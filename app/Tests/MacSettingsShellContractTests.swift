@@ -54,8 +54,12 @@ require(rootView.contains("private var macDesktopShell: some View"), "root has a
 require(!rootView.contains("macSidebar"), "desktop main navigation has no rejected sidebar")
 require(rootView.contains(".safeAreaInset(edge: .top, spacing: 0) { cinematicTopBar }"),
         "desktop shell hosts horizontal TV-inspired top navigation without obscuring forms")
-require(rootView.contains("ForEach(visibleTabs, id: \\.rawValue) { item in\n                        horizontalTabButton(item)"),
+require(rootView.contains("ForEach(visibleTabs, id: \\.rawValue) { item in\n                horizontalTabButton(item)"),
         "horizontal navigation uses the same visibility-filtered destinations")
+require(rootView.contains("ViewThatFits(in: .horizontal)") && rootView.contains("horizontalTabItems.fixedSize(horizontal: true, vertical: true)"),
+        "wide horizontal navigation hugs its destinations with a scrolling overflow fallback")
+require(rootView.contains("if topNavigation { cinematicTopBar }\n                selectedTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)\n                if !topNavigation { bottomTabBarRow }"),
+        "mobile shell reserves real top/bottom chrome space outside the detail viewport")
 require(rootView.contains("ScrollView(.horizontal, showsIndicators: false)") && rootView.contains("proxy.scrollTo(item.rawValue, anchor: .center)"),
         "narrow desktop navigation scrolls selected routes into view")
 require(rootView.contains("geometry.size.width >= 760") && rootView.contains("UIDevice.current.userInterfaceIdiom == .pad"),
@@ -77,6 +81,26 @@ require(rootView.contains(".onExitCommand") && rootView.contains("tabFocus = .ta
         "Escape returns desktop chrome focus to the active route")
 require(rootView.contains("if item == .library, activeDownloadCount > 0"), "download badge survives in Library navigation")
 require(rootView.contains("reduceMotion ? nil : .easeOut"), "shell respects Reduce Motion")
+let searchView = rootView.components(separatedBy: "struct iOSSearchView: View {").last?
+    .components(separatedBy: "struct iOSDiscoverView: View {").first ?? ""
+require(searchView.contains(".safeAreaInset(edge: .top, spacing: 0) { touchSearchField }") &&
+        searchView.contains("TextField(\"Movies or series\", text: $query)"),
+        "touch Search owns a visible top field outside the bottom navigation")
+require(!searchView.contains(".searchable(text:") && !searchView.contains(".searchCompletion("),
+        "touch Search no longer delegates its field or suggestions to an overlapping OS accessory")
+require(searchView.contains("if isTyping && !suggestionTitles.isEmpty { touchSearchSuggestions }") &&
+        searchView.contains("query = title\n                        submitTouchSearch(title)"),
+        "inline search suggestions retain the engine query and submit path")
+require(searchView.contains("let alreadySubmitted = submittedSuggestion == value") &&
+        searchView.contains("if alreadySubmitted { return }") &&
+        searchView.contains("scheduleSearch(value)") && searchView.contains("core.search(value)") &&
+        searchView.contains("searchFocused = false"),
+        "touch search retains debounce, immediate submit and keyboard dismissal")
+require(searchView.contains(".onChange(of: isActive) { active in if !active { searchFocused = false } }") &&
+        searchView.contains(".onChange(of: path.count) { count in if count > 0 { searchFocused = false } }"),
+        "hidden Search and pushed details do not strand keyboard focus")
+require(searchView.contains(".onReceive(MacSearchBridge.shared.$pending)"),
+        "desktop search keeps its existing bridge without adding window toolbar items")
 
 require(settings.contains("private var macSettingsShell: some View"), "Settings has a desktop workspace")
 require(settings.contains("private var macSettingsCategoryRail: some View"), "Settings exposes navigable categories")

@@ -92,6 +92,117 @@ private struct PlayerClockSlider: View {
     }
 }
 
+/// Shared geometry for the visual track, touch input and VoiceOver. Unknown/invalid durations
+/// remain non-seekable; neither a narrow layout nor an out-of-bounds drag can produce NaN.
+private enum PlayerSeekInteractionPolicy {
+    static func animates(requested: Bool, scrubbing: Bool, reduceMotion: Bool) -> Bool {
+        requested && !scrubbing && !reduceMotion
+    }
+
+    static func target(x: CGFloat, width: CGFloat, duration: Double) -> Double? {
+        guard x.isFinite, width.isFinite, duration.isFinite, duration > 0, width > 20 else { return nil }
+        return min(1, max(0, Double((x - 10) / (width - 20)))) * duration
+    }
+
+    static func fraction(_ position: Double, duration: Double) -> Double {
+        guard position.isFinite, duration.isFinite, duration > 0 else { return 0 }
+        return min(1, max(0, position / duration))
+    }
+
+    static func adjusted(_ position: Double, duration: Double, forward: Bool) -> Double? {
+        guard position.isFinite, duration.isFinite, duration > 0 else { return nil }
+        return min(duration, max(0, position + (forward ? 10 : -10)))
+    }
+}
+
+/// Only this small leaf observes time ticks and the seek-style preference. The decorative Canvas
+/// never owns input: this surface keeps the full 44pt drag target and VoiceOver adjustment action.
+private struct PlayerStyledSeekSlider: View {
+    @ObservedObject var clock: TimePosClock
+    @Binding var scrubbing: Bool
+    @Binding var scrubTarget: Double
+    @AppStorage(SeekBarStyle.storageKey) private var styleRaw = SeekBarStyle.classic.rawValue
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @GestureState private var gestureActive = false
+    @State private var dragActive = false
+    let duration: Double
+    let bufferedTime: Double
+    let width: CGFloat
+    let accent: Color
+    let animated: Bool
+    let onScrubChanged: (Double) -> Void
+    let onEditingChanged: (Bool) -> Void
+
+    var selectedStyle: SeekBarStyle { SeekBarStyle(rawValue: styleRaw) ?? .classic }
+    var position: Double { scrubbing ? scrubTarget : clock.position }
+    var progress: Double { PlayerSeekInteractionPolicy.fraction(position, duration: duration) }
+    var artwork: SeekBarTrack {
+        SeekBarTrack(style: selectedStyle, progress: progress, accent: accent,
+                     buffered: scrubbing ? 0 : PlayerSeekInteractionPolicy.fraction(bufferedTime, duration: duration),
+                     animated: PlayerSeekInteractionPolicy.animates(requested: animated, scrubbing: scrubbing, reduceMotion: reduceMotion))
+    }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            artwork
+                .frame(height: 18)
+                .padding(.horizontal, 10)
+                .allowsHitTesting(false)
+            Circle().fill(.white)
+                .frame(width: scrubbing ? 14 : 10, height: scrubbing ? 14 : 10)
+                .position(x: 10 + CGFloat(progress) * max(1, width - 20), y: 22)
+                .allowsHitTesting(false)
+        }
+        .frame(height: 44)
+        .contentShape(Rectangle())
+        .gesture(DragGesture(minimumDistance: 0)
+            .updating($gestureActive) { _, active, _ in active = true }
+            .onChanged { value in
+                guard let target = PlayerSeekInteractionPolicy.target(x: value.location.x, width: width, duration: duration) else { return }
+                if !dragActive { dragActive = true; onEditingChanged(true) }
+                scrubTarget = target
+                onScrubChanged(target)
+            }
+            .onEnded { _ in finishDrag() })
+        .onChange(of: gestureActive) { active in
+            // SwiftUI also resets GestureState when a drag is cancelled by the system.
+            if !active { finishDrag() }
+        }
+        .onDisappear { finishDrag() }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Playback position")
+        .accessibilityValue(accessibilityTime)
+        .accessibilityHint("Swipe up or down to seek ten seconds")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: adjust(forward: true)
+            case .decrement: adjust(forward: false)
+            @unknown default: break
+            }
+        }
+        .disabled(!duration.isFinite || duration <= 0)
+    }
+
+    private var accessibilityTime: String {
+        let value = progress * (duration.isFinite ? max(0, duration) : 0)
+        return "\(Int(value) / 60):\(String(format: "%02d", Int(value) % 60))"
+    }
+
+    private func finishDrag() {
+        guard dragActive else { return }
+        dragActive = false
+        onEditingChanged(false)
+    }
+
+    func adjust(forward: Bool) {
+        guard let target = PlayerSeekInteractionPolicy.adjusted(position, duration: duration, forward: forward) else { return }
+        onEditingChanged(true)
+        scrubTarget = target
+        onScrubChanged(target)
+        onEditingChanged(false)
+    }
+}
+
 private struct PlayerBufferedBand: View {
     @ObservedObject var clock: TimePosClock
     let duration: Double
@@ -129,6 +240,7 @@ private struct PlayerSeekSliderSurface: View {
     let size: CGSize
     let chapterFractions: [Double]
     let accent: Color
+    let animated: Bool
     let onScrubChanged: (Double) -> Void
     let onEditingChanged: (Bool) -> Void
     let onHoverPreviewChanged: (Double?) -> Void
@@ -137,6 +249,16 @@ private struct PlayerSeekSliderSurface: View {
     private var trackWidth: CGFloat { max(1, size.width - sliderInset * 2) }
 
     var body: some View {
+        #if os(iOS)
+        PlayerStyledSeekSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
+                               duration: duration, bufferedTime: bufferedTime, width: size.width,
+                               accent: accent, animated: animated,
+                               onScrubChanged: onScrubChanged, onEditingChanged: onEditingChanged)
+            .overlay {
+                PlayerChapterMarkers(fractions: chapterFractions, trackWidth: trackWidth,
+                                     sliderInset: sliderInset, height: size.height)
+            }
+        #else
         PlayerClockSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
                           duration: duration, onScrubChanged: onScrubChanged,
                           onEditingChanged: onEditingChanged)
@@ -163,6 +285,7 @@ private struct PlayerSeekSliderSurface: View {
                 PlayerChapterMarkers(fractions: chapterFractions, trackWidth: trackWidth,
                                      sliderInset: sliderInset, height: size.height)
             }
+        #endif
     }
 }
 
@@ -250,6 +373,7 @@ private struct PlayerSeekTimelineTrack: View {
     let size: CGSize
     let chapterFractions: [Double]
     let accent: Color
+    let animated: Bool
     let skipSegments: [SkipSegment]
     let showSkipEditor: Bool
     let skipEditStart: Double
@@ -263,7 +387,7 @@ private struct PlayerSeekTimelineTrack: View {
     var body: some View {
         PlayerSeekSliderSurface(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
                                 duration: duration, bufferedTime: bufferedTime, size: size,
-                                chapterFractions: chapterFractions, accent: accent, onScrubChanged: onScrubChanged,
+                                chapterFractions: chapterFractions, accent: accent, animated: animated, onScrubChanged: onScrubChanged,
                                 onEditingChanged: onEditingChanged, onHoverPreviewChanged: onHoverPreviewChanged)
             #if !os(tvOS)
             .overlay { PlayerSkipTimelineBands(segments: skipSegments, duration: duration, size: size) }
@@ -298,12 +422,18 @@ private struct PlayerControlButton: View {
             // fit at full size so minimumScaleFactor is a no-op there.
             Text(title).font(.subheadline.weight(.medium))
                 .lineLimit(1)
+                #if !os(iOS)
                 .minimumScaleFactor(0.75)
+                #endif
         }
         // Glass control pill (mockup .gp / .gp.on): a subtle chip that turns to the ember active variant
         // when its feature is engaged. Purely visual; the button's action is unchanged.
         .foregroundStyle(active ? Theme.Palette.accent : .white)
         .padding(.horizontal, 12).padding(.vertical, 7)
+        #if os(iOS)
+        .frame(minHeight: 44)
+        .fixedSize(horizontal: true, vertical: false)
+        #endif
         .background { RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.white.opacity(active ? 0 : 0.06)) }
         .vortxGlassActive(active, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay {
@@ -327,6 +457,21 @@ private struct PlayerTransportToolbar: View {
     let sleep: PlayerControlButton
 
     var body: some View {
+        #if os(iOS)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                subtitles
+                if let audio { audio }
+                speed
+                if let sources { sources }
+                if let episodes { episodes }
+                if let quality { quality }
+                if let chapters { chapters }
+            }
+        }
+        .accessibilityLabel("Playback controls")
+        .accessibilityHint("Scroll for more playback controls")
+        #else
         HStack(spacing: 0) {
             speed
             Spacer()
@@ -344,6 +489,7 @@ private struct PlayerTransportToolbar: View {
             sleep
         }
         .padding(.horizontal, 8)
+        #endif
     }
 }
 
@@ -374,6 +520,22 @@ private struct PlayerBottomTimeline: View {
     let track: (CGSize) -> PlayerSeekTimelineTrack
 
     var body: some View {
+        #if os(iOS)
+        VStack(spacing: 0) {
+            GeometryReader { geo in track(geo.size) }
+                .frame(height: 44)
+            HStack(spacing: 12) {
+                PlayerTimeLabel(clock: clock)
+                Spacer(minLength: 8)
+                if let endsAtText {
+                    Text(endsAtText).font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.6))
+                }
+                Spacer(minLength: 8)
+                Text(durationText).font(.caption.monospacedDigit()).foregroundStyle(.white.opacity(0.8))
+            }
+            .padding(.horizontal, 10)
+        }
+        #else
         HStack(spacing: 12) {
             PlayerTimeLabel(clock: clock)
             GeometryReader { geo in track(geo.size) }
@@ -386,6 +548,7 @@ private struct PlayerBottomTimeline: View {
                 }
             }
         }
+        #endif
     }
 }
 
@@ -404,6 +567,17 @@ private struct PlayerSkipEditorLayout: View {
 
     var body: some View {
         VStack(spacing: 6) {
+            #if os(iOS)
+            ScrollView(.horizontal, showsIndicators: true) {
+                HStack(spacing: 12) {
+                    PlayerSkipEditorSection(content: typeControls)
+                    PlayerSkipEditorSection(content: timeControls)
+                    PlayerSkipEditorSection(content: actions)
+                }
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(minHeight: 44)
+            }
+            #else
             HStack(spacing: 8) {
                 PlayerSkipEditorSection(content: typeControls)
                 Spacer()
@@ -411,6 +585,7 @@ private struct PlayerSkipEditorLayout: View {
                 Spacer()
                 PlayerSkipEditorSection(content: actions)
             }
+            #endif
             if let error {
                 Text(error).font(.caption2).foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .trailing)
@@ -432,6 +607,14 @@ private struct PlayerBottomBarLayout: View {
     let toolbar: PlayerTransportToolbar
 
     var body: some View {
+        #if os(iOS)
+        VStack(spacing: 10) {
+            if isLive { live } else { timeline }
+            if let editor { editor }
+            toolbar
+        }
+        .padding(.horizontal, 16).padding(.bottom, 12)
+        #else
         VStack(spacing: 14) {
             if isLive { live } else { timeline }
             if let editor { editor }
@@ -441,6 +624,245 @@ private struct PlayerBottomBarLayout: View {
         .vortxGlass(in: RoundedRectangle(cornerRadius: 22, style: .continuous),
                     fillAlpha: VortXGlass.barFillAlpha, shadow: .bar)
         .padding(.horizontal, 16).padding(.bottom, 16)
+        #endif
+    }
+}
+
+/// Pinch is a mode change on the existing engine, never a scale transform on the player UI.
+private enum PlayerVideoSizeGesturePolicy {
+    static func mode(scale: CGFloat, current: String, enabled: Bool, locked: Bool, panelOpen: Bool) -> String? {
+        guard enabled, !locked, !panelOpen, scale.isFinite, scale > 0 else { return nil }
+        let requested: String
+        if scale >= 1.08 { requested = "fill" }
+        else if scale <= 0.92 { requested = "original" }
+        else { return nil }
+        return requested == current ? nil : requested
+    }
+}
+
+/// An exclusive recognizer prevents a completed pinch from also toggling controls. It lives below
+/// the chrome, so slider drags and control taps retain their own independent targets.
+private struct PlayerVideoInteractionSurface: View {
+    let locked: Bool
+    let pinchEnabled: Bool
+    let onTap: () -> Void
+    let onPinch: (CGFloat) -> Void
+
+    var body: some View {
+        Color.clear.contentShape(Rectangle())
+            .gesture(MagnificationGesture(minimumScaleDelta: 0.02)
+                .exclusively(before: TapGesture())
+                .onEnded { result in
+                    switch result {
+                    case .first(let scale): if pinchEnabled && !locked { onPinch(scale) }
+                    case .second: onTap()
+                    }
+                })
+            .ignoresSafeArea()
+            .accessibilityLabel(locked ? "Unlock player controls" : "Show player controls")
+            .accessibilityAction { onTap() }
+    }
+}
+
+private struct PlayerSizeModeFeedback: View {
+    let title: String
+    let clear: () -> Void
+
+    var body: some View {
+        Text(title)
+            .font(.subheadline.weight(.medium)).foregroundStyle(.white)
+            .padding(.horizontal, 16).padding(.vertical, 10)
+            .background(.black.opacity(0.65), in: Capsule())
+            .allowsHitTesting(false)
+            .task(id: title) {
+                try? await Task.sleep(for: .seconds(1.6))
+                guard !Task.isCancelled else { return }
+                clear()
+            }
+    }
+}
+
+private struct PlayerTouchIconButton: View {
+    let icon: String
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(.black.opacity(0.24), in: Circle())
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+}
+
+private struct PlayerTouchAspectButton: View {
+    let mode: String
+    let toggle: () -> Void
+    let select: (String) -> Void
+    private var title: String { mode == "fill" ? "Fill" : mode == "stretch" ? "Stretch" : "Fit" }
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 5) {
+                Image(systemName: "aspectratio")
+                Text(title).font(.caption.weight(.semibold))
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 10).frame(height: 44)
+            .background(.black.opacity(0.24), in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Video size: \(title)")
+        .accessibilityHint("Double tap to toggle Fit and Fill. More options includes all aspect modes.")
+        .contextMenu {
+            Button("Fit") { select("original") }
+            Button("Fill") { select("fill") }
+            Button("Stretch") { select("stretch") }
+        }
+    }
+}
+
+private struct PlayerTouchOptionAction: Identifiable {
+    let id: String
+    let title: String
+    let icon: String
+    let action: () -> Void
+}
+
+private struct PlayerTouchOptionsPanel: View {
+    let actions: [PlayerTouchOptionAction]
+    let volume: () -> AnyView
+    let routePicker: () -> AnyView
+    let dismiss: () -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Player options").font(.headline)
+                    Spacer()
+                    PlayerTouchIconButton(icon: "xmark", label: "Close options", action: dismiss)
+                }
+                Text("Volume").font(.caption).foregroundStyle(.secondary)
+                volume()
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                routePicker()
+                Divider()
+                ForEach(actions) { item in
+                    Button {
+                        dismiss()
+                        item.action()
+                    } label: {
+                        Label(item.title, systemImage: item.icon)
+                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(16)
+        }
+        .frame(width: 300)
+        .frame(idealHeight: 380, maxHeight: 380)
+        .foregroundStyle(.white)
+        .preferredColorScheme(.dark)
+    }
+}
+
+private struct PlayerTouchOptionsButton: View {
+    @Binding var presented: Bool
+    let content: () -> PlayerTouchOptionsPanel
+    let onVisibilityChanged: (Bool) -> Void
+
+    var body: some View {
+        PlayerTouchIconButton(icon: "ellipsis", label: "More player options") { presented = true }
+            .popover(isPresented: $presented, arrowEdge: .top) {
+                #if os(iOS)
+                if #available(iOS 16.4, *) {
+                    content().presentationCompactAdaptation(.popover)
+                } else {
+                    content()
+                }
+                #else
+                content()
+                #endif
+            }
+            .onChange(of: presented, perform: onVisibilityChanged)
+    }
+}
+
+private struct PlayerTouchHeader: View {
+    let title: String
+    let metadata: String
+    let close: PlayerTouchIconButton
+    let pictureInPicture: () -> AnyView
+    let aspect: PlayerTouchAspectButton
+    let fullscreen: PlayerTouchIconButton
+    let options: PlayerTouchOptionsButton
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                close
+                Spacer(minLength: 0)
+                pictureInPicture()
+                aspect
+                fullscreen
+                options
+            }
+            if !title.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.headline.weight(.semibold)).lineLimit(1)
+                    if !metadata.isEmpty {
+                        Text(metadata).font(.caption).foregroundStyle(.white.opacity(0.65)).lineLimit(1)
+                    }
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 4)
+                .accessibilityElement(children: .combine)
+            }
+        }
+        .padding(.horizontal, 16).padding(.top, 4)
+    }
+}
+
+private struct PlayerTouchTransport: View {
+    let paused: Bool
+    let live: Bool
+    let seekStep: String
+    let previous: PlayerTouchIconButton?
+    let next: PlayerTouchIconButton?
+    let backward: () -> Void
+    let forward: () -> Void
+    let toggle: () -> Void
+
+    var body: some View {
+        HStack(spacing: 14) {
+            if let previous { previous }
+            if !live {
+                PlayerTouchIconButton(icon: "gobackward.\(seekStep)", label: "Skip back \(seekStep) seconds", action: backward)
+            }
+            Button(action: toggle) {
+                Image(systemName: paused ? "play.fill" : "pause.fill")
+                    .font(.system(size: 32, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 64, height: 64)
+                    .background(.black.opacity(0.3), in: Circle())
+                    .contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(paused ? "Play" : "Pause")
+            if !live {
+                PlayerTouchIconButton(icon: "goforward.\(seekStep)", label: "Skip forward \(seekStep) seconds", action: forward)
+            }
+            if let next { next }
+        }
     }
 }
 
@@ -808,6 +1230,8 @@ struct PlayerScreen: View {
     /// reveals the small unlock chip, so a pocketed phone / a handed-over device can't seek or pause by
     /// accident. Engaged from the top bar's lock button; per-playback state (never persisted).
     @State private var isLocked = false
+    @State private var touchOptionsVisible = false
+    @State private var videoSizeNotice: String?
     /// The transient unlock affordance a locked player shows on tap; auto-hides after a few seconds.
     @State private var unlockChipVisible = false
     @State private var unlockChipHideTask: Task<Void, Never>?
@@ -1547,11 +1971,25 @@ struct PlayerScreen: View {
             // recognizer on the Metal view frequently missed taps (you had to tap many times);
             // a SwiftUI contentShape layer catches every tap. The controls sit above it, so their
             // buttons still work and a tap on empty space falls through here to toggle.
+            #if os(iOS)
+            PlayerVideoInteractionSurface(locked: isLocked, pinchEnabled: touchPinchEnabled,
+                onTap: { if isLocked { revealUnlockChip() } else { toggleControls() } },
+                onPinch: handleVideoPinch)
+            #else
             Color.clear.contentShape(Rectangle())
                 .onTapGesture { if isLocked { revealUnlockChip() } else { toggleControls() } }
                 .ignoresSafeArea()
                 .accessibilityLabel(isLocked ? "Unlock player controls" : "Show player controls")
                 .accessibilityAction { if isLocked { revealUnlockChip() } else { toggleControls() } }
+            #endif
+
+            #if os(iOS)
+            if let videoSizeNotice {
+                PlayerSizeModeFeedback(title: videoSizeNotice) { self.videoSizeNotice = nil }
+                    .offset(y: 54)
+                    .zIndex(40)
+            }
+            #endif
 
             if (buffering || reconnecting) && !loadFailed { bufferingOverlay }
 
@@ -7075,6 +7513,141 @@ struct PlayerScreen: View {
     }
 
     private var topBar: some View {
+        #if os(iOS)
+        touchHeader
+        #else
+        legacyTopBar
+        #endif
+    }
+
+    #if os(iOS)
+    private var touchHeader: PlayerTouchHeader {
+        PlayerTouchHeader(
+            title: curTitle, metadata: metadataLine,
+            close: PlayerTouchIconButton(icon: "chevron.down", label: "Close player") { leavePlayback() },
+            pictureInPicture: {
+                if let controller = coordinator.player as? AVPlayerEngineController {
+                    return AnyView(AVPlayerPictureInPictureButton(controller: controller) { scheduleHide() })
+                }
+                return AnyView(EmptyView())
+            },
+            aspect: PlayerTouchAspectButton(mode: coordinator.player?.videoSizeMode ?? videoSize,
+                toggle: { applyVideoSize((coordinator.player?.videoSizeMode ?? videoSize) == "original" ? "fill" : "original") },
+                select: { applyVideoSize($0) }),
+            fullscreen: PlayerTouchIconButton(
+                icon: forcedLandscape ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                label: "Toggle fullscreen") {
+                    forcedLandscape.toggle()
+                    coordinator.player?.setOrientation(landscape: forcedLandscape)
+                    scheduleHide()
+                },
+            options: PlayerTouchOptionsButton(presented: $touchOptionsVisible,
+                content: { touchOptionsPanel },
+                onVisibilityChanged: { visible in
+                    if visible { hideTask?.cancel() } else { scheduleHide() }
+                })
+        )
+    }
+
+    private var touchOptionsPanel: PlayerTouchOptionsPanel {
+        PlayerTouchOptionsPanel(actions: touchOptionsActions,
+            volume: { AnyView(volumeControl) },
+            routePicker: {
+                AnyView(HStack(spacing: 8) {
+                    AirPlayRoutePickerButton()
+                    Text("AirPlay").font(.subheadline)
+                    Spacer()
+                })
+            },
+            dismiss: { touchOptionsVisible = false })
+    }
+
+    private var touchOptionsActions: [PlayerTouchOptionAction] {
+        var actions: [PlayerTouchOptionAction] = []
+        if !isLive {
+            actions.append(PlayerTouchOptionAction(id: "restart", title: "Restart from beginning",
+                icon: "arrow.counterclockwise", action: restartFromBeginning))
+        }
+        actions.append(PlayerTouchOptionAction(id: "aspect", title: "Aspect ratio · Fit / Fill / Stretch",
+            icon: "aspectratio") { openPanel(.video) })
+        actions.append(PlayerTouchOptionAction(id: "sleep", title: sleepArmed ? sleepLabel : "Sleep timer",
+            icon: "moon.zzz") { openPanel(.sleep) })
+        actions.append(PlayerTouchOptionAction(id: "grab", title: "Grab frame",
+            icon: "camera.viewfinder") { grabFrame() })
+        if let meta = curMeta, SkipEditPolicy.canEdit(isLiveContent: isLive, contentId: meta.libraryId) {
+            actions.append(PlayerTouchOptionAction(id: "editor",
+                title: showSkipDBEdit ? "Close skip editor" : "Edit skip segments",
+                icon: "checkmark.bubble") {
+                    if !showSkipDBEdit { seedSkipDBEditor() }
+                    showSkipDBEdit.toggle()
+                })
+        }
+        actions.append(PlayerTouchOptionAction(id: "lock", title: "Lock player controls",
+            icon: "lock") { engageLock() })
+        actions.append(PlayerTouchOptionAction(id: "settings", title: "Player settings",
+            icon: "gearshape") { openPanel(.playerSettings) })
+        actions.append(PlayerTouchOptionAction(id: "external", title: "Play in another app",
+            icon: "arrow.up.forward.app") {
+                hideTask?.cancel()
+                showExternalChooser = true
+            })
+        return actions
+    }
+
+    private var touchTransport: PlayerTouchTransport {
+        PlayerTouchTransport(paused: isPaused, live: isLive, seekStep: seekStep,
+            previous: showsPreviousEpisodeControl
+                ? PlayerTouchIconButton(icon: "backward.end.fill", label: "Previous episode") { goToPrevEpisode() } : nil,
+            next: (showsNextEpisodeControl || hasNext)
+                ? PlayerTouchIconButton(icon: "forward.end.fill", label: "Next episode") {
+                    if duration > 0 { reportProgress(currentTime) }
+                    if showsNextEpisodeControl { goToNextEpisode() } else { onNext() }
+                } : nil,
+            backward: { seekBy(-seekStepSeconds) },
+            forward: { seekBy(seekStepSeconds) },
+            toggle: { Haptics.tap(); viewerToggle(); scheduleHide() })
+    }
+
+    private var touchPinchEnabled: Bool {
+        !isLocked && panel == nil && !touchOptionsVisible && !showExternalChooser &&
+        !showShare && !loadFailed && !scrubbing
+    }
+
+    private func handleVideoPinch(_ scale: CGFloat) {
+        guard let mode = PlayerVideoSizeGesturePolicy.mode(
+            scale: scale, current: coordinator.player?.videoSizeMode ?? videoSize,
+            enabled: touchPinchEnabled, locked: isLocked, panelOpen: panel != nil) else { return }
+        applyVideoSize(mode)
+    }
+    #endif
+
+    private func applyVideoSize(_ mode: String) {
+        guard ["original", "fill", "stretch"].contains(mode) else { return }
+        videoSize = mode
+        coordinator.player?.setVideoSize(mode)
+        #if os(iOS)
+        videoSizeNotice = mode == "fill" ? "Fill · pinch in to fit" : mode == "stretch" ? "Stretch" : "Fit · pinch out to fill"
+        #endif
+        scheduleHide()
+    }
+
+    private func restartFromBeginning() {
+        issueSeek(to: 0, reason: "restart")
+        currentTime = 0
+        // Direct onSeek (a restart-to-0 must bypass reportSeek's resume floor), so the
+        // account write rides along explicitly, keyed on the CURRENT episode like every
+        // other save (the hosts no longer write the account from the closures).
+        if assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken),
+           duration > 0 {
+            if engineWritesOpen { onSeek(0, duration, playbackMutationTarget) }
+            lastReported = 0
+            saveAccountProgress(0)
+        }
+        viewerPlay()   // restart is an explicit resume, including its recovery budget
+        scheduleHide()
+    }
+
+    private var legacyTopBar: some View {
         HStack(spacing: 12) {
             iconButton("chevron.down", label: "Close player") { leavePlayback() }
             if !curTitle.isEmpty {
@@ -7191,7 +7764,11 @@ struct PlayerScreen: View {
                 Image(systemName: volumeGlyph)
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(.white).shadow(radius: 3)
+                    #if os(iOS)
+                    .frame(width: 44, height: 44)
+                    #else
                     .frame(width: 34, height: 40)
+                    #endif
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -7200,12 +7777,24 @@ struct PlayerScreen: View {
                                   set: { setPlayerVolume($0) }),
                    in: 0...100) { editing in if editing { hideTask?.cancel() } else { scheduleHide() } }
                 .tint(Theme.Palette.accent)
-                .frame(width: hSizeClass == .compact ? 60 : 92)   // narrower on compact iPhone so the top bar cluster doesn't crowd
+                #if os(iOS)
+                .frame(width: 204)   // the dedicated options popover keeps a usable continuous volume slider
+                #else
+                .frame(width: 92)
+                #endif
                 .accessibilityLabel("Volume")
         }
     }
 
     private var centerTransport: some View {
+        #if os(iOS)
+        touchTransport
+        #else
+        legacyCenterTransport
+        #endif
+    }
+
+    private var legacyCenterTransport: some View {
         HStack(spacing: 44) {
             // Skip back by the user's seek step (hidden for live - no fixed timeline to seek within).
             if !isLive {
@@ -7302,6 +7891,7 @@ struct PlayerScreen: View {
                 size: size,
                 chapterFractions: chapterFractions,
                 accent: Theme.Palette.accent,
+                animated: !isPaused && controlsVisible && !isLocked,
                 skipSegments: skipSegments,
                 showSkipEditor: skipEditorTimelineValues.visible,
                 skipEditStart: skipEditorTimelineValues.start,
@@ -8587,7 +9177,7 @@ struct PlayerScreen: View {
         switch p {
         case .video:
             return sizeModes.map { m in Row(label: m.label, detail: m.detail, selected: (coordinator.player?.videoSizeMode ?? videoSize) == m.raw) {
-                videoSize = m.raw; coordinator.player?.setVideoSize(m.raw)
+                applyVideoSize(m.raw)
             } }
         case .speed:
             return speeds.map { s in Row(label: speedLabel(s), selected: abs(speed - s) < 0.01) {
@@ -9743,7 +10333,7 @@ struct PlayerScreen: View {
             // Never auto-hide before the first frame arrives: a stuck pre-start load must KEEP its
             // controls (and their close button) on screen so the player is never a trap. Also hold
             // while scrubbing, a panel is open, or paused.
-            guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !isPaused, !skipEditActive else { return }
+            guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !touchOptionsVisible, !isPaused, !skipEditActive else { return }
             withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
         }
     }

@@ -521,6 +521,9 @@ extension View {
             highlightTop: 0.14,
             shadow: .flat,
             activeFill: selected ? tint.opacity(VortXGlass.chipSelectedAlpha) : nil,
+            // Small capsules need one edge, not Liquid Glass's ambient outer rim plus our hairline.
+            // Shape-clipped material retains the frost/selection and Reduce Transparency fallback.
+            hugsTightly: true,
             // tvOS: ~80 filter chips scroll under the focus engine, so they take the cheap OPAQUE warm
             // capsule (idle = surface2) instead of a live glass blur per chip; the ember selection tint
             // (activeFill above) and ChipButtonStyle's ring / scale still ride on top. Inert on iOS / macOS.

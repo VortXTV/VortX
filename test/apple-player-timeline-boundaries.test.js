@@ -43,7 +43,8 @@ test("toolbar and editor do not expose repeated opaque button or editor-section 
     const editor = source.slice(source.indexOf("private struct PlayerSkipEditorLayout:"),
         source.indexOf("private struct PlayerBottomBarLayout:"));
     assert.equal((editor.match(/let \w+: \(\) -> AnyView/g) || []).length, 3);
-    assert.equal((editor.match(/PlayerSkipEditorSection\(content:/g) || []).length, 3);
+    assert.equal((editor.match(/PlayerSkipEditorSection\(content:/g) || []).length, 6,
+        "both iOS scrolling and desktop editor rows retain three nominal sections");
     for (const name of ["skipDBEditTypeControls", "skipDBEditTimeControls", "skipDBEditActions", "skipDBTimeControl"]) {
         assert(new RegExp(`private func ${name}\\([^\\n]*\\) -> AnyView`).test(source), `${name} must bound its own subtree`);
     }
@@ -53,9 +54,42 @@ test("toolbar and editor do not expose repeated opaque button or editor-section 
 test("executable probe extracts production factories and editor bodies with actual glass styling", () => {
     const runner = fs.readFileSync(path.join(__dirname, "../scripts/test-apple-player-timeline.sh"), "utf8");
     for (const productionInput of ["private var skipEditorTimelineValues:", "private func skipDBEditBar(",
+        "private var touchOptionsActions:", "app/SourcesShared/SeekBarStyle.swift", "app/SourcesShared/SkipEditPolicy.swift",
         "app/SourcesShared/GlassStyle.swift", "app/SourcesShared/Theme.swift", "app/SourcesShared/ThemeManager.swift"]) {
         assert(runner.includes(productionInput), `runtime probe must compile ${productionInput}`);
     }
+});
+
+test("touch seek renders the stored style with a real adjustable 44pt interaction surface", () => {
+    const styled = source.slice(source.indexOf("private struct PlayerStyledSeekSlider:"),
+        source.indexOf("private struct PlayerBufferedBand:"));
+    for (const behavior of ["@ObservedObject var clock", "@AppStorage(SeekBarStyle.storageKey)",
+        "SeekBarTrack(style: selectedStyle", ".frame(height: 44)", "DragGesture(minimumDistance: 0)",
+        ".accessibilityAdjustableAction", "onEditingChanged(true)", "onEditingChanged(false)",
+        "PlayerSeekInteractionPolicy.animates(requested: animated, scrubbing: scrubbing, reduceMotion: reduceMotion)"]) {
+        assert(styled.includes(behavior), `missing real seek behavior: ${behavior}`);
+    }
+    const surface = source.slice(source.indexOf("private struct PlayerSeekSliderSurface:"),
+        source.indexOf("private struct PlayerChapterMarkers:"));
+    assert(surface.includes("#if os(iOS)\n        PlayerStyledSeekSlider("));
+    assert(surface.includes("#else\n        PlayerClockSlider("), "retain native desktop seek behavior");
+});
+
+test("pinch changes the live engine mode and is exclusive with video taps", () => {
+    const interaction = source.slice(source.indexOf("private struct PlayerVideoInteractionSurface:"),
+        source.indexOf("private struct PlayerSizeModeFeedback:"));
+    assert(interaction.includes(".exclusively(before: TapGesture())"));
+    assert(interaction.includes("if pinchEnabled && !locked { onPinch(scale) }"));
+    const enabled = source.slice(source.indexOf("private var touchPinchEnabled:"),
+        source.indexOf("private func applyVideoSize("));
+    for (const guard of ["!isLocked", "panel == nil", "!touchOptionsVisible", "!showExternalChooser", "!showShare", "!loadFailed", "!scrubbing"]) {
+        assert(enabled.includes(guard));
+    }
+    const apply = source.slice(source.indexOf("private func applyVideoSize("),
+        source.indexOf("private func restartFromBeginning("));
+    assert(apply.includes("videoSize = mode"));
+    assert(apply.includes("coordinator.player?.setVideoSize(mode)"));
+    assert(!apply.includes("scaleEffect") && !apply.includes("load("));
 });
 
 test("decorative layers preserve order, identities and non-interactive hit testing", () => {
