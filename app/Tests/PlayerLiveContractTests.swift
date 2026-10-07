@@ -3840,7 +3840,7 @@ enum PlayerLiveContractTests {
                   && tvPlayerChapterRows?.contains(
                     "issueSeek(to: ch.start, reason: \"chapter\")") == true
                   && playerScreenSkipAction?.contains(
-                    "issueSeek(to: segment.end, reason: \"skip\")") == true
+                    "issueSeek(to: segment.end, reason: \"skip-\\(segment.kind.rawValue)\")") == true
                   && tvPlayerSkipAction?.contains(
                     "issueSeek(to: segment.end, reason: \"skip\")") == true
                   && playerScreenDemotionUsesNewestEngineTarget

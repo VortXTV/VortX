@@ -15,6 +15,13 @@ enum DiagnosticsLog {
     static func log(_ category: String, _ message: String) {}
 }
 
+final class CredentialScopeRegistry: @unchecked Sendable {
+    static let shared = CredentialScopeRegistry()
+    struct Capture { let namespace = "tombstone-test-fixture" }
+    func capture() -> Capture { Capture() }
+    func isCurrent(_ capture: Capture) -> Bool { true }
+}
+
 @main
 enum TombstonePersistenceTests {
     static func main() {
@@ -62,7 +69,7 @@ enum TombstonePersistenceTests {
 
     private static func testCloudRestorePreservesPerEntryReceipts() {
         let defaults = UserDefaults.standard
-        let prefixes = ["stremiox.addons.", "stremiox.library."]
+        let prefixes = [AddonOwnerStorage.currentKey("stremiox.addons."), "stremiox.library."]
         let keys = prefixes.flatMap { prefix in ["removedAt", "addedAt", "deleted"].map { prefix + $0 } }
         let before = keys.reduce(into: [String: Any]()) { $0[$1] = defaults.object(forKey: $1) }
         defer {

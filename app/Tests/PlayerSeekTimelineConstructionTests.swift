@@ -27,6 +27,7 @@ enum ProbePanel: String { case speed, subtitles, audio, video, quality, sources,
 final class ProbeEffects {
     var events: [String] = []
     var seeks: [Double] = []
+    var activeLoadToken: UUID? = UUID()
     func seek(to time: Double) { seeks.append(time) }
 }
 struct ProbeCoordinator { var player: ProbeEffects? }
@@ -84,6 +85,9 @@ struct PlayerScreen {
     @ProbeValue var skipDBSubmitResult: Bool? = nil
     @ProbeValue var skipDBSubmitError: String? = nil
     @ProbeValue var skipDBPreviewing = false
+    @ProbeValue var skipDBPreviewReturnPosition: Double? = nil
+    @ProbeValue var skipDBPreviewWasPaused = false
+    @ProbeValue var skipDBPreviewOwner: UUID? = nil
     var skipDBSubmitting = false
     var skipDBSubmittedKeys: Set<String> = []
     var skipDBIntroEstimateMs: Int? = 60_000
@@ -95,6 +99,7 @@ struct PlayerScreen {
     func openPanel(_ panel: ProbePanel) { effects.events.append(panel.rawValue) }
     func grabFrame() { effects.events.append("grab") }
     func viewerPlay() { effects.events.append("play") }
+    func viewerPause() { effects.events.append("pause") }
     func restartFromBeginning() { effects.events.append("restart") }
     func seedSkipDBEditor() { effects.events.append("seed-editor") }
     func engageLock() { effects.events.append("lock") }
@@ -190,6 +195,7 @@ enum PlayerBottomBarConstructionProbe {
             }
         }
         verifyCallbacks()
+        verifyPreviewExit()
         verifySeekStylesAndAdjustment()
         verifyPinchPolicy()
         verifyOptionsAndTouchLayouts()
@@ -278,6 +284,38 @@ enum PlayerBottomBarConstructionProbe {
                 }
             }
         }
+    }
+
+    static func verifyPreviewExit() {
+        // The production Stop/close functions are extracted, not reimplemented by this fixture.
+        for paused in [false, true] {
+            let screen = PlayerScreen()
+            screen.currentTime = 10
+            screen.skipDBPreviewing = true
+            screen.skipDBPreviewReturnPosition = 400
+            screen.skipDBPreviewWasPaused = paused
+            screen.skipDBPreviewOwner = screen.effects.activeLoadToken
+            screen.stopSkipDBPreview()
+            precondition(screen.effects.seeks == [400] && screen.currentTime == 400)
+            precondition(screen.effects.events == (paused ? ["preview-exit", "pause"] : ["preview-exit"]))
+            precondition(!screen.skipDBPreviewing && screen.skipDBPreviewOwner == nil
+                         && screen.skipDBPreviewReturnPosition == nil)
+        }
+        let replaced = PlayerScreen()
+        replaced.skipDBPreviewing = true
+        replaced.showSkipDBEdit = true
+        replaced.skipDBPreviewReturnPosition = 400
+        replaced.skipDBPreviewOwner = UUID() // old media cannot reposition its accepted replacement
+        replaced.toggleSkipDBEditor()
+        precondition(replaced.effects.seeks.isEmpty && replaced.effects.events.isEmpty)
+        precondition(!replaced.showSkipDBEdit && !replaced.skipDBPreviewing)
+        let unowned = PlayerScreen()
+        unowned.skipDBPreviewing = true
+        unowned.effects.activeLoadToken = nil
+        unowned.skipDBPreviewOwner = nil
+        unowned.skipDBPreviewReturnPosition = 400
+        unowned.stopSkipDBPreview()
+        precondition(unowned.effects.seeks.isEmpty, "two absent owners do not authorize a return seek")
     }
 
     static func verifyOptionsAndTouchLayouts() {

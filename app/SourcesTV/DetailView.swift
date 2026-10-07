@@ -3031,7 +3031,7 @@ struct CoreStreamList: View {
                                                        titleVisibility: .visible) {
                             if let tier = qualityTier {
                                 ForEach(StreamRanking.variantOptions(groups, tier: tier), id: \.label) { option in
-                                    Button(option.label) { play(option.stream) }
+                                    Button(option.label) { play(option.stream, sourceAddon: option.addon) }
                                 }
                             }
                         }
@@ -3674,7 +3674,8 @@ struct CoreStreamList: View {
     /// treats this as a direct stream automatically (no warm-up, no `closeTorrent`).
     private func play(
         _ stream: CoreStream,
-        enginePreference: PlayerEngineRouter.Override? = nil
+        enginePreference: PlayerEngineRouter.Override? = nil,
+        sourceAddon: String? = nil
     ) {
         // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) is NOT a content stream. Route it to
         // the trailer path (isTrailer:true, meta:nil) so a dead trailer hits TVPlayerView's isTrailer guard
@@ -3695,7 +3696,8 @@ struct CoreStreamList: View {
                 stream,
                 explicit: true,
                 startProposal: proposedStart,
-                enginePreference: enginePreference
+                enginePreference: enginePreference,
+                sourceAddon: sourceAddon
             )
         }   // a tapped source row / quality pick: honor it in the player
     }
@@ -3909,7 +3911,8 @@ struct CoreStreamList: View {
         explicit: Bool,
         fromStart: Bool = false,
         startProposal: AccountBoundResumeProposal<TraktSessionID>,
-        enginePreference: PlayerEngineRouter.Override? = nil
+        enginePreference: PlayerEngineRouter.Override? = nil,
+        sourceAddon: String? = nil
     ) async {
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
@@ -3962,6 +3965,10 @@ struct CoreStreamList: View {
                                             enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
+            if explicit, let meta, meta.type == "series" {
+                SeriesSourceSticky.record(seriesKey: meta.libraryId, addon: sourceAddon,
+                                          bingeGroup: stream.behaviorHints?.bingeGroup)
+            }
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.
@@ -3989,6 +3996,10 @@ struct CoreStreamList: View {
                                             wasExplicitPick: explicit,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
+        if explicit, let meta, meta.type == "series" {
+            SeriesSourceSticky.record(seriesKey: meta.libraryId, addon: sourceAddon,
+                                      bingeGroup: stream.behaviorHints?.bingeGroup)
+        }
     }
 
     private var launchPlayerLabel: String {
@@ -4015,11 +4026,11 @@ struct CoreStreamList: View {
 
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if playableURL(for: stream) != nil || (canResolveNatively(stream) && (stream.isTorrent || stream.isUsenet)) {
-            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream), debridCached: isDebridCached(stream), lastPlayed: isLastPlayed(stream)) }
+            Button { play(stream, sourceAddon: addon) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream), debridCached: isDebridCached(stream), lastPlayed: isLastPlayed(stream)) }
                 .buttonStyle(RowFocusStyle())
                 .accessibilityHint("Press to play. Long-press for player options and source actions.")
                 .contextMenu {
-                    sourcePlayerMenu(stream)
+                    sourcePlayerMenu(stream, addon: addon)
                     Divider()
                     pinMenu(addon, stream)
                 }
@@ -4036,9 +4047,9 @@ struct CoreStreamList: View {
     /// One-launch choices for this exact source. Internal choices keep the existing resolver, headers,
     /// debrid provenance, torrent preparation, resume position, and explicit-pick behavior. External
     /// handoff is limited to detected players and self-contained remote URLs.
-    @ViewBuilder private func sourcePlayerMenu(_ stream: CoreStream) -> some View {
+    @ViewBuilder private func sourcePlayerMenu(_ stream: CoreStream, addon: String) -> some View {
         Button("VortX Player") {
-            play(stream, enginePreference: .mpv)
+            play(stream, enginePreference: .mpv, sourceAddon: addon)
         }
         if !stream.isYouTubeTrailer,
            let url = playableURL(for: stream),
@@ -4050,7 +4061,7 @@ struct CoreStreamList: View {
                plainRemuxDelivery: VortXRemuxHLSServer.deliveryEnabled
            ) {
             Button("AVPlayer") {
-                play(stream, enginePreference: .avfoundation)
+                play(stream, enginePreference: .avfoundation, sourceAddon: addon)
             }
         }
         if let url = playableURL(for: stream),

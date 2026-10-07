@@ -1552,6 +1552,10 @@ private func credentialOwnerRetrySourceContract(_ syncManager: String) -> Bool {
 /// confirmed absent before any live state, realtime channel, source index, or published flag can move to the
 /// signed-out projection. A failed deletion remains inside the same bounded generation-fenced retry task.
 private func signOutDurabilitySourceContract(_ syncManager: String) -> Bool {
+    let addonOrder = sourceRegion(
+        syncManager,
+        from: "nonisolated static var appliedAddonOrder: [String]",
+        to: "/// Posted")
     let coordinator = sourceRegion(
         syncManager,
         from: "enum CredentialSignOutCoordinator",
@@ -1590,8 +1594,11 @@ private func signOutDurabilitySourceContract(_ syncManager: String) -> Bool {
         "dataKey = nil",
         "isSignedIn = false",
         "lastSyncAt = nil",
-        "Self.appliedAddonOrder = []",
     ])
+        // The successful owner bind selects the guest order; sign-out must not erase that
+        // separately owned state or retain the prior account's order via a global store.
+        && occurrenceCount(addonOrder, "AddonOwnerStorage.currentKey(kAddonOrderKey)") == 2
+        && !completion.contains("Self.appliedAddonOrder = []")
         && occurrenceCount(completion, "Keychain.set(nil, for: self.kcAccount)") == 1
         && !completion.contains("_ = Keychain.set(nil, for:")
         && retry.contains("CredentialRetryCoordinator.acquireOwner(")

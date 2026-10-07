@@ -3744,6 +3744,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                 fallbackPoster: entry.poster,
                 continuity: entry.qualityText,
                 binge: entry.bingeGroup,
+                preserveChosenRelease: true,
                 core: core,
                 account: account
             )
@@ -3772,6 +3773,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                     fallbackPoster: entry.poster,
                     continuity: entry.qualityText,
                     binge: entry.bingeGroup,
+                    preserveChosenRelease: true,
                     core: core,
                     account: account
                 )
@@ -5116,6 +5118,7 @@ private struct MacBackAffordance: ViewModifier {
     @Environment(\.dismiss) private var dismiss
     func body(content: Content) -> some View {
         content
+            .navigationBarBackButtonHidden(true)
             .overlay(alignment: .topLeading) {
                 Button { dismiss() } label: {
                     Label("Back", systemImage: "chevron.left")

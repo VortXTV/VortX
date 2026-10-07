@@ -9422,12 +9422,13 @@ struct TVPlayerView: View {
                 if settled {
                     // Same sticky + provider-health terms the preload ranks with, so the fallback lane cannot
                     // quietly pick a different provider than the preload would have for the same episode. This
-                    // is an ADVANCE, so sticky is SOFT: it yields to a materially better tier/cache for the new
-                    // episode instead of sticking to the hand-picked source, and only holds among near-identical
-                    // releases so a binge stays consistent (diag-21). Keep this in lockstep with resolvePreloadedEpisode.
+                    // is an ADVANCE: preserve the manually chosen release before generic quality scoring,
+                    // retaining alternate sources after it for failure/missing-release fallback.
+                    // Keep this in lockstep with resolvePreloadedEpisode.
                     let candidates = StreamRanking.rankedCandidates(
                         groups, continuity: curHint, binge: curBinge, pin: sourcePin,
                         sticky: seriesSticky, stickyAuthoritative: false,
+                        preserveChosenRelease: true,
                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                         debridCachedHashes: debridCachedHashes
                     )
@@ -9996,8 +9997,7 @@ struct TVPlayerView: View {
         // `sticky` is the source the viewer chose BY HAND for this show and `providerPenalty` demotes an add-on
         // that just failed. Both are what stop the preload drifting to whichever provider answers fastest -
         // the drift the "wanted binge=X got=Y" line has been reporting. Preload of the NEXT episode is an
-        // ADVANCE, so sticky is SOFT here exactly as in `play(episode:)`: it yields to a materially better
-        // tier/cache and otherwise holds among near-identical releases (diag-21). The two MUST match so the
+        // ADVANCE: preserve the chosen release exactly as in `play(episode:)`. The two MUST match so the
         // preload cannot warm a different source than the advance would then pick.
         let candidates = StreamRanking.rankedCandidates(
             groups,
@@ -10005,6 +10005,7 @@ struct TVPlayerView: View {
             binge: bingeGroup,
             pin: pin,
             sticky: sticky, stickyAuthoritative: false,
+            preserveChosenRelease: true,
             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
             debridCachedHashes: effectiveCachedHashes
         )

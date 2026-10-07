@@ -3077,6 +3077,7 @@ final class MPVMetalViewController: PlatformViewController {
         let wasPaused = getFlag(MPVProperty.pause)
         let duration = getDouble(MPVProperty.duration)
         command("seek", args: [String(seconds), "absolute"], returnValueCallback: { [weak self] status in
+            DiagnosticsLog.log("playback", "resume seek command target=\(seconds) status=\(status)")
             guard let self, status >= 0, let owner else { return }
             self.seekEOFRecovery.begin(
                 owner: owner, target: seconds, wasPaused: wasPaused, duration: duration, origin: .resume,
@@ -4479,10 +4480,16 @@ final class MPVMetalViewController: PlatformViewController {
                                                 witness: cacheWitness, lowLevelSeeks: cacheSeeks
                                             )
                                             #endif
+                                            let receipt = self.seekEOFRecovery.current
                                             self.seekEOFRecovery.observePosition(
                                                 owner: loadToken, position: value,
                                                 now: ProcessInfo.processInfo.systemUptime
                                             )
+                                            if let receipt, receipt.owner == loadToken, receipt.origin == .resume,
+                                               receipt.positionAfterSeek == nil,
+                                               self.seekEOFRecovery.current?.positionAfterSeek != nil {
+                                                DiagnosticsLog.log("playback", "resume seek observed position=\(value) target=\(receipt.target) generation=\(receipt.transportGeneration)")
+                                            }
                                             self.completeSeekEOFRecovery(
                                                 loadToken: loadToken, position: value
                                             )
@@ -4523,20 +4530,24 @@ final class MPVMetalViewController: PlatformViewController {
                         self.freshOrigin.observedSeek(owner: owner)
                         self.loadTokenLock.unlock()
                     }
-                    #if canImport(UIKit)
                     guard let loadToken = self.callbackLoadToken(requiresLoadedFile: true) else { break }
+                    #if canImport(UIKit)
                     let cacheWitness = self.captureCacheReanchorEventWitness()
+                    #endif
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.mpv != nil,
                               PlayerLoadProvenanceState.accepts(
                                 callbackToken: loadToken, activeToken: self.activeLoadToken
                               ) else { return }
+                        #if canImport(UIKit)
                         self.observeCacheReanchorSeek(owner: loadToken, witness: cacheWitness)
-                        _ = self.seekEOFRecovery.observeSeek(owner: loadToken)
+                        #endif
+                        let observed = self.seekEOFRecovery.observeSeek(owner: loadToken)
+                        if observed != nil, let receipt = self.seekEOFRecovery.current,
+                           receipt.owner == loadToken, receipt.origin == .resume {
+                            DiagnosticsLog.log("playback", "resume seek event target=\(receipt.target) generation=\(receipt.transportGeneration)")
+                        }
                     }
-                    #else
-                    break
-                    #endif
                 case MPV_EVENT_PLAYBACK_RESTART:
                     #if canImport(UIKit)
                     guard let loadToken = self.callbackLoadToken(requiresLoadedFile: true) else { break }

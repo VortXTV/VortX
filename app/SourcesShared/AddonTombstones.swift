@@ -1,5 +1,77 @@
 import Foundation
 
+/// Local reconciliation receipts belong to one account, not to whichever account signs in next.
+/// Legacy unowned receipts are quarantined behind a single authenticated-owner claim.
+enum AddonOwnerStorage {
+    static let legacyKeys = ["stremiox.addons.removedAt", "stremiox.addons.addedAt",
+                             "stremiox.addons.deleted", "vortx.sync.appliedAddonOrder",
+                             "vortx.sync.addonBaselineStampedV2"]
+    private static let claimKey = "vortx.sync.addons.legacyClaim.v2"
+    private static let migrationLock = NSLock()
+    private struct Claim: Codable, Equatable {
+        let format: Int
+        let namespace: String
+    }
+
+    static func key(_ legacy: String, namespace: String) -> String {
+        "vortx.sync.addonOwner.v2.\(namespace).\(legacy)"
+    }
+
+    static func currentKey(_ legacy: String) -> String {
+        key(legacy, namespace: CredentialScopeRegistry.shared.capture().namespace)
+    }
+
+    /// The session boundary supplies eligibility only after authenticating its exact capture.
+    /// Same-owner retry is allowed; a second owner, guest, or malformed marker cannot consume it.
+    @discardableResult
+    static func migrateLegacy(namespace: String, authenticated: Bool,
+                              defaults: UserDefaults = .standard) -> Bool {
+        guard authenticated, namespace.hasPrefix("account.") else { return false }
+        migrationLock.lock()
+        defer { migrationLock.unlock() }
+        let claim = Claim(format: 1, namespace: namespace)
+        if let raw = defaults.object(forKey: claimKey) {
+            guard let data = raw as? Data,
+                  (try? JSONDecoder().decode(Claim.self, from: data)) == claim else { return false }
+        } else {
+            guard let data = try? JSONEncoder().encode(claim) else { return false }
+            defaults.set(data, forKey: claimKey)
+            guard defaults.data(forKey: claimKey) == data else { return false }
+        }
+        for legacy in legacyKeys {
+            let target = key(legacy, namespace: namespace)
+            if legacy.hasSuffix("removedAt") || legacy.hasSuffix("addedAt") {
+                var merged = finiteMap(defaults.dictionary(forKey: target) ?? [:])
+                for (url, time) in finiteMap(defaults.dictionary(forKey: legacy) ?? [:]) {
+                    merged[url] = max(merged[url] ?? 0, time)
+                }
+                TombstonePersistence.setMapIfChanged(merged, forKey: target, defaults: defaults)
+                guard finiteMap(defaults.dictionary(forKey: target) ?? [:]) == merged else { return false }
+            } else if legacy.hasSuffix("deleted") {
+                let merged = Set((defaults.stringArray(forKey: target) ?? []) + (defaults.stringArray(forKey: legacy) ?? []))
+                    .map(AddonTombstones.normalize).filter { !$0.isEmpty && $0.count <= 2048 }.sorted()
+                TombstonePersistence.setArrayIfChanged(Array(Set(merged)).sorted(), forKey: target, defaults: defaults)
+            } else if defaults.object(forKey: target) == nil, let value = defaults.object(forKey: legacy) {
+                defaults.set(value, forKey: target)
+                guard let actual = defaults.object(forKey: target),
+                      (actual as AnyObject).isEqual(value) else { return false }
+            }
+        }
+        return true
+    }
+
+    private static func finiteMap(_ raw: [String: Any]) -> [String: Double] {
+        var result: [String: Double] = [:]
+        for (rawURL, value) in raw {
+            let url = AddonTombstones.normalize(rawURL)
+            guard !url.isEmpty, url.count <= 2048, let number = value as? NSNumber,
+                  number.doubleValue.isFinite, number.doubleValue >= 0 else { continue }
+            result[url] = max(result[url] ?? 0, number.doubleValue)
+        }
+        return result
+    }
+}
+
 /// Durable cross-device REMOVE tombstones for add-ons, the add-on analogue of
 /// `ProfileStore`'s `deletedProfiles` set. The app OWNS this set (it lives in
 /// `doc.vortx.deletedAddons`, the app's namespace) so an add-on the user removed on one device can
@@ -69,15 +141,15 @@ enum AddonTombstones {
     /// The current durable removal set (normalized transportUrls that are EFFECTIVELY removed). Read fresh
     /// from UserDefaults so every surface (CoreBridge write, vortxSummary push, syncDown fold/apply) sees the
     /// same authority.
-    static func all() -> Set<String> {
-        effectiveRemoved(load())
+    static func all(defaults: UserDefaults = .standard) -> Set<String> {
+        effectiveRemoved(load(defaults: defaults))
     }
 
     /// The per-url timestamp map for the wire (`doc.vortx.deletedAddonsTs`). Carries BOTH stamps for every
     /// tracked url, not just the effectively-removed ones, so a peer folding this learns a genuine reinstall's
     /// `addedAt` and stops re-emitting a stale removal. Clients that do not know the field ignore it.
-    static func timestampsForSync() -> [String: [String: Double]] {
-        let state = load()
+    static func timestampsForSync(defaults: UserDefaults = .standard) -> [String: [String: Double]] {
+        let state = load(defaults: defaults)
         let urls = Set(state.removedAt.keys).union(state.addedAt.keys)
         var out: [String: [String: Double]] = [:]
         out.reserveCapacity(urls.count)
@@ -94,11 +166,14 @@ enum AddonTombstones {
     /// applying cloud settings; a stale/partial blob must not erase a known install or removal receipt.
     /// Manual backup-file restore remains an explicit replacement and does not call this wrapper.
     static func preservingLocalSyncStamps<T>(_ restore: () throws -> T) rethrows -> T {
+        let capture = CredentialScopeRegistry.shared.capture()
         let addons = timestampsForSync()
         let library = LibraryTombstones.timestampsForSync()
         defer {
-            merge(legacyIDs: [], stampsRaw: addons)
-            LibraryTombstones.merge(legacyIDs: [], stampsRaw: library)
+            if CredentialScopeRegistry.shared.isCurrent(capture) {
+                merge(legacyIDs: [], stampsRaw: addons)
+                LibraryTombstones.merge(legacyIDs: [], stampsRaw: library)
+            }
         }
         return try restore()
     }
@@ -107,10 +182,10 @@ enum AddonTombstones {
     /// url becomes NEWLY effectively-removed. Callers MUST guard PROTECTED before calling (a protected stub is
     /// never a real removal); a removable official add-on is a legitimate removal and IS tombstoned (#137).
     @discardableResult
-    static func tombstone(_ transportUrl: String) -> Bool {
+    static func tombstone(_ transportUrl: String, defaults: UserDefaults = .standard) -> Bool {
         let key = normalize(transportUrl)
         guard !key.isEmpty, key.count <= maxIDLength else { return false }
-        var state = load()
+        var state = load(defaults: defaults)
         let wasRemoved = isRemoved(key, in: state)
         // Move the removal high-water mark forward so this removal out-races an older install on any peer.
         state.removedAt[key] = max(state.removedAt[key] ?? 0, nowMs())
@@ -131,10 +206,10 @@ enum AddonTombstones {
     /// concurrently web-authored `doc.webAddonRemovals` for the same URL carries no stamp and folds at the
     /// migration epoch, so this real install out-races it too until the web lane learns the stamp fields.
     @discardableResult
-    static func forget(_ transportUrl: String) -> Bool {
+    static func forget(_ transportUrl: String, defaults: UserDefaults = .standard) -> Bool {
         let key = normalize(transportUrl)
         guard !key.isEmpty, key.count <= maxIDLength else { return false }
-        var state = load()
+        var state = load(defaults: defaults)
         let wasRemoved = isRemoved(key, in: state)
         // Move the install high-water mark forward so this install out-races an older removal on any peer.
         state.addedAt[key] = max(state.addedAt[key] ?? 0, nowMs())
@@ -159,13 +234,14 @@ enum AddonTombstones {
     /// stamp is published in `deletedAddonsTs` on the next push, so every later folder adopts it and no device
     /// re-mints. Once the web lane emits its own stamps, those arrive via `stampsRaw` and minting stops firing.
     @discardableResult
-    static func merge(legacyIDs: [String], stampsRaw: [String: Any], webIDs: [String] = []) -> Bool {
+    static func merge(legacyIDs: [String], stampsRaw: [String: Any], webIDs: [String] = [],
+                      defaults: UserDefaults = .standard) -> Bool {
         // Timestamps are wall-clock milliseconds, the only frame comparable across devices. The fold takes the
         // per-id MAX, so a stamp dated far in the future wins until real time reaches it: a device with a
         // grossly wrong-future clock pins a url's state until then. Bounded on purpose (docs are per-account
         // and E2E, so the only stamp source is the user's own devices); a bounded future-stamp clamp is queued
         // for a later build.
-        var state = load()
+        var state = load(defaults: defaults)
         let before = effectiveRemoved(state)
         let futureThresholdMs = nowMs() + 48 * 60 * 60 * 1000   // surface a clock-skewed peer before the b173 clamp
         var maxFutureSeen: Double = 0
@@ -212,12 +288,14 @@ enum AddonTombstones {
         if maxFutureSeen > 0 {
             DiagnosticsLog.log("sync", "add-on tombstone fold saw a stamp \(Int(maxFutureSeen)) beyond now+48h (peer clock skew)")
         }
-        return effectiveRemoved(load()) != before
+        return effectiveRemoved(state) != before
     }
 
     // MARK: - State
 
     private struct State {
+        let namespace: String
+        let defaults: UserDefaults
         var removedAt: [String: Double]
         var addedAt: [String: Double]
     }
@@ -239,35 +317,31 @@ enum AddonTombstones {
         return out
     }
 
-    private static func load() -> State {
-        var removedAt = loadMap(removedAtKey)
-        let addedAt = loadMap(addedAtKey)
-        // Fold the pre-b172 plain removal array at the migration epoch on EVERY load. The max-fold is monotone
-        // and idempotent, so no once-flag is needed (a flag has three holes: a kill between setting it and doing
-        // the work loses the set, a b171 downgrade reads a frozen pre-upgrade array, and a downgrade-then-upgrade
-        // skips re-migration). Folding every load also re-picks-up removals a b171 interlude added to the legacy
-        // key. Irreducible caveat: a reinstall made during a b171 interlude carries no stamp and stays
-        // suppressed until one manual reinstall on b172.
-        if let legacy = UserDefaults.standard.stringArray(forKey: legacyDeletedKey) {
+    private static func load(defaults: UserDefaults = .standard) -> State {
+        let namespace = CredentialScopeRegistry.shared.capture().namespace
+        var removedAt = loadMap(AddonOwnerStorage.key(removedAtKey, namespace: namespace), defaults: defaults)
+        let addedAt = loadMap(AddonOwnerStorage.key(addedAtKey, namespace: namespace), defaults: defaults)
+        // Fold this OWNER's compatibility array at the migration epoch. Unowned pre-upgrade arrays are
+        // consumed only at the authenticated migration boundary, never on guest/another account reads.
+        if let legacy = defaults.stringArray(forKey: AddonOwnerStorage.key(legacyDeletedKey, namespace: namespace)) {
             for raw in legacy.prefix(maxEntries) {
                 let url = normalize(raw)
                 guard !url.isEmpty, url.count <= maxIDLength else { continue }
                 removedAt[url] = max(removedAt[url] ?? 0, migrationEpochMs)
             }
         }
-        return State(removedAt: removedAt, addedAt: addedAt)
+        return State(namespace: namespace, defaults: defaults, removedAt: removedAt, addedAt: addedAt)
     }
 
     private static func save(_ state: State) {
         let bounded = capped(state)
-        TombstonePersistence.setMapIfChanged(bounded.removedAt, forKey: removedAtKey)
-        TombstonePersistence.setMapIfChanged(bounded.addedAt, forKey: addedAtKey)
-        // Dual-write the effective removed set back to the pre-b172 legacy key so a downgrade to b171 still
-        // reads the current removals (b171 reads this array directly; load() re-folds it at the epoch on the
-        // next b172 upgrade).
+        TombstonePersistence.setMapIfChanged(bounded.removedAt, forKey: AddonOwnerStorage.key(removedAtKey, namespace: bounded.namespace), defaults: bounded.defaults)
+        TombstonePersistence.setMapIfChanged(bounded.addedAt, forKey: AddonOwnerStorage.key(addedAtKey, namespace: bounded.namespace), defaults: bounded.defaults)
+        // Keep the compatibility array within this owner scope. The old unowned keys stay quarantined;
+        // dual-writing them would leak the current account's removals into a later account's migration.
         TombstonePersistence.setArrayIfChanged(
             TombstonePersistence.canonicalLegacy(effectiveRemoved(bounded)),
-            forKey: legacyDeletedKey
+            forKey: AddonOwnerStorage.key(legacyDeletedKey, namespace: bounded.namespace), defaults: bounded.defaults
         )
     }
 
@@ -293,8 +367,8 @@ enum AddonTombstones {
         save(state)
     }
 
-    private static func loadMap(_ key: String) -> [String: Double] {
-        guard let raw = UserDefaults.standard.dictionary(forKey: key) else { return [:] }
+    private static func loadMap(_ key: String, defaults: UserDefaults = .standard) -> [String: Double] {
+        guard let raw = defaults.dictionary(forKey: key) else { return [:] }
         var out: [String: Double] = [:]
         out.reserveCapacity(raw.count)
         for (url, value) in raw {
@@ -320,6 +394,6 @@ enum AddonTombstones {
             if let v = state.removedAt[url] { removedAt[url] = v }
             if let v = state.addedAt[url] { addedAt[url] = v }
         }
-        return State(removedAt: removedAt, addedAt: addedAt)
+        return State(namespace: state.namespace, defaults: state.defaults, removedAt: removedAt, addedAt: addedAt)
     }
 }

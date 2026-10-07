@@ -1301,6 +1301,9 @@ struct PlayerScreen: View {
     @State private var skipDBSubmitError: String? = nil
     @State private var skipDBSubmittedKeys: Set<String> = []
     @State private var skipDBPreviewing = false
+    @State private var skipDBPreviewReturnPosition: Double?
+    @State private var skipDBPreviewWasPaused = false
+    @State private var skipDBPreviewOwner: PlayerLoadToken?
     @State private var skipDBShowEndTime = true
     @State private var skipDBIntroEstimateMs: Int? = nil
     @ObservedObject private var apiKeys = ApiKeys.shared
@@ -2947,7 +2950,9 @@ struct PlayerScreen: View {
                     #if !os(tvOS)
                     if skipDBPreviewing, d >= skipDBEditStart {
                         skipDBPreviewing = false
-                        coordinator.player?.seek(to: skipDBEditEnd)
+                        skipDBPreviewReturnPosition = nil
+                        skipDBPreviewOwner = nil
+                        issueSeek(to: skipDBEditEnd, reason: "preview-end")
                     }
                     #endif
                     updateCurrentSkip(at: d)
@@ -3014,8 +3019,8 @@ struct PlayerScreen: View {
                 // (it would yank a mid-playback switch back to the original 0:00 launch offset).
                 if !appliedInitialResume, d > 0 {
                     appliedInitialResume = true
-                    let initialResume = assetSanityAttempt.owner == loadToken ? assetSanityRequestedResume : resumeSeconds
-                    if initialResume > 5, initialResume < d - 10 {   // this exact load's requested origin
+                    let initialResume = assetSanityAttempt.owner.map { $0 == loadToken } == true ? assetSanityRequestedResume : resumeSeconds
+                    if initialResume.isFinite, initialResume > 0, initialResume < d {   // this exact load's requested origin
                         // A remux resume is fulfilled before mount by rebuilding from the configured source
                         // origin. Do not seek AVPlayer into a forward-only playlist after mount. Verify the
                         // achieved keyframe origin instead; only a genuinely unreachable request needs the
@@ -5081,8 +5086,15 @@ struct PlayerScreen: View {
 
     /// A user seek supersedes either phase of the deferred resume transaction.
     private func cancelPendingResumeForUserSeek() {
+        let oldTarget = pendingLibmpvResumeSeek ?? postFrameResumeSeekWatchdogTarget ?? deferredResumeAttempt.targetSeconds
+        // The duration-polling phase can still be running before a deferred seek exists.
+        // Retire it as well, or it can seek back to the launch offset after newer input.
+        deferredResumeAttempt.invalidate()
+        // A launch can be waiting for its first duration without having minted a deferred ticket.
+        // User input owns the origin from now on; a later duration must not restore the old offset.
+        appliedInitialResume = true
         retireAbandonedResumeForUserSeek()
-        let oldTarget = pendingLibmpvResumeSeek ?? postFrameResumeSeekWatchdogTarget
+        if oldTarget != nil { suppressedResumeFloor = nil }
         guard let oldTarget else { return }
         pendingLibmpvResumeSeek = nil
         if postFrameResumeSeekWatchdogTarget == oldTarget {
@@ -5091,15 +5103,24 @@ struct PlayerScreen: View {
     }
 
     private func handleDeferredResumeUserSeek(_ intent: DeferredResumeUserSeekPolicy.Intent) -> Bool {
-        let unsettled = postFrameResumeSeekWatchdogOwner == coordinator.player?.activeLoadToken
-            ? postFrameResumeSeekWatchdogTarget : nil
+        let initialTarget = InitialResumeUserIntentPolicy.target(
+            applied: appliedInitialResume,
+            ownsRequest: assetSanityAttempt.owner.map { $0 == coordinator.player?.activeLoadToken } == true,
+            requested: assetSanityRequestedResume, launch: resumeSeconds)
+        let unsettled = (postFrameResumeSeekWatchdogOwner == coordinator.player?.activeLoadToken
+            ? postFrameResumeSeekWatchdogTarget : nil) ?? deferredResumeAttempt.targetSeconds ?? initialTarget
         switch DeferredResumeUserSeekPolicy.decision(
-            intent: intent, pendingTarget: pendingLibmpvResumeSeek, unsettledTarget: unsettled,
+            intent: intent,
+            pendingTarget: pendingLibmpvResumeSeek ?? deferredResumeAttempt.targetSeconds
+                ?? initialTarget,
+            unsettledTarget: unsettled,
             firstFrameRendered: hasStartedPlaying, duration: duration
         ) {
         case .normal: return false
         case .ignore: return true
         case .deferred(let target):
+            deferredResumeAttempt.invalidate()
+            appliedInitialResume = true
             retireAbandonedResumeForUserSeek()
             pendingLibmpvResumeSeek = target
             if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner {
@@ -5123,6 +5144,9 @@ struct PlayerScreen: View {
             }
             suppressedResumeFloor = nil
             currentTime = 0; lastReported = 0
+            // AVPlayer may already be remuxing from the old launch origin before first frame.
+            // Its seek API safely retargets that pending mount; merely changing UI state cannot.
+            if let av = coordinator.player as? AVPlayerEngineController { av.seek(to: 0) }
         }
         return true
     }
@@ -6054,6 +6078,11 @@ struct PlayerScreen: View {
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        #if !os(tvOS)
+        skipDBPreviewing = false
+        skipDBPreviewReturnPosition = nil
+        skipDBPreviewOwner = nil
+        #endif
         failedEpisodeResolutionID = nil
         loadFailed = false
         clearCachedAudioOutputTruth()
@@ -6098,6 +6127,11 @@ struct PlayerScreen: View {
     /// earlier would let a rejected replacement duplicate its watched/auto-add/progress side effects or undo
     /// the viewer's Watch Credits choice.
     private func resetRuntimeForIssuedEpisode() {
+        #if !os(tvOS)
+        skipDBPreviewing = false
+        skipDBPreviewReturnPosition = nil
+        skipDBPreviewOwner = nil
+        #endif
         clearCachedAudioOutputTruth()
         markedWatched = false
         autoAddedThisPlayback = false
@@ -7613,8 +7647,7 @@ struct PlayerScreen: View {
             actions.append(PlayerTouchOptionAction(id: "editor",
                 title: showSkipDBEdit ? "Close skip editor" : "Edit skip segments",
                 icon: "checkmark.bubble") {
-                    if !showSkipDBEdit { seedSkipDBEditor() }
-                    showSkipDBEdit.toggle()
+                    toggleSkipDBEditor()
                 })
         }
         actions.append(PlayerTouchOptionAction(id: "lock", title: "Lock player controls",
@@ -7761,8 +7794,7 @@ struct PlayerScreen: View {
             if let m = curMeta, SkipEditPolicy.canEdit(isLiveContent: isLive, contentId: m.libraryId) {
                 iconButton(showSkipDBEdit ? "checkmark.bubble.fill" : "checkmark.bubble",
                            label: showSkipDBEdit ? "Close skip editor" : "Edit skip segments") {
-                    if !showSkipDBEdit { seedSkipDBEditor() }
-                    showSkipDBEdit.toggle()
+                    toggleSkipDBEditor()
                 }
             }
             #endif
@@ -7865,6 +7897,9 @@ struct PlayerScreen: View {
         AutoSkipCountdownPolicy.invalidatePending(state: &autoSkipCountdown, position: currentTime)
         if handleDeferredResumeUserSeek(.absolute(target)) { return }
         cancelPendingResumeForUserSeek()
+        if let owner = coordinator.player?.activeLoadToken, assetSanityAttempt.owner == owner {
+            assetSanityRequestedResume = target
+        }
         DiagnosticsLog.log(
             "playback",
             String(format: "seek reason=%@ from=%.3f to=%.3f duration=%.3f", reason, currentTime, target, duration)
@@ -8069,7 +8104,7 @@ struct PlayerScreen: View {
                     let nextCh = boundaries.first(where: { $0 > currentTime + 0.5 })
                     HStack(spacing: 2) {
                         Button {
-                            if let t = prevCh { coordinator.player?.seek(to: t) }
+                            if let t = prevCh { issueSeek(to: t, reason: "chapter-previous") }
                         } label: {
                             Image(systemName: "backward.end.fill").font(.caption)
                                 .foregroundStyle(prevCh != nil ? .white : .white.opacity(0.3))
@@ -8078,7 +8113,7 @@ struct PlayerScreen: View {
                         .buttonStyle(.plain).disabled(prevCh == nil)
                         .skipDBTooltip("Previous chapter")
                         Button {
-                            if let t = nextCh { coordinator.player?.seek(to: t) }
+                            if let t = nextCh { issueSeek(to: t, reason: "chapter-next") }
                         } label: {
                             Image(systemName: "forward.end.fill").font(.caption)
                                 .foregroundStyle(nextCh != nil ? .white : .white.opacity(0.3))
@@ -8161,15 +8196,47 @@ struct PlayerScreen: View {
         )
     }
 
+    private func stopSkipDBPreview() {
+        let returnPosition = skipDBPreviewReturnPosition
+        let wasPaused = skipDBPreviewWasPaused
+        let ownsMedia = skipDBPreviewOwner != nil && skipDBPreviewOwner == coordinator.player?.activeLoadToken
+        skipDBPreviewing = false
+        skipDBPreviewReturnPosition = nil
+        skipDBPreviewOwner = nil
+        guard ownsMedia else { return }
+        if let returnPosition {
+            issueSeek(to: returnPosition, reason: "preview-exit")
+            currentTime = returnPosition
+        }
+        if wasPaused { viewerPause() }
+    }
+
+    private func toggleSkipDBEditor() {
+        if showSkipDBEdit {
+            if skipDBPreviewing { stopSkipDBPreview() }
+            showSkipDBEdit = false
+        } else {
+            seedSkipDBEditor()
+            showSkipDBEdit = true
+        }
+    }
+
     private func skipDBEditActions(meta: PlaybackMeta) -> AnyView {
         let submittedKey = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(skipDBEditType.rawValue)"
         let alreadySubmitted = skipDBSubmittedKeys.contains(submittedKey)
         return AnyView(
             HStack(spacing: 8) {
                 Button {
-                    skipDBPreviewing = true
-                    coordinator.player?.seek(to: max(0, skipDBEditStart - 2))
-                    viewerPlay()
+                    if skipDBPreviewing {
+                        stopSkipDBPreview()
+                    } else {
+                        skipDBPreviewReturnPosition = currentTime
+                        skipDBPreviewWasPaused = isPaused
+                        skipDBPreviewOwner = coordinator.player?.activeLoadToken
+                        skipDBPreviewing = true
+                        issueSeek(to: max(0, skipDBEditStart - 2), reason: "preview-start")
+                        viewerPlay()
+                    }
                 } label: {
                     Image(systemName: skipDBPreviewing ? "stop.circle.fill" : "play.circle")
                         .font(.caption.weight(.semibold))
@@ -8202,7 +8269,7 @@ struct PlayerScreen: View {
 
                 Button {
                     showSkipDBEdit = false
-                    skipDBPreviewing = false
+                    if skipDBPreviewing { stopSkipDBPreview() }
                 } label: {
                     Image(systemName: "xmark")
                         .font(.caption.weight(.semibold))
@@ -8222,7 +8289,7 @@ struct PlayerScreen: View {
         AnyView(
             HStack(spacing: 4) {
                 Button {
-                    coordinator.player?.seek(to: seconds.wrappedValue)
+                    issueSeek(to: seconds.wrappedValue, reason: isEnd ? "editor-end" : "editor-start")
                 } label: {
                     Text(label)
                         .font(.caption2)
@@ -8440,7 +8507,7 @@ struct PlayerScreen: View {
         guard hasStartedPlaying, !loadFailed, !isLocked, currentSkip == segment else { return }
         AutoSkipCountdownPolicy.complete(state: &autoSkipCountdown, segment: segment)
         Haptics.success()
-        issueSeek(to: segment.end, reason: "skip")
+        issueSeek(to: segment.end, reason: "skip-\(segment.kind.rawValue)")
         currentTime = segment.end
         updateCurrentSkip(at: segment.end)
     }
@@ -9553,8 +9620,7 @@ struct PlayerScreen: View {
                 rows.append(Row(label: "Contribute", isHeader: true))
                 rows.append(Row(label: showSkipDBEdit ? "Close skip editor" : "Submit skip segment",
                                 detail: showSkipDBEdit ? "" : "at \(timeString(currentTime))") {
-                    if !showSkipDBEdit { seedSkipDBEditor() }
-                    showSkipDBEdit.toggle()
+                    toggleSkipDBEditor()
                     panel = nil   // close the settings sheet so the editor bar is visible over the video
                 })
             }

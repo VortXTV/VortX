@@ -209,6 +209,7 @@ func iOSEngineAddonBase(for stream: CoreStream,
 func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: String,
                              seriesName: String, defaultSeason: Int, fallbackPoster: String?,
                              continuity: String?, binge: String? = nil, cachedHashes: Set<String> = [],
+                             preserveChosenRelease: Bool = false,
                              core: CoreBridge,
                              account: StremioAccount) async -> PlayerEpisodeStream? {
     guard !Task.isCancelled else { return nil }
@@ -251,10 +252,11 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     // source for THIS episode (a higher source-type tier or a cache hit) rather than sticking to a hand-picked
     // source over a better debrid/usenet on a later episode. Soft sticky still floats the pick among
     // near-identical releases, so a binge stays consistent without thrashing for marginal gains (diag-21).
-    guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin,
+    let candidates = StreamRanking.rankedCandidates(groups, continuity: continuity, binge: binge, pin: pin,
                                         sticky: sticky, stickyAuthoritative: false,
+                                        preserveChosenRelease: preserveChosenRelease,
                                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
-                                        debridCachedHashes: cachedHashes) else { return nil }
+                                        debridCachedHashes: cachedHashes)
     let targetSeason = v.season ?? defaultSeason
     // PRESENCE, not truthiness: `episodeNumber` is the DISPLAY helper (`episode ?? 0`), so using it here
     // made an unresolved episode indistinguishable from an explicit E0 special, and the `> 0` test then
@@ -262,20 +264,10 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let targetEpisode = v.episode
     let episodeHint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
         ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
-    let ref: DebridPlaybackRef?
-    if best.url == nil, episodeHint == nil {
-        ref = nil
-    } else {
-        ref = await DebridCoordinator.shared.resolvedPlaybackRef(
-            for: best, episode: episodeHint,
-            confirmedCachedHashes: cachedHashes.isEmpty ? nil : cachedHashes
-        )
-        guard !Task.isCancelled else { return nil }
-    }
-    guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-        isUsenet: best.isUsenet, resolvedURL: ref?.url,
-        fallbackURL: best.playableURL(isEpisode: true)
+    guard let selected = await iOSResolveRankedEpisodeCandidate(
+        candidates, episode: episodeHint, cachedHashes: cachedHashes.isEmpty ? nil : cachedHashes
     ) else { return nil }
+    let (best, url, ref) = (selected.stream, selected.url, selected.ref)
     let pm = PlaybackMeta(libraryId: seriesId, videoId: v.id, type: "series",
                           name: seriesName, poster: v.thumbnail ?? fallbackPoster,
                           season: v.season, episode: v.episode)
@@ -292,6 +284,38 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
         stream: best, url: url, meta: pm, title: title, resume: resume,
         debridRef: ref, engineAddonBase: iOSEngineAddonBase(for: best, in: groups)
     )
+}
+
+/// Resolve the frozen ordered list, retaining alternate releases if the preferred NZB cannot resolve.
+/// This does not reuse the outgoing episode's URL or alter its saved manual source preference.
+@MainActor func iOSResolveRankedEpisodeCandidate(
+    _ candidates: [CoreStream], episode: DebridEpisode?, cachedHashes: Set<String>? = nil,
+    waitForLocalUsenetNode: Bool = false,
+    deadline: TimeInterval? = nil, stillCurrent: () -> Bool = { true }
+) async -> (stream: CoreStream, url: URL, ref: DebridPlaybackRef?, index: Int)? {
+    let overallDeadline = deadline ?? (ProcessInfo.processInfo.systemUptime + 25)
+    for (index, stream) in candidates.enumerated() {
+        guard !Task.isCancelled, stillCurrent() else { return nil }
+        let remaining = overallDeadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0 else { return nil }
+        let ref: DebridPlaybackRef?
+        if stream.url == nil, episode == nil { ref = nil }
+        else {
+            let legDeadline = min(overallDeadline, ProcessInfo.processInfo.systemUptime + 5)
+            ref = await BoundedPreloadWorkPool.valueBeforeDeadline(legDeadline) {
+                await DebridCoordinator.shared.resolvedPlaybackRef(
+                    for: stream, episode: episode, confirmedCachedHashes: cachedHashes,
+                    waitForLocalUsenetNode: waitForLocalUsenetNode && stream.isUsenet,
+                    usenetResolveTimeout: .seconds(min(5, remaining)))
+            } ?? nil
+        }
+        guard !Task.isCancelled, stillCurrent(), ProcessInfo.processInfo.systemUptime < overallDeadline else { return nil }
+        guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
+            isUsenet: stream.isUsenet, resolvedURL: ref?.url,
+            fallbackURL: stream.playableURL(isEpisode: true)) else { continue }
+        return (stream, url, ref, index)
+    }
+    return nil
 }
 
 /// A left-to-right layout that wraps onto a new line when a row runs out of width. The hero action rows
@@ -4654,6 +4678,9 @@ struct iOSEpisodeStreams: View {
             isEpisode: true,
             showsPrimaryPlayButton: !heroOwnsPrimaryPlay,
             play: { stream, url in Task { await play(stream, url: url) } },
+            playWithAddon: { stream, url, addon, preference in
+                Task { await play(stream, url: url, enginePreference: preference, sourceAddon: addon) }
+            },
             playWithEngine: { stream, url, preference in
                 Task { await play(stream, url: url, enginePreference: preference) }
             },
@@ -4666,6 +4693,7 @@ struct iOSEpisodeStreams: View {
             sessionAudioLanguages: sourceList.sessionAudioLanguages,
             onSessionAudioLanguageChange: { sourceList.sessionAudioLanguages = $0 },
             download: episodeDownloadHandler,
+            downloadWithAddon: episodeDownloadWithAddonHandler,
             isSuspended: presentation != nil,
             refind: refindEnabled ? { refindEpisodeSources() } : nil
         )
@@ -4821,7 +4849,8 @@ struct iOSEpisodeStreams: View {
         _ stream: CoreStream,
         url: URL,
         explicit: Bool = true,
-        enginePreference: PlayerEngineRouter.Override? = nil
+        enginePreference: PlayerEngineRouter.Override? = nil,
+        sourceAddon: String? = nil
     ) async {
         // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) inside an episode source list is NOT a
         // content stream. Route it to the trailer player (isTrailer:true, no meta) so a dead trailer shows
@@ -4882,6 +4911,10 @@ struct iOSEpisodeStreams: View {
             resumeProposal,
             currentSessionID: TraktAuth.storedSessionID
         ) else { return }
+        if explicit {
+            SeriesSourceSticky.record(seriesKey: meta.id, addon: sourceAddon,
+                                      bingeGroup: stream.behaviorHints?.bingeGroup)
+        }
         presentation = .player(iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
                                             resume: admittedResume.seconds ?? 0, meta: pm,
                                             qualityText: StreamRanking.signature(stream),
@@ -4998,10 +5031,14 @@ struct iOSEpisodeStreams: View {
         { stream, url in Task { await downloadStream(stream, url: url) } }
     }
 
+    private var episodeDownloadWithAddonHandler: ((CoreStream, URL, String) -> Void)? {
+        { stream, url, addon in Task { await downloadStream(stream, url: url, sourceAddon: addon) } }
+    }
+
     /// Queue an offline download of a chosen episode source. Resolves the URL exactly as `play` does
     /// (cached-debrid direct preferred, else `stream.playableURL`) and builds the same series-typed
     /// `PlaybackMeta`, so play-from-local records progress against the right episode. Device-local only.
-    private func downloadStream(_ stream: CoreStream, url: URL) async {
+    private func downloadStream(_ stream: CoreStream, url: URL, sourceAddon: String? = nil) async {
         let target = shownVideo
         let targetGeneration = episodeTargetGeneration
         let ep = debridHint(for: target)
@@ -5023,11 +5060,17 @@ struct iOSEpisodeStreams: View {
             fallbackURL: stream.playableURL(isEpisode: true)
         ) else { return }
         guard episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
-        DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: resolvedURL,
-                                        sourceName: stream.name, qualityText: StreamRanking.signature(stream))
+        let priorIDs = Set(DownloadStore.shared.records.map(\.id))
+        let record = DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: resolvedURL,
+                                                    sourceName: stream.name, qualityText: StreamRanking.signature(stream))
+        if !priorIDs.contains(record.id), let stored = DownloadStore.shared.record(id: record.id), stored.state != .failed, let sourceAddon {
+            SeriesSourceSticky.record(seriesKey: meta.id, addon: sourceAddon,
+                                      bingeGroup: stream.behaviorHints?.bingeGroup)
+        }
     }
     #else
     private var episodeDownloadHandler: ((CoreStream, URL) -> Void)? { nil }
+    private var episodeDownloadWithAddonHandler: ((CoreStream, URL, String) -> Void)? { nil }
     #endif
 
     /// Resolve the URL to play for `stream` on this episode view, preferring a cached-debrid DIRECT link
@@ -5251,35 +5294,22 @@ struct iOSEpisodeStreams: View {
             }
         }
         guard !Task.isCancelled else { return nil }
-        // In-player episode navigation (Next / Prev / list / binge auto-next) is always an ADVANCE, so sticky is
-        // SOFT for BOTH the launch (`refreshedVideo == nil`) and the refreshed-successor (`refreshedVideo != nil`)
-        // paths: the remembered pick yields to a materially better tier/cache for the new episode and only holds
-        // among near-identical releases so a binge stays consistent (diag-21). A genuine in-episode manual source
-        // pick stays authoritative through the player's own switch/failover path, not here.
-        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
+        // Next / Prev / list / binge preserve the chosen release when present. Keep the full filtered
+        // candidate set for fallback rather than turning the preference into a source exclusion.
+        let candidates = StreamRanking.rankedCandidates(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
                                             sticky: sticky, stickyAuthoritative: false,
+                                            preserveChosenRelease: true,
                                             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
-                                            debridCachedHashes: debridCache.cachedHashes) else { return nil }
+                                            debridCachedHashes: debridCache.cachedHashes)
         let targetSeason = v.season ?? season
         // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.
         let targetEpisode = v.episode
         let episodeHint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
             ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
-        let ref: DebridPlaybackRef?
-        if best.url == nil, episodeHint == nil {
-            ref = nil
-        } else {
-            ref = await DebridCoordinator.shared.resolvedPlaybackRef(
-                for: best, episode: episodeHint,
-                waitForLocalUsenetNode: best.isUsenet,
-                usenetResolveTimeout: best.isUsenet ? .seconds(35) : .seconds(5)
-            )
-            guard !Task.isCancelled else { return nil }
-        }
-        guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-            isUsenet: best.isUsenet, resolvedURL: ref?.url,
-            fallbackURL: best.playableURL(isEpisode: true)
+        guard let selected = await iOSResolveRankedEpisodeCandidate(
+            candidates, episode: episodeHint, waitForLocalUsenetNode: true
         ) else { return nil }
+        let (best, url, ref) = (selected.stream, selected.url, selected.ref)
         let pm = PlaybackMeta(libraryId: meta.id, videoId: v.id, type: "series",
                               name: meta.name, poster: v.thumbnail ?? meta.poster,
                               season: v.season, episode: v.episode)
@@ -5397,7 +5427,7 @@ struct iOSEpisodeStreams: View {
         )
         clearAuxiliaryPublications()
         let displayGroups = iOSDisplayGroups(groups)
-        // Preload of the NEXT episode is an ADVANCE, so sticky is SOFT here exactly as in `loadEpisodeStream`.
+        // Preload preserves the chosen release exactly as in `loadEpisodeStream`.
         // The two MUST match, or the warm would prepare a different source than the advance then picks.
         guard let best = StreamRanking.best(
             displayGroups,
@@ -5405,6 +5435,7 @@ struct iOSEpisodeStreams: View {
             binge: lastBinge,
             pin: sourcePin,
             sticky: sticky, stickyAuthoritative: false,
+            preserveChosenRelease: true,
             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
             debridCachedHashes: debridCache.cachedHashes
         ) else { return nil }
@@ -5737,6 +5768,8 @@ struct iOSSourceList: View {
     /// Episode detail on phones places Play at the hero seam; selectors and source controls remain here.
     var showsPrimaryPlayButton = true
     let play: (CoreStream, URL) -> Void
+    /// Explicit rows carry their real group identity through asynchronous resolution, never guessed from URL.
+    var playWithAddon: ((CoreStream, URL, String, PlayerEngineRouter.Override?) -> Void)? = nil
     /// Explicit one-launch engine route from a source-row context menu. Optional for compatibility with
     /// narrow callers; normal taps continue through `play` and inherit the visible session picker.
     var playWithEngine: ((CoreStream, URL, PlayerEngineRouter.Override) -> Void)? = nil
@@ -5769,6 +5802,7 @@ struct iOSSourceList: View {
     /// downloads (e.g. tvOS, where the whole feature is `#if !os(tvOS)`-gated) pass nil and no Download
     /// affordance renders. `url` is resolved by the caller EXACTLY as the play path resolves it.
     var download: ((CoreStream, URL) -> Void)? = nil
+    var downloadWithAddon: ((CoreStream, URL, String) -> Void)? = nil
     /// Set true by the detail page while a full-screen player (or trailer) cover is up. On macOS the detail
     /// tree stays MOUNTED behind the player (MacRootPlayerOverlay only sets opacity 0 + disabled, it does not
     /// unmount), and on tvOS the equivalent shell stays mounted too, so this hidden list keeps re-evaluating
@@ -6087,7 +6121,7 @@ struct iOSSourceList: View {
                     Menu(tier) {
                         ForEach(StreamRanking.variantOptions(groups, tier: tier), id: \.label) { option in
                             if let url = option.stream.playableURL(isEpisode: isEpisode) {
-                                Button(option.label) { play(option.stream, url) }
+                                Button(option.label) { playSourceRow(option.stream, url, addon: option.addon) }
                             }
                         }
                     }
@@ -6281,18 +6315,21 @@ struct iOSSourceList: View {
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if let url = stream.playableURL(isEpisode: isEpisode) {
             HStack(spacing: Theme.Space.sm) {
-                Button { play(stream, url) } label: {
+                Button { playSourceRow(stream, url, addon: addon) } label: {
                     iOSStreamLabel(addon: addon, stream: stream, enabled: true, pinned: isPinned(addon, stream),
                                    debridCached: isDebridCached(stream))
                 }
                 .buttonStyle(RowFocusStyle())
                 .accessibilityHint("Double-tap to play. Long-press for player options and source actions.")
                 .contextMenu {
-                    sourcePlayerMenu(stream, url)
+                    sourcePlayerMenu(stream, url, addon: addon)
                     Divider()
                     pinMenu(addon, stream)
                     if let download {
-                        Button { download(stream, url) } label: { Label("Download", systemImage: "arrow.down.circle") }
+                        Button {
+                            if let downloadWithAddon { downloadWithAddon(stream, url, addon) }
+                            else { download(stream, url) }
+                        } label: { Label("Download", systemImage: "arrow.down.circle") }
                     }
                 }
                 // A visible per-row Download affordance (the context menu carries the same action for
@@ -6300,7 +6337,8 @@ struct iOSSourceList: View {
                 if let download {
                     let key = url.absoluteString
                     Button {
-                        download(stream, url)
+                        if let downloadWithAddon { downloadWithAddon(stream, url, addon) }
+                        else { download(stream, url) }
                         queuedDownloads.insert(key)
                     } label: {
                         Image(systemName: queuedDownloads.contains(key) ? "checkmark.circle.fill" : "arrow.down.circle")
@@ -6330,13 +6368,16 @@ struct iOSSourceList: View {
     /// debrid metadata, torrent preparation, resume position, and explicit-pick behavior through `play`.
     /// External players are offered only for self-contained remote URLs because they cannot inherit headers
     /// or reach the embedded torrent/usenet machinery.
-    @ViewBuilder private func sourcePlayerMenu(_ stream: CoreStream, _ url: URL) -> some View {
+    private func playSourceRow(_ stream: CoreStream, _ url: URL, addon: String,
+                               preference: PlayerEngineRouter.Override? = nil) {
+        if let playWithAddon { playWithAddon(stream, url, addon, preference) }
+        else if let preference, let playWithEngine { playWithEngine(stream, url, preference) }
+        else { play(stream, url) }
+    }
+
+    @ViewBuilder private func sourcePlayerMenu(_ stream: CoreStream, _ url: URL, addon: String) -> some View {
         Button("VortX Player") {
-            if let playWithEngine {
-                playWithEngine(stream, url, .mpv)
-            } else {
-                play(stream, url)
-            }
+            playSourceRow(stream, url, addon: addon, preference: .mpv)
         }
         if PlayerEngineRouter.canHonorAVPlayerChoice(
             for: url,
@@ -6346,11 +6387,7 @@ struct iOSSourceList: View {
             plainRemuxDelivery: VortXRemuxHLSServer.deliveryEnabled
         ) {
             Button("AVPlayer") {
-                if let playWithEngine {
-                    playWithEngine(stream, url, .avfoundation)
-                } else {
-                    play(stream, url)
-                }
+                playSourceRow(stream, url, addon: addon, preference: .avfoundation)
             }
         }
         if SourcePlayerChoicePolicy.canHandOffExternally(
