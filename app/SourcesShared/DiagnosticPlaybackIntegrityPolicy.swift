@@ -234,6 +234,14 @@ enum DeferredResumePolicy {
 
 /// User input edits an outstanding logical resume, not the engine's still-zero playhead.
 /// Before first frame, retain the cold-pipeline deferral; once warm, replace with an absolute seek.
+enum InitialResumeUserIntentPolicy {
+    static func target(applied: Bool, ownsRequest: Bool, requested: Double, launch: Double) -> Double? {
+        guard !applied else { return nil }
+        let value = ownsRequest ? requested : launch
+        return value.isFinite && value >= 0 ? value : nil
+    }
+}
+
 enum DeferredResumeUserSeekPolicy {
     enum Intent { case relative(Double), absolute(Double) }
     enum Decision: Equatable {

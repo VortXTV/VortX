@@ -86,6 +86,9 @@ enum SettingsBackup {
     /// VortXSyncManager writes on push and applies on pull. The blob was never its transport.
     static let deviceLocalKeyPrefixes: [String] = [
         "vortx.sync.",
+        // Legacy unowned add-on receipts are quarantined migration input. The account document's
+        // deletedAddonsTs, not a generic settings blob, carries installs/removals across devices.
+        "stremiox.addons.",
         // Owner resume caches and re-add receipts are account-scoped local reconciliation state, never
         // portable settings. Exporting them could both leak A's resume into B and manufacture a stale receipt.
         "vortx.owner.resumeCache.",

@@ -35,7 +35,8 @@ enum StreamRanking {
     static let stickyWeight = 6000
 
     /// Soft sticky weight for every AUTO-PICK lane that must YIELD to a MATERIALLY better source: FRESH plays,
-    /// Continue-Watching launches, AND binge auto-advance (with its preload). The remembered pick must not keep
+    /// Continue-Watching launches. Explicit release continuity for binge/downloads is handled separately by
+    /// `preserveChosenRelease`; a normal fresh recommendation must not keep
     /// beating an amazing cached debrid / usenet on a LATER episode - the CEO's "after I hand-pick a source it
     /// sticks to that choice over a better debrid or usenet on later episodes" report. Sized below the smallest
     /// labelled-resolution step (720 -> 1080 = 360), the DV bonus (45), the cached bonus (8000) and every 15000
@@ -223,8 +224,14 @@ enum StreamRanking {
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
                      pin: ResolvedPin? = nil, sticky: (addon: String?, bingeGroup: String?)? = nil,
                      stickyAuthoritative: Bool = true,
+                     preserveChosenRelease: Bool = false,
                      providerPenalty: ((String) -> Bool)? = nil,
                      debridCachedHashes: Set<String> = []) -> CoreStream? {
+        if preserveChosenRelease {
+            return rankedCandidates(groups, continuity: hint, binge: binge, pin: pin, sticky: sticky,
+                                    stickyAuthoritative: stickyAuthoritative, preserveChosenRelease: true,
+                                    providerPenalty: providerPenalty, debridCachedHashes: debridCachedHashes).first
+        }
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
         if SourcePreferences.reading.useAddonOrder {
             // Add-on order is the user's explicit "don't re-rank" choice, but a pin is an even more
@@ -267,6 +274,7 @@ enum StreamRanking {
     static func rankedCandidates(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
                                  pin: ResolvedPin? = nil, sticky: (addon: String?, bingeGroup: String?)? = nil,
                                  stickyAuthoritative: Bool = true,
+                                 preserveChosenRelease: Bool = false,
                                  providerPenalty: ((String) -> Bool)? = nil,
                                  debridCachedHashes: Set<String> = []) -> [CoreStream] {
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
@@ -294,8 +302,40 @@ enum StreamRanking {
                 .sorted { $0.score != $1.score ? $0.score > $1.score : $0.offset < $1.offset }   // stable within ties
                 .map { $0.stream }
         }
+        // Only binge/preload and batch callers opt in. Source-list presentation and fresh auto-picks
+        // retain their normal ordering. This is a preference partition, never a filter: unavailable
+        // matching releases leave the generic candidates available for the existing failure ladder.
+        let releaseOrdered: [CoreStream]
+        if preserveChosenRelease, let sticky {
+            // Keep the group beside its stream: identical URLs/stream IDs from two add-ons do not
+            // identify which add-on supplied the row. Avoid an O(n²) reverse lookup as well.
+            releaseOrdered = pairs.enumerated().map { entry in
+                let stream = entry.element.stream
+                let addon = entry.element.addon
+                let pinned = pinBonus(stream, addon: addon, pin: pin) > 0
+                let priority = ChosenReleaseContinuityPolicy.priority(
+                    addon: addon, bingeGroup: stream.behaviorHints?.bingeGroup,
+                    preferredAddon: sticky.addon, preferredBingeGroup: sticky.bingeGroup,
+                    unhealthy: providerPenalty?(addon) == true
+                )
+                let rank = SourcePreferences.reading.useAddonOrder ? 0 :
+                    score(stream, debridCachedHashes: debridCachedHashes)
+                    + callerBonuses(stream, addon: addon, hint: hint, binge: binge, sticky: sticky,
+                                    stickyAuthoritative: stickyAuthoritative)
+                    + pinBonus(stream, addon: addon, pin: pin)
+                    + healthPenalty(addon: addon, isUnhealthy: providerPenalty)
+                return (stream: stream, offset: entry.offset, pinned: pinned, priority: priority, rank: rank)
+            }.sorted {
+                ChosenReleaseContinuityPolicy.precedes(
+                    pinned: $0.pinned, priority: $0.priority, rank: $0.rank, offset: $0.offset,
+                    otherPinned: $1.pinned, otherPriority: $1.priority, otherRank: $1.rank, otherOffset: $1.offset
+                )
+            }.map { $0.stream }
+        } else {
+            releaseOrdered = ordered
+        }
         var seenURLs = Set<String>()
-        return ordered.filter { s in
+        return releaseOrdered.filter { s in
             guard let u = s.playableURL?.absoluteString else { return false }
             return seenURLs.insert(u).inserted
         }
@@ -1067,11 +1107,11 @@ enum StreamRanking {
     /// Second level of the quality picker: distinct flavor variants inside one resolution tier
     /// ("Dolby Vision · Remux", "HDR · Atmos", "BluRay"), best variant of each, best-first, capped.
     static func variantOptions(_ groups: [CoreStreamSourceGroup], tier wanted: String)
-        -> [(label: String, stream: CoreStream)] {
-        let playable = groups.flatMap { $0.streams }
-            .filter { $0.playableURL != nil && !$0.isYouTubeTrailer && tier(of: $0) == wanted }
-        var best: [String: (score: Int, stream: CoreStream)] = [:]
-        for s in playable {
+        -> [(label: String, stream: CoreStream, addon: String)] {
+        let playable = playablePairs(groups).filter { tier(of: $0.stream) == wanted }
+        var best: [String: (score: Int, stream: CoreStream, addon: String)] = [:]
+        for pair in playable {
+            let s = pair.stream
             let t = qualityText(s)
             var tags: [String] = []
             if StreamRanking.isDolbyVision(t) {
@@ -1088,13 +1128,13 @@ enum StreamRanking {
             let label = tags.isEmpty ? "Standard" : tags.joined(separator: " · ")
             let sc = score(s)
             if let current = best[label], current.score >= sc { continue }
-            best[label] = (sc, s)
+            best[label] = (sc, s, pair.addon)
         }
-        return best.map { entry -> (label: String, stream: CoreStream) in
+        return best.map { entry -> (label: String, stream: CoreStream, addon: String) in
             // The dedup key is the flavor; append the chosen stream's size for display.
             let size = sourceDetail(entry.value.stream).size
             let label = size.map { "\(entry.key)  ·  \($0)" } ?? entry.key
-            return (label: label, stream: entry.value.stream)
+            return (label: label, stream: entry.value.stream, addon: entry.value.addon)
         }
         .sorted { score($0.stream) > score($1.stream) }
         .prefix(8).map { $0 }
@@ -1366,5 +1406,28 @@ enum StreamRanking {
             return true
         }
         return s.url != nil && s.infoHash == nil   // plain URL with no contrary marker
+    }
+}
+
+/// Opaque add-on binge groups are compared for equality only, and scoped to their add-on when known.
+/// No previous episode URL or provider-specific parsing participates in next-episode selection.
+enum ChosenReleaseContinuityPolicy {
+    static func precedes(pinned: Bool, priority: Int, rank: Int, offset: Int,
+                         otherPinned: Bool, otherPriority: Int, otherRank: Int, otherOffset: Int) -> Bool {
+        if pinned != otherPinned { return pinned }
+        if priority != otherPriority { return priority > otherPriority }
+        if rank != otherRank { return rank > otherRank }
+        return offset < otherOffset
+    }
+
+    static func priority(addon: String, bingeGroup: String?, preferredAddon: String?,
+                         preferredBingeGroup: String?, unhealthy: Bool = false) -> Int {
+        guard !unhealthy else { return 0 }
+        let hasAddon = preferredAddon?.isEmpty == false
+        let addonMatches = hasAddon && addon.caseInsensitiveCompare(preferredAddon ?? "") == .orderedSame
+        let groupMatches = preferredBingeGroup?.isEmpty == false && bingeGroup == preferredBingeGroup
+        if groupMatches && (!hasAddon || addonMatches) { return 3 }
+        if addonMatches { return 2 }
+        return 0
     }
 }

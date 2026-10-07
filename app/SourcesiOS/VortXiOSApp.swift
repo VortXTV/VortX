@@ -392,7 +392,7 @@ private struct MacWindowChrome: NSViewRepresentable {
 
         deinit { if let token { NotificationCenter.default.removeObserver(token) } }
 
-        func attach(to window: NSWindow?) {
+        @MainActor func attach(to window: NSWindow?) {
             guard let window else { return }
             Self.apply(to: window)
             Self.probe(window)
@@ -402,7 +402,7 @@ private struct MacWindowChrome: NSViewRepresentable {
             token = NotificationCenter.default.addObserver(
                 forName: NSWindow.didUpdateNotification, object: window, queue: .main
             ) { note in
-                Self.apply(to: note.object as? NSWindow)
+                MainActor.assumeIsolated { Self.apply(to: note.object as? NSWindow) }
             }
             // Belt and braces for the first seconds while SwiftUI settles its toolbar/titlebar state.
             for delay in [0.2, 1.0, 3.0] {
@@ -441,7 +441,7 @@ private struct MacWindowChrome: NSViewRepresentable {
             #endif
         }
 
-        private static func apply(to window: NSWindow?) {
+        @MainActor private static func apply(to window: NSWindow?) {
             guard let window else { return }
             // While the full-window player is up (MacPlayerHost holds its view), do NOT resurrect the
             // titlebar chain. The player cover runs chrome-free on purpose; re-forcing the titlebar here
@@ -449,40 +449,7 @@ private struct MacWindowChrome: NSViewRepresentable {
             // video in fullscreen. Skip until the player is dismissed, at which point the didUpdate observer
             // + the delayed re-applies restore normal window chrome. No effect when no player is up.
             if MacPlayerHost.shared.content != nil { return }
-            // Cheap early-exit so the didUpdate observer costs nothing once the chrome is right.
-            if let close = window.standardWindowButton(.closeButton),
-               !close.isHidden, close.alphaValue >= 1,
-               close.superview?.isHidden == false, (close.superview?.alphaValue ?? 0) >= 1,
-               close.superview?.superview?.isHidden == false,
-               (close.superview?.superview?.alphaValue ?? 0) >= 1,
-               window.styleMask.contains(.titled) { return }
-            // Guarded union: reassigning styleMask when nothing is missing once collapsed the window to
-            // its minimum size (see MacPlayerChromeHider's note), so only touch it when a flag is absent.
-            let needed: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
-            if !window.styleMask.isSuperset(of: needed) { window.styleMask.formUnion(needed) }
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
-            for kind: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
-                guard let button = window.standardWindowButton(kind) else { continue }
-                button.isHidden = false
-                // Unhide the WHOLE titlebar chain: NSTitlebarView and NSTitlebarContainerView can each
-                // be the hidden/collapsed node when the window toolbar resolves hidden. A zero-height
-                // container never draws either, so give a collapsed node a real titlebar height back.
-                var node: NSView? = button.superview
-                while let v = node, v !== window.contentView?.superview {
-                    v.isHidden = false
-                    // SwiftUI's hidden-toolbar resolution FADES NSTitlebarContainerView to alpha 0
-                    // rather than hiding it (field-verified: hidden=false, alpha=0.0), restore alpha
-                    // or the unhidden buttons still never draw.
-                    if v.alphaValue < 1 { v.alphaValue = 1 }
-                    if v.frame.height < 1 {
-                        var f = v.frame
-                        f.size.height = 28
-                        v.frame = f
-                    }
-                    node = v.superview
-                }
-            }
+            MacWindowControls.restore(in: window)
         }
     }
 }

@@ -43,6 +43,7 @@ import {
 } from "./syncSettings";
 import { CINEMETA_URL, loadAddon } from "./addon";
 import type { MetaItem } from "./types";
+import { effectiveAddonRemovals, applyAddonIntents } from "./addonRemovals";
 
 // The in-memory cache. `undefined` = not yet hydrated from storage; `null` = hydrated, signed out.
 // We lazily hydrate from loadSession() on first read so a hard reload restores the signed-in state.
@@ -248,13 +249,7 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
   // stack's tombstones) + doc.webAddonRemovals (the flat mirror) + doc.vortx.deletedAddons (removals done in
   // the Apple app). Normalize (trim+lowercase) BOTH sides so casing differences can't cause a miss - the app
   // keys its tombstones the same way. Re-adding a URL clears the web tombstone (add wins LWW).
-  const removedNorm = new Set<string>();
-  if (doc.removedAddons && typeof doc.removedAddons === "object")
-    for (const k of Object.keys(doc.removedAddons)) removedNorm.add(normalizeAddonUrl(k));
-  if (Array.isArray(doc.webAddonRemovals))
-    for (const k of doc.webAddonRemovals) if (typeof k === "string") removedNorm.add(normalizeAddonUrl(k));
-  if (Array.isArray(vortx.deletedAddons))
-    for (const k of vortx.deletedAddons) if (typeof k === "string") removedNorm.add(normalizeAddonUrl(k));
+  const removedNorm = effectiveAddonRemovals(doc);
   const liveUrls = removedNorm.size ? urls.filter((u) => !removedNorm.has(normalizeAddonUrl(u))) : urls;
   const addedChanged = mergeInstalledAddons(liveUrls);
   const toPrune = removedNorm.size ? installedUrls().filter((u) => removedNorm.has(normalizeAddonUrl(u))) : [];
@@ -670,14 +665,7 @@ async function pushAddons(
       // false-tombstone app add-ons). doc.removedAddons {url: epochMs} is the web-internal record (carries
       // timestamps so a re-add can clear it). doc.webAddonRemovals is the flat string[] the APP reads and
       // folds into its uninstall set (VortXSyncManager: "web agent owns this write; we only READ it").
-      const tomb: Record<string, number> =
-        doc.removedAddons && typeof doc.removedAddons === "object"
-          ? (doc.removedAddons as Record<string, number>)
-          : {};
-      for (const u of hint?.removed ?? []) tomb[u] = Date.now();
-      for (const u of hint?.added ?? []) delete tomb[u];
-      doc.removedAddons = tomb;
-      doc.webAddonRemovals = Object.keys(tomb).map(normalizeAddonUrl); // the app-facing mirror
+      applyAddonIntents(doc, hint, Date.now());
     });
   } catch {
     // fail-soft: the add-on is already installed locally; a later change re-pushes.

@@ -465,8 +465,8 @@ final class VortXSyncManager: ObservableObject {
     /// evaluated off the main actor) can consult the shared order without an actor hop. All existing
     /// main-actor callers keep working (nonisolated members are callable from any context).
     nonisolated static var appliedAddonOrder: [String] {
-        get { UserDefaults.standard.stringArray(forKey: kAddonOrderKey) ?? [] }
-        set { UserDefaults.standard.set(Array(newValue.prefix(maxAddonOrderEntries)), forKey: kAddonOrderKey) }
+        get { UserDefaults.standard.stringArray(forKey: AddonOwnerStorage.currentKey(kAddonOrderKey)) ?? [] }
+        set { UserDefaults.standard.set(Array(newValue.prefix(maxAddonOrderEntries)), forKey: AddonOwnerStorage.currentKey(kAddonOrderKey)) }
     }
     /// Posted (main thread) whenever the shared add-on order changes: an in-app Reorder drag or a remote
     /// pull that carried a newer order. Views showing the add-on list observe it to re-sort live, since
@@ -935,7 +935,6 @@ final class VortXSyncManager: ObservableObject {
                 self.dataKey = nil
                 self.isSignedIn = false
                 self.lastSyncAt = nil
-                Self.appliedAddonOrder = []
             })
     }
 
@@ -1110,6 +1109,10 @@ final class VortXSyncManager: ObservableObject {
             object: nil,
             userInfo: ["generation": established.generation])
         let owner = established.scope
+        withRemoteApplySuppressed {
+            AddonOwnerStorage.migrateLegacy(namespace: established.namespace,
+                authenticated: credentialAuthority.isMigrationEligible(established))
+        }
         _ = ApiKeys.shared.migrateLegacyIfEligible(owner: owner, capture: established)
         _ = DebridKeys.shared.migrateLegacyIfEligible(owner: owner, capture: established)
         guard isCurrent(established) else { return false }
@@ -3066,7 +3069,8 @@ final class VortXSyncManager: ObservableObject {
     /// do not arm a push. Accepted trade-off: a genuine new removal made on a still-b171 peer will not beat
     /// these baseline stamps until that peer updates.
     private func baselineInstalledAddonsOnce() {
-        guard !UserDefaults.standard.bool(forKey: Self.addonBaselineStampedKey) else { return }
+        let baselineKey = AddonOwnerStorage.currentKey(Self.addonBaselineStampedKey)
+        guard !UserDefaults.standard.bool(forKey: baselineKey) else { return }
         let installed = CoreBridge.shared.addons.filter { !$0.isOfficial && !$0.isProtected }
         guard !installed.isEmpty else { return }   // engine not hydrated yet: retry on a later call, flag unset
         // #145 M1: the flag write belongs INSIDE the suppression window, with the stamping it guards. It used to
@@ -3077,7 +3081,7 @@ final class VortXSyncManager: ObservableObject {
         // line is what made the reinstall race fire every time instead of occasionally.
         withRemoteApplySuppressed {
             AddonTombstones.baselineInstalled(installed.map { $0.transportUrl })
-            UserDefaults.standard.set(true, forKey: Self.addonBaselineStampedKey)
+            UserDefaults.standard.set(true, forKey: baselineKey)
         }
     }
 

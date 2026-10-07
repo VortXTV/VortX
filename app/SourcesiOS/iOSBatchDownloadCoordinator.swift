@@ -72,6 +72,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         let video: CoreVideo
         let continuity: String?
         let pin: ResolvedPin?
+        let sticky: (addon: String?, bingeGroup: String?)?
         let cachedHashes: Set<String>
     }
 
@@ -194,6 +195,7 @@ final class BatchDownloadCoordinator: ObservableObject {
 
         let pendingIds = Set(pending.map { $0.video.id })
         var jobs: [Job] = []
+        let sticky = SeriesSourceSticky.preference(for: seriesId)
         for video in episodes {
             if DownloadStore.shared.hasDownload(videoId: video.id) {
                 tally?.alreadyDownloaded += 1
@@ -202,7 +204,7 @@ final class BatchDownloadCoordinator: ObservableObject {
             guard !pendingIds.contains(video.id), video.id != currentVideoId else { continue }
             jobs.append(Job(seriesId: seriesId, seriesName: seriesName, identityRoles: identityRoles,
                             fallbackPoster: fallbackPoster, video: video, continuity: continuity,
-                            pin: pin, cachedHashes: cachedHashes))
+                            pin: pin, sticky: sticky, cachedHashes: cachedHashes))
         }
 
         pending.append(contentsOf: jobs)
@@ -362,8 +364,9 @@ final class BatchDownloadCoordinator: ObservableObject {
             if elapsed >= StreamRanking.completeSetDeadline || now - slotPolicy.startedAt >= slotPolicy.maximumDuration { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
-        guard let best = StreamRanking.best(groups, continuity: job.continuity, pin: job.pin,
-                                            debridCachedHashes: job.cachedHashes) else { return .noSource }
+        let candidates = StreamRanking.rankedCandidates(groups, continuity: job.continuity, pin: job.pin,
+                                            sticky: job.sticky, stickyAuthoritative: false, preserveChosenRelease: true,
+                                            debridCachedHashes: job.cachedHashes)
         if Task.isCancelled { return .cancelled }   // don't start a debrid resolve for a stopped batch
         // PRESENCE, not truthiness: episode ZERO is a valid coordinate (specials), and both coordinates are
         // already optionals here, so absence is expressed by the flatMap rather than by a sentinel value.
@@ -372,17 +375,13 @@ final class BatchDownloadCoordinator: ObservableObject {
                 season >= 0 && episode >= 0 ? DebridEpisode(season: season, episode: episode) : nil
             }
         }
-        let resolved: URL?
-        if best.url == nil, ep == nil {
-            resolved = nil
-        } else {
-            resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: ep)
-        }
-        if Task.isCancelled { return .cancelled }
-        guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-            isUsenet: best.isUsenet, resolvedURL: resolved,
-            fallbackURL: best.playableURL(isEpisode: true)
-        ) else { return .noSource }
+        guard let selected = await iOSResolveRankedEpisodeCandidate(
+            candidates, episode: ep, deadline: slotPolicy.startedAt + slotPolicy.maximumDuration,
+            stillCurrent: { self.currentSeriesId == job.seriesId && self.currentVideoId == job.video.id }
+        ) else { return Task.isCancelled ? .cancelled : .noSource }
+        guard !Task.isCancelled, currentSeriesId == job.seriesId, currentVideoId == job.video.id,
+              ProcessInfo.processInfo.systemUptime < slotPolicy.startedAt + slotPolicy.maximumDuration else { return .cancelled }
+        let (best, url, resolved) = (selected.stream, selected.url, selected.ref?.url)
         // Raw torrent: the loopback server must be told to /create it first (#21). Fire-and-forget:
         // the prime's retry loop is self-terminating (~15s max), same as the CW-resume prime.
         if resolved == nil, best.isTorrent { _ = prepareTorrentStream(best) }
@@ -398,9 +397,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         // #119 remainder: arm ONE auto-swap to the next-best DISTINCT source if this download later fails its
         // byte transfer. Same ranking the batch just used (rankedCandidates mirrors best()); a nil alternate
         // (nothing else playable) arms no plan, so that episode simply fails honestly as before.
-        let candidates = StreamRanking.rankedCandidates(groups, continuity: job.continuity, pin: job.pin,
-                                                        debridCachedHashes: job.cachedHashes)
-        if let alternate = candidates.first(where: { !sameSource($0, best) }) {
+        if let alternate = candidates.dropFirst(selected.index + 1).first(where: { !sameSource($0, best) }) {
             retryPlans[record.id] = RetryPlan(alternate: alternate, pm: pm, episode: ep)
         }
         return .queued
