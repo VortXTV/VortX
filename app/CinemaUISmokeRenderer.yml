@@ -41,10 +41,13 @@ targets:
         PRODUCT_NAME: CinemaUISmokeRenderer
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
         # Xcode 26 rejects locally linked static XCFramework roots in an ad-hoc project even when
-        # their macOS slices validate.  Expose the same checked native module maps and archives
-        # directly; no native runtime is constructed by the renderer entry point.
+        # their macOS slices validate. Expose the same checked module maps and ordinary archives
+        # directly. Do not force-load whole Rust archives: this renderer neither starts an engine
+        # nor needs unreachable native code, and forcing them exceeds macOS compact-unwind limits.
         SWIFT_INCLUDE_PATHS: "$(inherited) $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64/Headers $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64/Headers/vortx"
-        OTHER_LDFLAGS: "$(inherited) -force_load $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64/libstremiox_core.a -force_load $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64/libvortx_ffi.a"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64 $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64"
+        OTHER_LDFLAGS: "$(inherited) -lstremiox_core -lvortx_ffi"
+        DEAD_CODE_STRIPPING: "YES"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: Cinema UI Smoke

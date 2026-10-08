@@ -46,9 +46,14 @@ for renderer_contract in \
   'cinema-phone.png' \
   'cinema-tablet.png' \
   'cinema-mac.png' \
-  'ENABLE_DEBUG_DYLIB: "NO"'; do
+  'ENABLE_DEBUG_DYLIB: "NO"' \
+  'DEAD_CODE_STRIPPING: "YES"'; do
   rg -Fq "$renderer_contract" SourcesiOS/CinemaUISmokeRendererApp.swift CinemaUISmokeRenderer.yml project.yml scripts/render-cinema-ui-smoke.sh SourcesiOS/VortXiOSApp.swift SourcesShared/WatchedIndex.swift
 done
+if rg -n -- '-force_load' CinemaUISmokeRenderer.yml >/dev/null; then
+  print -u2 'Cinema renderer must not force-load full native archives'
+  exit 1
+fi
 
 fixture_rail="$(sed -n '/struct CinemaFixturePosterRail/,/#endif/p' SourcesiOS/iOSRootView.swift)"
 [[ "$fixture_rail" == *"PosterRailBody"* && "$fixture_rail" == *"watchedIDs: []"* ]] || {
