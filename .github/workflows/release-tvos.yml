@@ -32,10 +32,10 @@ on:
   workflow_dispatch:
     inputs:
       native_only:
-        description: "Use the reviewed native data/resource/streaming engines and omit legacy core/Node payloads. Final cutover remains a separate release gate."
+        description: "Use the reviewed native data/resource/streaming engines and omit legacy core/Node payloads. Set false only for an artifact-only legacy comparison; release targets are rejected in that mode."
         required: false
         type: boolean
-        default: false
+        default: true
       mpvkit_artifacts_url:
         description: "Optional reviewed MPVKit asset override under this repository's releases/download/. Supply its exact SHA-256 too; otherwise use the pinned FFmpeg 9/SecureTransport package."
         required: false
@@ -111,6 +111,10 @@ jobs:
     # tops out below the Xcode 26.6 / tvOS SDK 26.5 release floor enforced below.
     runs-on: macos-26
     timeout-minutes: 90
+    env:
+      # Push events have no dispatch inputs. One effective value selects the native project AND
+      # every native input/app/archive proof; an explicit dispatch false remains a comparison lane.
+      VORTX_NATIVE_ONLY: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only }}
     # GitHub-owned actions are SHA-pinned too (a mutable tag -- even on an actions/* repo -- can be
     # repointed, and this job holds ENGINE_REPO_TOKEN + the release secrets). Each pin carries the
     # tag it resolved from.
@@ -118,6 +122,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Constrain legacy comparison to artifact-only builds
+        if: env.VORTX_NATIVE_ONLY != 'true'
+        env:
+          COMPARISON_RELEASE_TAG: ${{ inputs.release_tag }}
+          COMPARISON_RELEASE_ID: ${{ inputs.release_id }}
+          COMPARISON_PUBLISH: ${{ inputs.publish_release }}
+        run: |
+          set -euo pipefail
+          [ -z "$COMPARISON_RELEASE_TAG" ] && [ -z "$COMPARISON_RELEASE_ID" ] && [ "$COMPARISON_PUBLISH" != "true" ] || {
+            echo "::error::Legacy comparison mode cannot target or publish a release"
+            exit 1
+          }
 
       - name: Constrain Full tvOS test mode to artifact-only builds
         if: inputs.tvos_test_only == true
@@ -458,7 +475,7 @@ jobs:
 
       - name: Generate the Xcode project
         env:
-          NATIVE_ONLY: ${{ inputs.native_only }}
+          NATIVE_ONLY: ${{ env.VORTX_NATIVE_ONLY }}
         run: |
           set -euo pipefail
           cd app
@@ -472,7 +489,7 @@ jobs:
           fi
 
       - name: Capture exact native SDK and player inputs before app compilation
-        if: inputs.native_only == true
+        if: env.VORTX_NATIVE_ONLY == 'true'
         env:
           TVOS_TEST_ONLY: ${{ inputs.tvos_test_only }}
         run: |
@@ -575,7 +592,7 @@ jobs:
       - name: Smoke-test tvOS launch in a simulator (fail closed)
         timeout-minutes: 20
         env:
-          NATIVE_ONLY: ${{ inputs.native_only }}
+          NATIVE_ONLY: ${{ env.VORTX_NATIVE_ONLY }}
         run: |
           set -euo pipefail
           BUNDLE_ID="com.stremiox.tv"
@@ -777,7 +794,7 @@ jobs:
       - name: Gate iOS-simulator link + dSYM (fail closed)
         if: inputs.tvos_test_only != true
         env:
-          NATIVE_ONLY: ${{ inputs.native_only }}
+          NATIVE_ONLY: ${{ env.VORTX_NATIVE_ONLY }}
         run: |
           set -euo pipefail
           LOG="$RUNNER_TEMP/ios-sim-dsym.log"
@@ -830,7 +847,7 @@ jobs:
             SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
       - name: Verify exact native app selection and linked inputs
-        if: inputs.native_only == true
+        if: env.VORTX_NATIVE_ONLY == 'true'
         env:
           TVOS_TEST_ONLY: ${{ inputs.tvos_test_only }}
         run: |
@@ -1039,7 +1056,7 @@ jobs:
       - name: Package Full tvOS test IPA
         if: inputs.tvos_test_only == true
         env:
-          NATIVE_ONLY: ${{ inputs.native_only }}
+          NATIVE_ONLY: ${{ env.VORTX_NATIVE_ONLY }}
         run: |
           set -euo pipefail
           mkdir -p out/full/Payload
@@ -1055,7 +1072,7 @@ jobs:
       - name: Package the IPAs
         if: inputs.tvos_test_only != true
         env:
-          NATIVE_ONLY: ${{ inputs.native_only }}
+          NATIVE_ONLY: ${{ env.VORTX_NATIVE_ONLY }}
         run: |
           set -euo pipefail
           mkdir -p out/full/Payload out/lite/Payload out/ios/Payload
@@ -1195,7 +1212,7 @@ jobs:
       apple_only: ${{ steps.identity.outputs.apple_only }}
     if: >-
       always() && !cancelled() && github.event_name == 'workflow_dispatch' &&
-      inputs.release_tag != '' && inputs.tvos_test_only != true && (
+      inputs.release_tag != '' && inputs.tvos_test_only != true && inputs.native_only == true && (
         (inputs.resume_handoff == '' && needs.build-tvos.result == 'success' && github.ref == format('refs/tags/{0}', inputs.release_tag)) ||
         (inputs.resume_handoff != '' && needs.build-tvos.result == 'skipped' && github.ref == 'refs/heads/main')
       )
@@ -1209,6 +1226,8 @@ jobs:
       actions: read
     timeout-minutes: 35
     steps:
+      # Native-mode admission above is independent of build-tvos: coordinator resumes skip that
+      # job and its artifact-only comparison guard, but must never enable a legacy release write.
       - name: Validate immutable handoff provenance before coordinator resume
         id: handoff
         env:

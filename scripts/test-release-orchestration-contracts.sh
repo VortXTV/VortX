@@ -123,6 +123,93 @@ require_grep "secretless Apple validation retains actual player content verifica
     'bash scripts/verify-mpvkit-dvfel-artifacts\.sh "\$DEST"' "$VALIDATION_WF"
 ok "actual MPV selector accepts the reviewed fallback/pair and rejects partial, foreign and legacy inputs"
 
+# Exercise the actual effective expression and generator shell routing without compiling or
+# downloading anything. Command fixtures log only the selected XcodeGen route; the real generated
+# target/dependency/define/floor contract remains in test-native-apple-project.rb.
+node --input-type=module - "$APPLE_RELEASE_WF" "$REPO_ROOT" <<'NODE'
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+const [workflow, root] = process.argv.slice(2);
+const source = readFileSync(workflow, 'utf8');
+const input = source.match(/^      native_only:\n([\s\S]*?)(?=^      [a-z_]+:)/m)?.[1];
+assert.ok(input, 'native selection input must exist');
+assert.match(input, /^        type: boolean$/m);
+const defaultValue = input.match(/^        default: (true|false)$/m)?.[1];
+assert.equal(defaultValue, 'true', 'shipping dispatch must default to native');
+const build = source.match(/^  build-tvos:\n([\s\S]*?)^  attach-release:/m)?.[1];
+assert.ok(build, 'build job must be distinct from the release-write job');
+const expression = build.match(/^      VORTX_NATIVE_ONLY: \$\{\{ (.+) \}\}$/m)?.[1];
+assert.ok(expression, 'build job must define its single effective selector');
+assert.equal((build.match(/inputs\.native_only/g) ?? []).length, 1,
+  'no build consumer may bypass the effective selector with absent push inputs');
+const evaluate = new Function('github', 'inputs', `return (${expression});`);
+const step = (name) => {
+  const block = build.split(/^      - /m).find(value => value.startsWith(`name: ${name}\n`));
+  assert.ok(block, `${name}: required step missing`);
+  return block;
+};
+const run = (block) => {
+  const script = block.split('        run: |\n')[1];
+  assert.ok(script, 'fixture requires the actual step shell');
+  return script.split('\n').filter(line => line.startsWith('          '))
+    .map(line => line.slice(10)).join('\n');
+};
+const shellConsumers = ['Generate the Xcode project', 'Smoke-test tvOS launch in a simulator (fail closed)',
+  'Gate iOS-simulator link + dSYM (fail closed)', 'Package Full tvOS test IPA', 'Package the IPAs'];
+assert.equal((build.match(/^          NATIVE_ONLY:/gm) ?? []).length, shellConsumers.length);
+for (const name of shellConsumers) {
+  assert.match(step(name), /^          NATIVE_ONLY: \$\{\{ env\.VORTX_NATIVE_ONLY \}\}$/m,
+    `${name}: use the same effective native selection`);
+}
+const proofConditions = ['Capture exact native SDK and player inputs before app compilation',
+  'Verify exact native app selection and linked inputs'].map(name => {
+    const condition = step(name).match(/^        if: (.+)$/m)?.[1];
+    assert.equal(condition, "env.VORTX_NATIVE_ONLY == 'true'", `${name}: proof condition`);
+    return new Function('env', `return (${condition});`);
+  });
+const comparison = step('Constrain legacy comparison to artifact-only builds');
+const comparisonCondition = comparison.match(/^        if: (.+)$/m)?.[1];
+assert.equal(comparisonCondition, "env.VORTX_NATIVE_ONLY != 'true'");
+const comparisonRequired = new Function('env', `return (${comparisonCondition});`);
+const generator = run(step('Generate the Xcode project'));
+const commands = 'ruby() { printf "ruby:%s\\n" "$*"; }\nxcodegen() { printf "xcodegen:%s\\n" "$*"; }\n';
+for (const [name, event, inputs, expected] of [
+  ['push without inputs', 'push', {}, true],
+  ['push ignores dispatch comparison value', 'push', {native_only: false}, true],
+  ['default dispatch', 'workflow_dispatch', {native_only: defaultValue === 'true'}, true],
+  ['explicit native dispatch', 'workflow_dispatch', {native_only: true}, true],
+  ['explicit legacy comparison', 'workflow_dispatch', {native_only: false}, false],
+]) {
+  const selected = evaluate({event_name: event}, inputs);
+  assert.equal(selected, expected, name);
+  const env = {VORTX_NATIVE_ONLY: String(selected)};
+  for (const proof of proofConditions) assert.equal(proof(env), expected, `${name}: native proof`);
+  assert.equal(comparisonRequired(env), !expected, `${name}: comparison guard`);
+  const routed = spawnSync('bash', ['-c', commands + generator], {cwd: root, encoding: 'utf8',
+    env: {...process.env, NATIVE_ONLY: env.VORTX_NATIVE_ONLY, VORTX_ENGINE_SOURCE_REVISION: '0'.repeat(40)}});
+  assert.equal(routed.status, 0, `${name}: ${routed.stderr}`);
+  if (expected) {
+    assert.match(routed.stdout, /ruby:..\/scripts\/generate-native-apple-project\.rb --engine-revision 0{40} /);
+    assert.match(routed.stdout, /xcodegen:generate --spec \.native-project\.yml\n/);
+  } else {
+    assert.equal(routed.stdout, 'xcodegen:generate\n', 'explicit comparison keeps the legacy spec');
+  }
+}
+const comparisonScript = run(comparison);
+for (const [name, tag, id, publish, accepted] of [
+  ['artifact-only comparison', '', '', 'false', true],
+  ['comparison with release tag', 'v0.5.0-beta.1', '', 'false', false],
+  ['comparison with release ID', '', '123', 'false', false],
+  ['comparison publication', '', '', 'true', false],
+]) {
+  const result = spawnSync('bash', ['-c', comparisonScript], {encoding: 'utf8',
+    env: {...process.env, COMPARISON_RELEASE_TAG: tag, COMPARISON_RELEASE_ID: id, COMPARISON_PUBLISH: publish}});
+  assert.equal(result.status === 0, accepted, name);
+}
+NODE
+ok "actual Apple effective selector routes push/default dispatch and every proof to native; legacy comparison cannot ship"
+
 require_grep "Apple builds the native resource host" \
     'run: ./scripts/build-ffi-xcframework.sh --resource-host$' "$APPLE_RELEASE_WF"
 require_grep "Apple verifies resource and state ABI on warm and cold builds" \
