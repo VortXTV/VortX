@@ -1788,13 +1788,16 @@ jobs:
   # A published release is verification and recovery only. GitHub deliberately suppresses a new
   # `release: published` event when this workflow publishes with GITHUB_TOKEN, so the dispatch
   # publication path runs this same read-only verifier downstream from attach-release. External
-  # published-release events continue to use their immutable event payload. Neither path attaches
-  # assets, mutates main, promotes a feed, or republishes.
+  # published app-release events continue to use their immutable event payload. The vendor-* tag
+  # namespace contains dependency-only archives, not app/feed releases. Exclude only those external
+  # release events; dispatch publication still always verifies after successful attachment.
+  # Neither path attaches assets, mutates main, promotes a feed, or republishes.
   verify-published:
     needs: [attach-release]
     if: >-
       always() && (
-        github.event_name == 'release' ||
+        (github.event_name == 'release' &&
+        !startsWith(github.event.release.tag_name, 'vendor-')) ||
         (github.event_name == 'workflow_dispatch' &&
         inputs.publish_release == true &&
         needs.attach-release.result == 'success')

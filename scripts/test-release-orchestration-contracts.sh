@@ -631,6 +631,37 @@ ok "workflow-driven publication always reaches the downstream verifier after suc
 grep -Fq "github.event_name == 'release'" <<<"$verify_published_block" \
     || fail "published-release verifier no longer accepts external published-release events"
 ok "external published-release events retain independent verification"
+grep -Fq "!startsWith(github.event.release.tag_name, 'vendor-')" <<<"$verify_published_block" \
+    || fail "dependency-only vendor release events must not enter app/feed verification"
+VERIFY_PUBLISHED_BLOCK="$verify_published_block" node --input-type=module <<'NODE'
+import assert from 'node:assert/strict';
+const block = process.env.VERIFY_PUBLISHED_BLOCK;
+const expression = block.match(/^    if: >-\n([\s\S]*?)^    concurrency:/m)?.[1];
+assert.ok(expression, 'published-release job must have its own condition');
+// GitHub expressions accept hyphenated properties; use equivalent JS bracket access.
+const jsExpression = expression.replaceAll('needs.attach-release', "needs['attach-release']");
+const evaluate = new Function('github', 'inputs', 'needs', 'always', 'startsWith', `return (${jsExpression});`);
+const eligible = (event, tag, publish = false, result = 'skipped') => evaluate(
+  {event_name: event, event: {release: {tag_name: tag}}}, {publish_release: publish},
+  {'attach-release': {result}}, () => true,
+  (value, prefix) => String(value).toLowerCase().startsWith(String(prefix).toLowerCase()),
+);
+for (const tag of ['v0.5.0', 'v0.5.0-beta.1', 'v0.5.0-vendor-test', 'other-release']) {
+  assert.equal(eligible('release', tag), true, `${tag}: retain external app verification`);
+}
+for (const tag of ['vendor-mpvkit-dvfel-2', 'vendor-fonts-1', 'VENDOR-nodemobile-1']) {
+  assert.equal(eligible('release', tag), false, `${tag}: dependency-only event`);
+}
+assert.equal(eligible('workflow_dispatch', 'v0.5.0-beta.1', true, 'success'), true);
+assert.equal(eligible('workflow_dispatch', 'vendor-mpvkit-dvfel-2', true, 'success'), true,
+  'vendor event guard must never suppress a dispatch publication verifier');
+for (const result of ['failure', 'cancelled', 'skipped']) {
+  assert.equal(eligible('workflow_dispatch', 'v0.5.0-beta.1', true, result), false);
+}
+assert.equal(eligible('workflow_dispatch', 'v0.5.0-beta.1', false, 'success'), false);
+assert.equal(eligible('push', 'v0.5.0-beta.1', true, 'success'), false);
+NODE
+ok "actual verifier condition isolates vendor events and preserves app/dispatch gates"
 require_grep "attach-release exposes immutable release ID to the downstream verifier" \
     'release_id: \$\{\{ steps\.identity\.outputs\.release_id \}\}' "$APPLE_RELEASE_WF"
 grep -Fq 'needs.attach-release.outputs.release_id' <<<"$verify_published_block" \
