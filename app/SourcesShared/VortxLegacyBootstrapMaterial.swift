@@ -14,13 +14,18 @@ enum VortxLegacyBootstrapMaterial {
 
     /// A Sendable UTF-8 JSON result that can cross the caller's authentication/MainActor boundary.
     /// The result is the `material` member of `import_legacy_sync`, not a runtime or sync document.
+    ///
+    /// `profileEdits` is an authenticated, independently reconciled website authority channel. A
+    /// caller that has retained and will process that channel separately may defer only its
+    /// material-side reconciliation check; the edits themselves never enter this projection.
+    /// The default remains strict so ordinary legacy imports cannot acknowledge pending edits.
     static func encode(document: Data, roster: [UserProfile], ownerProfileID: UUID,
-                       rosterModifiedSeconds: Double?) throws -> Data {
+                       rosterModifiedSeconds: Double?, deferProfileEdits: Bool = false) throws -> Data {
         guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else {
             throw ReconciliationRequired(reason: "Account document must be an object")
         }
         let adapter = try Adapter(document: source, roster: roster, ownerID: ownerProfileID,
-                                  modified: rosterModifiedSeconds)
+                                  modified: rosterModifiedSeconds, deferProfileEdits: deferProfileEdits)
         return try JSONSerialization.data(withJSONObject: adapter.build(), options: [.sortedKeys, .withoutEscapingSlashes])
     }
 
@@ -32,15 +37,18 @@ enum VortxLegacyBootstrapMaterial {
         let owner: UserProfile
         let modified: Double?
         let profiles: [String: UserProfile]
+        let deferProfileEdits: Bool
         var deleted = Set<String>()
         var watches: [String: [Object]] = [:]
         var titles: [String: [String: Object]] = [:]
 
-        init(document: Object, roster: [UserProfile], ownerID: UUID, modified: Double?) throws {
+        init(document: Object, roster: [UserProfile], ownerID: UUID, modified: Double?,
+             deferProfileEdits: Bool) throws {
             self.document = document
             self.vortx = try object(document, "vortx") ?? [:]
             self.roster = roster
             self.modified = modified
+            self.deferProfileEdits = deferProfileEdits
             let owners = roster.filter(\.isOwner)
             try require(owners.count == 1 && owners[0].id == ownerID, "A unique resolved owner UUID is required")
             self.owner = owners[0]
@@ -65,7 +73,7 @@ enum VortxLegacyBootstrapMaterial {
             let library = try ownerLibrary()
             try importOverlays()
             try importOwnerIntents()
-            try validateProfileEdits(ownerLibrary: library)
+            if !deferProfileEdits { try validateProfileEdits(ownerLibrary: library) }
             var result: Object = [
                 "schemaVersion": 1, "roster": nativeRoster, "deletedProfileIds": deleted.sorted(),
                 "addons": [owner.id.uuidString: addons], "libraries": [owner.id.uuidString: library],

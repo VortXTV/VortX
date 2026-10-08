@@ -21,9 +21,11 @@ enum VortxLegacyBootstrapMaterialTests {
     static func check(_ condition: @autoclosure () -> Bool, _ message: String) {
         precondition(condition(), message)
     }
-    static func material(_ document: Object, roster: [UserProfile] = [owner, child], modified: Double? = 1720000000.1234) throws -> Object {
+    static func material(_ document: Object, roster: [UserProfile] = [owner, child], modified: Double? = 1720000000.1234,
+                         deferProfileEdits: Bool = false) throws -> Object {
         let data = try JSONSerialization.data(withJSONObject: document)
-        let result = try VortxLegacyBootstrapMaterial.encode(document: data, roster: roster, ownerProfileID: owner.id, rosterModifiedSeconds: modified)
+        let result = try VortxLegacyBootstrapMaterial.encode(document: data, roster: roster, ownerProfileID: owner.id,
+                                                              rosterModifiedSeconds: modified, deferProfileEdits: deferProfileEdits)
         return try JSONSerialization.jsonObject(with: result) as! Object
     }
     static func doc(_ vortx: Object = [:]) -> Object { ["vortx": vortx] }
@@ -231,6 +233,9 @@ enum VortxLegacyBootstrapMaterialTests {
         try fail(edits, "Pending profile roster", modified: 1710000000)
         edits["profileEdits"] = ["editedAt": 1720000000000.0, "libraryAdds": [owner.id.uuidString: [["id": "tt999", "type": "movie"]]]]
         try fail(edits, "absent from resolved saved")
+        let deferred = try material(edits, deferProfileEdits: true)
+        check(deferred["profileEdits"] == nil && deferred["libraries"] != nil,
+              "Explicit deferred website channel is not acknowledged or copied into native material")
         edits["profileEdits"] = ["editedAt": 1720000000000.0, "libraryAdds": [child.id.uuidString: [["id": "tt123", "type": "movie"]]]]
         try fail(edits, "explicit applied receipt")
         edits["profileEdits"] = ["editedAt": 1000, "roster": [["id": "30000000-0000-0000-0000-000000000001"]]]
