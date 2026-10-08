@@ -77,6 +77,7 @@ import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
+import com.vortx.android.ui.components.PosterRail
 import com.vortx.android.ui.components.SignedOutState
 import com.vortx.android.ui.components.shimmer
 import com.vortx.android.ui.library.LibrarySegment
@@ -96,6 +97,7 @@ import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.LibraryViewModel
+import com.vortx.android.ui.viewmodel.LibraryLandingViewModel
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.update.UpdateAvailableBanner
 
@@ -275,6 +277,7 @@ private fun DiscoverFilterChips(filters: DiscoverFilters?, hideLive: Boolean, on
 @Composable
 fun LibraryScreen(
     viewModel: LibraryViewModel,
+    landingViewModel: LibraryLandingViewModel,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
     onDownloads: (() -> Unit)? = null,
@@ -282,6 +285,7 @@ fun LibraryScreen(
     onPreviouslyWatched: (() -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val landingState by landingViewModel.state.collectAsStateWithLifecycle()
     val result = (state as? UiState.Success<LibraryResult>)?.data
     val filters = result?.filters
     val allItems = result?.items.orEmpty()
@@ -296,6 +300,19 @@ fun LibraryScreen(
     Column(modifier = modifier.fillMaxSize()) {
         if (onDownloads != null || onWatchlist != null || onPreviouslyWatched != null) {
             LibraryEntryCards(onDownloads, onWatchlist, onPreviouslyWatched)
+        }
+        // This is a second, authoritative projection rather than the saved Library grid. It stays below
+        // the three action entries so a Library visit exposes real resume work without replacing History.
+        when (val landing = landingState) {
+            is UiState.Loading -> Unit
+            is UiState.Error -> ErrorState(landing.message, onRetry = landingViewModel::retry)
+            is UiState.Success -> if (landing.data.continueWatching.isNotEmpty()) {
+                PosterRail(
+                    catalog = Catalog("continue", "Continue Watching", landing.data.continueWatching),
+                    onItem = onItem,
+                    eyebrow = "Pick up where you left off",
+                )
+            }
         }
         LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
         LibrarySegmentChips(segments = segments, active = activeSegment, onSelect = { selectedSegment = it })

@@ -14,29 +14,26 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.vortx.android.model.LibraryResult
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
-import com.vortx.android.ui.viewmodel.LibraryViewModel
+import com.vortx.android.ui.viewmodel.LibraryLandingViewModel
 
 /**
- * A focused Library history route. The engine's Library payload is the authoritative local collection;
- * [MetaItem.watched] is also the predicate behind the existing Library "Watched" smart filter. Keeping
- * this as a separate route gives the Library entry a real destination without replacing Continue Watching,
- * which remains a playback-progress rail on Home.
+ * A focused playback-history route. Its source is owner-bound repository history, not the saved Library:
+ * users can finish an unsaved title and can save a title they have never played.
  */
 @Composable
 fun PreviouslyWatchedScreen(
-    viewModel: LibraryViewModel,
+    viewModel: LibraryLandingViewModel,
     onBack: () -> Unit,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val watched = (state as? UiState.Success<LibraryResult>)?.data?.items.orEmpty().filter { it.watched }
+    val history = (state as? UiState.Success)?.data?.playbackHistory.orEmpty()
 
     Column(modifier = modifier.fillMaxSize()) {
         Row(
@@ -52,7 +49,7 @@ fun PreviouslyWatchedScreen(
             Column {
                 Text("Previously Watched", style = VortXTheme.type.screenTitle)
                 Text(
-                    "History from your Library",
+                    "Your complete playback history",
                     style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
                 )
             }
@@ -61,9 +58,9 @@ fun PreviouslyWatchedScreen(
             is UiState.Loading -> ShimmerGrid()
             is UiState.Error -> ErrorState(loaded.message, onRetry = viewModel::retry)
             is UiState.Success -> PosterGrid(
-                items = watched,
+                items = history,
                 onItem = onItem,
-                emptyHint = "Titles you finish from your Library appear here.",
+                emptyHint = "Titles you watch appear here, even when they are not saved.",
             )
         }
     }

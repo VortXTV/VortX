@@ -1053,6 +1053,58 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
     }
 }
 
+/** One owner-fenced read for the two non-library projections shown at the top of the Library landing. */
+data class LibraryLandingResult(
+    val owner: ContinueWatchingOwner,
+    val continueWatching: List<MetaItem>,
+    val playbackHistory: List<MetaItem>,
+)
+
+/**
+ * Keeps Library's Continue Watching rail and full playback History coherent across profile/account
+ * changes. It intentionally does not derive either list from `library()`; native playback may contain an
+ * unsaved watched title, while a saved title can still be unwatched.
+ */
+class LibraryLandingViewModel(private val repo: CatalogRepository) : ViewModel() {
+    private val _state = MutableStateFlow<UiState<LibraryLandingResult>>(UiState.Loading)
+    val state: StateFlow<UiState<LibraryLandingResult>> = _state.asStateFlow()
+
+    private var loadJob: Job? = null
+    private var everLoaded = false
+
+    init {
+        viewModelScope.launch {
+            repo.ctxUpdates().collect { load(showLoading = !everLoaded) }
+        }
+    }
+
+    fun retry() = load(showLoading = true)
+
+    private fun load(showLoading: Boolean) {
+        loadJob?.cancel()
+        if (showLoading) _state.value = UiState.Loading
+        loadJob = viewModelScope.launch {
+            _state.value = loadLibraryLanding(repo).toUiState()
+            everLoaded = true
+        }
+    }
+}
+
+/** Shared by the UI ViewModel and its contract test so an owner switch cannot publish mixed projections. */
+internal suspend fun loadLibraryLanding(repo: CatalogRepository): Result<LibraryLandingResult> = runCatching {
+    val owner = repo.continueWatchingOwner()
+    val history = repo.playbackHistorySnapshot(owner).getOrThrow()
+    val continueWatching = repo.continueWatchingSnapshot(owner).getOrThrow()
+    check(history.owner == owner) { "Playback history owner changed." }
+    check(continueWatching.owner == owner) { "Continue Watching owner changed." }
+    check(repo.continueWatchingOwner() == owner) { "Library landing owner changed." }
+    LibraryLandingResult(
+        owner = owner,
+        continueWatching = continueWatching.items,
+        playbackHistory = history.items,
+    )
+}
+
 /// Search: debounced full-text query across every installed add-on. A query below two trimmed
 /// characters is a calm idle
 /// state, never an error. [history] surfaces recent searches (DESIGN-SYSTEM.md §4 "Discover / Search":

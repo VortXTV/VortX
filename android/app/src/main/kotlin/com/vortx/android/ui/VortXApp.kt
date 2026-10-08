@@ -160,6 +160,7 @@ import com.vortx.android.ui.viewmodel.HomeViewModel
 import com.vortx.android.ui.viewmodel.HomeCatalogBrowseViewModel
 import com.vortx.android.ui.viewmodel.HomeCatalogTarget
 import com.vortx.android.ui.viewmodel.LibraryViewModel
+import com.vortx.android.ui.viewmodel.LibraryLandingViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
@@ -1108,7 +1109,7 @@ fun VortXApp(
 
         if (showPreviouslyWatched) {
             BackHandler { showPreviouslyWatched = false }
-            val historyVm: LibraryViewModel = viewModel(
+            val historyVm: LibraryLandingViewModel = viewModel(
                 key = "library-history",
                 factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext),
             )
@@ -1479,6 +1480,7 @@ fun VortXApp(
                 Tab.LIVE -> LiveScreen(viewModel<LiveViewModel>(factory = factory), onItem, content)
                 Tab.LIBRARY -> LibraryScreen(
                     viewModel = viewModel<LibraryViewModel>(factory = factory),
+                    landingViewModel = viewModel<LibraryLandingViewModel>(key = "library-history", factory = factory),
                     onItem = onItem,
                     modifier = content,
                     onDownloads = { showDownloads = true },
