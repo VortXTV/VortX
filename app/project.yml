@@ -425,6 +425,10 @@ targets:
         product: MPVKit-GPL # macos-arm64_x86_64 slice
       - framework: Vendor/StremioXCore.xcframework
         embed: false # now carries an aarch64-apple-darwin slice
+      # The native data branch needs the same kernel/resource ABI as iOS/tvOS.
+      # Its runtime selection stays off; macOS still spawns the separate server.
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
     preBuildScripts:
       # Download the standalone node binary before the resource copy phase runs. Idempotent:
       # skips the ~95MB download when the right version is already present.
@@ -450,6 +454,7 @@ targets:
         GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) CONFIG_VERSION=\\\"2025-09-13\\\""
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.mac
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
         MARKETING_VERSION: "0.4.0"
         CURRENT_PROJECT_VERSION: "259"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
