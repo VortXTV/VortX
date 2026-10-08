@@ -991,7 +991,8 @@ struct iOSDetailView: View {
                             initialStartAtSeconds: autoPlayEpisode.id == validInitialVideoID
                                 ? validInitialResumeSeconds
                                 : nil,
-                            initialTraktSessionID: initialTraktSessionID
+                            initialTraktSessionID: initialTraktSessionID,
+                            autoPlayOnAppear: true
                         ),
                         isActive: Binding(
                             get: { self.autoPlayEpisode != nil },
@@ -3027,9 +3028,22 @@ struct iOSDetailView: View {
     /// Movie playback waits for the same settled ranked source gate as the visible hero CTA; series use the
     /// same episode-source destination as a manual hero/episode tap. No URL is synthesized and no resolver or
     /// player policy is bypassed.
+    private func autoPlayMetaMatchesRoute(_ m: CoreMetaItem) -> Bool {
+        guard m.id == metaRequestID,
+              !LiveTypes.contains(type),
+              !LiveTypes.contains(m.type) else { return false }
+        // CoreBridge is a shared single-slot store. The id fence above rejects a stale title, while the
+        // content-kind fence rejects a late movie/series replacement for a route that is still mounted.
+        // Keep the authoritative meta type for stream/player routing; this check only decides whether the
+        // one-shot quick-view request is safe to consume.
+        let routeKind = SourceIndexIdentity.ContentKind.from(type: type, liveTypes: LiveTypes.all)
+        let residentKind = SourceIndexIdentity.ContentKind.from(type: m.type, liveTypes: LiveTypes.all)
+        return routeKind == residentKind
+    }
+
     private func requestAutoPlayIfReady() {
         guard autoPlayOnAppear, !autoPlayConsumed, !metaUnavailable, let m = meta,
-              m.id == metaRequestID else { return }
+              autoPlayMetaMatchesRoute(m) else { return }
         if isEpisodic {
             guard let primary = m.videos.flatMap({ seriesPrimaryEpisode($0) }) else { return }
             autoPlayConsumed = true
@@ -3860,9 +3874,6 @@ struct iOSDetailView: View {
                 }
 
                 HStack(spacing: Theme.Space.sm) {
-                    if let runtime = meta?.runtime, !runtime.isEmpty {
-                        Label(runtime, systemImage: "clock")
-                    }
                     Text(progress > 0.01 ? "Resume episode" : "Open sources")
                 }
                 .font(Theme.Typography.label)
@@ -4376,6 +4387,9 @@ struct iOSEpisodeStreams: View {
     let seasonEpisodes: [CoreVideo]   // ALL episodes across seasons, ordered (season, episode), for in-player Next/Prev/list + auto-advance ACROSS the season boundary (so the last episode of a season rolls into the next season's first)
     var initialStartAtSeconds: Double? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    /// Set only by the Cinema quick-view route. It reuses this page's settled ranked Watch command; the
+    /// ordinary episode-detail route remains source-list-first unless Smart Source Selection is enabled.
+    var autoPlayOnAppear: Bool = false
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
@@ -4544,11 +4558,11 @@ struct iOSEpisodeStreams: View {
             if core.metaDetails?.meta?.id != meta.id || !hasThisEpisodeStreams {
                 core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: shownVideo.id)
             }
-            // Smart Source Selection (Lane A): auto-pick my best source. Fires once per appearance and only
-            // when the viewer opted in; reuses `loadEpisodeStream` (the SAME settle + StreamRanking.best +
-            // resume + torrent-prime resolve the in-player Next/Prev uses), then presents the player, so this
-            // adds no new playback logic. A viewer who backs out of the player lands on the full source list.
-            if SourcePreferences.shared.autoPickBest, !didAutoPick {
+            // Smart Source Selection (Lane A) and Cinema quick-view Watch both use the same one-shot command.
+            // Quick-view is accepted only after this page has authoritative target metadata; the command then
+            // waits for the exact settled ranked source set before resolving and presenting the player. A viewer
+            // who backs out of the player lands on the full source list.
+            if (autoPlayOnAppear || SourcePreferences.shared.autoPickBest), !didAutoPick {
                 didAutoPick = true
                 Task { await autoPickAndPlayEpisode() }
             }
