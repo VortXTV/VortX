@@ -466,6 +466,159 @@ class NativeWatchedMigrationProducerTest {
     }
 
     @Test
+    fun `historical pending retry uses original source after unrelated current document change`() = runBlocking {
+        val scope = VortxAccountScope("account.fixture", fixedOwner.id)
+        val roster = listOf(fixedOwner, sharedProfile)
+        val original = document(fixedOwner.id)
+        val pending = NativeWatchedMigrationProducer { error("offline") }
+            .prepare(scope, original, roster, isCurrent = { true }).pending()
+        val originalBytes = pending.getJSONObject(0).getString("sourceDocumentBase64")
+        val changed = document(fixedOwner.id).put("unrelatedSetting", "new value")
+        val requests = mutableListOf<String>()
+
+        val retry = fakeProducer(requests).retryPending(scope, pending, isCurrent = { true })
+
+        assertTrue(retry.isComplete)
+        assertEquals(listOf("owner-series", "overlay-series"), requests)
+        assertEquals(0, retry.pending().length())
+        assertEquals(2, retry.archive().length())
+        for (index in 0 until retry.archive().length()) {
+            assertEquals(originalBytes, retry.archive().getJSONObject(index).getString("sourceDocumentBase64"))
+            assertEquals("https://catalog.example/manifest.json", retry.archive().getJSONObject(index)
+                .getJSONObject("addon").getString("transportUrl"))
+        }
+        // An archive for source A cannot authorize source B, even when the rows themselves match.
+        var changedFetches = 0
+        val current = NativeWatchedMigrationProducer { changedFetches++; error("B remains offline") }
+            .prepare(scope, changed, roster, retainedArchive = retry.archive(), isCurrent = { true })
+        assertEquals(2, changedFetches)
+        assertFalse(current.isComplete)
+        assertEquals(0, current.archive().length())
+        assertFailure { nativeLegacyMaterial(changed, roster, null, accountScope = scope, watchedMigration = current) }
+        val replay = NativeWatchedMigrationProducer { error("archive retry must not fetch") }
+            .retryPending(scope, pending, retainedArchive = retry.archive(), isCurrent = { true })
+        assertTrue(replay.isComplete)
+        assertEquals(retry.archive().toString(), replay.archive().toString())
+        // Only an independently prepared batch for the EXACT original source may consume A.
+        val originalBatch = NativeWatchedMigrationProducer { error("exact original must cold replay") }
+            .prepare(scope, original, roster, retainedArchive = retry.archive(), isCurrent = { true })
+        assertTrue(originalBatch.isComplete)
+        assertEquals(3, watchRows(nativeLegacyMaterial(original, roster, null, accountScope = scope,
+            watchedMigration = originalBatch), fixedOwner.id).size)
+    }
+
+    @Test
+    fun `historical own pending retry preserves archived UID without reviving old source authority`() = runBlocking {
+        val scope = VortxAccountScope("account.00000000-0000-0000-0000-000000000456", fixedOwner.id)
+        var oldActive = true
+        val oldSource = ownSource(ownDocument(), ownProfile.id, "old-uid") { check -> oldActive && check() }
+        val pending = NativeWatchedMigrationProducer { error("offline") }
+            .prepareOwn(scope, ownProfile, oldSource, isCurrent = { true }).pending()
+        val oldBytes = pending.getJSONObject(0).getString("sourceDocumentBase64")
+        oldActive = false
+        val newSource = ownSource(ownDocument(), ownProfile.id, "new-uid")
+        val capturedUIDs = mutableListOf<String?>()
+        val retry = NativeWatchedMigrationProducer { request ->
+            capturedUIDs += request.scope.verifiedStreamingUID
+            response(request)
+        }.retryPending(scope, pending, isCurrent = { true })
+
+        assertTrue(retry.isComplete)
+        assertEquals(listOf("old-uid", "old-uid"), capturedUIDs)
+        for (index in 0 until retry.archive().length()) {
+            assertEquals("old-uid", retry.archive().getJSONObject(index).getString("verifiedStreamingUid"))
+            assertEquals(oldBytes, retry.archive().getJSONObject(index).getString("sourceDocumentBase64"))
+        }
+        assertTrue(runCatching { oldSource.withActive { true } }.exceptionOrNull() is IllegalStateException)
+        val current = NativeWatchedMigrationProducer { request ->
+            assertEquals("new-uid", request.scope.verifiedStreamingUID)
+            error("new UID remains offline")
+        }.prepareOwn(scope, ownProfile, newSource, retainedArchive = retry.archive(), isCurrent = { true })
+        assertFalse(current.isComplete)
+        assertEquals(0, current.archive().length())
+        assertEquals(2, current.pending().length())
+        assertTrue((0 until current.pending().length()).all {
+            current.pending().getJSONObject(it).getString("verifiedStreamingUid") == "new-uid"
+        })
+        val replay = NativeWatchedMigrationProducer { error("historical UID replay must not fetch") }
+            .retryPending(scope, pending, retainedArchive = retry.archive(), isCurrent = { true })
+        assertEquals(retry.archive().toString(), replay.archive().toString())
+    }
+
+    @Test
+    fun `historical pending remains immutable and visible across failed retry and caller mutation`() = runBlocking {
+        val scope = VortxAccountScope("account.fixture", fixedOwner.id)
+        val pending = NativeWatchedMigrationProducer { error("offline") }
+            .prepare(scope, document(fixedOwner.id), listOf(fixedOwner, sharedProfile), isCurrent = { true }).pending()
+        val snapshot = pending.toString()
+        var current = true
+        val retry = NativeWatchedMigrationProducer { request ->
+            pending.getJSONObject(0).put("sourceDocumentBase64", "replaced by caller")
+            // An incomplete raw inventory cannot resolve the original opaque bitmap.
+            LegacyWatchedBitfieldMigrationEvidence.MetadataResponse(request, metadata(request.metaID, includeVideos = false))
+        }.retryPending(scope, pending, isCurrent = { current })
+        assertFalse(retry.isComplete)
+        assertEquals(snapshot, retry.pending().toString())
+        assertEquals(0, retry.archive().length())
+        retry.pending().getJSONObject(0).put("reason", "caller edited output")
+        assertEquals(snapshot, retry.pending().toString())
+        current = false
+        assertFailure { retry.archive() }
+        assertFailure { retry.pending() }
+    }
+
+    @Test
+    fun `historical retry rejects foreign scopes duplicate rows and tampered sources before network`() = runBlocking {
+        val scope = VortxAccountScope("account.fixture", fixedOwner.id)
+        val pending = NativeWatchedMigrationProducer { error("offline") }
+            .prepare(scope, document(fixedOwner.id), listOf(fixedOwner, sharedProfile), isCurrent = { true }).pending()
+        var calls = 0
+        val producer = NativeWatchedMigrationProducer { request -> calls++; response(request) }
+        assertFailure { producer.retryPending(VortxAccountScope("account.other", fixedOwner.id), pending, isCurrent = { true }) }
+        assertFailure { producer.retryPending(VortxAccountScope(scope.accountID, customOwner.id), pending, isCurrent = { true }) }
+        val duplicate = JSONArray(pending.toString()).put(pending.getJSONObject(0))
+        assertFailure { producer.retryPending(scope, duplicate, isCurrent = { true }) }
+        val tampered = JSONArray(pending.toString()).also { it.getJSONObject(0).put("sourceDocumentSha256", "0".repeat(64)) }
+        assertFailure { producer.retryPending(scope, tampered, isCurrent = { true }) }
+        val foreignArchive = fakeProducer().prepare(VortxAccountScope("account.other", fixedOwner.id), document(fixedOwner.id),
+            listOf(fixedOwner, sharedProfile), isCurrent = { true }).archive()
+        assertFailure { producer.retryPending(scope, pending, retainedArchive = foreignArchive, isCurrent = { true }) }
+        assertEquals(0, calls)
+    }
+
+    @Test
+    fun `historical retry discards stale and canceled successful metadata responses`() = runBlocking {
+        val scope = VortxAccountScope("account.fixture", fixedOwner.id)
+        val pending = NativeWatchedMigrationProducer { error("offline") }
+            .prepare(scope, document(fixedOwner.id), listOf(fixedOwner, sharedProfile), isCurrent = { true }).pending()
+        var current = true
+        val stale = NativeWatchedMigrationProducer { request -> current = false; response(request) }
+        assertFailure { stale.retryPending(scope, pending, isCurrent = { current }) }
+        var returned = false
+        val cancelled = NativeWatchedMigrationProducer { request ->
+            currentCoroutineContext().cancel(CancellationException("cancel successful historical callback"))
+            response(request)
+        }
+        val task = launch {
+            cancelled.retryPending(scope, pending, isCurrent = { true })
+            returned = true
+        }
+        task.join()
+        assertTrue(task.isCancelled)
+        assertFalse(returned)
+        val accepted = fakeProducer().retryPending(scope, pending, isCurrent = { true }).archive()
+        val cancelledReplay = launch(start = CoroutineStart.LAZY) {
+            currentCoroutineContext().cancel(CancellationException("cancel no-network replay"))
+            fakeProducer().retryPending(scope, pending, retainedArchive = accepted, isCurrent = { true })
+            returned = true
+        }
+        cancelledReplay.start()
+        cancelledReplay.join()
+        assertTrue(cancelledReplay.isCancelled)
+        assertFalse(returned)
+    }
+
+    @Test
     fun `real JNI retains decoded and explicit unwatch facts across replay and cold hydration`() = runBlocking {
         org.junit.Assume.assumeTrue(System.getenv("VORTX_JNI_SYNC") == "1" && !System.getenv("VORTX_JNI_LIBRARY").isNullOrBlank())
         System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))

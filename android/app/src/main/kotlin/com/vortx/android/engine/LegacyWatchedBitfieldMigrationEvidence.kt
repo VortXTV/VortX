@@ -121,6 +121,10 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
         validatedSourceRow(StrictJson.value(source.copyOf()), scope, rowLocator)
     }
 
+    /** A retry may select metadata only for the series proven by its archived source/locator. */
+    fun sourceMetaID(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator): String =
+        validatedSourceRow(StrictJson.value(source.copyOf()), scope, rowLocator).metaID
+
     /** Preserve original manifest number lexemes while extracting source-authorized candidates.
      * A platform JSONObject reserialization can otherwise change the descriptor being attested. */
     fun originalAddons(source: ByteArray, rowLocator: SourceRowLocator): List<AuthorizedAddon> {

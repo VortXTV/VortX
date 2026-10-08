@@ -44,6 +44,74 @@ internal class NativeWatchedMigrationProducer(
         return prepareCaptured(scope, JSONObject(), listOf(profile), listOf(source), retainedArchive, isCurrent)
     }
 
+    /** Retry sealed historical rows, not the current document or active credential. Completing an
+     * archived UID's metadata grants no current import authority: this API cannot return a batch. */
+    suspend fun retryPending(scope: VortxAccountScope, pending: JSONArray, retainedArchive: JSONArray? = null,
+                             isCurrent: () -> Boolean): NativeWatchedMigrationRetry {
+        fun requireCurrent() { require(isCurrent()) { "Watched migration account or profile changed" } }
+        currentCoroutineContext().ensureActive()
+        requireCurrent()
+        // Validate and freeze every input before suspension. Caller mutations cannot replace the
+        // source, descriptor, UID, row, or remaining pending records midway through a retry.
+        val originals = validateNativeWatchedMigrationPending(pending)
+        val accepted = retainedArchive?.let(::validateNativeWatchedMigrationArchive) ?: JSONArray()
+        fun requireScope(record: JSONObject) {
+            require(record.getString("accountId") == scope.accountID && record.getString("ownerProfileId") == scope.ownerProfileID) {
+                "Archived watched migration belongs to another account scope"
+            }
+        }
+        val acceptedIdentities = mutableSetOf<String>()
+        for (index in 0 until accepted.length()) {
+            val record = accepted.getJSONObject(index)
+            requireScope(record)
+            acceptedIdentities.add(watchedRecordIdentity(record))
+        }
+        val pendingIdentities = mutableSetOf<String>()
+        for (index in 0 until originals.length()) {
+            val record = originals.getJSONObject(index)
+            requireScope(record)
+            require(pendingIdentities.add(watchedRecordIdentity(record))) { "Duplicate pending watched row" }
+        }
+        val unresolved = JSONArray()
+        for (index in 0 until originals.length()) {
+            currentCoroutineContext().ensureActive()
+            requireCurrent()
+            val record = originals.getJSONObject(index)
+            val identity = watchedRecordIdentity(record)
+            if (identity in acceptedIdentities) continue
+            val historicalScope = WatchedEvidence.Scope(record.getString("accountId"), record.getString("profileId"),
+                record.opt("verifiedStreamingUid") as? String, record.getString("ownerProfileId"))
+            val source = watchedDecode64(record.getString("sourceDocumentBase64"))
+            val locator = watchedLocator(record.getJSONObject("row"))
+            val metaID = WatchedEvidence.sourceMetaID(historicalScope, source, locator)
+            val descriptors = WatchedEvidence.originalAddons(source, locator).filter { supportsSeriesMetadata(it, metaID) }
+            val successful = mutableListOf<NativeWatchedRowEvidence>()
+            for (descriptor in descriptors) {
+                currentCoroutineContext().ensureActive()
+                requireCurrent()
+                try {
+                    successful += NativeWatchedRowEvidence.capture(historicalScope, source, locator, descriptor, isCurrent, fetch)
+                    currentCoroutineContext().ensureActive()
+                } catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) {
+                    requireCurrent()
+                    currentCoroutineContext().ensureActive()
+                }
+            }
+            val first = successful.firstOrNull()
+            if (first != null && successful.all { it.sameInventory(first) }) {
+                accepted.put(first.archive())
+                acceptedIdentities.add(identity)
+            } else {
+                // Preserve the exact unresolved archived record, including its original source.
+                unresolved.put(record)
+            }
+        }
+        currentCoroutineContext().ensureActive()
+        requireCurrent()
+        return NativeWatchedMigrationRetry(accepted, unresolved, isCurrent)
+    }
+
     private suspend fun prepareCaptured(scope: VortxAccountScope, document: JSONObject, roster: List<UserProfile>,
                                         ownSources: List<NativeOwnAccountSource>, retainedArchive: JSONArray?,
                                         isCurrent: () -> Boolean): NativeWatchedMigrationBatch {
@@ -120,8 +188,13 @@ internal class NativeWatchedRowEvidence private constructor(private val evidence
 
     companion object {
         internal suspend fun capture(candidate: WatchedCandidate, addon: WatchedEvidence.AuthorizedAddon, isCurrent: () -> Boolean,
+                                     fetch: suspend (WatchedEvidence.MetadataRequest) -> WatchedEvidence.MetadataResponse): NativeWatchedRowEvidence =
+            capture(candidate.scope, candidate.source.bytes(), candidate.locator, addon, isCurrent, fetch)
+
+        internal suspend fun capture(scope: WatchedEvidence.Scope, source: ByteArray, locator: WatchedLocator,
+                                     addon: WatchedEvidence.AuthorizedAddon, isCurrent: () -> Boolean,
                                      fetch: suspend (WatchedEvidence.MetadataRequest) -> WatchedEvidence.MetadataResponse): NativeWatchedRowEvidence {
-            val evidence = WatchedEvidence.capture(candidate.scope, candidate.source.bytes(), candidate.locator, addon, isCurrent, fetch)
+            val evidence = WatchedEvidence.capture(scope, source, locator, addon, isCurrent, fetch)
             requireWatchedCredentialFree(evidence)
             return NativeWatchedRowEvidence(evidence)
         }
@@ -142,6 +215,23 @@ internal class NativeWatchedRowEvidence private constructor(private val evidence
             requireWatchedCredentialFree(evidence)
             return NativeWatchedRowEvidence(evidence)
         }
+    }
+}
+
+/** Historical retry receipts are archival data only. No video IDs, native material, source
+ * authority, or current-import admission can be obtained from this result. */
+internal class NativeWatchedMigrationRetry internal constructor(accepted: JSONArray, unresolved: JSONArray,
+                                                                private val isCurrent: () -> Boolean) {
+    private val acceptedSnapshot = accepted.toString()
+    private val unresolvedSnapshot = unresolved.toString()
+    val isComplete: Boolean get() = JSONArray(unresolvedSnapshot).length() == 0
+    fun archive(): JSONArray {
+        require(isCurrent()) { "Watched migration account or profile changed" }
+        return validateNativeWatchedMigrationArchive(JSONArray(acceptedSnapshot))
+    }
+    fun pending(): JSONArray {
+        require(isCurrent()) { "Watched migration account or profile changed" }
+        return validateNativeWatchedMigrationPending(JSONArray(unresolvedSnapshot))
     }
 }
 
@@ -239,12 +329,17 @@ internal fun validateNativeWatchedMigrationArchive(value: JSONArray): JSONArray 
     for (index in 0 until value.length()) {
         val evidence = NativeWatchedRowEvidence.replay(value.getJSONObject(index)) { true }
         val record = evidence.archive()
-        val identity = listOf(record.getString("accountId"), record.getString("profileId"), record.optString("verifiedStreamingUid"),
-            record.getString("sourceDocumentSha256"), record.getJSONObject("row").toString()).joinToString("\u0000")
+        val identity = watchedRecordIdentity(record)
         require(identities.add(identity)) { "Duplicate watched archive row" }
         output.put(record)
     }
 }
+
+private fun watchedRecordIdentity(record: JSONObject): String = JSONArray(listOf(
+    record.getString("accountId"), record.getString("ownerProfileId"), record.getString("profileId"),
+    record.opt("verifiedStreamingUid"), record.getString("sourceDocumentSha256"), record.getString("sourceDocumentBase64"),
+    watchedLocatorJSON(watchedLocator(record.getJSONObject("row"))),
+)).toString()
 
 /** Pending rows retain undecoded originals with truthful failure status. They grant no watched
  * authority and must never be acknowledged as an empty completed migration. */
