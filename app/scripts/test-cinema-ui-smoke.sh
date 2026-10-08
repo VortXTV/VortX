@@ -10,6 +10,7 @@ for source in \
   SourcesiOS/iOSDetailView.swift \
   SourcesiOS/CinemaUISmokeHarness.swift \
   SourcesiOS/CinemaUISmokeRendererApp.swift \
+  SourcesiOS/CinemaJSProviderSourceStub.swift \
   SourcesiOS/VortXiOSApp.swift \
   SourcesShared/WatchedIndex.swift; do
   swiftc -parse "$source"
@@ -57,5 +58,19 @@ fixture_rail="$(sed -n '/struct CinemaFixturePosterRail/,/#endif/p' SourcesiOS/i
 }
 rg -Fq 'preconditionFailure("Cinema UI renderer must not construct WatchedIndex.shared")' SourcesShared/WatchedIndex.swift
 rg -Fq 'usesInertArtwork: true' SourcesiOS/iOSRootView.swift
+
+# `SourceIndexClient` names this optional source even though the fixture never supplies it. The renderer
+# compiles a stub instead of the QuickJS runtime, so a compile-only dependency cannot construct its store,
+# touch provider cache, or create a network-capable interpreter.
+stub='SourcesiOS/CinemaJSProviderSourceStub.swift'
+rg -Fq '#if CINEMA_UI_SMOKE_RENDERER' "$stub"
+rg -Fq 'final class JSProviderSource' "$stub"
+rg -Fq 'SourceContributorSettlement' "$stub"
+rg -Fq 'preconditionFailure("Cinema UI renderer must not construct JSProviderSource")' "$stub"
+rg -Fq 'preconditionFailure("Cinema UI renderer must not refresh JSProviderSource")' "$stub"
+if sed '/^[[:space:]]*\/\//d' "$stub" | rg -n 'JSProviderStore|JSProviderRuntime|CommunityStreamGateway|URLSession|NWConnection' >/dev/null; then
+  print -u2 'Cinema JS provider stub must remain inert'
+  exit 1
+fi
 
 print 'ok: Cinema smoke harness is parseable, offline, and wired to production presentation components'
