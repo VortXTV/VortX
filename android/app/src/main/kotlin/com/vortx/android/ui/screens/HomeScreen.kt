@@ -79,6 +79,7 @@ fun HomeScreen(
     onDirectResume: (MetaItem) -> Unit = onItem,
     onDiscover: (() -> Unit)? = null,
     onBrowseCatalog: ((Catalog) -> Unit)? = null,
+    onCatalogItem: ((MetaItem) -> Unit)? = null,
     onQuickView: ((MetaItem) -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -124,6 +125,7 @@ fun HomeScreen(
                     onDirectResume,
                     onDiscover,
                     onBrowseCatalog,
+                    onCatalogItem,
                     onQuickView,
                     lastStreamStore,
                     viewModel,
@@ -143,6 +145,7 @@ private fun HomeContent(
     onDirectResume: (MetaItem) -> Unit,
     onDiscover: (() -> Unit)?,
     onBrowseCatalog: ((Catalog) -> Unit)?,
+    onCatalogItem: ((MetaItem) -> Unit)?,
     onQuickView: ((MetaItem) -> Unit)?,
     lastStreamStore: LastStreamStore,
     viewModel: HomeViewModel,
@@ -216,7 +219,11 @@ private fun HomeContent(
                     }
                     PosterRail(
                         catalog = catalog,
-                        onItem = onItem,
+                        // Only ordinary catalog taps are redirected to the optional Quick View. Continue
+                        // Watching keeps its established direct-detail/resume behavior and long-press menu.
+                        onItem = { item ->
+                            if (catalog.id != "continue" && onCatalogItem != null) onCatalogItem(item) else onItem(item)
+                        },
                         onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
                         eyebrow = eyebrow,
                         onEndReached = if (catalog.hasNextPage) {

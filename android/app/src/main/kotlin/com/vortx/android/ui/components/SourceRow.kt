@@ -110,7 +110,6 @@ fun SourceRow(
                 Text(
                     text = sourceAuthoredText(title, description),
                     style = VortXTheme.type.cardTitle.copy(color = if (enabled) colors.textPrimary else colors.textTertiary),
-                    maxLines = 4,
                 )
             }
         }

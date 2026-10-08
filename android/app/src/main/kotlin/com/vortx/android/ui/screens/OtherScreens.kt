@@ -279,7 +279,7 @@ fun LibraryScreen(
     modifier: Modifier = Modifier,
     onDownloads: (() -> Unit)? = null,
     onWatchlist: (() -> Unit)? = null,
-    onContinueWatching: (() -> Unit)? = null,
+    onPreviouslyWatched: (() -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val result = (state as? UiState.Success<LibraryResult>)?.data
@@ -294,8 +294,8 @@ fun LibraryScreen(
     val activeFilters = selectedFilters intersect applicableFilters.toSet()
 
     Column(modifier = modifier.fillMaxSize()) {
-        if (onDownloads != null || onWatchlist != null || onContinueWatching != null) {
-            LibraryEntryCards(onDownloads, onWatchlist, onContinueWatching)
+        if (onDownloads != null || onWatchlist != null || onPreviouslyWatched != null) {
+            LibraryEntryCards(onDownloads, onWatchlist, onPreviouslyWatched)
         }
         LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
         LibrarySegmentChips(segments = segments, active = activeSegment, onSelect = { selectedSegment = it })
@@ -322,7 +322,7 @@ fun LibraryScreen(
 private fun LibraryEntryCards(
     onDownloads: (() -> Unit)?,
     onWatchlist: (() -> Unit)?,
-    onContinueWatching: (() -> Unit)?,
+    onPreviouslyWatched: (() -> Unit)?,
 ) {
     Row(
         modifier = Modifier
@@ -332,7 +332,7 @@ private fun LibraryEntryCards(
     ) {
         onDownloads?.let { LibraryEntryCard("Downloads", "Offline", VortXIcons.download, it, Modifier.weight(1f)) }
         onWatchlist?.let { LibraryEntryCard("Watchlist", "Plan to watch", VortXIcons.starFill, it, Modifier.weight(1f)) }
-        onContinueWatching?.let { LibraryEntryCard("Continue", "Pick up", VortXIcons.playFill, it, Modifier.weight(1f)) }
+        onPreviouslyWatched?.let { LibraryEntryCard("History", "Previously watched", VortXIcons.clock, it, Modifier.weight(1f)) }
     }
 }
 

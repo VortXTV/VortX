@@ -41,6 +41,7 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
     var showHubDiscover by remember { mutableStateOf(prefs.showCollectionsHubDiscover) }
     var refreshCadence by remember { mutableStateOf(prefs.refreshCadence) }
     var mergeDiscoverSearch by remember { mutableStateOf(prefs.mergeDiscoverSearch) }
+    var cinemaQuickView by remember { mutableStateOf(prefs.cinemaQuickView) }
     var regionPreference by remember { mutableStateOf(prefs.regionPreference) }
     var hiddenCategories by remember { mutableStateOf(prefs.hiddenCategories) }
     var showFinancials by remember { mutableStateOf(prefs.showFinancials) }
@@ -54,6 +55,7 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
             showHubDiscover = prefs.showCollectionsHubDiscover
             refreshCadence = prefs.refreshCadence
             mergeDiscoverSearch = prefs.mergeDiscoverSearch
+            cinemaQuickView = prefs.cinemaQuickView
             regionPreference = prefs.regionPreference
             hiddenCategories = prefs.hiddenCategories
             showFinancials = prefs.showFinancials
@@ -103,6 +105,15 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
                     onCheckedChange = {
                         showHubHome = it
                         prefs.showCollectionsHubHome = it
+                    },
+                )
+                ToggleRow(
+                    label = "Open Quick View from Home",
+                    detail = "Preview catalog titles before opening their details. Continue Watching still resumes directly.",
+                    checked = cinemaQuickView,
+                    onCheckedChange = {
+                        cinemaQuickView = it
+                        prefs.cinemaQuickView = it
                     },
                 )
             }

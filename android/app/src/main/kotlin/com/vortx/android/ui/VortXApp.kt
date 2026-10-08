@@ -126,6 +126,7 @@ import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.MergedDiscoverSearchScreen
 import com.vortx.android.ui.screens.MetadataKeysScreen
 import com.vortx.android.ui.screens.PosterStyleScreen
+import com.vortx.android.ui.screens.PreviouslyWatchedScreen
 import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
@@ -272,6 +273,7 @@ fun VortXApp(
             // Search tab is dropped from the bar while the pref is on (Apple `visibleTabs`).
             val homeDiscoverPrefs = remember(appContext) { HomeDiscoverPreferences(appContext) }
             var mergeDiscoverSearch by remember { mutableStateOf(homeDiscoverPrefs.mergeDiscoverSearch) }
+            var cinemaQuickView by remember { mutableStateOf(homeDiscoverPrefs.cinemaQuickView) }
             val visibleTabs = Tab.entries.filter {
                 hiddenTabs.isVisible(it.slot) && !(mergeDiscoverSearch && it == Tab.SEARCH)
             }
@@ -362,6 +364,7 @@ fun VortXApp(
         var showMediaServers by remember { mutableStateOf(false) }
         var showDownloads by remember { mutableStateOf(false) }
         var showWatchlist by remember { mutableStateOf(false) }
+        var showPreviouslyWatched by remember { mutableStateOf(false) }
         var catalogBrowseTarget by remember { mutableStateOf<HomeCatalogTarget?>(null) }
         var quickViewItem by remember { mutableStateOf<MetaItem?>(null) }
         var quickWatchIdentity by remember { mutableStateOf<String?>(null) }
@@ -401,7 +404,10 @@ fun VortXApp(
         // selection to Discover -- or Home if Discover itself is hidden -- exactly like Apple's
         // `.onChange(of: mergeDiscoverSearch)` healer.
         LaunchedEffect(showHomeDiscover) {
-            if (!showHomeDiscover) mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+            if (!showHomeDiscover) {
+                mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+                cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
+            }
         }
         LaunchedEffect(mergeDiscoverSearch, tab) {
             if (mergeDiscoverSearch && tab == Tab.SEARCH) {
@@ -427,6 +433,7 @@ fun VortXApp(
             showMediaServers = false
             showDownloads = false
             showWatchlist = false
+            showPreviouslyWatched = false
             catalogBrowseTarget = null
             quickViewItem = null
             quickWatchIdentity = null
@@ -1099,6 +1106,23 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showPreviouslyWatched) {
+            BackHandler { showPreviouslyWatched = false }
+            val historyVm: LibraryViewModel = viewModel(
+                key = "library-history",
+                factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext),
+            )
+            PreviouslyWatchedScreen(
+                viewModel = historyVm,
+                onBack = { showPreviouslyWatched = false },
+                onItem = { item ->
+                    showPreviouslyWatched = false
+                    onItem(item)
+                },
+            )
+            return@VortXTheme
+        }
+
         if (showPlayback) {
             // Settings > Playback: device-scoped player preferences. Self-contained like the two above
             // (reads and writes the shared `vortx_settings` SharedPreferences the engines already read at
@@ -1422,6 +1446,7 @@ fun VortXApp(
                     onBrowseCatalog = { catalog ->
                         catalogBrowseTarget = HomeCatalogTarget(catalog.id, catalog.title)
                     },
+                    onCatalogItem = if (cinemaQuickView) ({ item -> quickViewItem = item }) else null,
                     onQuickView = { item -> quickViewItem = item },
                 )
                 Tab.DISCOVER -> if (mergeDiscoverSearch) {
@@ -1458,9 +1483,7 @@ fun VortXApp(
                     modifier = content,
                     onDownloads = { showDownloads = true },
                     onWatchlist = { showWatchlist = true },
-                    onContinueWatching = {
-                        catalogBrowseTarget = HomeCatalogTarget("continue", "Continue Watching")
-                    },
+                    onPreviouslyWatched = { showPreviouslyWatched = true },
                 )
                 Tab.SEARCH -> SearchScreen(
                     viewModel<SearchViewModel>(factory = factory),
