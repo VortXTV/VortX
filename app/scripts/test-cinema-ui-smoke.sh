@@ -66,6 +66,7 @@ for native_renderer_contract in \
   'Cinema UI Smoke iPad Pro 13 M5'; do
   rg -Fq "$native_renderer_contract" SourcesiOS/CinemaUISmokeHarness.swift SourcesiOS/CinemaUISmokeIOSRendererApp.swift CinemaUISmokeIOSRenderer.yml scripts/render-cinema-ui-smoke-native.sh
 done
+zsh scripts/test-render-cinema-ui-smoke-native.sh
 if rg -n 'CoreBridge\.shared|StremioAccount\(|PlayerScreen\(' SourcesiOS/CinemaUISmokeIOSRendererApp.swift >/dev/null; then
   print -u2 'native Cinema renderer must not boot production lifecycle owners'
   exit 1

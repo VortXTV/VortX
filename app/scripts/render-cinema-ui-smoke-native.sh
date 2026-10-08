@@ -17,29 +17,29 @@ bundle='com.stremiox.cinema-ui-smoke.ios'
 command -v xcodegen >/dev/null || { print -u2 'xcodegen is required'; exit 1; }
 command -v xcrun >/dev/null || { print -u2 'xcrun is required'; exit 1; }
 mkdir -p "$output"
-print -r -- $'uuid\tname\tbundle' > "$receipt"
 
-create_owned_simulator() {
-  local name="$1"
-  local type="$2"
-  local uuid
-  uuid="$(xcrun simctl create "$name" "$type" "$runtime")"
-  print -r -- "$uuid" | /usr/bin/grep -Eq '^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$' || {
-    print -u2 "unexpected simulator UUID: $uuid"
-    exit 1
-  }
-  print -r -- "$uuid\t$name\t$bundle" >> "$receipt"
-  print "$uuid"
+# A failed prior run retains the IDs it created. Refuse to overwrite that recovery receipt: a human can
+# inspect or explicitly remove only those IDs, while a later renderer invocation cannot mistake them for
+# fresh ownership.
+[[ ! -e "$receipt" ]] || {
+  print -u2 "native Cinema simulator receipt already exists; preserve or recover its exact UUIDs first: $receipt"
+  exit 1
 }
+printf 'uuid\tname\tbundle\n' > "$receipt"
 
-phone_uuid="$(create_owned_simulator 'Cinema UI Smoke iPhone 16 Pro' 'com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro')"
-ipad_uuid="$(create_owned_simulator 'Cinema UI Smoke iPad Pro 13 M5' 'com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M5-12GB')"
-created=("$phone_uuid" "$ipad_uuid")
+created=()
 completed=false
+
+is_uuid() {
+  print -r -- "$1" | /usr/bin/grep -Eq '^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+}
 
 cleanup() {
   local uuid
   for uuid in "${created[@]}"; do
+    # Never aim simctl at arbitrary command output. Invalid data remains in the preserved receipt for
+    # diagnosis, but cannot become a cleanup target.
+    is_uuid "$uuid" || continue
     xcrun simctl terminate "$uuid" "$bundle" >/dev/null 2>&1 || true
     xcrun simctl shutdown "$uuid" >/dev/null 2>&1 || true
     if $completed; then
@@ -48,6 +48,41 @@ cleanup() {
   done
 }
 trap cleanup EXIT
+
+create_owned_simulator() {
+  local name="$1"
+  local type="$2"
+  local uuid
+  if ! uuid="$(xcrun simctl create "$name" "$type" "$runtime")"; then
+    print -u2 "could not create native Cinema simulator: $name"
+    return 1
+  fi
+  # Record the exact command result before validation and before the next create. If a later command
+  # fails, this is the recovery source of truth rather than a truncated/empty receipt.
+  printf '%s\t%s\t%s\n' "$uuid" "$name" "$bundle" >> "$receipt"
+  created+=("$uuid")
+  is_uuid "$uuid" || {
+    print -u2 "unexpected simulator UUID: $uuid"
+    return 1
+  }
+  CREATED_UUID="$uuid"
+}
+
+create_or_preserve() {
+  if ! create_owned_simulator "$1" "$2"; then
+    # `set -e` can skip EXIT cleanup for a failed assignment in some shells. Invoke the same exact-ID
+    # cleanup explicitly before exiting so the first successful create is always shut down and retained
+    # in its receipt; remove the trap to avoid a duplicate cleanup pass.
+    cleanup
+    trap - EXIT
+    exit 1
+  fi
+}
+
+create_or_preserve 'Cinema UI Smoke iPhone 16 Pro' 'com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro'
+phone_uuid="$CREATED_UUID"
+create_or_preserve 'Cinema UI Smoke iPad Pro 13 M5' 'com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M5-12GB'
+ipad_uuid="$CREATED_UUID"
 
 xcodegen generate --spec "$spec" --project "$root"
 xcodebuild \
