@@ -12,18 +12,24 @@ fixture nor this document authorizes the default flip. The installed/public rele
 
 - Reviewed Apple provider intent/ACK handling, account checkpoint recovery, add-on replacement,
   card-level series/season watched actions and library filter retention are integrated.
-- Reviewed Android provider intent/ACK handling and Cinema touch navigation are integrated.
+- Reviewed Android provider intent/ACK handling, atomic authoritative watched batches,
+  ordered add-on replacement and Cinema touch navigation are integrated.
   Library viewing history uses authoritative watched history plus partial Continue Watching,
   not saved membership. CW cards use a typed, one-shot resume intent and fall back to details
   when the device has no matching saved stream.
-- The current real C/JNI fixture is private source `b6de6b861247ab10e304d6686d95660c887c441e`;
-  its immutable library SHA-256 is `34c900f1c64537f275e6eca835925a2e4e8328c4fd801a0986bfbc7e04d7a061`.
-  A newer reviewed website-intent kernel exists, but its host integration and matching fixture
-  are separate pending gates. Do not run new website actions against the older fixture.
+- Reviewed Apple website native/host transactions are integrated and passed the combined live
+  C-ABI suite plus focused checkpoint/conflict/replay tests. They use private source `286a26c`,
+  immutable library SHA-256 `a99af5d5d3148c0ca77299a18c43e11917a5f5d5e22f5b6553c70db509d8bea5`.
+  Earlier provider/API receipts use source `b6de6b86`, library
+  `34c900f1c64537f275e6eca835925a2e4e8328c4fd801a0986bfbc7e04d7a061`.
+  The reviewed own-account import kernel `cf693ddb` has a separate fresh fixture,
+  `7e9d73ce43987f4f690421d4d98305c904f66eaff53d68cbc0e7bb2299e3f719`;
+  authenticated host fetch, own-account rebinding and final packaging remain separate gates.
+  Do not run newer actions against older fixtures or infer package provenance from these tests.
 - Own-streaming-account profile migration and projection remain functional cutover blockers,
   not permission to clear that preference or run those profiles under the owner's identity.
-- Android bulk watched/add-on replacement and durable downloaded-watch receipts are active
-  implementation lanes, not yet covered by the integrated Cinema/provider approvals.
+- Android website transactions and durable downloaded-watch cleanup are separately reviewed
+  integration lanes; their acceptance must include the final account/lifecycle/download lock order.
 - Fresh native-flag Apple Mac/iOS/tvOS compilation succeeded using unsigned, unoptimized
   diagnostic builds. Optimized signed packages, current full Android flavor/ABI packages,
   physical playback and rendered UI verification remain distinct release gates.
@@ -104,7 +110,7 @@ preferences and provider credentials use separately versioned register carriers.
 durable prepared intent, complete OAuth tuples, explicit clears and exact event acknowledgements;
 account/session replacement cannot publish or clear an earlier captured event. Credentials never enter
 the native kernel or bootstrap archive. Website sparse host edits must also prove the exact independent
-host-register base before an atomic native/host commit; that integration remains in progress.
+host-register base before an atomic native/host commit; the reviewed Apple transaction is integrated.
 Pending legacy settings/order edits and explicit legacy-source override refuse a native-only push;
 their dirty acknowledgement cannot be cleared by a carrier that did not export them.
 
@@ -201,7 +207,7 @@ app or media player. The fixture server requires Node 22+ lossless JSON source s
 | Owner lane | Required behavior before selecting native by default |
 | --- | --- |
 | Apple facade | Own-streaming-account profile identity, migration and projection; remaining reachable unsupported actions and full-app parity verification. Offline authenticated checkpoint recovery, native profile CRUD/preferences, authoritative playback/history/stat readers and reviewed Apple bulk watched/add-on actions are implemented behind the gate, not a default cutover. |
-| Android facade | Finish and integrate whole-series/season/individual authoritative watch inventory, add-on URL replacement, native downloaded-watch receipt, and own-streaming-account profiles. Verify remaining interface defaults at their real consumers; a deliberately unused legacy login method is not itself a native auth gap. |
+| Android facade | Integrate and verify website edits, native downloaded-watch receipt and own-streaming-account profiles. Authoritative whole-series/season/individual watch inventory and add-on URL replacement are integrated. Verify remaining interface defaults at their real consumers; a deliberately unused legacy login method is not itself a native auth gap. |
 | Native state integration | Website immutable sparse events, independent host causal bases, atomic receipt/state/host persistence, exact CAS acknowledgements, native-aware website projection, and own-account/ambiguous source cohorts. Shared clocked legacy reconciliation is implemented; that alone does not establish website convergence. |
 | Sources/playback | Integrate provider/debrid resolution, full subtitle options, current source preferences, source-preserving resume, episode/binge selection and download admission. |
 | Native server | Advertise/test NNTP/archive capabilities before changing Node routes; unsupported archives require the supported fallback. |
