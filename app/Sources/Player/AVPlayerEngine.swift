@@ -276,6 +276,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var seekRequestGeneration: UInt64 = 0
     private var preparedSeekTask: Task<Void, Never>?
     private var seekCompletionTimeoutTask: Task<Void, Never>?
+    private var seekDestination = AVPlayerRecoverySettlementPolicy.SeekDestination()
+    private var seekDestinationOwnership: AVPlayerRecoverySettlementPolicy.Ownership {
+        .init(generation: itemGeneration, mountIdentity: playbackMountIdentity, revision: seekRequestGeneration)
+    }
     /// A recovery-position seek shares the normal seek request epoch and HLS admission transaction. This
     /// ticket records only the recovery origin so a later viewer seek can retire it before AVFoundation calls
     /// its completion handler.
@@ -885,6 +889,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// leave a server playhead pinned behind an admission that AVPlayer will never receive.
     @discardableResult
     private func supersedeSeekRequest() -> UInt64 {
+        seekDestination.clear()
         seekEndBoundary.reset()
         seekCompletionTimeoutTask?.cancel()
         seekCompletionTimeoutTask = nil
@@ -910,6 +915,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// of playback ticks: AVFoundation may still be waiting for data and cannot prove its own liveness.
     /// This is one recovery of an explicit seek, not a mid-play watchdog or a reason to change engines.
     private func armSeekCompletionDeadline(requestID: UInt64, sourceSeconds: Double) {
+        guard requestID == seekRequestGeneration else { return }
+        seekDestination.record(sourceSeconds: sourceSeconds, ownership: seekDestinationOwnership)
         seekCompletionTimeoutTask?.cancel()
         let seekItem = item
         let generation = itemGeneration
@@ -934,9 +941,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             if !self.remountForSeek(sourceSeconds: repairSourceSeconds), let loadToken {
                 // A direct asset cannot use the remux seek replacement. Expose a failure instead of
                 // leaving the chrome frozen or manufacturing an EOF that would advance the episode.
-                self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: loadToken)
+                self.emitUnfinishedSeekFailure(sourceSeconds: repairSourceSeconds, loadToken: loadToken)
             }
         }
+    }
+
+    /// Invalidating the failed native request must not discard its destination before the chrome
+    /// reads it for fallback. A newer seek retires both this receipt and its queued error delivery.
+    private func emitUnfinishedSeekFailure(sourceSeconds: Double, loadToken: PlayerLoadToken) {
+        guard loadToken == activeLoadToken else { return }
+        seekDestination.record(sourceSeconds: sourceSeconds, ownership: seekDestinationOwnership)
+        emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.",
+             loadToken: loadToken, seekRequestID: seekRequestGeneration)
     }
 
     private func registerSeekAdmission(
@@ -1042,6 +1058,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     @discardableResult
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
+        let carriedSeekTarget = pendingRequestedSourcePositionSeconds
         invalidateSeekRequests()
         eventOwnedRecoveryTask?.cancel()
         eventOwnedRecoveryTask = nil
@@ -1063,6 +1080,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             terminalClaimed: terminalLatch.hasEmitted)
         if carriesOwnedRecoveryIntent {
             pendingPlaybackIntent = beginPlaybackRemountIntent(from: item)
+            if let carriedSeekTarget { pendingPlaybackIntent?.updateSourceSeconds(carriedSeekTarget) }
         }
         let isIntentRemount = pendingPlaybackIntent != nil
             && (loadToken != nil || carriesOwnedRecoveryIntent)
@@ -2718,11 +2736,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     DiagnosticsLog.log("avplayer", "seek completion interrupted: restoring requested target")
                     let repairSourceSeconds = recoveryRepair?.sourceSeconds ?? sourceSeconds
                     if !self.remountForSeek(sourceSeconds: repairSourceSeconds), let seekLoadToken {
-                        self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: seekLoadToken)
+                        self.emitUnfinishedSeekFailure(sourceSeconds: repairSourceSeconds, loadToken: seekLoadToken)
                     }
                     return
                 }
                 self.seekEndBoundary.finish(requestID: requestID)
+                self.seekDestination.finish(ownership: self.seekDestinationOwnership)
                 _ = self.recoverySeekSettlement.finish(requestID: requestID)
                 if let preparedServer {
                     self.completeSeekAdmission(
@@ -2773,9 +2792,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             origin: remuxTimelineOrigin)
     }
 
-    /// Newest source destination owned by an in-flight replacement. Chrome fallback reads this before stop(),
+    /// Newest source destination owned by an in-flight seek or replacement. Chrome fallback reads this before stop(),
     /// because stop correctly clears every engine transaction and cannot be the point at which resume is derived.
     var pendingRequestedSourcePositionSeconds: Double? {
+        guard activeLoadToken != nil else { return nil }
+        if let target = seekDestination.target(ownership: seekDestinationOwnership) { return target }
         if let pendingSeek, pendingSeek.isFinite { return max(0, pendingSeek) }
         return pendingPlaybackIntent?.sourceSeconds
     }
@@ -3072,10 +3093,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// not rewrite an existing one after capture.
     private func capturePlaybackIntent(from currentItem: AVPlayerItem?) -> PlaybackIntentPolicy.Intent {
         if let intent = pendingPlaybackIntent { return intent }
+        let recoverySourceSeconds = pendingRequestedSourcePositionSeconds ?? playbackPositionSeconds
         if var intent = pendingMediaSelectionIntent {
-            // Position has already been restored, so this is the current live clock rather than the old
+            // Use a newer admitted seek, or the live clock once it settles, rather than the old
             // remount target retained by the selection continuation.
-            intent.updateSourceSeconds(playbackPositionSeconds)
+            intent.updateSourceSeconds(recoverySourceSeconds)
             intent.updateTransport(playbackRequested: playbackRequested, requestedRate: requestedRate)
             return intent
         }
@@ -3094,7 +3116,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             audioGroup.flatMap { Self.selectedIndex(in: $0, item: current) }
         }
         return PlaybackIntentPolicy.Intent(
-            sourceSeconds: playbackPositionSeconds,
+            sourceSeconds: recoverySourceSeconds,
             playbackRequested: playbackRequested,
             requestedRate: requestedRate,
             audioSelectionKnown: !remuxSourceAudioTracks.isEmpty || audioGroup != nil,
@@ -3250,7 +3272,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         audioReplacement = RemuxAudioReplacementPolicy.State(
             rollbackSourceIndex: selectedRemuxAudioSourceIndex,
             targetSourceIndex: id,
-            sourceSeconds: playbackPositionSeconds)
+            sourceSeconds: intent.sourceSeconds)
         mountCurrentAudioReplacement(reason: "audio source selected")
     }
     /// Selecting an embedded/HLS legible track (or turning subtitles Off) also turns OFF any external overlay
@@ -4892,7 +4914,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         finishFailure()
     }
 
-    private func emit(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+    private func emit(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil,
+                      seekRequestID: UInt64? = nil) {
         guard let capturedToken = loadToken ?? activeLoadToken,
               capturedToken == activeLoadToken else { return }
         let capturedItemGeneration = itemGeneration
@@ -4901,7 +4924,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // every event preserves the atomic contract: return/register first, callbacks second.
         DispatchQueue.main.async { [weak self] in
             guard let self, capturedToken == self.activeLoadToken,
-                  capturedItemGeneration == self.itemGeneration else { return }
+                  capturedItemGeneration == self.itemGeneration,
+                  seekRequestID == nil || seekRequestID == self.seekRequestGeneration else { return }
             self.playDelegate?.propertyChange(
                 propertyName: name, data: data, loadToken: capturedToken
             )
