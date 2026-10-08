@@ -61,6 +61,13 @@ enum LocalNNTPPlaybackPolicyTests {
         // Live incident: each accepted reload first-framed at 0.034s and then froze again.
         check(freeze(&policy, owner: 2, start: 40, position: 0.034) == .failover,
               "first frame on same-source reload cannot replenish retry budget")
+        var rapidThenFrozen = Recovery()
+        rapidThenFrozen.recordSameSourceReload()
+        check(freeze(&rapidThenFrozen, owner: 2, start: 0) == .failover,
+              "TV rapid-starvation reload consumes the frozen-cache lane's same-route retry too")
+        var frozenThenRapid = Recovery()
+        check(freeze(&frozenThenRapid, start: 0) == .reload && frozenThenRapid.reloadUsed,
+              "TV frozen-cache reload exposes its spent budget to the rapid-starvation lane")
 
         var healthy = Recovery()
         for tick in 0...30 {
@@ -177,12 +184,25 @@ enum LocalNNTPPlaybackPolicyTests {
               "issued short seek retains its floor until actual landing")
         check(DeferredResumeFloorPolicy.floorAfterAcceptedPlayback(currentFloor: shortFloor, positionSeconds: 2) == nil,
               "accepted short resume landing retires persistence floor")
+        for target in [0.034, 2.0, 5.0] {
+            check(TVLocalNNTPShortResumePolicy.admits(target: target, duration: 1200,
+                      ownedTarget: target, ownerMatches: true), "actual TV resume gate admits owned \(target)s recovery")
+            check(!TVLocalNNTPShortResumePolicy.admits(target: target, duration: 1200,
+                      ownedTarget: target, ownerMatches: false), "actual TV resume gate rejects retired load")
+            check(!TVLocalNNTPShortResumePolicy.admits(target: target, duration: 1200,
+                      ownedTarget: nil, ownerMatches: true), "ordinary TV short resume retains original cutoff")
+        }
+        check(!TVLocalNNTPShortResumePolicy.admits(target: 2, duration: 1200,
+                  ownedTarget: 1, ownerMatches: true), "TV manual target change supersedes short recovery exception")
+        check(!TVLocalNNTPShortResumePolicy.admits(target: 2, duration: 0,
+                  ownedTarget: 2, ownerMatches: true), "TV short recovery waits for duration")
 
         // Exercise wiring that cannot run in this dependency-free harness: pre-admission profile,
         // all-Apple compilation, raw ownership, real transport guards, and the existing resume/hop path.
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         let controller = try String(contentsOf: root.appendingPathComponent("Sources/Player/MPVMetalViewController.swift"), encoding: .utf8)
         let player = try String(contentsOf: root.appendingPathComponent("Sources/PlayerScreen.swift"), encoding: .utf8)
+        let tv = try String(contentsOf: root.appendingPathComponent("SourcesTV/TVPlayerView.swift"), encoding: .utf8)
         func section(_ source: String, _ first: String, _ end: String) -> String {
             let start = source.range(of: first)!
             let finish = source.range(of: end, range: start.upperBound..<source.endIndex)!
@@ -240,6 +260,50 @@ enum LocalNNTPPlaybackPolicyTests {
                              ("private func resetRuntimeForIssuedEpisode", "private func switchStream(")] {
             check(section(player, first, end).contains("localNNTPStallRecovery = .init()"),
                   "accepted manual source/episode replacement resets local retry budget")
+        }
+        let tvWatchdog = section(tv, "private func startStallWatchdog()", "private func rearmAVStallWatchdogItemGenerationIfOwned")
+        check(tvWatchdog.contains("sample: mpv.localNNTPPlaybackSample(owner: owner)")
+              && tvWatchdog.contains("!leftPlayback, !scrubbing, !switchingEpisode, pendingAdvance == nil")
+              && tvWatchdog.contains("inFlightSeekTarget == nil")
+              && tvWatchdog.contains("isPaused: isPaused || playbackDeadlineClock.isPaused"),
+              "TV raw policy suspends stop/pause/scrub/seek/episode transitions")
+        check(tvWatchdog.contains("if atEOFFrozen {")
+              && tvWatchdog.contains("resolveTerminalAdvanceOrExit(reason: \"stall watchdog at EOF\")"),
+              "TV terminal EOF retains its dedicated advance owner")
+        let tvBurst = section(tv, "private func recordRapidBufferingStartIfEligible()", "private func startStallWatchdog()")
+        check(tvBurst.contains("LocalNNTPBufferPolicy.isLocalNNTP(curURL ?? url)")
+              && tvBurst.contains("reloadSameSource: !localNNTPStallRecovery.reloadUsed"),
+              "TV rapid bursts cannot bypass the local same-route reload limit")
+        let tvRecovery = section(tv, "private func recoverFromLocalNNTPStarvation", "private func recoverFromStall(")
+        check(tvRecovery.contains("mpv.activeLoadToken == owner")
+              && tvRecovery.contains("sample.playbackRequested, sample.seekSettled")
+              && tvRecovery.contains("localNNTPStallRecovery.recordSameSourceReload()")
+              && tvRecovery.contains("hopToNextSource(reason: \"local NNTP repeated starvation\", resumeOverride: resume)"),
+              "TV recovery revalidates current intent and retains existing episode/resume/source-hop transaction")
+        check(tvRecovery.components(separatedBy: "armLocalNNTPShortResume(target: resume)").count == 3,
+              "TV accepted retry and hop both retain exact short resume")
+        let tvReload = section(tv, "private func reloadAtPlayhead()", "private func presentTerminalLoadFailure()")
+        let tvRejection = section(tvReload, "guard issuedToken != nil else", "// A newly accepted libmpv mount")
+        check(tvRejection.contains("hasStartedPlaying = previousHasStartedPlaying")
+              && tvRejection.contains("pendingAudioReapply = previousPendingAudioReapply")
+              && tvRejection.contains("pendingSubtitleReapply = previousPendingSubtitleReapply")
+              && tvRejection.contains("return false"), "TV rejected reload restores the authoritative prior surface")
+        let tvResume = section(tv, "private func maybeResume()", "private func saveProgress(")
+        check(tvResume.contains("TVLocalNNTPShortResumePolicy.admits(")
+              && tvResume.contains("ownerMatches: localNNTPShortResume?.owner == coordinator.player?.activeLoadToken")
+              && tvResume.contains("guard r > 5 || shortResumeAdmitted, midPlayRecovery || r < duration - 10"),
+              "TV actual maybeResume uses tested short gate and preserves ordinary near-end behavior")
+        check(tvResume.contains("else if shortResumeAdmitted, hasStartedPlaying")
+              && tvResume.contains("coordinator.player?.seekForResume(to: target)"),
+              "TV late duration issues a warm short seek after first frame instead of stashing forever")
+        let tvSeek = section(tv, "private func retireAbandonedResumeForUserSeek()", "private func cancelPendingLibmpvResumeForUserSeek()")
+        check(tvSeek.contains("localNNTPShortResume = nil") && tvSeek.contains("suppressedResumeFloor = nil"),
+              "TV explicit seek retires the owned short-recovery target and persistence floor")
+        for (first, end) in [("private func resetRuntimeForIssuedSourceSwitch(", "private func switchStream("),
+                             ("private func resetRuntimeForIssuedEpisode()", "private func localPreparedResumeOffset(")] {
+            let reset = section(tv, first, end)
+            check(reset.contains("localNNTPStallRecovery = .init()") && reset.contains("localNNTPShortResume = nil"),
+                  "TV accepted source/episode changes retire prior starvation budget and short-resume authority")
         }
         print("Local NNTP playback policy and wiring: all checks passed")
     }

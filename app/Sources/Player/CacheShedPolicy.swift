@@ -64,6 +64,13 @@ struct LocalNNTPStallRecovery<Owner: Equatable> {
         healthySince = nil
     }
 
+    /// tvOS also detects rapid cache-refill bursts. Both proven starvation lanes must share the
+    /// same retry, so a burst cannot buy an extra reload after a frozen-cache retry (or vice versa).
+    mutating func recordSameSourceReload() {
+        reloadUsed = true
+        suspend()
+    }
+
     mutating func observe(owner: Owner, sample: LocalNNTPPlaybackSample?, now: TimeInterval) -> Action {
         guard let sample else { suspend(); return .generalWatchdog }
         if self.owner != owner || seekGeneration != sample.seekGeneration {

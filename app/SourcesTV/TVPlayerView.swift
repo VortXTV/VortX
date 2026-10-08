@@ -2,6 +2,18 @@ import SwiftUI
 import UIKit
 import os
 
+/// Exact-load opt-in for recovering the opening seconds of a failed local NNTP source.
+/// Ordinary stored resumes and requests belonging to an earlier load retain the existing cutoff.
+enum TVLocalNNTPShortResumePolicy {
+    static func admits(target: Double, duration: Double, ownedTarget: Double?, ownerMatches: Bool) -> Bool {
+        guard ownerMatches, ownedTarget == target, target <= 5 else { return false }
+        return DeferredResumePolicy.decision(
+            targetSeconds: target, observedDurationSeconds: duration, engineDurationSeconds: duration,
+            deadlineReached: false, allowShortResume: true) == .seek(to: target)
+    }
+}
+// END TVLocalNNTPShortResumePolicy
+
 @MainActor private enum TVPlaybackIdleTimer {
     static var lease = PlaybackIdleTimerLease<UUID>()
 
@@ -853,6 +865,8 @@ struct TVPlayerView: View {
     @State private var stalledTicks = 0
     @State private var stallRecoveries = 0
     @State private var stallStableProgressTicks = 0
+    @State private var localNNTPStallRecovery = LocalNNTPStallRecovery<PlayerLoadToken>()
+    @State private var localNNTPShortResume: (owner: PlayerLoadToken, target: Double)?
     @State private var stallNudgesIssued = 0          // B2 seek-nudge counter, per continuous stall episode
     // The six-second playhead watchdog cannot see a source that advances briefly between 0-byte cache refills.
     // This is a separate, edge-driven owner for that rapid loop, bounded to one reload then one source hop.
@@ -1827,6 +1841,7 @@ struct TVPlayerView: View {
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
                 if b {
+                    localNNTPStallRecovery.suspend()
                     if let loadToken {
                         suspendAVPostReplacementFirstFrameDeadlineIfOwned(by: loadToken)
                     }
@@ -4188,6 +4203,8 @@ struct TVPlayerView: View {
         libmpvStartupNudgeIssued = false
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         resetRapidBufferingRecovery(reason: "issued source switch")
+        localNNTPStallRecovery = .init()
+        localNNTPShortResume = nil
         sourceHops = 0; exhaustedURLs = []
         nativeDebridFreshLinkRecovery.reset()
         if userInitiated {
@@ -5235,6 +5252,7 @@ struct TVPlayerView: View {
     /// Track changes and seeks can initiate a legitimate demux refill after their immediate callback has already
     /// completed. Suppress an entire detector window, rather than relying on the shorter-lived in-flight seek bit.
     private func suppressRapidBufferingRecovery(reason: String) {
+        localNNTPStallRecovery.suspend()
         let now = ProcessInfo.processInfo.systemUptime
         rapidBufferingRecovery.reset()
         rapidBufferingSuppressedUntilUptime = max(
@@ -5249,6 +5267,7 @@ struct TVPlayerView: View {
     private func recordRapidBufferingStartIfEligible() {
         let now = ProcessInfo.processInfo.systemUptime
         guard hasStartedPlaying,
+              !leftPlayback, !scrubbing, !playbackDeadlineClock.isPaused, pendingAdvance == nil,
               firstFrameRenderedAt != nil,
               coordinator.player is MPVMetalViewController,
               !isPaused,
@@ -5263,7 +5282,18 @@ struct TVPlayerView: View {
               ),
               !switchingEpisode else { return }
 
-        switch rapidBufferingRecovery.recordBufferingStart(at: now) {
+        let action = rapidBufferingRecovery.recordBufferingStart(at: now)
+        if LocalNNTPBufferPolicy.isLocalNNTP(curURL ?? url),
+           let owner = coordinator.player?.activeLoadToken {
+            switch action {
+            case .none: return
+            case .reloadSameSource, .hopSource:
+                recoverFromLocalNNTPStarvation(
+                    owner: owner, reloadSameSource: !localNNTPStallRecovery.reloadUsed)
+                return
+            }
+        }
+        switch action {
         case .none:
             return
         case .reloadSameSource:
@@ -5297,13 +5327,14 @@ struct TVPlayerView: View {
         lastObservedTime = -1
         stalledTicks = 0
         stallStableProgressTicks = 0
+        localNNTPStallRecovery.suspend()
         stallWatchdog = Task { @MainActor in
             while !Task.isCancelled {
                 try? await Task.sleep(
                     for: .seconds(PlayerMidPlaybackStallPolicy.pollIntervalSeconds)
                 )
                 guard !Task.isCancelled else { return }
-                if episodeInventoryUnavailable { continue }
+                if episodeInventoryUnavailable { localNNTPStallRecovery.suspend(); continue }
                 // A terminal freeze - the play head parked on the FINAL frame at EOF while the next target
                 // resolves - reports paused-for-cache=true (mapped to `buffering`), so the normal buffering-
                 // aware stand-down just below would wait on it forever (diag-22). It is NOT a mid-stream
@@ -5315,6 +5346,7 @@ struct TVPlayerView: View {
                 )
 
                 if atEOFFrozen {
+                    localNNTPStallRecovery.suspend()
                     if lastObservedTime >= 0, abs(currentTime - lastObservedTime) < 0.25 {
                         stalledTicks += 1
                         if stalledTicks >= PlayerMidPlaybackStallPolicy.ordinaryRecoveryTicks {
@@ -5328,9 +5360,11 @@ struct TVPlayerView: View {
                     continue
                 }
 
-                guard PlayerMidPlaybackStallPolicy.shouldObserve(
+                guard !leftPlayback, !scrubbing, !switchingEpisode, pendingAdvance == nil,
+                      inFlightSeekTarget == nil,
+                      PlayerMidPlaybackStallPolicy.shouldObserve(
                     hasStartedPlaying: hasStartedPlaying,
-                    isPaused: isPaused,
+                    isPaused: isPaused || playbackDeadlineClock.isPaused,
                     loadFailed: loadFailed,
                     isLive: isCurrentLiveStream,
                     duration: duration,
@@ -5346,7 +5380,30 @@ struct TVPlayerView: View {
                     lastObservedTime = -1
                     stalledTicks = 0
                     stallStableProgressTicks = 0
+                    localNNTPStallRecovery.suspend()
                     continue
+                }
+
+                if LocalNNTPBufferPolicy.isLocalNNTP(curURL ?? url),
+                   let mpv = coordinator.player as? MPVMetalViewController,
+                   let owner = mpv.activeLoadToken {
+                    let action = localNNTPStallRecovery.observe(
+                        owner: owner, sample: mpv.localNNTPPlaybackSample(owner: owner),
+                        now: ProcessInfo.processInfo.systemUptime)
+                    if action != .generalWatchdog {
+                        lastObservedTime = -1; stalledTicks = 0; stallStableProgressTicks = 0
+                        switch action {
+                        case .reload:
+                            recoverFromLocalNNTPStarvation(owner: owner, reloadSameSource: true)
+                        case .failover:
+                            recoverFromLocalNNTPStarvation(owner: owner, reloadSameSource: false)
+                        case .wait, .generalWatchdog:
+                            break
+                        }
+                        continue
+                    }
+                } else {
+                    localNNTPStallRecovery.suspend()
                 }
 
                 if lastObservedTime < 0 {
@@ -5715,6 +5772,57 @@ struct TVPlayerView: View {
         startLoadTimeout()
     }
 
+    /// Both local article-starvation detectors share one same-source retry. The existing hop
+    /// transaction retains episode identity, manual media selections, resume, and exhausted URLs.
+    private func recoverFromLocalNNTPStarvation(owner: PlayerLoadToken, reloadSameSource: Bool) {
+        guard !leftPlayback, !isPaused, !playbackDeadlineClock.isPaused, !scrubbing,
+              !switchingEpisode, pendingAdvance == nil, inFlightSeekTarget == nil,
+              hasStartedPlaying, !loadFailed,
+              LocalNNTPBufferPolicy.isLocalNNTP(curURL ?? url),
+              let mpv = coordinator.player as? MPVMetalViewController,
+              mpv.activeLoadToken == owner,
+              let sample = mpv.localNNTPPlaybackSample(owner: owner),
+              sample.playbackRequested, sample.seekSettled else {
+            localNNTPStallRecovery.suspend()
+            return
+        }
+        let resume = recoveryResumeTarget()
+        if reloadSameSource, stallRecoveries < 3 {
+            localNNTPStallRecovery.recordSameSourceReload()
+            stallRecoveries += 1
+            stallStableProgressTicks = 0; stallNudgesIssued = 0
+            DiagnosticsLog.log("player", "local NNTP: proven starvation; one same-source retry")
+            if reloadAtPlayhead() {
+                armLocalNNTPShortResume(target: resume)
+                return
+            }
+            // reloadAtPlayhead restored the old mount on command rejection. It is still a proven
+            // starved route, so proceed to the bounded hop instead of repeating the refused command.
+        }
+        DiagnosticsLog.log("player", "local NNTP: starvation retry unavailable or repeated; failing over")
+        if hopToNextSource(reason: "local NNTP repeated starvation", resumeOverride: resume) {
+            armLocalNNTPShortResume(target: resume)
+            return
+        }
+        loadErrorMsg = "Playback kept buffering on this source."
+        presentTerminalLoadFailure()
+    }
+
+    /// Bind the opening-seconds exception only after an accepted replacement. Ordinary saved
+    /// resumes retain maybeResume's five-second cutoff; a different load cannot consume this one.
+    private func armLocalNNTPShortResume(target: Double) {
+        guard target.isFinite, target > 0, target <= 5,
+              let owner = coordinator.player?.activeLoadToken else { return }
+        localNNTPShortResume = (owner, target)
+        resumeSeconds = target
+        resumeIsMidPlayRecovery = true
+        appliedResume = false
+        if let floor = DeferredResumeFloorPolicy.armedFloor(targetSeconds: target, allowShortResume: true) {
+            suppressedResumeFloor = max(suppressedResumeFloor ?? 0, floor)
+            lastSaved = max(lastSaved, suppressedResumeFloor ?? floor)
+        }
+    }
+
     private func recoverFromStall(stalledTicksAtRecovery: Int) {
         if let avPlayer = coordinator.player as? AVPlayerEngineController,
            let expectedItemGeneration = avStallWatchdogItemGeneration {
@@ -5877,7 +5985,8 @@ struct TVPlayerView: View {
 
     /// The shared mid-play same-engine reload: replays the current mount at the live play head. Used by
     /// the stall ladder and by the buffered-retirement gate ahead of an AVPlayer-to-libmpv demote (B3).
-    private func reloadAtPlayhead() {
+    @discardableResult
+    private func reloadAtPlayhead() -> Bool {
         let recoveryToken = coordinator.player is AVPlayerEngineController
             ? coordinator.player?.activeLoadToken : nil
         let recoveryOrigin = recoveryResumeTarget()
@@ -5950,12 +6059,13 @@ struct TVPlayerView: View {
             hasStartedPlaying = previousHasStartedPlaying
             firstFrameRenderedAt = previousFirstFrameRenderedAt
             curURL = previousURL
-            return
+            return false
         }
         // A newly accepted libmpv mount does not own external subtitle rows from the retired controller. Clear
         // bookkeeping only now, never before an accepted load, so a refused recovery cannot duplicate rows.
         if recoveryToken == nil { addedSubURLs = []; addedPooledIDs = [] }
         startLoadTimeout()
+        return true
     }
 
     /// REQ-260721-78 option A (surface side): the ONE way this view publishes a terminal load
@@ -6010,6 +6120,7 @@ struct TVPlayerView: View {
 
     private func viewerPause() {
         guard coordinator.player != nil else { return }
+        localNNTPStallRecovery.suspend()
         recoveryPauseIntent = true
         playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
         refreshPlaybackIdleTimer()
@@ -6035,6 +6146,8 @@ struct TVPlayerView: View {
 
     private func retryPlaybackByUser() {
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
+        localNNTPStallRecovery = .init()
+        localNNTPShortResume = nil
         retryLoad()
         refreshPlaybackIdleTimer()
     }
@@ -6732,6 +6845,13 @@ struct TVPlayerView: View {
     }
 
     private func retireAbandonedResumeForUserSeek() {
+        localNNTPStallRecovery.suspend()
+        if let recovery = localNNTPShortResume,
+           recovery.owner == coordinator.player?.activeLoadToken,
+           suppressedResumeFloor == recovery.target {
+            suppressedResumeFloor = nil
+        }
+        localNNTPShortResume = nil
         if let owner = coordinator.player?.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
         let pending = pendingResumeSurfaceTransfer
         let transferIsCurrent = pending.map { $0.context == resumeSurfaceContext(engine: $0.context.engine) } == true
@@ -9157,6 +9277,8 @@ struct TVPlayerView: View {
         stallRecoveries = 0; stallStableProgressTicks = 0; stalledTicks = 0; stallNudgesIssued = 0
         midPlayBufferedReloadUsed = false; lastObservedTime = -1
         resetRapidBufferingRecovery(reason: "accepted episode issue")
+        localNNTPStallRecovery = .init()
+        localNNTPShortResume = nil
         pendingAudioReapply = nil; pendingSubtitleReapply = nil
         pendingTransportIntent = nil
         pendingBoundaryAdvanceAfterPlay = false
@@ -10587,8 +10709,11 @@ struct TVPlayerView: View {
         // rather than drop the viewer into the last few seconds. A mid-play recovery is the opposite case - the
         // value is the live play head of a mount that just died - so applying it there restarted the whole
         // episode for a source that failed eight seconds from the end. The trivial-position floor still applies
-        // either way.
-        guard r > 5, midPlayRecovery || r < duration - 10 else {
+        // either way, except an exact-owned local-starvation recovery of the opening seconds.
+        let shortResumeAdmitted = TVLocalNNTPShortResumePolicy.admits(
+            target: r, duration: duration, ownedTarget: localNNTPShortResume?.target,
+            ownerMatches: localNNTPShortResume?.owner == coordinator.player?.activeLoadToken)
+        guard r > 5 || shortResumeAdmitted, midPlayRecovery || r < duration - 10 else {
             DiagnosticsLog.log(
                 "playback",
                 String(format: "resume decision=no-seek value=%.3fs duration=%.3fs", r, duration)
@@ -10676,6 +10801,14 @@ struct TVPlayerView: View {
                 coordinator.player?.seekForResume(to: target)
             }
             recoveryPauseTarget = target
+            pendingLibmpvResumeSeek = nil
+        } else if shortResumeAdmitted, hasStartedPlaying {
+            // Duration may arrive after this replacement's first frame. Its one-shot callback
+            // has already run, so issue the warm seek now instead of leaving an unconsumed stash.
+            coordinator.player?.seekForResume(to: target)
+            if let owner = coordinator.player?.activeLoadToken {
+                armPostFrameResumeSeekWatchdog(target: target, owner: owner)
+            }
             pendingLibmpvResumeSeek = nil
         } else {
             pendingLibmpvResumeSeek = target
