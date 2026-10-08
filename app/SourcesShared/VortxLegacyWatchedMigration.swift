@@ -83,6 +83,7 @@ enum VortxLegacyWatchedMigration {
                         profileIDs: [UUID], ownAccountSources: [VortxLegacyBootstrapMaterial.OwnAccountSource] = [],
                         archivedEvidence: [Data] = [], isCurrent: @escaping @Sendable () -> Bool,
                         fetch: Evidence.MetadataFetcher) async throws -> Preparation {
+        try Task.checkCancellation()
         guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
         var candidates = [Candidate]()
         let root = try VortxProfileOverlayWitness.decodeObject(json: document)
@@ -136,6 +137,7 @@ enum VortxLegacyWatchedMigration {
             throw Failure.staleBinding
         }
         for candidate in candidates {
+            try Task.checkCancellation()
             guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
             try Evidence.validateSource(scope: candidate.scope, source: candidate.source, rowLocator: candidate.locator)
             let digest = sha256(candidate.source)
@@ -146,6 +148,7 @@ enum VortxLegacyWatchedMigration {
                 guard sameScope(archive.scope, candidate.scope), archive.source == candidate.source else { throw Failure.staleBinding }
                 let replayed = try Evidence.replay(scope: candidate.scope, source: candidate.source,
                     rowLocator: candidate.locator, addon: archive.addon, metadata: archive.metadata, isCurrent: isCurrent)
+                try Task.checkCancellation()
                 rows.append(ValidatedRow(replayed)); archives.append(archive.bytes)
                 continue
             }
@@ -156,12 +159,15 @@ enum VortxLegacyWatchedMigration {
                 do {
                     let evidence = try await Evidence.capture(scope: candidate.scope, source: candidate.source,
                         rowLocator: candidate.locator, addon: addon, isCurrent: isCurrent, fetch: fetch)
+                    try Task.checkCancellation()
                     captures.append(evidence)
                 } catch {
-                    guard isCurrent(), !Task.isCancelled else { throw Evidence.Failure.admissionRevoked }
+                    try Task.checkCancellation()
+                    guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
                     // A provider failure never establishes an empty inventory or an unwatch.
                 }
             }
+            try Task.checkCancellation()
             guard let accepted = captures.first else {
                 pending.append(.init(scope: candidate.scope, profileID: candidate.scope.profileID, sourceDocument: candidate.source,
                     sourceDocumentSHA256: digest, row: candidate.locator, reason: "episode_inventory_unavailable"))
@@ -175,6 +181,7 @@ enum VortxLegacyWatchedMigration {
             rows.append(ValidatedRow(accepted)); archives.append(try encodeArchive(accepted))
         }
         guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
+        try Task.checkCancellation()
         return Preparation(rows: rows, archives: archives, unresolved: pending)
     }
 
@@ -183,12 +190,15 @@ enum VortxLegacyWatchedMigration {
     static func replay(_ archive: Data, accountID: String, profileID: UUID, ownerProfileID: UUID,
                        verifiedStreamingUID: String?, sourceDocument: Data,
                        isCurrent: @escaping @Sendable () -> Bool) throws -> ValidatedRow {
+        try Task.checkCancellation()
         let retained = try decodeArchive(archive)
         let scope = try Evidence.Scope(accountID: accountID, profileID: profileID,
                                        verifiedStreamingUID: verifiedStreamingUID, ownerProfileID: ownerProfileID)
         guard sameScope(retained.scope, scope), retained.source == sourceDocument else { throw Failure.staleBinding }
-        return ValidatedRow(try Evidence.replay(scope: scope, source: sourceDocument, rowLocator: retained.locator,
-                                               addon: retained.addon, metadata: retained.metadata, isCurrent: isCurrent))
+        let row = ValidatedRow(try Evidence.replay(scope: scope, source: sourceDocument, rowLocator: retained.locator,
+                                                 addon: retained.addon, metadata: retained.metadata, isCurrent: isCurrent))
+        try Task.checkCancellation()
+        return row
     }
 
     /// A sealed host archive can validate historical tuples without authorizing their reuse for a
@@ -226,6 +236,7 @@ enum VortxLegacyWatchedMigration {
             guard let rawBitmap = state["watched"], !(rawBitmap is NSNull) else { continue }
             guard let bitmap = rawBitmap as? String else { throw Failure.malformedArchive }
             if bitmap.isEmpty { continue }
+            guard index < Evidence.maximumSourceRows else { throw Failure.malformedArchive }
             guard let meta = row[ownLibrary ? "_id" : "id"] as? String, !meta.isEmpty,
                   row["type"] as? String == "series" else { throw Failure.malformedArchive }
             result.append(.init(scope: scope, source: source, locator: locator(index), metaID: meta))
@@ -317,7 +328,7 @@ enum VortxLegacyWatchedMigration {
     private static func decodeLocator(_ row: Object) throws -> Evidence.SourceRowLocator {
         guard let kind = row["kind"] as? String, let number = row["index"] as? NSNumber,
               CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue >= 0,
-              number.doubleValue < 10_000, number.doubleValue == Double(number.intValue),
+              number.doubleValue < Double(Evidence.maximumSourceRows), number.doubleValue == Double(number.intValue),
               Set(row.keys) == (kind == "owner_history" ? ["kind", "index", "sourceProfileId"] : ["kind", "index"]) else { throw Failure.malformedArchive }
         let index = number.intValue
         switch kind {

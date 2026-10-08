@@ -25,6 +25,8 @@ enum VortxLegacyWatchedMigrationTests {
 
     static func main() async throws {
         try await capturesAndMergesFreshOwnerEvidence()
+        try await rejectsCancellationAfterFetchReturnsSuccess()
+        try await enforcesSourceRowIndexArchiveBoundary()
         try await coldArchiveReplayIsBoundAndNetworkFree()
         try await historicalOwnerHistoryMapsToResolvedOwner()
         try await rejectsChangedOriginalAddon()
@@ -134,6 +136,60 @@ enum VortxLegacyWatchedMigrationTests {
             try VortxLegacyWatchedMigration.validateArchivedEvidence(first.archives[0],
                 accountID: "account-b", ownerProfileID: ownerID)
         }
+    }
+
+    private static func rejectsCancellationAfterFetchReturnsSuccess() async throws {
+        let document = try ownerDocument()
+        let gate = CancellationGate()
+        let preparation = Task {
+            try await VortxLegacyWatchedMigration.prepare(accountID: "account-a", ownerProfileID: ownerID,
+                document: document, profileIDs: [ownerID], isCurrent: { true }) { request in
+                    // Deliberately ignore Task cancellation and deliver a successful provider response.
+                    await gate.fetchStartedAndWait()
+                    return .init(request: request, raw: metadata())
+                }
+        }
+        await gate.waitForFetchStart()
+        preparation.cancel()
+        await gate.releaseFetch()
+        do {
+            _ = try await preparation.value
+            preconditionFailure("cancelled preparation accepted a late successful fetch")
+        } catch is CancellationError {
+            check(true, "late successful fetch is rejected as canceled work")
+        } catch {
+            preconditionFailure("cancelled preparation failed with the wrong error: \(error)")
+        }
+    }
+
+    private static func enforcesSourceRowIndexArchiveBoundary() async throws {
+        let boundaryDocument = try indexedOwnerDocument(unwatchedRowCount: 9_999)
+        let boundaryCalls = Locked(0)
+        let boundary = try await prepare(document: boundaryDocument) { request in
+            boundaryCalls.modify { $0 += 1 }
+            return .init(request: request, raw: metadata())
+        }
+        check(boundaryDocument.count < 2 * 1024 * 1024, "index 9999 boundary fixture stays below 2 MiB")
+        check(boundaryCalls.value == 1 && boundary.rows.count == 1 && boundary.archives.count == 1,
+              "source row index 9999 remains capturable")
+        let replayCalls = Locked(0)
+        let replayed = try await prepare(document: boundaryDocument, archived: boundary.archives) { request in
+            replayCalls.modify { $0 += 1 }
+            return .init(request: request, raw: metadata())
+        }
+        check(replayCalls.value == 0 && replayed.rows.count == 1,
+              "source row index 9999 archive replays without fetching")
+
+        let outsideDocument = try indexedOwnerDocument(unwatchedRowCount: 10_000)
+        check(outsideDocument.count < 2 * 1024 * 1024, "index 10000 boundary fixture stays below 2 MiB")
+        let outsideCalls = Locked(0)
+        await expectFailure("source row index 10000 rejected before network") {
+            _ = try await prepare(document: outsideDocument) { request in
+                outsideCalls.modify { $0 += 1 }
+                return .init(request: request, raw: metadata())
+            }
+        }
+        check(outsideCalls.value == 0, "out-of-range watched row never starts a metadata request")
     }
 
     private static func rejectsChangedOriginalAddon() async throws {
@@ -398,6 +454,15 @@ enum VortxLegacyWatchedMigrationTests {
         return try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
     }
 
+    private static func indexedOwnerDocument(unwatchedRowCount: Int) throws -> Data {
+        let ordinary: Object = ["id": "tt-unwatched", "type": "movie"]
+        let watched: Object = ["id": "tt2934286", "type": "series", "watched": bitmap]
+        let rows = Array(repeating: ordinary, count: unwatchedRowCount) + [watched]
+        return try JSONSerialization.data(withJSONObject: ["vortx": [
+            "library": rows, "addons": [addon(url: catalogURL, manifest: manifest)]
+        ]], options: [.sortedKeys])
+    }
+
     private static func ownerHistoryDocument() throws -> Data {
         try JSONSerialization.data(withJSONObject: ["vortx": [
             "addons": [addon(url: catalogURL, manifest: manifest)],
@@ -494,4 +559,27 @@ private final class Locked<Value>: @unchecked Sendable {
     init(_ value: Value) { stored = value }
     var value: Value { lock.lock(); defer { lock.unlock() }; return stored }
     func modify(_ body: (inout Value) -> Void) { lock.lock(); defer { lock.unlock() }; body(&stored) }
+}
+
+private actor CancellationGate {
+    private var started = false
+    private var startedContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func fetchStartedAndWait() async {
+        started = true
+        startedContinuation?.resume()
+        startedContinuation = nil
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitForFetchStart() async {
+        guard !started else { return }
+        await withCheckedContinuation { startedContinuation = $0 }
+    }
+
+    func releaseFetch() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
 }

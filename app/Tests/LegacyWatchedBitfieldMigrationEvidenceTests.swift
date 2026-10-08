@@ -17,6 +17,7 @@ enum LegacyWatchedBitfieldMigrationEvidenceTests {
         try await rejectsRevokedAdmission()
         try await validatesOwnSourceIdentity()
         try await validatesResolvedOwnerAndTypedHistory()
+        try await rejectsCancelledColdReplay()
     }
 
     private static func capturesBoundedOriginalEvidence() async throws {
@@ -198,6 +199,19 @@ enum LegacyWatchedBitfieldMigrationEvidenceTests {
             _ = try LegacyWatchedBitfieldMigrationEvidence.replay(scope: scope, source: sharedSource(),
                 rowLocator: .authenticatedOwnerLibrary(index: 0), addon: addon, metadata: metadata(), isCurrent: { false })
         }
+    }
+
+    private static func rejectsCancelledColdReplay() async throws {
+        let scope = try LegacyWatchedBitfieldMigrationEvidence.Scope(accountID: "account-a", profileID: profileID, ownerProfileID: profileID)
+        let replay = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try LegacyWatchedBitfieldMigrationEvidence.replay(scope: scope, source: sharedSource(),
+                rowLocator: .authenticatedOwnerLibrary(index: 0), addon: addon, metadata: metadata(), isCurrent: { true })
+        }
+        do {
+            _ = try await replay.value
+            preconditionFailure("Cancelled cold replay returned evidence")
+        } catch is CancellationError { }
     }
 
     private static func sharedSource() -> Data {

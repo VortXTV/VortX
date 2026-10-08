@@ -9,6 +9,8 @@ import CryptoKit
 /// authenticated document and uses the injected fetcher for exactly one original-addon meta call.
 enum LegacyWatchedBitfieldMigrationEvidence {
     private static let legacyOwnerProfileID = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
+    /// Shared by capture, pending validation, and sidecar replay. An index is zero-based.
+    static let maximumSourceRows = 10_000
     enum Failure: Error, Equatable {
         case malformed(String)
         case admissionRevoked
@@ -62,6 +64,15 @@ enum LegacyWatchedBitfieldMigrationEvidence {
             switch self {
             case .ownAccountLibraryResponse, .ownAccountProfileLibrary, .ownAccountOwnerHistory: return true
             default: return false
+            }
+        }
+
+        var sourceIndex: Int {
+            switch self {
+            case .authenticatedOwnerLibrary(let index), .authenticatedLegacyRootLibrary(let index),
+                 .authenticatedProfileLibrary(let index), .authenticatedOwnerHistory(_, let index),
+                 .ownAccountLibraryResponse(let index), .ownAccountProfileLibrary(let index),
+                 .ownAccountOwnerHistory(let index): return index
             }
         }
     }
@@ -122,13 +133,13 @@ enum LegacyWatchedBitfieldMigrationEvidence {
     static func capture(scope: Scope, source: Data, rowLocator: SourceRowLocator,
                         addon: AuthorizedAddon, isCurrent: @escaping @Sendable () -> Bool,
                         fetch: MetadataFetcher) async throws -> Evidence {
-        guard isCurrent() else { throw Failure.admissionRevoked }
+        try requireAdmission(isCurrent)
         let (sourceTree, row) = try checkedSource(scope: scope, source: source, rowLocator: rowLocator)
         try requireOriginalAddon(sourceTree, locator: rowLocator, expected: addon)
 
         let request = MetadataRequest(scope: scope, addon: addon, type: "series", metaID: row.metaID)
         let response = try await fetch(request)
-        guard isCurrent() else { throw Failure.admissionRevoked }
+        try requireAdmission(isCurrent)
         guard sameRequest(response.request, request) else { throw Failure.malformed("Metadata response belongs to another request") }
         return try replay(scope: scope, source: source, rowLocator: rowLocator, addon: addon, metadata: response.raw, isCurrent: isCurrent)
     }
@@ -137,15 +148,16 @@ enum LegacyWatchedBitfieldMigrationEvidence {
     /// projected inventory or caller-constructed Evidence can bypass source/descriptor validation.
     static func replay(scope: Scope, source: Data, rowLocator: SourceRowLocator, addon: AuthorizedAddon,
                        metadata: Data, isCurrent: @escaping @Sendable () -> Bool) throws -> Evidence {
-        guard isCurrent() else { throw Failure.admissionRevoked }
+        try requireAdmission(isCurrent)
         let (sourceTree, row) = try checkedSource(scope: scope, source: source, rowLocator: rowLocator)
         try requireOriginalAddon(sourceTree, locator: rowLocator, expected: addon)
         let inventory = try inventory(metadata, requestedID: row.metaID)
         let watched = try LegacyWatchedBitfieldDecoder.decode(serialized: row.watchedBitfield, inventory: inventory)
-        guard isCurrent() else { throw Failure.admissionRevoked }
-        return Evidence(scope: scope, rowLocator: rowLocator, metaID: row.metaID, watchedBitfield: row.watchedBitfield,
+        let evidence = Evidence(scope: scope, rowLocator: rowLocator, metaID: row.metaID, watchedBitfield: row.watchedBitfield,
                         addon: addon, source: source, sourceSHA256: sha256(source), metadata: metadata,
                         metadataSHA256: sha256(metadata), inventory: inventory, watchedVideoIDs: watched)
+        try requireAdmission(isCurrent)
+        return evidence
     }
 
     /// Pending evidence still proves which original bitmap was left unresolved, even when no
@@ -155,6 +167,8 @@ enum LegacyWatchedBitfieldMigrationEvidence {
     }
 
     private static func checkedSource(scope: Scope, source: Data, rowLocator: SourceRowLocator) throws -> (StrictJSON.Value, SourceRow) {
+        try Task.checkCancellation()
+        guard (0..<maximumSourceRows).contains(rowLocator.sourceIndex) else { throw Failure.malformed("Invalid source row index") }
         let sourceTree = try StrictJSON.value(source)
         if rowLocator.isOwnAccount {
             guard scope.verifiedStreamingUID != nil, scope.profileID != scope.ownerProfileID else { throw Failure.malformed("Own source requires verified secondary streaming identity") }
@@ -164,7 +178,14 @@ enum LegacyWatchedBitfieldMigrationEvidence {
         }
         let row = try sourceRow(sourceTree, scope: scope, locator: rowLocator)
         guard row.type == "series", !row.metaID.isEmpty, !row.watchedBitfield.isEmpty else { throw Failure.malformed("Source row is not a watched series") }
+        try Task.checkCancellation()
         return (sourceTree, row)
+    }
+
+    private static func requireAdmission(_ isCurrent: @Sendable () -> Bool) throws {
+        try Task.checkCancellation()
+        guard isCurrent() else { throw Failure.admissionRevoked }
+        try Task.checkCancellation()
     }
 
     private struct SourceRow { let metaID: String; let type: String; let watchedBitfield: String }

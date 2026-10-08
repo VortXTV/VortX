@@ -7,6 +7,7 @@ enum VortxLegacyWatchedMetadataTransport {
 
     static func fetch(_ request: LegacyWatchedBitfieldMigrationEvidence.MetadataRequest,
                       send: Send = { try await AuthenticatedHTTPTransport.shared.send($0, allowedHosts: $1, maxResponseBytes: $2) }) async throws -> LegacyWatchedBitfieldMigrationEvidence.MetadataResponse {
+        try Task.checkCancellation()
         guard request.type == "series", !request.metaID.isEmpty,
               var components = URLComponents(string: request.addon.transportURL),
               components.scheme?.lowercased() == "https", let host = components.host, !host.isEmpty,
@@ -27,9 +28,11 @@ enum VortxLegacyWatchedMetadataTransport {
         http.httpMethod = "GET"; http.timeoutInterval = 20
         http.setValue("application/json", forHTTPHeaderField: "Accept")
         let response = try await send(http, [host], 2 * 1024 * 1024)
+        try Task.checkCancellation()
         guard (200..<300).contains(response.statusCode), response.data.count <= 2 * 1024 * 1024 else {
             throw AuthenticatedHTTPTransportError.invalidResponse
         }
+        try Task.checkCancellation()
         return .init(request: request, raw: response.data)
     }
 }
