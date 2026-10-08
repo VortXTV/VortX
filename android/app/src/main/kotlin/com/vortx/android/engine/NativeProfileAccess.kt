@@ -6,6 +6,27 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 internal class NativeProfileAccess(private val session: () -> VortxNativeSession) : NativeProfileGateway {
+    internal class EditTarget internal constructor(internal val runtime: VortxNativeSession, internal val owner: VortxNativeOwner,
+        internal val profileID: String, internal val original: UserProfile?, internal val binding: NativeAccountBinding?)
+    fun captureEdit(profile: UserProfile, adding: Boolean): EditTarget = captureTarget(profile, adding, requireActive = true)
+    fun captureSelection(profile: UserProfile): EditTarget = captureTarget(profile, adding = false, requireActive = false)
+    private fun captureTarget(profile: UserProfile, adding: Boolean, requireActive: Boolean): EditTarget = com.vortx.android.profile.ContinueWatchingOwnerGate.serialized {
+        val runtime = session(); val read = runtime.read()
+        check(!requireActive || adding || read.owner.profileID == profile.id) { "Open this profile through its PIN gate before editing" }
+        val original = projection(read).profiles.singleOrNull { it.id == profile.id }
+        check(if (adding) original == null else original == profile) { "Profile editor source changed" }
+        EditTarget(runtime, read.owner, profile.id, original, original?.let { NativeAccountBinding.read(read.state, it.id) })
+    }
+    /** Preserve ProfileStore's existing lock order; nested store callbacks reenter these same locks. */
+    fun <T> withEditTarget(target: EditTarget, action: () -> T): T = com.vortx.android.profile.ContinueWatchingOwnerGate.serialized {
+        target.runtime.owned(target.owner) {
+            check(session() === target.runtime) { "Profile account changed" }
+            val read = target.runtime.read()
+            check(projection(read).profiles.singleOrNull { it.id == target.profileID } == target.original) { "Profile editor source changed" }
+            target.binding?.let { check(it.matches(NativeAccountBinding.read(read.state, target.profileID))) { "Profile binding changed" } }
+            action()
+        }
+    }
     override fun read(): NativeProfileGateway.Projection = projection(session().read())
     override fun select(id: String): NativeProfileGateway.Projection {
         val runtime = session(); val read = runtime.read()

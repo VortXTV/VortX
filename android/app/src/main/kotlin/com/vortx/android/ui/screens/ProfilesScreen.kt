@@ -25,6 +25,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -33,10 +35,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.vortx.android.BuildConfig
+import com.vortx.android.VortXApplication
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.components.Chip
@@ -46,6 +53,7 @@ import com.vortx.android.ui.screens.profiles.ProfileCustomAvatarField
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
 
 /// Settings > Profiles: the "Who's watching?" switcher plus create / rename / delete, the Android port of
 /// the Apple `ProfilePickerView` + `ProfileEditorView` (`app/SourcesShared/ProfilesView.swift`).
@@ -75,6 +83,24 @@ import com.vortx.android.ui.theme.VortXTheme
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
+    val nativeModel: NativeStreamingAccountViewModel? = if (BuildConfig.NATIVE_ENGINE_ENABLED) {
+        val app = LocalContext.current.applicationContext as? VortXApplication
+        val accounts = remember(app) { runCatching { app?.nativeStreamingAccounts() }.getOrNull() }
+        if (accounts == null) null else viewModel(factory = NativeStreamingAccountViewModel.Factory(accounts))
+    } else null
+    DisposableEffect(nativeModel) { onDispose { nativeModel?.close() } }
+    val nativeState = nativeModel?.state?.collectAsState()?.value
+    if (BuildConfig.NATIVE_ENGINE_ENABLED) {
+        if (nativeModel == null || nativeState == null) { ProfilesUnavailable(onBack, modifier); return }
+        nativeState.formProfile?.let { profile ->
+            NativeStreamingAccountForm(profile, nativeState, nativeModel::submit, nativeModel::close, modifier)
+            return
+        }
+        if (!nativeState.mounted) {
+            NativeStreamingSetup(nativeState, nativeModel::prepare, nativeModel::openPrepared, onBack, modifier)
+            return
+        }
+    }
     val store = ProfileStore.sharedOrNull()
     if (store == null) {
         // Fail-soft: before ProfileStore.init (or if it failed) there is no roster to manage. Mirror the
@@ -85,20 +111,33 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
     // Bumped after any store mutation to force a fresh read of the plain (non-observable) store fields.
     var refresh by remember { mutableStateOf(0) }
-    val roster = remember(refresh) { store.profiles }
-    val activeId = remember(refresh) { store.activeID }
+    val roster = nativeState?.profiles ?: remember(refresh) { store.profiles }
+    val activeId = nativeState?.activeID ?: remember(refresh) { store.activeID }
 
     // The editor overlay (null = closed). Carries the profile being edited and whether it is brand-new; a new
     // draft is minted here so Save can route to add() vs update().
     var editorProfile by remember { mutableStateOf<UserProfile?>(null) }
     var editorIsNew by remember { mutableStateOf(false) }
+    var nativeEditor by remember { mutableStateOf<NativeStreamingAccountViewModel.Editor?>(null) }
     // The PIN gate for switching INTO a locked profile (Apple `ProfilePickerView.pick` -> PinGateOverlay).
-    var pinTarget by remember { mutableStateOf<UserProfile?>(null) }
+    var pinTarget by remember { mutableStateOf<Pair<UserProfile, NativeStreamingAccountViewModel.Editor?>?>(null) }
     // The last account-switch note, shown inline (see the SCOPE note in the header doc).
     var status by remember { mutableStateOf<String?>(null) }
 
-    fun commitSwitch(profile: UserProfile) {
+    fun openEditor(profile: UserProfile, adding: Boolean) {
+        val capture = nativeModel?.captureEditor(profile, adding)
+        if (BuildConfig.NATIVE_ENGINE_ENABLED && capture == null) return
+        nativeEditor = capture; editorProfile = profile; editorIsNew = adding
+    }
+
+    fun commitSwitch(profile: UserProfile, captured: NativeStreamingAccountViewModel.Editor?) {
         status = null
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) {
+            if (captured == null || nativeModel?.commitEditor(captured) { store.select(profile) } != true)
+                status = "The profile changed. Unlock it again before switching."
+            nativeModel?.refresh(); refresh++
+            return
+        }
         // select() applies the profile's theme/filters, fires the reload + rebuild seams, and swaps the watch
         // overlay — the account library is never touched. Its outcome tells the account layer what is left.
         when (val outcome = store.select(profile)) {
@@ -119,7 +158,8 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
             store = store,
             original = editing,
             isNew = editorIsNew,
-            onDone = { editorProfile = null; refresh++ },
+            nativeCommit = nativeEditor?.let { editor -> { action -> nativeModel?.commitEditor(editor, action) == true } },
+            onDone = { editorProfile = null; refresh++; nativeModel?.refresh() },
             onCancel = { editorProfile = null },
             modifier = modifier,
         )
@@ -158,25 +198,37 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                                 if (profile.id == activeId) {
                                     // Editing is only allowed from within the profile itself (Apple's
                                     // isLocked guardrail); the active row therefore opens its own editor.
-                                    editorProfile = profile
-                                    editorIsNew = false
-                                } else if (profile.hasPin) {
-                                    pinTarget = profile   // gate the switch on the PIN
+                                    openEditor(profile, false)
                                 } else {
-                                    commitSwitch(profile)
+                                    val captured = nativeModel?.captureSelection(profile)
+                                    if (!BuildConfig.NATIVE_ENGINE_ENABLED || captured != null) {
+                                        if (profile.hasPin) pinTarget = profile to captured
+                                        else commitSwitch(profile, captured)
+                                    }
                                 }
                             },
                         )
                     }
                     AddProfileRow(onClick = {
-                        editorProfile = UserProfile(
+                        val draft = UserProfile(
                             name = "",
                             avatar = "🎬",
                             accentID = store.active?.accentID ?: "ember",
                         )
-                        editorIsNew = true
+                        openEditor(draft, true)
                     })
                 }
+
+                nativeState?.streaming?.filter { it.profile.id == activeId }?.forEach { entry ->
+                    SettingsSection(title = "This profile's streaming account", footer =
+                        "Sign-in verifies this profile's Stremio identity and imports its independent library and add-ons. The VortX owner account is unchanged.") {
+                        EditorButton("Sign in or change streaming account", true, false, onClick = { nativeModel?.open(entry.profile.id) })
+                        if (entry.pendingOverlay) Text(
+                            "Historical profile data is preserved but still needs source attribution. Linking another account does not assign that history to it.",
+                            style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary), modifier = Modifier.padding(VortXTheme.spacing.sm))
+                    }
+                }
+                nativeState?.message?.let { Text(it, style = VortXTheme.type.label) }
 
                 status?.let { message ->
                     Text(
@@ -190,10 +242,68 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
         pinTarget?.let { target ->
             PinGateOverlay(
-                profile = target,
-                onUnlock = { pinTarget = null; commitSwitch(target) },
+                profile = target.first,
+                onUnlock = { pinTarget = null; commitSwitch(target.first, target.second) },
                 onCancel = { pinTarget = null },
             )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NativeStreamingSetup(state: NativeStreamingAccountViewModel.State, prepare: (String) -> NativeStreamingAccountViewModel.Prepared?,
+                                 open: (NativeStreamingAccountViewModel.Prepared) -> Unit,
+                                 onBack: () -> Unit, modifier: Modifier) {
+    var pinTarget by remember { mutableStateOf<NativeStreamingAccountViewModel.Prepared?>(null) }
+    Box(modifier.fillMaxSize()) {
+        Scaffold(topBar = { TopAppBar(title = { Text("Set up profile accounts") },
+            navigationIcon = { IconButton(onClick = onBack) { Icon(VortXIcons.back, "Back") } }) }) { padding ->
+            Column(Modifier.fillMaxSize().padding(padding).padding(VortXTheme.spacing.edge).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+                Text(if (state.streaming.isEmpty()) "Sign into your VortX account to load its authenticated profiles. No device-local roster will be imported automatically."
+                    else "These profiles use independent streaming accounts. Verify each account before opening the native library; no blank replacement is created.",
+                    style = VortXTheme.type.body)
+                state.streaming.filter { it.pendingImport }.forEach { entry ->
+                    SettingsSection(title = entry.profile.name, footer = "Historical data stays preserved and pending until its original source can be verified.") {
+                        EditorButton("Sign in to this profile", true, false, onClick = {
+                            prepare(entry.profile.id)?.let { captured ->
+                                if (captured.profile.hasPin) pinTarget = captured else open(captured)
+                            }
+                        })
+                    }
+                }
+                state.message?.let { Text(it, style = VortXTheme.type.label) }
+            }
+        }
+        pinTarget?.let { captured -> PinGateOverlay(captured.profile, onUnlock = { pinTarget = null; open(captured) }, onCancel = { pinTarget = null }) }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun NativeStreamingAccountForm(profile: UserProfile, state: NativeStreamingAccountViewModel.State,
+                                       submit: (String, String) -> Unit, close: () -> Unit, modifier: Modifier) {
+    // Deliberately not rememberSaveable: passwords are never placed in Bundle/saved state.
+    var email by remember(profile.id) { mutableStateOf("") }
+    var password by remember(profile.id) { mutableStateOf("") }
+    Scaffold(modifier, topBar = { TopAppBar(title = { Text("Sign in for ${profile.name}") },
+        navigationIcon = { IconButton(onClick = { password = ""; close() }) { Icon(VortXIcons.close, "Cancel") } }) }) { padding ->
+        Column(Modifier.fillMaxSize().padding(padding).padding(VortXTheme.spacing.edge).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+            Text("Use this profile's Stremio account. Its identity is verified before any library is imported. This does not sign the VortX owner into a different account.", style = VortXTheme.type.body)
+            OutlinedTextField(email, { email = it }, label = { Text("Email") }, singleLine = true,
+                enabled = !state.busy, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(password, { password = it }, label = { Text("Password") }, singleLine = true,
+                enabled = !state.busy, visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), modifier = Modifier.fillMaxWidth())
+            state.message?.let { Text(it, style = VortXTheme.type.label.copy(color = VortXTheme.colors.danger)) }
+            EditorButton(if (state.busy) "Verifying account…" else "Verify and link account",
+                !state.busy && email.isNotBlank() && password.isNotEmpty(), true, onClick = {
+                    val submitted = password
+                    password = ""
+                    submit(email, submitted)
+                })
         }
     }
 }
@@ -321,6 +431,7 @@ private fun ProfileEditor(
     store: ProfileStore,
     original: UserProfile,
     isNew: Boolean,
+    nativeCommit: (((() -> Unit)) -> Boolean)? = null,
     onDone: () -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
@@ -335,6 +446,8 @@ private fun ProfileEditor(
     var accentId by remember { mutableStateOf(original.accentID) }
     var oled by remember { mutableStateOf(original.oled) }
     var isKids by remember { mutableStateOf(original.isKids) }
+    var usesOwnAccount by remember { mutableStateOf(original.usesOwnAccount) }
+    var saveError by remember { mutableStateOf<String?>(null) }
     // The PIN field only ever takes a NEW pin (stored pins are salted hashes, never shown). Empty + no
     // explicit remove = keep the existing pin, exactly like Apple's editor.
     var pinText by remember { mutableStateOf("") }
@@ -354,13 +467,19 @@ private fun ProfileEditor(
             // The owner is the account's main profile; it can never be a Kids profile (guarded here as well
             // as by hiding the row below).
             isKids = if (original.isOwner) false else isKids,
+            usesOwnAccount = if (BuildConfig.NATIVE_ENGINE_ENABLED && !original.isOwner) usesOwnAccount else original.usesOwnAccount,
         )
         draft = when {
             removePin -> draft.copy(pin = null)
             pinText.isNotEmpty() -> draft.copy(pin = UserProfile.pinHash(pinText, draft.id))
             else -> draft
         }
-        if (isNew) store.add(draft) else store.update(draft)
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) {
+            if (nativeCommit?.invoke { if (isNew) store.add(draft) else store.update(draft) } != true) {
+                saveError = "Profile changes could not be confirmed. Reopen the account before trying again."
+                return
+            }
+        } else if (isNew) store.add(draft) else store.update(draft)
         onDone()
     }
 
@@ -481,6 +600,15 @@ private fun ProfileEditor(
                 }
             }
 
+            if (BuildConfig.NATIVE_ENGINE_ENABLED && !original.isOwner) {
+                SettingsSection(title = "Streaming library", footer = "Own account creates a separate, pending sign-in. Shared keeps this profile's separate watch history with the owner's add-ons. Existing account slots are retained when switching.") {
+                    Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm), modifier = Modifier.padding(VortXTheme.spacing.sm)) {
+                        Chip(label = "Shared", selected = !usesOwnAccount, onClick = { usesOwnAccount = false })
+                        Chip(label = "Own account", selected = usesOwnAccount, onClick = { usesOwnAccount = true })
+                    }
+                }
+            }
+            saveError?.let { Text(it, style = VortXTheme.type.label.copy(color = VortXTheme.colors.danger)) }
             EditorButton(label = "Save", enabled = canSave, prominent = true, onClick = { save() })
             if (canDelete) {
                 if (!confirmDelete) {
@@ -504,7 +632,12 @@ private fun ProfileEditor(
                             prominent = false,
                             destructive = true,
                             modifier = Modifier.weight(1f),
-                            onClick = { store.remove(original); onDone() },
+                            onClick = {
+                                if (BuildConfig.NATIVE_ENGINE_ENABLED) {
+                                    if (nativeCommit?.invoke { store.remove(original) } == true) onDone()
+                                    else saveError = "The profile changed. Reopen its editor before deleting."
+                                } else { store.remove(original); onDone() }
+                            },
                         )
                         EditorButton(
                             label = "Keep",

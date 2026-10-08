@@ -5,6 +5,14 @@ import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.security.PersistentCredentialSnapshot
 import com.vortx.android.sync.SessionOwnerSnapshot
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withTimeout
+import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -12,6 +20,7 @@ import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 /** Production coordinator + real JNI; all authenticated responses below are synthetic local data. */
+@OptIn(ExperimentalCoroutinesApi::class)
 class NativeOwnAccountCoordinatorTest {
     private val account = SessionOwnerSnapshot.Account("00000000-0000-0000-0000-000000000456", 7)
     private val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Main", avatar = "🍿", isOwner = true)
@@ -137,5 +146,90 @@ class NativeOwnAccountCoordinatorTest {
         proof.put("verifiedStreamingUid", java.util.Base64.getEncoder().encodeToString("{\"authKey\":\"fake-secret\"}".toByteArray()))
         assertTrue(NativeHostDocument.archive(raw).getJSONArray("excludedCredentialPaths").length() > 0)
         assertTrue(runCatching { NativeHostDocument.archive(JSONObject().put("ordinary", uid)) }.isFailure)
+    }
+
+    @Test fun `profile form shows only authenticated setup and clears captured form after verified commit`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val accounts = coordinator(Store(), Journal()); val models = androidx.lifecycle.ViewModelStore()
+        try {
+            assertFalse(accounts.applyDocument(account, document()) { true })
+            val model = NativeStreamingAccountViewModel(accounts).also { models.put("profile-sign-in", it) }
+            assertFalse(model.state.value.mounted)
+            assertEquals(listOf(child.id), model.state.value.profiles.map { it.id })
+            model.open(child.id); assertEquals(child.id, model.state.value.formProfile!!.id)
+            model.submit("fake@example.invalid", "fake-password")
+            val state = withTimeout(5_000) { model.state.first { !it.busy && it.mounted } }
+            assertNull(state.formProfile)
+            assertFalse(state.toString().contains("fake-password")); assertFalse(state.toString().contains("fake-token"))
+            assertTrue(state.streaming.single().pendingOverlay)
+        } finally { models.clear(); accounts.retire(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `form submission cannot recapture a replacement setup or reveal credential error detail`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val journal = Journal(); val store = Store(); val accounts = coordinator(store, journal)
+        val models = androidx.lifecycle.ViewModelStore()
+        try {
+            assertFalse(accounts.applyDocument(account, document()) { true })
+            val model = NativeStreamingAccountViewModel(accounts).also { models.put("profile-sign-in", it) }
+            model.open(child.id)
+            assertFalse(accounts.applyDocument(account, document()) { true })
+            model.submit("fake@example.invalid", "fake-password")
+            val state = withTimeout(5_000) { model.state.first { !it.busy && it.message != null } }
+            assertFalse(state.mounted); assertNotNull(state.formProfile)
+            assertTrue(journal.values.isEmpty()); assertNull(store.value)
+            assertFalse(state.toString().contains("fake-password")); assertFalse(state.toString().contains("fake@example.invalid"))
+            model.close(); assertNull(model.state.value.formProfile)
+        } finally { models.clear(); accounts.retire(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `old PIN dialog cannot recapture a replacement authenticated setup`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val accounts = coordinator(Store(), Journal()); val models = androidx.lifecycle.ViewModelStore()
+        try {
+            val original = document()
+            original.getJSONObject("vortx").getJSONArray("roster").getJSONObject(1).put("pin", UserProfile.pinHash("1234", child.id))
+            assertFalse(accounts.applyDocument(account, original) { true })
+            val model = NativeStreamingAccountViewModel(accounts).also { models.put("profile-sign-in", it) }
+            val beforePin = requireNotNull(model.prepare(child.id))
+            assertEquals(UserProfile.pinHash("1234", child.id), beforePin.profile.pin)
+            val replacement = document()
+            replacement.getJSONObject("vortx").getJSONArray("roster").getJSONObject(1).put("pin", UserProfile.pinHash("5678", child.id))
+            assertFalse(accounts.applyDocument(account, replacement) { true })
+            model.openPrepared(beforePin) // Even a correct old PIN does not authorize the new target.
+            assertNull(model.state.value.formProfile)
+            assertEquals(UserProfile.pinHash("5678", child.id), requireNotNull(model.prepare(child.id)).profile.pin)
+        } finally { models.clear(); accounts.retire(); Dispatchers.resetMain() }
+    }
+
+    @Test fun `editor save delete and add cannot recapture a later binding or profile ABA`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        val accounts = coordinator(Store(), Journal()); val models = androidx.lifecycle.ViewModelStore()
+        try {
+            assertFalse(accounts.applyDocument(account, document()) { true })
+            assertTrue(accounts.signInStreaming(accounts.captureStreamingTarget(child.id), "fake@example.invalid", "fake-password"))
+            val access = NativeProfileAccess { accounts.session() }; access.select(child.id)
+            val model = NativeStreamingAccountViewModel(accounts).also { models.put("profile-sign-in", it) }
+            val original = access.read().profiles.single { it.id == child.id }
+            val editor = requireNotNull(model.captureEditor(original, false))
+            // Same UID relink still rotates immutable binding txn and must invalidate an old editor.
+            assertTrue(accounts.signInStreaming(accounts.captureStreamingTarget(child.id), "fake@example.invalid", "fake-password"))
+            var callback = false
+            assertFalse(model.commitEditor(editor) { callback = true; access.save(original.copy(usesOwnAccount = false), false) })
+            assertFalse(callback)
+            assertFalse(model.commitEditor(editor) { callback = true; access.remove(child.id) })
+            assertFalse(callback); assertEquals("own", NativeAccountBinding.read(accounts.session().read().state, child.id).kind)
+            val draft = child.copy(id = "22222222-2222-2222-2222-222222222222", name = "New")
+            val adding = requireNotNull(model.captureEditor(draft, true))
+            access.select(owner.id); access.select(child.id)
+            assertFalse(model.commitEditor(adding) { callback = true; access.save(draft, true) })
+            assertFalse(callback); assertFalse(access.read().profiles.any { it.id == draft.id })
+            val switching = requireNotNull(model.captureSelection(access.read().profiles.single { it.id == owner.id }))
+            accounts.retire(); assertTrue(accounts.reopenCheckpoint(account) { true })
+            assertFalse(model.commitEditor(switching) { callback = true; access.select(owner.id) })
+            assertFalse(callback) // Same account/profile values after reopen do not revive old PIN admission.
+            access.save(access.read().profiles.single { it.id == child.id }.copy(name = "Remote update"), false)
+            assertEquals("Remote update", model.state.value.profiles.single { it.id == child.id }.name)
+        } finally { models.clear(); accounts.retire(); Dispatchers.resetMain() }
     }
 }

@@ -51,8 +51,9 @@ internal class NativeAccountCoordinator(
                 StreamingProfile(it, false, pending?.has(it.id) == true)
             }
         }
-        return pendingImport?.takeIf { it.isCurrent() && accountCurrent(it.account) }?.profiles.orEmpty()
-            .filter { it.usesOwnAccount && !it.isOwner }.map { StreamingProfile(it, true, true) }
+        val pending = pendingImport?.takeIf { it.isCurrent() && accountCurrent(it.account) } ?: return emptyList()
+        val verified = pending.sources.filter { runCatching { it.withActive {} }.isSuccess }.map { it.profileID }.toSet()
+        return pending.profiles.filter { it.usesOwnAccount && !it.isOwner }.map { StreamingProfile(it, it.id !in verified, true) }
     }
     fun captureStreamingTarget(profileID: String): StreamingTarget {
         mounted.get()?.takeIf { accountCurrent(it.account) }?.let { current ->
@@ -67,6 +68,20 @@ internal class NativeAccountCoordinator(
         val profile = pending.profiles.single { it.id == profileID && it.usesOwnAccount && !it.isOwner }
         return StreamingTarget(pending.account, profile, null, null, pending.id)
     }
+    fun requireStreamingTargetCurrent(target: StreamingTarget) {
+        val session = target.session
+        if (session != null) session.owned(requireNotNull(target.owner)) {
+            check(mounted.get()?.let { it.account == target.account && it.session === session } == true)
+            check(NativeProfileAccess.projection(session.read()).profiles.singleOrNull { it.id == target.profile.id } == target.profile)
+        } else {
+            val pending = checkNotNull(pendingImport)
+            check(pending.id == target.pendingID && pending.account == target.account && pending.isCurrent() && accountCurrent(target.account))
+            check(pending.profiles.singleOrNull { it.id == target.profile.id } == target.profile)
+        }
+    }
+    /** Caller already holds ContinueWatchingOwnerGate -> Session, never acquire either inside auth. */
+    fun withProfileMutation(session: VortxNativeSession, account: SessionOwnerSnapshot.Account, action: () -> Boolean): Boolean =
+        withAccountAdmission(account, { true }) { withMountedSession(session, account, action) }
     suspend fun signInStreaming(target: StreamingTarget, email: String, password: String): Boolean = mutex.withLock {
         val credentials = checkNotNull(ownCredentials) { "Native streaming sign-in unavailable" }
         val admission = checkNotNull(captureOwnAccountAdmission(target.account)) { "Native account authentication changed" }
@@ -250,7 +265,8 @@ internal class NativeAccountCoordinator(
         if (unavailable.isNotEmpty() && !hasNative) {
             // This is an authenticated roster, not a native account. Publish only setup UI; no
             // blank runtime/checkpoint or unscoped global ProfileStore import is manufactured.
-            pendingImport = PendingImport(UUID.randomUUID(), account, document, roster, isCurrent, sources)
+            pendingImport = PendingImport(UUID.randomUUID(), account,
+                NativeProfileOverlayWitness.parseDocument(document.toString().toByteArray(Charsets.UTF_8)), roster, isCurrent, sources.toList())
             changes.value += 1
             return false
         }
