@@ -65,6 +65,7 @@ enum VortxLegacyBootstrapMaterial {
             let library = try ownerLibrary()
             try importOverlays()
             try importOwnerIntents()
+            try validateProfileEdits(ownerLibrary: library)
             var result: Object = [
                 "schemaVersion": 1, "roster": nativeRoster, "deletedProfileIds": deleted.sorted(),
                 "addons": [owner.id.uuidString: addons], "libraries": [owner.id.uuidString: library],
@@ -91,7 +92,7 @@ enum VortxLegacyBootstrapMaterial {
                                     "textScale": Int((profile.textScale * 1000).rounded()),
                                     "languages": languages, "disabledAddons": unique(try disabled.map(normalizeURL))]
             if let playback = profile.playback {
-                var ranking: Object = ["preferred_languages": languages]
+                var ranking: Object = ["preferred_languages": unique(terms(playback.audioLang)).sorted()]
                 if let resolution = playback.maxResolution, resolution != 0 {
                     let values = [480: "480p", 720: "720p", 1080: "1080p", 2160: "2160p", 4000: "2160p"]
                     guard let value = values[resolution] else { throw fail("Unsupported profile resolution cap") }
@@ -151,10 +152,12 @@ enum VortxLegacyBootstrapMaterial {
                 return matches.first ?? url
             }
             var intents: [String: Object] = [:]
+            var publishedStamps = Set<String>()
             for (raw, value) in try object(vortx, "deletedAddonsTs") ?? [:] {
                 guard let entry = value as? Object else { throw fail("Malformed add-on intent") }
                 try require(Set(entry.keys).isSubset(of: ["addedAt", "removedAt"]), "Unsupported add-on intent carrier")
                 let url = try resolve(raw)
+                if try clock(entry, "addedAt") != nil || clock(entry, "removedAt") != nil { publishedStamps.insert(url) }
                 var intent = intents[url] ?? ["transportUrl": url]
                 try mergeClock(entry, into: &intent, from: "addedAt", to: "addedAtMs")
                 try mergeClock(entry, into: &intent, from: "removedAt", to: "removedAtMs")
@@ -164,11 +167,14 @@ enum VortxLegacyBootstrapMaterial {
                 let url = try resolve(raw)
                 // Shipping AddonTombstones migration epoch is 1ms, not a fabricated 'now'.
                 if intents[url]?["addedAtMs"] == nil && intents[url]?["removedAtMs"] == nil {
+                    try require(!publishedStamps.contains(url), "Ambiguous zero-stamp add-on removal requires reconciliation")
                     intents[url] = ["transportUrl": url, "removedAtMs": 1.0]
                 }
             }
             for raw in try strings(document, "webAddonRemovals") {
-                try require(intents[resolve(raw)] != nil, "Unclocked web add-on removal requires reconciliation")
+                let intent = intents[try resolve(raw)] ?? [:]
+                try require((try clock(intent, "addedAtMs") ?? 0) > 0 || (try clock(intent, "removedAtMs") ?? 0) > 0,
+                            "Unclocked web add-on removal requires reconciliation")
             }
             for (url, row) in intents {
                 let added = try clock(row, "addedAtMs") ?? 0, removed = try clock(row, "removedAtMs") ?? 0
@@ -186,6 +192,7 @@ enum VortxLegacyBootstrapMaterial {
             let ownerID = owner.id.uuidString
             let rows = try array(vortx, "library") ?? array(document, "library") ?? []
             var items: [String: Object] = [:], intents: [String: Object] = [:]
+            var removedRows = Set<String>(), publishedStamps = Set<String>()
             var seen = Set<String>()
             for value in rows {
                 guard let row = value as? Object else { throw fail("Malformed owner library row") }
@@ -197,8 +204,9 @@ enum VortxLegacyBootstrapMaterial {
                 if let poster = try optionalString(row, "poster"), !poster.isEmpty { item["poster"] = poster }
                 if try boolean(row, "temp") == true { throw fail("Temporary owner-library membership requires reconciliation") }
                 if try boolean(row, "removed") == true {
-                    guard let at = try clock(row, "eventEpochMs") ?? lastWatched(row), at > 0 else { throw fail("Unclocked owner-library removal") }
-                    intents[key] = ["key": key, "removedAtMs": at]
+                    // eventEpochMs/lastWatched describe viewing, not membership removal. Require
+                    // a separately proven library tombstone below; never promote a viewing clock.
+                    removedRows.insert(key)
                 } else { items[key] = item }
                 try importWatch(ownerID, id, row, history: false, overlay: false)
                 try importMarks(ownerID, id, row, includeUnclocked: true)
@@ -232,6 +240,7 @@ enum VortxLegacyBootstrapMaterial {
                 guard let entry = value as? Object else { throw fail("Malformed library intent") }
                 try require(Set(entry.keys).isSubset(of: ["addedAt", "removedAt"]), "Unsupported library intent carrier")
                 let key = try keyFor(raw)
+                if try clock(entry, "addedAt") != nil || clock(entry, "removedAt") != nil { publishedStamps.insert(key) }
                 var intent = intents[key] ?? ["key": key]
                 try mergeClock(entry, into: &intent, from: "addedAt", to: "addedAtMs")
                 try mergeClock(entry, into: &intent, from: "removedAt", to: "removedAtMs")
@@ -240,8 +249,14 @@ enum VortxLegacyBootstrapMaterial {
             for raw in try strings(vortx, "deletedLibrary") {
                 let key = try keyFor(raw)
                 if intents[key]?["addedAtMs"] == nil && intents[key]?["removedAtMs"] == nil {
+                    try require(!publishedStamps.contains(key), "Ambiguous zero-stamp library removal requires reconciliation")
                     intents[key] = ["key": key, "removedAtMs": 1.0]
                 }
+            }
+            for key in removedRows {
+                let intent = intents[key] ?? [:]
+                try require((try clock(intent, "removedAtMs") ?? 0) > (try clock(intent, "addedAtMs") ?? 0),
+                            "Owner-library removal lacks a proven membership tombstone")
             }
             for (key, row) in intents {
                 let added = try clock(row, "addedAtMs") ?? 0, removed = try clock(row, "removedAtMs") ?? 0
@@ -274,6 +289,7 @@ enum VortxLegacyBootstrapMaterial {
                 }
                 let rows = try objects(bucket, "library")
                 let railTitles = Set(try rows.map { try string($0, "id") })
+                try require(railTitles.count == rows.count, "Duplicate overlay title snapshots require reconciliation")
                 for row in rows {
                     let meta = try string(row, "id")
                     try known(id, meta, row)
@@ -327,7 +343,7 @@ enum VortxLegacyBootstrapMaterial {
             // Ordinary saved rows can contain a synthetic lastWatched. Only a positive position or
             // an explicit genuine-history carrier proves playback; a watched bit alone proves no play.
             let hasProgress = (position ?? 0) > 0 || history
-            if !hasProgress && watched != true && whole != true { return }
+            if !hasProgress && watched != true && whole != true && count == nil { return }
             if hasProgress {
                 try require(played != nil && played! > 0 && position != nil, "Progress lacks a genuine viewing clock")
                 try require(type != "series" || video != nil, "Series progress requires an exact video identity")
@@ -353,6 +369,8 @@ enum VortxLegacyBootstrapMaterial {
             for video in watched.union(marked.keys).union(reset.keys).sorted() {
                 try require(!video.isEmpty, "Empty watched video identity")
                 let ma = try clock(marked, video), ua = try clock(reset, video)
+                let bareWatched = ma == nil && ua == nil && watched.contains(video)
+                if (ma ?? 0) == 0 && (ua ?? 0) == 0 && !bareWatched { continue }
                 if video == meta {
                     try require(titles[profile]?[meta]?["type"] as? String == "movie",
                                 "Whole-title watched intent requires verified movie or episode reconciliation")
@@ -362,7 +380,9 @@ enum VortxLegacyBootstrapMaterial {
                    let duration = try milliseconds(raw, "d") { row["durationMs"] = duration }
                 if let ma, ma > 0 { row["markedAtMs"] = ma }
                 if let ua, ua > 0 { row["resetAtMs"] = ua }
-                if row["markedAtMs"] == nil && row["resetAtMs"] == nil && watched.contains(video) { row["watched"] = true }
+                // Shipping overlay policy distinguishes a present zero sentinel from a missing
+                // operation key: either map key suppresses the older bare w, without minting reset.
+                if bareWatched { row["watched"] = true }
                 if row["markedAtMs"] != nil || row["resetAtMs"] != nil || row["watched"] != nil { watches[profile, default: []].append(row) }
             }
         }
@@ -407,6 +427,47 @@ enum VortxLegacyBootstrapMaterial {
                 }
             }
             titles[profile, default: [:]][meta] = metadata
+        }
+
+        /// Pending web edits are a separate authority channel. A roster snapshot alone cannot prove
+        /// that web membership changes have been consumed; consult only this authenticated carrier.
+        func validateProfileEdits(ownerLibrary: Object) throws {
+            guard let edits = try object(document, "profileEdits") else { return }
+            let rows = try objects(edits, "roster"), adds = try object(edits, "libraryAdds") ?? [:]
+            guard !rows.isEmpty || !adds.isEmpty else { return }
+            guard let at = try clock(edits, "editedAt"), at > 0 else { throw fail("Unclocked profile edits require reconciliation") }
+            if !rows.isEmpty {
+                try require(modified != nil && at <= modified! * 1000, "Pending profile roster edits require reconciliation")
+            }
+            for row in rows {
+                guard let uuid = UUID(uuidString: try string(row, "id")) else { throw fail("Invalid profile edit identity") }
+                let id = uuid.uuidString
+                if try boolean(row, "deleted") == true {
+                    try require(uuid != owner.id && deleted.contains(id), "Profile deletion edit lacks its permanent tombstone")
+                } else {
+                    // Missing IDs are created even by stale web edits in the shipping host.
+                    try require(profiles[id] != nil || deleted.contains(id), "Profile edit identity is absent from resolved roster")
+                }
+            }
+            let ownerItems = try objects(ownerLibrary, "items")
+            let ownerIntents = try objects(ownerLibrary, "intents")
+            for (rawID, raw) in adds {
+                guard let uuid = UUID(uuidString: rawID), let items = raw as? [Object] else { throw fail("Malformed profile library additions") }
+                let id = uuid.uuidString
+                if deleted.contains(id) { continue }
+                try require(profiles[id] != nil, "Library additions reference an unknown profile")
+                if items.isEmpty { continue }
+                // A secondary's old add operation manufactures a zero-offset overlay observation.
+                // An existing progress row does not prove it was applied. Do not emulate that reset.
+                try require(uuid == owner.id, "Secondary profile library additions require an explicit applied receipt")
+                for item in items {
+                    let meta = try string(item, "id"), type = try contentType(item), key = type + ":" + meta
+                    let intent = ownerIntents.first { $0["key"] as? String == key } ?? [:]
+                    let removed = try clock(intent, "removedAtMs") ?? 0, added = try clock(intent, "addedAtMs") ?? 0
+                    let saved = ownerItems.contains { $0["id"] as? String == meta && $0["type"] as? String == type }
+                    try require(saved && removed <= added, "Owner library addition is absent from resolved saved membership")
+                }
+            }
         }
 
         func context(_ profile: String, _ meta: String) -> Object {

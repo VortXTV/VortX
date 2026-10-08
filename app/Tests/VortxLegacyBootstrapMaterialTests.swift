@@ -14,6 +14,7 @@ enum VortxLegacyBootstrapMaterialTests {
         try descriptorAndRemovalPolicies()
         try watchConsolidation()
         try profilePreferencesAndIdentity()
+        try completenessAndClockEvidence()
         try rejectedEvidence()
     }
 
@@ -85,13 +86,14 @@ enum VortxLegacyBootstrapMaterialTests {
         for index in 0..<125 { durable["title-\(index)"] = ["w": ["opaque-\(index)"]] }
         durable["clocked"] = ["w": ["opaque"], "ma": ["opaque": 50.25], "ua": ["opaque": 50.25]]
         durable["zero"] = ["w": ["zero-episode"], "ma": ["zero-episode": 0], "ua": ["zero-episode": 0]]
+        durable["null"] = ["w": ["null-episode"], "ma": ["null-episode": NSNull()]]
         let result = try material(doc(["byProfile": [child.id.uuidString: ["watched": durable]]]))
         let rows = watches(result, profile: child)
         check(rows.count == 127, "No 120-row trimming")
         let tie = rows.first { $0["metaId"] as? String == "clocked" }!
         check(tie["markedAtMs"] as? Double == 50.25 && tie["resetAtMs"] as? Double == 50.25 && tie["watched"] == nil, "Overlay strict mark > reset sent to native")
-        let zero = rows.first { $0["metaId"] as? String == "zero" }!
-        check(zero["watched"] as? Bool == true && zero["markedAtMs"] == nil, "Zero sentinel is absent event")
+        check(!rows.contains { $0["metaId"] as? String == "zero" }, "Present zero map keys suppress stale bare w without invented reset")
+        check(rows.first { $0["metaId"] as? String == "null" }?["watched"] as? Bool == true, "Null operation is missing, unlike a published finite zero")
         var current = movie(position: 1); current["w"] = [String]()
         let stale = try material(doc(["byProfile": [child.id.uuidString: ["library": [current], "watched": ["tt123": ["w": ["stale-episode"]]]]]]))
         check(watches(stale, profile: child).count == 1, "Durable unclocked set cannot resurrect omitted rail marker")
@@ -171,7 +173,7 @@ enum VortxLegacyBootstrapMaterialTests {
         var main = owner
         main.addonPreferences = ProfileAddonPreferences(disabledAddonURLsOverride: ["HTTPS://Example.COM/OwnerCase/manifest.json"])
         var kid = child
-        kid.playback = UserProfile.PlaybackPrefs(audioLang: "en", subtitleLang: "hi", forcedPolicy: "auto", subFont: "system", subSize: "normal", subColor: "white", subBackground: "none")
+        kid.playback = UserProfile.PlaybackPrefs(audioLang: "en, JA, en", subtitleLang: "hi", forcedPolicy: "auto", subFont: "system", subSize: "normal", subColor: "white", subBackground: "none")
         kid.playback?.maxResolution = 4000
         kid.playback?.maxFileSizeGB = 12.5
         kid.playback?.sourceTypeOrder = ["debrid", "torrent"]
@@ -184,6 +186,7 @@ enum VortxLegacyBootstrapMaterialTests {
         let ranking = settings["ranking"] as! Object
         check(ranking["max_resolution"] as? String == "2160p" && ranking["max_filesize_gb"] as? Double == 12.5, "Supported ranking fields")
         check(ranking["source_type_order"] == nil && ranking["keyword_include"] as? [String] == ["atmos", "hdr"], "Transport source classes never cast to native quality classes")
+        check(ranking["preferred_languages"] as? [String] == ["en", "ja"], "Canonical audio languages only; subtitle preference must not rank audio streams")
         kid.addonPreferences = ProfileAddonPreferences(disabledAddonURLsOverride: [])
         let empty = try material(doc(), roster: [main, kid])["roster"] as! [Object]
         check((empty[1]["settings"] as! Object)["disabledAddons"] as? [String] == [], "Explicit empty visibility override survives")
@@ -197,5 +200,37 @@ enum VortxLegacyBootstrapMaterialTests {
         let typed = try material(doc(["deletedLibraryTs": ["series:removed-id": ["removedAt": 1000.125]]]))
         let library = (typed["libraries"] as! [String: Object])[owner.id.uuidString]!
         check((library["intents"] as! [Object])[0]["key"] as? String == "series:removed-id", "Already typed tombstone retained without guessing")
+    }
+
+    static func completenessAndClockEvidence() throws {
+        var removed = movie(position: 1); removed["removed"] = true; removed["eventEpochMs"] = 1000.25
+        try fail(doc(["library": [removed]]), "proven membership tombstone")
+        let proven = try material(doc(["library": [removed], "deletedLibraryTs": ["tt123": ["removedAt": 2000.75]]]))
+        let library = (proven["libraries"] as! [String: Object])[owner.id.uuidString]!
+        check((library["intents"] as! [Object])[0]["removedAtMs"] as? Double == 2000.75, "Removal uses membership clock only")
+        var count = movie(); count["timesWatched"] = 2
+        let row = watches(try material(doc(["library": [count]])))[0]
+        check(row["timesWatched"] as? Int == 2 && row["positionMs"] == nil && row["lastPlayedAtMs"] == nil && row["watched"] == nil, "Count-only metadata remains without fabricated playback")
+        let url = "https://example.com/manifest.json"
+        var web = doc(["deletedAddonsTs": [url: Object()]])
+        web["webAddonRemovals"] = [url]
+        try fail(web, "Unclocked web add-on")
+        try fail(doc(["deletedAddons": [url], "deletedAddonsTs": [url: ["removedAt": 0]]]), "zero-stamp add-on")
+        try fail(doc(["library": [movie()], "deletedLibrary": ["tt123"], "deletedLibraryTs": ["tt123": ["removedAt": 0]]]), "zero-stamp library")
+        var old = movie(position: 1); old["w"] = ["stale-episode"]
+        var newer = movie(position: 2); newer["w"] = [String](); newer["lastWatched"] = "2026-01-02T00:00:00Z"
+        try fail(doc(["byProfile": [child.id.uuidString: ["library": [old, newer]]]]), "Duplicate overlay")
+        var edits = doc(["library": [movie()]])
+        edits["profileEdits"] = ["editedAt": 1720000000000.0, "roster": [["id": child.id.uuidString]], "libraryAdds": [owner.id.uuidString: [["id": "tt123", "type": "movie"]]]]
+        _ = try material(edits)
+        try fail(edits, "Pending profile roster", modified: 1710000000)
+        edits["profileEdits"] = ["editedAt": 1720000000000.0, "libraryAdds": [owner.id.uuidString: [["id": "tt999", "type": "movie"]]]]
+        try fail(edits, "absent from resolved saved")
+        edits["profileEdits"] = ["editedAt": 1720000000000.0, "libraryAdds": [child.id.uuidString: [["id": "tt123", "type": "movie"]]]]
+        try fail(edits, "explicit applied receipt")
+        edits["profileEdits"] = ["editedAt": 1000, "roster": [["id": "30000000-0000-0000-0000-000000000001"]]]
+        try fail(edits, "absent from resolved roster")
+        edits["profileEdits"] = ["editedAt": 1000, "roster": [["id": child.id.uuidString, "deleted": true]]]
+        try fail(edits, "permanent tombstone")
     }
 }
