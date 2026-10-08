@@ -11,7 +11,7 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
     app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift \
-    app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
+    app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
     app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/LinkAuthService.swift app/SourcesShared/VortxNativeOwnAccountProducer.swift \
     "$own_source_dir/UserProfile.swift" "$own_source_dir/Discovery.swift" app/Tests/VortxNativeOwnAccountProducerTests.swift \
     -o "$own_source_dir/own-source"
@@ -25,7 +25,7 @@ if [[ -n "${VORTX_FFI_LIBRARY:-}" ]]; then
         -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST -I "$own_source_dir" \
         app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
         app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift \
-        app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
+        app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
         app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/LinkAuthService.swift app/SourcesShared/VortxNativeOwnAccountProducer.swift \
         "$own_source_dir/UserProfile.swift" "$own_source_dir/Discovery.swift" app/Tests/VortxNativeOwnAccountLiveTests.swift \
         "$VORTX_FFI_LIBRARY" -o "$own_source_dir/own-live"
