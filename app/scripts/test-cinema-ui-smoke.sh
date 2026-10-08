@@ -11,6 +11,7 @@ for source in \
   SourcesiOS/CinemaUISmokeHarness.swift \
   SourcesiOS/CinemaUISmokeRendererApp.swift \
   SourcesiOS/CinemaJSProviderSourceStub.swift \
+  SourcesiOS/CinemaPinnedHTTPClientStub.swift \
   SourcesiOS/VortXiOSApp.swift \
   SourcesShared/WatchedIndex.swift; do
   swiftc -parse "$source"
@@ -70,6 +71,15 @@ rg -Fq 'preconditionFailure("Cinema UI renderer must not construct JSProviderSou
 rg -Fq 'preconditionFailure("Cinema UI renderer must not refresh JSProviderSource")' "$stub"
 if sed '/^[[:space:]]*\/\//d' "$stub" | rg -n 'JSProviderStore|JSProviderRuntime|CommunityStreamGateway|URLSession|NWConnection' >/dev/null; then
   print -u2 'Cinema JS provider stub must remain inert'
+  exit 1
+fi
+
+pinned_stub='SourcesiOS/CinemaPinnedHTTPClientStub.swift'
+rg -Fq '#if CINEMA_UI_SMOKE_RENDERER' "$pinned_stub"
+rg -Fq 'enum PinnedHTTPClient' "$pinned_stub"
+rg -Fq 'preconditionFailure("Cinema UI renderer must not execute PinnedHTTPClient")' "$pinned_stub"
+if sed '/^[[:space:]]*\/\//d' "$pinned_stub" | rg -n 'URLSession|NWConnection|Network|Security|socket' >/dev/null; then
+  print -u2 'Cinema pinned HTTP stub must remain inert'
   exit 1
 fi
 
