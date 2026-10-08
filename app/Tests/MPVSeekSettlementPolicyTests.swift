@@ -120,6 +120,72 @@ enum MPVSeekSettlementPolicyTests {
             seconds: 366, loadToken: owner,
             mpvSeekSettlement: MPVSeekSettlementEvidence(generation: 7, settled: true))
         check(settledEvent.transportSettled, "restart sample can retire resume")
+
+        // Fault injection: dequeue A's native event, delay main delivery, then issue B on the
+        // same source. Exercise the production settlement and EOF policies, not a copied gate.
+        var queued = MPVSeekSettlementPolicy<Int>()
+        var eofRecovery = SeekEOFRecoveryPolicy<Int>()
+        queued.reset(owner: 11)
+        let seekA = queued.beginIssue(owner: 11, seeking: false)!
+        queued.completeIssue(seekA, accepted: true)
+        queued.observeSeek(owner: 11)
+        let dequeuedA = queued.evidence(owner: 11, seeking: true)
+        queued.observeRestart(owner: 11, seeking: false)
+        let positionA = queued.evidence(owner: 11, seeking: false)
+        let seekB = queued.beginIssue(owner: 11, seeking: false)!
+        queued.completeIssue(seekB, accepted: true)
+        eofRecovery.begin(owner: 11, target: 104.146, wasPaused: false, duration: 1418,
+                          origin: .resume, now: 20)
+        if queued.accepts(dequeuedA, owner: 11) { _ = eofRecovery.observeSeek(owner: 11) }
+        check(eofRecovery.current?.phase == .awaitingSeekEvent,
+              "delayed same-file SEEK cannot advance replacement resume B")
+        queued.observeSeek(owner: 11)
+        let dequeuedB = queued.evidence(owner: 11, seeking: true)
+        if queued.accepts(dequeuedB, owner: 11) { _ = eofRecovery.observeSeek(owner: 11) }
+        if queued.accepts(positionA, owner: 11) {
+            eofRecovery.observePosition(owner: 11, position: 93.9, now: 21)
+        }
+        check(eofRecovery.current?.phase == .seekObserved && eofRecovery.current?.positionAfterSeek == nil,
+              "delayed prior position cannot lend B a landing witness")
+        check(eofRecovery.shouldRejectUnsettledEOF(owner: 11, now: 32),
+              "missing actual B landing stays a recoverable error, never false completion")
+        check(!eofRecovery.shouldRecoverEOF(owner: 11, now: 21),
+              "stale A position cannot authorize B's one-shot reopen")
+        queued.observeRestart(owner: 11, seeking: false)
+        let positionB = queued.evidence(owner: 11, seeking: false)
+        if queued.accepts(positionB, owner: 11) {
+            eofRecovery.observePosition(owner: 11, position: 104.18, now: 22)
+        }
+        check(eofRecovery.current?.positionAfterSeek == 104.18,
+              "matching B transport evidence still reaches real EOF policy")
+        let refused = queued.beginIssue(owner: 11, seeking: false)!
+        queued.completeIssue(refused, accepted: false)
+        check(queued.accepts(positionB, owner: 11), "refused replacement seek does not discard B's witness")
+        queued.reset(owner: nil)
+        check(!queued.accepts(dequeuedB, owner: 11), "manual stop retires pending native observations")
+
+        let unknown = MPVSeekNativeSnapshot(position: .nan, seeking: nil, eof: nil, paused: nil,
+            pausedForCache: nil, cacheDuration: nil, cacheEnd: nil, demuxSeeking: nil,
+            lowLevelSeeks: nil, forwardBytes: nil, softwareDecoder: nil).receipt
+        check(unknown.contains("seeking=unknown") && unknown.contains("eof=unknown")
+              && unknown.contains("pos=unknown") && !unknown.contains("=false"),
+              "unavailable raw properties remain unknown instead of manufactured healthy/zero state")
+        let native = MPVSeekNativeSnapshot(position: 104.146, seeking: true, eof: false, paused: false,
+            pausedForCache: false, cacheDuration: 0, cacheEnd: nil, demuxSeeking: 104.146,
+            lowLevelSeeks: 1, forwardBytes: 0, softwareDecoder: true).receipt
+        check(native.contains("pos=104.146 seeking=true eof=false")
+              && native.contains("demuxSeeking=104.146 lowLevelSeeks=1 fwBytes=0 software=true"),
+              "accepted-but-unsettled fixture exposes raw demux state without implying landing")
+
+        let source = try! String(contentsOfFile: "app/Sources/Player/MPVMetalViewController.swift", encoding: .utf8)
+        check(source.contains("guard self.acceptsCurrentSeekEvent(rawSeekEvidence, owner: loadToken) else { return }\n                        let observed = self.seekEOFRecovery.observeSeek"),
+              "production main-queue SEEK delivery executes the exact-generation gate")
+        check(source.contains("guard self.acceptsCurrentSeekEvent(rawSeekEvidence, owner: loadToken) else { return }\n                                            let receipt = self.seekEOFRecovery.current"),
+              "production queued position gate precedes EOF witness mutation")
+        check(source.contains("for delay in [2.0, 6.0, 11.0]")
+              && source.contains("self.seekSettlement.accepts(evidence, owner: owner)")
+              && source.contains("self.seekSettlement.current?.phase != .settled"),
+              "native pending diagnostics are bounded and retired by exact seek/source settlement")
         print("MPV seek settlement policy: PASS")
     }
 }

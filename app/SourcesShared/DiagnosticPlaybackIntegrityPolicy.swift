@@ -333,6 +333,35 @@ struct MPVSeekSettlementEvidence: Equatable, Sendable {
     }
 }
 
+/// Numeric/Boolean native evidence only. Never retain a path, header, decoder log, or URL here.
+/// Missing native properties remain unknown; a synthetic target-shaped time-pos is not landing proof.
+struct MPVSeekNativeSnapshot: Sendable {
+    let position: Double?
+    let seeking: Bool?
+    let eof: Bool?
+    let paused: Bool?
+    let pausedForCache: Bool?
+    let cacheDuration: Double?
+    let cacheEnd: Double?
+    let demuxSeeking: Double?
+    let lowLevelSeeks: Int?
+    let forwardBytes: Int?
+    let softwareDecoder: Bool?
+
+    var receipt: String {
+        func number(_ value: Double?) -> String {
+            guard let value, value.isFinite else { return "unknown" }
+            return String(format: "%.3f", value)
+        }
+        func flag(_ value: Bool?) -> String { value.map { $0 ? "true" : "false" } ?? "unknown" }
+        return "pos=\(number(position)) seeking=\(flag(seeking)) eof=\(flag(eof))"
+            + " paused=\(flag(paused)) cachePaused=\(flag(pausedForCache))"
+            + " cacheSec=\(number(cacheDuration)) cacheEnd=\(number(cacheEnd))"
+            + " demuxSeeking=\(number(demuxSeeking)) lowLevelSeeks=\(lowLevelSeeks.map(String.init) ?? "unknown")"
+            + " fwBytes=\(forwardBytes.map(String.init) ?? "unknown") software=\(flag(softwareDecoder))"
+    }
+}
+
 /// The controller serializes command admission and raw event dequeue under one lock. Native events
 /// have no command ID: overlapping seeks can settle physically without proving command attribution.
 /// A subsequent command after that observed settlement establishes a fresh, unambiguous boundary.

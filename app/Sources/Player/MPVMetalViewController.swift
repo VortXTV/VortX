@@ -170,11 +170,56 @@ final class MPVMetalViewController: PlatformViewController {
     private var seekEOFRecovery = SeekEOFRecoveryPolicy<PlayerLoadToken>()
     /// Protected by loadTokenLock, including command admission and raw event dequeue.
     private var seekSettlement = MPVSeekSettlementPolicy<PlayerLoadToken>()
+    /// A callback can cross the main queue after a newer seek on the SAME file was issued.
+    /// Source ownership alone is insufficient; retain the generation captured at raw dequeue.
+    private func acceptsCurrentSeekEvent(_ evidence: MPVSeekSettlementEvidence?,
+                                         owner: PlayerLoadToken) -> Bool {
+        guard let evidence else { return false }
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        return seekSettlement.accepts(evidence, owner: owner)
+    }
     private func acceptsSettledPosition(_ evidence: MPVSeekSettlementEvidence?,
                                         owner: PlayerLoadToken) -> Bool {
         guard let evidence, evidence.settled else { return false }
-        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
-        return seekSettlement.accepts(evidence, owner: owner)
+        return acceptsCurrentSeekEvent(evidence, owner: owner)
+    }
+
+    /// Called only on the event queue (handle destruction is serialized behind it), while
+    /// loadTokenLock fences the exact accepted source and seek generation.
+    private func nativeSeekSnapshot(handle: OpaquePointer) -> MPVSeekNativeSnapshot {
+        MPVSeekNativeSnapshot(
+            position: diagnosticDouble(MPVProperty.timePos, handle: handle),
+            seeking: diagnosticFlag("seeking", handle: handle),
+            eof: diagnosticFlag("eof-reached", handle: handle),
+            paused: diagnosticFlag(MPVProperty.pause, handle: handle),
+            pausedForCache: diagnosticFlag(MPVProperty.pausedForCache, handle: handle),
+            cacheDuration: diagnosticDouble("demuxer-cache-duration", handle: handle),
+            cacheEnd: diagnosticDouble("demuxer-cache-time", handle: handle),
+            demuxSeeking: diagnosticDouble("demuxer-cache-state/debug-seeking", handle: handle),
+            lowLevelSeeks: diagnosticInt("demuxer-cache-state/debug-low-level-seeks", handle: handle),
+            forwardBytes: diagnosticInt("demuxer-cache-state/fw-bytes", handle: handle),
+            softwareDecoder: diagnosticString("hwdec-current", handle: handle).map { $0 == "no" })
+    }
+
+    /// Three bounded observations of an accepted seek that has not restarted. Supersession,
+    /// settlement, source replacement, or stop makes each pending observation inert. These do
+    /// not seek, change pause/decoder options, or extend the surface's recovery deadline.
+    private func scheduleNativeSeekWitness(owner: PlayerLoadToken, evidence: MPVSeekSettlementEvidence) {
+        for delay in [2.0, 6.0, 11.0] {
+            queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self, let handle = self.mpv else { return }
+                self.loadTokenLock.lock()
+                guard self.loadProvenance.callbackToken(requiresLoadedFile: true) == owner,
+                      self.seekSettlement.accepts(evidence, owner: owner),
+                      self.seekSettlement.current?.phase != .settled else {
+                    self.loadTokenLock.unlock()
+                    return
+                }
+                let snapshot = self.nativeSeekSnapshot(handle: handle)
+                self.loadTokenLock.unlock()
+                DiagnosticsLog.log("playback", "seek-native pending=\(Int(delay))s load=\(owner.hashValue) seek=\(evidence.generation) \(snapshot.receipt)")
+            }
+        }
     }
     private var seekEOFReloadSource: SeekEOFReloadSource?
     private var seekEOFRecoveryTimeout: DispatchWorkItem?
@@ -4001,14 +4046,19 @@ final class MPVMetalViewController: PlatformViewController {
         }
         //print("\(command) -- \(args)")
         let returnValue: Int32
+        var seekWitness: (PlayerLoadToken, MPVSeekSettlementEvidence)?
         if command == "seek" {
             loadTokenLock.lock()
-            let settlementLease = loadProvenance.callbackToken(requiresLoadedFile: true).flatMap {
+            let owner = loadProvenance.callbackToken(requiresLoadedFile: true)
+            let settlementLease = owner.flatMap {
                 seekSettlement.beginIssue(owner: $0, seeking: diagnosticFlag("seeking"))
             }
             returnValue = mpv_command(mpv, &cargs)
             if let settlementLease {
                 seekSettlement.completeIssue(settlementLease, accepted: returnValue >= 0)
+                if returnValue >= 0, let owner {
+                    seekWitness = (owner, .init(generation: settlementLease, settled: false))
+                }
             }
             loadTokenLock.unlock()
         } else {
@@ -4019,6 +4069,9 @@ final class MPVMetalViewController: PlatformViewController {
         }
         if let cb = returnValueCallback {
             cb(returnValue)
+        }
+        if let (owner, evidence) = seekWitness {
+            scheduleNativeSeekWitness(owner: owner, evidence: evidence)
         }
     }
 
@@ -4351,7 +4404,13 @@ final class MPVMetalViewController: PlatformViewController {
                 }
                 let rawRestartPosition = eventID == MPV_EVENT_PLAYBACK_RESTART
                     ? self.diagnosticDouble(MPVProperty.timePos, handle: handle) : nil
+                let nativeSeekSnapshot = (eventID == MPV_EVENT_SEEK || eventID == MPV_EVENT_PLAYBACK_RESTART)
+                    && self.seekSettlement.current != nil ? self.nativeSeekSnapshot(handle: handle) : nil
                 self.loadTokenLock.unlock()
+                if let snapshot = nativeSeekSnapshot, let owner = rawSeekOwner, let evidence = rawSeekEvidence {
+                    let kind = eventID == MPV_EVENT_SEEK ? "seek" : "restart"
+                    DiagnosticsLog.log("playback", "seek-native event=\(kind) load=\(owner.hashValue) seek=\(evidence.generation) settled=\(evidence.settled) attributed=\(evidence.attributed) \(snapshot.receipt)")
+                }
                 if event?.pointee.event_id == MPV_EVENT_NONE {
                     break
                 }
@@ -4568,6 +4627,7 @@ final class MPVMetalViewController: PlatformViewController {
                                                 witness: cacheWitness, lowLevelSeeks: cacheSeeks
                                             )
                                             #endif
+                                            guard self.acceptsCurrentSeekEvent(rawSeekEvidence, owner: loadToken) else { return }
                                             let receipt = self.seekEOFRecovery.current
                                             self.seekEOFRecovery.observePosition(
                                                 owner: loadToken, position: value,
@@ -4631,6 +4691,7 @@ final class MPVMetalViewController: PlatformViewController {
                         #if canImport(UIKit)
                         self.observeCacheReanchorSeek(owner: loadToken, witness: cacheWitness)
                         #endif
+                        guard self.acceptsCurrentSeekEvent(rawSeekEvidence, owner: loadToken) else { return }
                         let observed = self.seekEOFRecovery.observeSeek(owner: loadToken)
                         if observed != nil, let receipt = self.seekEOFRecovery.current,
                            receipt.owner == loadToken, receipt.origin == .resume {
