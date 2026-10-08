@@ -307,6 +307,26 @@ import CryptoKit
         ])
         let ownState: VortxJSON = .object(["roster": .object(["profiles": .object([ownAccount.id.uuidString: ownRecord])])])
         check(try VortxNativeProfiles.project(state: ownState, host: .object([:]), baseline: [ownAccount]).first?.usesOwnAccount == true)
+        let sharedViewer = UserProfile(id: UUID(uuidString: "10000000-0000-0000-0000-000000000002")!, name: "Shared", avatar: "S")
+        var pendingViewer = UserProfile(id: UUID(uuidString: "10000000-0000-0000-0000-000000000003")!, name: "Pending", avatar: "P")
+        pendingViewer.usesOwnAccount = true
+        func profileRecord(_ profile: UserProfile, account: VortxJSON, addons: VortxJSON) -> VortxJSON {
+            .object(["name": .string(profile.name), "owner": .bool(profile.isOwner), "account": account, "addons": addons,
+                     "parental": .object(["kids": .bool(false), "familyEdit": .bool(false)]),
+                     "settings": .object(["accent": .string("ember"), "oled": .bool(false), "textScale": .integer(1000), "disabledAddons": .array([])])])
+        }
+        let mixedRecords: VortxJSON = .object([
+            owner.id.uuidString: profileRecord(owner, account: .object(["kind": .string("local_only")]), addons: .string("own")),
+            sharedViewer.id.uuidString: profileRecord(sharedViewer, account: .object(["kind": .string("shared"), "value": .string(owner.id.uuidString)]), addons: .string("share_primary")),
+            pendingViewer.id.uuidString: profileRecord(pendingViewer, account: .object(["kind": .string("pending_own")]), addons: .string("own")),
+            ownAccount.id.uuidString: profileRecord(ownAccount, account: .object(["kind": .string("own"), "value": .string("verified-own-uid")]), addons: .string("share_primary"))
+        ])
+        let mixedState: VortxJSON = .object(["roster": .object(["profiles": mixedRecords])])
+        let mixedProjection = try VortxNativeProfiles.project(state: mixedState, host: .object([:]), baseline: [owner, sharedViewer, pendingViewer, ownAccount])
+        check(mixedProjection.first(where: { $0.id == owner.id })?.usesOwnAccount == false
+              && mixedProjection.first(where: { $0.id == sharedViewer.id })?.usesOwnAccount == false
+              && mixedProjection.first(where: { $0.id == pendingViewer.id })?.usesOwnAccount == true
+              && mixedProjection.first(where: { $0.id == ownAccount.id })?.usesOwnAccount == true)
         var renamedOwn = ownAccount; renamedOwn.name = "Renamed own account"
         let retainedOwnBinding = try VortxNativeProfiles.mutation(renamedOwn, previous: ownAccount, ownerID: owner.id.uuidString)
         check(retainedOwnBinding.0.count == 1 && retainedOwnBinding.0[0]["type"] == .string("patch_profile"))

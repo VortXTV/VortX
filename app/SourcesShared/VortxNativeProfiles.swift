@@ -191,18 +191,20 @@ enum VortxNativeProfiles {
             // host. Do not reinterpret or reject a historical representation here.
             return false
         }
-        guard !isOwner, record["addons"] == .string("own") else {
-            throw VortxNativeError.invalidSnapshot
-        }
         switch kind {
         case "own":
-            guard case .string(let uid) = binding["value"], validUID(uid) else { throw VortxNativeError.invalidSnapshot }
+            guard !isOwner, case .string(let uid) = binding["value"], validUID(uid),
+                  record["addons"] == .string("own") || record["addons"] == .string("share_primary") else {
+                throw VortxNativeError.invalidSnapshot
+            }
             return true
         case "pending_own":
             // Pending-own has no UID by design.  It must never silently fall back to shared
             // add-ons, otherwise a profile awaiting first-open sign-in can observe another
             // person's resource membership.
-            guard Set(binding.keys) == ["kind"] else { throw VortxNativeError.invalidSnapshot }
+            guard !isOwner, Set(binding.keys) == ["kind"], record["addons"] == .string("own") else {
+                throw VortxNativeError.invalidSnapshot
+            }
             return true
         default:
             return false
