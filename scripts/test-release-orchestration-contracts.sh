@@ -79,6 +79,50 @@ for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
     native_pin="$pin"
 done
 ok "Apple and both Android lanes use one exact native engine revision"
+
+# Execute only the real MPV selection prefix, stopping before its first network/download command.
+# This proves the reviewed default works with empty push/dispatch inputs, overrides are atomic,
+# and the retired digest remains rejected independently of the new EXPECTED digest.
+readonly REVIEWED_MPV_SHA='ccccc9a3faa84276bf10625d652dd4c9eea04c6a0abdc8e26cb1b35f147514fb'
+readonly REVIEWED_MPV_URL='https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-2/mpvkit-dvfel-artifacts-ffmpeg9-20261008.zip'
+readonly LEGACY_MPV_SHA='6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1'
+mpv_selection="$(awk '
+    /name: Fetch the MPVKit-DVFEL artifacts \(pinned, sha256-verified\)/ { step=1; next }
+    step && /^        run: \|$/ { script=1; next }
+    script && /curl -sfL/ { exit }
+    script { sub(/^          /, ""); print }
+' "$APPLE_RELEASE_WF")"
+[[ "$mpv_selection" == *'LEGACY_MPVKIT_SHA256='* && "$mpv_selection" == *'EXPECTED='* ]] \
+    || fail "MPV selection prefix is missing"
+mpv_selected_pair() {
+    REVIEWED_MPVKIT_URL="$1" REVIEWED_MPVKIT_SHA256="$2" \
+        bash -c "$mpv_selection"$'\n''printf "%s\\n%s\\n" "$URL" "$EXPECTED"'
+}
+expected_mpv_pair="$REVIEWED_MPV_URL"$'\n'"$REVIEWED_MPV_SHA"
+[[ "$(mpv_selected_pair '' '')" = "$expected_mpv_pair" ]] \
+    || fail "empty MPV inputs do not select the pinned fresh package"
+[[ "$(mpv_selected_pair "$REVIEWED_MPV_URL" "$REVIEWED_MPV_SHA")" = "$expected_mpv_pair" ]] \
+    || fail "valid explicit fresh MPV pair was rejected"
+for invalid in url-only sha-only bad-sha foreign-url old-sha; do
+    case "$invalid" in
+        url-only) override_url="$REVIEWED_MPV_URL"; override_sha='' ;;
+        sha-only) override_url=''; override_sha="$REVIEWED_MPV_SHA" ;;
+        bad-sha) override_url="$REVIEWED_MPV_URL"; override_sha='latest' ;;
+        foreign-url) override_url='https://example.com/player.zip'; override_sha="$REVIEWED_MPV_SHA" ;;
+        old-sha) override_url="$REVIEWED_MPV_URL"; override_sha="$LEGACY_MPV_SHA" ;;
+    esac
+    if mpv_selected_pair "$override_url" "$override_sha" >/dev/null 2>&1; then
+        fail "MPV selector accepted $invalid override"
+    fi
+done
+require_grep "secretless Apple validation uses the same reviewed MPV digest" \
+    "MPVKIT_ARTIFACTS_SHA256: \"$REVIEWED_MPV_SHA\"" "$VALIDATION_WF"
+grep -Fq "$REVIEWED_MPV_URL" "$VALIDATION_WF" \
+    || fail "secretless Apple validation uses a different MPV URL"
+require_grep "secretless Apple validation retains actual player content verification" \
+    'bash scripts/verify-mpvkit-dvfel-artifacts\.sh "\$DEST"' "$VALIDATION_WF"
+ok "actual MPV selector accepts the reviewed fallback/pair and rejects partial, foreign and legacy inputs"
+
 require_grep "Apple builds the native resource host" \
     'run: ./scripts/build-ffi-xcframework.sh --resource-host$' "$APPLE_RELEASE_WF"
 require_grep "Apple verifies resource and state ABI on warm and cold builds" \

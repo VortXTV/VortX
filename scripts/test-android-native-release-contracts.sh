@@ -78,7 +78,7 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     require_literal "$(basename "$workflow") pins stremiox-core immutably" 'repository: VortXTV/stremiox-core' "$workflow"
     require_regex "$(basename "$workflow") stremiox-core ref is a full SHA" 'ref: [0-9a-f]{40}' "$workflow"
     require_literal "$(basename "$workflow") pins vortx-core immutably" 'repository: VortXTV/vortx-core' "$workflow"
-    require_literal "$(basename "$workflow") enforces the reviewed vortx-core SHA" 'ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4' "$workflow"
+    require_literal "$(basename "$workflow") enforces the reviewed vortx-core SHA" 'feaa0e074133137625e5e143c80715d5cb2a5ffe' "$workflow"
     require_literal "$(basename "$workflow") records the exact fetched Vortx source SHA" 'VORTX_ENGINE_SOURCE_SHA=$vortx_sha' "$workflow"
     require_literal "$(basename "$workflow") verifies artifacts against the source SHA" '--source-sha "$VORTX_ENGINE_SOURCE_SHA"' "$workflow"
     # rust-cache's explicit key survives its lockfile-prefix fallback. Bind that key to the
@@ -132,15 +132,14 @@ require_literal "native resource bridge requires the resource-host ABI" 'nativeR
 require_literal "native resource bridge rejects an unavailable host" 'nativeResourceHostNew()' "$RESOURCE_BRIDGE"
 ok "native mode selects the resource-host repository without packaging the legacy engine"
 
-# Report, but do not alter, the private engine pins. The approved CI replacement is intentionally
-# supplied by the parent after this contract lane; changing a pin here would make this source review
-# conflate selection behavior with a private dependency approval.
+# The parent-approved source revision remains an exact contract, not a mutable branch or
+# a declaration that its separate private CI, SDK and whole-app gates have passed.
 for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     stremio_pin="$(awk '/repository: VortXTV\/stremiox-core/{seen=1; next} seen && /ref:/{print $2; exit}' "$workflow")"
     vortx_pin="$(awk '/repository: VortXTV\/vortx-core/{seen=1; next} seen && /ref:/{print $2; exit}' "$workflow")"
     [[ "$stremio_pin" = "31c66611822043e089f5819ad232a5df93975873" ]] \
       || fail "$(basename "$workflow") changed the retained stremiox-core comparison pin"
-    [[ "$vortx_pin" = "ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4" ]] \
+    [[ "$vortx_pin" = "feaa0e074133137625e5e143c80715d5cb2a5ffe" ]] \
       || fail "$(basename "$workflow") changed the reviewed vortx-core pin"
     printf 'pin: %s stremiox-core=%s vortx-core=%s (parent approval owns replacement)\n' "$(basename "$workflow")" "$stremio_pin" "$vortx_pin"
 done

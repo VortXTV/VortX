@@ -266,12 +266,12 @@ jobs:
 
       - name: Fetch MPVKit-DVFEL artifacts (public release asset, sha256-verified)
         env:
-          MPVKIT_ARTIFACTS_SHA256: "6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1"
+          MPVKIT_ARTIFACTS_SHA256: "ccccc9a3faa84276bf10625d652dd4c9eea04c6a0abdc8e26cb1b35f147514fb"
         run: |
           set -euo pipefail
           DEST="app/Vendor/MPVKit-DVFEL"
           curl -sfL --retry 3 -o "$RUNNER_TEMP/mpvkit.zip" \
-            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-1/mpvkit-dvfel-artifacts.zip"
+            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-2/mpvkit-dvfel-artifacts-ffmpeg9-20261008.zip"
           ACTUAL="$(shasum -a 256 "$RUNNER_TEMP/mpvkit.zip" | cut -d' ' -f1)"
           if [ "$ACTUAL" != "$MPVKIT_ARTIFACTS_SHA256" ]; then
             echo "::error::MPVKit artifact checksum mismatch: expected $MPVKIT_ARTIFACTS_SHA256 got $ACTUAL"
@@ -279,6 +279,7 @@ jobs:
           fi
           rm -rf "$DEST/artifacts"
           unzip -q "$RUNNER_TEMP/mpvkit.zip" -d "$DEST"
+          bash scripts/verify-mpvkit-dvfel-artifacts.sh "$DEST"
 
       - name: Generate CI-only stub engine xcframeworks
         run: |

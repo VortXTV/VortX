@@ -37,12 +37,12 @@ on:
         type: boolean
         default: false
       mpvkit_artifacts_url:
-        description: "Native build: exact reviewed MPVKit artifact URL under this repository's releases/download/. Required with native_only."
+        description: "Optional reviewed MPVKit asset override under this repository's releases/download/. Supply its exact SHA-256 too; otherwise use the pinned FFmpeg 9/SecureTransport package."
         required: false
         type: string
         default: ""
       mpvkit_artifacts_sha256:
-        description: "Native build: SHA-256 of that exact reviewed MPVKit archive. Required with native_only."
+        description: "Optional SHA-256 for the reviewed MPVKit URL override. URL and digest must be supplied together."
         required: false
         type: string
         default: ""
@@ -169,7 +169,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4
+          ref: feaa0e074133137625e5e143c80715d5cb2a5ffe
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -178,7 +178,7 @@ jobs:
         run: |
           set -euo pipefail
           NATIVE_REVISION="$(git -C _vortx_core_src rev-parse HEAD)"
-          [ "$NATIVE_REVISION" = ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4 ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
+          [ "$NATIVE_REVISION" = feaa0e074133137625e5e143c80715d5cb2a5ffe ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
           echo "VORTX_ENGINE_SOURCE_REVISION=$NATIVE_REVISION" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
@@ -186,7 +186,7 @@ jobs:
           test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
           test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
           test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@ec96c6c (promoted from monorepo subdir)"
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@$NATIVE_REVISION (promoted from monorepo subdir)"
 
       - name: Select the newest Xcode on the runner
         run: |
@@ -426,18 +426,20 @@ jobs:
       # runs BEFORE the build, so nothing was produced at all.
       - name: Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)
         env:
-          NATIVE_ONLY: ${{ inputs.native_only }}
           REVIEWED_MPVKIT_URL: ${{ inputs.mpvkit_artifacts_url }}
           REVIEWED_MPVKIT_SHA256: ${{ inputs.mpvkit_artifacts_sha256 }}
         run: |
           set -euo pipefail
           DEST="app/Vendor/MPVKit-DVFEL"
-          EXPECTED="6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1"
-          URL="https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-1/mpvkit-dvfel-artifacts.zip"
-          if [ "$NATIVE_ONLY" = true ]; then
-            [[ "$REVIEWED_MPVKIT_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::native build requires the exact reviewed MPVKit archive SHA-256"; exit 1; }
+          LEGACY_MPVKIT_SHA256="6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1"
+          EXPECTED="ccccc9a3faa84276bf10625d652dd4c9eea04c6a0abdc8e26cb1b35f147514fb"
+          URL="https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-2/mpvkit-dvfel-artifacts-ffmpeg9-20261008.zip"
+          # Empty dispatch inputs (including push events) use the exact reviewed public package.
+          # Overrides are one URL/digest decision; never fall back after a partial or invalid pair.
+          if [ -n "$REVIEWED_MPVKIT_URL" ] || [ -n "$REVIEWED_MPVKIT_SHA256" ]; then
+            [[ "$REVIEWED_MPVKIT_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::MPVKit override requires the exact reviewed archive SHA-256"; exit 1; }
             [[ "$REVIEWED_MPVKIT_URL" =~ ^https://github\.com/VortXTV/VortX/releases/download/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.zip$ ]] || { echo "::error::native MPVKit URL must identify an exact repository release asset"; exit 1; }
-            [ "$REVIEWED_MPVKIT_SHA256" != "$EXPECTED" ] || { echo "::error::the old FFmpeg 8/GnuTLS package cannot supply a native release"; exit 1; }
+            [ "$REVIEWED_MPVKIT_SHA256" != "$LEGACY_MPVKIT_SHA256" ] || { echo "::error::the old FFmpeg 8/GnuTLS package cannot supply a native release"; exit 1; }
             EXPECTED="$REVIEWED_MPVKIT_SHA256"
             URL="$REVIEWED_MPVKIT_URL"
           fi
