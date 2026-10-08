@@ -1,11 +1,16 @@
 package com.vortx.android.ui.screens
 
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.UiState
@@ -55,22 +60,16 @@ fun MergedDiscoverSearchScreen(
         onItem(it)
     }
 
-    Column(modifier = modifier.fillMaxSize()) {
-        quickActions?.invoke()
-        SearchField(
-            query = query,
-            onQueryChange = searchViewModel::onQueryChange,
-            onSubmit = searchViewModel::submitQuery,
-            onClear = { searchViewModel.onQueryChange("") },
-        )
+    @Composable
+    fun BrowseOrResults(contentModifier: Modifier) {
         if (hasQuery) {
             when (val s = searchState.content) {
-                is UiState.Loading -> EmptyState("Searching your add-ons…", Modifier.weight(1f))
-                is UiState.Error -> ErrorState(s.message, modifier = Modifier.weight(1f))
+                is UiState.Loading -> EmptyState("Searching your add-ons…", contentModifier)
+                is UiState.Error -> ErrorState(s.message, modifier = contentModifier)
                 is UiState.Success -> PosterGrid(
                     items = s.data,
                     onItem = openItem,
-                    modifier = Modifier.weight(1f),
+                    modifier = contentModifier,
                     emptyHint = when (val message = searchEmptyMessage(query, s)) {
                         null -> ""
                         else -> stringResource(message.textResourceId)
@@ -84,11 +83,45 @@ fun MergedDiscoverSearchScreen(
             DiscoverScreen(
                 viewModel = discoverViewModel,
                 onItem = onItem,
-                modifier = Modifier.weight(1f),
+                modifier = contentModifier,
                 signedIn = true,
                 hideLive = hideLive,
                 reselectSignal = reselectSignal,
             )
+        }
+    }
+
+    // On a phone held landscape (and on compact tablets), a top-pinned field leaves too little height
+    // for filter chips and a meaningful result grid. Keep the same field, query gate, and Discover owner,
+    // but give browse/results a wide reading pane. Portrait remains the familiar vertical composition.
+    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
+        val useLandscapePane = maxWidth >= 600.dp && maxWidth > maxHeight
+        if (useLandscapePane) {
+            Row(modifier = Modifier.fillMaxSize()) {
+                Column(
+                    modifier = Modifier.widthIn(max = 360.dp).fillMaxHeight(),
+                ) {
+                    quickActions?.invoke()
+                    SearchField(
+                        query = query,
+                        onQueryChange = searchViewModel::onQueryChange,
+                        onSubmit = searchViewModel::submitQuery,
+                        onClear = { searchViewModel.onQueryChange("") },
+                    )
+                }
+                BrowseOrResults(Modifier.weight(1f))
+            }
+        } else {
+            Column(modifier = Modifier.fillMaxSize()) {
+                quickActions?.invoke()
+                SearchField(
+                    query = query,
+                    onQueryChange = searchViewModel::onQueryChange,
+                    onSubmit = searchViewModel::submitQuery,
+                    onClear = { searchViewModel.onQueryChange("") },
+                )
+                BrowseOrResults(Modifier.weight(1f))
+            }
         }
     }
 }
