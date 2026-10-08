@@ -63,7 +63,7 @@ private func warmFetchEpisodeStreams(
 
 /// Structured, bounded account add-on fetch for iOS/macOS preparation. The user's sticky provider enters the
 /// first five-wide window, ordinary providers keep a short cap, and results return to account order for rank.
-private func warmFetchEpisodeSourceGroups(
+func warmFetchEpisodeSourceGroups(
     sources: [StreamSource],
     request: NextEpisodePreparationRequest,
     wantedAddon: String?
@@ -115,7 +115,7 @@ private func warmFetchEpisodeSourceGroups(
 /// Retire one raw-torrent preparation exactly once. A season-pack request can point at the hash already
 /// feeding the current episode; that engine remains under the ordinary player lifecycle and must not be
 /// removed by a canceled E+1 preload.
-private func retireWarmTorrentEngine(
+func retireWarmTorrentEngine(
     _ lease: PreparedTorrentEngineLease,
     reason: String
 ) {
@@ -134,7 +134,7 @@ private func retireWarmTorrentEngine(
 
 /// Start the exact tracker-bearing embedded torrent engine and retain its ownership receipt. A ranged media
 /// GET is forbidden until this returns a lease whose create completed with a 2xx response.
-private func prepareWarmTorrentEngine(
+func prepareWarmTorrentEngine(
     _ stream: CoreStream,
     request: NextEpisodePreparationRequest
 ) async -> PreparedTorrentEngineLease? {
@@ -4559,11 +4559,9 @@ struct iOSEpisodeStreams: View {
     @StateObject private var sourceIndex = SourceIndexServeSource()
     // Media servers (Plex/Jellyfin/Emby) for THIS episode: direct-play hits resolved by SxEy. Dormant with no server.
     @StateObject private var mediaServers = MediaServerSource()
-    /// Separate episode-preparation contributors. The visible episode source list keeps owning the three
-    /// objects above while the player prepares a later episode behind it.
-    @StateObject private var preloadTorboxSearch = TorBoxSearchSource()
-    @StateObject private var preloadSourceIndex = SourceIndexServeSource()
-    @StateObject private var preloadMediaServers = MediaServerSource()
+    /// A distinct provider-owner scope for this detail player. Its state never leaks into the visible
+    /// source list or a later CW launch.
+    @StateObject private var nextEpisodePreparer = iOSNextEpisodePreparer()
 
     /// A series pin is keyed by the show id, so every episode shares the pinned provider/quality.
     private var pinContext: SourcePinContext { SourcePinContext(metaId: meta.id, isSeries: true) }
@@ -4759,7 +4757,7 @@ struct iOSEpisodeStreams: View {
                     seriesInventoryAuthority: .launch,
                     loadEpisode: { await loadEpisodeStream($0) },
                     loadEpisodeWithMetadata: { await loadEpisodeStream($0.id, refreshedVideo: $0) },
-                    warmNextEpisode: { await warmEpisodeStream($0) },
+                    warmNextEpisode: { await nextEpisodePreparer.warm($0, context: nextEpisodePreparationContext()) },
                     // Engine feed only: the ACCOUNT write lives in PlayerScreen.saveAccountProgress, keyed on
                     // curMeta, so a binge advance attributes progress to the CURRENT episode (capturing
                     // launch.meta here saved every advance's progress against the launch episode).
@@ -5647,6 +5645,44 @@ struct iOSEpisodeStreams: View {
         )
     }
 
+    /// Builds a fresh fence at the moment PlayerScreen requests E+1 work. The video supplier consults the
+    /// current title metadata first, so a player that launched before its series inventory arrived can warm
+    /// a later successor without issuing `core.loadMeta` or mutating the current playback slot.
+    private func nextEpisodePreparationContext() -> iOSNextEpisodePreparationContext {
+        let expectedProfileID = profiles.activeID
+        let expectedAccountBoundary = account.credentialBoundaryGeneration
+        let expectedTraktSession = initialTraktSessionID
+        return iOSNextEpisodePreparationContext(
+            seriesID: meta.id, seriesName: meta.name, defaultSeason: season,
+            defaultVideoID: meta.behaviorHints?.defaultVideoId, poster: meta.poster,
+            sources: account.streamSources, continuity: rememberedQuality, binge: lastBinge,
+            pin: sourcePin, cachedHashes: debridCache.cachedHashes,
+            signedInToVortX: VortXSyncManager.shared.isSignedIn,
+            videos: {
+                let current = core.metaDetails?.meta
+                guard current?.id == meta.id, let videos = current?.videos, !videos.isEmpty else {
+                    return seasonEpisodes
+                }
+                return videos.orderedBySeasonEpisode
+            },
+            resumeOffset: { playbackMeta in await localResume(playbackMeta) },
+            isCurrent: {
+                profiles.activeID == expectedProfileID
+                    && account.credentialBoundaryGeneration == expectedAccountBoundary
+                    && (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession)
+            }
+        )
+    }
+
+    /// Compatibility entry point retained while callers migrate to the reusable per-player preparer.
+    /// The PlayerScreen closure above is the only active path; this delegates so detail and CW cannot drift.
+    private func warmEpisodeStream(
+        _ request: NextEpisodePreparationRequest
+    ) async -> PlayerEpisodeStream? {
+        await nextEpisodePreparer.warm(request, context: nextEpisodePreparationContext())
+    }
+
+    /*
     /// F6 preload: warm the next episode's likely source without disturbing the playing episode. Fetch
     /// its streams directly from every add-on (never `core.loadMeta`, which would evict the current
     /// episode's slot), rank with the same continuity hint, then start the chosen torrent's peer search
@@ -5938,6 +5974,7 @@ struct iOSEpisodeStreams: View {
             settlement: decision
         )
     }
+    */
 }
 
 // MARK: - iOS / macOS presentation helpers

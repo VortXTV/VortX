@@ -3772,6 +3772,9 @@ struct iOSPlayerLaunch: Identifiable {
     /// Resolver for an exact CoreVideo admitted by PlayerScreen's request-owned authoritative refresh. This
     /// remains available even when the launch inventory was empty, so a newly surfaced successor can play.
     var loadEpisodeWithMetadata: ((CoreVideo) async -> PlayerEpisodeStream?)? = nil
+    /// The same bounded E+1 preparation contract used by the detail player. nil remains correct for movies,
+    /// downloads, and pasted links; a CW series launch supplies a per-launch owner below.
+    var warmNextEpisode: ((NextEpisodePreparationRequest) async -> PlayerEpisodeStream?)? = nil
     /// A Continue-Watching launch carries the identity needed for one owned,
     /// deferred source contribution after the player exits.
     var resumeHoardContentID: String? = nil
@@ -3805,6 +3808,7 @@ extension View {
                 audioSidecarURL: item.audioSidecarURL,
                 episodes: item.episodes, loadEpisode: item.loadEpisode,
                 loadEpisodeWithMetadata: item.loadEpisodeWithMetadata,
+                warmNextEpisode: item.warmNextEpisode,
                 // Feed the engine Player so Continue Watching updates live + watched time is tracked (the
                 // direct-resume / paste-a-link path was missing this, like the detail covers). It's keyed off
                 // the engine's loaded Player, so it runs regardless of `item.meta` and no-ops if none is loaded.
@@ -3835,6 +3839,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     guard expectedTraktSession == nil
             || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let pid = ProfileStore.shared.activeID
+    let accountBoundary = account.credentialBoundaryGeneration
     guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
         LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
     }
@@ -3880,8 +3885,9 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // entry carries debrid provenance; a non-debrid entry returns the stored url unchanged (refreshed == false),
     // so torrent / plain-direct resumes are byte-identical to before.
     let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
-    guard expectedTraktSession == nil
-            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+          ProfileStore.shared.activeID == pid,
+          account.credentialBoundaryGeneration == accountBoundary else { return nil }
     let playURL = refreshed ? resolvedURL : url
     if hasEpisodicPhysicalIdentity, entry.torrent == true, entry.fileIdx == nil, !refreshed {
         LastStreamStore.logResume("episodeTorrentMissingFileIdx", libraryId: item.id, profileID: pid)
@@ -3941,6 +3947,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     var episodes: [PlayerEpisodeRef] = []
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
     var loadEpisodeWithMetadata: ((CoreVideo) async -> PlayerEpisodeStream?)? = nil
+    var warmNextEpisode: ((NextEpisodePreparationRequest) async -> PlayerEpisodeStream?)? = nil
     var enginePlayerVideoId: String? = nil
     var launchSource: CoreStream? = nil
     if usesSeriesLifecycle {
@@ -4012,6 +4019,36 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                 return resolved
             }
         }
+        // Do not freeze `allSeriesVideos`: a direct-resume player can mount before the series inventory
+        // settles, then run for many minutes before PlayerScreen reaches its preparation threshold. The
+        // supplier reads the exact current title metadata at THAT point and the captured owner/profile/
+        // credential fence rejects a replacement account or profile before and after every async stage.
+        let preparer = iOSNextEpisodePreparer()
+        warmNextEpisode = { request in
+            let valid = {
+                ProfileStore.shared.activeID == pid
+                    && account.credentialBoundaryGeneration == accountBoundary
+                    && (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession)
+            }
+            let context = iOSNextEpisodePreparationContext(
+                seriesID: item.id, seriesName: entry.name, defaultSeason: season,
+                defaultVideoID: nil, poster: entry.poster, sources: account.streamSources,
+                continuity: entry.qualityText, binge: entry.bingeGroup, pin: SourcePinStore.shared.effectivePin(
+                    SourcePinContext(metaId: item.id, isSeries: true)), cachedHashes: [],
+                signedInToVortX: VortXSyncManager.shared.isSignedIn,
+                videos: {
+                    guard core.metaDetails?.meta?.id == item.id else { return [] }
+                    return (core.metaDetails?.meta?.videos ?? []).orderedBySeasonEpisode
+                },
+                resumeOffset: { playbackMeta in
+                    if let engine = core.engineResumeSeconds(for: playbackMeta) { return engine }
+                    return await account.resumeOffset(for: playbackMeta)
+                },
+                isCurrent: valid
+            )
+            guard valid() else { return nil }
+            return await preparer.warm(request, context: context)
+        }
     }
     if hasEpisodicPhysicalIdentity {
         let groups = core.streamGroups(forStreamId: entry.videoId)
@@ -4045,8 +4082,9 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             )
         }
     }
-    guard expectedTraktSession == nil
-            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+          ProfileStore.shared.activeID == pid,
+          account.credentialBoundaryGeneration == accountBoundary else { return nil }
     return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,
                            resume: resume, meta: meta,
                            qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
@@ -4056,6 +4094,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                            wasExplicitPick: wasExplicitPick, wasResume: true,
                            episodes: episodes, loadEpisode: loadEpisode,
                            loadEpisodeWithMetadata: loadEpisodeWithMetadata,
+                           warmNextEpisode: warmNextEpisode,
                            resumeHoardContentID: resumeHoardContentID,
                            resumeHoardStreamID: resumeHoardContentID == nil ? nil : entry.videoId)
 }
