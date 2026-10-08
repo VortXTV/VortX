@@ -87,6 +87,7 @@ struct iOSRootView: View {
     }
 
     @State private var tab: Tab = .home
+    @State private var homeBrowse = false
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     #if os(macOS)
@@ -130,6 +131,9 @@ struct iOSRootView: View {
     /// Merge Discover + Search into one surface (Settings toggle, default OFF, reversible). When ON the
     /// Search tab is dropped from the bar and Discover hosts an inline search field; OFF keeps them separate.
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
+    /// A reversible presentation fold; the existing Discover filters, search, and paging stay owned
+    /// by iOSDiscoverView. An absent key defaults to the unified Cinema landing surface.
+    @AppStorage("vortx.mergeHomeDiscover") private var mergeHomeDiscover = true
     @Environment(\.openURL) private var openURL
     /// The profile roster + launch-picker gate, shared with every surface. When the roster has more than
     /// one profile and none has been chosen this launch, the "Who's watching?" picker is owed at cold
@@ -296,6 +300,7 @@ struct iOSRootView: View {
         // bar can never point at a screen it no longer shows (the tvOS RootTabView twin does the same).
         .onChange(of: hideDiscoverTab) { hidden in
             if hidden, tab == .discover { tab = .home }
+            if hidden { homeBrowse = false }
         }
         .onChange(of: hideLibraryTab) { hidden in
             if hidden, tab == .library { tab = .home }
@@ -307,7 +312,16 @@ struct iOSRootView: View {
             // Search folds into Discover: if the bar was pointing at the now-dropped Search tab, land
             // on Discover, unless Discover itself is hidden in Settings > Tab bar (#117 rule: never
             // route to a hidden tab, fall back to Home like every other healer).
-            if merged, tab == .search { tab = hideDiscoverTab ? .home : .discover }
+            if merged, tab == .search { selectTab(hideDiscoverTab ? .home : .discover) }
+        }
+        .onChange(of: mergeHomeDiscover) { merged in
+            if merged, tab == .discover {
+                homeBrowse = !hideDiscoverTab
+                tab = .home
+            } else if !merged, tab == .home, homeBrowse {
+                homeBrowse = false
+                tab = hideDiscoverTab ? .home : .discover
+            }
         }
         .onAppear {
             updates.startMonitoring()   // cached result immediately, network at most once per day
@@ -325,12 +339,12 @@ struct iOSRootView: View {
             if dest == .search {
                 macSearchPresented = true
                 macSearchFocused = true
-                tab = searchDestination
+                selectTab(searchDestination)
                 return
             }
             // Same rule for every other Go-menu destination: a tab hidden in Settings > Tab bar is
             // never routed to; fall back to Home instead of resurrecting a hidden screen.
-            tab = hiddenTabs.contains(dest) ? .home : dest
+            selectTab(hiddenTabs.contains(dest) ? .home : dest)
         }
         #endif
         // Launch "Who's watching?" picker: a real modal at cold start when the roster has more than one
@@ -363,7 +377,8 @@ struct iOSRootView: View {
     @ViewBuilder private var selectedTabContent: some View {
         switch tab {
         case .home:
-            iOSHomeView(isActive: true)
+            if mergeHomeDiscover { unifiedHomeContent }
+            else { iOSHomeView(isActive: true) }
         case .discover:
             if !hideDiscoverTab { iOSDiscoverView(isActive: true) }
         case .live:
@@ -377,6 +392,40 @@ struct iOSRootView: View {
         case .settings:
             iOSSettingsView()
         }
+    }
+
+    private var unifiedHomeContent: some View {
+        VStack(spacing: 0) {
+            if !hideDiscoverTab {
+                HStack(spacing: Theme.Space.xs) {
+                    homeModeButton("Featured", browse: false)
+                    homeModeButton("Browse", browse: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.vertical, Theme.Space.xs)
+                .background(Theme.Palette.canvas)
+            }
+            if homeBrowse, !hideDiscoverTab {
+                iOSDiscoverView(isActive: true)
+            } else {
+                iOSHomeView(isActive: true, onBrowse: hideDiscoverTab ? nil : { homeBrowse = true })
+            }
+        }
+    }
+
+    private func homeModeButton(_ title: LocalizedStringKey, browse: Bool) -> some View {
+        let selected = homeBrowse == browse
+        return Button { homeBrowse = browse } label: {
+            Text(title)
+                .font(.system(size: 14, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+                .padding(.horizontal, Theme.Space.md)
+                .frame(minHeight: 44)
+                .background(selected ? Theme.Palette.accent : Theme.Palette.surface1, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 
     #if os(macOS)
@@ -454,7 +503,7 @@ struct iOSRootView: View {
         guard !query.isEmpty else { return }
         let destination = searchDestination
         if destination != .home { MacSearchBridge.shared.pending = query }
-        tab = destination
+        selectTab(destination)
         macSearchPresented = false
     }
 
@@ -544,8 +593,15 @@ struct iOSRootView: View {
     }
 
     private func selectTab(_ item: Tab) {
-        if tab == item { TabScrollToTop.shared.bump(item.scrollKey) }
-        else { tab = item }
+        if mergeHomeDiscover, item == .discover {
+            let alreadyBrowsing = tab == .home && homeBrowse && !hideDiscoverTab
+            homeBrowse = !hideDiscoverTab
+            tab = .home
+            if alreadyBrowsing { TabScrollToTop.shared.bump(TabScrollKeys.discover) }
+        } else if tab == item {
+            TabScrollToTop.shared.bump(item == .home && mergeHomeDiscover && homeBrowse
+                                      ? TabScrollKeys.discover : item.scrollKey)
+        } else { tab = item }
     }
 
     private func horizontalTabButton(_ item: Tab) -> some View {
@@ -599,6 +655,7 @@ struct iOSRootView: View {
     private var visibleTabs: [Tab] {
         Tab.allCases.filter {
             if hiddenTabs.contains($0) { return false }
+            if mergeHomeDiscover, $0 == .discover { return false }
             // Merged mode folds Search into Discover, so drop the standalone Search tab.
             if mergeDiscoverSearch, $0 == .search { return false }
             return true
@@ -930,6 +987,7 @@ private struct iOSCWRenderSnapshot {
 struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
+    var onBrowse: (() -> Void)? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
@@ -988,9 +1046,15 @@ struct iOSHomeView: View {
 
     private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot {
         let selection = continueWatchingSelection
+        let residentCatalog = core.boardRows.flatMap(\.items)
         let items = selection.items.map {
-            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
-                     cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
+            // Remote private history keeps its own bounded snapshot. Local history can reuse public
+            // metadata already resident in the catalog/detail; drawing a shelf never fetches anything.
+            if selection.source == .trakt {
+                return RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
+                                cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
+            }
+            return cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta)
         }
         return iOSCWRenderSnapshot(
             items: items,
@@ -1136,11 +1200,14 @@ struct iOSHomeView: View {
                     // back-to-top button appears; it hides again when you return to the top (#8).
                     // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
                     Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.home, active: isActive)
-                    // Home is the Cinema landing surface, but Discover stays a first-class browse owner.
-                    // This value link opens its existing paginated category screen; the main Discover tab
-                    // still retains all engine filters and its dedicated advanced-filter sheet.
-                    NavigationLink(value: HubTarget.discover(.trending)) {
-                        CinemaBrowseEntry()
+                    // Unified Home switches to the existing Discover owner, keeping its filters and
+                    // paging. Separate-tab mode retains this legacy category/deep-link destination.
+                    Group {
+                        if let onBrowse {
+                            Button(action: onBrowse) { CinemaBrowseEntry() }
+                        } else {
+                            NavigationLink(value: HubTarget.discover(.trending)) { CinemaBrowseEntry() }
+                        }
                     }
                     .buttonStyle(.plain)
                     .padding(.horizontal, Theme.Space.md)
@@ -2059,6 +2126,7 @@ struct iOSLibraryView: View {
     enum LibraryRoute: Hashable {
         case downloads
         case queue        // the download-queue manager (reorder / pause / concurrency), pushed from Downloads
+        case watchlist
     }
 
     #if !os(tvOS)
@@ -2073,9 +2141,9 @@ struct iOSLibraryView: View {
     /// own private watch overlay (every watched title), never the account.
     private var libraryItems: [RailItem] {
         let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
-        return source.map {
-            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress)
-        }
+        let residentCatalog = core.boardRows.flatMap(\.items)
+        return source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta,
+                                                  includesResume: false) }
     }
 
     /// True when there is at least one offline download; keeps the empty-Library placeholder from
@@ -2101,10 +2169,8 @@ struct iOSLibraryView: View {
         let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory
             ? core.continueWatching
             : profiles.cwItems
-        return source.map {
-            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
-                     cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
-        }
+        let residentCatalog = core.boardRows.flatMap(\.items)
+        return source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta) }
     }
 
     var body: some View {
@@ -2126,12 +2192,8 @@ struct iOSLibraryView: View {
                         )
                     }
                     .buttonStyle(.plain)
-                    Button {
-                        segment = .all
-                        activeFilters.removeAll()
-                    } label: {
-                        CinemaLibraryEntryCard(title: "Watchlist", subtitle: "All saved titles", systemImage: "bookmark.fill",
-                                               badge: libraryItems.isEmpty ? nil : "\(libraryItems.count)")
+                    NavigationLink(value: LibraryRoute.watchlist) {
+                        CinemaLibraryEntryCard(title: "Watchlist", subtitle: "Titles bookmarked to watch later", systemImage: "bookmark.fill")
                     }
                     .buttonStyle(.plain)
                     Button {
@@ -2221,6 +2283,7 @@ struct iOSLibraryView: View {
                 switch route {
                 case .downloads: iOSDownloadsScreen()
                 case .queue: DownloadQueueView()
+                case .watchlist: CinemaWatchlist(onOpen: handleTap, onWatch: watchFromQuickView)
                 }
             }
             .iOSPlayerCover($downloadPlayer, account: account, core: core)
@@ -3760,6 +3823,39 @@ struct RailItem: Identifiable {
     /// The saved resume position in seconds, so a Continue Watching card can show the "1:03" resume
     /// timecode badge. Nil on every non-CW rail, so their cards are byte-for-byte unchanged.
     var resumeSeconds: Double? = nil
+}
+
+/// Reuses only metadata the current UI has already received. History membership, artwork identity, and
+/// resume offsets remain owned by the history entry; catalog facts never create a metadata/network join.
+private func cinemaHistoryRailItem(_ item: CoreCWItem, catalog: [CoreMeta], residentMeta: CoreMetaItem?,
+                                   includesResume: Bool = true) -> RailItem {
+    let preview = catalog.first { $0.id == item.id && $0.type == item.type }
+    let meta = residentMeta.flatMap { $0.id == item.id && $0.type == item.type ? $0 : nil }
+    let measuredMinutes = item.state.duration.isFinite && item.state.duration >= 60_000 && item.state.duration <= 86_400_000
+        ? Int((item.state.duration / 60_000).rounded()) : nil
+    let runtime = measuredMinutes.map { minutes in
+        minutes >= 60 ? "\(minutes / 60)h \(minutes % 60)m" : "\(minutes)m"
+    } ?? meta?.runtime
+    var facts: [String] = []
+    for value in [runtime, preview?.releaseInfo ?? meta?.releaseInfo] {
+        if let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty,
+           !facts.contains(value) { facts.append(value) }
+    }
+    let video = item.state.videoId.flatMap { id in meta?.videos?.first { $0.id == id } }
+    let coordinate = video.flatMap { video -> String? in
+        guard let episode = video.episode else { return nil }
+        if let season = video.season { return "S\(season) · E\(episode)" }
+        return "E\(episode)"
+    }
+    return RailItem(id: item.id, type: item.type, name: item.name, poster: item.poster, progress: item.progress,
+                    background: preview?.background ?? meta?.background,
+                    description: preview?.description ?? meta?.description,
+                    releaseInfo: facts.isEmpty ? nil : facts.joined(separator: " · "),
+                    imdbRating: preview?.imdbRating ?? meta?.imdbRating,
+                    genres: preview?.genres ?? meta?.genres,
+                    cwVideoId: includesResume ? item.state.videoId : nil,
+                    caption: includesResume ? coordinate : nil,
+                    resumeSeconds: includesResume ? item.resumeSeconds : nil)
 }
 
 // MARK: - Poster context menu (#14, ported from tvOS PosterCard.menuItems)

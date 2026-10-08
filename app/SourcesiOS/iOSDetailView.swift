@@ -1025,6 +1025,9 @@ struct iOSDetailView: View {
                 #endif
                 }
                 .onPreferenceChange(EpisodeTopOffsetPreferenceKey.self) { episodeTopOffset = $0 }
+                .environment(\.cinemaSourceJump, { anchor in
+                    withAnimation(reduceMotion ? nil : Theme.Motion.state) { proxy.scrollTo(anchor, anchor: .top) }
+                })
             }
         }
         // Dynamic dominant-color backdrop: canvas stays the base, with the art's average color washed in
@@ -2271,10 +2274,11 @@ struct iOSDetailView: View {
            !localWatchedSet.contains(video.id) {
             return (video, true)
         }
-        if let next = sorted.first(where: { !watched.contains($0.id) }) {
+        if let next = EpisodeDefaultSelectionPolicy.firstUnwatched(in: sorted, season: { $0.season },
+                                                                   isWatched: { watched.contains($0.id) }) {
             return (next, false)
         }
-        return sorted.first.map { ($0, false) }
+        return EpisodeDefaultSelectionPolicy.fallback(in: sorted, season: { $0.season }).map { ($0, false) }
     }
 
     private func primaryEpisodeLabel(_ video: CoreVideo, isResume: Bool, resumeSeconds: Double? = nil) -> String {
@@ -2321,7 +2325,8 @@ struct iOSDetailView: View {
     private var firstUnwatchedSeason: Int? {
         guard let videos = meta?.videos else { return nil }
         let watched = watchedSet
-        return sortedEpisodes(videos).first { !watched.contains($0.id) }?.season
+        return EpisodeDefaultSelectionPolicy.firstUnwatched(in: sortedEpisodes(videos), season: { $0.season },
+                                                             isWatched: { watched.contains($0.id) })?.season
     }
 
     /// Apply the preferred episode-list season: the Continue-Watching resume-season hint, else first-unwatched,
@@ -3927,6 +3932,8 @@ struct iOSDetailView: View {
             progress: progress,
             cardWidth: cardWidth,
             spoilerHidden: spoilerVeiled(v, isWatched: isWatched),
+            runtimeLabel: episodeRuntimeLabel(v),
+            qualityLabel: episodeQualityLabel(v),
             artwork: AnyView(
                 episodeThumbnail(v, isWatched: isWatched, progress: progress,
                                  width: imageWidth, height: imageHeight)
@@ -3941,6 +3948,40 @@ struct iOSDetailView: View {
                 }
             )
         )
+    }
+
+    private func episodeRuntimeLabel(_ video: CoreVideo) -> String? {
+        guard let m = meta else { return nil }
+        let duration: Double? = {
+            if !profiles.activeUsesEngineHistory {
+                guard let entry = profiles.watch[m.id], entry.videoId == video.id else { return nil }
+                return Double(entry.durationMs)
+            }
+            guard let item = core.metaDetails?.libraryItem, item.state.videoId == video.id else { return nil }
+            return item.state.duration
+        }()
+        if let duration, duration.isFinite, (60_000...86_400_000).contains(duration) {
+            return "\(Int((duration / 60_000).rounded())) min"
+        }
+        // CoreVideo has no per-episode runtime. A title-level estimate must remain explicitly typical.
+        guard let runtime = m.runtime?.trimmingCharacters(in: .whitespacesAndNewlines), !runtime.isEmpty else { return nil }
+        return "\(String(localized: "Typical")) \(runtime)"
+    }
+
+    private func episodeQualityLabel(_ video: CoreVideo) -> String? {
+        guard let m = meta else { return nil }
+        #if !os(tvOS)
+        if let record = downloads.records.first(where: {
+            $0.contentId == m.id && $0.videoId == video.id && $0.state == .completed
+        }), let quality = record.qualityText, !quality.isEmpty {
+            return "\(String(localized: "Downloaded")) · \(quality)"
+        }
+        #endif
+        if let entry = LastStreamStore.entry(for: m.id, profileID: profiles.activeID),
+           entry.videoId == video.id, let quality = entry.qualityText, !quality.isEmpty {
+            return "\(String(localized: "Last played")) · \(quality)"
+        }
+        return nil
     }
 
     private func episodeCoordinate(_ v: CoreVideo) -> String {
@@ -4432,6 +4473,8 @@ struct CinemaEpisodeRailCard: View {
     let progress: Double
     let cardWidth: CGFloat
     var spoilerHidden = false
+    var runtimeLabel: String? = nil
+    var qualityLabel: String? = nil
     let artwork: AnyView
     let trailingStatus: AnyView
 
@@ -4466,6 +4509,14 @@ struct CinemaEpisodeRailCard: View {
                     Text(String(aired.prefix(10))).font(Theme.Typography.label)
                         .foregroundStyle(Theme.Palette.textTertiary)
                 }
+                if let runtimeLabel {
+                    Label(runtimeLabel, systemImage: "clock")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                }
+                if let qualityLabel {
+                    Text(qualityLabel).font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary).lineLimit(2)
+                }
                 if spoilerHidden {
                     Label("Tap to reveal", systemImage: "eye.slash").font(Theme.Typography.label)
                         .foregroundStyle(Theme.Palette.textTertiary).accessibilityLabel("Description hidden")
@@ -4484,7 +4535,7 @@ struct CinemaEpisodeRailCard: View {
         .opacity(isWatched ? 0.58 : 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(coordinate): \(video.episodeTitle)")
-        .accessibilityValue(status)
+        .accessibilityValue([status, runtimeLabel, qualityLabel].compactMap { $0 }.joined(separator: ", "))
     }
 }
 
@@ -4498,6 +4549,7 @@ struct CinemaEpisodeRailCard: View {
 /// tapping an episode silently auto-played the best source and showed no sources / no quality picker.
 struct iOSEpisodeStreams: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let meta: CoreMetaItem
     let video: CoreVideo
     let season: Int
@@ -4619,6 +4671,8 @@ struct iOSEpisodeStreams: View {
         // Hard-cap the column to the viewport width (see iOSDetailView.body) so the episode hero's wide
         // single-line metaRow can't stretch the ZStack past the screen and clip the title/synopsis off the left.
         GeometryReader { geo in
+        ScrollViewReader { proxy in
+        Group {
         #if os(macOS)
         // macOS pinned-episode model (mirrors `iOSDetailView.macDetailBody`, FINDING 3): the episode banner
         // is a FIXED near-fullscreen top layer and only the overview + source list scroll in an inner
@@ -4653,6 +4707,11 @@ struct iOSEpisodeStreams: View {
             .frame(width: geo.size.width, alignment: .leading)
         }
         #endif
+        }
+        .environment(\.cinemaSourceJump, { anchor in
+            withAnimation(reduceMotion ? nil : Theme.Motion.state) { proxy.scrollTo(anchor, anchor: .top) }
+        })
+        }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         // iOS-only: a macOS navigationTitle on this pushed episode-streams view crashes the shared NSToolbar.
@@ -6116,7 +6175,19 @@ private struct SourceRow: Identifiable { let id: String; let addon: String; let 
 /// shared render budget. A collapsed group carries an empty `rows` (its header still shows the full count).
 private struct WindowedGroup: Identifiable { let id: String; let group: CoreStreamSourceGroup; let rows: [SourceRow] }
 
+private enum CinemaSourceJumpKey: EnvironmentKey {
+    static var defaultValue: ((String) -> Void)? { nil }
+}
+
+private extension EnvironmentValues {
+    var cinemaSourceJump: ((String) -> Void)? {
+        get { self[CinemaSourceJumpKey.self] }
+        set { self[CinemaSourceJumpKey.self] = newValue }
+    }
+}
+
 struct iOSSourceList: View {
+    @Environment(\.cinemaSourceJump) private var jumpToSource
     let groups: [CoreStreamSourceGroup]
     let progress: (loaded: Int, total: Int)
     /// The resolved movie, episode, or live identity. Only Infuse consumes it as filename metadata.
@@ -6646,7 +6717,14 @@ struct iOSSourceList: View {
     private func selectSourceAddon(_ addon: String?) {
         selectedSourceAddon = addon
         sourceFilter = addon
-        if addon != nil { showAllSources = true }
+        showAllSources = true
+        if let addon {
+            collapsed.remove(addon)
+        }
+        let anchor = addon.flatMap { name in groups.first { $0.addon == name }?.id }
+            .map { "cinema-source-\($0)" } ?? "cinema-source-list"
+        // Filtering/expanding realizes the selected header before the parent scroll view jumps to it.
+        DispatchQueue.main.async { jumpToSource?(anchor) }
     }
 
     private var filterBar: some View {
@@ -6705,6 +6783,7 @@ struct iOSSourceList: View {
                 // "sources vanish / big blank gaps on scroll". Emitting them flat removes that reservation
                 // while KEEPING the LazyVStack, so a title with thousands of sources still won't OOM on tvOS.
                 sectionHeader(wg.group)
+                    .id("cinema-source-\(wg.group.id)")
                 if !collapsed.contains(wg.group.addon) {
                     ForEach(wg.rows) { row in streamRow(row.addon, row.stream) }
                 }
@@ -6716,6 +6795,7 @@ struct iOSSourceList: View {
                 .buttonStyle(ChipButtonStyle())
             }
         }
+        .id("cinema-source-list")
     }
 
     /// Tappable add-on header: name + source count + a chevron that folds the section away. Styled as

@@ -8,7 +8,12 @@ struct CinemaQuickView: View {
     let onDetails: () -> Void
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isWatchlisted = false
     @State private var watchlistStatus: String?
+
+    private var supportsWatchlist: Bool {
+        ["movie", "series"].contains(item.type) && LibraryWatchedMutationPolicy.isCanonicalCatalogID(item.id)
+    }
 
     private var facts: [String] {
         [item.releaseInfo, item.imdbRating.map { "★ \($0)" }, item.type.capitalized]
@@ -29,6 +34,10 @@ struct CinemaQuickView: View {
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Quick view for \(item.name)")
+        .onAppear(perform: refreshWatchlist)
+        .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
+            refreshWatchlist()
+        }
     }
 
     private var wideLayout: some View {
@@ -97,7 +106,7 @@ struct CinemaQuickView: View {
                     dismiss()
                     onWatch()
                 } label: {
-                    Label("Watch", systemImage: "play.fill")
+                    Label("Watch Now", systemImage: "play.fill")
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.plain)
@@ -105,24 +114,16 @@ struct CinemaQuickView: View {
                 .accessibilityHint("Opens this title's playback options")
 
                 Button {
-                    let accepted = CoreBridge.shared.addToLibrary(
-                        metaId: item.id,
-                        expectedType: item.type,
-                        fallbackPreview: .init(id: item.id, type: item.type, name: item.name, poster: item.poster)
-                    )
-                    // `addToLibrary` intentionally returns false for an overlay after it has updated that
-                    // profile's local library. Report that route truthfully instead of presenting a false
-                    // failure merely because no account-engine dispatch occurred.
-                    watchlistStatus = accepted || !ProfileStore.shared.activeUsesEngineHistory
-                        ? "Added to Watchlist"
-                        : "Couldn't add to Watchlist"
+                    toggleWatchlist()
                 } label: {
-                    Label("Watchlist", systemImage: "bookmark")
+                    Label(isWatchlisted ? "In Watchlist" : "Add to Watchlist",
+                          systemImage: isWatchlisted ? "bookmark.fill" : "bookmark")
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.plain)
                 .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
-                .accessibilityHint("Adds this title to your library")
+                .disabled(!supportsWatchlist)
+                .accessibilityHint(isWatchlisted ? "Removes this title from your watchlist" : "Saves this title to your watchlist")
             }
             if let watchlistStatus {
                 Text(watchlistStatus)
@@ -142,6 +143,69 @@ struct CinemaQuickView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: item.id)
+    }
+
+    private func refreshWatchlist() {
+        #if !CINEMA_UI_SMOKE_RENDERER
+        isWatchlisted = LibraryAutoAdd.isWatchlisted(item.id)
+        #endif
+    }
+
+    private func toggleWatchlist() {
+        guard supportsWatchlist else { return }
+        #if CINEMA_UI_SMOKE_RENDERER
+        preconditionFailure("Cinema UI renderer must not mutate a watchlist")
+        #else
+        isWatchlisted = LibraryAutoAdd.toggleWatchlist(id: item.id, type: item.type,
+                                                       name: item.name, poster: item.poster)
+        watchlistStatus = isWatchlisted ? "Added to Watchlist" : "Removed from Watchlist"
+        #endif
+    }
+}
+
+/// The same per-profile want-to-watch ledger as the detail and quick-view bookmark buttons. The main
+/// Library grid remains the account/local saved library; this destination makes the bookmark intent visible.
+struct CinemaWatchlist: View {
+    let onOpen: (RailItem) -> Void
+    let onWatch: (RailItem) -> Void
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var profiles: ProfileStore
+    @State private var entries: [LibraryAutoAdd.WatchlistEntry] = []
+
+    private var items: [RailItem] {
+        let catalog = core.boardRows.flatMap(\.items)
+        return entries.map { entry in
+            let preview = catalog.first { $0.id == entry.id && $0.type == entry.type }
+            return RailItem(id: entry.id, type: entry.type, name: entry.name ?? preview?.name ?? entry.id,
+                            poster: entry.poster ?? preview?.poster, progress: 0,
+                            background: preview?.background, description: preview?.description,
+                            releaseInfo: preview?.releaseInfo, imdbRating: preview?.imdbRating,
+                            genres: preview?.genres)
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            if items.isEmpty {
+                ContentUnavailableViewCompat(title: "Watchlist", systemImage: "bookmark",
+                                             message: "Titles you bookmark to watch later appear here.")
+                    .frame(minHeight: 360)
+            } else {
+                PosterGrid(items: items, onTap: onOpen, onWatch: onWatch, menu: .catalog)
+                    .padding(.vertical, Theme.Space.md)
+            }
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #if os(iOS)
+        .navigationTitle("Watchlist")
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .macBackAffordance()
+        .onAppear { entries = LibraryAutoAdd.watchlist() }
+        .onChange(of: profiles.activeID) { _ in entries = LibraryAutoAdd.watchlist() }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
+            entries = LibraryAutoAdd.watchlist()
+        }
     }
 }
 

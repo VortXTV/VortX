@@ -139,6 +139,7 @@ struct iOSSettingsView: View {
     // has a single source of truth (no leftover legacy default-on blur when the user turns spoiler-safe off).
     @AppStorage(SourcePreferences.spoilerSafeKey) private var spoilerSafe = SourcePreferences.defaultSpoilerSafe
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false   // fold Search into Discover (one surface)
+    @AppStorage("vortx.mergeHomeDiscover") private var mergeHomeDiscover = true
     // Compact source rows (#117): parsed quality line instead of the raw release name. SAME key as tvOS.
     @AppStorage("vortx.streams.compactLabels") private var compactStreamLabels = false
     #if os(iOS) || os(macOS)
@@ -1855,14 +1856,16 @@ struct iOSSettingsView: View {
     /// tab is hidden.
     @ViewBuilder private var tabBarSection: some View {
         Section {
-            Toggle("Show Discover tab", isOn: Binding(get: { !hideDiscoverTab }, set: { hideDiscoverTab = !$0 }))
+            Toggle("Combine Home & Discover", isOn: $mergeHomeDiscover)
+            Toggle(mergeHomeDiscover ? "Show Browse in Home" : "Show Discover tab",
+                   isOn: Binding(get: { !hideDiscoverTab }, set: { hideDiscoverTab = !$0 }))
             Toggle("Show Live TV tab", isOn: Binding(get: { !hideLiveTab }, set: { hideLiveTab = !$0 }))
             Toggle("Show Library tab", isOn: Binding(get: { !hideLibraryTab }, set: { hideLibraryTab = !$0 }))
             Toggle("Show Search tab", isOn: Binding(get: { !hideSearchTab }, set: { hideSearchTab = !$0 }))
         } header: {
             Text("Tab bar")
         } footer: {
-            Text("Choose which tabs appear in the tab bar. Home, Add-ons, and Settings always stay. If the tab you are on is hidden, you land on Home.")
+            Text("Combined Home has Featured and Browse modes. Turn the combination off to restore a separate Discover tab. Home, Add-ons, and Settings always stay. Hiding Browse returns Home to Featured; hiding another active tab lands on Home.")
         }
     }
 

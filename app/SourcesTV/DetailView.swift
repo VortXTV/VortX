@@ -1757,10 +1757,11 @@ struct DetailView: View {
            !localWatched.contains(video.id) {
             return (video, true)
         }
-        if let next = ordered.first(where: { !watched.contains($0.id) }) {
+        if let next = EpisodeDefaultSelectionPolicy.firstUnwatched(in: ordered, season: { $0.season },
+                                                                   isWatched: { watched.contains($0.id) }) {
             return (next, false)
         }
-        return ordered.first.map { ($0, false) }
+        return EpisodeDefaultSelectionPolicy.fallback(in: ordered, season: { $0.season }).map { ($0, false) }
     }
 
     private func primaryEpisodeLabel(_ video: CoreVideo, isResume: Bool, resumeSeconds: Double? = nil) -> String {
@@ -2067,7 +2068,7 @@ struct CoreSeasonedEpisodes: View {
     }
 
     private var firstUnwatchedSeason: Int? {
-        videos
+        let ordered = videos
             .sorted {
                 let leftSeason = $0.season ?? 0
                 let rightSeason = $1.season ?? 0
@@ -2077,8 +2078,8 @@ struct CoreSeasonedEpisodes: View {
                 if leftEpisode != rightEpisode { return leftEpisode < rightEpisode }
                 return $0.id < $1.id
             }
-            .first { !watched.contains($0.id) }?
-            .season
+        return EpisodeDefaultSelectionPolicy.firstUnwatched(in: ordered, season: { $0.season },
+                                                             isWatched: { watched.contains($0.id) })?.season
     }
 
     /// Spoiler-safe veil for one episode on the detail list: mode ON, the episode is NOT watched, and it is

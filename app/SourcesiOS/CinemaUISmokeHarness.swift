@@ -172,6 +172,8 @@ private struct CinemaUISmokeDetailSection: View {
                         isWatched: false,
                         progress: 0.42,
                         cardWidth: 340,
+                        runtimeLabel: "48 min",
+                        qualityLabel: "Last played · 1080p · HDR",
                         artwork: AnyView(CinemaUISmokeArtwork()),
                         trailingStatus: AnyView(EmptyView())
                     )
@@ -214,7 +216,7 @@ private enum CinemaUISmokeFixtures {
         rail("catalog-4", "Stone & Sky", type: "series", release: "2 seasons · 16 episodes", rating: "8.0")
     ]
     static let search = [
-        rail("search-1", "Silent City", type: "movie", release: "1h 48m · 2026", rating: "8.3", description: "A detective returns to a city that has forgotten how to sleep."),
+        rail("tt0000001", "Silent City", type: "movie", release: "1h 48m · 2026", rating: "8.3", description: "A detective returns to a city that has forgotten how to sleep."),
         rail("search-2", "Halcyon", type: "series", release: "2 seasons · 18 episodes · 2025", rating: "8.0", description: "A stranded crew follows a signal through deep space.")
     ]
     static let episode: CoreVideo = decode("""
