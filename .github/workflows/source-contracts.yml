@@ -13,6 +13,10 @@ on:
       - "scripts/test-profile-roster-propagation.sh"
       - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
+      - "scripts/generate-native-apple-project.rb"
+      - "scripts/test-native-apple-project.rb"
+      - "scripts/verify-native-apple-package.py"
+      - "scripts/tests/test_native_apple_package.py"
       - "scripts/verify-android-release-version.sh"
       - "scripts/tests/test_android_release_version.py"
       - "workers/vortx-appcast/**"
@@ -32,6 +36,10 @@ on:
       - "scripts/test-profile-roster-propagation.sh"
       - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
+      - "scripts/generate-native-apple-project.rb"
+      - "scripts/test-native-apple-project.rb"
+      - "scripts/verify-native-apple-package.py"
+      - "scripts/tests/test_native_apple_package.py"
       - "scripts/verify-android-release-version.sh"
       - "scripts/tests/test_android_release_version.py"
       - "workers/vortx-appcast/**"
@@ -54,6 +62,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash scripts/test-release-orchestration-contracts.sh
+      - run: ruby scripts/test-native-apple-project.rb
+      - run: python3 scripts/tests/test_native_apple_package.py
       - run: python3 scripts/tests/test_android_release_version.py
       - run: node --test workers/vortx-appcast/test/index.test.mjs
       - run: bash scripts/test-subtitle-source-contracts.sh

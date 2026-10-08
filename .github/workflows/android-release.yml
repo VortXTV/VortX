@@ -55,8 +55,8 @@ jobs:
           echo "::error::Android artifacts may only be attached to the draft. The Apple release coordinator validates the complete cross-platform set and publishes last."
           exit 1
 
-      # Private engine fetch is kept in lockstep with android.yml. Both checkouts are required because
-      # every release variant packages libstremiox_core.so and libvortx_ffi.so.
+      # Private source pins stay in lockstep with android.yml. Native variants package only
+      # libvortx_ffi.so; the Stremio checkout pin remains for the explicit non-native comparison path.
       - name: Preflight the engine token (fail closed)
         env:
           ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
@@ -93,16 +93,24 @@ jobs:
           path: _vortx_core_src
           persist-credentials: false
 
-      - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+      - name: Promote the vortx-core workspace + record exact private source pins
         run: |
           set -euo pipefail
+          vortx_sha="$(git -C _vortx_core_src rev-parse HEAD^{commit})"
+          test "$vortx_sha" = "ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4" \
+            || { echo "::error::vortx-core checkout does not match the reviewed private pin"; exit 1; }
+          stremio_sha="$(git -C core rev-parse HEAD^{commit})"
+          test "$stremio_sha" = "31c66611822043e089f5819ad232a5df93975873" \
+            || { echo "::error::stremiox-core checkout does not match its immutable pin"; exit 1; }
+          echo "VORTX_ENGINE_SOURCE_SHA=$vortx_sha" >> "$GITHUB_ENV"
+          echo "STREMIOX_CORE_SOURCE_SHA=$stremio_sha" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
           rm -rf _vortx_core_src
           test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
           test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
           test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@ec96c6c (promoted from monorepo subdir)"
+          echo "pinned private sources: stremiox-core@$stremio_sha vortx-core@$vortx_sha (promoted monorepo subdir)"
 
       - name: Set up JDK 21
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
@@ -163,7 +171,7 @@ jobs:
         # derives BuildConfig.NATIVE_ENGINE_ENABLED and the Cargo feature from these same values.
         run: ./gradlew :app:assembleFullRelease :app:assemblePlayRelease :app:bundlePlayRelease -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true --no-daemon --stacktrace
 
-      - name: Verify each APK embeds both engines for every shipped ABI
+      - name: Verify native BuildConfig and native-only engine in every Android artifact
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -174,49 +182,16 @@ jobs:
             exit 1
           fi
           READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          test -x "$READELF" || { echo "::error::pinned NDK llvm-readelf unavailable"; exit 1; }
+          STRIP="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           DEXDUMP="$ANDROID_HOME/build-tools/36.0.0/dexdump"
+          test -x "$READELF" || { echo "::error::pinned NDK llvm-readelf unavailable"; exit 1; }
+          test -x "$STRIP" || { echo "::error::pinned NDK llvm-strip unavailable"; exit 1; }
           test -x "$DEXDUMP" || { echo "::error::pinned Android build-tools dexdump unavailable"; exit 1; }
-          # Require the complete public Kotlin binding, including the receipt-based history API.
-          syms_libstremiox_core="JNI_OnLoad Java_com_vortx_android_engine_StremioCoreNative_nativeInit Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch Java_com_vortx_android_engine_StremioCoreNative_nativeGetState Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion Java_com_vortx_android_engine_StremioCoreNative_nativeRestoreLibrary Java_com_vortx_android_engine_StremioCoreNative_nativeReadLibraryEvents"
-          syms_libvortx_ffi="Java_com_vortx_android_engine_VortxCore_nativeInitRuntime Java_com_vortx_android_engine_VortxCore_nativeDispatchJson Java_com_vortx_android_engine_VortxCore_nativeResolveJson Java_com_vortx_android_engine_VortxCore_nativeGetStateJson Java_com_vortx_android_engine_VortxCore_nativeEngineFree Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
-          workdir="$(mktemp -d)"
-          trap 'rm -rf "$workdir"' EXIT
           DEXDUMP="$DEXDUMP" bash scripts/verify-android-native-build-config.sh "${apks[@]}" "${bundles[@]}"
-          for apk in "${apks[@]}" "${bundles[@]}"; do
-            prefix=lib
-            [[ "$apk" == *.aab ]] && prefix=base/lib
-            for abi in arm64-v8a armeabi-v7a x86_64; do
-              case "$abi" in
-                arm64-v8a) elf_class=ELF64; machine=AArch64 ;;
-                armeabi-v7a) elf_class=ELF32; machine=ARM ;;
-                x86_64) elf_class=ELF64; machine='Advanced Micro Devices X86-64' ;;
-              esac
-              for lib in libstremiox_core.so libvortx_ffi.so; do
-                entry="$prefix/$abi/$lib"
-                out="$workdir/$(basename "$apk").$abi.$lib"
-                unzip -p "$apk" "$entry" > "$out" 2>/dev/null || { echo "::error::$entry missing from $apk"; exit 1; }
-                test -s "$out" || { echo "::error::$entry is empty in $apk"; exit 1; }
-                magic="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
-                test "$magic" = "7f454c46" || { echo "::error::$entry is not ELF in $apk"; exit 1; }
-                header="$("$READELF" -h "$out")"
-                grep -Eq "Class:[[:space:]]+$elf_class([[:space:]]|$)" <<<"$header" || { echo "::error::$entry has wrong ELF class"; exit 1; }
-                grep -Eq 'Data:.*little endian' <<<"$header" || { echo "::error::$entry is not little-endian"; exit 1; }
-                grep -Eq 'Type:[[:space:]]+DYN\b' <<<"$header" || { echo "::error::$entry is not a shared object"; exit 1; }
-                grep -Eq "Machine:[[:space:]]+$machine([[:space:]]|$)" <<<"$header" || { echo "::error::$entry has wrong architecture"; exit 1; }
-                symbols="$("$READELF" -W --dyn-syms "$out")"
-                required="$syms_libvortx_ffi"
-                [[ "$lib" == libstremiox_core.so ]] && required="$syms_libstremiox_core"
-                for symbol in $required; do
-                  awk -v required="$symbol" '$4 == "FUNC" && ($5 == "GLOBAL" || $5 == "WEAK") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $7 ~ /^[0-9]+$/ && $7 > 0 && $8 == required { found=1 } END { exit !found }' <<<"$symbols" || { echo "::error::$entry lacks callable JNI export $symbol"; exit 1; }
-                done
-                if [[ "$lib" == libvortx_ffi.so ]]; then
-                  READELF="$READELF" ./scripts/verify-native-engine-abi.sh android "$out" resource-host
-                fi
-                echo "ok: $apk contains verified engine ABI and JNI/resource-host exports for $entry"
-              done
-            done
-          done
+          READELF="$READELF" STRIP="$STRIP" bash scripts/verify-native-android-artifacts.sh \
+            --native-only --staged-dir android/app/src/main/jniLibs \
+            --source-sha "$VORTX_ENGINE_SOURCE_SHA" "${apks[@]}" "${bundles[@]}" \
+            | tee "$RUNNER_TEMP/android-native-engine-provenance.txt"
 
       - name: Verify pinned production signer on every Android artifact
         run: |
@@ -290,9 +265,13 @@ jobs:
             echo "release tag: $RELEASE_TAG"
             echo "release tag commit: $RELEASE_TAG_COMMIT"
             echo "source commit: $SOURCE_COMMIT"
+            echo "native engine source commit: $VORTX_ENGINE_SOURCE_SHA"
+            echo "native engine Cargo features: jni,server,resource-host"
+            echo "legacy Stremio source commit (not packaged): $STREMIOX_CORE_SOURCE_SHA"
             echo "workflow run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             echo "workflow run attempt: $GITHUB_RUN_ATTEMPT"
           } >> dist/SIGNING_PROVENANCE.txt
+          cat "$RUNNER_TEMP/android-native-engine-provenance.txt" >> dist/SIGNING_PROVENANCE.txt
           sha256sum \
             "dist/VortX-${version}-full-mpv-universal.apk" \
             "dist/VortX-${version}-play-media3-universal.apk" \

@@ -2,8 +2,8 @@ name: Build Android APK
 
 # CI-first Android artifact build. Local source/unit validation is also possible with a configured
 # SDK/JDK; this lane supplies the pinned private-engine packaging proof. It builds BOTH flavors when
-# an integration-branch push touches android/, verifies BOTH engine .so's for every shipped ABI, and
-# enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the GPLv3
+# an integration-branch push touches android/, verifies the native-only VortX .so for every shipped
+# ABI, and enforces the GPL licensing boundary: the Play-Store `play` flavor must never carry the GPLv3
 # libmpv native libs. The engine crates live in PRIVATE repos (moved out of the public tree in
 # 33ff9b5) and are fetched below at pinned commits; bumping an engine pin means editing this file,
 # which is itself a path trigger, so the old `core/**` path filters are gone (that dir no longer
@@ -75,27 +75,17 @@ jobs:
           persist-credentials: false
 
       # ---- Private engine fetch (moved out of the public tree in 33ff9b5) --------------------------
-      # Android needs BOTH private engines, because android/app/build.gradle.kts attaches BOTH native
-      # build tasks to every variant's merge<Variant>JniLibFolders (lines 359-361 and 449-451):
-      #   - cargoNdkBuild -> libstremiox_core.so from the stremiox-core crate. Hard runtime
-      #     requirement: StremioCoreNative.kt:43 does a bare System.loadLibrary("stremiox_core") in
-      #     its class initializer. Resolved via STREMIOX_CORE_DIR (build.gradle.kts:261-264).
-      #   - cargoNdkBuildVortxFfi -> libvortx_ffi.so (features jni,server) from the vortx-core engine
-      #     workspace, resolved ONLY via VORTX_ENGINE_CORE_DIR / -Pvortx.engine.coreDir
-      #     (build.gradle.kts:382-385). Without it the task skips on dev machines and HARD-FAILS
-      #     under VORTX_REQUIRE_ENGINE (the onlyIf at build.gradle.kts:412-431), because the APK
-      #     would otherwise package "whatever .so is already staged in src/main/jniLibs" -- which in
-      #     CI is NOTHING (android/.gitignore:23 ignores app/src/main/jniLibs/**/*.so). That would
-      #     ship the DEFAULT-ON in-process torrent streaming server (VortxServer.kt FLAG_KEY doc:
-      #     "DEFAULT ON: with the server absent a raw torrent could only ever throw") and the
-      #     vortx.engine shadow-ranking lane permanently dead, since this workflow is the ONLY
-      #     Android build channel. So CI fetches vortx-core too and exports VORTX_ENGINE_CORE_DIR.
+      # Native Android artifacts use libvortx_ffi.so only, built with jni,server,resource-host from
+      # the reviewed vortx-core pin. The stremiox-core checkout and full-SHA pin stay available for
+      # explicit non-native comparison builds, but native variants do not schedule cargoNdkBuild and
+      # Gradle excludes libstremiox_core.so from those packages.
       #
       # Both fetches use actions/checkout (GitHub's own auth path: the token is injected through an
       # env-sourced local git config, never argv, and persist-credentials: false wipes it after the
       # step), pinned to the exact commits the current build links. Requires the ENGINE_REPO_TOKEN
       # secret (fine-grained PAT, Contents:read on both private repos; deploy keys are disabled by
-      # the VortXTV org). Fails closed: empty secret or a missing crate manifest kills the job.
+      # the VortXTV org). Both immutable source pins are checked; a missing VortX manifest/toolchain
+      # fails native builds closed, while the retained Stremio pin is not compiled in native mode.
       - name: Preflight the engine token (fail closed)
         env:
           ENGINE_REPO_TOKEN: ${{ secrets.ENGINE_REPO_TOKEN }}
@@ -130,16 +120,24 @@ jobs:
           path: _vortx_core_src
           persist-credentials: false
 
-      - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+      - name: Promote the vortx-core workspace + record exact private source pins
         run: |
           set -euo pipefail
+          vortx_sha="$(git -C _vortx_core_src rev-parse HEAD^{commit})"
+          test "$vortx_sha" = "ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4" \
+            || { echo "::error::vortx-core checkout does not match the reviewed private pin"; exit 1; }
+          stremio_sha="$(git -C core rev-parse HEAD^{commit})"
+          test "$stremio_sha" = "31c66611822043e089f5819ad232a5df93975873" \
+            || { echo "::error::stremiox-core checkout does not match its immutable pin"; exit 1; }
+          echo "VORTX_ENGINE_SOURCE_SHA=$vortx_sha" >> "$GITHUB_ENV"
+          echo "STREMIOX_CORE_SOURCE_SHA=$stremio_sha" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
           rm -rf _vortx_core_src
           test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
           test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
           test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@ec96c6c (promoted from monorepo subdir)"
+          echo "pinned private sources: stremiox-core@$stremio_sha vortx-core@$vortx_sha (promoted monorepo subdir)"
 
       - name: Set up JDK 17
         uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
@@ -160,12 +158,9 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
 
-      # The Compose app links libstremiox_core.so, cross-compiled from core/ by the gradle
-      # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -p 26 ...`). That
-      # needs: the NDK pinned in app/build.gradle.kts (ndkVersion), Rust nightly with the Android
-      # targets (core/ pins nightly via rust-toolchain.toml; the android targets are tier-2, so no
-      # build-std), and the cargo-ndk subcommand. Without these the task fails with
-      # "error: no such command: ndk" / a missing NDK.
+      # Native artifacts cross-compile vortx-ffi from the reviewed VortX workspace. The pinned NDK,
+      # Rust nightly Android targets and cargo-ndk are required for that output. The legacy Stremio
+      # source remains pinned for explicit non-native comparison builds but is not built here.
       - name: Install Android NDK (must match ndkVersion in app/build.gradle.kts)
         run: |
           yes | sdkmanager "ndk;27.2.12479018"
@@ -226,16 +221,14 @@ jobs:
       #   STREMIOX_CORE_DIR      -> cargoNdkBuild's crate dir (explicit; don't lean on the legacy
       #                             ../core fallback chain in build.gradle.kts:261-264).
       #   VORTX_ENGINE_CORE_DIR  -> cargoNdkBuildVortxFfi's engine workspace (build.gradle.kts:382-385).
-      #   VORTX_REQUIRE_ENGINE=1 -> flips both tasks' dev-machine warn-and-skip into a HARD FAILURE
-      #                             (missing manifest, missing cargo, or missing/empty .so output all
-      #                             throw), so a CI APK can never silently ship without its engines.
+      #   VORTX_REQUIRE_ENGINE=1 -> the selected Vortx FFI task fails closed on missing source, cargo,
+      #                             or per-ABI output, so native CI cannot package staged leftovers.
       # Native selection is explicit at the Gradle invocation boundary. Passing both properties is
       # required: the app BuildConfig and the vortx-ffi resource-host feature are derived from the
       # same fail-closed contract in app/build.gradle.kts. VORTX_NATIVE_RESOURCE_HOST remains in
       # env for the private-engine fetch/build diagnostics and backwards-compatible local tooling.
-      # Reproducibility: both engine cargo-ndk invocations pass --locked (build.gradle.kts) against
-      # the Cargo.lock each pinned engine commit now tracks, so a drifted dependency resolution
-      # FAILS the build instead of silently linking a different graph than the proven runs.
+      # Reproducibility: the selected Vortx cargo-ndk invocation passes --locked against the Cargo.lock
+      # at its exact private commit. The retained Stremio pin is not built in native mode.
       - name: Build debug APKs (full + play)
         working-directory: android
         env:
@@ -263,126 +256,37 @@ jobs:
           echo "full APK(s): ${full[*]}"
           echo "play APK(s): ${play[*]}"
 
-      # Engine-presence proof (fail-closed, strong): every built APK MUST embed BOTH engines for BOTH
-      # shipped ABIs (the abiFilters/androidAbis list in app/build.gradle.kts): lib/<abi>/libstremiox_core.so
-      # AND lib/<abi>/libvortx_ffi.so, for arm64-v8a, armeabi-v7a, and x86_64. Both tasks feed `main`
-      # sourceSet's jniLibs, so BOTH flavors carry both engines (only the GPLv3 libmpv is play-gated).
-      # A zip-listing grep is not proof: it matches a single ABI, and a zero-byte or decoy entry would
-      # pass. Presence + ELF magic alone is not proof either: a valid ELF of the wrong architecture,
-      # an executable, or a stub with no JNI surface would pass and only die on-device. So EXTRACT
-      # each entry and require, in order (each check fail-closed), all via the PINNED NDK's own
-      # llvm-readelf (the toolchain that produced the .so's, installed above; gate provenance now
-      # rides the NDK pin instead of whatever binutils the runner image ships). llvm-readelf prints
-      # GNU-readelf-compatible output by default and accepts -W as a GNU-compat no-op; the exact
-      # strings the greps below match ("Class: ELF32" / "ELF64", "2's complement, little endian",
-      # "Type: DYN (Shared object file)", "Machine: AArch64" / "Machine: Advanced Micro Devices
-      # X86-64", and --dyn-syms rows ending in the bare symbol name) were verified verbatim against
-      # NDK 27.2.12479018's llvm-readelf on real android26 .so's for all shipped ABIs:
-      #   1. non-zero size + the ELF magic \x7fELF (cheap pre-checks with a clear byte-level error);
-      #   2. llvm-readelf -h: the ABI's expected ELF class, little-endian data (e_ident[EI_DATA]=1),
-      #      Type DYN (e_type=ET_DYN: a shared object, not ET_EXEC/ET_REL), and the machine matching
-      #      the ABI dir: AArch64/ELF64 under arm64-v8a, ARM/ELF32 under armeabi-v7a, and Advanced
-      #      Micro Devices X86-64/ELF64 under x86_64;
-      #   3. llvm-readelf -W --dyn-syms: the lib actually EXPORTS the JNI surface the app binds. The
-      #      required names are DERIVED from source, not guessed -- JNI resolves a Kotlin
-      #      `external fun` to Java_<package with _>_<Class>_<method>, and both engines export those
-      #      names directly via #[no_mangle] (neither registers via RegisterNatives):
-      #        libstremiox_core.so <- StremioCoreNative.kt:43 loadLibrary("stremiox_core"),
-      #          external funs at StremioCoreNative.kt:75/81/83/85; exported by the pinned
-      #          stremiox-core commit's core/src/android_jni.rs:70/83/133/150 plus JNI_OnLoad
-      #          (android_jni.rs:61, caches the JavaVM for engine worker threads).
-      #        libvortx_ffi.so <- VortxCore.kt:38 + VortxServer.kt:65 loadLibrary("vortx_ffi"),
-      #          external funs at VortxCore.kt:50/54/58/61/64 and VortxServer.kt:85/88/91/95;
-      #          exported by the pinned vortx-core commit's crates/ffi/src/jni.rs:128-230 (feature
-      #          `jni`) and crates/ffi/src/jni_server.rs:82-146 (features `jni`+`server`). Native
-      #          builds additionally pass `resource-host` (build.gradle.kts), so a .so built with a
-      #          dropped kernel, server, or resource-host feature silently gone fails this gate
-      #          instead of shipping.
-      - name: Verify native BuildConfig and engine .so in every APK (all ABIs, right ELF class/arch, JNI exports)
+      # Native-only package proof: BuildConfig must select the Vortx repository, every APK must
+      # contain exactly one libvortx_ffi.so for each shipped ABI and no libstremiox_core.so, and the
+      # packaged bytes must match fresh src/main/jniLibs output after identical pinned llvm-strip
+      # normalization. The shared verifier checks ELF architecture, kernel/server JNI exports, and the
+      # resource-host ABI; it records the exact private source SHA, feature set, and normalized hashes.
+      # BuildConfig remains a separate pinned-dexdump check because it is DEX data, not ELF metadata.
+      - name: Verify native BuildConfig and native-only .so in every APK
         run: |
           set -euo pipefail
           shopt -s nullglob
-          # The pinned NDK's llvm-readelf (same NDK the cargo-ndk cross-link used; installed by the
-          # "Install Android NDK" step above). Fail closed if it is not where that pin puts it: a
-          # silent fallback to another readelf would detach the gate's provenance from the NDK pin.
           READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          if [ ! -x "$READELF" ]; then
-            echo "::error::pinned NDK llvm-readelf not found/executable at $READELF; refusing to verify APKs with an unpinned readelf"
-            exit 1
-          fi
+          STRIP="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           DEXDUMP="$ANDROID_HOME/build-tools/36.0.0/dexdump"
-          if [ ! -x "$DEXDUMP" ]; then
-            echo "::error::pinned Android build-tools dexdump not found/executable at $DEXDUMP; refusing to verify BuildConfig with an unpinned tool"
-            exit 1
-          fi
+          test -x "$READELF" || { echo "::error::pinned NDK llvm-readelf unavailable"; exit 1; }
+          test -x "$STRIP" || { echo "::error::pinned NDK llvm-strip unavailable"; exit 1; }
+          test -x "$DEXDUMP" || { echo "::error::pinned Android build-tools dexdump unavailable"; exit 1; }
           full_apks=(android/app/build/outputs/apk/full/debug/*.apk)
           play_apks=(android/app/build/outputs/apk/play/debug/*.apk)
           if [ ${#full_apks[@]} -ne 1 ] || [ ${#play_apks[@]} -ne 1 ]; then
-            echo "::error::expected exactly one Full APK and one Play APK to verify engines"
+            echo "::error::expected exactly one Full APK and one Play APK to verify native-only packaging"
             exit 1
           fi
           apks=("${full_apks[@]}" "${play_apks[@]}")
-          # Required dynamic exports per lib (derivation + source citations in the step comment above).
-          syms_libstremiox_core="JNI_OnLoad Java_com_vortx_android_engine_StremioCoreNative_nativeInit Java_com_vortx_android_engine_StremioCoreNative_nativeDispatch Java_com_vortx_android_engine_StremioCoreNative_nativeGetState Java_com_vortx_android_engine_StremioCoreNative_nativeSchemaVersion Java_com_vortx_android_engine_StremioCoreNative_nativeRestoreLibrary Java_com_vortx_android_engine_StremioCoreNative_nativeReadLibraryEvents"
-          syms_libvortx_ffi="Java_com_vortx_android_engine_VortxCore_nativeInitRuntime Java_com_vortx_android_engine_VortxCore_nativeDispatchJson Java_com_vortx_android_engine_VortxCore_nativeResolveJson Java_com_vortx_android_engine_VortxCore_nativeGetStateJson Java_com_vortx_android_engine_VortxCore_nativeEngineFree Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
-          fail=0
-          workdir="$(mktemp -d)"
           for apk in "${apks[@]}"; do
-            if ! DEXDUMP="$DEXDUMP" bash scripts/verify-android-native-build-config.sh "$apk"; then fail=1; fi
-            for abi in arm64-v8a armeabi-v7a x86_64; do
-              case "$abi" in
-                arm64-v8a)   elf_class='ELF64'; machine='AArch64' ;;
-                armeabi-v7a) elf_class='ELF32'; machine='ARM' ;;
-                x86_64)      elf_class='ELF64'; machine='Advanced Micro Devices X86-64' ;;
-              esac
-              for lib in libstremiox_core.so libvortx_ffi.so; do
-                entry="lib/$abi/$lib"
-                out="$workdir/$(basename "$apk").$abi.$lib"
-                if ! unzip -p "$apk" "$entry" > "$out" 2>/dev/null; then
-                  echo "::error::$entry missing from APK: $apk"; fail=1; continue
-                fi
-                size="$(stat -c%s "$out")"
-                if [ "$size" -eq 0 ]; then
-                  echo "::error::$entry in $apk is EMPTY (0 bytes)"; fail=1; continue
-                fi
-                magic="$(head -c 4 "$out" | od -An -tx1 | tr -d ' \n')"
-                if [ "$magic" != "7f454c46" ]; then
-                  echo "::error::$entry in $apk is not an ELF binary (leading bytes: $magic)"; fail=1; continue
-                fi
-                if ! hdr="$("$READELF" -h "$out" 2>/dev/null)"; then
-                  echo "::error::$entry in $apk has an unparseable ELF header (llvm-readelf -h failed)"; fail=1; continue
-                fi
-                if ! grep -Eq "Class:[[:space:]]+${elf_class}[[:space:]]*$" <<<"$hdr"; then
-                  echo "::error::$entry in $apk has the wrong ELF class (want $elf_class): $(grep -E 'Class:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
-                fi
-                if ! grep -Eq 'Data:.*little endian' <<<"$hdr"; then
-                  echo "::error::$entry in $apk is not little-endian (e_ident[EI_DATA] != 1): $(grep -E 'Data:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
-                fi
-                if ! grep -Eq 'Type:[[:space:]]+DYN\b' <<<"$hdr"; then
-                  echo "::error::$entry in $apk is not a shared object (e_type != ET_DYN): $(grep -E 'Type:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
-                fi
-                if ! grep -Eq "Machine:[[:space:]]+${machine}[[:space:]]*\$" <<<"$hdr"; then
-                  echo "::error::$entry in $apk is the WRONG ARCHITECTURE (want $machine): $(grep -E 'Machine:' <<<"$hdr" | tr -s ' ')"; fail=1; continue
-                fi
-                dynsyms="$("$READELF" -W --dyn-syms "$out" 2>/dev/null || true)"
-                syms_var="syms_${lib%.so}"
-                missing=""
-                for sym in ${!syms_var}; do
-                  awk -v required="$sym" '$4 == "FUNC" && ($5 == "GLOBAL" || $5 == "WEAK") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $7 ~ /^[0-9]+$/ && $7 > 0 && $8 == required { found=1 } END { exit !found }' <<<"$dynsyms" || missing="$missing $sym"
-                done
-                if [ -n "$missing" ]; then
-                  echo "::error::$entry in $apk is missing required JNI export(s):$missing"; fail=1; continue
-                fi
-                if [[ "$lib" == libvortx_ffi.so ]] && ! READELF="$READELF" ./scripts/verify-native-engine-abi.sh android "$out" resource-host; then
-                  echo "::error::$entry lacks the complete native resource/state ABI"; fail=1; continue
-                fi
-                echo "ok: $apk $entry ($size bytes, $elf_class LE DYN $machine, all required JNI exports present)"
-              done
-            done
+            DEXDUMP="$DEXDUMP" bash scripts/verify-android-native-build-config.sh "$apk"
           done
-          rm -rf "$workdir"
-          if [ "$fail" -ne 0 ]; then exit 1; fi
-          echo "every APK embeds both engines for arm64-v8a + armeabi-v7a + x86_64 (correct ELF class/machine and JNI exports)"
+          READELF="$READELF" STRIP="$STRIP" bash scripts/verify-native-android-artifacts.sh \
+            --native-only \
+            --staged-dir android/app/src/main/jniLibs \
+            --source-sha "$VORTX_ENGINE_SOURCE_SHA" \
+            "${apks[@]}"
 
       # Licensing boundary gate: the `play` flavor must be free of the GPLv3 mpv/ffmpeg native libs
       # (they ship only via fullImplementation). libmpv.so is the canonical marker; the sibling libs
@@ -426,8 +330,8 @@ jobs:
       # ANDROID_KEYSTORE_BASE64 is absent (a fork, or before the owner sets the secrets) the steps
       # below skip and the job still succeeds on the debug artifacts. The release is the sideloaded
       # `full` flavor (mirrors the Apple sideload-IPA model); the GPL-gated `play` flavor is a separate
-      # Play-Store concern. VORTX_REQUIRE_ENGINE=1 is carried through, so a release APK/AAB that built
-      # at all is guaranteed to embed both engines -- the build fails closed otherwise (build.gradle.kts).
+      # Play-Store concern. VORTX_REQUIRE_ENGINE=1 requires fresh Vortx FFI output and the native-only
+      # artifact verifier rejects missing, stale, or legacy Stremio JNI libraries.
       #
       # Secrets cannot be referenced directly in a step `if:`, so this preflight promotes their
       # presence to an output the later steps gate on. It reveals only whether the secret is set,
@@ -458,8 +362,8 @@ jobs:
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/upload.jks"
           test -s "$RUNNER_TEMP/signing/upload.jks" || { echo "::error::decoded keystore is empty (bad ANDROID_KEYSTORE_BASE64)"; exit 1; }
 
-      # Build the signed release APK + AAB for the sideloaded `full` flavor. Same engine wiring as the
-      # debug build above (both private engines fetched at pinned commits, VORTX_REQUIRE_ENGINE=1). The
+      # Build the signed release APK + AAB for the sideloaded `full` flavor. Same native-only engine
+      # wiring as the debug build above; both immutable private pins remain checked. The
       # VORTX_* signing env vars are exactly what app/build.gradle.kts's signingSecret() reads; with all
       # four set, its release signingConfig activates and signs the outputs.
       - name: Build signed release (full flavor APK + AAB)
@@ -552,7 +456,10 @@ jobs:
           fi
           scripts/verify-android-release-signing.sh verify "${apks[@]}" "${bundles[@]}"
           READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
-            bash scripts/verify-native-android-artifacts.sh "${apks[@]}" "${bundles[@]}"
+          STRIP="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            bash scripts/verify-native-android-artifacts.sh \
+              --native-only --staged-dir android/app/src/main/jniLibs \
+              --source-sha "$VORTX_ENGINE_SOURCE_SHA" "${apks[@]}" "${bundles[@]}"
 
       # The packaged .so gate above proves JNI/resource-host exports. This separate bytecode gate
       # proves the signed APK/AAB selected the same native mode at compile time; a release with a

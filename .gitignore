@@ -86,6 +86,8 @@ graphify-out/
 /docs/REBASE-stremio-core.md
 /docs/superpowers/
 app/*.entitlements
+app/.native-project.yml
+scripts/__pycache__/
 
 # runtime poster URLCache (PosterImageLoader diskPath)
 app/vortx-images/

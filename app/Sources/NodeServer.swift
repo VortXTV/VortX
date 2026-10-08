@@ -1,6 +1,8 @@
 import Foundation
 import Darwin   // sockets (waitForPortFree) + rlimit (RLIMIT_NOFILE raise) before node boots
+#if !VORTX_NATIVE_DATA_ENGINE
 import NodeMobile
+#endif
 
 /// Pure state machine mirrored by the Node preload's listener-rebind guard below. A relisten can succeed and
 /// then lose its listener again before the next HTTP response, which is a fresh failure episode rather than a
@@ -210,6 +212,12 @@ enum NodeServer {
     }
 
     static func startIfNeeded() {
+        #if VORTX_NATIVE_DATA_ENGINE
+        // Native-only packages omit NodeMobile and server.js. Start the real native service;
+        // unavailable native artifacts remain an explicit failure in VortxNativeServer.
+        ServerDiagnostics.register(status: { VortxNativeServer.statusDescription }, logTail: { _ in [] })
+        VortxNativeServer.startIfNeeded()
+        #else
         #if !VORTX_WEB_HOST
         if VortxNativeServerFlag.isOn {
             ServerDiagnostics.register(status: { VortxNativeServer.statusDescription }, logTail: { _ in [] })
@@ -244,8 +252,10 @@ enum NodeServer {
         thread.stackSize = 8 * 1024 * 1024   // Node requires a large stack
         thread.qualityOfService = .userInitiated
         thread.start()
+        #endif
     }
 
+    #if !VORTX_NATIVE_DATA_ENGINE
     private static func runNode(_ scriptPath: String) {
         // Resolve the writable cache dir + log path up front and stamp a fresh BOOT marker into the log
         // BEFORE the (up-to-10s) port wait and node boot. This keeps the log's mtime current from the very
@@ -645,6 +655,7 @@ enum NodeServer {
         // export file so the cause is right there.
         DiagnosticsLog.log("server", "node exited rc=\(rc) (server cannot restart in-process; relaunch required)")
     }
+    #endif
 
     /// tvOS/iOS cannot see or kill a stale previous instance holding 11470 (no lsof/kill in the sandbox,
     /// unlike MacNodeServer.reclaimStalePort). Instead WAIT for the port to become bindable before starting

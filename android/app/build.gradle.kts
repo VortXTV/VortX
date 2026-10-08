@@ -393,31 +393,28 @@ dependencies {
 }
 
 // =====================================================================================================
-// stremio-core JNI: build libstremiox_core.so from ../../core (Rust cdylib) and package it into the APK.
+// Legacy Stremio-core JNI: build libstremiox_core.so from ../../core for an explicit non-native
+// comparison build. Native-only builds do not depend on or package this library.
 //
 // APPENDED block, owned by the engine/JNI scope. It does NOT modify the android {} or dependencies {}
 // blocks above (the gradle owner owns those). It only: (1) points jniLibs at a build-output dir, and
-// (2) registers a cargo-ndk cross-compile task that the native-dependent variants depend on.
+// (2) registers a cargo-ndk cross-compile task selected only by non-native variants.
 //
 // The native library is produced by `cargo ndk` (https://github.com/bbqsrc/cargo-ndk, v3.x). The Rust
 // side lives in core/ with crate-type = ["staticlib", "cdylib"]; the cdylib + the
 // #[cfg(target_os = "android")] JNI surface (core/src/android_jni.rs) compile to the .so loaded by
 // StremioCoreNative.System.loadLibrary("stremiox_core").
 //
-// Honest status: this is the build wiring (scaffold). It runs cargo-ndk when the Rust + NDK toolchain
-// is present (CI installs it: rustup target add aarch64-linux-android..., cargo install cargo-ndk).
-// On a machine without the toolchain the task is skipped with a warning so the Kotlin/Compose build
-// still configures; the resulting APK simply won't contain the .so until built where cargo-ndk exists.
-// RELEASE-INTENT builds are the exception: see `engineRequired` below -- CI sets it, and then every
-// skip above becomes a hard build failure instead.
+// This task runs cargo-ndk when selected and the Rust + NDK toolchain is present. On a machine without
+// the toolchain a non-release comparison build warns and skips; release-intent builds fail closed
+// when the legacy task is selected without its source/toolchain.
 // =====================================================================================================
 
 // Fail-closed switch for release-intent builds. When VORTX_REQUIRE_ENGINE=1 (env) or
 // -Pvortx.requireEngine=true is set, a missing engine checkout, a missing cargo toolchain, or a
 // missing/empty .so output is a HARD build failure (GradleException) instead of the dev-machine
-// warn-and-skip: an APK from such a build must never silently ship without its engines. CI
-// (.github/workflows/android.yml) sets it on every build it distributes; dev machines without the
-// Rust toolchain keep the graceful skip so the Kotlin/Compose build still works.
+// warn-and-skip. Native workflows require freshly built VortX output; the explicit non-native
+// comparison path retains this check for the legacy Stremio library.
 val engineRequired: Boolean =
     System.getenv("VORTX_REQUIRE_ENGINE") == "1" ||
         (project.findProperty("vortx.requireEngine") as? String)?.toBoolean() == true
@@ -425,7 +422,7 @@ val engineRequired: Boolean =
 // stremiox-core is proprietary + lives in a PRIVATE repo. Resolve its checkout from (in order):
 // STREMIOX_CORE_DIR env, the `stremiox.core.dir` gradle property, a sibling `../../stremiox-core`
 // clone, else the legacy in-repo `../core` (removed from the public app repo). If none exist the
-// task's onlyIf skips the native build (APK ships without libstremiox_core.so), same as no-cargo.
+// non-native comparison task's onlyIf skips (that APK has no libstremiox_core.so), same as no-cargo.
 val coreCrateDir: File =
     (System.getenv("STREMIOX_CORE_DIR") ?: (project.findProperty("stremiox.core.dir") as? String))?.let(::File)
         ?: rootProject.file("../../stremiox-core").takeIf { it.exists() }
@@ -457,8 +454,8 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
 
     // Skip gracefully when the toolchain is absent so non-Rust dev machines can still build the
     // Kotlin/Compose app -- UNLESS the build is release-intent (engineRequired), where a missing
-    // engine is a hard failure. CI (android.yml) installs cargo-ndk + the Android Rust targets and
-    // sets VORTX_REQUIRE_ENGINE=1, so there the task must run and the .so must be packaged.
+    // engine is a hard failure. The private-source CI lane installs cargo-ndk + Android targets;
+    // native-only workflows invoke Vortx FFI below rather than this legacy task.
     val cargoOnPath = System.getenv("PATH").orEmpty().split(File.pathSeparator).any { dir ->
         File(dir, "cargo").exists() || File(dir, "cargo.exe").exists()
     }
@@ -499,10 +496,9 @@ val cargoNdkBuild by tasks.registering(Exec::class) {
 }
 
 android {
-    // Package the cargo-ndk output. Additive: srcDirs accumulates, so this coexists with any default
-    // src/main/jniLibs the gradle owner may add.
+    // Package the legacy cargo-ndk output only for an explicit non-native comparison build.
     sourceSets.named("main") {
-        jniLibs.srcDir(jniLibsOutDir)
+        if (!nativeEngineEnabled) jniLibs.srcDir(jniLibsOutDir)
     }
     // The bounded community-provider host is a separate C library. It deliberately does not share
     // symbols or build output with the Rust engine JNI library above.
@@ -522,6 +518,9 @@ android {
     packaging {
         jniLibs {
             pickFirsts += "**/libc++_shared.so"
+            // Guard against stale legacy JNI output in native-only artifacts. Compatible add-on
+            // manifests are handled by the VortX resource host in this mode.
+            if (nativeEngineEnabled) excludes += "**/libstremiox_core.so"
             // W1-B: the AAR's own JNI glue is dead weight now -- :mpv-seam's source-built
             // libvortx_mpv_seam.so replaces it (MpvSeam loads "mpv" + "vortx_mpv_seam", never
             // "player"), so exclude libplayer.so instead of packaging an opaque binary nothing can
@@ -529,12 +528,6 @@ android {
             excludes += "**/libplayer.so"
         }
     }
-}
-
-// Make the native library exist before it is merged into the APK. merge*JniLibFolders is AGP's task
-// that collects jniLibs; depending on it for every variant covers debug + release.
-tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
-    dependsOn(cargoNdkBuild)
 }
 
 // =====================================================================================================
@@ -642,4 +635,7 @@ val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
 
 tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders") }.configureEach {
     dependsOn(cargoNdkBuildVortxFfi)
+    // Keep the explicit non-native comparison path intact. Native-only mode never schedules the
+    // legacy Stremio engine build.
+    if (!nativeEngineEnabled) dependsOn(cargoNdkBuild)
 }

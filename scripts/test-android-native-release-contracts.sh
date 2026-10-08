@@ -43,6 +43,7 @@ require_regex() {
 # precedence over environment values, malformed values fail during configuration, and native=true
 # cannot reach compilation without resource-host=true.
 require_literal "Gradle owns one native boolean resolver" 'fun nativeBooleanFlag(propertyName: String, environmentName: String)' "$GRADLE_BUILD"
+require_literal "native mode remains false unless explicitly selected" 'null, "", "false", "0" -> false' "$GRADLE_BUILD"
 require_literal "Gradle resolves the native application mode once" 'val nativeEngineEnabled = nativeBooleanFlag("vortx.nativeEngine", "VORTX_NATIVE_ENGINE")' "$GRADLE_BUILD"
 require_literal "Gradle resolves the resource-host mode once" 'val nativeResourceHostEnabled = nativeBooleanFlag("vortx.nativeResourceHost", "VORTX_NATIVE_RESOURCE_HOST")' "$GRADLE_BUILD"
 require_literal "native mode fails closed without resource-host" 'if (nativeEngineEnabled && !nativeResourceHostEnabled)' "$GRADLE_BUILD"
@@ -50,6 +51,9 @@ require_literal "BuildConfig is derived from the resolved native mode" 'buildCon
 require_literal "resource-host compilation is an explicit Cargo feature" '"jni,server,resource-host"' "$GRADLE_BUILD"
 require_literal "legacy JNI/server feature remains explicit for non-native builds" '"jni,server"' "$GRADLE_BUILD"
 require_regex "native feature selection uses the shared resource-host decision" 'if \(nativeResourceHostEnabled\) "jni,server,resource-host" else "jni,server"' "$GRADLE_BUILD"
+require_literal "legacy Stremio JNI task is a non-native comparison dependency only" 'if (!nativeEngineEnabled) dependsOn(cargoNdkBuild)' "$GRADLE_BUILD"
+require_literal "native mode excludes the legacy Stremio jniLibs directory" 'if (!nativeEngineEnabled) jniLibs.srcDir(jniLibsOutDir)' "$GRADLE_BUILD"
+require_literal "native mode excludes stale legacy Stremio JNI packages" 'if (nativeEngineEnabled) excludes += "**/libstremiox_core.so"' "$GRADLE_BUILD"
 if grep -qF 'providers.gradleProperty("vortx.nativeEngine").orNull == "true"' "$GRADLE_BUILD"; then
     fail "BuildConfig still has an independent provider-only native selector"
 fi
@@ -69,10 +73,14 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     done <<< "$build_runs"
     require_literal "$(basename "$workflow") keeps the engine-required host env" 'VORTX_NATIVE_RESOURCE_HOST: "1"' "$workflow"
     require_literal "$(basename "$workflow") keeps the native mode env aligned" 'VORTX_NATIVE_ENGINE: "1"' "$workflow"
-    require_regex "$(basename "$workflow") verifies the resource-host ABI" 'verify-native-engine-abi\.sh android .* resource-host' "$workflow"
+    require_literal "$(basename "$workflow") invokes native-only artifact verification" '--native-only --staged-dir android/app/src/main/jniLibs' "$workflow"
+    require_literal "$(basename "$workflow") uses the pinned NDK strip normalizer" 'llvm-strip' "$workflow"
     require_literal "$(basename "$workflow") pins stremiox-core immutably" 'repository: VortXTV/stremiox-core' "$workflow"
     require_regex "$(basename "$workflow") stremiox-core ref is a full SHA" 'ref: [0-9a-f]{40}' "$workflow"
     require_literal "$(basename "$workflow") pins vortx-core immutably" 'repository: VortXTV/vortx-core' "$workflow"
+    require_literal "$(basename "$workflow") enforces the reviewed vortx-core SHA" 'ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4' "$workflow"
+    require_literal "$(basename "$workflow") records the exact fetched Vortx source SHA" 'VORTX_ENGINE_SOURCE_SHA=$vortx_sha' "$workflow"
+    require_literal "$(basename "$workflow") verifies artifacts against the source SHA" '--source-sha "$VORTX_ENGINE_SOURCE_SHA"' "$workflow"
     # rust-cache's explicit key survives its lockfile-prefix fallback. Bind that key to the
     # private source, not only the branch, so updating engine code cannot restore older targets.
     cache_key="$(awk '/^[[:space:]]*key:.*github.ref_name/{print; exit}' "$workflow")"
@@ -93,26 +101,36 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     require_literal "$(basename "$workflow") names the native BuildConfig field in its artifact gate" 'NATIVE_ENGINE_ENABLED' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
     require_literal "$(basename "$workflow") rejects an artifact without native BuildConfig=true" 'does not prove BuildConfig.NATIVE_ENGINE_ENABLED=true' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
     require_literal "$(basename "$workflow") checks the AAB base dex path" 'dex_prefix="base/dex/"' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
-    require_literal "$(basename "$workflow") checks all shipped Android ABIs" 'for abi in arm64-v8a armeabi-v7a x86_64' "$workflow"
-    require_literal "$(basename "$workflow") checks callable resource-host JNI exports" 'resource-host' "$workflow"
+    require_literal "$(basename "$workflow") delegates all-ABI checks to the shared verifier" 'scripts/verify-native-android-artifacts.sh' "$workflow"
+    require_literal "$(basename "$workflow") checks the resource-host JNI ABI" 'verify-native-engine-abi.sh' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 done
-require_literal "candidate signed artifacts still run the complete native ABI verifier" 'bash scripts/verify-native-android-artifacts.sh "${apks[@]}" "${bundles[@]}"' "$ANDROID_CI_WF"
-ok "APK/AAB gates prove BuildConfig native mode and JNI/resource-host content"
+candidate_artifact_gate="$(awk '/name: Verify signed release artifacts against the pinned production signer/{active=1; next}
+    active && /^[[:space:]]+- name:/{exit} active{print}' "$ANDROID_CI_WF")"
+require_regex "candidate signed APK/AAB verification uses native-only package comparison" \
+    'verify-native-android-artifacts\.sh.*--native-only|--native-only --staged-dir android/app/src/main/jniLibs' \
+    <(printf '%s\n' "$candidate_artifact_gate")
+require_literal "artifact verifier retains its default legacy-both mode" 'mode=legacy-both' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_literal "native-only verifier rejects the legacy Stremio library" 'native-only artifact still contains legacy libstremiox_core.so' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_literal "native-only verifier compares staged and packaged bytes after strip normalization" '"$strip" --strip-debug --strip-unneeded "$normalized_package"' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_literal "native-only verifier records normalized packaged hashes with exact source and features" 'native-engine source=%s features=jni,server,resource-host' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_literal "resource-host ABI helper requires the native host surface" 'nativeResourceHostAbiVersion' "$REPO_ROOT/scripts/verify-native-engine-abi.sh"
+require_literal "release provenance records normalized package hashes" 'normalized-sha256=%s' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+ok "APK/AAB gates prove native-only BuildConfig, exact staged engine bytes, and resource-host ABI"
 
 require_literal "BuildConfig helper tracks static field numbers" 'target_field=current_field' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
 require_literal "BuildConfig helper tracks static value numbers" 'current_value == target_field' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
 require_literal "BuildConfig helper uses a whitespace-safe exact class boundary" '^[[:space:]]*Class descriptor' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
 require_literal "BuildConfig parser negative fixtures are executable" 'native_whitespace_class_boundary.dump' "$REPO_ROOT/scripts/test-android-native-build-config.sh"
 
-# Native mode must not be able to fall back through the old repository or sync seams. This is a
-# read-only call-graph contract; the legacy implementation remains compiled and packaged for the
-# explicitly selected non-native variant until an independently reviewed link-removal gate exists.
+# Native mode must not be able to fall back through the old repository or sync seams. Legacy JNI and
+# repository code remain available to the explicit non-native comparison build, but native artifacts
+# package only the resource-host engine.
 require_literal "application selects NativeCatalogRepository in native mode" 'if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeRepository' "$APP_SOURCE"
 require_literal "application does not attach legacy sync seams in native mode" 'if (!BuildConfig.NATIVE_ENGINE_ENABLED) manager.attachSyncSeams(store)' "$APP_SOURCE"
 require_literal "legacy repository rejects native construction" 'check(!com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)' "$LEGACY_REPOSITORY"
 require_literal "native resource bridge requires the resource-host ABI" 'nativeResourceHostAbiVersion()' "$RESOURCE_BRIDGE"
 require_literal "native resource bridge rejects an unavailable host" 'nativeResourceHostNew()' "$RESOURCE_BRIDGE"
-ok "native mode has no legacy repository fallback path"
+ok "native mode selects the resource-host repository without packaging the legacy engine"
 
 # Report, but do not alter, the private engine pins. The approved CI replacement is intentionally
 # supplied by the parent after this contract lane; changing a pin here would make this source review
@@ -120,6 +138,10 @@ ok "native mode has no legacy repository fallback path"
 for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     stremio_pin="$(awk '/repository: VortXTV\/stremiox-core/{seen=1; next} seen && /ref:/{print $2; exit}' "$workflow")"
     vortx_pin="$(awk '/repository: VortXTV\/vortx-core/{seen=1; next} seen && /ref:/{print $2; exit}' "$workflow")"
+    [[ "$stremio_pin" = "31c66611822043e089f5819ad232a5df93975873" ]] \
+      || fail "$(basename "$workflow") changed the retained stremiox-core comparison pin"
+    [[ "$vortx_pin" = "ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4" ]] \
+      || fail "$(basename "$workflow") changed the reviewed vortx-core pin"
     printf 'pin: %s stremiox-core=%s vortx-core=%s (parent approval owns replacement)\n' "$(basename "$workflow")" "$stremio_pin" "$vortx_pin"
 done
 

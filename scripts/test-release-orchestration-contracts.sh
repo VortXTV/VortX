@@ -67,7 +67,7 @@ done
 candidate_signing_step="$(awk '/name: Verify signed release artifacts against the pinned production signer/{active=1; next}
     active && /^[[:space:]]+- name:/{exit} active{print}' "$ANDROID_CI_WF")"
 require_grep "signed candidate APK and AAB both verify complete engine ABIs" \
-    'bash scripts/verify-native-android-artifacts.sh "\$\{apks\[@\]\}" "\$\{bundles\[@\]\}"' \
+    'verify-native-android-artifacts\.sh .*--native-only|--native-only --staged-dir android/app/src/main/jniLibs' \
     <(printf '%s\n' "$candidate_signing_step")
 ok "Apple and both Android lanes use one exact wrapper revision"
 native_pin=""
@@ -92,9 +92,13 @@ for wf in "$ANDROID_CI_WF" "$RELEASE_WF"; do
          waiting { if ($0 !~ /VORTX_NATIVE_RESOURCE_HOST: "1"/) exit 1; enabled++; waiting=0 }
          END { if (!required || required != enabled || waiting) exit 1 }' "$wf" ||
         fail "$(basename "$wf") has an engine build without the resource host"
-    require_grep "$(basename "$wf") inspects the complete packaged native ABI" \
-        'verify-native-engine-abi.sh android .* resource-host' "$wf"
+    require_grep "$(basename "$wf") invokes native-only staged/package verification" \
+        '--native-only --staged-dir android/app/src/main/jniLibs' "$wf"
 done
+require_grep "native-only Android verifier retains resource-host ABI proof" \
+    'verify-native-engine-abi\.sh.*android.*resource-host' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_grep "native-only verifier rejects legacy Stremio JNI packaging" \
+    'native-only artifact still contains legacy libstremiox_core\.so' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_grep "Android quality analysis uses the NDK-aware traced build" \
     'queries: \./\.github/codeql/java-quality\.qls' "$CODEQL_WF"
 require_grep "Android quality suite retains GitHub's maintained selector" \
@@ -172,7 +176,7 @@ require_grep "gradle still declares the distribution flavor dimension" \
     'flavorDimensions \+= "distribution"' "$GRADLE_BUILD"
 
 # The universal label is only honest when every native producer and verifier carries the same ABI
-# set. In particular, armeabi-v7a must never be enabled at packaging level without both Rust engines,
+# set. In particular, armeabi-v7a must never be enabled at packaging level without the VortX engine,
 # the source-built libmpv seam, CI rust-std installation, and artifact inspection following it.
 require_grep "root Gradle contract includes the 32-bit Fire TV ABI" \
     'vortxAndroidAbis.*arm64-v8a.*armeabi-v7a.*x86_64' "$ROOT_GRADLE_BUILD"
@@ -183,34 +187,42 @@ require_grep "mpv seam ABI filter consumes the shared native ABI contract" \
 for wf in "$ANDROID_CI_WF" "$RELEASE_WF"; do
     require_grep "$(basename "$wf") installs the armv7 Rust target" \
         'targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android' "$wf"
-    require_grep "$(basename "$wf") verifies all three shipped ABI directories" \
-        'for abi in arm64-v8a armeabi-v7a x86_64' "$wf"
-    for method in nativeRestoreLibrary nativeReadLibraryEvents; do
-        require_grep "$(basename "$wf") requires $method in the engine artifact" \
-            "Java_com_vortx_android_engine_StremioCoreNative_$method" "$wf"
-    done
-    # Run the exact production symbol predicate against readelf-shaped rows. A matching
-    # import/local/hidden/object must never stand in for a callable JNI definition.
-    symbol_predicate="$(sed -n "s/.*awk -v required=.* '\\(.*\\)' <<<.*/\\1/p" "$wf")"
-    [[ -n "$symbol_predicate" ]] || fail "$(basename "$wf") callable JNI predicate missing"
-    valid_symbol='1: 0000000000000100 64 FUNC GLOBAL DEFAULT 12 nativeRestoreLibrary'
-    awk -v required=nativeRestoreLibrary "$symbol_predicate" <<<"$valid_symbol" \
-        || fail "$(basename "$wf") rejects a defined visible JNI function"
+    require_grep "$(basename "$wf") invokes the shared native-only artifact verifier" \
+        'verify-native-android-artifacts\.sh' "$wf"
+done
+for abi in arm64-v8a armeabi-v7a x86_64; do
+    require_grep "native-only verifier explicitly requires $abi" "$abi/libvortx_ffi\.so" \
+        "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+done
+for method in nativeResourceHostAbiVersion nativeResourceHostNew nativeResourceHostLoadJson nativeResourceHostFree; do
+    require_grep "native-only engine ABI gate checks $method" "$method" \
+        "$REPO_ROOT/scripts/verify-native-engine-abi.sh"
+done
+require_grep "native-only verifier rejects non-little-endian engines" 'Data:.*little endian' \
+    "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_grep "native-only verifier rejects non-shared-object engines" 'Type:.*DYN' \
+    "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+# Keep the original executable JNI predicate negatives after moving the workflow's inline
+# checker into shared helpers. A text match or archive path can never replace callable exports.
+for helper in "$REPO_ROOT/scripts/verify-native-android-artifacts.sh" "$REPO_ROOT/scripts/verify-native-engine-abi.sh"; do
+    symbol_predicate="$(sed -n "s/.*awk -v wanted=.* '\\(.*\\)' <<<.*/\\1/p" "$helper" | awk 'NR == 1 { print }')"
+    [[ -n "$symbol_predicate" ]] || fail "$(basename "$helper") callable JNI predicate missing"
+    valid_symbol='1: 0000000000000100 64 FUNC GLOBAL DEFAULT 12 nativeResourceHostNew'
+    awk -v wanted=nativeResourceHostNew "$symbol_predicate" <<<"$valid_symbol" \
+        || fail "$(basename "$helper") rejects a defined visible JNI function"
     for invalid_symbol in \
-        '1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND nativeRestoreLibrary' \
-        '1: 0000000000000100 64 FUNC LOCAL DEFAULT 12 nativeRestoreLibrary' \
-        '1: 0000000000000100 64 FUNC GLOBAL HIDDEN 12 nativeRestoreLibrary' \
-        '1: 0000000000000100 64 OBJECT GLOBAL DEFAULT 12 nativeRestoreLibrary'; do
-        if awk -v required=nativeRestoreLibrary "$symbol_predicate" <<<"$invalid_symbol"; then
-            fail "$(basename "$wf") accepts a non-callable JNI entry"
+        '1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND nativeResourceHostNew' \
+        '1: 0000000000000100 64 FUNC LOCAL DEFAULT 12 nativeResourceHostNew' \
+        '1: 0000000000000100 64 FUNC GLOBAL HIDDEN 12 nativeResourceHostNew' \
+        '1: 0000000000000100 64 OBJECT GLOBAL DEFAULT 12 nativeResourceHostNew'; do
+        if awk -v wanted=nativeResourceHostNew "$symbol_predicate" <<<"$invalid_symbol"; then
+            fail "$(basename "$helper") accepts a non-callable JNI entry"
         fi
     done
-    require_grep "$(basename "$wf") rejects non-little-endian engines" 'Data:.*little endian' "$wf"
-    require_grep "$(basename "$wf") rejects non-shared-object engines" 'Type:.*DYN' "$wf"
-    ok "$(basename "$wf") JNI predicate rejects undefined/local/hidden/object symbols"
+    ok "$(basename "$helper") JNI predicate rejects undefined/local/hidden/object symbols"
 done
 require_grep "release verifies engines inside the Play AAB as well as both APKs" \
-    'prefix=base/lib' "$RELEASE_WF"
+    '\*\.aab\) prefix=base/lib' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_grep "candidate verifies exactly one Full and one Play APK" \
     '\$\{#full_apks\[@\]\} -ne 1.*\$\{#play_apks\[@\]\} -ne 1' "$ANDROID_CI_WF"
 require_grep "secretless packaging proves libmpv for all three shipped ABIs" \
