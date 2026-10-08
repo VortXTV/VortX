@@ -73,7 +73,10 @@ struct VortxNativeHostPreferences: Sendable {
         var documentFields: [String: VortxJSON] = ["ownAccountSources": .object(retained)]
         if let pending { documentFields["ownAccountOverlayPending"] = pending }
         let document = try JSONEncoder().encode(VortxJSON.object(documentFields))
-        local.authenticatedSourceArchive = try VortxNativeBootstrapArchive.encode(document: document)
+        let merged = try VortxNativeBootstrapArchive.encode(document: document)
+        let scope = VortxAccountScope(account: local.document.scope, ownerProfileID: local.document.ownerProfileId)
+        let historical = try VortxNativeWatchedArchive.retaining(merged, prior: local.authenticatedSourceArchive, scope: scope)
+        local.authenticatedSourceArchive = try VortxNativeWatchedArchive.retaining(historical, prior: archive, scope: scope)
     }
     mutating func merge(_ remote: VortxJSON?, scope: VortxAccountScope) throws {
         guard let remote else { return }

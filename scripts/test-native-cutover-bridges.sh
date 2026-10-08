@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/native-watched-swift-inputs.sh
 mkdir -p app/build
 native_test_dir=$(mktemp -d app/build/native-cutover.XXXXXX)
 sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The profile roster and the active selection\./!p; }' app/SourcesShared/Profiles.swift > "$native_test_dir/UserProfile.swift"
@@ -15,7 +16,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
 "$native_test_dir/native-bridges" test/fixtures/native-resource-contract.json
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
-  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
+  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
   "$native_test_dir/UserProfile.swift" "$native_test_dir/Discovery.swift" app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxNativeProfileEditHost.swift \
   app/Tests/VortxNativeSessionTests.swift -o "$native_test_dir/native-session"
 "$native_test_dir/native-session" "$native_test_dir"

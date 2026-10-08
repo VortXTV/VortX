@@ -23,12 +23,15 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var resourceRegistryValid = true
     private var pendingProfileTransitions = 0
     private var accountEpoch = UUID()
+    private var sourceArchive: Data?
+    var authenticatedSourceArchive: Data? { lock.withLock { sourceArchive } }
     var accountGeneration: UUID { lock.withLock { accountEpoch } }
     func captureSourceFence() -> @Sendable () -> Bool {
         guard let captured = profileSnapshot() else { return { false } }
+        let archive = authenticatedSourceArchive
         return { [weak self] in
             guard let current = self?.profileSnapshot() else { return false }
-            return current.generation == captured.generation && current.pending == captured.pending
+            return current.generation == captured.generation && current.pending == captured.pending && self?.authenticatedSourceArchive == archive
         }
     }
     private func accountIdentity(_ state: VortxJSON?) -> VortxJSON {
@@ -84,6 +87,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         facade.values = try facade.stateFields(state)
         facade.values["native_host_preferences"] = try await session.hostPreferencesDocument()
         facade.values["native_own_overlay_pending"] = try await session.pendingOwnAccountOverlays()
+        facade.sourceArchive = try await session.authenticatedSourceArchive()
         return facade
     }
     private init(session: VortxNativeSession, registry: [VortxResourceAddon], mutationAccepted: @escaping @Sendable () -> Void, changed: @escaping @Sendable ([String]) -> Void) {
@@ -221,6 +225,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 let host = try await session.hostPreferencesDocument()
                 let website = try await session.websiteEditOutcome()
                 let ownPending = try await session.pendingOwnAccountOverlays()
+                let sourceArchive = try await session.authenticatedSourceArchive()
                 let websiteChanged = !websiteEvents.isEmpty && self.lock.withLock {
                     self.values["native_state"]?["nativeSync"] != state["nativeSync"] ||
                         self.values["native_host_preferences"] != host || self.values["native_website_edits"] != website
@@ -235,6 +240,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     if self.accountIdentity(self.values["native_state"]) != self.accountIdentity(state) { self.accountEpoch = UUID() }
                     self.failure = nil
                     self.playback = playback
+                    self.sourceArchive = sourceArchive
                     if self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) {
                         self.invalidateResourcePublications(); self.registryGeneration = UUID()
                         if let replacement { self.registry = replacement; self.resourceRegistryValid = true }

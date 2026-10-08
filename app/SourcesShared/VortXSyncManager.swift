@@ -229,10 +229,11 @@ final class VortXSyncManager: ObservableObject {
     private var nativeCheckpointCapture: CredentialScopeRegistry.Capture?
     private var nativeCheckpointProfile: UUID?
     private var nativeCheckpointGeneration = UUID()
-    private(set) var nativeCheckpointStatus = "not_started"
+    @Published private(set) var nativeCheckpointStatus = "not_started"
     @Published private(set) var nativeProfileEditConflicts: [VortxNativeProfileEditHost.Conflict] = []
     @Published private(set) var nativeOwnAccountResyncUnavailable: [UUID] = []
     @Published private(set) var nativeOwnAccountOverlayPending: [UUID] = []
+    @Published private(set) var nativeWatchedMigrationPending: [UUID] = []
     @Published private(set) var nativeOwnAccountOverlayUnattributed: [UUID] = []
     private var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
     private func nativeProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
@@ -488,6 +489,14 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture) else { return }
         nativeOwnAccountResyncUnavailable.removeAll { $0 == profileID }
     }
+    func publishNativeWatchedPending(_ archive: Data?, capture: CredentialScopeRegistry.Capture) throws {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        nativeWatchedMigrationPending = try VortxNativeWatchedArchive.pendingProfileIDs(archive)
+    }
+    func retryNativeWatchedMigration() async {
+        if CoreBridge.shared.hasNativeSession { _ = await syncDown(force: true) }
+        else { _ = await restoreNativeCheckpoint() }
+    }
     func publishNativeOwnOverlayPending(_ value: VortxJSON, capture: CredentialScopeRegistry.Capture) throws {
         guard isCurrent(capture), case .object(let records) = value else { throw VortxNativeError.superseded }
         let ids = try records.keys.map { id in
@@ -502,10 +511,6 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture), let roster = Self.resolveRoster(from: document, fullOnly: true),
               let owner = roster.profiles.first(where: \.isOwner), roster.profiles.filter(\.isOwner).count == 1 else { throw VortxNativeError.invalidSnapshot }
         let profiles = roster.profiles.filter { !$0.isOwner && $0.usesOwnAccount }
-        guard !profiles.isEmpty else {
-            nativeOwnAccountResyncUnavailable = []
-            return .init(material: try Self.nativeLegacyMaterial(document), authority: nil, sourceArchive: nil)
-        }
         let selectedProfile = ProfileStore.shared.activeID
         let mountedSourceFence = CoreBridge.shared.captureNativeSourceFence()
         guard let keyBytes = dataKey, keyBytes.count == 32 else { throw VortxNativeError.unavailable }
@@ -538,8 +543,11 @@ final class VortXSyncManager: ObservableObject {
         }
         var retainedEnvelopes: [VortxLegacyBootstrapMaterial.RetainedOwnAccountSourceEnvelope] = []
         var pendingOverlays: [String: VortxJSON] = [:]
+        let priorWatchedDraft = try probe.readMigrationDraft(scope: scope)
+        var watchedArchive = priorWatchedDraft
         if let host = try probe.readHostPreferences(scope: scope),
            let archive = try JSONDecoder().decode(VortxNativeHostPreferences.Local.self, from: host).authenticatedSourceArchive {
+            watchedArchive = try VortxNativeWatchedArchive.retaining(archive, prior: watchedArchive, scope: scope)
             try VortxNativeBootstrapArchive.validate(archive)
             let value = try JSONDecoder().decode(VortxJSON.self, from: archive)
             if case .object(let pending) = value["hostDocument"]?["ownAccountOverlayPending"] { pendingOverlays = pending }
@@ -555,7 +563,7 @@ final class VortXSyncManager: ObservableObject {
                 }
             }
         }
-        let documentBytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys, .withoutEscapingSlashes])
+        let documentBytes = try VortxNativeBootstrapArchive.credentialFreeDocument(document)
         let sourceDocument = try JSONDecoder().decode(VortxJSON.self, from: documentBytes)
         func hasAttribution(_ profileID: UUID) throws -> Bool {
             try VortxNativeOwnAccountProducer.hasOverlayAttribution(proof: preferredSources[profileID.uuidString],
@@ -638,17 +646,39 @@ final class VortXSyncManager: ObservableObject {
                 pendingOverlays.removeValue(forKey: source.profileID.uuidString)
             }
         }
+        let watched = try await VortxLegacyWatchedMigration.prepare(accountID: capture.namespace, ownerProfileID: owner.id,
+            document: documentBytes, profileIDs: roster.profiles.filter { $0.isOwner || !$0.usesOwnAccount }.map(\.id),
+            ownAccountSources: sources, archivedEvidence: VortxNativeWatchedArchive.entries(watchedArchive, key: VortxNativeWatchedArchive.evidenceKey),
+            isCurrent: { (try? authority.withActive {}) != nil }, fetch: { try await VortxLegacyWatchedMetadataTransport.fetch($0) })
+        try authority.withActive {}
+        let baseArchive = try VortxNativeOwnAccountProducer.archive(sources, pendingOverlays: pendingOverlays)
+        let archive = try VortxNativeWatchedArchive.retaining(baseArchive, prior: watchedArchive,
+            evidence: watched.archives, pending: watched.pendingArchives, scope: scope)
+        if !watched.unresolved.isEmpty {
+            // Never pair an unimported own source with the existing kernel receipt. Only the
+            // self-contained metadata/pending sidecars enter this no-op checkpoint transaction.
+            let pendingArchive = try VortxNativeWatchedArchive.retaining(VortxNativeOwnAccountProducer.archive([]), prior: watchedArchive,
+                evidence: watched.archives, pending: watched.pendingArchives, scope: scope)
+            if enforceMountedFence, CoreBridge.shared.hasNativeSession {
+                _ = try await CoreBridge.shared.mergeNativeAccountDocument(nil, hostRemote: nil, capture: capture,
+                    legacyMaterial: nil, sourceAuthority: authority, authenticatedSourceArchive: pendingArchive)
+            } else {
+                try probe.retainMigrationDraft(pendingArchive, scope: scope, expected: priorWatchedDraft, authority: authority)
+            }
+            guard isCurrent(capture), !Task.isCancelled else { throw VortxNativeError.superseded }
+            nativeWatchedMigrationPending = try VortxNativeWatchedArchive.pendingProfileIDs(pendingArchive)
+            throw VortxNativeWatchedArchive.Failure.pending
+        }
         let material = try VortxLegacyBootstrapMaterial.encode(document: documentBytes,
             roster: roster.profiles, ownerProfileID: owner.id, rosterModifiedSeconds: roster.modified,
             deferProfileEdits: true, ownAccountSources: sources, retainedOwnAccountBaseline: retainedBaseline,
             retainedOwnAccountSourceEnvelopes: envelopes, retainedOwnAccountSlotBaselines: retainedSlots,
-            deferredOwnAccountOverlays: deferred)
+            deferredOwnAccountOverlays: deferred, accountID: capture.namespace, watchedEvidence: watched.rows)
         nativeOwnAccountResyncUnavailable = unavailable
         for source in sources {
             guard let binding = captured.first(where: { $0.profileID == source.profileID }) else { throw VortxNativeError.invalidSnapshot }
             try CoreBridge.stageNativeCredential(token: binding.token, source: source, transactionID: nil, capture: capture, authority: authority)
         }
-        let archive = try VortxNativeOwnAccountProducer.archive(sources, pendingOverlays: pendingOverlays)
         return .init(material: material, authority: authority, sourceArchive: archive)
     }
     private static func nativeWebsiteEvents(_ document: [String: Any]) throws -> [VortxJSON] {
@@ -777,7 +807,7 @@ final class VortXSyncManager: ObservableObject {
         if let pending = nativeCheckpointTask, nativeCheckpointCapture == capture, nativeCheckpointProfile == selectedProfile {
             return await pending.value
         }
-        let generation = UUID(); nativeCheckpointGeneration = generation; nativeProfileEditConflicts = []; nativeOwnAccountResyncUnavailable = []; nativeOwnAccountOverlayPending = []; nativeOwnAccountOverlayUnattributed = []
+        let generation = UUID(); nativeCheckpointGeneration = generation; nativeProfileEditConflicts = []; nativeOwnAccountResyncUnavailable = []; nativeOwnAccountOverlayPending = []; nativeOwnAccountOverlayUnattributed = []; nativeWatchedMigrationPending = []
         let previous = nativeCheckpointTask; previous?.cancel(); _ = await previous?.value
         guard isCurrent(capture), nativeCheckpointGeneration == generation else { return false }
         nativeCheckpointCapture = capture; nativeCheckpointProfile = selectedProfile
@@ -908,7 +938,7 @@ final class VortXSyncManager: ObservableObject {
                 } catch { await session.close(); throw error }
             } catch {
                 if self.isCurrent(capture), self.nativeCheckpointGeneration == generation,
-                   ProfileStore.shared.activeID == selectedProfile { self.nativeCheckpointStatus = "native_checkpoint_unavailable" }
+                   ProfileStore.shared.activeID == selectedProfile { self.nativeCheckpointStatus = (error as? VortxNativeWatchedArchive.Failure) == .pending ? "watched_migration_pending" : "native_checkpoint_unavailable" }
                 return false // No empty account, legacy token dispatch, or destructive repair fallback.
             }
         }
@@ -1550,6 +1580,7 @@ final class VortXSyncManager: ObservableObject {
         nativeProfileEditConflicts = []
         nativeOwnAccountResyncUnavailable = []
         nativeOwnAccountOverlayPending = []
+        nativeWatchedMigrationPending = []
         nativeOwnAccountOverlayUnattributed = []
 #endif
         if case .account = scope { CoreBridge.excludeAccountHistoryFromGuestRecommendations() }
@@ -1578,6 +1609,7 @@ final class VortXSyncManager: ObservableObject {
         nativeProfileEditConflicts = []
         nativeOwnAccountResyncUnavailable = []
         nativeOwnAccountOverlayPending = []
+        nativeWatchedMigrationPending = []
         nativeOwnAccountOverlayUnattributed = []
 #endif
         if case .account = scope { CoreBridge.excludeAccountHistoryFromGuestRecommendations() }

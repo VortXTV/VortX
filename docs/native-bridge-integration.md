@@ -223,3 +223,31 @@ app or media player. The fixture server requires Node 22+ lossless JSON source s
 
 Passing bridge tests establishes the adapter and lifetime boundary. It does not establish the full
 application cutover or physical playback parity.
+
+## Apple watched-history migration journal
+
+Authenticated bootstrap/pull and explicit independent-account connection prepare opaque watched
+bitmaps with the original source's addon inventory. The exact token-free capture is reused for
+metadata evidence and the typed importer. Raw metadata/source bytes stay device-local under
+`authenticatedSourceArchive.hostDocument.nativeWatchedMigrationEvidence` and
+`nativeWatchedMigrationPending`, as immutable base64 sidecars. Historical bytes are union-retained;
+only evidence for the exact account/owner/profile/UID/source digest/row resolves a pending display.
+They are not an independent kernel receipt and are never exported as cloud preferences.
+
+An existing native session commits sidecars with its unchanged native state through the same FIFO
+and source-generation fence. A first-run unresolved import instead saves an account/owner-AEAD
+`native-migration-draft-v1-<scope digest>.sealed` draft with durable staging and exact prior-draft
+CAS. This cannot mount a session or establish an owner locator. Cancelled/retired preparations
+cannot write it. Cold retries can reuse exact evidence without metadata requests.
+
+The strict first import still requires every watched bitmap's episode inventory: an unavailable
+original addon postpones that import rather than manufacturing empty history. The published
+`nativeWatchedMigrationPending` profile IDs and `nativeCheckpointStatus ==
+"watched_migration_pending"` expose this condition; `retryNativeWatchedMigration()` retries
+authenticated pull for a mounted session or bootstrap otherwise. Existing mounted profiles stay
+usable. `ProfilesView` includes the explanation and retry action; startup shells must display the
+same state when they cannot yet reach the picker.
+
+`scripts/test-native-own-account-producer.sh` with the frozen actual ABI additionally tests draft
+crash/reopen, no fabricated checkpoint/locator, cancelled and stale draft writes, exact cold replay,
+foreign-account refusal, and FIFO source-sidecar retirement. No live provider requests are made.

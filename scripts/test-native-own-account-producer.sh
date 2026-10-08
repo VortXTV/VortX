@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/native-watched-swift-inputs.sh
 mkdir -p app/build
 own_source_dir=$(mktemp -d app/build/native-own-source.XXXXXX)
 sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The profile roster and the active selection\./!p; }' app/SourcesShared/Profiles.swift > "$own_source_dir/UserProfile.swift"
@@ -11,8 +12,8 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     app/SourcesShared/CredentialScope.swift app/SourcesShared/Keychain.swift \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-    app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift \
-    app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
+    app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift \
+    app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
     app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/LinkAuthService.swift app/SourcesShared/VortxNativeOwnAccountProducer.swift app/SourcesShared/VortxNativeAccountCredentials.swift \
     "$own_source_dir/UserProfile.swift" "$own_source_dir/Discovery.swift" app/Tests/VortxNativeOwnAccountProducerTests.swift \
     -o "$own_source_dir/own-source"
@@ -25,8 +26,8 @@ if [[ -n "${VORTX_FFI_LIBRARY:-}" ]]; then
     xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
         -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST -I "$own_source_dir" \
         app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-        app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift \
-        app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
+        app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift \
+        app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
         app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/LinkAuthService.swift app/SourcesShared/VortxNativeOwnAccountProducer.swift \
         app/SourcesShared/VortxNativeProfiles.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxNativeAccountCredentials.swift \
         "$own_source_dir/UserProfile.swift" "$own_source_dir/Discovery.swift" app/Tests/VortxNativeOwnAccountLiveTests.swift \

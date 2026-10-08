@@ -96,6 +96,11 @@ struct ProfilePickerView: View {
                     Text(error).font(Theme.Typography.label).foregroundStyle(.red)
                 }
 #if VORTX_NATIVE_DATA_ENGINE
+                if !nativeSync.nativeWatchedMigrationPending.isEmpty {
+                    Text("Watched-history migration is waiting for episode metadata from an original addon. Saved history is preserved. Existing profiles remain available; first-time setup cannot finish until this metadata can be verified.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    Button("Retry watched-history migration") { Task { await nativeSync.retryNativeWatchedMigration() } }
+                }
                 if !account.isSignedIn, let active = store.active, active.isOwner || !active.usesOwnAccount {
                     Text("Reconnect the owner's Stremio account for external refresh. Credentials from another VortX account are not reused; saved library and watch history remain available.")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)

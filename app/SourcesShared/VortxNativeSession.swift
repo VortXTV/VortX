@@ -121,6 +121,7 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
     private let key: SymmetricKey
     private let installationKey: SymmetricKey?
     private let lock = NSLock()
+    private static let migrationDraftLock = NSLock()
     private var bootstraps: [VortxAccountScope: Data] = [:]
     private struct AccountLocator: Codable {
         let format: String
@@ -147,6 +148,43 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
     private func url(_ scope: VortxAccountScope) -> URL {
         let digest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
         return directory.appendingPathComponent("native-state-v1-\(digest).sealed")
+    }
+    private func migrationDraftURL(_ scope: VortxAccountScope) -> URL {
+        let digest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent("native-migration-draft-v1-\(digest).sealed")
+    }
+    private func migrationDraftAAD(_ scope: VortxAccountScope) -> Data {
+        Data("vortx-native-migration-draft-v1\u{0}".utf8) + scope.authenticatedData
+    }
+    /// A draft cannot mount an account, pin an owner, or certify an import. It only retains exact
+    /// authenticated recovery evidence before the first complete kernel checkpoint exists.
+    func readMigrationDraft(scope: VortxAccountScope) throws -> Data? {
+        Self.migrationDraftLock.lock(); defer { Self.migrationDraftLock.unlock() }
+        try scope.validate()
+        let bytes: Data
+        do { bytes = try Data(contentsOf: migrationDraftURL(scope)) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
+        let archive = try AES.GCM.open(AES.GCM.SealedBox(combined: bytes), using: key, authenticating: migrationDraftAAD(scope))
+        try VortxNativeWatchedArchive.validate(archive, scope: scope)
+        return archive
+    }
+    func retainMigrationDraft(_ archive: Data, scope: VortxAccountScope, expected: Data? = nil, authority: any VortxMutationAuthority) throws {
+        Self.migrationDraftLock.lock(); defer { Self.migrationDraftLock.unlock() }
+        try scope.validate(); try VortxNativeWatchedArchive.validate(archive, scope: scope)
+        guard archive.count <= 48 * 1_024 * 1_024 else { throw VortxNativeError.invalidSnapshot }
+        try authority.withActive {
+            try Task.checkCancellation()
+            var current: Data?
+            do {
+                current = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: migrationDraftURL(scope))),
+                    using: key, authenticating: migrationDraftAAD(scope))
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {}
+            guard current == expected else { throw VortxNativeError.superseded }
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let sealed = try AES.GCM.seal(archive, using: key, authenticating: migrationDraftAAD(scope))
+            guard let bytes = sealed.combined else { throw VortxNativeError.invalidSnapshot }
+            try durableInstall(bytes, at: migrationDraftURL(scope))
+        }
     }
     private func locatorAAD(_ account: String) -> Data { Data(("vortx-native-account-locator-v1\u{0}" + account).utf8) }
     private func locatorURL(_ account: String) -> URL {
@@ -529,6 +567,9 @@ actor VortxNativeSession {
     private static func validateAuthenticatedSources(_ archive: Data?, state: VortxJSON) throws {
         guard let archive else { return }
         try VortxNativeBootstrapArchive.validate(archive)
+        guard case .string(let account) = state["nativeSync"]?["scope"],
+              case .string(let owner) = state["nativeSync"]?["ownerProfileId"] else { throw VortxNativeError.invalidSnapshot }
+        try VortxNativeWatchedArchive.validate(archive, scope: .init(account: account, ownerProfileID: owner))
         let decoded = try JSONDecoder().decode(VortxJSON.self, from: archive)
         guard case .object(let sources) = decoded["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
         for (id, value) in sources {
@@ -763,6 +804,9 @@ actor VortxNativeSession {
             guard let archive = hostPreferences.local.authenticatedSourceArchive else { return .object([:]) }
             return try JSONDecoder().decode(VortxJSON.self, from: archive)["hostDocument"]?["ownAccountOverlayPending"] ?? .object([:])
         }
+    }
+    func authenticatedSourceArchive() throws -> Data? {
+        try lease.withActive { hostPreferences.local.authenticatedSourceArchive }
     }
     @discardableResult func dispatch(_ actions: [String], now: UInt64, legacyMaterial: Data? = nil,
                                     hostRemote: VortxJSON? = nil, hostEdits: [VortxNativeHostPreferences.Edit] = [],

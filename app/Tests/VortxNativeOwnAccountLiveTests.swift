@@ -19,6 +19,7 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
     static func raw(_ value: VortxJSON) throws -> String { String(decoding: try JSONEncoder().encode(value), as: UTF8.self) }
     static func phase(_ value: String) { FileHandle.standardError.write(Data(("Own-account live phase: " + value + "\n").utf8)) }
     static func main() async throws {
+        try await watchedMigrationCheckpoint()
         let owner = UserProfile(id: UserProfile.ownerID, name: "Owner", avatar: "🍿", isOwner: true)
         let own = UserProfile(id: UUID(uuidString: "00000000-0000-0000-0000-00000000B22C")!, name: "Independent", avatar: "🍿", usesOwnAccount: true)
         let scope = VortxAccountScope(account: "account.own-source-fixture", ownerProfileID: owner.id.uuidString)
@@ -454,5 +455,84 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
         check(coldState["nativeSync"]?["accountSlots"] == returned["nativeSync"]?["accountSlots"])
         await cold.close()
         print("Own-account schema4 actual C: atomic shared/own CAS, retained buckets, same-profile epoch retirement, inactive failed-CAS credential and credentialless cold slot passed")
+    }
+    static func watchedMigrationCheckpoint() async throws {
+        phase("watched preflight draft, retry and atomic source sidecars")
+        let owner = UserProfile(id: UUID(uuidString: "90000000-0000-0000-0000-000000000009")!, name: "Owner", avatar: "O", isOwner: true)
+        let scope = VortxAccountScope(account: "account.watched-host", ownerProfileID: owner.id.uuidString)
+        let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("watched")
+        let key = SymmetricKey(size: .bits256)
+        let document = try VortxNativeBootstrapArchive.credentialFreeDocument(["apiKeys": ["tmdb": "fixture-never-archived"], "vortx": [
+            "library": [["id": "tt2934286", "type": "series", "name": "Fixture", "watched": "tt2934286:1:5:5:eJyTZwAAAEAAIA==",
+                         "ua": ["tt2934286:1:4": 4321.5]]],
+            "addons": [["transportUrl": "https://catalog.invalid/manifest.json", "manifest": ["id": "catalog", "name": "Catalog", "version": "1.0.0", "resources": ["meta"], "types": ["series"]]]]]])
+        check(!String(decoding: document, as: UTF8.self).contains("fixture-never-archived"))
+        let authority = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
+        let pending = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
+            document: document, profileIDs: [owner.id], isCurrent: { true }, fetch: { _ in throw URLError(.notConnectedToInternet) })
+        check(pending.unresolved.count == 1 && pending.rows.isEmpty)
+        let empty = try VortxNativeOwnAccountProducer.archive([])
+        let draft = try VortxNativeWatchedArchive.retaining(empty, evidence: pending.archives, pending: pending.pendingArchives, scope: scope)
+        let probe = try VortxEncryptedCheckpointStore(directory: directory, key: key)
+        try probe.retainMigrationDraft(draft, scope: scope, authority: authority)
+        check(try probe.authenticatedCheckpoint(scope: scope) == nil)
+        let reopened = try VortxEncryptedCheckpointStore(directory: directory, key: key)
+        check(try reopened.readMigrationDraft(scope: scope) == draft)
+        let accepted = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
+        do { try probe.retainMigrationDraft(draft, scope: scope, authority: accepted); check(false) } catch VortxNativeError.superseded {}
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try probe.retainMigrationDraft(draft, scope: scope, expected: draft, authority: accepted)
+        }
+        do { try await cancelled.value; check(false) } catch is CancellationError {}
+        check(try reopened.readMigrationDraft(scope: scope) == draft)
+        check(try VortxNativeWatchedArchive.pendingProfileIDs(draft) == [owner.id])
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        check(!files.contains { $0.hasPrefix("native-state-") || $0.hasPrefix("native-account-") })
+        let retired = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
+        VortxNativeOwnAccountProducer.invalidateContext()
+        do { try probe.retainMigrationDraft(draft, scope: scope, authority: retired); check(false) } catch VortxNativeError.superseded {}
+        check(try reopened.readMigrationDraft(scope: scope) == draft)
+        do { try VortxNativeWatchedArchive.validate(draft, scope: .init(account: "account.foreign", ownerProfileID: owner.id.uuidString)); check(false) } catch {}
+        let metadata = try JSONSerialization.data(withJSONObject: ["meta": ["id": "tt2934286", "type": "series", "videos": (1...5).map {
+            ["id": "tt2934286:1:\($0)", "season": 1, "episode": $0, "released": "2020-01-0\($0)T00:00:00.000Z"] as [String: Any]
+        }]])
+        let complete = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
+            document: document, profileIDs: [owner.id], isCurrent: { true }, fetch: { .init(request: $0, raw: metadata) })
+        check(complete.rows.count == 1 && complete.unresolved.isEmpty)
+        let archive = try VortxNativeWatchedArchive.retaining(empty, prior: draft, evidence: complete.archives, scope: scope)
+        check(try VortxNativeWatchedArchive.pendingProfileIDs(archive).isEmpty)
+        check(try VortxNativeWatchedArchive.entries(archive, key: VortxNativeWatchedArchive.pendingKey) == pending.pendingArchives)
+        let replay = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
+            document: document, profileIDs: [owner.id], archivedEvidence: VortxNativeWatchedArchive.entries(archive, key: VortxNativeWatchedArchive.evidenceKey),
+            isCurrent: { true }, fetch: { _ in check(false); throw URLError(.unsupportedURL) })
+        let material = try VortxLegacyBootstrapMaterial.encode(document: document, roster: [owner], ownerProfileID: owner.id,
+            rosterModifiedSeconds: nil, accountID: scope.account, watchedEvidence: replay.rows)
+        let bootstrap = try VortxNativeBootstrapArchive.encode(document: document, material: material, authenticatedSourceArchive: archive)
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: key, bootstrap: bootstrap, bootstrapScope: scope)
+        let action: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account), "ownerProfileId": .string(scope.ownerProfileID),
+            "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
+        let session = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: store,
+            transport: VortxCResourceTransport(), allowNewAccount: true, initialActions: [raw(action)], authenticatedSourceArchive: archive)
+        let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        check(state["nativeSync"]?["legacyImport"] != nil)
+        let persisted = try await session.authenticatedSourceArchive()
+        check(try VortxNativeWatchedArchive.entries(persisted, key: VortxNativeWatchedArchive.evidenceKey) == complete.archives)
+        check(try VortxNativeWatchedArchive.pendingProfileIDs(persisted).isEmpty)
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: []) { _ in }
+        let fence = facade.captureSourceFence()
+        let stale = VortxNativeOwnAccountProducer.Authority(generations: [], validate: fence)
+        let otherDocument = try VortxNativeBootstrapArchive.credentialFreeDocument(["vortx": ["library": [["id": "tt2934286", "type": "series", "watched": "tt2934286:1:5:5:eJyTZwAAAEAAIA=="]], "addons": []]])
+        let otherPending = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
+            document: otherDocument, profileIDs: [owner.id], isCurrent: { true }, fetch: { _ in throw URLError(.notConnectedToInternet) })
+        let sidecar = try VortxNativeWatchedArchive.retaining(empty, pending: otherPending.pendingArchives, scope: scope)
+        _ = try await facade.mergeAccountDocument(nil, hostRemote: nil, legacyMaterial: nil, authenticatedSourceArchive: sidecar)
+        let before = try store.readHostPreferences(scope: scope)
+        do { _ = try await facade.mergeAccountDocument(nil, hostRemote: nil, legacyMaterial: nil, sourceAuthority: stale, authenticatedSourceArchive: archive); check(false) }
+        catch VortxNativeError.superseded {}
+        check(try store.readHostPreferences(scope: scope) == before)
+        check(try VortxNativeWatchedArchive.entries(facade.authenticatedSourceArchive, key: VortxNativeWatchedArchive.evidenceKey) == complete.archives)
+        await facade.shutdown()
+        print("Watched host actual C: encrypted first-run draft, no empty checkpoint, retired capture refusal, source-exact offline replay, immutable pending/evidence retention and FIFO stale sidecar rejection passed")
     }
 }

@@ -140,7 +140,7 @@ final class CoreBridge: ObservableObject {
     }
     @MainActor
     func mergeNativeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
-                                    legacyMaterial: Data, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [],
+                                    legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [],
                                     sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws -> VortxJSON {
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
@@ -156,6 +156,9 @@ final class CoreBridge: ObservableObject {
     @MainActor
     private func refreshNativeProfiles(reloadCredentials: Bool = true) throws {
         guard let facade = nativeFacade, let snapshot = facade.profileSnapshot() else { throw VortxNativeError.closed }
+        if let capture = nativeFacadeLock.withLock({ nativeCredentialCapture }) {
+            try VortXSyncManager.shared.publishNativeWatchedPending(facade.authenticatedSourceArchive, capture: capture)
+        }
         let state = snapshot.state
         let profiles = try VortxNativeProfiles.project(state: state, host: snapshot.host, baseline: nativeProfileBaseline)
         guard case .string(let active) = state["activeProfileId"], let activeID = UUID(uuidString: active) else { throw VortxNativeError.invalidSnapshot }
@@ -268,9 +271,10 @@ final class CoreBridge: ObservableObject {
               let owner = ProfileStore.shared.profiles.first(where: \.isOwner), owner.id != target.profile.id,
               let initial = facade.profileSnapshot() else { throw VortxNativeError.superseded }
         let capture = target.binding.credential, accountEpoch = facade.accountGeneration
+        let sourceFence = facade.captureSourceFence()
         let generation = VortxNativeOwnAccountProducer.capture(slot: ProfileStore.shared.keychainAccount(for: target.profile))
         let authority = VortxNativeOwnAccountProducer.Authority(generations: [generation], validate: {
-            CredentialScopeRegistry.shared.isCurrent(capture) && facade.isAvailable && facade.accountGeneration == accountEpoch
+            CredentialScopeRegistry.shared.isCurrent(capture) && sourceFence() && facade.isAvailable && facade.accountGeneration == accountEpoch
                 && facade.profileSnapshot()?.pending == initial.pending
         })
         let uid = try await LinkAuthService.authenticatedIdentity(authKey: token).uid
@@ -280,8 +284,23 @@ final class CoreBridge: ObservableObject {
         let source = try await VortxNativeOwnAccountProducer.fetch(profileID: target.profile.id, authKey: token, authority: authority,
             profileOverlay: consumedOverlay, framing: pendingOverlay == nil ? .independentNetworkOnly : .authenticatedOverlay, verify: { _ in uid })
         guard nativePlaybackBinding(.native(target.binding))?.0 === facade else { throw VortxNativeError.superseded }
+        let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owner.id.uuidString)
+        let previousArchive = facade.authenticatedSourceArchive
+        let watched = try await VortxLegacyWatchedMigration.prepare(accountID: capture.namespace, ownerProfileID: owner.id,
+            document: consumedOverlay, profileIDs: [owner.id], ownAccountSources: [source],
+            archivedEvidence: VortxNativeWatchedArchive.entries(previousArchive, key: VortxNativeWatchedArchive.evidenceKey),
+            isCurrent: { (try? authority.withActive {}) != nil }, fetch: { try await VortxLegacyWatchedMetadataTransport.fetch($0) })
+        try authority.withActive {}
+        if !watched.unresolved.isEmpty {
+            let pendingArchive = try VortxNativeWatchedArchive.retaining(VortxNativeOwnAccountProducer.archive([]), prior: previousArchive,
+                evidence: watched.archives, pending: watched.pendingArchives, scope: scope)
+            _ = try await mergeNativeAccountDocument(nil, hostRemote: nil, capture: capture, legacyMaterial: nil,
+                sourceAuthority: authority, authenticatedSourceArchive: pendingArchive)
+            throw VortxNativeWatchedArchive.Failure.pending
+        }
         let material = try VortxLegacyBootstrapMaterial.encode(document: consumedOverlay, roster: [owner, target.profile],
-            ownerProfileID: owner.id, rosterModifiedSeconds: nil, ownAccountSources: [source])
+            ownerProfileID: owner.id, rosterModifiedSeconds: nil, ownAccountSources: [source],
+            accountID: capture.namespace, watchedEvidence: watched.rows)
         let own = try VortxNativeProfiles.ownTarget(material: JSONDecoder().decode(VortxJSON.self, from: material), profileID: target.profile.id)
         let request = try VortxNativeProfiles.AccountRebindRequest(scope: capture.namespace, ownerProfileID: owner.id.uuidString,
             transactionID: target.transactionID, expected: target.expected, target: .own(own))
@@ -291,7 +310,8 @@ final class CoreBridge: ObservableObject {
         if pendingOverlay != nil, case .object(var pending) = initial.pending {
             pending.removeValue(forKey: target.profile.id.uuidString); remaining = pending
         }
-        let archive = try VortxNativeOwnAccountProducer.archive([source], pendingOverlays: remaining)
+        let archive = try VortxNativeWatchedArchive.retaining(VortxNativeOwnAccountProducer.archive([source], pendingOverlays: remaining),
+            prior: previousArchive, evidence: watched.archives, pending: watched.pendingArchives, scope: scope)
         try await facade.mutateProfiles([VortxNativeProfiles.rebindAction(profileID: target.profile.id, request: request)], hostEdits: [],
             expectedProfileID: target.profile.id.uuidString, expectedAccountGeneration: accountEpoch, sourceAuthority: authority, authenticatedSourceArchive: archive)
         guard CredentialScopeRegistry.shared.isCurrent(capture), nativeFacade === facade,

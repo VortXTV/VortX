@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/native-watched-swift-inputs.sh
 mkdir -p app/build
 website_host_dir=$(mktemp -d app/build/native-website-host.XXXXXX)
 sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The profile roster and the active selection\./!p; }' app/SourcesShared/Profiles.swift > "$website_host_dir/UserProfile.swift"
@@ -21,7 +22,7 @@ writeFileSync(process.argv[2],JSON.stringify(values.map(value=>({value,canonical
 NODE
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-    app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
+    app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
     app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift \
     "$website_host_dir/UserProfile.swift" "$website_host_dir/Discovery.swift" app/Tests/VortxNativeProfileEditHostTests.swift \
     -o "$website_host_dir/website-host"
@@ -34,8 +35,8 @@ if [[ -n "${VORTX_FFI_LIBRARY:-}" ]]; then
     xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
         -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST -I "$website_host_dir" \
         app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-        app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
-        app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
+        app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift "${native_watched_swift_inputs[@]}" app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
+        app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift \
         "$website_host_dir/UserProfile.swift" "$website_host_dir/Discovery.swift" app/Tests/VortxNativeWebsiteTransactionTests.swift \
         "$VORTX_FFI_LIBRARY" -o "$website_host_dir/website-transaction"
     DYLD_LIBRARY_PATH="$(dirname "$VORTX_FFI_LIBRARY"):$(dirname "$VORTX_FFI_LIBRARY")/deps" "$website_host_dir/website-transaction" "$website_host_dir/checkpoints"

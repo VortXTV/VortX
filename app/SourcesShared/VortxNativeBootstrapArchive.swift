@@ -9,6 +9,13 @@ enum VortxNativeBootstrapArchive {
         "auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
         "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials", "nativeprovidercredentials"
     ]
+    /// Fresh authenticated capture only. Do not use this to rewrite an archived source. The caller
+    /// supplies the strict-decoded object so binary64 provenance is not reparsed by Foundation.
+    static func credentialFreeDocument(_ source: [String: Any]) throws -> Data {
+        var exclusions: [String] = []
+        let value = try sanitize(source, path: "", exclusions: &exclusions)
+        return try JSONSerialization.data(withJSONObject: value, options: [.sortedKeys, .withoutEscapingSlashes])
+    }
     static func encode(document: Data, material: Data? = nil, authenticatedSourceArchive: Data? = nil) throws -> Data {
         guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else { throw Failure.malformed }
         var exclusions: [String] = []
@@ -56,7 +63,7 @@ enum VortxNativeBootstrapArchive {
         guard depth <= 64 else { throw Failure.opaquePreference }
         // Typed SHA-256 evidence is hexadecimal, not a base64 JSON carrier. Some valid hashes
         // (for example e9...) decode to a leading brace plus arbitrary bytes under base64 probing.
-        let typedDigest = ["/valueHash", "/fingerprint", "/sourceDocumentSha256", "/profileOverlaySha256", "/typedCarrierFingerprint"].contains(where: path.hasSuffix)
+        let typedDigest = ["/valueHash", "/fingerprint", "/sourceDocumentSha256", "/metadataResponseSha256", "/profileOverlaySha256", "/typedCarrierFingerprint"].contains(where: path.hasSuffix)
             || path.range(of: #"/nativeSync/legacyImport/acceptedFingerprints/[0-9]+$"#, options: .regularExpression) != nil
             || path.range(of: #"/nativeSync/legacyImport/ownAccountSourceHistory/[0-9A-F-]{36}/[0-9a-f]{64}$"#, options: .regularExpression) != nil
         if let text = value as? String, typedDigest,
