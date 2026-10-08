@@ -99,13 +99,28 @@ private struct CinemaUISmokeSurfaceContent: View {
                     .padding(.vertical, Theme.Space.md)
             }
         case .quickView:
-            CinemaQuickView(item: CinemaUISmokeFixtures.search[0], onWatch: {}, onDetails: {})
+            CinemaUISmokeQuickViewModalHost()
         case .episodeSources:
             ScrollView {
                 CinemaUISmokeDetailSection()
                     .padding(.vertical, Theme.Space.md)
             }
         }
+    }
+}
+
+/// Presents the production quick-view in its real SwiftUI sheet container. The renderer attaches this host to
+/// an isolated `NSWindow` and snapshots that attached sheet rather than directly mounting `CinemaQuickView`,
+/// whose own presentation background is intentionally sheet-oriented.
+private struct CinemaUISmokeQuickViewModalHost: View {
+    @State private var isPresented = true
+
+    var body: some View {
+        Color.clear
+            .accessibilityHidden(true)
+            .sheet(isPresented: $isPresented) {
+                CinemaQuickView(item: CinemaUISmokeFixtures.search[0], onWatch: {}, onDetails: {})
+            }
     }
 }
 

@@ -72,6 +72,9 @@ rg -Fq 'usesInertArtwork: true' SourcesiOS/iOSRootView.swift
 for surface in 'CinemaQuickView' 'CinemaSearchResults' 'CinemaUISmokeDetailSection' 'CinemaUISmokeSurface'; do
   rg -Fq "$surface" SourcesiOS/CinemaUISmokeHarness.swift SourcesiOS/CinemaUISmokeRendererApp.swift
 done
+rg -Fq '.sheet(isPresented: $isPresented)' SourcesiOS/CinemaUISmokeHarness.swift
+rg -Fq 'window.attachedSheet' SourcesiOS/CinemaUISmokeRendererApp.swift
+rg -Fq 'missingQuickViewSheet' SourcesiOS/CinemaUISmokeRendererApp.swift
 
 # `SourceIndexClient` names this optional source even though the fixture never supplies it. The renderer
 # compiles a stub instead of the QuickJS runtime, so a compile-only dependency cannot construct its store,

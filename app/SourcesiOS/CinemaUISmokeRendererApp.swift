@@ -52,16 +52,36 @@ enum CinemaUISmokeRendererApp {
                                             surface: surface)
         let host = NSHostingView(rootView: root)
         host.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(contentRect: host.frame,
+                              styleMask: [.titled],
+                              backing: .buffered,
+                              defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        drainMainRunLoop()
         host.layoutSubtreeIfNeeded()
 
+        let capturedView: NSView
+        if surface == .quickView {
+            guard let sheet = window.attachedSheet, let sheetContent = sheet.contentView else {
+                throw RendererError.missingQuickViewSheet
+            }
+            sheetContent.layoutSubtreeIfNeeded()
+            capturedView = sheetContent
+        } else {
+            capturedView = host
+        }
+
         guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
-                                            pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
+                                            pixelsWide: Int(capturedView.bounds.width), pixelsHigh: Int(capturedView.bounds.height),
                                             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
                                             isPlanar: false, colorSpaceName: .deviceRGB,
                                             bitmapFormat: [], bytesPerRow: 0, bitsPerPixel: 0) else {
             throw RendererError.bitmapAllocation
         }
-        host.cacheDisplay(in: host.bounds, to: bitmap)
+        capturedView.cacheDisplay(in: capturedView.bounds, to: bitmap)
         guard let png = bitmap.representation(using: .png, properties: [:]) else {
             throw RendererError.pngEncoding
         }
@@ -70,13 +90,20 @@ enum CinemaUISmokeRendererApp {
         print("rendered \(file.path) \(surface.title) \(Int(size.width))x\(Int(size.height))")
     }
 
+    private static func drainMainRunLoop() {
+        for _ in 0..<6 {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.03))
+        }
+    }
+
     private enum RendererError: LocalizedError {
-        case missingOutputDirectory, bitmapAllocation, pngEncoding
+        case missingOutputDirectory, bitmapAllocation, pngEncoding, missingQuickViewSheet
         var errorDescription: String? {
             switch self {
             case .missingOutputDirectory: return "CINEMA_UI_SMOKE_OUTPUT must be an absolute directory"
             case .bitmapAllocation: return "could not allocate an offscreen bitmap"
             case .pngEncoding: return "could not encode PNG output"
+            case .missingQuickViewSheet: return "production CinemaQuickView sheet was not attached"
             }
         }
     }
