@@ -137,8 +137,14 @@ check(nativeBootstrap.contains("resolveRoster(from: document, fullOnly: true)")
 let postInstall = section(nativeBootstrap, from: "try await CoreBridge.shared.installNativeSession", until: "// Upload only")
 check(postInstall.contains("self.isCurrent(capture), !Task.isCancelled")
                 && postInstall.contains("self.nativeCheckpointGeneration == generation")
-                && postInstall.contains("ProfileStore.shared.activeID == selectedProfile"),
+                && postInstall.contains("ProfileStore.shared.activeID == installationProfile"),
               "final install await rechecks owner, profile, cancellation and opener generation before status or push")
+let detachedSeed = section(syncSource, from: "private func publishDetachedNativeSeed", until: "private func restoreOfflineNativeCheckpoint")
+check(detachedSeed.contains("VortxNativeSession.detachedLegacySync")
+      && detachedSeed.contains("pushSyncDocAt(candidate, version: 0")
+      && appearsBefore("pushSyncDocAt(candidate, version: 0", "pullDocVersionedResult", in: detachedSeed)
+      && !detachedSeed.contains("rememberAuthenticatedScope") && !detachedSeed.contains("installNativeSession"),
+      "proven-empty seed is detached until create-only PUT and authenticated winner readback")
 let nativePush = section(syncSource, from: "private func mergeLocalIntoDoc", until: "// Read-merge the pulled doc's tombstone stamps")
 check(nativePush.contains("legacyMaterial: Self.nativeLegacyMaterial(doc)")
                 && nativePush.contains("VortxNativeSyncExportPolicy.permitsStateOnlyExport")

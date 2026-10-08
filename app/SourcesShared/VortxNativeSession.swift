@@ -53,10 +53,12 @@ protocol VortxCheckpointStore: Sendable {
     /// Must atomically replace and read back before returning. Never log or write plaintext state.
     func commit(_ snapshot: String, scope: VortxAccountScope) throws
     func readHostPreferences(scope: VortxAccountScope) throws -> Data?
+    func readLegacyMaterial(scope: VortxAccountScope) throws -> Data?
     func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws
 }
 extension VortxCheckpointStore {
     func readHostPreferences(scope: VortxAccountScope) throws -> Data? { nil }
+    func readLegacyMaterial(scope: VortxAccountScope) throws -> Data? { nil }
     func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws { throw VortxNativeError.unavailable }
 }
 
@@ -190,6 +192,14 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         do { return try open(Data(contentsOf: url(scope)), scope: scope).hostPreferences }
         catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
     }
+    func readLegacyMaterial(scope: VortxAccountScope) throws -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        let bootstrap: Data?
+        do { bootstrap = try open(Data(contentsOf: url(scope)), scope: scope).bootstrap }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { bootstrap = bootstraps[scope] }
+        guard let bootstrap, let material = try JSONDecoder().decode(VortxJSON.self, from: bootstrap)["legacyImportMaterial"] else { return nil }
+        return try JSONEncoder().encode(material)
+    }
     func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws {
         try VortxNativeHostPreferences.validateSealed(hostPreferences, scope: scope)
         try commitSnapshot(snapshot, scope: scope, hostPreferences: hostPreferences)
@@ -299,6 +309,7 @@ actor VortxNativeSession {
     private let transport: any VortxResourceTransport
     private var runtime: VortxNativeRuntime
     private var hostPreferences: VortxNativeHostPreferences
+    private let legacyBaseline: Data?
     private var closed = false
     private var persistenceFailed = false
     private var epoch = UUID()
@@ -317,6 +328,7 @@ actor VortxNativeSession {
         try scope.validate()
         guard legacy == nil || legacy?.scope == scope else { throw VortxNativeError.invalidSnapshot }
         self.scope = scope; self.abi = abi; self.store = store; self.transport = transport
+        legacyBaseline = try store.readLegacyMaterial(scope: scope)
         hostPreferences = try VortxNativeHostPreferences(scope: scope, actor: hostActor, sealed: store.readHostPreferences(scope: scope))
         writer = try VortxScopeWriter(scope: scope, lease: lease)
         if let captured = try store.read(scope: scope) {
@@ -348,13 +360,26 @@ actor VortxNativeSession {
         let result = try runtime.dispatch(action, now: UInt64(Date().timeIntervalSince1970))
         guard try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))["ok"] == .bool(true) else { throw VortxNativeError.invalidResponse }
     }
-    /// One-time migration is not ongoing old-client reconciliation. Before any durable reopen or
-    /// native-carrier adoption, replay the freshly extracted legacy material against a detached
-    /// candidate. The kernel's own receipt canonicalization accepts identical material after native
-    /// edits and rejects changed legacy intent. Never seed a missing receipt on an existing account.
+    /// A never-backed account must win create-only publication before it owns a durable local
+    /// checkpoint. This detached candidate has no writer lease, checkpoint or mounted session.
+    nonisolated static func detachedLegacySync(scope: VortxAccountScope, ownerName: String, material: Data,
+                                               abi: any VortxRuntimeABI) throws -> VortxJSON {
+        try scope.validate()
+        let candidate = try VortxNativeRuntime(abi: abi, ownerID: scope.ownerProfileID, ownerName: ownerName)
+        defer { candidate.close() }
+        try bind(candidate, scope: scope)
+        let action: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account),
+            "ownerProfileId": .string(scope.ownerProfileID), "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
+        try apply(candidate, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
+        guard let sync = try scope.validateSnapshot(candidate.stateJSON())["nativeSync"] else { throw VortxNativeError.invalidSnapshot }
+        return sync
+    }
+    /// Before durable reopen/adoption, prove the complete legacy material against a detached
+    /// kernel candidate. Exact receipt replay is compatible with older artifacts; changed intent
+    /// requires the private kernel's causal reconciliation action. Missing receipts never seed.
     nonisolated static func validateLegacyCompatibility(scope: VortxAccountScope, ownerName: String,
                                                         snapshot: String?, nativeSync: VortxJSON?, material: Data,
-                                                        abi: any VortxRuntimeABI) throws {
+                                                        abi: any VortxRuntimeABI, baselineMaterial: Data? = nil) throws {
         try scope.validate()
         let candidate: VortxNativeRuntime
         if let snapshot {
@@ -367,15 +392,24 @@ actor VortxNativeSession {
             let action: VortxJSON = .object(["type": .string("merge_native_sync"), "document": nativeSync])
             try apply(candidate, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
         }
-        try validateLegacyReceipt(candidate, scope: scope, material: material)
+        try validateLegacyReceipt(candidate, scope: scope, material: material, baselineMaterial: baselineMaterial)
     }
-    private static func validateLegacyReceipt(_ candidate: VortxNativeRuntime, scope: VortxAccountScope, material: Data) throws {
+    private static func validateLegacyReceipt(_ candidate: VortxNativeRuntime, scope: VortxAccountScope, material: Data, baselineMaterial: Data?) throws {
         let state = try scope.validateSnapshot(candidate.stateJSON())
         guard state["nativeSync"]?["legacyImport"]?["schemaVersion"] == .integer(1) else { throw VortxNativeError.invalidSnapshot }
         let replay: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account),
                                        "ownerProfileId": .string(scope.ownerProfileID),
                                        "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
-        try apply(candidate, action: String(decoding: JSONEncoder().encode(replay), as: UTF8.self))
+        let replayResult = try candidate.dispatch(String(decoding: JSONEncoder().encode(replay), as: UTF8.self), now: UInt64(Date().timeIntervalSince1970))
+        if try JSONDecoder().decode(VortxJSON.self, from: Data(replayResult.utf8))["ok"] == .bool(true) { return }
+        // Only the private kernel decides which old-peer causal changes are supported. Older
+        // artifacts reject this additive action and remain closed; there is no host reducer.
+        var reconciliation: [String: VortxJSON] = ["type": .string("reconcile_legacy_sync"), "scope": .string(scope.account),
+            "ownerProfileId": .string(scope.ownerProfileID), "material": try JSONDecoder().decode(VortxJSON.self, from: material)]
+        if state["nativeSync"]?["legacyImport"]?["baseline"] == nil, let baselineMaterial {
+            reconciliation["baselineMaterial"] = try JSONDecoder().decode(VortxJSON.self, from: baselineMaterial)
+        }
+        try apply(candidate, action: String(decoding: JSONEncoder().encode(VortxJSON.object(reconciliation)), as: UTF8.self))
     }
     func close() {
         revoke(); closed = true; invalidateScreens(); runtime.close(); writer.release()
@@ -456,7 +490,7 @@ actor VortxNativeSession {
             guard value["ok"] == .bool(true) else { throw VortxNativeError.invalidResponse }
             results.append(result)
         }
-        if let legacyMaterial { try Self.validateLegacyReceipt(candidate, scope: scope, material: legacyMaterial) }
+        if let legacyMaterial { try Self.validateLegacyReceipt(candidate, scope: scope, material: legacyMaterial, baselineMaterial: legacyBaseline) }
         let updated = try candidate.stateJSON()
         let state = try scope.validateSnapshot(updated)
         var candidateHost = hostPreferences

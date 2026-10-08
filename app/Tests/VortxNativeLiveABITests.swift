@@ -147,6 +147,8 @@ import CryptoKit
         let action: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(legacyScope.account), "ownerProfileId": .string(legacyScope.ownerProfileID),
                                          "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
         let rawImport = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
+        let detached = try VortxNativeSession.detachedLegacySync(scope: legacyScope, ownerName: owner.name, material: material, abi: VortxCABI())
+        check(detached["scope"] == .string(legacyScope.account) && detached["legacyImport"]?["schemaVersion"] == .integer(1))
         let rejectedScope = VortxAccountScope(account: "fixture-rejected-import", ownerProfileID: owner.id.uuidString)
         let rejectedStore = try VortxEncryptedCheckpointStore(directory: URL(fileURLWithPath: CommandLine.arguments[3]).appendingPathComponent("rejected"), key: SymmetricKey(size: .bits256))
         do {
@@ -200,7 +202,13 @@ import CryptoKit
         do { _ = try await migrated.dispatch([String(decoding: JSONSerialization.data(withJSONObject: different), as: UTF8.self)], now: 11); fatalError("different legacy material replaced native authority") }
         catch VortxNativeError.invalidResponse {}
         check(try migrationStore.read(scope: legacyScope) == migrationState)
-        let changedBytes = try JSONSerialization.data(withJSONObject: changedMaterial)
+        // A changed field without a new source clock remains unsupported, including on kernels
+        // that now reconcile properly timestamped old-client edits.
+        var unsupportedMaterial = try JSONSerialization.jsonObject(with: material) as! [String: Any]
+        var unsupportedProfiles = unsupportedMaterial["roster"] as! [[String: Any]]
+        unsupportedProfiles[0]["name"] = "Unclocked legacy rename"
+        unsupportedMaterial["roster"] = unsupportedProfiles
+        let changedBytes = try JSONSerialization.data(withJSONObject: unsupportedMaterial)
         for remote in [nil, remoteCarrier] {
             do { try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
                                                                    nativeSync: remote, material: changedBytes, abi: VortxCABI()); fatalError("changed legacy material silently mounted") }
