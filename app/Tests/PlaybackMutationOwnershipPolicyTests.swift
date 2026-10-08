@@ -29,6 +29,16 @@ private struct PlaybackMutationOwnershipPolicyTests {
         let overlay = UUID()
         let replacement = UUID()
         let account = "stremiox.auth"
+        let credential = CredentialScopeRegistry.Capture(generation: 7)
+        let nativeA = Policy.NativeBinding(profileID: owner, credential: credential, sessionGeneration: UUID())
+        let nativeTarget = Policy.Target.native(nativeA)
+        let nativeB = Policy.NativeBinding(profileID: overlay, credential: credential, sessionGeneration: UUID())
+        let reopenedA = Policy.NativeBinding(profileID: owner, credential: credential, sessionGeneration: UUID())
+        check(Policy.allowsNative(nativeTarget, binding: nativeA), "native launch owns its exact installed session")
+        check(!Policy.allowsNative(nativeTarget, binding: nativeB), "native A callback cannot write B")
+        check(!Policy.allowsNative(nativeTarget, binding: reopenedA), "native A to B to A or same-profile reopen cannot revive old player")
+        check(!Policy.allowsNative(nativeTarget, binding: nil), "revoked native session cannot accept callback")
+        check(!Policy.allowsNative(.native(nil), binding: nativeA), "unavailable launch never acquires later native session")
         let ownerContext = Policy.Context(activeProfileID: owner, activeUsesEngineHistory: true,
                                           activeKeychainAccount: account, activeUID: "owner-uid",
                                           extantOverlayProfileIDs: [overlay])

@@ -135,11 +135,10 @@ typealias PlaybackMutationTarget = PlaybackMutationOwnershipPolicy.Target
 extension PlaybackMutationTarget {
 
     static func capture(core: CoreBridge) -> PlaybackMutationTarget {
-        let profiles = ProfileStore.shared
 #if VORTX_NATIVE_DATA_ENGINE
-        let capture = CredentialScopeRegistry.shared.capture()
-        return .engine(profileID: profiles.activeID, keychainAccount: capture.namespace, uid: nil, historyCapture: capture)
+        return core.captureNativePlaybackTarget()
 #else
+        let profiles = ProfileStore.shared
         if profiles.activeUsesEngineHistory {
             // History is an owner-account carrier, never a generic native-engine carrier. A
             // secondary profile may use its own Stremio account, but its callbacks must not
@@ -164,10 +163,7 @@ extension PlaybackMutationTarget {
 
     func stillOwnsCurrentContext(core: CoreBridge) -> Bool {
 #if VORTX_NATIVE_DATA_ENGINE
-        guard case let .engine(profileID?, namespace, _, capture?) = self,
-              profileID == ProfileStore.shared.activeID, namespace == capture.namespace,
-              CredentialScopeRegistry.shared.isCurrent(capture), core.hasNativeSession else { return false }
-        return true
+        return core.nativePlaybackTargetIsCurrent(self)
 #else
         let profiles = ProfileStore.shared
         let context = PlaybackMutationOwnershipPolicy.Context(

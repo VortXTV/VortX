@@ -30,13 +30,22 @@ final class CoreBridge: ObservableObject {
     private var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
     var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
     var hasNativeSession: Bool { nativeFacade?.isAvailable == true }
+    func captureNativePlaybackTarget() -> PlaybackMutationTarget {
+        nativeFacadeLock.withLock { .native(currentNativePlaybackBinding()) }
+    }
+    func nativePlaybackTargetIsCurrent(_ target: PlaybackMutationTarget) -> Bool { nativePlaybackBinding(target) != nil }
+    /// Called only under nativeFacadeLock; never substitute a new session into a captured target.
+    private func currentNativePlaybackBinding() -> PlaybackMutationOwnershipPolicy.NativeBinding? {
+        guard let profile = ProfileStore.shared.activeID, let capture = nativeCredentialCapture,
+              CredentialScopeRegistry.shared.isCurrent(capture), let facade = nativeFacadeStorage,
+              facade.isAvailable, facade.registryBinding?.profileID == profile.uuidString else { return nil }
+        return .init(profileID: profile, credential: capture, sessionGeneration: nativeInstallGeneration)
+    }
     private func nativePlaybackBinding(_ target: PlaybackMutationTarget) -> (VortxNativeCoreFacade, UUID)? {
-        guard case let .engine(profile?, namespace, _, capture?) = target,
-              profile == ProfileStore.shared.activeID, namespace == capture.namespace else { return nil }
         return nativeFacadeLock.withLock {
-            guard nativeCredentialCapture == capture, CredentialScopeRegistry.shared.isCurrent(capture),
-                  let facade = nativeFacadeStorage, facade.isAvailable else { return nil }
-            return (facade, profile)
+            guard let binding = currentNativePlaybackBinding(),
+                  PlaybackMutationOwnershipPolicy.allowsNative(target, binding: binding), let facade = nativeFacadeStorage else { return nil }
+            return (facade, binding.profileID)
         }
     }
     func nativeResumeSeconds(for meta: PlaybackMeta, target: PlaybackMutationTarget) async -> Double {
@@ -2608,6 +2617,7 @@ final class CoreBridge: ObservableObject {
         }
 #if VORTX_NATIVE_DATA_ENGINE
         if usesNativeProfileState {
+            ScrobbleCoordinator.shared.watched(meta)
             guard allowEngineWrite else { return }
             nativeWatchedIntent(id: meta.libraryId, videoID: meta.usesSeriesLifecycle ? meta.videoId : nil,
                                 name: meta.name, type: meta.type, poster: meta.poster, watched: true, target: target)

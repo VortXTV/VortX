@@ -10,6 +10,20 @@ enum PlaybackMutationOwnershipPolicy {
         case engine(profileID: UUID?, keychainAccount: String, uid: String?,
                     historyCapture: CredentialScopeRegistry.Capture?)
         case overlay(profileID: UUID)
+        /// A native player must not regain authority after A -> B -> A or a same-account reopen.
+        /// nil records a launch attempted while no acknowledged native session was installed.
+        case native(NativeBinding?)
+    }
+
+    struct NativeBinding: Hashable {
+        let profileID: UUID
+        let credential: CredentialScopeRegistry.Capture
+        let sessionGeneration: UUID
+    }
+
+    static func allowsNative(_ target: Target, binding: NativeBinding?) -> Bool {
+        guard case .native(let captured?) = target, let binding else { return false }
+        return captured == binding
     }
 
     struct Context: Equatable {
@@ -127,6 +141,8 @@ enum PlaybackMutationOwnershipPolicy {
             // `nil` is an identity too. Treating a missing launch uid as a wildcard would let a
             // later sign-in in the same profile/keychain slot inherit an old callback.
             return context.activeUID == uid
+        case .native:
+            return false // native targets require their exact session-aware binding, never this legacy context
         }
     }
 

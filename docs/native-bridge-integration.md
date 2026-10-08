@@ -70,7 +70,7 @@ until reopen; neither path is reported as successful empty history. The new quer
 metadata-enriched progress need the next exact native artifact/live receipt.
 Watched/statistics readers, recommendations and remaining overlay mutation paths remain gates.
 
-Native playback targets capture the exact account namespace/generation for every profile, including
+Native playback targets capture the exact credential epoch and immutable installed-session generation for every profile, including
 historical owner IDs. Native `StremioAccount` resume/progress entry points use kernel reads/writes
 instead of overlay caches or the optional legacy network mirror. Synchronous resume reads consume
 the kernel-provided `resumeById` map; unknown IDs use the same kernel `resume_point` query asynchronously.
@@ -80,6 +80,14 @@ Unproven bulk-season/series marks remain unavailable; these adapters do not inve
 The shipping player can produce both a selected-player progress tick and an explicit metadata save;
 the kernel treats repeated completion as one watched count, but duplicate durable commits remain an
 optimization opportunity. No audible playback/device receipt is claimed by source tests.
+Same-account A→B→A and same-profile reopen invalidate old launch targets permanently; unavailable
+launches never acquire a later session. The existing owner-gated external scrobble fanout remains
+after this target validation, independently of whether selected-player engine writes are allowed.
+
+The local C-ABI facade/playback fixture passed against integrated private source `61a7d450`, library
+SHA-256 `b69aa916cbe65adc38b378576c3b5d04118433fd3068836f05d985f379d318a9` and header
+`f7e277e197c8c72d230be633db5395234a19ff73ec645f971b0d3e88da376672`, with unchanged before/after
+hashes. That covers real kernel queries/mutations and localhost resources, not full app packaging.
 
 ## Artifact gate
 
