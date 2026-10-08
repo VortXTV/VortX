@@ -8,6 +8,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineStart
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.MetaItem
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.sync.SessionOwnerSnapshot
 import org.json.JSONArray
@@ -284,12 +285,50 @@ class VortxNativeLiveJniTest {
         } finally { runtime.retire(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
 
+    @Test fun `real JNI causal legacy reconciliation preserves native fields and survives cold ancestor replay`() = runBlocking {
+        assumeTrue("Requires reviewed reconciliation JNI", System.getenv("VORTX_JNI_SYNC") == "1"); load()
+        val directory = Files.createTempDirectory(File("build").toPath(), "native-reconcile-jni-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val checkpoints = VortxEncryptedCheckpointStore(directory) { key }
+        val account = SessionOwnerSnapshot.Account("00000000-0000-0000-0000-000000000123", 4)
+        val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Baseline", avatar = "🍿", isOwner = true)
+        val baseline = JSONObject().put("vortx", JSONObject().put("roster", JSONArray().put(owner.encode()))
+            .put("rosterModified", 100).put("library", JSONArray()).put("addons", JSONArray()))
+        fun coordinator() = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { it == account }, { it() }, {})
+        var runtime = coordinator()
+        try {
+            assertTrue(runtime.applyDocument(account, baseline) { true })
+            val original = runtime.session().read().state.getJSONObject("legacyImportMaterial").toString()
+            val pin = UserProfile.pinHash("1234", owner.id)
+            NativeProfileAccess { runtime.session() }.save(owner.copy(pin = pin), false)
+            val changed = JSONObject(baseline.toString()).also {
+                it.getJSONObject("vortx").put("rosterModified", System.currentTimeMillis() / 1000 + 20)
+                    .getJSONArray("roster").getJSONObject(0).put("name", "Legacy edit")
+            }
+            assertTrue(runtime.applyDocument(account, changed) { true })
+            var profile = NativeProfileAccess { runtime.session() }.read().profiles.single()
+            assertEquals("Legacy edit", profile.name); assertEquals(pin, profile.pin)
+            assertEquals(original, runtime.session().read().state.getJSONObject("legacyImportMaterial").toString())
+            val exported = JSONObject(changed.toString()).put("nativeSync", runtime.exportDocument(account)!!.nativeSync)
+            runtime.retire(); runtime = coordinator()
+            assertTrue(runtime.applyDocument(account, exported) { true })
+            assertTrue(runtime.applyDocument(account, baseline) { true })
+            profile = NativeProfileAccess { runtime.session() }.read().profiles.single()
+            assertEquals("Legacy edit", profile.name); assertEquals(pin, profile.pin)
+            val before = runtime.session().read().state.toString()
+            val unclocked = JSONObject(changed.toString()).also { it.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).put("name", "Unclocked") }
+            assertTrue(runCatching { runtime.applyDocument(account, unclocked) { true } }.isFailure)
+            assertEquals(before, runtime.session().read().state.toString()); assertEquals(before, checkpoints.read(runtime.session().scope))
+        } finally { runtime.retire(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+
     @Test fun `real JNI parental catalog metadata embedded streams and pagination fail closed on missing certification`() = runBlocking {
         assumeTrue("Requires reviewed native JNI", System.getenv("VORTX_JNI_SYNC") == "1"); load()
         val requests = mutableListOf<JSONObject>()
         var firstPageBlocked = false
+        var recertified = false
         fun meta(id: String) = JSONObject().put("id", id).put("type", "movie").put("name", id).also {
-            if (id.startsWith("g")) it.put("certification", "G")
+            if (id.startsWith("g")) it.put("certification", if (recertified) "R" else "G")
             if (id == "r") it.put("certification", "R")
             it.put("streams", JSONArray().put(JSONObject().put("url", "https://fixture.invalid/$id.mp4").put("name", "1080p")))
         }
@@ -330,6 +369,11 @@ class VortxNativeLiveJniTest {
             val repo = NativeCatalogRepository { session }
             val row = repo.home().getOrThrow().last()
             assertEquals(listOf("g"), row.items.map { it.id })
+            val generated = listOf(com.vortx.android.model.Catalog("client", "Client", listOf("g", "r", "u").map {
+                MetaItem(it, MediaType.MOVIE, it)
+            }))
+            assertEquals(listOf("g"), repo.admitClientHomeRows(generated, repo.continueWatchingOwner()).getOrThrow().single().items.map { it.id })
+            assertTrue(repo.admitClientHomeRows(generated, repo.continueWatchingOwner().copy(revision = -1)).isFailure)
             repo.loadHomeRowNextPage(row).getOrThrow()
             assertEquals("3", requests.last().getJSONArray("extra").getJSONArray(0).getString(1))
             assertEquals(listOf("g"), repo.discover().getOrThrow().items.map { it.id })
@@ -353,6 +397,9 @@ class VortxNativeLiveJniTest {
             assertFalse(com.vortx.android.ui.components.showEmptyCatalogContinuation(row))
             repo.loadHomeRowNextPage(blocked).getOrThrow()
             assertEquals("2", requests.last().getJSONArray("extra").getJSONArray(0).getString(1))
+            recertified = true
+            assertTrue(repo.meta(MediaType.MOVIE, "g").isFailure)
+            assertTrue(repo.admitClientHomeRows(generated, repo.continueWatchingOwner()).getOrThrow().single().items.isEmpty())
         }
     }
 

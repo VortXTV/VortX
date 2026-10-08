@@ -10,13 +10,15 @@ account lease has authenticated/decrypted a successful backup response. Scope is
 `account.<canonical lowercase account UUID>`, with the exact historical owner UUID
 from the authenticated full roster (not the lossy dashboard summary or global
 ProfileStore). Existing checkpoints reopen; a first import uses the shared
-`import_legacy_sync` reducer and its durable, idempotent receipt. A changed legacy
-carrier after import requires explicit reconciliation, not an automatic overwrite.
+`import_legacy_sync` reducer and its durable, idempotent receipt. Later observed
+legacy carriers use `reconcile_legacy_sync` with the retained typed baseline, not
+an automatic overwrite. The kernel applies only changed fields/events with sufficient
+causal evidence; missing/regressing/ambiguous clocks reject the full transaction.
 Every authenticated route, including existing checkpoints and native carriers,
-reprojects the current legacy material and replays its receipt in the same atomic
+reprojects the current legacy material and reconciles its receipt in the same atomic
 transaction as native merge. Pending/malformed website `profileEdits` and missing
 native-carrier import receipts fail closed before checkpoint publication. Unchanged
-legacy material remains a no-op after native edits; differing material never silently
+legacy material and acknowledged ancestors remain no-ops after native edits; unsupported differing material never silently
 mounts an older native state. The exact account/mount is checked again after UI projection.
 An authenticated never-backed account can provision a deterministic Main/A11C baseline
 only after a proven missing backup and acknowledged create-only version-zero PUT.
@@ -29,7 +31,7 @@ Logout/account replacement retires the writer and clears native profile/UI state
 reopening waits for retired transactions before touching the account checkpoint.
 
 `VortxNativeSession` requires the resource-host ABI and the additive
-`bind_sync_scope`/`nativeSync`, `import_legacy_sync`, `installed_addons` and
+`bind_sync_scope`/`nativeSync`, `import_legacy_sync`, `reconcile_legacy_sync`, `installed_addons` and
 `profile_playback` kernel contracts. Missing or old artifacts fail
 explicitly. Every mutation clones the current full state, applies the native
 actions, validates account/owner/schema, writes an encrypted checkpoint, verifies
@@ -72,6 +74,13 @@ and pending state adjacent to the kernel. Only the carrier is uploaded; an exact
 generation is acknowledged, so edits during PUT remain pending across cold restart.
 Old `hostProfileSyncPending` intent migrates only against an authenticated baseline.
 Native-owned name/PIN/parental/theme fields remain pushable through `nativeSync`.
+Provider-credential completion is a separate, unresolved cutover blocker: Android
+does not yet record durable explicit-clear intent or consume the new provider registers.
+A local key removal can therefore leave the older remote key intact while unrelated
+native state uploads; it must not be described as credential synchronization. The known
+`nativeProviderCredentials` cloud carrier is excluded entirely from local host archives,
+not copied into checkpoints. Default native selection remains off until that secure-store
+intent/merge/ack path and its tests are complete.
 
 Checkpoints live in Android's `noBackupFilesDir/native-state`. Android Keystore
 holds a non-exportable AES-256 key per scope. The sealed payload is
@@ -103,6 +112,8 @@ The real repository currently supports:
   Unknown certifications fail closed. A certified series cannot authorize a foreign
   episode ID. Pagination advances by raw counts, and empty filtered Home pages expose
   a native-only Continue catalog button on phone/TV, one bounded page per user action.
+  Supplemental host-generated Home rails also pass final owner-bound admission;
+  items without current raw native certification evidence stay hidden under restrictions.
 - Watch Stats reads the native active-profile history/resume projection and cached
   native metadata genres. It never reads legacy JNI or disk buckets in native
   mode; unavailable ownership produces an explicit UI error. Native watch time is
@@ -127,9 +138,11 @@ Watch-only/idempotent cloud merges preserve an active playback lease; actual
 profile, registry and host-preference changes revoke it. A cached detail offset
 cannot overwrite the kernel's exact resume offset or explicit reset-to-zero.
 
-Still unsupported, exposed as errors rather than success/no-op: Stremio login,
+Still unsupported (repository operations fail explicitly; the provider-clear gap above
+is an unresolved exception and release blocker): Stremio login,
 unresolved own-Stremio-account migration, ambiguous or incomplete legacy carriers,
-continuous old-client reconciliation, outbound provider credential reconciliation,
+legacy changes without the shared reducer's required causal evidence (including pending
+website profile patches), outbound provider credential reconciliation,
 global settings outside the explicit shared SettingsBackup type whitelist (and legacy
 flat native-profile theme changes), whole-series bulk watched mutation and add-on URL
 replacement. The existing profile UI verifies projected salted PINs before

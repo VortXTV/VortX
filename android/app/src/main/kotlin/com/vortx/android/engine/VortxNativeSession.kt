@@ -294,7 +294,7 @@ internal class VortxNativeSession private constructor(
                 NativeHostPreferences.validateProjectedProfiles(hostProfiles)
                 // Preserve exact typed source clocks beside the receipt, never the credential-bearing cloud document.
                 val legacyMaterial = old?.optJSONObject("legacyImportMaterial")
-                    ?: bootstrapActions.firstOrNull { it.getString("type") == "import_legacy_sync" }?.getJSONObject("material")
+                    ?: bootstrapActions.firstOrNull { it.getString("type") in setOf("import_legacy_sync", "reconcile_legacy_sync") }?.getJSONObject("material")
                 val archive = initialHostArchive ?: old?.optJSONObject("hostDocument")?.let {
                     JSONObject().put("document", it).put("excludedCredentialPaths", old.getJSONArray("excludedCredentialPaths"))
                 }
@@ -358,7 +358,7 @@ internal class VortxNativeSession private constructor(
             preferences = NativeHostPreferences.projectProfiles(hostState, preferences,
                 JSONObject(candidate.stateJson()).getJSONObject("roster").getJSONObject("profiles"))
             NativeHostPreferences.validateProjectedProfiles(preferences)
-            val retained = legacyImportMaterial ?: actions.firstOrNull { it.getString("type") == "import_legacy_sync" }?.getJSONObject("material")
+            val retained = legacyImportMaterial ?: actions.firstOrNull { it.getString("type") in setOf("import_legacy_sync", "reconcile_legacy_sync") }?.getJSONObject("material")
             val archive = hostArchive ?: hostDocumentArchive
             val updated = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("hostProfileSyncPending", pendingPreferences).put("legacyImportMaterial", retained)
                 .put("nativeHostPreferenceState", hostState)

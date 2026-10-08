@@ -217,7 +217,7 @@ internal object NativeHostDocument {
     }
 
     private val credentialKeys = setOf("auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
-        "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials")
+        "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials", "nativeprovidercredentials")
     private val suspiciousSuffixes = listOf("token", "password", "authkey", "apikey")
 
     private fun recognizableBackup(value: JSONObject): Boolean = value.opt("format") == SettingsBackup.FORMAT_TAG ||

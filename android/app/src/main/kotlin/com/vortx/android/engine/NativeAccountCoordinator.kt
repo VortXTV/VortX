@@ -136,19 +136,22 @@ internal class NativeAccountCoordinator(
             require(remote.getString("scope") == namespace && remote.getString("ownerProfileId") == owner.id)
             requireNotNull(remote.optJSONObject("legacyImport")) { "Native account requires a verified legacy baseline receipt" }
         }
-        // Always project the CURRENT authenticated legacy carrier, even when nativeSync/checkpoint
-        // exists. Receipt replay is a no-op after native edits, but differing old-client/website
-        // material is rejected by the kernel before this transaction commits or publishes anything.
+        // Current authenticated legacy material is reconciled against the kernel's acknowledged
+        // baseline. Unsupported/missing causal evidence rejects the complete candidate transaction.
         val material = nativeLegacyMaterial(document, roster, resolved.modifiedSeconds)
         // Full descriptors may contain encoded custom strings. Retain exact typed input only if it
         // is credential-free; sanitizing it would silently change the shared kernel's receipt input.
         NativeHostDocument.requireCredentialFree(material)
-        val replay = JSONObject().put("type", "import_legacy_sync").put("scope", namespace).put("ownerProfileId", owner.id)
+        val old = mounted.get()
+        val retained = old?.takeIf { it.account == account && it.session.scope == scope }?.session?.read()?.state
+            ?: checkpoints.read(scope)?.let(scope::validateSnapshot)
+        val hasReceipt = remote?.optJSONObject("legacyImport") != null || retained?.optJSONObject("nativeSync")?.optJSONObject("legacyImport") != null
+        val replay = JSONObject().put("type", if (hasReceipt) "reconcile_legacy_sync" else "import_legacy_sync").put("scope", namespace).put("ownerProfileId", owner.id)
             .put("material", material)
+        if (hasReceipt) replay.put("baselineMaterial", retained?.optJSONObject("legacyImportMaterial") ?: material)
         val syncActions = listOfNotNull(remote?.let { JSONObject().put("type", "merge_native_sync").put("document", it) }, replay)
         val archive = NativeHostDocument.archive(document)
         val baselineHost = NativeHostProfiles.fromDocument(archive.getJSONObject("document"), roster, resolved.modifiedSeconds)
-        val old = mounted.get()
         if (old != null && old.account == account && old.session.scope == scope) {
             val read = old.session.read()
             val host = read.state.getJSONObject("hostProfilePreferences")

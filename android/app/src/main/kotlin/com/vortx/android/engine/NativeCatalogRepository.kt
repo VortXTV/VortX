@@ -51,6 +51,7 @@ internal class NativeCatalogRepository(
     private val homePages = linkedMapOf<String, HomePage>()
     private val homePageChanges = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     private val detailCache = mutableMapOf<Pair<MediaType, String>, Pair<VortxNativeOwner, MetaDetail>>()
+    private var admittedResources: Pair<VortxNativeOwner, Set<Pair<String, String>>>? = null
     private var playing: Playing? = null
     private data class SourceBinding(val owner: VortxNativeOwner, val context: PlaybackContext)
     private val sourceBindings = mutableMapOf<String, SourceBinding>()
@@ -127,9 +128,23 @@ internal class NativeCatalogRepository(
                 val ids = response.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }.toSet()
                 JSONArray(raw.getJSONArray("metas").objects().filter { (it.getString("type") to it.getString("id")) in ids })
             }
+            val admitted = when (allowed) {
+                is JSONObject -> setOf(allowed.getString("type") to allowed.getString("id"))
+                is JSONArray -> allowed.objects().map { it.getString("type") to it.getString("id") }.toSet()
+                else -> emptySet()
+            }
+            val observed = if (kind == "meta") setOf(page.request.type to page.request.id) else
+                raw.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }.toSet()
+            session().owned(read.owner) { synchronized(this) {
+                val prior = admittedResources?.takeIf { it.first == read.owner }?.second.orEmpty()
+                admittedResources = read.owner to (prior - observed + admitted).takeLastBounded(20_000)
+                detailCache.entries.removeAll { (identity, entry) -> entry.first == read.owner &&
+                    (identity.first.id to identity.second) in (observed - admitted) }
+            } }
             group.copy(contentJson = JSONObject(raw.toString()).put(field, allowed).toString())
         })
     }
+    private fun <T> Set<T>.takeLastBounded(size: Int): Set<T> = if (this.size <= size) this else toList().takeLast(size).toSet()
     private fun board(pages: List<VortxResourceSnapshot>, addons: List<VortxResourceAddon>, read: VortxNativeRead) =
         VortxResourceProjection.board(pages.map { policyPage(it, read) }, addons)
     private fun rawCount(page: VortxResourceSnapshot) = page.groups.sumOf { it.items(page.request.resource).size }
@@ -140,12 +155,18 @@ internal class NativeCatalogRepository(
         val raw = JSONArray(items.map { JSONObject().put("id", it.id).put("type", it.type.id).put("name", it.name) })
         val allowed = session().resolve(JSONObject().put("kind", "catalog").put("metas", raw), read.owner)
         check(allowed.getString("kind") == "catalog")
-        val cached = synchronized(this) { detailCache.values.filter { it.first == read.owner }.map { it.second.type.id to it.second.id }.toSet() }
+        val cached = synchronized(this) { detailCache.values.filter { it.first == read.owner }.map { it.second.type.id to it.second.id }.toSet() +
+            admittedResources?.takeIf { it.first == read.owner }?.second.orEmpty() }
         val identities = allowed.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }.toSet() + cached
         return items.filter { (it.type.id to it.id) in identities }
     }
     private fun owner(value: VortxNativeOwner) = ContinueWatchingOwner(value.profileID, value.scope.digest, value.scope.accountID, true, value.revision)
     override fun continueWatchingOwner() = runCatching { owner(session().read().owner) }.getOrDefault(unavailableOwner)
+    override fun admitClientHomeRows(rows: List<Catalog>, expectedOwner: ContinueWatchingOwner): Result<List<Catalog>> = runCatching {
+        val session = session(); val read = session.read()
+        check(owner(read.owner) == expectedOwner) { "Native client rail owner changed" }
+        session.owned(read.owner) { rows.map { it.copy(items = visibleLocal(it.items, read)) } }
+    }
 
     private fun savedItems(read: VortxNativeRead): List<MetaItem> = library(read).getJSONArray("items").objects().filter {
         it.getString("kind") == "standard"

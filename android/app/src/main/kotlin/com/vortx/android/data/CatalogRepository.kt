@@ -115,6 +115,9 @@ data class StreamLoadUpdate(
 ///   - [meta]               -> `meta_details.meta`
 ///   - [streams]            -> `meta_details` stream groups (one per stream add-on)
 interface CatalogRepository {
+    /** Final owner-bound admission for host-generated rails whose lossy items lack provider certification. */
+    fun admitClientHomeRows(rows: List<Catalog>, expectedOwner: ContinueWatchingOwner): Result<List<Catalog>> = Result.success(rows)
+
     /// Home rows: Continue Watching first, then the user's add-on catalogs as poster rails.
     suspend fun home(): Result<List<Catalog>>
 

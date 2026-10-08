@@ -27,12 +27,14 @@ class NativeHostDocumentTest {
 
     @Test fun `known credential carriers omitted with escaped deterministic paths no source mutation`() {
         val source = JSONObject().put("apiKeys", JSONObject().put("realdebrid", "hidden-value"))
+            .put("nativeProviderCredentials", JSONObject().put("fields", JSONObject().put("tmdb", "hidden-register")))
             .put("a/b~c", JSONObject().put("access_token", "hidden-nested").put("keep", "yes"))
             .put("nativeSync", JSONObject().put("schemaVersion", 1).put("key", "movie:authToken"))
             .put("activeProfile", "device-selection")
         val before = source.toString(); val result = NativeHostDocument.archive(source)
         assertEquals(before, source.toString())
-        assertEquals(listOf("/apiKeys", "/a~1b~0c/access_token"), paths(result))
+        assertEquals(listOf("/apiKeys", "/a~1b~0c/access_token", "/nativeProviderCredentials"), paths(result))
+        assertFalse(result.toString().contains("hidden-register"))
         assertFalse(result.toString().contains("hidden-value")); assertFalse(result.toString().contains("hidden-nested"))
         val document = result.getJSONObject("document")
         assertEquals("movie:authToken", document.getJSONObject("nativeSync").getString("key"))

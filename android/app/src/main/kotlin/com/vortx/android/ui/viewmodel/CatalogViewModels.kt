@@ -619,7 +619,12 @@ class HomeViewModel internal constructor(
         val visibleRows = renderedOwner?.let { owner ->
             withoutContinueWatchingItems(rows, pendingContinueWatchingDismissals, owner)
         } ?: rows
-        _state.value = UiState.Success(visibleRows)
+        // Native admission is the final boundary even for Trakt/Simkl/editorial/server rails.
+        // Their presentation items cannot manufacture certification lost before this layer.
+        val admitted = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+            renderedOwner?.let { repo.admitClientHomeRows(visibleRows, it).getOrNull() } ?: emptyList()
+        else visibleRows
+        _state.value = UiState.Success(admitted)
     }
 
     fun removeFromContinueWatching(item: MetaItem) {
