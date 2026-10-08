@@ -10,6 +10,7 @@ on:
       - "scripts/test-apple-player-timeline.sh"
       - "scripts/test-issue240-playback-failures.sh"
       - "scripts/test-source-continuity-and-seek-intent.sh"
+      - "scripts/test-profile-roster-propagation.sh"
       - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/verify-android-release-version.sh"
@@ -28,6 +29,7 @@ on:
       - "scripts/test-apple-player-timeline.sh"
       - "scripts/test-issue240-playback-failures.sh"
       - "scripts/test-source-continuity-and-seek-intent.sh"
+      - "scripts/test-profile-roster-propagation.sh"
       - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/verify-android-release-version.sh"
@@ -58,6 +60,7 @@ jobs:
       - run: bash scripts/test-apple-playback-recovery.sh
       - run: bash scripts/test-issue240-playback-failures.sh
       - run: bash scripts/test-source-continuity-and-seek-intent.sh
+      - run: bash scripts/test-profile-roster-propagation.sh
       - run: bash scripts/test-apple-parity-contracts.sh
       - run: bash scripts/test-apple-player-timeline.sh
       - run: swift app/Tests/MacSettingsShellContractTests.swift

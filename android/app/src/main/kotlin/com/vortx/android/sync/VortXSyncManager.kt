@@ -12,6 +12,7 @@ import com.vortx.android.metadata.MetadataProviderKeys
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.DashboardProfileEdits
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -1919,8 +1920,9 @@ class VortXSyncManager(context: Context) {
                         addonTombstones.merge(parsed.deletedAddons, parsed.deletedAddonsTs)
                     }
                     resolvedRoster.roster?.let {
-                        if (it.isNotEmpty()) store.mergeInRoster(it, resolvedRoster.modifiedSeconds)
+                        foldNativeProfileRoster(store, doc, it, resolvedRoster.modifiedSeconds, parsed.rosterIsLossless)
                     }
+                    foldDashboardProfileEdits(store, doc)
                 } finally {
                     applyingRemote = false
                 }
@@ -1975,6 +1977,22 @@ class VortXSyncManager(context: Context) {
      * Apple's never-wipe restore). Must run inside syncDown's apply window (applyingRemote true) so these
      * SharedPreferences writes cannot arm a self-echo push. Returns true when at least one setting was applied.
      */
+    private fun foldNativeProfileRoster(store: ProfileStore, doc: JSONObject,
+        remote: List<com.vortx.android.profile.UserProfile>, modified: Double?, carrierIsLossless: Boolean) {
+        val lossless = carrierIsLossless || SettingsBackup.rosterFromBlob(doc.opt("settings"))?.isNotEmpty() == true
+        val safe = DashboardProfileEdits.safeIncoming(store.profiles, remote, lossless)
+        if (safe.isNotEmpty()) store.mergeInRoster(safe, if (lossless) modified else null)
+    }
+
+    private fun foldDashboardProfileEdits(store: ProfileStore, doc: JSONObject): Boolean {
+        val result = DashboardProfileEdits.apply(store.profiles, store.deletedProfileIDs,
+            store.rosterModified, doc.optJSONObject("profileEdits"), doc.optJSONObject("vortx")?.opt("updatedAt"))
+        val changed = result.profiles != store.profiles || result.deletedIDs.isNotEmpty()
+        if (result.deletedIDs.isNotEmpty()) store.mergeDeletedTombstones(result.deletedIDs.toList())
+        if (result.profiles.isNotEmpty()) store.mergeInRoster(result.profiles, result.modified)
+        return changed
+    }
+
     private fun applyDeviceSettings(blob: Any?): Boolean {
         val settings = SettingsBackup.settingsFromBlob(blob) ?: return false
         if (settings.isEmpty()) return false
@@ -2176,10 +2194,11 @@ class VortXSyncManager(context: Context) {
                     // Roster UNION (never shrinks local; newest-wins by epoch-SECONDS; subtracts tombstones).
                     resolvedRoster.roster?.let { remote ->
                         if (remote.isNotEmpty()) {
-                            store.mergeInRoster(remote, resolvedRoster.modifiedSeconds)
+                            foldNativeProfileRoster(store, doc, remote, resolvedRoster.modifiedSeconds, parsed.rosterIsLossless)
                             restored = true
                         }
                     }
+                    if (foldDashboardProfileEdits(store, doc)) restored = true
                     // Per-profile watch overlays: union + LWW by lastWatched, never touching owner/engine history.
                     if (parsed.overlays.isNotEmpty()) {
                         for ((profileId, entries) in parsed.overlays) {

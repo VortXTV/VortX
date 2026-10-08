@@ -186,6 +186,7 @@ final class ProfileStore: ObservableObject {
         let type: String
     }
     private static let pendingAccountLibraryAddsKey = "stremiox.profiles.pendingAccountLibraryAdds"
+    private var applyingProfileEdits = false
     private var pendingAccountLibraryReplayIDs: Set<String> = []
     static let shared = ProfileStore()
 
@@ -513,7 +514,14 @@ final class ProfileStore: ObservableObject {
     /// profile (an id not seen locally), DELETE a tombstoned one (HARD-GATED: never the owner, and
     /// remove() itself refuses the last profile), and feed per-profile library adds into the overlay.
     /// Union-safe: a profile absent from the edits is left untouched. See [[vortx-dashboard-profile-mgmt-design]].
-    func applyProfileEdits(_ edits: [String: Any]) {
+    func applyProfileEdits(_ edits: [String: Any], mirrorUpdatedAt: Any? = nil) {
+        let wasApplying = applyingProfileEdits
+        applyingProfileEdits = true
+        defer { applyingProfileEdits = wasApplying }
+        let editedSeconds = ProfileRosterSyncPolicy.validClock(edits["editedAt"]).map { $0 / 1000 }
+        let fieldFloor = max(rosterModified.timeIntervalSince1970,
+                             (ProfileRosterSyncPolicy.validClock(mirrorUpdatedAt) ?? 0) / 1000)
+        let acceptFields = editedSeconds.map { $0 > fieldFloor } ?? false
         if let roster = edits["roster"] as? [[String: Any]] {
             for e in roster {
                 guard let idStr = e["id"] as? String, let uuid = UUID(uuidString: idStr) else { continue }
@@ -532,6 +540,10 @@ final class ProfileStore: ObservableObject {
                     }
                     continue
                 }
+                // A stale web overlay must not revert newer native fields. Missing ids still union
+                // in (unless explicitly deleted), while tombstones above remain independent of clocks.
+                guard acceptFields || existing == nil else { continue }
+                guard !deletedProfileIDs.contains(uuid.uuidString) else { continue }
                 if var p = existing {
                     var changed = false
                     if let name = (e["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -567,9 +579,26 @@ final class ProfileStore: ObservableObject {
                     // normal new profile; playback is seeded on the next load like any pre-feature roster.
                     guard let name = (e["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
                           !name.isEmpty else { continue }
-                    add(UserProfile(id: uuid, name: name, avatar: "🍿",
+                    var created = UserProfile(id: uuid, name: name, avatar: "🍿",
                                     pin: (e["pin"] as? String).flatMap { $0.isEmpty ? nil : $0 },
-                                    isOwner: false, familyEdit: (e["familyEdit"] as? Bool) ?? false))
+                                    isOwner: false, familyEdit: (e["familyEdit"] as? Bool) ?? false)
+                    if let st = e["settings"] as? [String: Any] {
+                        if let avatar = st["avatar"] as? String, !avatar.isEmpty { created.avatar = avatar }
+                        if let accent = st["accent"] as? String, !accent.isEmpty { created.accentID = accent }
+                        if let oled = st["oled"] as? Bool { created.oled = oled }
+                        if let scale = st["textScale"] as? Double { created.textScale = scale }
+                        if let kids = st["isKids"] as? Bool { created.isKids = kids }
+                        if let playback = st["playback"] as? [String: Any] {
+                            created.playback = Self.playbackPrefs(from: playback, base: nil)
+                        }
+                    }
+                    created.disabledAddons = (e["disabledAddons"] as? [String]).flatMap { $0.isEmpty ? nil : $0.sorted() }
+                    add(created)
+                }
+            }
+            if let editedSeconds, editedSeconds > rosterModified.timeIntervalSince1970 {
+                VortXSyncManager.suppressHousekeeping {
+                    UserDefaults.standard.set(editedSeconds, forKey: Self.modifiedKey)
                 }
             }
         }
@@ -999,11 +1028,12 @@ final class ProfileStore: ObservableObject {
             }
             UserDefaults.standard.set(self.activeID?.uuidString, forKey: Self.activeKey)
         }
-        if touch {
+        if touch && !applyingProfileEdits {
             // A genuine local edit: write normally so the global UserDefaults observer arms an auto-push and
             // this change syncs to the account + other devices.
             writeRosterAndActive()
-            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.modifiedKey)
+            UserDefaults.standard.set(ProfileRosterSyncPolicy.nextLocalClock(
+                now: Date().timeIntervalSince1970, prior: rosterModified.timeIntervalSince1970), forKey: Self.modifiedKey)
             schedulePushRoster()
         } else {
             // Routine housekeeping (normalizeOwner re-key, legacy migrations, per-device selection, tombstone
@@ -1336,7 +1366,8 @@ final class ProfileStore: ObservableObject {
     /// The roster-level modification time this device last recorded (a `persist(touch:true)` stamp).
     /// Used as the tiebreaker when the SAME profile id exists on both sides of a merge.
     var rosterModified: Date {
-        Date(timeIntervalSince1970: UserDefaults.standard.double(forKey: Self.modifiedKey))
+        Date(timeIntervalSince1970: ProfileRosterSyncPolicy.validClock(
+            UserDefaults.standard.object(forKey: Self.modifiedKey)) ?? 0)
     }
 
     /// Whether `incoming` is a genuinely different roster from the live one, compared by the SET of
@@ -1360,13 +1391,12 @@ final class ProfileStore: ObservableObject {
     /// `watchCacheKey(id)` cache (SettingsBackup.restore only ever SETS keys, it never deletes one),
     /// so re-adding a profile preserves its Continue Watching / library overlay.
     ///
-    /// NOTE: explicit cross-device DELETE propagation (tombstones) is deferred. Until it exists,
-    /// union-merge means a profile that was deliberately deleted on one device may reappear from
-    /// another device that still has it. That is the intended, safe tradeoff: a profile coming BACK
-    /// is recoverable; a profile silently DELETED with its history is not.
+    /// Explicit deletion tombstones are subtracted after the union; absence alone never means delete.
     func mergeInRoster(_ incoming: [UserProfile], incomingModified: Date? = nil) {
         guard !incoming.isEmpty else { return }
-        let preferIncoming = (incomingModified ?? .distantPast) > rosterModified
+        let clock = ProfileRosterSyncPolicy.clockDecision(local: rosterModified.timeIntervalSince1970,
+            incoming: incomingModified?.timeIntervalSince1970)
+        let preferIncoming = clock.preferIncoming
 
         // Owner-singleton is enforced by normalizeOwner() AFTER the union below, direction-independently.
         // We intentionally do NOT drop an owner here. The earlier direction-sensitive drop assumed
@@ -1376,13 +1406,10 @@ final class ProfileStore: ObservableObject {
         // owner (the one carrying the account email) and demotes the leftover to a deletable shared profile.
         let localRoster = profiles
 
-        let incomingByID = Dictionary(incoming.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        let localByID = Dictionary(localRoster.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-
         // Start from the live order, then append any ids that exist only in the incoming roster, so
         // the union keeps every profile from both sides and preserves a stable, local-first ordering.
-        var merged: [UserProfile] = localRoster.map { local in
-            guard let remote = incomingByID[local.id] else { return local }
+        var merged = ProfileRosterSyncPolicy.union(local: localRoster, incoming: incoming,
+                                                   preferIncoming: preferIncoming) { local, remote in
             // Fresh-install owner-clobber guard (tightly scoped). A just-reinstalled device restores its
             // session from the Keychain but its roster is still the un-hydrated placeholder owner that
             // migrateFromSingleAccount mints on a fresh install: the FIXED owner id, name exactly "Main",
@@ -1395,15 +1422,8 @@ final class ProfileStore: ObservableObject {
             // fails the empty-email check, and any profile the user actually renamed fails name == "Main". In
             // both of those cases preferIncoming still governs the record, unchanged. The empty-email check
             // covers both a wiped (nil) and a blanked ("") email so a reinstalled placeholder is caught either way.
-            if local.id == UserProfile.ownerID,
-               local.name == "Main", (local.email ?? "").isEmpty,
-               (remote.name != "Main" || !(remote.email ?? "").isEmpty) {
-                return remote
-            }
-            return preferIncoming ? remote : local
-        }
-        for remote in incoming where localByID[remote.id] == nil {
-            merged.append(remote)
+            local.id == UserProfile.ownerID && local.name == "Main" && (local.email ?? "").isEmpty
+                && (remote.name != "Main" || !(remote.email ?? "").isEmpty)
         }
 
         // SUBTRACT delete tombstones from the union: a profile the user deleted must NOT come back, even
@@ -1411,6 +1431,13 @@ final class ProfileStore: ObservableObject {
         // so this can never remove the account owner.
         merged.removeAll { deletedProfileIDs.contains($0.id.uuidString) && !$0.isOwner }
 
+        // Equal payloads still adopt the peer watermark. Otherwise a later local edit/push can
+        // publish an older clock and undo an already-received profile update. This is not a user edit.
+        if clock.watermark > rosterModified.timeIntervalSince1970 {
+            VortXSyncManager.suppressHousekeeping {
+                UserDefaults.standard.set(clock.watermark, forKey: Self.modifiedKey)
+            }
+        }
         // No change once the ids and chosen fields already match: skip the write so this never loops
         // (reloadFromDefaults / syncDown call into here on the foreground/auto path).
         guard merged != profiles else { return }
