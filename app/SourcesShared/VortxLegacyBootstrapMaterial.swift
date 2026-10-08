@@ -122,7 +122,7 @@ enum VortxLegacyBootstrapMaterial {
                        retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope] = [],
                        retainedOwnAccountSlotBaselines: [RetainedOwnAccountSlotBaseline] = [],
                        deferredOwnAccountOverlays: [RetainedOwnAccountOverlayDisposition] = []) throws -> Data {
-        guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else {
+        guard let source = try? VortxProfileOverlayWitness.decodeObject(json: document) else {
             throw ReconciliationRequired(reason: "Account document must be an object")
         }
         let adapter = try Adapter(document: source, roster: roster, ownerID: ownerProfileID,
@@ -369,7 +369,7 @@ enum VortxLegacyBootstrapMaterial {
                   overlayBytes.base64EncodedString() == overlayBase64,
                   let libraryEnvelope = try JSONSerialization.jsonObject(with: libraryBytes) as? Object,
                   let addonEnvelope = try JSONSerialization.jsonObject(with: addonBytes) as? Object,
-                  let overlay = try JSONSerialization.jsonObject(with: overlayBytes) as? Object,
+                  let overlay = try? VortxProfileOverlayWitness.decodeObject(json: overlayBytes),
                   (Set(libraryEnvelope.keys) == ["result"] ||
                     (Set(libraryEnvelope.keys) == ["result", "error"] && libraryEnvelope["error"] is NSNull)),
                   (Set(addonEnvelope.keys) == ["result"] ||

@@ -291,10 +291,23 @@ import CryptoKit
         let ownTarget = try VortxNativeProfiles.ownTarget(material: rebindMaterial, profileID: child.id)
         // A fresh authenticated v2 source has the mandatory overlay witness. It must survive the
         // public material encoder, target extraction and rebind action unchanged.
-        let rebindOverlay: [String: Any] = ["vortx": ["byProfile": [child.id.uuidString: ["watched": ["tt-rebind": ["w": ["tt-rebind"]]]]]]]
+        // Preserve this difficult decimal as raw source text. The strict witness parser must see
+        // the correctly rounded binary64 value through classifier -> encoder -> native cold path;
+        // Foundation's generic JSON ingress is not allowed to turn it into a false pending proof.
+        let rebindOverlayText = "{\"vortx\":{\"byProfile\":{\"" + child.id.uuidString
+            + "\":{\"watched\":{\"tt-rebind\":{\"w\":[\"tt-rebind\"],\"ma\":{\"tt-rebind\":0.039304369631583587}}}}}}}"
         let emptyLibraryResponse = try JSONSerialization.data(withJSONObject: ["result": [["_id": "tt-rebind", "type": "movie", "name": "Rebind"]]])
         let emptyAddonsResponse = try JSONSerialization.data(withJSONObject: ["result": ["addons": []]])
-        let emptyOverlayResponse = try JSONSerialization.data(withJSONObject: rebindOverlay, options: [.sortedKeys, .withoutEscapingSlashes])
+        let emptyOverlayResponse = Data(rebindOverlayText.utf8)
+        let strictOverlay = try VortxProfileOverlayWitness.decodeObject(json: emptyOverlayResponse)
+        let strictVortx = strictOverlay["vortx"] as? [String: Any]
+        let strictProfiles = strictVortx?["byProfile"] as? [String: Any]
+        let strictBucket = strictProfiles?[child.id.uuidString] as? [String: Any]
+        let strictWatched = strictBucket?["watched"] as? [String: Any]
+        let strictRow = strictWatched?["tt-rebind"] as? [String: Any]
+        let strictMarks = strictRow?["ma"] as? [String: Any]
+        let strictClock = strictMarks?["tt-rebind"] as? NSNumber
+        check(strictClock?.doubleValue.bitPattern == 0x3fa41fb3cc50aa03)
         let freshSourceEnvelope = try JSONSerialization.data(withJSONObject: [
             "schemaVersion": 2,
             "libraryResponseBase64": emptyLibraryResponse.base64EncodedString(),
@@ -302,7 +315,7 @@ import CryptoKit
             "profileOverlayBase64": emptyOverlayResponse.base64EncodedString()
         ], options: [.sortedKeys])
         let freshWitness = try VortxProfileOverlayWitness.digest(json: emptyOverlayResponse)
-        let freshRootDocument = try JSONSerialization.data(withJSONObject: rebindOverlay, options: [.sortedKeys, .withoutEscapingSlashes])
+        let freshRootDocument = emptyOverlayResponse
         let freshMaterialData = try VortxLegacyBootstrapMaterial.encode(
             document: freshRootDocument, roster: [owner, ownAccount], ownerProfileID: owner.id,
             rosterModifiedSeconds: nil,
