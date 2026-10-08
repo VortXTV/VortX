@@ -22,10 +22,6 @@ struct CinemaQuickView: View {
                 wideLayout
                 compactLayout
             }
-            // A vertical ScrollView proposes an unbounded horizontal size to its child. Constrain the
-            // chooser to the visible sheet/container width so a phone actually selects `compactLayout`
-            // instead of accepting the wide HStack and placing its facts outside the clipped viewport.
-            .containerRelativeFrame(.horizontal)
             .padding(Theme.Space.md)
         }
         .presentationDetents([.medium, .large])
