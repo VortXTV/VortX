@@ -905,6 +905,7 @@ struct iOSHomeView: View {
     /// still matches the episode the engine is parked on. The owner profile rides the account's
     /// engine history; an overlay profile rides its own private synced overlay (never the account).
     private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
+        if core.usesNativeProfileState { return .init(items: core.continueWatching, source: .local, sessionID: nil) }
         if profiles.activeUsesEngineHistory {
             _ = traktContinueWatchingRevision
             return TraktPlaybackShadow.shared.continueWatchingSelection(
@@ -1032,7 +1033,7 @@ struct iOSHomeView: View {
         let metaByID = Dictionary(core.boardRows.flatMap { $0.items }.map { ($0.id, $0) },
                                   uniquingKeysWith: { first, _ in first })
         // Overlay profiles seed from their own watch overlay, never the account's CW.
-        let cwSource = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        let cwSource = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
         var items: [FeaturedHeroItem] = cwSource.prefix(3).map { cw in
             if let meta = metaByID[cw.id] { return FeaturedHeroItem.from(meta: meta) }
             return FeaturedHeroItem.from(cw: cw)
@@ -1976,7 +1977,7 @@ struct iOSLibraryView: View {
     /// The owner profile's Library is the account library (engine); an overlay profile's Library is its
     /// own private watch overlay (every watched title), never the account.
     private var libraryItems: [RailItem] {
-        let source = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
         return source.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress)
         }
@@ -1995,7 +1996,7 @@ struct iOSLibraryView: View {
     /// The hero pool: the first few saved titles. Library entries carry no backdrop field, so (like
     /// tvOS) the hero derives 16:9 art from metahub for IMDB ids and enriches the rest in the background.
     private var heroCandidates: [FeaturedHeroItem] {
-        let source = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
         return source.prefix(5).map(FeaturedHeroItem.from(cw:))
     }
 
@@ -2037,7 +2038,7 @@ struct iOSLibraryView: View {
                             // profiles, replacing the engine's type chips; the engine's SORT chips stay
                             // owner-only (they need the engine `selectable`).
                             segmentBar(libraryItems)
-                            if profiles.activeUsesEngineHistory, let lib = core.library {
+                            if core.usesNativeProfileState || profiles.activeUsesEngineHistory, let lib = core.library {
                                 sortChips(lib.selectable)
                             }
                             // Smart filters (Unwatched / In Progress / Watched / Short) sit below the type
@@ -2182,7 +2183,7 @@ struct iOSLibraryView: View {
     /// profile's are its own private watch overlay. This is the SOURCE the smart filters read: the grid's
     /// `RailItem` drops the media runtime + watched signal the predicates need, so they are evaluated here.
     private var sourceItems: [CoreCWItem] {
-        profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
     }
 
     /// The source titles filtered to the active type segment, so the smart-filter chips + predicate track
@@ -2210,6 +2211,7 @@ struct iOSLibraryView: View {
     /// watched bookkeeping (plus the derived series-completion set), an overlay reads only its private
     /// overlay, never the account. Read-only.
     private func isWatched(_ item: CoreCWItem) -> Bool {
+        if core.usesNativeProfileState { return item.isWatched }
         if watchedIndex.ids.contains(item.id) { return true }
         return profiles.activeUsesEngineHistory
             ? item.isWatched

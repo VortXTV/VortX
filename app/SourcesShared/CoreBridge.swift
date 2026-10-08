@@ -2,6 +2,10 @@ import Foundation
 import CryptoKit
 import StremioXCore
 
+#if VORTX_NATIVE_DATA_ENGINE && (!VORTX_ENGINE_STATE_BRIDGE || !VORTX_ENGINE_RESOURCE_HOST || !canImport(VortxEngine))
+#error("Native data engine requires the exact state/resource-host VortxEngine artifact and bridge conditions")
+#endif
+
 /// Bridges the native Rust **stremio-core** engine (StremioXCore.xcframework) to Swift.
 ///
 /// The engine owns catalogs, library, Continue-Watching, meta and streams, the same way the official
@@ -9,6 +13,15 @@ import StremioXCore
 /// worker thread) whenever model fields change, so the UI can re-pull exactly what changed.
 final class CoreBridge: ObservableObject {
     static let shared = CoreBridge()
+    /// In the gated engine every active profile has a native bucket. An unbound session is
+    /// unavailable, never permission to read the previous account's global overlay caches.
+    var usesNativeProfileState: Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        true
+#else
+        false
+#endif
+    }
 #if VORTX_NATIVE_DATA_ENGINE
     private let nativeFacadeLock = NSLock()
     private var nativeFacadeStorage: VortxNativeCoreFacade?
@@ -16,6 +29,17 @@ final class CoreBridge: ObservableObject {
     private var nativeInstallGeneration = UUID()
     private var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
     var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
+    var hasNativeSession: Bool { nativeFacade != nil }
+
+    @MainActor
+    func mergeNativeSyncDocument(_ remote: VortxJSON?, capture: CredentialScopeRegistry.Capture) async throws -> VortxJSON {
+        guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
+              let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
+        let document = try await facade.mergeSyncDocument(remote)
+        guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
+              nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
+        return document
+    }
 
     @MainActor
     func rebindNativeRegistry(_ registry: [VortxResourceAddon], expected: VortxNativeCoreFacade.RegistryBinding) async throws {
@@ -35,7 +59,12 @@ final class CoreBridge: ObservableObject {
         guard CredentialScopeRegistry.shared.isCurrent(capture), session.scope.account == capture.namespace else {
             session.revoke(); throw VortxNativeError.invalidSnapshot
         }
-        let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry) { [weak self] fields in
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry, mutationAccepted: {
+            Task { @MainActor in
+                guard CredentialScopeRegistry.shared.isCurrent(capture) else { return }
+                VortXSyncManager.shared.requestSyncSoon()
+            }
+        }) { [weak self] fields in
             guard CredentialScopeRegistry.shared.isCurrent(capture),
                   let data = try? JSONSerialization.data(withJSONObject: ["name": "NewState", "args": fields]) else { return }
             self?.handleEvent(data)
@@ -57,6 +86,7 @@ final class CoreBridge: ObservableObject {
         await old?.shutdown()
     }
     private func revokeNativeSession() {
+        VortxNativeSession.revokeAllForOwnerBoundary()
         let old = nativeFacadeLock.withLock {
             nativeInstallGeneration = UUID()
             let old = nativeFacadeStorage; nativeFacadeStorage = nil; nativeCredentialCapture = nil; return old
@@ -394,7 +424,15 @@ final class CoreBridge: ObservableObject {
 #if VORTX_NATIVE_DATA_ENGINE
         credentialScopeObserver = NotificationCenter.default.addObserver(
             forName: VortXSyncManager.credentialScopeDidChangeNote, object: nil, queue: .main
-        ) { [weak self] _ in self?.revokeNativeSession() }
+        ) { [weak self] _ in
+            guard let self else { return }
+            let previous = self.nativeFacade
+            self.revokeNativeSession()
+            Task { @MainActor in
+                await previous?.shutdown()
+                _ = await VortXSyncManager.shared.restoreNativeCheckpoint()
+            }
+        }
 #else
         // Seed the observer's previous scope from the registry, rather than treating the first note seen
         // after CoreBridge construction as an unrelated initial bind.  This preserves the account -> guest
@@ -448,7 +486,10 @@ final class CoreBridge: ObservableObject {
         started = true
 #if VORTX_NATIVE_DATA_ENGINE
         // A compiled native lane cannot initialize Stremio, even when migration is not yet bound.
-        Task { await RemoteConfig.shared.bootstrap() }
+        Task {
+            await RemoteConfig.shared.bootstrap()
+            _ = await VortXSyncManager.shared.restoreNativeCheckpoint()
+        }
         return
 #else
         let initialCapture = CredentialScopeRegistry.shared.capture()
@@ -2835,10 +2876,14 @@ final class CoreBridge: ObservableObject {
         // here off-main (a UserDefaults read plus the ctx auth probe, both thread-safe) and applied BEFORE
         // `pruneFinished`, because a title Stremio reports as finished would otherwise be pruned away before
         // the floor could restore VortX's own in-progress position.
+#if !VORTX_NATIVE_DATA_ENGINE
         let mayReplaceCW = MirrorSettings.stremioMayReplaceContinueWatching(stremioSessionLive: isLoggedIn())
+#endif
         let decodedPreview = decode(CoreCWPreview.self, field: "continue_watching_preview")
         let preview = decodedPreview?.items ?? []
+#if !VORTX_NATIVE_DATA_ENGINE
         let library = decode(CoreLibrary.self, field: "library")?.catalog ?? []
+#endif
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.continueWatchingRebuildLock.lock()
@@ -2847,6 +2892,11 @@ final class CoreBridge: ObservableObject {
             guard isLatest,
                   self.publicationStillCurrent(publicationToken),
                   CredentialScopeRegistry.shared.isCurrent(credentialCapture) else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+            // The kernel has already selected the live title/episode and applied its tombstones.
+            // Legacy owner floors/history unions must not resurrect superseded native rows.
+            self.continueWatching = preview
+#else
             // Owner profile only: the floor and the union are both owner-library concepts, and an overlay
             // profile rides `profiles.cwItems` and ignores this published value entirely.
             let ownerProfile = ProfileStore.shared.active?.isOwner == true
@@ -2861,6 +2911,7 @@ final class CoreBridge: ObservableObject {
                 : engine
             VXProbe.log("engine", "continueWatching rebuilt n=\(items.count) (engine=\(engine.count))")
             self.continueWatching = items
+#endif
             if recordsHistoryReceipt, decodedPreview != nil {
                 self.recordAcceptedHistoryReceipt(
                     fields: ["continue_watching_preview"],
@@ -4129,7 +4180,12 @@ final class CoreBridge: ObservableObject {
     /// the prior profile before a new account switch or a same-account revalidation can begin.
     func activeProfileDidChange() {
 #if VORTX_NATIVE_DATA_ENGINE
+        let previous = nativeFacade
         revokeNativeSession()
+        Task { @MainActor in
+            await previous?.shutdown()
+            _ = await VortXSyncManager.shared.restoreNativeCheckpoint()
+        }
         return
 #else
         invalidateAuthenticationGeneration()

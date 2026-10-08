@@ -223,6 +223,83 @@ final class VortXSyncManager: ObservableObject {
     private let kcAccount = "vortx.sync.session.v1"
     private var token: String?
     private var dataKey: Data?
+#if VORTX_NATIVE_DATA_ENGINE
+    private var nativeCheckpointTask: Task<Bool, Never>?
+    private var nativeCheckpointCapture: CredentialScopeRegistry.Capture?
+    private var nativeCheckpointProfile: UUID?
+    private var nativeCheckpointGeneration = UUID()
+    private(set) var nativeCheckpointStatus = "not_started"
+
+    /// The key never leaves this account owner. A missing/undecryptable native checkpoint is not
+    /// a fresh account: first-install legacy import is a separate, validated transaction.
+    @discardableResult
+    func restoreNativeCheckpoint(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
+        let capture = suppliedCapture ?? credentialAuthority.capture()
+        let selectedProfile = ProfileStore.shared.activeID
+        guard isSignedIn, isCurrent(capture), case .account = capture.scope else { return false }
+        if let pending = nativeCheckpointTask, nativeCheckpointCapture == capture, nativeCheckpointProfile == selectedProfile {
+            return await pending.value
+        }
+        let generation = UUID(); nativeCheckpointGeneration = generation
+        let previous = nativeCheckpointTask; previous?.cancel(); _ = await previous?.value
+        guard isCurrent(capture), nativeCheckpointGeneration == generation else { return false }
+        nativeCheckpointCapture = capture; nativeCheckpointProfile = selectedProfile
+        let task = Task { @MainActor [weak self] () -> Bool in
+            guard let self else { return false }
+            defer {
+                if self.nativeCheckpointGeneration == generation {
+                    self.nativeCheckpointTask = nil; self.nativeCheckpointCapture = nil; self.nativeCheckpointProfile = nil
+                }
+            }
+            guard self.isCurrent(capture), !Task.isCancelled else { return false }
+            // Global ProfileStore is not account-attribution evidence. Pin the owner from this
+            // freshly authenticated/decrypted account roster, including historical PIN-bound IDs.
+            guard case .doc(let document) = await self.pullSyncDocResult(credentialCapture: capture),
+                  self.isCurrent(capture), !Task.isCancelled,
+                  let roster = Self.resolveRoster(from: document),
+                  let keyBytes = self.dataKey, keyBytes.count == 32 else {
+                if self.isCurrent(capture) { self.nativeCheckpointStatus = "account_document_unavailable" }; return false
+            }
+            let owners = roster.profiles.filter(\.isOwner)
+            guard owners.count == 1, let selectedProfile,
+                  roster.profiles.contains(where: { $0.id == selectedProfile }) else {
+                self.nativeCheckpointStatus = "profile_attribution_unavailable"; return false
+            }
+            await CoreBridge.shared.closeNativeSession()
+            guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { return false }
+            do {
+                let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owners[0].id.uuidString)
+                let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+                    .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+                let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+                let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
+                                                    transport: VortxCResourceTransport())
+                do {
+                    if let raw = document["nativeSync"] {
+                        let native = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: raw))
+                        let action = VortxJSON.object(["type": .string("merge_native_sync"), "document": native])
+                        _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970))
+                    }
+                    guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                    let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+                    if state["activeProfileId"] != .string(selectedProfile.uuidString) {
+                        let action = VortxJSON.object(["type": .string("switch_profile"), "id": .string(selectedProfile.uuidString)])
+                        _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970))
+                    }
+                    let registry = try await session.resourceRegistry()
+                    guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                    try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture)
+                    self.nativeCheckpointStatus = "mounted"; return true
+                } catch { await session.close(); throw error }
+            } catch {
+                if self.isCurrent(capture) { self.nativeCheckpointStatus = "native_checkpoint_unavailable" }
+                return false // No empty account, legacy token dispatch, or destructive repair fallback.
+            }
+        }
+        nativeCheckpointTask = task
+        return await task.value
+    }
+#endif
     /// Shared account-owner epoch. Every async sync/auth operation captures this before its first await and
     /// must still own it before applying a result, so an account switch cannot commit A's pull into B.
     private let credentialAuthority = CredentialScopeRegistry.shared
@@ -2113,6 +2190,17 @@ final class VortXSyncManager: ObservableObject {
         case .doc(let existing): doc = existing
         }
         guard isCurrent(capture) else { return nil }
+#if VORTX_NATIVE_DATA_ENGINE
+        // The native CRDT is a TOP-LEVEL sibling of the full legacy/host preference carriers.
+        // Merge the freshly pulled peer state through the kernel before exporting; never assign
+        // a stale local snapshot over it, and never upload device-local activeProfileId or tokens.
+        do {
+            let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+            let merged = try await CoreBridge.shared.mergeNativeSyncDocument(remote, capture: capture)
+            guard isCurrent(capture) else { return nil }
+            doc["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged))
+        } catch { return nil }
+#endif
         // Read-merge the pulled doc's tombstone stamps into the local stores BEFORE vortxSummary rebuilds them
         // from local state, so a push that raced a peer's fresh re-add stamp adopts that stamp instead of
         // overwriting the doc with a local-only view; this also re-seeds the maps after a b171 peer push that
@@ -2386,6 +2474,15 @@ final class VortXSyncManager: ObservableObject {
             break
         }
         let doc = pulled.doc
+#if VORTX_NATIVE_DATA_ENGINE
+        if CoreBridge.shared.hasNativeSession, let carrier = doc["nativeSync"] {
+            do {
+                let remote = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: carrier))
+                _ = try await CoreBridge.shared.mergeNativeSyncDocument(remote, capture: capture)
+                guard isCurrent(capture) else { return false }
+            } catch { return false }
+        }
+#endif
         var restored = false
         var restoredSettings = false
         var pendingDebridValues = pendingDebridApply?.values ?? [:]
@@ -2885,6 +2982,9 @@ final class VortXSyncManager: ObservableObject {
     /// Hydration installs only descriptors the engine lacks (idempotent). Library recovery is gated to
     /// "engine account library empty AND the account owns one" so it runs at most once per fresh install.
     func hydrateEngineFromOwnedAddons(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async {
+#if VORTX_NATIVE_DATA_ENGINE
+        _ = await restoreNativeCheckpoint(credentialCapture: suppliedCapture)
+#else
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture) else { return }
         guard case let .doc(doc) = await pullSyncDocResult(credentialCapture: capture) else { return }   // .failed/.empty: do nothing
@@ -2939,6 +3039,7 @@ final class VortXSyncManager: ObservableObject {
             credentialCapture: capture,
             library: source.library,
             continueWatching: source.continueWatching)
+#endif
     }
 
     /// Compute the account-owned add-on descriptors from a pulled doc: `doc.vortx.addons` (the app's
@@ -3640,6 +3741,9 @@ final class VortXSyncManager: ObservableObject {
         Task {
             await self.restoreAccountDocIfNeeded()
             await self.syncDown()
+#if VORTX_NATIVE_DATA_ENGINE
+            _ = await self.restoreNativeCheckpoint()
+#endif
             // A settings change from a PREVIOUS session whose debounced push never landed (relaunch, offline, or a
             // crash before the 2.5s push) is still marked dirty and survived the pull above untouched. Arm a push
             // now so the account and the rest of the fleet converge on it. No-op when nothing is unpushed.

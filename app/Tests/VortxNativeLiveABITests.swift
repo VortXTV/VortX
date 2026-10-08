@@ -38,8 +38,12 @@ import CryptoKit
         let checkpoint = try VortxEncryptedCheckpointStore(directory: URL(fileURLWithPath: CommandLine.arguments[3]), key: SymmetricKey(size: .bits256))
         let session = try VortxNativeSession(scope: scope, ownerName: "Fixture", abi: VortxCABI(), store: checkpoint,
                                             transport: VortxCResourceTransport(), allowNewAccount: true)
-        _ = try await session.dispatch([#"{"type":"bind_sync_scope","scope":"fixture-account"}"#], now: 1000)
-        let facade = try await VortxNativeCoreFacade.create(session: session, registry: [addon], changed: { _ in })
+        let install: VortxJSON = .object(["type": .string("install_addon"), "profileId": .string(scope.ownerProfileID),
+                                         "addon": .object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest!])])
+        _ = try await session.dispatch([String(decoding: JSONEncoder().encode(install), as: UTF8.self)], now: 1000)
+        let acceptedRegistry = try await session.resourceRegistry()
+        check(acceptedRegistry.count == 1 && acceptedRegistry[0].transportUrl == addon.transportUrl)
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: acceptedRegistry, changed: { _ in })
         func dispatch(_ action: [String: Any], field: String) throws {
             check(facade.dispatch(data: try JSONSerialization.data(withJSONObject: action), field: field))
         }
@@ -82,11 +86,16 @@ import CryptoKit
         let oldBinding = facade.registryBinding!
         try dispatch(["action": "Vortx", "args": ["type": "switch_profile", "id": "kid"]], field: "native_state")
         await facade.settled()
-        check(!facade.dispatch(data: Data(#"{"action":"Load","args":{"model":"CatalogWithFilters","args":null}}"#.utf8), field: "discover"))
-        check(facade.lastFailure == "registry_rebind_required")
         do { try await facade.rebindRegistry([addon], expected: oldBinding); fatalError("stale profile rebound registry") }
         catch VortxNativeError.superseded {}
-        try await facade.rebindRegistry([addon], expected: facade.registryBinding!)
+        // New profiles share the owner's installed registry. The accepted kernel query is now
+        // rebound automatically; no restart/manual host registry injection is needed.
+        check(facade.lastFailure == nil)
+        try dispatch(["action": "Load", "args": ["model": "CatalogWithFilters", "args": NSNull()]], field: "discover")
+        await facade.settled(); check(try field("discover")["catalog"]?.array?.count == 1)
+        let exported = try await facade.mergeSyncDocument(nil)
+        check(exported["scope"] == .string(scope.account) && exported["activeProfileId"] == nil)
+        check(try await facade.mergeSyncDocument(exported) == exported)
         try dispatch(["action": "Load", "args": ["model": "CatalogWithFilters", "args": NSNull()]], field: "discover")
         await facade.settled(); check(try field("discover")["catalog"]?.array?.count == 1)
         let lastState = try await session.stateJSON()

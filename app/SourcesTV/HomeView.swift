@@ -30,6 +30,7 @@ struct HomeView: View {
     /// The owner profile rides the account's Continue Watching; overlay profiles ride their own
     /// private synced history.
     private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
+        if core.usesNativeProfileState { return .init(items: core.continueWatching, source: .local, sessionID: nil) }
         guard profiles.activeUsesEngineHistory else {
             return .init(items: profiles.cwItems, source: .local, sessionID: nil)
         }
@@ -44,7 +45,7 @@ struct HomeView: View {
 
     /// The profile-aware library, used (with Continue Watching) to seed + exclude in Top Picks.
     private var libraryItems: [CoreCWItem] {
-        profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
     }
 
     /// Non-secret account identity for personalized rails. The email publisher catches a Stremio
@@ -358,7 +359,7 @@ struct HomeView: View {
     /// First render shows the page's actual first item, and Continue Watching pre-fetches its
     /// details so heroes are rich on first focus.
     private func seed() {
-        let localHistory = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        let localHistory = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
         focusModel.seedIfEmpty(localHistory.first?.focusedHero
                                ?? core.boardRows.first?.items.first?.focusedHero)
         focusModel.warm(localHistory.map(\.focusedHero))

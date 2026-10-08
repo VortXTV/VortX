@@ -18,21 +18,25 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var tasks: [String: Task<Void, Never>] = [:]
     private var closed = false
     private let changed: @Sendable ([String]) -> Void
+    private let mutationAccepted: @Sendable () -> Void
     private var failure: String?
     private var resourceRegistryValid = true
     private var pendingProfileTransitions = 0
+    private var playback: VortxJSON?
     var lastFailure: String? { lock.withLock { failure } }
 
     static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
+                       mutationAccepted: @escaping @Sendable () -> Void = {},
                        changed: @escaping @Sendable ([String]) -> Void) async throws -> VortxNativeCoreFacade {
         guard Set(registry.map(\.id)).count == registry.count else { throw VortxNativeError.invalidResponse }
-        let facade = VortxNativeCoreFacade(session: session, registry: registry, changed: changed)
+        let facade = VortxNativeCoreFacade(session: session, registry: registry, mutationAccepted: mutationAccepted, changed: changed)
         let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        facade.playback = try? await session.playbackProjection()
         facade.values = try facade.stateFields(state)
         return facade
     }
-    private init(session: VortxNativeSession, registry: [VortxResourceAddon], changed: @escaping @Sendable ([String]) -> Void) {
-        self.session = session; self.registry = registry; self.changed = changed
+    private init(session: VortxNativeSession, registry: [VortxResourceAddon], mutationAccepted: @escaping @Sendable () -> Void, changed: @escaping @Sendable ([String]) -> Void) {
+        self.session = session; self.registry = registry; self.changed = changed; self.mutationAccepted = mutationAccepted
     }
     func stateData(_ field: String) -> Data? {
         lock.lock(); defer { lock.unlock() }; guard !closed, let value = values[field] else { return nil }
@@ -95,7 +99,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func publish(_ fields: [String: VortxJSON], field: String, ticket: UUID) {
         lock.lock()
         guard !closed, generations[field] == ticket else { lock.unlock(); return }
-        fields.forEach { values[$0.key] = $0.value }; lock.unlock(); changed(Array(fields.keys))
+        fields.forEach {
+            values[$0.key] = $0.key == "meta_details" ? metaWithPlayback($0.value, library: values["library"]?["catalog"]?.array ?? []) : $0.value
+        }; lock.unlock(); changed(Array(fields.keys))
     }
     private func enqueue(_ field: String, initial: VortxJSON? = nil, operation: @escaping @Sendable () async throws -> [String: VortxJSON]) -> Bool {
         guard let ticket = begin(field) else { return false }
@@ -114,7 +120,8 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         if closed || generations[field] != ticket { task.cancel() } else { tasks[field] = task }
         lock.unlock(); return true
     }
-    private func enqueueMutation(type: String, raw: String) -> Bool {
+    private func enqueueMutation(type: String, raw: String,
+                                 completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
         let predecessor = tasks["native_state"]
         let ticket = UUID(); generations["native_state"] = ticket
@@ -123,16 +130,26 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         // State intents are FIFO, never latest-wins: dropping one would lose progress/profile edits.
         tasks["native_state"] = Task { [weak self] in
             await predecessor?.value
-            guard let self else { return }
+            guard let self else { completion?(.failure(VortxNativeError.closed)); return }
             defer { if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 } } }
             do {
                 try Task.checkCancellation()
                 _ = try await session.dispatch([raw], now: UInt64(Date().timeIntervalSince1970))
                 let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+                let playback = try? await session.playbackProjection()
+                let resourceChanged = self.lock.withLock { self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) }
+                // Only the native registry query determines installed membership/order. It also
+                // resolves own/share-primary before new-profile resource loads can be admitted.
+                let replacement = resourceChanged ? try? await session.resourceRegistry() : nil
+                if resourceChanged { await session.invalidateResources() }
                 let publishedFields = try self.lock.withLock { () -> [String: VortxJSON]? in
                     guard !self.closed else { return nil }
+                    self.failure = nil
+                    self.playback = playback
                     if self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) {
                         self.invalidateResourcePublications(); self.registryGeneration = UUID()
+                        if let replacement { self.registry = replacement; self.resourceRegistryValid = true }
+                        else { self.failure = "registry_unavailable" }
                     }
                     let fields = try self.stateFields(state)
                     fields.forEach { self.values[$0.key] = $0.value }; return fields
@@ -140,10 +157,28 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 // FIFO intents each publish their acknowledged state before the next task executes.
                 // A later get_state must not hide the profile transition's accepted state.
                 if let publishedFields { self.changed(Array(publishedFields.keys)) }
-            } catch VortxNativeError.checkpointUncertain { _ = self.fail("checkpoint_uncertain_reopen_required") }
-            catch { _ = self.fail("native_mutation_failed") }
+                guard publishedFields != nil, let document = state["nativeSync"] else { throw VortxNativeError.closed }
+                if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) { self.mutationAccepted() }
+                completion?(.success(document))
+            } catch VortxNativeError.checkpointUncertain {
+                _ = self.fail("checkpoint_uncertain_reopen_required"); completion?(.failure(VortxNativeError.checkpointUncertain))
+            } catch { _ = self.fail("native_mutation_failed"); completion?(.failure(error)) }
         }
         return true
+    }
+    /// Merge the fresh authenticated remote carrier and export only the accepted CRDT document.
+    /// This shares the exact FIFO with profile/progress intents; a stale read cannot overwrite a
+    /// concurrent local change, and a failed merge/checkpoint never becomes an outgoing snapshot.
+    func mergeSyncDocument(_ remote: VortxJSON?) async throws -> VortxJSON {
+        let action = remote.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) }
+            ?? .object(["type": .string("get_state")])
+        let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
+        return try await withCheckedThrowingContinuation { continuation in
+            if !enqueueMutation(type: remote == nil ? "get_state" : "merge_native_sync", raw: raw,
+                                completion: { continuation.resume(with: $0) }) {
+                continuation.resume(throwing: VortxNativeError.closed)
+            }
+        }
     }
     /// Testing/integration receipt: waits for currently admitted operations, never launches UI/media.
     func settled() async {
@@ -229,7 +264,11 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                   let videoID = string(selected?["streamRequest"]?["path"]?["id"]),
                   let time = try? action["args"]?["args"]?["time"]?.decode(UInt64.self),
                   let duration = try? action["args"]?["args"]?["duration"]?.decode(UInt64.self), duration > 0 else { return fail("invalid_player_progress") }
-            let native: VortxJSON = .object(["type": .string("report_progress"), "metaId": .string(metaID), "videoId": .string(videoID), "positionMs": .unsigned(time), "durationMs": .unsigned(duration)])
+            guard let mediaType = selected?["metaRequest"]?["path"]?["type"] else { return fail("invalid_player_type") }
+            let readyMeta = values["meta_details"]?["metaItems"]?.array?.compactMap { $0["content"]?["content"] }.first { $0["id"] == .string(metaID) }
+            let native: VortxJSON = .object(["type": .string("report_progress"), "metaId": .string(metaID), "videoId": .string(videoID),
+                                           "name": readyMeta?["name"] ?? .string(metaID), "positionMs": .unsigned(time), "durationMs": .unsigned(duration),
+                                           "metadata": .object(["type": mediaType, "poster": readyMeta?["poster"] ?? .null])])
             guard let bytes = try? JSONEncoder().encode(native) else { return false }
             return enqueueMutation(type: "report_progress", raw: String(decoding: bytes, as: UTF8.self))
         }
@@ -325,16 +364,42 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let items = (library["items"]?.array ?? []).filter { $0["kind"] == .string("standard") }
         let projected = items.compactMap { item -> VortxJSON? in
             guard let id = string(item["id"]), let type = string(item["type"]) else { return nil }
-            let resume = library["resume"]?[id]
-            let offset = (try? resume?["offsetSecs"]?.decode(UInt64.self)) ?? 0
-            let duration = (try? resume?["durationSecs"]?.decode(UInt64.self)) ?? 0
+            // Exact native selected-unit projection, never max(old episode offsets). A saved
+            // membership without watch evidence stays unwatched and out of Continue Watching.
+            let resume = playback?["continueWatching"]?.array?.first { $0["metaId"] == .string(id) }
+            let offset = resume?["offsetMs"] ?? .integer(0)
+            let duration = resume?["durationMs"] ?? .integer(0)
+            let watched = playback?["watchedTitles"]?[id] ?? .integer(0)
             return .object(["_id": .string(id), "type": .string(type), "name": item["name"] ?? .string(id), "poster": item["poster"] ?? .null,
-                            "state": .object(["timeOffset": .unsigned(offset.multipliedReportingOverflow(by: 1000).overflow ? UInt64.max : offset * 1000),
-                                              "duration": .unsigned(duration.multipliedReportingOverflow(by: 1000).overflow ? UInt64.max : duration * 1000),
-                                              "timesWatched": .integer(Int64(library["watched"]?[id]?["videoIds"]?.array?.count ?? 0))])])
+                            "state": .object(["timeOffset": offset, "duration": duration,
+                                              "video_id": resume?["videoId"] ?? .null, "lastWatched": isoTimestamp(resume?["updatedAt"]),
+                                              "flaggedWatched": watched, "timesWatched": watched])])
         }
         let descriptors = (lock.withLock { resourceRegistryValid ? registry : [] }).map { addon in VortxJSON.object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest ?? .object([:])]) }
-        return ["native_state": state, "ctx": .object(["profile": .object(["addons": .array(descriptors)])]),
+        var fields: [String: VortxJSON] = ["native_state": state, "ctx": .object(["profile": .object(["addons": .array(descriptors)])]),
+                "continue_watching_preview": .object(["items": .array((playback?["continueWatching"]?.array ?? []).compactMap(playbackRow))]),
+                "native_history": .object(["items": .array((playback?["history"]?.array ?? []).compactMap(playbackRow))]),
                 "library": .object(["catalog": .array(projected), "selectable": .object(["types": .array([]), "sorts": .array([])])])]
+        if let detail = values["meta_details"] { fields["meta_details"] = metaWithPlayback(detail, library: projected) }
+        return fields
+    }
+    private func metaWithPlayback(_ detail: VortxJSON, library: [VortxJSON]) -> VortxJSON {
+        guard case .object(var fields) = detail, let id = string(detail["selected"]?["metaPath"]?["id"]) else { return detail }
+        fields["libraryItem"] = library.first { $0["_id"] == .string(id) } ?? .null
+        fields["watchedVideoIds"] = playback?["watchedVideoIdsByTitle"]?[id] ?? .array([])
+        return .object(fields)
+    }
+    private func isoTimestamp(_ value: VortxJSON?) -> VortxJSON {
+        guard let seconds = try? value?.decode(UInt64.self), seconds <= 253_402_300_799 else { return .null }
+        return .string(ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: Double(seconds))))
+    }
+    private func playbackRow(_ row: VortxJSON) -> VortxJSON? {
+        guard let id = string(row["metaId"]), let type = string(row["type"]), !type.isEmpty,
+              let offset = try? row["offsetMs"]?.decode(UInt64.self), let duration = try? row["durationMs"]?.decode(UInt64.self),
+              let count = try? row["timesWatched"]?.decode(UInt64.self), case .bool(let watched) = row["watched"] else { return nil }
+        return .object(["_id": .string(id), "type": .string(type), "name": row["name"] ?? .string(id), "poster": row["poster"] ?? .null,
+                        "state": .object(["timeOffset": .unsigned(offset), "duration": .unsigned(duration),
+                                          "video_id": row["videoId"] ?? .null, "lastWatched": isoTimestamp(row["updatedAt"]),
+                                          "flaggedWatched": .integer(watched ? 1 : 0), "timesWatched": .unsigned(count)])])
     }
 }

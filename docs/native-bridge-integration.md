@@ -24,7 +24,8 @@ using the host-supplied secure account key and account/owner identity as authent
 syncs and verifies a staged file, atomically renames it, syncs the directory and reads back before
 publication. An ambiguous post-rename failure is `checkpointUncertain`: no later mutation can
 overwrite it until the session is reopened and checked. Neither account tokens nor encryption keys
-enter kernel actions or checkpoint metadata. Same-scope sessions have one in-process writer;
+enter kernel actions or checkpoint metadata. Same-account sessions have one in-process writer,
+including attempted replacement with a different owner-profile identifier;
 replacement must await shutdown before opening another session.
 
 State changes clone the runtime, apply a FIFO action transaction, verify owner/nativeSync/watch-context
@@ -36,10 +37,22 @@ not yet the lossless legacy importer.
 
 `VORTX_NATIVE_DATA_ENGINE` selects the actual Apple `CoreBridge.start/dispatch/stateData` branch:
 that branch does not initialize/call Stremio and rejects unsupported actions. It needs an explicitly
-installed, authenticated session. No target sets this compilation condition. At this checkpoint the
-production account/key bootstrap is still a separate gate; merely enabling the flag leaves the bridge
-unbound, not an empty native account. CoreBridge exposes awaited shutdown and generation-checked
-session installation plus addon-registry rebind after profile/configuration changes.
+installed, authenticated session. No target sets this compilation condition. The gated production
+bootstrap now lives inside `VortXSyncManager`, where the account key remains private: launch,
+credential changes, profile changes and the existing addon-hydration entry point open a validated
+encrypted checkpoint, bind the captured account namespace and merge a freshly decrypted top-level
+`nativeSync` carrier. The exact owner comes from the authenticated full account roster, not the
+global local profile cache. Missing checkpoints, failed/decrypt-failed account pulls, invalid owner
+attribution and unavailable artifact queries fail closed; there is no empty-account fallback.
+First-install migration and offline authenticated-roster recovery are still gates.
+
+CoreBridge exposes awaited shutdown and generation-checked installation. Owner boundaries revoke
+both installed sessions and candidates still awaiting installation. Native mutations use the same
+FIFO as remote sync merges. The freshly pulled carrier is merged before exporting only `nativeSync`
+at the top level of the existing encrypted account document; full host preferences/legacy fields
+remain adjacent. Local acknowledged mutations schedule sync; read-only export/remote merge does not
+self-echo. Profile/configuration changes resolve the kernel's ordered `installed_addons` query and
+rebind the accepted own/shared registry automatically; no restart or raw-token import is involved.
 
 Apple compatibility currently covers board/search Load + LoadRange, default/specific Discover loads,
 metadata/episode streams, subtitles, default library reads, standard AddToLibrary/RemoveFromLibrary,
@@ -47,6 +60,13 @@ title/episode watched intents, Player selection/progress attribution and explici
 actions. Loading groups use the shipping read shape. Unsupported pagination/filter/sort/player actions
 return false; there is no silent Stremio fallback. The native library projection currently covers standard
 saved titles, not native magnet/playlist presentation or full Continue Watching/history parity.
+The main Home/Library read paths use native active-profile data for secondary profiles too, and
+native Continue Watching never unions legacy owner caches. The shared `profile_playback` query
+consumer projects exact-millisecond selected episode rows, keeps history separate from saved
+membership and uses whole-title watched counts instead of counting episode IDs. Unknown-type rows
+are not invented as movies. Query-unavailable artifacts currently yield no playback projection;
+the new query and metadata-enriched progress need the next exact native artifact/live receipt.
+Watched/statistics readers, recommendations and remaining overlay mutation paths remain gates.
 
 ## Artifact gate
 
@@ -77,16 +97,17 @@ build tasks when testing the pure bridge. Both consume `test/fixtures/native-res
 `VORTX_FFI_HEADER` and `VORTX_FFI_LIBRARY`, hash-fences both artifacts, proves cold hydration/deltas,
 and fetches deterministic catalog/meta/stream/subtitle fixtures over loopback. It also runs the real
 Apple facade, bound nativeSync scope, standard library membership, FIFO profile/progress actions,
-registry rebind and encrypted exact-state cold reopen with episode watch contexts. It launches no
+native installed-addon materialization, automatic profile registry rebind, top-level sync export/merge
+and encrypted exact-state cold reopen with episode watch contexts. It launches no
 app or media player. The fixture server requires Node 22+ lossless JSON source support.
 
 ## Remaining default-cutover gates
 
 | Owner lane | Required behavior before selecting native by default |
 | --- | --- |
-| Apple facade | Production authenticated bootstrap/import; horizontal and Discover pagination; genre/filter options; full library/CW/history and overlay profile integration; remaining player actions. Gated callsites and current supported actions are implemented, not a default cutover. |
+| Apple facade | First-install authenticated import and offline owner-roster bootstrap; horizontal and Discover pagination; genre/filter options; full library/CW/history, profile CRUD and overlay mutation integration; remaining player actions. Existing-checkpoint production bootstrap and main profile-aware read callsites are implemented behind the gate, not a default cutover. |
 | Android facade | Implement all CatalogRepository/AuthRepository/history interfaces; remove direct Stremio calls from stats and other consumers only after equivalent behavior is tested. |
-| Native state integration | Lossless authenticated legacy account/profile/addon/library/watch import and nativeSync transport in the existing encrypted account envelope. Apple scoped acknowledged checkpointing is implemented; absence/decrypt failure never creates an empty account. |
+| Native state integration | Lossless one-time authenticated legacy account/profile/addon/library/watch import. Apple acknowledged checkpointing and top-level nativeSync transport are implemented; absence/decrypt failure never creates an empty account. Ongoing old-client convergence is not implied by the one-time importer. |
 | Sources/playback | Integrate provider/debrid resolution, full subtitle options, current source preferences, source-preserving resume, episode/binge selection and download admission. |
 | Native server | Advertise/test NNTP/archive capabilities before changing Node routes; unsupported archives require the supported fallback. |
 | Packaging | Exact reviewed core pin, both Android flavors and all ABIs, Apple slice/header/export checks, universal Mac and Lite decisions, device verification. |

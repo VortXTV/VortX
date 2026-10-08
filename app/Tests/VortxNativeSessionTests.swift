@@ -6,7 +6,7 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
     private var next: UInt = 0
     private var states: [UInt: String] = [:]
     func create(ownerID: String, ownerName: String) -> UInt {
-        hydrate("{\"roster\":{\"profiles\":{\"\(ownerID)\":{\"id\":\"\(ownerID)\",\"owner\":true,\"deleted\":false},\"kid\":{\"id\":\"kid\",\"owner\":false}}},\"activeProfileId\":\"\(ownerID)\",\"libraries\":{\"kid\":{},\"\(ownerID)\":{\"watchContexts\":{\"episode\":{\"name\":\"Retain context\",\"durationMs\":1200001}}}}}")
+        hydrate("{\"roster\":{\"profiles\":{\"\(ownerID)\":{\"id\":\"\(ownerID)\",\"owner\":true,\"deleted\":false,\"addons\":\"own\"},\"kid\":{\"id\":\"kid\",\"owner\":false,\"addons\":\"share_primary\"}}},\"activeProfileId\":\"\(ownerID)\",\"libraries\":{\"kid\":{},\"\(ownerID)\":{\"watchContexts\":{\"episode\":{\"name\":\"Retain context\",\"durationMs\":1200001}}}}}")
     }
     func hydrate(_ snapshot: String) -> UInt {
         lock.lock(); defer { lock.unlock() }; next += 1; states[next] = snapshot; return next
@@ -16,12 +16,35 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
         guard var state = try? JSONSerialization.jsonObject(with: Data(states[handle]!.utf8)) as? [String: Any],
               let action = try? JSONSerialization.jsonObject(with: Data(action.utf8)) as? [String: Any] else { return nil }
         if action["type"] as? String == "fail" { return "{\"ok\":false}" }
+        if action["type"] as? String == "bind_sync_scope" {
+            let roster = state["roster"] as! [String: Any]
+            let profiles = roster["profiles"] as! [String: [String: Any]]
+            let owner = profiles.first { $0.value["owner"] as? Bool == true }!.key
+            state["nativeSync"] = ["schemaVersion": 1, "scope": action["scope"]!, "ownerProfileId": owner]
+            states[handle] = String(decoding: try! JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]), as: UTF8.self)
+            return "{\"ok\":true}"
+        }
         if action["type"] as? String == "switch_profile" { state["activeProfileId"] = action["id"] }
+        if action["type"] as? String == "merge_native_sync" {
+            guard let incoming = action["document"] as? [String: Any],
+                  incoming["scope"] as? String == (state["nativeSync"] as? [String: Any])?["scope"] as? String else { return "{\"ok\":false}" }
+            state["nativeSync"] = incoming
+        }
         state["fixtureMutation"] = action["value"] ?? now
         if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]) { states[handle] = String(decoding: data, as: UTF8.self) }
         return "{\"ok\":true}"
     }
-    func resolve(_ handle: UInt, request: String) -> String? { request }
+    func resolve(_ handle: UInt, request: String) -> String? {
+        guard var query = try? JSONSerialization.jsonObject(with: Data(request.utf8)) as? [String: Any] else { return nil }
+        if query["kind"] as? String == "installed_addons" { query["addons"] = [] }
+        if query["kind"] as? String == "profile_playback" {
+            query["continueWatching"] = [["metaId": "unsaved-series", "videoId": "opaque-video", "name": "In progress", "type": "series", "offsetMs": 120001, "durationMs": 1200001, "updatedAt": 1700000000, "watched": false, "timesWatched": 0]]
+            query["history"] = [["metaId": "watched-movie", "name": "Watched movie", "type": "movie", "offsetMs": 0, "durationMs": 1000000, "updatedAt": 1700000001, "watched": true, "timesWatched": 2]]
+            query["watchedVideoIdsByTitle"] = ["unsaved-series": ["other-video"]]
+            query["watchedTitles"] = ["watched-movie": 2]
+        }
+        return String(decoding: try! JSONSerialization.data(withJSONObject: query), as: UTF8.self)
+    }
     func state(_ handle: UInt) -> String? { lock.lock(); defer { lock.unlock() }; return states[handle] }
     func delta(_ handle: UInt) -> String? { "{}" }
     func free(_ handle: UInt) { lock.lock(); defer { lock.unlock() }; precondition(states.removeValue(forKey: handle) != nil) }
@@ -62,7 +85,7 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
 }
 
 @main enum VortxNativeSessionTests {
-    static func check(_ value: Bool) { precondition(value) }
+    static func check(_ value: Bool, line: Int = #line) { precondition(value, "session assertion at line \(line)") }
     static func main() async throws {
         let scope = VortxAccountScope(account: "account-a", ownerProfileID: "owner")
         let abi = SessionABI(), store = SessionStore(), transport = SessionTransport()
@@ -71,6 +94,8 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
             do { _ = try VortxNativeSession(scope: scope, ownerName: "Other", abi: abi, store: SessionStore(), transport: transport, allowNewAccount: true); fatalError("overlapping account writer admitted") }
             catch VortxNativeError.unavailable {}
         }
+        do { _ = try VortxNativeSession(scope: .init(account: scope.account, ownerProfileID: "other-owner"), ownerName: "Other", abi: abi, store: SessionStore(), transport: transport, allowNewAccount: true); fatalError("same account with a different owner admitted a second writer") }
+        catch VortxNativeError.unavailable {}
         let before = try await session.stateJSON()
         do { _ = try await session.dispatch(["{\"type\":\"fail\"}"], now: 2); fatalError("invalid action accepted") }
         catch VortxNativeError.invalidResponse {}
@@ -120,9 +145,32 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         let recovered = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: ambiguousStore, transport: transport)
         check(try await recovered.stateJSON() == uncertainDisk)
         await recovered.close()
+        let firstImportStore = SessionStore()
+        do {
+            _ = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: firstImportStore,
+                                       transport: transport, allowNewAccount: true, initialActions: [#"{"type":"fail"}"#])
+            fatalError("failed cold import published a checkpoint")
+        } catch VortxNativeError.invalidResponse {}
+        check(try firstImportStore.read(scope: scope) == nil)
+        let candidate = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: firstImportStore,
+                                                transport: transport, allowNewAccount: true,
+                                                initialActions: [#"{"type":"edit","value":314}"#])
+        let firstImport = try firstImportStore.read(scope: scope)
+        check(firstImport?.contains("314") == true)
+        // Revocation reaches a candidate before any facade is installed, not just active UI state.
+        VortxNativeSession.revokeAllForOwnerBoundary()
+        do { _ = try await candidate.dispatch([#"{"type":"edit","value":315}"#], now: 5); fatalError("uninstalled revoked candidate wrote state") }
+        catch VortxNativeError.closed {}
+        check(try firstImportStore.read(scope: scope) == firstImport)
+        await candidate.close()
         let transitionStore = SessionStore()
         let transitionSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: transitionStore, transport: transport, allowNewAccount: true)
         let facade = try await VortxNativeCoreFacade.create(session: transitionSession, registry: [], changed: { _ in })
+        let nativeCW = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("continue_watching_preview")!)
+        check(nativeCW["items"]?.array?.first?["state"]?["timeOffset"] == .integer(120001))
+        check(nativeCW["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-video"))
+        let nativeLibrary = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("library")!)
+        check(nativeLibrary["catalog"] == .array([])) // history/resume is not saved membership
         transitionStore.blockNextWrite()
         check(facade.dispatch(data: Data(#"{"action":"Vortx","args":{"type":"switch_profile","id":"kid"}}"#.utf8), field: nil))
         await withCheckedContinuation { done in DispatchQueue.global().async { precondition(transitionStore.entered.wait(timeout: .now() + 5) == .success); done.resume() } }
@@ -133,6 +181,14 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         let published = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("native_state")!)
         check(published["activeProfileId"] == .string("kid"))
         check(facade.registryBinding?.profileID == "kid")
+        check(facade.lastFailure == nil)
+        let remote: VortxJSON = .object(["schemaVersion": .integer(1), "scope": .string(scope.account), "ownerProfileId": .string(scope.ownerProfileID), "fixturePeer": .string("retained")])
+        let exported = try await facade.mergeSyncDocument(remote)
+        check(exported == remote && exported["activeProfileId"] == nil && exported["libraries"] == nil)
+        let durable = try JSONDecoder().decode(VortxJSON.self, from: Data(try transitionStore.read(scope: scope)!.utf8))
+        check(durable["nativeSync"] == remote && durable["activeProfileId"] == .string("kid"))
+        do { _ = try await facade.mergeSyncDocument(.object(["scope": .string("another-account")])); fatalError("foreign account carrier exported") }
+        catch VortxNativeError.invalidResponse {}
         await facade.shutdown()
         print("Native session: acknowledged transactions, sealed cold state/context, legacy preservation and independent screen/logout fences passed")
     }

@@ -128,21 +128,28 @@ private final class VortxSessionLease: @unchecked Sendable {
 private final class VortxScopeWriter: @unchecked Sendable {
     private final class Registry: @unchecked Sendable {
         let lock = NSLock()
-        var scopes = Set<VortxAccountScope>()
+        var leases: [String: VortxSessionLease] = [:]
     }
     private static let registry = Registry()
     private let scope: VortxAccountScope
     private let lock = NSLock()
     private var released = true
-    init(scope: VortxAccountScope) throws {
+    init(scope: VortxAccountScope, lease: VortxSessionLease) throws {
         self.scope = scope
-        let inserted = Self.registry.lock.withLock { Self.registry.scopes.insert(scope).inserted }
+        let inserted = Self.registry.lock.withLock { () -> Bool in
+            guard Self.registry.leases[scope.account] == nil else { return false }
+            Self.registry.leases[scope.account] = lease; return true
+        }
         guard inserted else { throw VortxNativeError.unavailable }
         released = false
     }
     func release() {
         lock.lock(); defer { lock.unlock() }; guard !released else { return }; released = true
-        _ = Self.registry.lock.withLock { Self.registry.scopes.remove(scope) }
+        _ = Self.registry.lock.withLock { Self.registry.leases.removeValue(forKey: scope.account) }
+    }
+    static func revokeAll() {
+        let leases = registry.lock.withLock { Array(registry.leases.values) }
+        leases.forEach { $0.revoke() }
     }
     deinit { release() }
 }
@@ -170,23 +177,40 @@ actor VortxNativeSession {
 
     init(scope: VortxAccountScope, ownerName: String, abi: any VortxRuntimeABI,
          store: any VortxCheckpointStore, transport: any VortxResourceTransport,
-         allowNewAccount: Bool = false, legacy: VortxLegacyImport? = nil) throws {
+         allowNewAccount: Bool = false, legacy: VortxLegacyImport? = nil,
+         initialActions: [String] = []) throws {
         try scope.validate()
         guard legacy == nil || legacy?.scope == scope else { throw VortxNativeError.invalidSnapshot }
         self.scope = scope; self.abi = abi; self.store = store; self.transport = transport
-        writer = try VortxScopeWriter(scope: scope)
+        writer = try VortxScopeWriter(scope: scope, lease: lease)
         if let captured = try store.read(scope: scope) {
             _ = try scope.validateSnapshot(captured)
             runtime = try VortxNativeRuntime(abi: abi, snapshot: captured)
             // Hydration may migrate projections. Commit that full state before publishing it.
             let hydrated = try runtime.stateJSON()
             try scope.validateHydration(from: captured, to: hydrated)
-            try store.commit(hydrated, scope: scope)
+            try Self.bind(runtime, scope: scope)
+            let bound = try runtime.stateJSON()
+            try lease.withActive { try store.commit(bound, scope: scope) }
         } else {
             guard allowNewAccount, legacy?.documents.isEmpty != false else { throw VortxNativeError.invalidSnapshot }
             runtime = try VortxNativeRuntime(abi: abi, ownerID: scope.ownerProfileID, ownerName: ownerName)
-            try store.commit(runtime.stateJSON(), scope: scope)
+            try Self.bind(runtime, scope: scope)
+            for action in initialActions { try Self.apply(runtime, action: action) }
+            let bound = try runtime.stateJSON()
+            _ = try scope.validateSnapshot(bound)
+            try lease.withActive { try store.commit(bound, scope: scope) }
         }
+    }
+    private static func bind(_ runtime: VortxNativeRuntime, scope: VortxAccountScope) throws {
+        let action = VortxJSON.object(["type": .string("bind_sync_scope"), "scope": .string(scope.account)])
+        try apply(runtime, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
+        let bound = try scope.validateSnapshot(runtime.stateJSON())
+        guard bound["nativeSync"]?["scope"] == .string(scope.account) else { throw VortxNativeError.invalidSnapshot }
+    }
+    private static func apply(_ runtime: VortxNativeRuntime, action: String) throws {
+        let result = try runtime.dispatch(action, now: UInt64(Date().timeIntervalSince1970))
+        guard try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))["ok"] == .bool(true) else { throw VortxNativeError.invalidResponse }
     }
     func close() {
         revoke(); closed = true; invalidateScreens(); runtime.close(); writer.release()
@@ -194,6 +218,9 @@ actor VortxNativeSession {
     /// Synchronous logout boundary: waits for an already-running atomic commit, then forbids later
     /// commits even before the actor processes close(). No outgoing account writes occur after return.
     nonisolated func revoke() { lease.revoke() }
+    /// Also reaches an authenticated mount that has opened a checkpoint but has not yet installed
+    /// its facade. Owner/profile boundaries therefore revoke writes during every bootstrap await.
+    nonisolated static func revokeAllForOwnerBoundary() { VortxScopeWriter.revokeAll() }
     private func invalidateScreens() {
         epoch = UUID(); bridges.values.forEach { $0.invalidate() }
         tickets.removeAll(); pages.removeAll(); screens.removeAll(); catalogRegistries.removeAll()
@@ -201,6 +228,37 @@ actor VortxNativeSession {
     func invalidateResources() { invalidateScreens() }
     func stateJSON() throws -> String {
         guard !closed else { throw VortxNativeError.closed }; return try lease.withActive { try runtime.stateJSON() }
+    }
+    func playbackProjection() throws -> VortxJSON {
+        let state = try scope.validateSnapshot(stateJSON())
+        guard let profile = state["activeProfileId"] else { throw VortxNativeError.invalidSnapshot }
+        let query = VortxJSON.object(["kind": .string("profile_playback"), "profileId": profile])
+        let result = try lease.withActive { try runtime.resolve(String(decoding: JSONEncoder().encode(query), as: UTF8.self)) }
+        let response = try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))
+        guard response["kind"] == .string("profile_playback"), response["profileId"] == profile,
+              response["continueWatching"]?.array != nil, response["history"]?.array != nil,
+              case .object = response["watchedVideoIdsByTitle"], case .object = response["watchedTitles"] else { throw VortxNativeError.invalidResponse }
+        return response
+    }
+    /// The kernel materializes membership/order; hosts do not reproduce its merge reducer.
+    func resourceRegistry() throws -> [VortxResourceAddon] {
+        let state = try scope.validateSnapshot(stateJSON())
+        guard case .string(let active) = state["activeProfileId"], let profile = state["roster"]?["profiles"]?[active],
+              let binding = profile["addons"], [.string("own"), .string("share_primary")].contains(binding) else { throw VortxNativeError.invalidSnapshot }
+        let bucket = binding == .string("share_primary") ? scope.ownerProfileID : active
+        let query = VortxJSON.object(["kind": .string("installed_addons"), "profileId": .string(bucket)])
+        let result = try lease.withActive { try runtime.resolve(String(decoding: JSONEncoder().encode(query), as: UTF8.self)) }
+        let response = try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))
+        guard response["kind"] == .string("installed_addons"), response["profileId"] == .string(bucket),
+              let addons = response["addons"]?.array else { throw VortxNativeError.invalidResponse }
+        let disabled = (try? profile["settings"]?["disabledAddons"]?.decode([String].self)) ?? []
+        return try addons.compactMap { addon in
+            guard case .string(let url) = addon["transportUrl"], !url.isEmpty,
+                  case .object = addon["manifest"] else { throw VortxNativeError.invalidResponse }
+            if disabled.contains(url) { return nil }
+            let id = SHA256.hash(data: Data(url.utf8)).map { String(format: "%02x", $0) }.joined()
+            return VortxResourceAddon(id: id, transportUrl: url, manifest: addon["manifest"])
+        }
     }
     /// Native action wire only; full Stremio Ctx/player action compatibility is still an explicit gate.
     @discardableResult func dispatch(_ actions: [String], now: UInt64) throws -> [String] {

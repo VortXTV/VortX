@@ -107,7 +107,7 @@ struct LibraryView: View {
                             TVDownloadsView()
                                 .padding(.bottom, Theme.Space.lg)
                         }
-                        if profiles.activeUsesEngineHistory {
+                        if core.usesNativeProfileState || profiles.activeUsesEngineHistory {
                             // Owner profile: the account library (engine). The client-side type segment
                             // (Movies / TV / Anime) replaces the engine's type chips; the engine's SORT
                             // chips stay as-is.
@@ -157,7 +157,7 @@ struct LibraryView: View {
     }
 
     private func seed() {
-        let first = profiles.activeUsesEngineHistory ? core.library?.catalog.first : profiles.libraryItems.first
+        let first = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? core.library?.catalog.first : profiles.libraryItems.first
         focusModel.seedIfEmpty(first?.focusedHero)
     }
 
@@ -298,6 +298,7 @@ struct LibraryView: View {
     /// overlay profiles read only their private overlay (a whole-title mark records the
     /// metaId itself, episode finishes record episode ids), never the account's state.
     private func isWatched(_ item: CoreCWItem) -> Bool {
+        if core.usesNativeProfileState { return item.isWatched }
         // A series fully watched by its aired, regular-season episodes badges even when the engine's
         // `times_watched` never got bumped (marked, not played), WatchedIndex holds that derived set,
         // per profile, alongside the engine bucket / overlay signal (issue #143).
