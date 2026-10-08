@@ -3921,73 +3921,26 @@ struct iOSDetailView: View {
                                  cardWidth: CGFloat) -> some View {
         let imageWidth = max(220, cardWidth - Theme.Space.md * 2)
         let imageHeight = max(124, imageWidth * 9 / 16)
-        let status: String = {
-            if isWatched { return "Watched" }
-            if progress > 0.01 { return "Resume · \(Int((progress * 100).rounded()))%" }
-            return "Unwatched"
-        }()
-        return VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            episodeThumbnail(v, isWatched: isWatched, progress: progress,
-                             width: imageWidth, height: imageHeight)
-
-            VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                HStack(spacing: Theme.Space.xs) {
-                    Text(episodeCoordinate(v))
-                        .font(Theme.Typography.eyebrow)
-                        .tracking(1.2)
-                        .foregroundStyle(Theme.Palette.accent)
-                    Spacer(minLength: 0)
-                    Text(status)
-                        .font(Theme.Typography.eyebrow)
-                        .foregroundStyle(isWatched ? Theme.Palette.textTertiary : Theme.Palette.accent)
-                        .lineLimit(1)
+        return CinemaEpisodeRailCard(
+            video: v,
+            isWatched: isWatched,
+            progress: progress,
+            cardWidth: cardWidth,
+            spoilerHidden: spoilerVeiled(v, isWatched: isWatched),
+            artwork: AnyView(
+                episodeThumbnail(v, isWatched: isWatched, progress: progress,
+                                 width: imageWidth, height: imageHeight)
+            ),
+            trailingStatus: AnyView(
+                Group {
                     #if !os(tvOS)
                     episodeDownloadStateBadge(v)
+                    #else
+                    EmptyView()
                     #endif
                 }
-
-                Text(v.episodeTitle)
-                    .font(Theme.Typography.cardTitle)
-                    .foregroundStyle(isWatched ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
-                    .lineLimit(2)
-
-                if let aired = v.released, aired.count >= 10 {
-                    Text(String(aired.prefix(10)))
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                }
-
-                if spoilerVeiled(v, isWatched: isWatched) {
-                    // Synopsis withheld until the viewer reveals this episode (spoiler-safe mode). The card
-                    // itself is the reveal control, so this remains a static, non-nested affordance.
-                    Label("Tap to reveal", systemImage: "eye.slash")
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textTertiary)
-                        .accessibilityLabel("Description hidden")
-                } else if let overview = v.overview, !overview.isEmpty {
-                    Text(overview)
-                        .font(Theme.Typography.body)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                        .lineLimit(4)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                HStack(spacing: Theme.Space.sm) {
-                    Text(progress > 0.01 ? "Resume episode" : "Open sources")
-                }
-                .font(Theme.Typography.label)
-                .foregroundStyle(Theme.Palette.textTertiary)
-                .lineLimit(1)
-            }
-        }
-        .padding(Theme.Space.md)
-        .frame(width: cardWidth, alignment: .leading)
-        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
-                    fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
-        .opacity(isWatched ? 0.58 : 1)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(episodeCoordinate(v)): \(v.episodeTitle)")
-        .accessibilityValue(status)
+            )
+        )
     }
 
     private func episodeCoordinate(_ v: CoreVideo) -> String {
@@ -4467,6 +4420,71 @@ struct iOSDetailView: View {
     // previous page's still-resident meta (A -> back -> B) can't render A's hero/title under B.
     private var meta: CoreMetaItem? {
         ResidentMeta.fenced(core.metaDetails?.meta, pageID: metaRequestID) { $0.id }
+    }
+}
+
+/// The visual, data-only body of a Cinema episode card. Navigation, spoiler reveal, download work,
+/// and thumbnail loading remain with `iOSDetailView`; keeping this body independent lets the debug
+/// smoke surface render the exact production geometry using an inert local artwork view.
+struct CinemaEpisodeRailCard: View {
+    let video: CoreVideo
+    let isWatched: Bool
+    let progress: Double
+    let cardWidth: CGFloat
+    var spoilerHidden = false
+    let artwork: AnyView
+    let trailingStatus: AnyView
+
+    private var coordinate: String {
+        if let season = video.season { return "S\(season) · E\(video.episodeNumber)" }
+        return "E\(video.episodeNumber)"
+    }
+
+    private var status: String {
+        if isWatched { return "Watched" }
+        if progress > 0.01 { return "Resume · \(Int((progress * 100).rounded()))%" }
+        return "Unwatched"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            artwork
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                HStack(spacing: Theme.Space.xs) {
+                    Text(coordinate).font(Theme.Typography.eyebrow).tracking(1.2)
+                        .foregroundStyle(Theme.Palette.accent)
+                    Spacer(minLength: 0)
+                    Text(status).font(Theme.Typography.eyebrow)
+                        .foregroundStyle(isWatched ? Theme.Palette.textTertiary : Theme.Palette.accent)
+                        .lineLimit(1)
+                    trailingStatus
+                }
+                Text(video.episodeTitle).font(Theme.Typography.cardTitle)
+                    .foregroundStyle(isWatched ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
+                    .lineLimit(2)
+                if let aired = video.released, aired.count >= 10 {
+                    Text(String(aired.prefix(10))).font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
+                if spoilerHidden {
+                    Label("Tap to reveal", systemImage: "eye.slash").font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary).accessibilityLabel("Description hidden")
+                } else if let overview = video.overview, !overview.isEmpty {
+                    Text(overview).font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                        .lineLimit(4).fixedSize(horizontal: false, vertical: true)
+                }
+                Text(progress > 0.01 ? "Resume episode" : "Open sources")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary).lineLimit(1)
+            }
+        }
+        .padding(Theme.Space.md)
+        .frame(width: cardWidth, alignment: .leading)
+        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
+                    fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
+        .opacity(isWatched ? 0.58 : 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(coordinate): \(video.episodeTitle)")
+        .accessibilityValue(status)
     }
 }
 
@@ -5984,7 +6002,7 @@ struct iOSEpisodeStreams: View {
 // same visual language without depending on the tvOS-only target.
 
 /// Section header: a small ember eyebrow over the section title (mirrors tvOS RailHeader).
-private struct iOSRailHeader: View {
+struct iOSRailHeader: View {
     // Optional so every detail section can share this component (S9): sections with a natural kicker
     // (Episodes "N episodes", More Like This "Similar Series", Sources) pass one; sections without one
     // (Cast & Crew, Where to Watch) omit it and render title-only, rather than fabricating filler copy.
@@ -6906,7 +6924,7 @@ extension iOSSourceList: Equatable {
 
 /// Source rows retain the add-on's authored formatter by default, matching the TV detail page.
 /// Parsed quality/flavour/size labels remain available through the explicit compact preference.
-private struct iOSStreamLabel: View {
+struct iOSStreamLabel: View {
     let addon: String
     let stream: CoreStream
     let enabled: Bool

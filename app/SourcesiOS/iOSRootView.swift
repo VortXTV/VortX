@@ -617,24 +617,14 @@ struct iOSRootView: View {
     }
 
     private var customTabBar: some View {
-        HStack(spacing: 0) {
-            ForEach(compactTabLayout.primary, id: \.rawValue) { item in
-                tabButton(item)
+        CinemaTabBarChrome {
+            HStack(spacing: 0) {
+                ForEach(compactTabLayout.primary, id: \.rawValue) { item in
+                    tabButton(item)
+                }
+                if !compactTabLayout.overflow.isEmpty { overflowTabMenu }
             }
-            if !compactTabLayout.overflow.isEmpty { overflowTabMenu }
         }
-        #if os(macOS)
-        .focusSection()
-        #endif
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Tabs")
-        // The same floating capsule as TV, with at most five touch targets instead of squeezing
-        // all seven labels into a phone. The shell reserves its real height below scrolling content.
-        .padding(.horizontal, Theme.Space.sm)
-        .padding(.vertical, Theme.Space.xs)
-        .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .padding(.horizontal, Theme.Space.md)
-        .padding(.vertical, Theme.Space.xs)
     }
 
     private var compactTabLayout: (primary: [Tab], overflow: [Tab]) {
@@ -681,30 +671,9 @@ struct iOSRootView: View {
 
     private func compactTabLabel(title: String, icon: String, selected: Bool,
                                  downloadBadge: Bool = false) -> some View {
-        VStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 20, weight: .semibold))
-                .frame(height: 22)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-                .background {
-                    if selected { Capsule().fill(Theme.Palette.accent) }
-                }
-                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
-                .overlay(alignment: .topTrailing) {
-                    if downloadBadge, activeDownloadCount > 0 {
-                        downloadCountBadge(activeDownloadCount)
-                    }
-                }
-            Text(title)
-                .font(.system(size: compactLabelSize, weight: selected ? .semibold : .medium))
-                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-        }
-        .frame(maxWidth: .infinity, minHeight: 44)
-        .padding(.bottom, 2)
-        .contentShape(Rectangle())
+        CinemaCompactTabLabel(title: title, icon: icon, selected: selected,
+                              downloadBadge: downloadBadge ? activeDownloadCount : nil,
+                              fontSize: compactLabelSize)
     }
 
     /// Quiet, persistent "You're offline" strip (#120), shown across every tab while the device has no
@@ -829,6 +798,79 @@ struct iOSRootView: View {
         #else
         return base
         #endif
+    }
+}
+
+/// Shared compact navigation chrome. RootTabView supplies the real destination buttons; the offline
+/// Cinema fixture supplies inert buttons, which lets it render the actual safe-area treatment without
+/// constructing the root's account/session state.
+struct CinemaTabBarChrome<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            #if os(macOS)
+            .focusSection()
+            #endif
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Tabs")
+            .padding(.horizontal, Theme.Space.sm)
+            .padding(.vertical, Theme.Space.xs)
+            .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.vertical, Theme.Space.xs)
+    }
+}
+
+/// Shared compact tab glyph/label treatment. The root continues to own tab selection and download state.
+struct CinemaCompactTabLabel: View {
+    let title: String
+    let icon: String
+    let selected: Bool
+    var downloadBadge: Int? = nil
+    var fontSize: CGFloat = 12
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 20, weight: .semibold))
+                .frame(height: 22)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background { if selected { Capsule().fill(Theme.Palette.accent) } }
+                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+                .overlay(alignment: .topTrailing) {
+                    if let downloadBadge, downloadBadge > 0 {
+                        Text(downloadBadge > 9 ? "9+" : "\(downloadBadge)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(Theme.Palette.onAccent)
+                            .padding(.horizontal, 5)
+                            .frame(minWidth: 16, minHeight: 16)
+                            .background(Theme.Palette.accent, in: Capsule())
+                            .offset(x: 6, y: -6)
+                            .accessibilityLabel("\(downloadBadge) active downloads")
+                    }
+                }
+            Text(title)
+                .font(.system(size: fontSize, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .padding(.bottom, 2)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct CinemaFixtureDisablesArtworkLoadingKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var cinemaFixtureDisablesArtworkLoading: Bool {
+        get { self[CinemaFixtureDisablesArtworkLoadingKey.self] }
+        set { self[CinemaFixtureDisablesArtworkLoadingKey.self] = newValue }
     }
 }
 
@@ -4679,7 +4721,7 @@ struct iOSGroupHeader: View {
     }
 }
 
-private struct PosterRail: View {
+private struct PosterRailBody: View {
     let title: String
     /// An optional dim uppercase kicker above the shelf title (the redesign mockup's "Pick up where you left
     /// off" style eyebrow). Tertiary-toned to match the mockup's shelf eyebrows and the tvOS RailHeader
@@ -4703,6 +4745,10 @@ private struct PosterRail: View {
     /// cards carry the resume timecode + progress stripe, not a watched badge).
     /// Declared before `onReachEnd` so the synthesized memberwise init accepts the call-site argument order.
     var showWatchedBadges: Bool = false
+    /// Live wrappers pass the active-profile watched set; fixture callers pass an inert empty set.
+    let watchedIDs: Set<String>
+    /// Supplying a static presentation bypasses the live preference/localization/card owners.
+    var fixtureCardPresentation: ((RailItem) -> CinemaPosterCardPresentation)? = nil
     /// Horizontal infinite scroll: fired when the LAST card appears, so a Home catalog row loads its next
     /// page of items (#95). nil on rails that do not paginate (Continue Watching, editorial collections).
     var onReachEnd: (() -> Void)? = nil
@@ -4714,8 +4760,6 @@ private struct PosterRail: View {
     var macFocus: FocusState<MacBrowseFocus?>.Binding? = nil
     #endif
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
-    // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
-    @ObservedObject private var watchedIndex = WatchedIndex.shared
     @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
     @State private var quickViewItem: RailItem?
     /// Pointer hovering the rail (#3). Never fires on pure-touch iPhone, so the
@@ -4795,11 +4839,24 @@ private struct PosterRail: View {
             if shouldPresentQuickView(for: item) { quickViewItem = item }
             else { onTap(item) }
         } label: {
-            PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
-                          releaseInfo: item.releaseInfo, progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
-                          isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id),
-                          onDetails: onDetails.map { od in { od(item) } },
-                          privateArtwork: accessibilityProvenance != nil)
+            Group {
+                if let fixtureCardPresentation {
+                    CinemaPosterCardBody(id: item.id, type: item.type, name: item.name, poster: item.poster,
+                                         fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
+                                         releaseInfo: item.releaseInfo, progress: item.progress,
+                                         resumeSeconds: item.resumeSeconds, menu: menu,
+                                         isWatched: showWatchedBadges && watchedIDs.contains(item.id),
+                                         onDetails: onDetails.map { od in { od(item) } },
+                                         privateArtwork: accessibilityProvenance != nil,
+                                         presentation: fixtureCardPresentation(item))
+                } else {
+                    PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
+                                  releaseInfo: item.releaseInfo, progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
+                                  isWatched: showWatchedBadges && watchedIDs.contains(item.id),
+                                  onDetails: onDetails.map { od in { od(item) } },
+                                  privateArtwork: accessibilityProvenance != nil)
+                }
+            }
         }
         // S3: shared card treatment (resting shadow, Mac hover lift, designed press, Reduce-Motion aware),
         // matching the browse grid and tvOS poster cards. scale 1.04 is touch-tuned.
@@ -4869,6 +4926,72 @@ private struct PosterRail: View {
     }
 }
 
+/// Live rail wrapper. The only watched-index subscription remains here, so normal catalog reactivity is
+/// unchanged while the fixture can render the same body with a static watched set.
+private struct PosterRail: View {
+    let title: String
+    var eyebrow: String? = nil
+    let items: [RailItem]
+    let onTap: (RailItem) -> Void
+    var onWatch: ((RailItem) -> Void)? = nil
+    var onSeeAll: (() -> Void)? = nil
+    var menu: iOSPosterMenu = .none
+    var onDetails: ((RailItem) -> Void)? = nil
+    var accessibilityProvenance: String? = nil
+    var showWatchedBadges: Bool = false
+    var onReachEnd: (() -> Void)? = nil
+    #if os(macOS)
+    var macFocus: FocusState<MacBrowseFocus?>.Binding? = nil
+    #endif
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
+
+    var body: some View {
+        #if os(macOS)
+        PosterRailBody(title: title, eyebrow: eyebrow, items: items, onTap: onTap, onWatch: onWatch,
+                       onSeeAll: onSeeAll, menu: menu, onDetails: onDetails,
+                       accessibilityProvenance: accessibilityProvenance,
+                       showWatchedBadges: showWatchedBadges, watchedIDs: watchedIndex.ids,
+                       onReachEnd: onReachEnd, macFocus: macFocus
+        )
+        #else
+        PosterRailBody(title: title, eyebrow: eyebrow, items: items, onTap: onTap, onWatch: onWatch,
+                       onSeeAll: onSeeAll, menu: menu, onDetails: onDetails,
+                       accessibilityProvenance: accessibilityProvenance,
+                       showWatchedBadges: showWatchedBadges, watchedIDs: watchedIndex.ids,
+                       onReachEnd: onReachEnd)
+        #endif
+    }
+}
+
+// MARK: - Debug-only Cinema fixture seam
+
+#if DEBUG
+/// An inert entry point to the shipping shelf.  The UI smoke host deliberately owns only static
+/// `RailItem` values and no `CoreBridge`/account lifecycle, so it can exercise Cinema card geometry
+/// without booting an engine, resolving artwork, or issuing a catalog request.
+struct CinemaFixturePosterRail: View {
+    let title: String
+    var eyebrow: String? = nil
+    let items: [RailItem]
+    var continueWatching = false
+    var includesSeeAll = false
+
+    var body: some View {
+        PosterRailBody(
+            title: title,
+            eyebrow: eyebrow,
+            items: items,
+            onTap: { _ in },
+            onSeeAll: includesSeeAll ? {} : nil,
+            menu: continueWatching ? .continueWatching : .none,
+            onDetails: { _ in },
+            watchedIDs: [],
+            fixtureCardPresentation: { .fixture(name: $0.name, poster: $0.poster) }
+        )
+    }
+}
+#endif
+
 // The old image-only `iOSHeroBackdrop` was replaced by the interactive `FeaturedHeroView`
 // (FeaturedHeroView.swift) on all three browse screens; its 16:9-art helpers now live on
 // `FeaturedHeroItem`.
@@ -4890,6 +5013,7 @@ struct CachedPosterImage: View {
     let url: String?
     @State private var image: VXPosterImage?
     @State private var failed = false
+    @Environment(\.cinemaFixtureDisablesArtworkLoading) private var disablesArtworkLoading
 
     /// Paint instantly (no task hop, no blank frame) when the decoded image is already in memory. The
     /// `.task` still runs to load a cold poster; on a warm one it returns immediately.
@@ -4899,7 +5023,7 @@ struct CachedPosterImage: View {
     }
 
     var body: some View {
-        Group {
+        let renderedImage = Group {
             if let image = image ?? synchronousCache {
                 imageView(image).resizable().scaledToFill()
             } else if failed {
@@ -4909,7 +5033,11 @@ struct CachedPosterImage: View {
                 Theme.Palette.surface1
             }
         }
-        .task(id: url) { await load() }
+        if disablesArtworkLoading {
+            renderedImage
+        } else {
+            renderedImage.task(id: url) { await load() }
+        }
     }
 
     private func imageView(_ img: VXPosterImage) -> Image {
@@ -5072,7 +5200,25 @@ private struct LandscapeArtiOS: View {
 /// Reused across rails on every surface: catalog rows, Continue Watching, the browse grid, and the detail
 /// page's "More Like This" rail. Because it reads `CatalogPreferences` directly, every rail that uses it
 /// honors the poster-orientation (landscape/portrait) and hide-labels settings consistently.
-struct PosterCardiOS: View {
+/// Immutable presentation inputs for the shared card body. The live wrapper observes preferences and
+/// localized metadata; the renderer supplies this value directly so no credential or metadata singleton
+/// is constructed merely to draw a fixture card.
+struct CinemaPosterCardPresentation {
+    let landscape: Bool
+    let width: PosterWidthPreset
+    let radius: PosterRadiusPreset
+    let hidesLabels: Bool
+    let displayName: String
+    let displayPoster: String?
+    var usesInertArtwork = false
+
+    static func fixture(name: String, poster: String?) -> Self {
+        .init(landscape: true, width: .balanced, radius: .rounded, hidesLabels: false,
+              displayName: name, displayPoster: poster, usesInertArtwork: true)
+    }
+}
+
+private struct CinemaPosterCardBody: View {
     let id: String
     let type: String
     let name: String
@@ -5104,20 +5250,18 @@ struct PosterCardiOS: View {
     /// Account-private remote rows may reuse only already-warm local art. They must not enrich, resolve,
     /// fetch, or persist artwork based on private playback history.
     var privateArtwork = false
-    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
-    @ObservedObject private var apiKeys = ApiKeys.shared
-    @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized title/poster override
+    let presentation: CinemaPosterCardPresentation
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @Environment(\.horizontalSizeClass) private var hSize
 
     /// The title to show: the pooled localized title in the user's language when available, else the add-on's.
-    private var displayName: String { privateArtwork ? name : (l10n.title(for: id) ?? name) }
+    private var displayName: String { presentation.displayName }
     /// The poster to show: the pooled localized (language-matched) poster when available, else the add-on's.
-    private var displayPoster: String? { privateArtwork ? poster : (l10n.poster(for: id) ?? poster) }
+    private var displayPoster: String? { presentation.displayPoster }
 
     /// The existing Appearance control remains authoritative. When Landscape is selected it applies to
     /// every card, including private history rows; those rows use an already-warm-only renderer below.
-    private var landscape: Bool { catalogPrefs.landscapeCards }
+    private var landscape: Bool { presentation.landscape }
     /// Preserve this card's actual catalog identity for its context menu. CoreBridge uses it only if
     /// board/discover/search no longer has the engine's resident raw preview, then validates id/type.
     private var catalogPreview: LibraryWatchedMutationPolicy.MetaPreview {
@@ -5128,7 +5272,7 @@ struct PosterCardiOS: View {
     // + cards stay in lockstep and the responsive column count recomputes from the chosen width. The height
     // follows the card's own aspect (16:9 landscape, 2:3 portrait) so posters aren't distorted.
     private var cardW: CGFloat {
-        iOSPillMetrics.gridPosterWidth(preset: catalogPrefs.posterWidth, compact: isCompactWidth)
+        iOSPillMetrics.gridPosterWidth(preset: presentation.width, compact: isCompactWidth)
     }
     /// True on a compact-width class (iPhone portrait), where the preset uses its narrower compact widths.
     private var isCompactWidth: Bool {
@@ -5140,7 +5284,7 @@ struct PosterCardiOS: View {
     }
     private var cardH: CGFloat { landscape ? cardW * 9.0 / 16.0 : cardW * 3.0 / 2.0 }
     /// The poster clip radius from the user's preset (default `.rounded` = Theme.Radius.card).
-    private var cornerRadius: CGFloat { catalogPrefs.posterRadius.radius }
+    private var cornerRadius: CGFloat { presentation.radius.radius }
     private var cinemaFacts: [String] {
         [releaseInfo, imdbRating.map { "★ \($0)" }, caption]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -5158,7 +5302,9 @@ struct PosterCardiOS: View {
                 // retries, the blank-poster cause). Landscape uses a clean TMDB backdrop (LandscapeArtiOS);
                 // portrait crops the poster to the card so non-2:3 add-on posters fill cleanly (F37).
                 Group {
-                    if landscape {
+                    if presentation.usesInertArtwork {
+                        WarmCachedPosterImage(url: nil)
+                    } else if landscape {
                         if privateArtwork {
                             privateLandscapeArt
                         } else {
@@ -5182,7 +5328,8 @@ struct PosterCardiOS: View {
                         // When a poster service bakes the rating into the image (VortX/XRDB or ERDB), skip
                         // the native overlay to avoid a double badge. Also skipped on a watched card, whose
                         // topTrailing corner carries the check badge instead (mirror of tvOS PosterCard).
-                        if !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings(forID: id) {
+                        if !presentation.usesInertArtwork,
+                           !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings(forID: id) {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))
@@ -5248,7 +5395,7 @@ struct PosterCardiOS: View {
             // The title label is hidden when the user turns off poster labels in Poster Style (default:
             // shown). The caption (Upcoming Episodes "S2E5 · Jun 30") is a functional date, not a title, so
             // it stays visible even with labels hidden.
-            if !catalogPrefs.hidePosterLabels {
+            if !presentation.hidesLabels {
                 Text(displayName)
                     .font(Theme.Typography.cardTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
@@ -5288,6 +5435,42 @@ struct PosterCardiOS: View {
                 .scaledToFit()
                 .padding(6)
         }
+    }
+}
+
+/// Live card wrapper. Keeping the observed preference/localization owners here preserves normal app
+/// reactivity while allowing the smoke renderer to reuse `CinemaPosterCardBody` without constructing them.
+struct PosterCardiOS: View {
+    let id: String
+    let type: String
+    let name: String
+    let poster: String?
+    var fallbackArt: String? = nil
+    var caption: String? = nil
+    var imdbRating: String? = nil
+    var releaseInfo: String? = nil
+    let progress: Double
+    var resumeSeconds: Double? = nil
+    var menu: iOSPosterMenu = .none
+    var isWatched: Bool = false
+    var onDetails: (() -> Void)? = nil
+    var privateArtwork = false
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var l10n = LocalizedMetadataStore.shared
+    @EnvironmentObject private var theme: ThemeManager
+
+    var body: some View {
+        CinemaPosterCardBody(
+            id: id, type: type, name: name, poster: poster, fallbackArt: fallbackArt, caption: caption,
+            imdbRating: imdbRating, releaseInfo: releaseInfo, progress: progress, resumeSeconds: resumeSeconds,
+            menu: menu, isWatched: isWatched, onDetails: onDetails, privateArtwork: privateArtwork,
+            presentation: .init(
+                landscape: catalogPrefs.landscapeCards, width: catalogPrefs.posterWidth,
+                radius: catalogPrefs.posterRadius, hidesLabels: catalogPrefs.hidePosterLabels,
+                displayName: privateArtwork ? name : (l10n.title(for: id) ?? name),
+                displayPoster: privateArtwork ? poster : (l10n.poster(for: id) ?? poster)
+            )
+        )
     }
 }
 

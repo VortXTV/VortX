@@ -3,6 +3,30 @@ import SwiftUI
 import UIKit
 #endif
 
+#if CINEMA_UI_SMOKE_RENDERER
+// The regular app entry point is intentionally excluded from the offline renderer. These are the two
+// platform-neutral bridge declarations iOSRootView's macOS layout references while it is compiled as a
+// real production view tree; neither starts an account, player, or window lifecycle.
+enum MacCommands {
+    static let tabRequest = Notification.Name("stremiox.macCommands.tabRequest")
+    enum Destination: Int { case home, discover, live, library, search, addons, settings }
+    static func go(_ destination: Destination) {
+        NotificationCenter.default.post(name: tabRequest, object: nil, userInfo: ["tab": destination.rawValue])
+    }
+}
+
+#if os(macOS)
+@MainActor
+final class MacSearchBridge: ObservableObject {
+    static let shared = MacSearchBridge()
+    private init() {}
+    @Published var pending: String?
+}
+#endif
+#endif
+
+#if !CINEMA_UI_SMOKE_RENDERER
+
 /// Native iPhone / iPad entry point. Boots the SAME stremio-core engine + embedded server as the
 /// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors VortXTVApp's
 /// engine/server/profile wiring; the UI layer (SourcesiOS) is touch-native instead of focus-driven.
@@ -507,6 +531,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 #endif
+#endif // !CINEMA_UI_SMOKE_RENDERER
 
 #if os(iOS)
 /// Reports the app's currently-allowed interface orientations to UIKit. The player flips `lock` to
