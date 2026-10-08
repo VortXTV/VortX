@@ -289,6 +289,8 @@ final class VortXSyncManager: ObservableObject {
                 guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
                       ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
                 try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture)
+                guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
+                      ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
                 nativeCheckpointStatus = "mounted_offline"; return true
             } catch { await session.close(); throw error }
         } catch {
