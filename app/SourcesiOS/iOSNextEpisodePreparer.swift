@@ -51,7 +51,14 @@ final class iOSNextEpisodePreparer: ObservableObject {
             return await self.prepare(request, context: context)
         }
         inFlight = (key, task)
-        let result = await task.value
+        // Task is an owned child of this caller for cancellation purposes: PlayerScreen invalidation, cover
+        // teardown, or replacement cancels the provider work immediately instead of merely abandoning an
+        // unstructured task that continues to warm the old episode in the background.
+        let result = await withTaskCancellationHandler(operation: {
+            await task.value
+        }, onCancel: {
+            task.cancel()
+        })
         if inFlight?.key == key { inFlight = nil }
         return result
     }
@@ -105,13 +112,16 @@ final class iOSNextEpisodePreparer: ObservableObject {
             waitForLocalUsenetNode: true, deadline: request.deadline, stillCurrent: admitted), admitted() else { return nil }
         let (best, url, ref) = (selected.stream, selected.url, selected.ref)
         let rawTorrent = ref == nil && best.url == nil
-        let lease: PreparedTorrentEngineLease?
-        if rawTorrent {
-            guard let prepared = await prepareWarmTorrentEngine(best, request: request), admitted() else { return nil }
-            lease = prepared
-        } else { lease = nil }
+        var lease: PreparedTorrentEngineLease?
         var retainLease = false
         defer { if let lease, !retainLease { retireWarmTorrentEngine(lease, reason: "preparation did not retain winner") } }
+        if rawTorrent {
+            guard let prepared = await prepareWarmTorrentEngine(best, request: request) else { return nil }
+            lease = prepared
+            // Register cleanup BEFORE the stale fence. `prepareWarmTorrentEngine` has already retained the
+            // engine by this point, so a profile/source switch here must retire it exactly once.
+            guard admitted() else { return nil }
+        }
         let signature = StreamRanking.signature(best)
         let dolbyVision = StreamRanking.isDolbyVision(signature)
         let remuxMode = VortXPreparedRemuxCallerPolicy.mode(avPlayerActive: request.prepareLocalAVPlayerRemux,
@@ -132,15 +142,22 @@ final class iOSNextEpisodePreparer: ObservableObject {
             name: context.seriesName, poster: video.thumbnail ?? context.poster, season: video.season, episode: video.episode)
         let resume = await BoundedPreloadWorkPool.valueBeforeDeadline(request.deadline) { await context.resumeOffset(playbackMeta) } ?? 0
         guard admitted() else { return nil }
-        let attachment: VortXPreparedRemuxAttachment?
+        var attachment: VortXPreparedRemuxAttachment?
         if let remuxMode {
             let owner = VortXPreparedRemuxOwnerIdentity(mediaID: playbackMeta.videoId,
                 generation: request.preparedRemuxGeneration, sourceSignature: signature)
             if let handle = await AVPlayerEngineController.prepareRemuxTransport(input: url, headers: best.requestHeaders,
-                mode: remuxMode, startAtSeconds: resume, ownerIdentity: owner), admitted() {
+                mode: remuxMode, startAtSeconds: resume, ownerIdentity: owner) {
                 attachment = VortXPreparedRemuxAttachment(handle: handle, ownerIdentity: owner)
-            } else { attachment = nil }
-        } else { attachment = nil }
+                // As above, construct/register the owned attachment before checking staleness. Otherwise a
+                // successful handle returned after a profile switch is silently discarded without abandon.
+                guard admitted() else {
+                    attachment?.abandon(reason: "iOS preparation stale after remux readiness")
+                    attachment = nil
+                    return nil
+                }
+            }
+        }
         guard admitted() else { attachment?.abandon(reason: "iOS preparation cancelled after transport readiness"); return nil }
         retainLease = true
         return PlayerEpisodeStream(stream: best, url: url, meta: playbackMeta,

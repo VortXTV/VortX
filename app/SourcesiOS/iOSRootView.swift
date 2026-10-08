@@ -3775,6 +3775,8 @@ struct iOSPlayerLaunch: Identifiable {
     /// The same bounded E+1 preparation contract used by the detail player. nil remains correct for movies,
     /// downloads, and pasted links; a CW series launch supplies a per-launch owner below.
     var warmNextEpisode: ((NextEpisodePreparationRequest) async -> PlayerEpisodeStream?)? = nil
+    /// Releases the per-launch preparation owner when this player is dismissed. Nil for non-series launches.
+    var cancelNextEpisodePreparation: (() -> Void)? = nil
     /// A Continue-Watching launch carries the identity needed for one owned,
     /// deferred source contribution after the player exits.
     var resumeHoardContentID: String? = nil
@@ -3817,6 +3819,7 @@ extension View {
                 onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                 onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                 onClose: {
+                    item.cancelNextEpisodePreparation?()
                     core.unloadEnginePlayer()
                     launch.wrappedValue = nil
                 }
@@ -3948,6 +3951,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
     var loadEpisodeWithMetadata: ((CoreVideo) async -> PlayerEpisodeStream?)? = nil
     var warmNextEpisode: ((NextEpisodePreparationRequest) async -> PlayerEpisodeStream?)? = nil
+    var cancelNextEpisodePreparation: (() -> Void)? = nil
     var enginePlayerVideoId: String? = nil
     var launchSource: CoreStream? = nil
     if usesSeriesLifecycle {
@@ -4024,6 +4028,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         // supplier reads the exact current title metadata at THAT point and the captured owner/profile/
         // credential fence rejects a replacement account or profile before and after every async stage.
         let preparer = iOSNextEpisodePreparer()
+        cancelNextEpisodePreparation = { preparer.cancel() }
         warmNextEpisode = { request in
             let valid = {
                 ProfileStore.shared.activeID == pid
@@ -4037,8 +4042,15 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                     SourcePinContext(metaId: item.id, isSeries: true)), cachedHashes: [],
                 signedInToVortX: VortXSyncManager.shared.isSignedIn,
                 videos: {
-                    guard core.metaDetails?.meta?.id == item.id else { return [] }
-                    return (core.metaDetails?.meta?.videos ?? []).orderedBySeasonEpisode
+                    // CW navigation has a request-owned alias payload. It is authoritative even when the
+                    // global active meta slot has moved, and it proves both library and current video identity.
+                    let navigation = core.appleCWMetaRefreshDetails?.appleCWNavigationMeta(
+                        for: item.id, streamID: entry.videoId
+                    ) ?? core.metaDetails?.appleCWNavigationMeta(for: item.id, streamID: entry.videoId)
+                    guard let navigation else {
+                        return []
+                    }
+                    return (navigation.videos ?? []).orderedBySeasonEpisode
                 },
                 resumeOffset: { playbackMeta in
                     if let engine = core.engineResumeSeconds(for: playbackMeta) { return engine }
@@ -4095,6 +4107,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                            episodes: episodes, loadEpisode: loadEpisode,
                            loadEpisodeWithMetadata: loadEpisodeWithMetadata,
                            warmNextEpisode: warmNextEpisode,
+                           cancelNextEpisodePreparation: cancelNextEpisodePreparation,
                            resumeHoardContentID: resumeHoardContentID,
                            resumeHoardStreamID: resumeHoardContentID == nil ? nil : entry.videoId)
 }
