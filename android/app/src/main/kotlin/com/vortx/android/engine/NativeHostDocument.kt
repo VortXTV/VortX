@@ -164,6 +164,9 @@ internal object NativeHostDocument {
             // UUIDs (including random register actors) are identifiers, not base64url carriers.
             // Some random UUID bytes otherwise happen to start with a quote or JSON delimiter.
             if (Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").matches(value)) return null
+            // Website protocol SHA-256 evidence is opaque identity material, not an encoded
+            // document. Keep this narrow: arbitrary lookalike strings still receive inspection.
+            if ((path.endsWith("/valueHash") || path.endsWith("/fingerprint")) && Regex("[0-9a-f]{64}").matches(value)) return null
             val candidate = value.filterNot { it in " \t\r\n" }
             if (candidate.isEmpty()) return null
             requireArchive(candidate.length <= 44 * 1024 * 1024, "Encoded host document exceeds inspection limits")

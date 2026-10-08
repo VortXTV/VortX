@@ -42,4 +42,23 @@ class NativeWebsiteProfileEditsTest {
         assertTrue(runCatching { NativeWebsiteProfileEdits.events(JSONObject().put("profileEditEvents", JSONObject().put("schemaVersion", 1).put("events", JSONArray()))) }.isFailure)
         assertTrue(runCatching { NativeWebsiteProfileEdits.events(JSONObject().put("profileEditEvents", JSONObject().put("schemaVersion", 2).put("events", JSONArray().put("bad")))) }.isFailure)
     }
+
+    @Test fun `legacy aggregate wrapper keeps exact raw source and deterministic migration identity`() {
+        val aggregate = JSONObject().put("editedAt", 1001).put("roster", JSONArray().put(JSONObject().put("id", "owner").put("name", "Old dashboard")))
+        val pending = NativeWebsiteProfileEdits.legacyPending(aggregate)
+        val again = NativeWebsiteProfileEdits.legacyPending(JSONObject(aggregate.toString()))
+        assertEquals(pending.getString("eventId"), again.getString("eventId"))
+        assertTrue(NativeHostPreferences.equal(aggregate, pending.getJSONObject("legacyAggregate")))
+        val migration = NativeWebsiteProfileEdits.legacyMigrationEvent(aggregate, "b".repeat(64))
+        assertEquals(pending.getString("eventId"), migration.getString("eventId"))
+        assertEquals("b".repeat(64), migration.getString("legacyBootstrapFingerprint"))
+        assertFalse(migration.has("observedNativeClock"))
+    }
+
+    @Test fun `website hash evidence survives host archive inspection unchanged`() {
+        val source = JSONObject().put("profileEditEvents", JSONObject().put("schemaVersion", 2).put("events", JSONArray().put(event())))
+        val archived = NativeHostDocument.archive(source).getJSONObject("document")
+        assertEquals(hash("\"moon\""), archived.getJSONObject("profileEditEvents").getJSONArray("events").getJSONObject(0)
+            .getJSONObject("hostBases").getJSONObject("owner").getJSONObject("avatar").getString("valueHash"))
+    }
 }

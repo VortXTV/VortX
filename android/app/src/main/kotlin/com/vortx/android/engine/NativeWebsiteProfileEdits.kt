@@ -41,6 +41,12 @@ internal object NativeWebsiteProfileEdits {
             ?: throw IllegalArgumentException("Website event[$index] must be an object") }
     }
 
+    /** Exact old aggregate is retained as source; only the session can prove bootstrap eligibility. */
+    fun legacyPending(raw: Any?): JSONObject = JSONObject().put("eventId", "legacy-aggregate-${hash(raw)}")
+        .put("legacyAggregate", copy(raw))
+    fun legacyMigrationEvent(raw: JSONObject, legacyImportFingerprint: String): JSONObject = JSONObject(raw.toString())
+        .put("eventId", legacyPending(raw).getString("eventId")).put("legacyBootstrapFingerprint", legacyImportFingerprint)
+
     fun validateRetained(scope: VortxAccountScope, pending: JSONObject, certificates: JSONObject) {
         require(pending.keys().asSequence().toSet() == setOf("events")) { "Invalid retained website events" }
         val events = pending.optJSONArray("events") ?: throw IllegalArgumentException("Invalid retained website events")
@@ -51,7 +57,7 @@ internal object NativeWebsiteProfileEdits {
             require(ids.add(event.getString("eventId"))) { "Duplicate retained website event" }
         }
         for (id in certificates.keys()) {
-            require(uuid.matches(id) && hex.matches(certificates.getString(id))) { "Invalid website receipt certificate" }
+            require(id.isNotBlank() && hex.matches(certificates.getString(id))) { "Invalid website receipt certificate" }
         }
     }
 
@@ -224,5 +230,12 @@ internal object NativeWebsiteProfileEdits {
         is Boolean -> value.toString()
         is Number -> BigDecimal(value.toString()).stripTrailingZeros().toPlainString()
         else -> throw IllegalArgumentException("Unsupported canonical JSON value")
+    }
+    private fun copy(value: Any?): Any = when (value) {
+        null, JSONObject.NULL -> JSONObject.NULL
+        is JSONObject -> JSONObject(value.toString())
+        is JSONArray -> JSONArray(value.toString())
+        is String, is Boolean, is Number -> value
+        else -> throw IllegalArgumentException("Unsupported legacy website source")
     }
 }

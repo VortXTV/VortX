@@ -360,7 +360,9 @@ internal class VortxNativeSession private constructor(
      * never installs the candidate runtime or its receipt; only the credential-free raw event is
      * retained for explicit resolution and subsequent independent events may continue.
      */
-    @Synchronized fun applyWebsiteProfileEdit(event: JSONObject, owner: VortxNativeOwner = read().owner): Boolean = owned(owner) {
+    @Synchronized fun applyWebsiteProfileEdit(event: JSONObject, owner: VortxNativeOwner = read().owner): Boolean =
+        applyWebsiteProfileEdit(event, event, owner)
+    @Synchronized private fun applyWebsiteProfileEdit(event: JSONObject, retainedSource: JSONObject, owner: VortxNativeOwner): Boolean = owned(owner) {
         scope.rejectCredentials(event)
         val before = runtime.stateJson()
         val candidate = VortxNativeRuntime.hydrate(bindings, before)
@@ -373,11 +375,11 @@ internal class VortxNativeSession private constructor(
                 NativeWebsiteProfileEdits.admit(scope, event, JSONObject(candidate.dispatch(action.toString())), nativeHostPreferenceState,
                     hostProfilePreferences, websiteProfileEditCertificates)
             } catch (error: NativeWebsiteProfileEdits.Conflict) {
-                retainWebsiteProfileEdit(event, owner); return@owned false
+                retainWebsiteProfileEdit(retainedSource, owner); return@owned false
             } catch (error: IllegalArgumentException) {
                 // Schema/kernel rejections are sealed for user-visible conflict resolution; the
                 // credential guard above is deliberately outside this conversion.
-                retainWebsiteProfileEdit(event, owner); return@owned false
+                retainWebsiteProfileEdit(retainedSource, owner); return@owned false
             }
             val fingerprint = applied.receipt.getJSONObject("source").getString("fingerprint")
             val receipts = JSONObject(candidate.stateJson()).getJSONObject("nativeSync").getJSONObject("legacyProfileEditReceipts")
@@ -412,6 +414,20 @@ internal class VortxNativeSession private constructor(
         scope.validateSnapshot(updated); store.commit(scope, updated)
         check(store.read(scope) == updated) { "Native checkpoint readback failed" }; check(isAccountCurrent()) { "Native account changed" }
         websiteProfileEditPending = pending; changes.value += 1
+    }
+    /**
+     * The aggregate has no causal watermark. It is admitted only as the kernel's one-time
+     * original-baseline migration, never re-clocked from the receiving device or document.
+     */
+    @Synchronized fun applyLegacyWebsiteAggregate(raw: Any?, owner: VortxNativeOwner = read().owner): Boolean = owned(owner) {
+        val retained = NativeWebsiteProfileEdits.legacyPending(raw)
+        val aggregate = raw as? JSONObject ?: run { retainWebsiteProfileEdit(retained, owner); return@owned false }
+        val archived = hostDocumentArchive?.optJSONObject("document")?.opt("profileEdits")
+        if (!NativeHostPreferences.equal(archived, aggregate)) { retainWebsiteProfileEdit(retained, owner); return@owned false }
+        val import = JSONObject(runtime.stateJson()).getJSONObject("nativeSync").optJSONObject("legacyImport")
+        val fingerprint = import?.optString("fingerprint")?.takeIf { it.matches(Regex("[0-9a-f]{64}")) }
+            ?: run { retainWebsiteProfileEdit(retained, owner); return@owned false }
+        applyWebsiteProfileEdit(NativeWebsiteProfileEdits.legacyMigrationEvent(aggregate, fingerprint), retained, owner)
     }
     @Synchronized fun <T> owned(owner: VortxNativeOwner, action: () -> T): T {
         check(accepts(owner)) { "Native owner changed" }; return action()
