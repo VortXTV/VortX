@@ -3,6 +3,28 @@ import SwiftUI
 import UIKit
 #endif
 
+#if CINEMA_UI_SMOKE_RENDERER
+// The regular app entry point is intentionally excluded from the offline renderer. These are the two
+// platform-neutral bridge declarations iOSRootView's macOS layout references while it is compiled as a
+// real production view tree; neither starts an account, player, or window lifecycle.
+enum MacCommands {
+    static let tabRequest = Notification.Name("stremiox.macCommands.tabRequest")
+    enum Destination: Int { case home, discover, live, library, search, addons, settings }
+    static func go(_ destination: Destination) {
+        NotificationCenter.default.post(name: tabRequest, object: nil, userInfo: ["tab": destination.rawValue])
+    }
+}
+
+#if os(macOS)
+@MainActor
+final class MacSearchBridge: ObservableObject {
+    static let shared = MacSearchBridge()
+    private init() {}
+    @Published var pending: String?
+}
+#endif
+#endif
+
 #if !CINEMA_UI_SMOKE_RENDERER
 
 /// Native iPhone / iPad entry point. Boots the SAME stremio-core engine + embedded server as the
