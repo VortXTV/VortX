@@ -170,13 +170,14 @@ final class MPVMetalViewController: PlatformViewController {
     private var seekEOFRecovery = SeekEOFRecoveryPolicy<PlayerLoadToken>()
     /// Protected by loadTokenLock, including command admission and raw event dequeue.
     private var seekSettlement = MPVSeekSettlementPolicy<PlayerLoadToken>()
+    private var latestAcceptedAbsoluteSeek: MPVResumeSeekTicket<PlayerLoadToken>?
     /// A callback can cross the main queue after a newer seek on the SAME file was issued.
     /// Source ownership alone is insufficient; retain the generation captured at raw dequeue.
     private func acceptsCurrentSeekEvent(_ evidence: MPVSeekSettlementEvidence?,
                                          owner: PlayerLoadToken) -> Bool {
         guard let evidence else { return false }
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
-        return seekSettlement.accepts(evidence, owner: owner)
+        return seekSettlement.acceptsAttributedEvent(evidence, owner: owner)
     }
     private func acceptsSettledPosition(_ evidence: MPVSeekSettlementEvidence?,
                                         owner: PlayerLoadToken) -> Bool {
@@ -184,8 +185,8 @@ final class MPVMetalViewController: PlatformViewController {
         return acceptsCurrentSeekEvent(evidence, owner: owner)
     }
 
-    /// Called only on the event queue (handle destruction is serialized behind it), while
-    /// loadTokenLock fences the exact accepted source and seek generation.
+    /// Called on the controller or event queue while loadTokenLock fences the exact accepted
+    /// source and seek generation. Values are observational, never a replacement for settlement.
     private func nativeSeekSnapshot(handle: OpaquePointer) -> MPVSeekNativeSnapshot {
         MPVSeekNativeSnapshot(
             position: diagnosticDouble(MPVProperty.timePos, handle: handle),
@@ -211,7 +212,7 @@ final class MPVMetalViewController: PlatformViewController {
                 self.loadTokenLock.lock()
                 guard self.loadProvenance.callbackToken(requiresLoadedFile: true) == owner,
                       self.seekSettlement.accepts(evidence, owner: owner),
-                      self.seekSettlement.current?.phase != .settled else {
+                      self.seekSettlement.needsNativeWitness else {
                     self.loadTokenLock.unlock()
                     return
                 }
@@ -1299,6 +1300,7 @@ final class MPVMetalViewController: PlatformViewController {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.invalidate()
         seekSettlement.reset(owner: nil)
+        latestAcceptedAbsoluteSeek = nil
         initializationFailure.invalidateLoad()
         freshOrigin.supersede()
         requestedFreshOrigin = nil
@@ -1773,6 +1775,7 @@ final class MPVMetalViewController: PlatformViewController {
         )
         if commandResult >= 0 {
             seekSettlement.reset(owner: issuedToken)
+            latestAcceptedAbsoluteSeek = nil
             // Refused replacements do not consume configuration. A concurrent newer configure call
             // belongs to a later load and must not be cleared by this command's admission.
             if requestedFreshOriginGeneration == requestedOriginGeneration {
@@ -3145,6 +3148,41 @@ final class MPVMetalViewController: PlatformViewController {
         })
     }
 
+    /// Capture immediately after issuing seekForResume. A refused command, manual seek, or
+    /// different source cannot acquire this watchdog's destination.
+    func resumeSeekRecoveryTicket(target: Double, owner: PlayerLoadToken) -> MPVResumeSeekTicket<PlayerLoadToken>? {
+        guard let intent = seekEOFRecovery.current, intent.owner == owner,
+              intent.origin == .resume, intent.target == target else { return nil }
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        guard loadProvenance.callbackToken(requiresLoadedFile: true) == owner,
+              let ticket = latestAcceptedAbsoluteSeek, ticket.owner == owner,
+              ticket.target == target else { return nil }
+        return ticket
+    }
+
+    /// A native read at the original deadline, before any recovery command changes the evidence.
+    /// Does not relax restart/EOF settlement or infer failure from a synthetic target timestamp.
+    func failedResumeSeekTarget(ticket: MPVResumeSeekTicket<PlayerLoadToken>,
+                                confirmedPosition: Double, landingTolerance: Double) -> Double? {
+        guard let handle = mpv else { return nil }
+        loadTokenLock.lock()
+        let owner = loadProvenance.callbackToken(requiresLoadedFile: true)
+        guard owner == ticket.owner,
+              seekSettlement.current?.generation == ticket.generation else {
+            loadTokenLock.unlock()
+            return nil
+        }
+        let snapshot = nativeSeekSnapshot(handle: handle)
+        let evidence = seekSettlement.evidence(owner: ticket.owner, seeking: snapshot.seeking, eofReached: snapshot.eof)
+        let target = MPVResumeSeekRecoveryPolicy.target(
+            ticket: ticket, activeOwner: owner, evidence: evidence, playbackRequested: !requestedPauseIntent,
+            nativePaused: snapshot.paused, nativeSeeking: snapshot.seeking, nativeEOF: snapshot.eof,
+            confirmedPosition: confirmedPosition, landingTolerance: landingTolerance)
+        loadTokenLock.unlock()
+        DiagnosticsLog.log("playback", "seek-native deadline load=\(ticket.owner.hashValue) seek=\(ticket.generation) target=\(ticket.target) recover=\(target != nil) \(snapshot.receipt)")
+        return target
+    }
+
     /// A parked recovery cannot advance from a preceding keyframe. Admit only the loaded
     /// replacement, and request an exact frame without the viewer-scrub cache hold.
     func durationForPausedRecovery(owner: PlayerLoadToken) -> Double? {
@@ -4058,6 +4096,14 @@ final class MPVMetalViewController: PlatformViewController {
                 seekSettlement.completeIssue(settlementLease, accepted: returnValue >= 0)
                 if returnValue >= 0, let owner {
                     seekWitness = (owner, .init(generation: settlementLease, settled: false))
+                    // Keep command admission distinct from a later native refresh SEEK. That
+                    // refresh must not silently lend its generation to the earlier resume.
+                    if args.count > 1, args[1]?.hasPrefix("absolute") == true,
+                       let argument = args[0], let target = Double(argument), target.isFinite {
+                        latestAcceptedAbsoluteSeek = .init(owner: owner, generation: settlementLease, target: target)
+                    } else {
+                        latestAcceptedAbsoluteSeek = nil
+                    }
                 }
             }
             loadTokenLock.unlock()

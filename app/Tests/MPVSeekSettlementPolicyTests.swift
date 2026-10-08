@@ -184,8 +184,97 @@ enum MPVSeekSettlementPolicyTests {
               "production queued position gate precedes EOF witness mutation")
         check(source.contains("for delay in [2.0, 6.0, 11.0]")
               && source.contains("self.seekSettlement.accepts(evidence, owner: owner)")
-              && source.contains("self.seekSettlement.current?.phase != .settled"),
+              && source.contains("self.seekSettlement.needsNativeWitness"),
               "native pending diagnostics are bounded and retired by exact seek/source settlement")
+
+        // Stronger ordering: neither A event has been dequeued when B is accepted. mpv has
+        // no event command ID, so A's eventual event inherits B's generation but is ambiguous.
+        var overlapping = MPVSeekSettlementPolicy<Int>()
+        var newerEOF = SeekEOFRecoveryPolicy<Int>()
+        overlapping.reset(owner: 11)
+        let a = overlapping.beginIssue(owner: 11, seeking: false)!
+        overlapping.completeIssue(a, accepted: true)
+        let b = overlapping.beginIssue(owner: 11, seeking: true)!
+        overlapping.completeIssue(b, accepted: true)
+        newerEOF.begin(owner: 11, target: 104.146, wasPaused: false, duration: 1418,
+                       origin: .resume, now: 20)
+        overlapping.observeSeek(owner: 11)
+        let lateA = overlapping.evidence(owner: 11, seeking: true)
+        check(lateA.generation == b && !lateA.attributed,
+              "A accepted then B accepted then A dequeued is same-generation but unattributed")
+        if overlapping.acceptsAttributedEvent(lateA, owner: 11) { _ = newerEOF.observeSeek(owner: 11) }
+        overlapping.observeRestart(owner: 11, seeking: false)
+        let lateARestart = overlapping.evidence(owner: 11, seeking: false)
+        if overlapping.acceptsAttributedEvent(lateARestart, owner: 11) {
+            newerEOF.observePosition(owner: 11, position: 93.9, now: 21)
+        }
+        check(newerEOF.current?.phase == .awaitingSeekEvent && newerEOF.current?.positionAfterSeek == nil,
+              "unattributed SEEK and restart cannot mutate B's EOF intent")
+        check(overlapping.needsNativeWitness, "settled but unattributed native state retains bounded diagnostics")
+        check(source.contains("return seekSettlement.acceptsAttributedEvent(evidence, owner: owner)"),
+              "production queued event fence uses the actual attributed policy")
+
+        // Exact raw shape reproduced by the linked libmpv fixture when HTTP advertises
+        // Range but sends the full body for nonzero requests: target-shaped time-pos,
+        // seeking=true, eof=false, and no restarted/confirmed frame at the deadline.
+        let resumeTicket = MPVResumeSeekTicket(owner: 11, generation: 7, target: 104.146)
+        func recoveryTarget(owner: Int? = 11, generation: UInt64 = 7, requested: Bool = true,
+                            paused: Bool? = false, seeking: Bool? = true, eof: Bool? = false,
+                            settled: Bool = false, confirmed: Double = 0.417) -> Double? {
+            MPVResumeSeekRecoveryPolicy.target(
+                ticket: resumeTicket, activeOwner: owner,
+                evidence: .init(generation: generation, settled: settled), playbackRequested: requested,
+                nativePaused: paused, nativeSeeking: seeking, nativeEOF: eof,
+                confirmedPosition: confirmed, landingTolerance: 5)
+        }
+        check(recoveryTarget() == 104.146, "ignored-Range deadline retains104.146, never emits0.517 nudge")
+        check(recoveryTarget(seeking: false, settled: true, confirmed: 104.167) == nil,
+              "valid206 native restart stays on the healthy source")
+        check(recoveryTarget(generation: 8) == nil, "new manual seek supersedes old resume deadline")
+        check(recoveryTarget(owner: 12) == nil && recoveryTarget(owner: nil) == nil,
+              "source replacement and manual stop retire old deadline")
+        check(recoveryTarget(requested: false) == nil && recoveryTarget(paused: true) == nil,
+              "deliberate pause cannot spend a recovery or change source")
+        check(recoveryTarget(seeking: nil) == nil && recoveryTarget(eof: nil) == nil
+              && recoveryTarget(eof: true) == nil, "unknown native state and EOF keep their existing owners")
+        check(recoveryTarget(seeking: false, settled: true, confirmed: 0.417) == 104.146,
+              "wrong-position restart retains requested target rather than calling it reached")
+        check(recoveryTarget(generation: 6, seeking: false, settled: true, confirmed: 104.167) == nil,
+              "late old restart cannot authorize the current recovery")
+        let retryTarget = RetryResumeTargetPolicy.target(isLive: false, hasStartedPlaying: false,
+            currentTimeSeconds: 0.417, activeRequestedResumeSeconds: 104.146,
+            fallbackResumeSeconds: 0, persistenceFloorSeconds: 104.146)
+        check(retryTarget == 104.146 && !DeferredResumeFloorPolicy.allowsPersistence(
+            positionSeconds: 0.417, currentFloor: 104.146), "terminal Retry and progress retain104.146")
+        let shortTarget = MPVResumeSeekRecoveryPolicy.target(
+            ticket: MPVResumeSeekTicket(owner: 11, generation: 7, target: 2), activeOwner: 11,
+            evidence: .init(generation: 7, settled: false), playbackRequested: true,
+            nativePaused: false, nativeSeeking: true, nativeEOF: false,
+            confirmedPosition: 0.417, landingTolerance: 5)
+        check(shortTarget == 2 && DeferredResumePolicy.decision(targetSeconds: 2,
+            observedDurationSeconds: 1418, engineDurationSeconds: 1418,
+            deadlineReached: false, allowShortResume: true) == .seek(to: 2),
+              "short accepted destination survives recovery and actual deferred-seek admission")
+        for path in ["app/Sources/PlayerScreen.swift", "app/SourcesTV/TVPlayerView.swift"] {
+            let surface = try! String(contentsOfFile: path, encoding: .utf8)
+            let start = surface.range(of: "private func armPostFrameResumeSeekWatchdog(")!
+            let rest = String(surface[start.lowerBound...])
+            check(rest.range(of: "failedResumeSeekTarget(")!.lowerBound
+                  < rest.range(of: "DeferredResumeSeekReconciliationPolicy.abandonment(")!.lowerBound,
+                  "\(path) exact-native branch precedes opening-position reconciliation")
+            let recoveryStart = surface.range(of: "private func recoverFromUnsettledResume(")!
+            let recovery = String(surface[recoveryStart.lowerBound...].prefix(2200))
+            check(recovery.contains("hopToNextSource(reason: \"resume seek did not settle\", resumeOverride: target)")
+                  && recovery.contains("failedResumeSeekRetry = (owner, target)")
+                  && recovery.contains("coordinator.player?.pause()")
+                  && recovery.contains("presentTerminalLoadFailure()"),
+                  "\(path) recovery retains target, existing hop, terminal pause, and retry owner")
+            check(!recovery.prefix(1500).contains("curURL ="), "\(path) rejected recovery does not publish an unaccepted URL")
+            check(surface.contains("return failedResumeSeekRetry.target   // exact terminal resume intent"),
+                  "\(path) owner-scoped failed target wins over earlier persistence floors on Retry")
+            check(surface.contains("viewerPlay()   // release only the accepted replacement from terminal parking"),
+                  "\(path) explicit Retry releases terminal pause only after new-owner admission")
+        }
         print("MPV seek settlement policy: PASS")
     }
 }

@@ -362,6 +362,31 @@ struct MPVSeekNativeSnapshot: Sendable {
     }
 }
 
+/// The target belongs to an accepted resume command, not to UI time or a saved-position floor.
+struct MPVResumeSeekTicket<Owner: Equatable> {
+    let owner: Owner
+    let generation: UInt64
+    let target: Double
+}
+
+enum MPVResumeSeekRecoveryPolicy {
+    /// Called at the existing active-playback deadline. Preserve the accepted destination on a
+    /// different source; never replace an in-progress absolute seek with the opening-frame clock.
+    static func target<Owner: Equatable>(
+        ticket: MPVResumeSeekTicket<Owner>, activeOwner: Owner?, evidence: MPVSeekSettlementEvidence,
+        playbackRequested: Bool, nativePaused: Bool?, nativeSeeking: Bool?, nativeEOF: Bool?,
+        confirmedPosition: Double, landingTolerance: Double
+    ) -> Double? {
+        guard activeOwner == ticket.owner, evidence.generation == ticket.generation,
+              playbackRequested, nativePaused == false, nativeSeeking != nil, nativeEOF == false,
+              ticket.target.isFinite, ticket.target > 0,
+              confirmedPosition.isFinite, confirmedPosition >= 0,
+              landingTolerance.isFinite, landingTolerance >= 0 else { return nil }
+        if evidence.settled, abs(confirmedPosition - ticket.target) <= landingTolerance { return nil }
+        return ticket.target
+    }
+}
+
 /// The controller serializes command admission and raw event dequeue under one lock. Native events
 /// have no command ID: overlapping seeks can settle physically without proving command attribution.
 /// A subsequent command after that observed settlement establishes a fresh, unambiguous boundary.
@@ -442,6 +467,16 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
     func accepts(_ evidence: MPVSeekSettlementEvidence, owner: Owner) -> Bool {
         self.owner == owner && admission == nil
             && evidence.generation == (current?.generation ?? nextGeneration)
+    }
+
+    /// Events dequeued after overlapping commands have the current generation, but cannot
+    /// prove which command produced them. They must not mutate the newer EOF/recovery intent.
+    func acceptsAttributedEvent(_ evidence: MPVSeekSettlementEvidence, owner: Owner) -> Bool {
+        evidence.attributed && accepts(evidence, owner: owner)
+    }
+
+    var needsNativeWitness: Bool {
+        current.map { $0.phase != .settled || $0.ambiguous } ?? false
     }
 }
 

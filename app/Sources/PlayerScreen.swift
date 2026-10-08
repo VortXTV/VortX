@@ -1433,6 +1433,7 @@ struct PlayerScreen: View {
     /// it before a later manual backward seek can look like a failed resume.
     @State private var postFrameResumeSeekWatchdogTarget: Double?
     @State private var postFrameResumeSeekWatchdogOwner: PlayerLoadToken?
+    @State private var failedResumeSeekRetry: (owner: PlayerLoadToken, target: Double)?
     @State private var abandonedResumeRecovery: DeferredResumeSeekReconciliationPolicy.OwnedAbandonment<PlayerLoadToken>?
     @State private var pendingResumeSurfaceTransfer: DeferredResumeSeekReconciliationPolicy.SurfaceTransfer<PlayerLoadToken>?
     @State private var retiredResumePersistenceFloor: DeferredResumeSeekReconciliationPolicy.RetiredPersistenceFloor?
@@ -4173,6 +4174,9 @@ struct PlayerScreen: View {
         if let confirmedPositionOverride, confirmedPositionOverride.isFinite, confirmedPositionOverride >= 0 {
             return confirmedPositionOverride   // proven premature EOF evidence, not the saved floor
         }
+        if let failedResumeSeekRetry, failedResumeSeekRetry.owner == coordinator.player?.activeLoadToken {
+            return failedResumeSeekRetry.target   // exact terminal resume intent, not an older saved floor
+        }
         let activeLoadToken = coordinator.player?.activeLoadToken ?? terminalRetiredAssetSanityOwner
         let activeRequestedResume = RetryResumeTargetPolicy.ownedRequestedResume(
             activeOwner: activeLoadToken,
@@ -4660,7 +4664,22 @@ struct PlayerScreen: View {
             return
         }
         localNNTPStallRecovery = .init()
+        let resumeRetry = failedResumeSeekRetry.flatMap {
+            $0.owner == coordinator.player?.activeLoadToken ? $0 : nil
+        }
+        let previousURL = curURL
         retryLoad()
+        if let resumeRetry {
+            if let acceptedOwner = coordinator.player?.activeLoadToken, acceptedOwner != resumeRetry.owner {
+                failedResumeSeekRetry = nil
+                viewerPlay()   // release only the accepted replacement from terminal parking
+                if resumeRetry.target <= 5 { nudgeResume(to: resumeRetry.target, allowShortResume: true) }
+            } else {
+                curURL = previousURL
+                loadErrorMsg = "This source could not reach your resume point. Retry or choose another source."
+                presentTerminalLoadFailure()
+            }
+        }
     }
 
     private func viewerToggle() {
@@ -5146,17 +5165,30 @@ struct PlayerScreen: View {
     /// Safety net for the DEFERRED resume seek issued at first frame (the warm-pipeline scrub). On a slow or
     /// non-Range source that absolute seek can leave mpv parked at the pre-seek position indefinitely; the
     /// plain stall ladder then reloads at the real (low) playhead and silently drops the viewer's resume
-    /// point. If the seek has not landed within 12s, abandon the offset instead: a relative +0.1s nudge (the
-    /// proven wedge release) resumes playback from wherever the source actually is, and the floor armed at
-    /// issuance stays as the persistence floor at abandonment because this source failure cannot invalidate the
-    /// viewer's last valid Continue Watching position.
+    /// point. At 12s an exact-owned native request retains its target through source failover; a queued
+    /// 0.x nudge would overwrite a still-running Range seek. Other engines keep their reconciliation path.
     private func armPostFrameResumeSeekWatchdog(target: Double) {
         cancelPostFrameResumeSeekWatchdog()
         guard let armedToken = coordinator.player?.activeLoadToken else { return }
+        let nativeTicket = (coordinator.player as? MPVMetalViewController)?
+            .resumeSeekRecoveryTicket(target: target, owner: armedToken)
         postFrameResumeSeekWatchdogTarget = target
         postFrameResumeSeekWatchdogOwner = armedToken
         postFrameResumeSeekWatchdog = Task { @MainActor in
             guard await waitForPlaybackTime(postFrameResumeSeekWatchdogSeconds) else { return }
+            guard !Task.isCancelled, !playbackExited, !loadFailed, !isPaused,
+                  !playbackDeadlineClock.isPaused, !scrubbing, pendingAdvance == nil,
+                  coordinator.player?.activeLoadToken == armedToken else { return }
+            if let nativeTicket {
+                // An admitted native request that is still seeking is not an invalid saved
+                // offset. Preserve its destination through failover, never issue a seek to 0.x.
+                guard let mpv = coordinator.player as? MPVMetalViewController,
+                      let resume = mpv.failedResumeSeekTarget(
+                        ticket: nativeTicket, confirmedPosition: confirmedRawPosition(owner: armedToken),
+                        landingTolerance: 5) else { return }
+                recoverFromUnsettledResume(target: resume, owner: armedToken)
+                return
+            }
             guard !Task.isCancelled,
                   let reconciliation = DeferredResumeSeekReconciliationPolicy.abandonment(
                     targetSeconds: target,
@@ -5171,6 +5203,28 @@ struct PlayerScreen: View {
             )
             reconcileUnavailableResume(target: target, actualPosition: reconciliation.presentationSeconds, owner: armedToken)
         }
+    }
+
+    private func recoverFromUnsettledResume(target: Double, owner: PlayerLoadToken) {
+        guard coordinator.player?.activeLoadToken == owner, !playbackExited, !loadFailed,
+              !isPaused, !playbackDeadlineClock.isPaused, !scrubbing, pendingAdvance == nil else { return }
+        cancelPostFrameResumeSeekWatchdog()
+        pendingLibmpvResumeSeek = nil
+        if hopToNextSource(reason: "resume seek did not settle", resumeOverride: target) {
+            if target <= 5 { nudgeResume(to: target, allowShortResume: true) }
+            return
+        }
+        // No accepted replacement: keep this episode/source and the exact requested origin
+        // for Retry. Parking prevents a late old restart from playing behind the error overlay.
+        midPlayFailureResume = target
+        failedResumeSeekRetry = (owner, target)
+        abandonedResumeRecovery = nil
+        suppressedResumeFloor = max(suppressedResumeFloor ?? 0, target)
+        lastReported = max(lastReported, target)
+        hasStartedPlaying = false
+        coordinator.player?.pause()
+        loadErrorMsg = "This source could not reach your resume point. Retry or choose another source."
+        presentTerminalLoadFailure()
     }
 
     private var permitsDecoderResumeSeek: Bool {

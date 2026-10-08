@@ -1085,6 +1085,7 @@ struct TVPlayerView: View {
     /// enough: a late tick from an old source must not settle, or cancel, a newer source's watchdog.
     @State private var postFrameResumeSeekWatchdogTarget: Double?
     @State private var postFrameResumeSeekWatchdogOwner: PlayerLoadToken?
+    @State private var failedResumeSeekRetry: (owner: PlayerLoadToken, target: Double)?
     private let postFrameResumeSeekWatchdogSeconds: Double = 12
     /// Wall-clock when settled playback first ticked inside the last-10% "watched" zone, nil while
     /// outside it (or while scrubbing). The watched marker requires a few seconds of dwell here, so a
@@ -6117,6 +6118,9 @@ struct TVPlayerView: View {
         if let confirmedPositionOverride, confirmedPositionOverride.isFinite, confirmedPositionOverride >= 0 {
             return confirmedPositionOverride   // proven premature EOF evidence, not the saved floor
         }
+        if let failedResumeSeekRetry, failedResumeSeekRetry.owner == coordinator.player?.activeLoadToken {
+            return failedResumeSeekRetry.target   // exact terminal resume intent, not an older saved floor
+        }
         let owner = coordinator.player?.activeLoadToken ?? terminalRetiredAssetSanityOwner
         let target = RetryResumeTargetPolicy.target(
             isLive: isCurrentLiveStream, hasStartedPlaying: hasStartedPlaying, currentTimeSeconds: currentTime,
@@ -6300,7 +6304,16 @@ struct TVPlayerView: View {
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         localNNTPStallRecovery = .init()
         localNNTPShortResume = nil
+        let resumeRetry = failedResumeSeekRetry.flatMap {
+            $0.owner == coordinator.player?.activeLoadToken ? $0 : nil
+        }
         retryLoad()
+        if let resumeRetry, let acceptedOwner = coordinator.player?.activeLoadToken,
+           acceptedOwner != resumeRetry.owner {
+            failedResumeSeekRetry = nil
+            viewerPlay()   // release only the accepted replacement from terminal parking
+            if resumeRetry.target <= 5 { armLocalNNTPShortResume(target: resumeRetry.target) }
+        }
         refreshPlaybackIdleTimer()
     }
 
@@ -7128,10 +7141,25 @@ struct TVPlayerView: View {
 
     private func armPostFrameResumeSeekWatchdog(target: Double, owner: PlayerLoadToken) {
         clearPostFrameResumeSeekWatchdog()
+        let nativeTicket = (coordinator.player as? MPVMetalViewController)?
+            .resumeSeekRecoveryTicket(target: target, owner: owner)
         postFrameResumeSeekWatchdogTarget = target
         postFrameResumeSeekWatchdogOwner = owner
         postFrameResumeSeekWatchdog = Task { @MainActor in
             guard await waitForPlaybackTime(postFrameResumeSeekWatchdogSeconds) else { return }
+            guard !Task.isCancelled, !leftPlayback, !loadFailed, !isPaused,
+                  !playbackDeadlineClock.isPaused, !scrubbing, !switchingEpisode, pendingAdvance == nil,
+                  postFrameResumeSeekWatchdogTarget == target,
+                  postFrameResumeSeekWatchdogOwner == owner,
+                  coordinator.player?.activeLoadToken == owner else { return }
+            if let nativeTicket {
+                guard let mpv = coordinator.player as? MPVMetalViewController,
+                      let resume = mpv.failedResumeSeekTarget(
+                        ticket: nativeTicket, confirmedPosition: confirmedRawPosition(owner: owner),
+                        landingTolerance: inFlightSeekSnapRadius) else { return }
+                recoverFromUnsettledResume(target: resume, owner: owner)
+                return
+            }
             guard !Task.isCancelled,
                   postFrameResumeSeekWatchdogTarget == target,
                   postFrameResumeSeekWatchdogOwner == owner,
@@ -7148,6 +7176,31 @@ struct TVPlayerView: View {
             )
             reconcileUnavailableResume(target: target, actualPosition: reconciliation.presentationSeconds, owner: owner)
         }
+    }
+
+    private func recoverFromUnsettledResume(target: Double, owner: PlayerLoadToken) {
+        guard coordinator.player?.activeLoadToken == owner, !leftPlayback, !loadFailed,
+              !isPaused, !playbackDeadlineClock.isPaused, !scrubbing,
+              !switchingEpisode, pendingAdvance == nil else { return }
+        clearPostFrameResumeSeekWatchdog()
+        pendingLibmpvResumeSeek = nil
+        inFlightSeekTarget = nil
+        if hopToNextSource(reason: "resume seek did not settle", resumeOverride: target) {
+            if target <= 5 { armLocalNNTPShortResume(target: target) }
+            return
+        }
+        // Refused/exhausted hop preserves the original source and current episode. Retry
+        // retains the requested target, while a delayed old restart cannot play behind the error.
+        resumeSeconds = target
+        resumeIsMidPlayRecovery = true
+        failedResumeSeekRetry = (owner, target)
+        abandonedResumeRecovery = nil
+        suppressedResumeFloor = max(suppressedResumeFloor ?? 0, target)
+        lastSaved = max(lastSaved, target)
+        hasStartedPlaying = false
+        coordinator.player?.pause()
+        loadErrorMsg = "This source could not reach your resume point. Retry or choose another source."
+        presentTerminalLoadFailure()
     }
 
     /// AVPlayer-only START watchdog. AVPlayer can mount and present its chrome yet never produce a playable
