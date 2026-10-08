@@ -1741,7 +1741,9 @@ class VortXSyncManager(context: Context) {
         // applies any other stale account data. A real server only returns a version >= our high-water mark.
         if (pulledVersion < lastSyncedVersion(lease) && !allowOlderAddonTombstones) return SyncDocPull.Failed
         val plaintext = openSyncDocument(lease, docStr, pulledVersion) ?: return SyncDocPull.Failed
-        val obj = runCatching { JSONObject(String(plaintext, Charsets.UTF_8)) }.getOrNull()
+        val obj = runCatching { if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+            com.vortx.android.engine.NativeProfileOverlayWitness.parseAccountDocument(plaintext)
+            else JSONObject(String(plaintext, Charsets.UTF_8)) }.getOrNull()
             ?: return SyncDocPull.Failed                          // undecodable plaintext: do not clobber
         if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
             var remembered = false

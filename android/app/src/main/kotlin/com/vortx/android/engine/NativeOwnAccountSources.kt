@@ -9,7 +9,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import org.json.JSONTokener
 import java.math.BigDecimal
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
@@ -241,10 +240,7 @@ private class NativeOwnAccountHTTP {
 }
 
 private fun ownObject(bytes: ByteArray): JSONObject {
-    val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
-        .decode(ByteBuffer.wrap(bytes)).toString()
-    val parser = JSONTokener(text); val value = parser.nextValue() as? JSONObject ?: error("Streaming response is not an object")
-    require(parser.nextClean() == '\u0000') { "Trailing streaming response data" }; return value
+    return NativeProfileOverlayWitness.parseDocument(bytes)
 }
 private fun ownString(value: JSONObject, key: String): String = (value.get(key) as? String)?.takeIf(String::isNotBlank) ?: error("Malformed streaming response")
 private fun ownResult(value: JSONObject): JSONObject {

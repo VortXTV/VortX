@@ -114,6 +114,26 @@ class NativeAccountSyncTest {
         } finally { manager.cancelSyncTestWork() }
     }
 
+    @Test fun `native pull preflights exact overlay number tokens before org json rounding`() = runBlocking {
+        for ((literal, accepted) in listOf("9007199254740991.1" to false, "1e400" to false, "1.25" to true)) {
+            val manager = VortXSyncManager(TestContext()); val gateway = Gateway(); var uploads = 0
+            val raw = """{"vortx":{"byProfile":{"11111111-1111-1111-1111-111111111111":{"future":$literal}}}}"""
+            try {
+                manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0,
+                    transport = { method, _, _, _ ->
+                        if (method == "PUT") uploads++
+                        200 to JSONObject().put("version", 100).put("document", VortXCrypto.sealDocument(key, raw.toByteArray(), account.id, 100, true))
+                    })
+                installNative(manager, gateway)
+                assertEquals(literal, accepted, manager.syncDown(true))
+                assertEquals(literal, if (accepted) 1 else 0, gateway.applied)
+                assertEquals(0, uploads)
+                if (accepted) assertEquals(1.25, gateway.last!!.getJSONObject("vortx").getJSONObject("byProfile")
+                    .getJSONObject("11111111-1111-1111-1111-111111111111").getDouble("future"), 0.0)
+            } finally { manager.cancelSyncTestWork() }
+        }
+    }
+
     @Test fun `native push never claims pending host settings were uploaded or clears dirty intent`() = runBlocking {
         val context = TestContext(); val manager = VortXSyncManager(context); val gateway = Gateway()
         var requests = 0
