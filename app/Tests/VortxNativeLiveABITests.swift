@@ -86,6 +86,16 @@ import CryptoKit
         check(try field("local_search")["searchResults"]?.array?.map { $0["id"] } == [.string("tt-fixture")])
         check(try field("meta_details")["selected"] == detailBeforeAutoAdd["selected"])
         check(try field("meta_details")["metaItems"] == detailBeforeAutoAdd["metaItems"])
+        check(!facade.setWatchedVideos(metaID: "tt-fixture", videoIDs: ["fabricated-episode"], name: "Fixture", type: "series", poster: nil,
+                                       watched: true, profileID: scope.ownerProfileID))
+        check(facade.lastFailure == "stale_or_empty_watched_inventory")
+        check(facade.setWatchedVideos(metaID: "tt-fixture", videoIDs: ["tt-fixture:1:2"], name: "Fixture", type: "series", poster: nil,
+                                      watched: true, profileID: scope.ownerProfileID))
+        await facade.settled()
+        check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("tt-fixture:1:2")) == true)
+        // A native mutation republishes library, but must retain the selected type/sort even when
+        // the matching type later has no rows.
+        check(try field("library")["selectable"]?["sorts"]?.array?.contains { $0["sort"] == .string("name") && $0["selected"] == .bool(true) } == true)
         do { _ = try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: "kid", allowInsert: true); fatalError("stale profile auto-add admitted") }
         catch VortxNativeError.superseded {}
         try dispatch(["action": "Ctx", "args": ["action": "AddToLibrary", "args": ["id": "tt-fixture", "type": "series", "name": "Fixture"]]], field: "ctx")
@@ -130,14 +140,6 @@ import CryptoKit
         check(try field("continue_watching_preview")["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-kid-episode"))
         check(facade.cachedResumeSeconds(id: "opaque-kid-episode") == 3.001)
         check(try await facade.resumeSeconds(id: "opaque-kid-episode", profileID: "kid") == 3.001)
-        check(!facade.setWatchedVideos(metaID: "tt-fixture", videoIDs: [], name: "Fixture", type: "series", poster: nil,
-                                       watched: true, profileID: "kid"))
-        check(facade.lastFailure == "stale_or_empty_watched_inventory")
-        check(facade.setWatchedVideos(metaID: "tt-fixture", videoIDs: ["opaque-kid-a", "opaque-kid-b"], name: "Fixture", type: "series", poster: nil,
-                                      watched: true, profileID: "kid"))
-        await facade.settled()
-        check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("opaque-kid-a")) == true)
-        check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("opaque-kid-b")) == true)
         let watchedMovie: VortxJSON = .object(["type": .string("mark_watched"), "metaId": .string("unsaved-movie"), "name": .string("Watched without saving"),
                                               "metadata": .object(["type": .string("movie")])])
         check(facade.dispatchForProfile(watchedMovie, profileID: "kid")); await facade.settled()

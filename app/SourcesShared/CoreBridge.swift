@@ -833,6 +833,25 @@ final class CoreBridge: ObservableObject {
         // A logout, unresolved binding, or rejected credential still belongs to the previous
         // account. Do not create a durable deletion intent or inspect engine state while fenced.
         guard addonMutationStillAllowed(mutationToken) else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            // Native removal is only admitted by the facade after it has identified the active
+            // owner bucket.  Do not advance the legacy deletion carrier or start a sync push just
+            // because a Ctx request was constructed; wait for the FIFO's durable acknowledgement.
+            guard let raw = rawAddonsByUrl[descriptor.transportUrl],
+                  dispatchCtx(["action": addonMutationAction("UninstallAddon", local: "UninstallAddonLocal"), "args": raw]),
+                  let facade = nativeFacade else { return }
+            guard tombstone, !descriptor.isProtected else { return }
+            Task { @MainActor [weak self, facade] in
+                await facade.settled()
+                guard let self, self.addonMutationStillAllowed(mutationToken),
+                      !self.addons.contains(where: { $0.transportUrl == descriptor.transportUrl }) else { return }
+                AddonTombstones.tombstone(descriptor.transportUrl)
+                _ = await VortXSyncManager.shared.pushThisDevice()
+            }
+            return
+        }
+#endif
         // Record the durable removal FIRST, before touching rawAddonsByUrl. A synced add-on can be visible
         // in the published `addons` list yet be MISSING from `rawAddonsByUrl` (its raw engine descriptor
         // never landed, e.g. a roster the sync layer added without an engine InstallAddon). The old
@@ -999,9 +1018,13 @@ final class CoreBridge: ObservableObject {
             action = ["action": addonMutationAction("InstallAddon", local: "InstallAddonLocal"),
                       "args": descriptor]
         }
-        guard addonMutationStillAllowed(mutationToken), dispatchCtx(action, beforeDispatch: {
+        let clearTombstoneBeforeDispatch: (() -> Void)? = {
+#if VORTX_NATIVE_DATA_ENGINE
+            guard !self.usesNativeProfileState else { return }
+#endif
             AddonTombstones.forget(identityURL.absoluteString)
-        }) else {
+        }
+        guard addonMutationStillAllowed(mutationToken), dispatchCtx(action, beforeDispatch: clearTombstoneBeforeDispatch) else {
             return .failed(retryable: true, message: Self.accountTransitionMessage)
         }
 
@@ -1013,6 +1036,9 @@ final class CoreBridge: ObservableObject {
         guard installConfirmed else {
             return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
         }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState { AddonTombstones.forget(identityURL.absoluteString) }
+#endif
         if let replacingDescriptor, replacingDescriptor.transportUrl != identityURL.absoluteString {
             guard addonMutationStillAllowed(mutationToken) else {
                 return .failed(retryable: true, message: Self.accountTransitionMessage)
