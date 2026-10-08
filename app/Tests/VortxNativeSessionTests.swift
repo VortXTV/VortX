@@ -184,9 +184,11 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         try baselineWatch.edit(profileID: watchProfile.uuidString, fields: [movieKey: .null], scope: scope)
         try baselineWatch.merge(secondBaseline, scope: scope)
         check(try VortxNativeWatchlist.entries(host: baselineWatch.document, profileID: watchProfile).isEmpty)
-        let beforeBadWatch = try watchA.encoded()
+        // JSONEncoder does not promise dictionary key order across separate encodes. Compare the
+        // complete local state, including counters and journals, rather than incidental byte order.
+        let beforeBadWatch = try JSONDecoder().decode(VortxJSON.self, from: watchA.encoded())
         do { try watchA.edit(profileID: watchProfile.uuidString, fields: [movieKey: .object(["id": .string("ttOther")])], scope: scope); check(false) } catch {}
-        check(try watchA.encoded() == beforeBadWatch)
+        check(try JSONDecoder().decode(VortxJSON.self, from: watchA.encoded()) == beforeBadWatch)
         check(try VortxNativeWatchlist.entries(host: watchA.document, profileID: UUID()).isEmpty)
         var credentials = try VortxNativeProviderCredentials(scope: scope.account, actor: actorA)
         try credentials.edit(["tmdb": .string("fixture-nonproduction")])
