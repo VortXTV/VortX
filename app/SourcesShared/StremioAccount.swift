@@ -295,6 +295,11 @@ final class StremioAccount: ObservableObject {
     }
 
     init() {
+#if VORTX_NATIVE_DATA_ENGINE
+        VortxNativeCredentialSelectionRelay.shared.observe(self) { account in
+            account.reloadForActiveProfile()
+        }
+#endif
         email = Self.displayEmail()
         migrateTokenToKeychain()
         let context = captureAuthOperationContext()

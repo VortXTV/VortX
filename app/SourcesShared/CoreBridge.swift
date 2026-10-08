@@ -171,9 +171,9 @@ final class CoreBridge: ObservableObject {
         ProfileStore.shared.applyNativeProfiles(profiles, activeID: activeID, projectionTarget: projection)
         NotificationCenter.default.post(name: LibraryAutoAdd.watchlistChangedNote, object: nil)
         let slot = ProfileStore.shared.activeKeychainAccount
+        let shouldReloadCredentials = nativePublishedCredentialSlot != slot && reloadCredentials
         if nativePublishedCredentialSlot != slot {
             nativePublishedCredentialSlot = slot
-            if reloadCredentials { StremioAccount.shared.reloadForActiveProfile() }
         }
         if let capture = nativeCredentialCapture {
             try VortXSyncManager.shared.publishNativeOwnOverlayPending(snapshot.pending, capture: capture)
@@ -185,6 +185,12 @@ final class CoreBridge: ObservableObject {
             VortXSyncManager.shared.updateNativeOwnAccountAvailability(missing: missing, profiles: profiles, capture: capture)
         }
         nativeFacadeLock.withLock { nativePublishedAccountGeneration = snapshot.generation }
+        if shouldReloadCredentials {
+            VortxNativeCredentialSelectionRelay.shared.publish {
+                projection.stillOwnsCurrentContext(core: self)
+                    && ProfileStore.shared.activeKeychainAccount == slot
+            }
+        }
     }
     @MainActor
     func saveNativeProfile(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget) async throws {
