@@ -166,6 +166,12 @@ enum LegacyWatchedBitfieldMigrationEvidence {
         _ = try checkedSource(scope: scope, source: source, rowLocator: rowLocator)
     }
 
+    /// Uses the same typed locator and strict source checks for an archived pending retry. The
+    /// caller must not recover this identity from a current document or a projected row instead.
+    static func sourceMetaID(scope: Scope, source: Data, rowLocator: SourceRowLocator) throws -> String {
+        try checkedSource(scope: scope, source: source, rowLocator: rowLocator).1.metaID
+    }
+
     private static func checkedSource(scope: Scope, source: Data, rowLocator: SourceRowLocator) throws -> (StrictJSON.Value, SourceRow) {
         try Task.checkCancellation()
         guard (0..<maximumSourceRows).contains(rowLocator.sourceIndex) else { throw Failure.malformed("Invalid source row index") }

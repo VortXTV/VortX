@@ -31,6 +31,9 @@ enum VortxLegacyWatchedMigrationTests {
         try await historicalOwnerHistoryMapsToResolvedOwner()
         try await rejectsChangedOriginalAddon()
         try await unresolvedInventoriesStayPendingAndStrict()
+        try await retriesHistoricalPendingWithoutReplacingSource()
+        try await retriesOwnPendingWithCapturedIdentityOnly()
+        try await failedPendingRetriesPreserveExactSidecars()
         try await ownAccountEnvelopeAndOverlayAreExactForBothSchemas()
         try await originalManifestNumberLexemesSurviveCapture()
         try await metadataTransportUsesOnlyBoundedOriginalEndpoint()
@@ -291,6 +294,177 @@ enum VortxLegacyWatchedMigrationTests {
         }
     }
 
+    private static func retriesHistoricalPendingWithoutReplacingSource() async throws {
+        let sourceA = try ownerDocument()
+        let pendingPreparation = try await prepare(document: sourceA) { request in
+            .init(request: request, raw: emptyInventory())
+        }
+        let pendingA = try pendingPreparation.pendingArchives[0]
+        let originalPending = pendingA
+        let sourceB = try JSONSerialization.data(withJSONObject: ["unrelatedSetting": "newer",
+            "vortx": ["library": [], "addons": [addon(url: catalogURL, manifest: manifest)]]], options: [.sortedKeys])
+        let fetches = Locked(0)
+        let retried = try await retryPending([pendingA]) { request in
+            fetches.modify { $0 += 1 }
+            return .init(request: request, raw: metadata())
+        }
+        check(fetches.value == 1 && retried.archives.count == 1 && retried.unresolved.isEmpty,
+              "historical pending source retries successfully")
+        check(pendingA == originalPending, "retry does not rewrite its input pending sidecar")
+        let completed = try object(retried.archives[0])
+        let retainedSource = Data(base64Encoded: completed["sourceDocumentBase64"] as! String)!
+        check(retainedSource == sourceA && digest(retainedSource) == digest(sourceA),
+              "retry evidence remains bound to exact source A bytes and digest")
+        try await expectStale("retried historical evidence cannot bind to current source B") {
+            _ = try VortxLegacyWatchedMigration.replay(retried.archives[0], accountID: "account-a",
+                profileID: ownerID, ownerProfileID: ownerID, verifiedStreamingUID: nil,
+                sourceDocument: sourceB, isCurrent: { true })
+        }
+
+        let idempotentCalls = Locked(0)
+        let idempotent = try await retryPending([pendingA], evidence: retried.archives) { request in
+            idempotentCalls.modify { $0 += 1 }
+            return .init(request: request, raw: metadata())
+        }
+        check(idempotentCalls.value == 0 && idempotent.archives == retried.archives
+              && idempotent.unresolved.isEmpty,
+              "archived evidence makes retry idempotent and network-free")
+
+        await expectFailure("pending retry account mismatch") {
+            _ = try await retryPending([pendingA], accountID: "account-b") { request in
+                .init(request: request, raw: metadata())
+            }
+        }
+        await expectFailure("pending retry owner mismatch") {
+            _ = try await retryPending([pendingA], ownerProfileID: sharedID) { request in
+                .init(request: request, raw: metadata())
+            }
+        }
+    }
+
+    private static func retriesOwnPendingWithCapturedIdentityOnly() async throws {
+        let ownA = try ownNetworkOnlySource(verifiedUID: "captured-uid-a")
+        let rootA = Data("{}".utf8)
+        let ownEnvelope = try object(ownA.sourceDocument)
+        let retainedOverlay = Data(base64Encoded: ownEnvelope["profileOverlayBase64"] as! String)!
+        check(retainedOverlay == Data("{}".utf8), "network-only own reconnect retains an empty schema-1 overlay")
+        let pendingPreparation = try await VortxLegacyWatchedMigration.prepare(accountID: "account-a",
+            ownerProfileID: ownerID, document: rootA, profileIDs: [ownerID], ownAccountSources: [ownA],
+            isCurrent: { true }) { request in .init(request: request, raw: emptyInventory()) }
+        let pendingA = try pendingPreparation.pendingArchives[0]
+        let pendingObject = try object(pendingA)
+        check(pendingObject["verifiedStreamingUid"] as? String == "captured-uid-a",
+              "own pending sidecar seals the captured UID")
+
+        let observedUID = Locked<String?>(nil)
+        let retried = try await retryPending([pendingA]) { request in
+            observedUID.modify { $0 = request.scope.verifiedStreamingUID }
+            return .init(request: request, raw: metadata())
+        }
+        check(observedUID.value == "captured-uid-a" && retried.archives.count == 1,
+              "retry reads the captured own UID instead of substituting a later session")
+
+        try await expectStale("own retry result cannot rebind to UID B") {
+            _ = try VortxLegacyWatchedMigration.replay(retried.archives[0], accountID: "account-a",
+                profileID: ownID, ownerProfileID: ownerID, verifiedStreamingUID: "captured-uid-b",
+                sourceDocument: ownA.sourceDocument, isCurrent: { true })
+        }
+        let ownB = try ownNetworkOnlySource(verifiedUID: "captured-uid-b", libraryName: "Changed current source")
+        try await expectStale("own retry result cannot bind to changed source B") {
+            _ = try VortxLegacyWatchedMigration.replay(retried.archives[0], accountID: "account-a",
+                profileID: ownID, ownerProfileID: ownerID, verifiedStreamingUID: "captured-uid-b",
+                sourceDocument: ownB.sourceDocument, isCurrent: { true })
+        }
+
+        // This receipt has the same profile, exact raw source and locator, but a different
+        // authenticated UID. It must not be adopted as the historical pending row's evidence.
+        let uidBPrepared = try await VortxLegacyWatchedMigration.prepare(accountID: "account-a",
+            ownerProfileID: ownerID, document: rootA, profileIDs: [ownerID],
+            ownAccountSources: [try ownNetworkOnlySource(verifiedUID: "captured-uid-b")],
+            isCurrent: { true }) { request in .init(request: request, raw: metadata()) }
+        do {
+            _ = try await retryPending([pendingA], evidence: uidBPrepared.archives) { request in
+                .init(request: request, raw: metadata())
+            }
+            preconditionFailure("Expected same-source archived evidence with another own UID to be rejected")
+        } catch let failure as VortxLegacyWatchedMigration.Failure {
+            check(failure == .staleBinding, "same-source archived evidence from another own UID rejects as stale binding")
+        } catch {
+            throw error
+        }
+
+        var missingUID = pendingObject
+        missingUID.removeValue(forKey: "verifiedStreamingUid")
+        let malformedPending = try JSONSerialization.data(withJSONObject: missingUID, options: [.sortedKeys])
+        let requestCount = Locked(0)
+        await expectFailure("own pending archive without captured UID") {
+            _ = try await retryPending([malformedPending]) { request in
+                requestCount.modify { $0 += 1 }
+                return .init(request: request, raw: metadata())
+            }
+        }
+        check(requestCount.value == 0, "missing own UID is rejected before metadata fetch")
+
+        let mismatchedResponse = try await retryPending([pendingA]) { request in
+            let otherUID = try LegacyWatchedBitfieldMigrationEvidence.Scope(accountID: "account-a",
+                profileID: ownID, verifiedStreamingUID: "captured-uid-b", ownerProfileID: ownerID)
+            let foreignRequest = LegacyWatchedBitfieldMigrationEvidence.MetadataRequest(scope: otherUID,
+                addon: request.addon, type: request.type, metaID: request.metaID)
+            return .init(request: foreignRequest, raw: metadata())
+        }
+        check(mismatchedResponse.archives.isEmpty && mismatchedResponse.unresolved == [pendingA],
+              "metadata response with a different request UID leaves exact pending sidecar unresolved")
+    }
+
+    private static func failedPendingRetriesPreserveExactSidecars() async throws {
+        let source = try ownerDocument()
+        let pending = try await prepare(document: source) { request in .init(request: request, raw: emptyInventory()) }
+        let pendingA = try pending.pendingArchives[0]
+
+        let hostile = try await retryPending([pendingA]) { request in
+            .init(request: request, raw: Data(#"{"meta":{"id":"other-title","type":"series","videos":[]}}"#.utf8))
+        }
+        check(hostile.archives.isEmpty && hostile.unresolved == [pendingA],
+              "hostile metadata leaves the exact original pending bytes unresolved")
+
+        let missing = try await retryPending([pendingA]) { request in
+            .init(request: request, raw: emptyInventory())
+        }
+        check(missing.archives.isEmpty && missing.unresolved == [pendingA],
+              "missing inventory leaves the exact original pending bytes unresolved")
+
+        let ambiguousSource = try ownerDocument(addons: [addon(url: catalogURL, manifest: manifest),
+                                                            addon(url: alternateURL, manifest: alternateManifest)])
+        let ambiguousPending = try await prepare(document: ambiguousSource) { request in
+            .init(request: request, raw: request.addon.transportURL == catalogURL ? metadata() : metadata(releaseOffset: 1))
+        }
+        let ambiguousBytes = try ambiguousPending.pendingArchives[0]
+        let stillAmbiguous = try await retryPending([ambiguousBytes]) { request in
+            .init(request: request, raw: request.addon.transportURL == catalogURL ? metadata() : metadata(releaseOffset: 1))
+        }
+        check(stillAmbiguous.archives.isEmpty && stillAmbiguous.unresolved == [ambiguousBytes],
+              "conflicting inventories leave the exact ambiguous pending bytes unresolved")
+
+        let gate = CancellationGate()
+        let canceledRetry = Task {
+            try await retryPending([pendingA]) { request in
+                await gate.fetchStartedAndWait()
+                return .init(request: request, raw: metadata())
+            }
+        }
+        await gate.waitForFetchStart()
+        canceledRetry.cancel()
+        await gate.releaseFetch()
+        do {
+            _ = try await canceledRetry.value
+            preconditionFailure("canceled historical retry accepted a late successful fetch")
+        } catch is CancellationError {
+            check(true, "historical retry propagates cancellation after successful fetch")
+        } catch {
+            preconditionFailure("historical retry propagated the wrong cancellation error: \(error)")
+        }
+    }
+
     private static func metadataTransportUsesOnlyBoundedOriginalEndpoint() async throws {
         let scope = try LegacyWatchedBitfieldMigrationEvidence.Scope(accountID: "account-a", profileID: ownerID,
                                                                        ownerProfileID: ownerID)
@@ -447,6 +621,14 @@ enum VortxLegacyWatchedMigrationTests {
             isCurrent: { true }, fetch: fetch)
     }
 
+    private static func retryPending(_ archives: [Data], accountID: String = "account-a",
+                                     ownerProfileID: UUID = ownerID, evidence: [Data] = [],
+                                     fetch: @escaping LegacyWatchedBitfieldMigrationEvidence.MetadataFetcher) async throws
+        -> VortxLegacyWatchedMigration.HistoricalRetry {
+        try await VortxLegacyWatchedMigration.retryArchivedPending(archives, accountID: accountID,
+            ownerProfileID: ownerProfileID, archivedEvidence: evidence, isCurrent: { true }, fetch: fetch)
+    }
+
     private static func ownerDocument(addons: [Object]? = nil) throws -> Data {
         let row: Object = ["id": "tt2934286", "type": "series", "name": "Fixture Series", "watched": bitmap,
                            "ma": [episodeIDs[1]: 1234.125], "ua": [episodeIDs[3]: 4321.5]]
@@ -490,13 +672,16 @@ enum VortxLegacyWatchedMigrationTests {
                                            options: [.sortedKeys])
     }
 
-    private static func ownAccountSource(schemaVersion: Int) throws -> VortxLegacyBootstrapMaterial.OwnAccountSource {
+    private static func ownAccountSource(schemaVersion: Int, verifiedUID: String = "verified-own-uid",
+                                         historyName: String = "Fixture Series") throws -> VortxLegacyBootstrapMaterial.OwnAccountSource {
         let ownAddon = addon(url: catalogURL, manifest: manifest)
         let libraryRows: [Object] = [["_id": "tt2934286", "type": "series", "name": "Fixture Series",
                                       "state": ["timeOffset": 0, "duration": 0]]]
         let addonBody = try JSONSerialization.data(withJSONObject: ["result": ["addons": [ownAddon]]], options: [.sortedKeys])
         let libraryBody = try JSONSerialization.data(withJSONObject: ["result": libraryRows], options: [.sortedKeys])
-        let overlay: Object = ["vortx": ["byProfile": [ownID.uuidString: ["ownerHistory": [historyRow()]]]]]
+        var ownHistory = historyRow()
+        ownHistory["name"] = historyName
+        let overlay: Object = ["vortx": ["byProfile": [ownID.uuidString: ["ownerHistory": [ownHistory]]]]]
         let overlayBody = try JSONSerialization.data(withJSONObject: overlay, options: [.sortedKeys])
         let envelope: Object = ["schemaVersion": schemaVersion,
             "libraryResponseBase64": libraryBody.base64EncodedString(),
@@ -504,8 +689,39 @@ enum VortxLegacyWatchedMigrationTests {
             "profileOverlayBase64": overlayBody.base64EncodedString()]
         let source = try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
         let overlayWitness = schemaVersion == 2 ? try VortxProfileOverlayWitness.digest(json: overlayBody) : nil
-        return VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: ownID, verifiedStreamingUID: "verified-own-uid",
+        return VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: ownID, verifiedStreamingUID: verifiedUID,
             sourceDocument: source, profileOverlaySHA256: overlayWitness)
+    }
+
+    private static func ownNetworkOnlySource(verifiedUID: String,
+                                            libraryName: String = "Fixture Series") throws -> VortxLegacyBootstrapMaterial.OwnAccountSource {
+        let ownAddon = addon(url: catalogURL, manifest: manifest)
+        let libraryRows: [Object] = [
+            ["_id": "tt2934286", "type": "series", "name": libraryName,
+             "state": ["watched": bitmap, "timeOffset": 0, "duration": 0]]
+        ]
+        let addonBody = try JSONSerialization.data(withJSONObject: ["result": ["addons": [ownAddon]]], options: [.sortedKeys])
+        let libraryBody = try JSONSerialization.data(withJSONObject: ["result": libraryRows], options: [.sortedKeys])
+        let overlayBody = Data("{}".utf8)
+        let envelope: Object = ["schemaVersion": 1,
+            "libraryResponseBase64": libraryBody.base64EncodedString(),
+            "addonsResponseBase64": addonBody.base64EncodedString(),
+            "profileOverlayBase64": overlayBody.base64EncodedString()]
+        let source = try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
+        return VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: ownID, verifiedStreamingUID: verifiedUID,
+            sourceDocument: source, profileOverlaySHA256: nil)
+    }
+
+    private static func overlayDocument(from source: VortxLegacyBootstrapMaterial.OwnAccountSource) throws -> Data {
+        let envelope = try object(source.sourceDocument)
+        guard let overlay = envelope["profileOverlayBase64"] as? String, let bytes = Data(base64Encoded: overlay) else {
+            throw TestFailure.expectedObject
+        }
+        return bytes
+    }
+
+    private static func emptyInventory() -> Data {
+        Data(#"{"meta":{"id":"tt2934286","type":"series","videos":[]}}"#.utf8)
     }
 
     private static func digest(_ data: Data) -> String {

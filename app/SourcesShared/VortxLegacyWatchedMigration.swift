@@ -70,6 +70,14 @@ enum VortxLegacyWatchedMigration {
         var pendingArchives: [Data] { get throws { try unresolved.map { try $0.archive } } }
     }
 
+    /// Historical repair deliberately exposes no material-authorizing rows. The host unions the
+    /// evidence into its sealed archive and retains every original pending record, including those
+    /// now matched by evidence. `unresolved` is a display/retry subset, never a deletion ACK.
+    struct HistoricalRetry: Sendable {
+        let archives: [Data]
+        let unresolved: [Data]
+    }
+
     private struct Candidate: Sendable {
         let scope: Evidence.Scope
         let source: Data
@@ -152,37 +160,97 @@ enum VortxLegacyWatchedMigration {
                 rows.append(ValidatedRow(replayed)); archives.append(archive.bytes)
                 continue
             }
-            var captures = [Evidence.Evidence]()
-            let addons = try Evidence.originalAddons(source: candidate.source, rowLocator: candidate.locator)
-                .filter { try supports($0, metaID: candidate.metaID) }
-            for addon in addons {
-                do {
-                    let evidence = try await Evidence.capture(scope: candidate.scope, source: candidate.source,
-                        rowLocator: candidate.locator, addon: addon, isCurrent: isCurrent, fetch: fetch)
-                    try Task.checkCancellation()
-                    captures.append(evidence)
-                } catch {
-                    try Task.checkCancellation()
-                    guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
-                    // A provider failure never establishes an empty inventory or an unwatch.
-                }
-            }
-            try Task.checkCancellation()
-            guard let accepted = captures.first else {
+            switch try await capture(candidate, isCurrent: isCurrent, fetch: fetch) {
+            case .accepted(let accepted):
+                rows.append(ValidatedRow(accepted)); archives.append(try encodeArchive(accepted))
+            case .pending(let reason):
                 pending.append(.init(scope: candidate.scope, profileID: candidate.scope.profileID, sourceDocument: candidate.source,
-                    sourceDocumentSHA256: digest, row: candidate.locator, reason: "episode_inventory_unavailable"))
-                continue
+                    sourceDocumentSHA256: digest, row: candidate.locator, reason: reason))
             }
-            guard captures.dropFirst().allSatisfy({ exactInventory($0.inventory, accepted.inventory) }) else {
-                pending.append(.init(scope: candidate.scope, profileID: candidate.scope.profileID, sourceDocument: candidate.source,
-                    sourceDocumentSHA256: digest, row: candidate.locator, reason: "episode_inventory_ambiguous"))
-                continue
-            }
-            rows.append(ValidatedRow(accepted)); archives.append(try encodeArchive(accepted))
         }
         guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
         try Task.checkCancellation()
         return Preparation(rows: rows, archives: archives, unresolved: pending)
+    }
+
+    /// Retries only snapshots already retained by the authenticated, same-account host archive.
+    /// In particular, a historical own UID comes from that sealed pending tuple, never from the
+    /// currently selected credential or active native slot. The original snapshot may no longer
+    /// be present in the current account document. This API cannot authorize current material.
+    static func retryArchivedPending(_ archives: [Data], accountID: String, ownerProfileID: UUID,
+                                     archivedEvidence: [Data] = [], isCurrent: @escaping @Sendable () -> Bool,
+                                     fetch: Evidence.MetadataFetcher) async throws -> HistoricalRetry {
+        try requireAdmission(isCurrent)
+        _ = try Evidence.Scope(accountID: accountID, profileID: ownerProfileID, ownerProfileID: ownerProfileID)
+        guard archives.count <= 10_000, archivedEvidence.count <= 10_000 else { throw Failure.malformedArchive }
+        let pending = try archives.map { try decodePending($0, accountID: accountID, ownerProfileID: ownerProfileID) }
+        let retained = try archivedEvidence.map(decodeArchive)
+        guard retained.allSatisfy({ exact($0.scope.accountID, accountID) && $0.scope.ownerProfileID == ownerProfileID }) else {
+            throw Failure.staleBinding
+        }
+        var evidence = [Data](), unresolved = [Data]()
+        var seenPending = Set<Data>(), seenEvidence = Set<Data>()
+        for (original, candidate) in zip(archives, pending) where seenPending.insert(original).inserted {
+            try requireAdmission(isCurrent)
+            let digest = sha256(candidate.source)
+            let matches = retained.filter { $0.scope.profileID == candidate.scope.profileID
+                && exact($0.sourceSHA256, digest) && $0.locator == candidate.locator }
+            guard matches.count <= 1 else { throw Failure.malformedArchive }
+            if let retained = matches.first {
+                guard sameScope(retained.scope, candidate.scope), retained.source == candidate.source else { throw Failure.staleBinding }
+                _ = try Evidence.replay(scope: candidate.scope, source: candidate.source, rowLocator: candidate.locator,
+                    addon: retained.addon, metadata: retained.metadata, isCurrent: isCurrent)
+                try requireAdmission(isCurrent)
+                if seenEvidence.insert(retained.bytes).inserted { evidence.append(retained.bytes) }
+                continue
+            }
+            switch try await capture(candidate, isCurrent: isCurrent, fetch: fetch) {
+            case .accepted(let captured):
+                let archive = try encodeArchive(captured)
+                try requireAdmission(isCurrent)
+                if seenEvidence.insert(archive).inserted { evidence.append(archive) }
+            case .pending:
+                // Preserve even the old reason and JSON spelling; a failed retry never rewrites
+                // the original attested tuple or manufactures an acknowledgement for it.
+                unresolved.append(original)
+            }
+        }
+        try requireAdmission(isCurrent)
+        return HistoricalRetry(archives: evidence, unresolved: unresolved)
+    }
+
+    private enum CaptureResult { case accepted(Evidence.Evidence), pending(String) }
+
+    private static func capture(_ candidate: Candidate, isCurrent: @escaping @Sendable () -> Bool,
+                                fetch: Evidence.MetadataFetcher) async throws -> CaptureResult {
+        try requireAdmission(isCurrent)
+        var captures = [Evidence.Evidence]()
+        let addons = try Evidence.originalAddons(source: candidate.source, rowLocator: candidate.locator)
+            .filter { try supports($0, metaID: candidate.metaID) }
+        for addon in addons {
+            do {
+                let evidence = try await Evidence.capture(scope: candidate.scope, source: candidate.source,
+                    rowLocator: candidate.locator, addon: addon, isCurrent: isCurrent, fetch: fetch)
+                try requireAdmission(isCurrent)
+                captures.append(evidence)
+            } catch {
+                try requireAdmission(isCurrent)
+                // A provider failure never establishes an empty inventory or an unwatch.
+            }
+        }
+        try requireAdmission(isCurrent)
+        guard let accepted = captures.first else { return .pending("episode_inventory_unavailable") }
+        guard captures.dropFirst().allSatisfy({ exactInventory($0.inventory, accepted.inventory) }) else {
+            return .pending("episode_inventory_ambiguous")
+        }
+        try requireAdmission(isCurrent)
+        return .accepted(accepted)
+    }
+
+    private static func requireAdmission(_ isCurrent: @Sendable () -> Bool) throws {
+        try Task.checkCancellation()
+        guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
+        try Task.checkCancellation()
     }
 
     /// Cold open makes no request. The caller still provides the currently authenticated account,
@@ -209,6 +277,11 @@ enum VortxLegacyWatchedMigration {
     }
 
     static func validateArchivedPending(_ archive: Data, accountID: String, ownerProfileID: UUID) throws {
+        _ = try decodePending(archive, accountID: accountID, ownerProfileID: ownerProfileID)
+    }
+
+    private static func decodePending(_ archive: Data, accountID: String, ownerProfileID: UUID) throws -> Candidate {
+        try Task.checkCancellation()
         let value = try VortxProfileOverlayWitness.decodeObject(json: archive)
         let required: Set<String> = ["schemaVersion", "accountId", "profileId", "ownerProfileId", "sourceDocumentBase64", "sourceDocumentSha256", "row", "reason"]
         guard Set(value.keys) == required || Set(value.keys) == required.union(["verifiedStreamingUid"]),
@@ -224,7 +297,9 @@ enum VortxLegacyWatchedMigration {
         guard exact(digest, sha256(source)) else { throw Failure.malformedArchive }
         let scope = try Evidence.Scope(accountID: account, profileID: profile,
             verifiedStreamingUID: value["verifiedStreamingUid"] as? String, ownerProfileID: ownerProfileID)
-        try Evidence.validateSource(scope: scope, source: source, rowLocator: decodeLocator(row))
+        let locator = try decodeLocator(row)
+        let metaID = try Evidence.sourceMetaID(scope: scope, source: source, rowLocator: locator)
+        return Candidate(scope: scope, source: source, locator: locator, metaID: metaID)
     }
 
     private static func append(_ rows: [Any], scope: Evidence.Scope, source: Data,
