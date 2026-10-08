@@ -14,17 +14,32 @@ if [[ "$platform" == apple ]]; then
         count=$((count + 1))
         header="$(dirname "$archive")/Headers/vortx/vortx_ffi.h"
         [[ -f "$header" ]] || { echo "missing native header: $header" >&2; exit 1; }
-        exports=$(nm -gUj "$archive" | sed -n '/^_vortx_/p')
+        # -j also prints member labels and includes N_PEXT definitions. Only
+        # ordinary external definitions are the shared link-visible ABI.
+        exports=$(nm -m -gU "$archive" | awk '/ external / && !/ private external / { print $NF }')
+        unexpected=$(printf '%s\n' "$exports" | sed '/^_vortx_/d; /^$/d')
+        [[ -z "$unexpected" ]] || { echo "unexpected public native exports: $archive: $unexpected" >&2; exit 1; }
+        slice="$(basename "$(dirname "$archive")")"
+        case "$slice" in
+            ios-arm64) sdk=iphoneos; target=arm64-apple-ios16.0 ;;
+            ios-arm64-simulator) sdk=iphonesimulator; target=arm64-apple-ios16.0-simulator ;;
+            tvos-arm64) sdk=appletvos; target=arm64-apple-tvos18.0 ;;
+            tvos-arm64-simulator) sdk=appletvsimulator; target=arm64-apple-tvos18.0-simulator ;;
+            macos-arm64) sdk=macosx; target=arm64-apple-macos14.0 ;;
+            *) echo "unsupported Apple native slice: $slice" >&2; exit 1 ;;
+        esac
+        sysroot="$(xcrun --sdk "$sdk" --show-sdk-path)"
         expected=("${state_symbols[@]}")
         [[ "$mode" != resource-host ]] || expected+=("${resource_symbols[@]}")
         for symbol in "${expected[@]}"; do
             printf '%s\n' "$exports" | grep -Fxq "_$symbol" || { echo "missing export $symbol: $archive" >&2; exit 1; }
             # A present symbol with an absent header is still unusable from Swift.
             printf 'void probe(void) { (void)&%s; }\n' "$symbol" |
-                clang -Werror -fsyntax-only -x c -include "$header" -
+                xcrun --sdk "$sdk" clang -target "$target" -isysroot "$sysroot" \
+                    -Werror -fsyntax-only -x c -include "$header" -
         done
     done
-    [[ "$count" -gt 0 ]] || { echo "no Apple native slices" >&2; exit 1; }
+    [[ "$count" == 5 ]] || { echo "expected five Apple native slices; found $count" >&2; exit 1; }
 elif [[ "$platform" == android ]]; then
     readelf="${READELF:-llvm-readelf}"
     exports=$($readelf --dyn-syms --wide "$artifact")

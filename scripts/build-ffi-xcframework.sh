@@ -42,10 +42,10 @@
 #
 # Other invariants, unchanged from the Phase 7 script:
 #   - Every slice builds against a panic_abort std so no panic can unwind across the C boundary.
-#   - ALL non-vortx_* globals are localized per slice (ld -r + -exported_symbols_list). The app
+#   - Non-vortx_* public globals are hidden per slice (ld -r + -exported_symbols_list). The app
 #     already links StremioXCore (another Rust staticlib) and MPVKit's Libdovi (Rust as well);
 #     any exported std/compiler-builtins symbol from this archive would be a duplicate at link
-#     time. Only the vortx_* entry points stay global.
+#     time. Only vortx_* entry points stay public; SDK common symbols may remain private externs.
 #   - Headers are nested as Headers/vortx/{vortx_ffi.h,module.modulemap}. A flat Headers/ would
 #     collide with StremioXCore's module.modulemap in the shared Products/include copy step
 #     ("Multiple commands produce ... module.modulemap"); project.yml points SWIFT_INCLUDE_PATHS
@@ -193,7 +193,9 @@ xcodebuild -create-xcframework \
 
 echo "- slice audit (exports must be vortx_* only; server column from _vortx_server_start):"
 for slice in ios-arm64 ios-arm64-simulator tvos-arm64 tvos-arm64-simulator macos-arm64; do
-    syms="$(nm -gUj "$OUT/$slice/$LIB" | sort -u)"
+    syms="$(nm -m -gU "$OUT/$slice/$LIB" | awk '/ external / && !/ private external / { print $NF }' | sort -u)"
+    unexpected="$(printf '%s\n' "$syms" | sed '/^_vortx_/d; /^$/d')"
+    [ -z "$unexpected" ] || { echo "unexpected public native exports in $slice: $unexpected" >&2; exit 1; }
     if echo "$syms" | grep -q '^_vortx_server_start$'; then kind=server-inclusive; else kind=kernel-only; fi
     echo "  $slice [$kind]: $(echo "$syms" | tr '\n' ' ')"
 done
