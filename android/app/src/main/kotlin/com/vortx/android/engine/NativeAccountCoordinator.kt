@@ -117,6 +117,7 @@ internal class NativeAccountCoordinator(
 
     private suspend fun publish(account: SessionOwnerSnapshot.Account, candidate: VortxNativeSession, isCurrent: () -> Boolean): Boolean {
         val next = Mounted(account, candidate)
+        // Authentication may take its own lock; never invoke it while holding lifecycleLock.
         val current = isCurrent() && accountCurrent(account)
         val installed = current && synchronized(lifecycleLock) { mounted.compareAndSet(null, next) }
         if (!installed) {
@@ -157,9 +158,14 @@ internal class NativeAccountCoordinator(
         // This carrier is immutable source evidence. It is deliberately not folded into the
         // historical aggregate before native reconciliation; each entry owns its own receipt.
         val websiteEvents = NativeWebsiteProfileEdits.events(document)
+        val legacyAggregate = document.opt("profileEdits").takeIf { value -> value != null && value != JSONObject.NULL &&
+            (value !is JSONObject || value.length() > 0) }
+        // The historical aggregate must never be folded by the broad legacy importer. Its narrow
+        // original-baseline reducer runs after the immutable host archive has durably committed.
+        val materialDocument = if (legacyAggregate == null) document else JSONObject(document.toString()).also { it.remove("profileEdits") }
         // Current authenticated legacy material is reconciled against the kernel's acknowledged
         // baseline. Unsupported/missing causal evidence rejects the complete candidate transaction.
-        val material = nativeLegacyMaterial(document, roster, resolved.modifiedSeconds)
+        val material = nativeLegacyMaterial(materialDocument, roster, resolved.modifiedSeconds)
         // Full descriptors may contain encoded custom strings. Retain exact typed input only if it
         // is credential-free; sanitizing it would silently change the shared kernel's receipt input.
         NativeHostDocument.requireCredentialFree(material)
@@ -182,6 +188,7 @@ internal class NativeAccountCoordinator(
             old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive,
                 remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost)
             websiteEvents.forEach { event -> old.session.applyWebsiteProfileEdit(event) }
+            legacyAggregate?.let { aggregate -> old.session.applyLegacyWebsiteAggregate(aggregate) }
             check(isCurrent()) { "Native account changed" }
             project(old.session)
             check(isCurrent() && accountCurrent(account) && mounted.get() === old) { "Native account changed" }
@@ -198,6 +205,8 @@ internal class NativeAccountCoordinator(
             initialHostPreferences = remoteHost, onMutation = onMutation) { accountCurrent(account) } }
             catch (error: Throwable) { (resources as? AutoCloseable)?.close(); throw error }
         try { websiteEvents.forEach { event -> candidate.applyWebsiteProfileEdit(event) } }
+        catch (error: Throwable) { candidate.close(); throw error }
+        try { legacyAggregate?.let { aggregate -> candidate.applyLegacyWebsiteAggregate(aggregate) } }
         catch (error: Throwable) { candidate.close(); throw error }
         try { checkpoints.remember(scope) }
         catch (error: Throwable) { candidate.close(); throw error }
