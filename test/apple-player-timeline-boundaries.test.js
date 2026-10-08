@@ -67,6 +67,20 @@ test("executable probe extracts production factories and editor bodies with actu
     }
 });
 
+test("accent-control regression compiles the extracted modifier and renders its opaque branches", () => {
+    const runner = fs.readFileSync(path.join(__dirname, "../scripts/test-apple-player-accent-controls.sh"), "utf8");
+    const harness = fs.readFileSync(path.join(__dirname, "../app/Tests/PlayerAccentControlsReduceTransparencyTests.swift"), "utf8");
+    for (const productionInput of ["PlayerControlReduceTransparencyOverrideKey",
+        "app/Tests/PlayerAccentControlsReduceTransparencyTests.swift", "xcrun swiftc -O -parse-as-library",
+        "private struct PlayerControlSurfaceModifier", "private struct PlayerControlButton:"]) {
+        assert(runner.includes(productionInput), `accent probe must compile ${productionInput}`);
+    }
+    for (const runtimeProbe of ["NSHostingView", "cacheDisplay(in: host.bounds, to: bitmap)",
+        "accent.alpha >= 0.98", "disabled surface must remain visually distinct"] ) {
+        assert(harness.includes(runtimeProbe), `accent probe must render ${runtimeProbe}`);
+    }
+});
+
 test("touch seek renders the stored style with a real adjustable 44pt interaction surface", () => {
     const styled = source.slice(source.indexOf("private struct PlayerStyledSeekSlider:"),
         source.indexOf("private struct PlayerBufferedBand:"));
@@ -130,15 +144,23 @@ test("player controls opt out of native button chrome and confine profile accent
         ".contentShape(shape)",
         ".shadow(color: .black.opacity(shadowOpacity)",
         "Theme.Palette.accent.opacity",
-        "guard isEnabled else { return .black.opacity(0.32) }",
-        "let alpha = reduceTransparency ? 0.32 : (active ? 0.28 : 0.17)"
+        "guard isEnabled else { return Theme.Palette.surface1 }",
+        "if reduceTransparency || prominent { return Theme.Palette.accent }",
+        "let alpha = active ? 0.28 : 0.17",
+        "return (prominent || reduceTransparency) ? Theme.Palette.onAccent : Theme.Palette.accent",
+        "guard isEnabled else { return Theme.Palette.textTertiary }",
+        "guard isEnabled else { return Theme.Palette.hairline }"
     ]) {
         assert(surface.includes(contract), `player surface contract: ${contract}`);
     }
+    assert(!surface.includes("reduceTransparency ? 0.32"),
+        "Reduce Transparency must not leave secondary surfaces translucent over video");
+    assert(!surface.includes("accent.opacity(0.32)"),
+        "Reduce Transparency must not use a translucent accent fill");
     assert(!surface.includes("shadow(color: Theme.Palette.accent"),
         "player surface must never cast an accent-colored outer shadow");
-    assert(surface.includes("prominent ? Theme.Palette.onAccent : Theme.Palette.accent"),
-        "solid primary face and secondary ink must use the profile-aware palette");
+    assert(surface.includes("(prominent || reduceTransparency) ? Theme.Palette.onAccent : Theme.Palette.accent"),
+        "solid primary face and Reduce Transparency secondary ink must use the profile-aware palette");
 
     const controls = [
         ["toolbar control", section("private struct PlayerControlButton:", "private struct PlayerTransportToolbar:")],

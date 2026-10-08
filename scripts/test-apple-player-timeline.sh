@@ -36,3 +36,4 @@ xcrun swiftc -O -parse-as-library \
   app/Tests/PlayerSeekTimelineConstructionTests.swift -o "$timeline_test_dir/construction"
 "$timeline_test_dir/construction"
 node --test test/apple-player-timeline-boundaries.test.js
+bash scripts/test-apple-player-accent-controls.sh

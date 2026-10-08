@@ -413,13 +413,30 @@ private struct PlayerSeekTimelineTrack: View {
 /// rectangle visible outside the control in the profile-accent screenshots. Keeping the presentation in
 /// one player-only modifier makes the plain-button contract explicit without changing shared browse/TV
 /// button styles or the global glass presets.
+private enum PlayerControlReduceTransparencyOverrideKey: EnvironmentKey {
+    static let defaultValue: Bool? = nil
+}
+
+private extension EnvironmentValues {
+    /// Testable player-only override; production callers inherit the system accessibility setting.
+    var playerControlReduceTransparencyOverride: Bool? {
+        get { self[PlayerControlReduceTransparencyOverrideKey.self] }
+        set { self[PlayerControlReduceTransparencyOverrideKey.self] = newValue }
+    }
+}
+
 private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
     let shape: S
     let prominent: Bool
     let active: Bool
 
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceTransparency) private var systemReduceTransparency
+    @Environment(\.playerControlReduceTransparencyOverride) private var reduceTransparencyOverride
     @Environment(\.isEnabled) private var isEnabled
+
+    private var reduceTransparency: Bool {
+        reduceTransparencyOverride ?? systemReduceTransparency
+    }
 
     func body(content: Content) -> some View {
         content
@@ -434,19 +451,24 @@ private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
     }
 
     private var fill: Color {
-        guard isEnabled else { return .black.opacity(0.32) }
-        if prominent { return Theme.Palette.accent }
-        let alpha = reduceTransparency ? 0.32 : (active ? 0.28 : 0.17)
+        // Reduce Transparency is a no-compositing contract here: every enabled player
+        // control must cover the moving video with an opaque profile-accent face.
+        guard isEnabled else { return Theme.Palette.surface1 }
+        if reduceTransparency || prominent { return Theme.Palette.accent }
+        let alpha = active ? 0.28 : 0.17
         return Theme.Palette.accent.opacity(alpha)
     }
 
     private var foreground: Color {
-        guard isEnabled else { return .white.opacity(0.38) }
-        return prominent ? Theme.Palette.onAccent : Theme.Palette.accent
+        guard isEnabled else { return Theme.Palette.textTertiary }
+        return (prominent || reduceTransparency) ? Theme.Palette.onAccent : Theme.Palette.accent
     }
 
     private var border: Color {
-        guard isEnabled else { return .white.opacity(0.14) }
+        guard isEnabled else { return Theme.Palette.hairline }
+        if reduceTransparency {
+            return prominent ? Theme.Palette.accentBright : Theme.Palette.accent
+        }
         return prominent
             ? Theme.Palette.accentBright.opacity(0.50)
             : Theme.Palette.accent.opacity(active ? 0.78 : 0.55)
