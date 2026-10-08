@@ -10,7 +10,7 @@ native_live_dir=$(mktemp -d "$PWD/app/build/native-live-abi.XXXXXX")
 # Generated import artifacts are retained under ignored build output, never added to public source.
 cp "$header" "$native_live_dir/vortx_ffi.h"
 printf 'module VortxEngine { header "vortx_ffi.h" export * }\n' > "$native_live_dir/module.modulemap"
-node test/native-resource-fixture-server.mjs test/fixtures/native-resource-contract.json "$native_live_dir/port" &
+node test/native-resource-fixture-server.mjs test/fixtures/native-resource-contract.json "$native_live_dir/port" "$native_live_dir/delay-meta" &
 fixture_pid=$!
 trap 'kill "$fixture_pid" 2>/dev/null || true; wait "$fixture_pid" 2>/dev/null || true' EXIT
 for attempt in {1..50}; do
@@ -30,7 +30,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
     "$native_live_dir/UserProfile.swift" "$native_live_dir/Discovery.swift" app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift app/SourcesShared/VortxNativeProfiles.swift app/SourcesShared/VortxNativeProviderCredentials.swift \
     app/Tests/VortxNativeLiveABITests.swift "$library" -o "$native_live_dir/live-abi"
 DYLD_LIBRARY_PATH="$(dirname "$library"):$(dirname "$library")/deps" \
-    "$native_live_dir/live-abi" test/fixtures/native-resource-contract.json "$(<"$native_live_dir/port")" "$native_live_dir/checkpoints"
+    "$native_live_dir/live-abi" test/fixtures/native-resource-contract.json "$(<"$native_live_dir/port")" "$native_live_dir/checkpoints" "$native_live_dir/delay-meta"
 test "$library_hash" = "$(shasum -a 256 "$library" | awk '{print $1}')"
 test "$header_hash" = "$(shasum -a 256 "$header" | awk '{print $1}')"
 printf 'Verified unchanged library %s\nVerified unchanged header %s\n' "$library_hash" "$header_hash"

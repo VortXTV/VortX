@@ -93,6 +93,56 @@ import CryptoKit
                                       watched: true, profileID: scope.ownerProfileID))
         await facade.settled()
         check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("tt-fixture:1:2")) == true)
+        // A catalog/library card has no resident detail inventory. Its isolated lookup must still
+        // issue the complete opaque-id batch, while leaving the visible detail slot unloaded.
+        try dispatch(["action": "Unload"], field: "meta_details")
+        let unloadedDetail = try field("meta_details")
+        check(unloadedDetail["metaItems"] == .array([]))
+        check(await facade.resolveAndSetWatchedVideos(metaID: "tt-fixture", type: "series", name: "Fixture", poster: nil,
+                                                       watched: false, profileID: scope.ownerProfileID))
+        await facade.settled()
+        check(try field("meta_details") == unloadedDetail)
+        check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("tt-fixture:1:2")) != true)
+        // An authoritative lookup failure must not submit even a partial watch transaction.
+        let playbackBeforeFailedResolution = try field("native_playback")
+        check(await !facade.resolveAndSetWatchedVideos(metaID: "tt-fixture", type: "movie", name: "Fixture", poster: nil,
+                                                        watched: true, profileID: scope.ownerProfileID))
+        await facade.settled()
+        check(try field("native_playback") == playbackBeforeFailedResolution)
+        // Start normal detail navigation, then resolve a card action. libraryMetadata owns a
+        // separate slot, so it cannot cancel or replace the in-flight meta_details request.
+        try dispatch(["action": "Load", "args": ["model": "MetaDetails", "args": ["metaPath": metaPath, "streamPath": streamPath]]], field: "meta_details")
+        let navigatingSelection = try field("meta_details")["selected"]
+        check(await facade.resolveAndSetWatchedVideos(metaID: "tt-fixture", type: "series", name: "Fixture", poster: nil,
+                                                       watched: true, profileID: scope.ownerProfileID))
+        await facade.settled()
+        check(try field("meta_details")["selected"] == navigatingSelection)
+        check(try field("meta_details")["streams"]?.array?.count == 1)
+        // Once the isolated lookup has captured its resource request, an add-on mutation can
+        // replace that registry before the watch batch is admitted. The stale resolver must
+        // reject and leave the pre-existing watched set exact.
+        let delayPath = CommandLine.arguments[4]
+        let temporaryURL = "http://127.0.0.1:\(port)/temporary/manifest.json"
+        let manifestObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(fixture["manifest"]!))
+        let temporaryDescriptor: [String: Any] = ["transportUrl": temporaryURL, "manifest": manifestObject]
+        check(FileManager.default.createFile(atPath: delayPath, contents: Data()))
+        let staleCardResolution = Task { await facade.resolveAndSetWatchedVideos(metaID: "tt-fixture", type: "series", name: "Fixture", poster: nil,
+                                                                                   watched: false, profileID: scope.ownerProfileID) }
+        let enteredPath = delayPath + ".entered"
+        for _ in 0..<100 where !FileManager.default.fileExists(atPath: enteredPath) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        check(FileManager.default.fileExists(atPath: enteredPath))
+        try dispatch(["action": "Ctx", "args": ["action": "InstallAddonLocal", "args": temporaryDescriptor]], field: "ctx")
+        await facade.settled()
+        try FileManager.default.removeItem(atPath: delayPath)
+        check(await !staleCardResolution.value)
+        await facade.settled()
+        check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("tt-fixture:1:2")) == true)
+        // Remove the temporary source before the next mutation. Its retained CRDT identity must
+        // not poison subsequent owner-bucket order reconstruction.
+        try dispatch(["action": "Ctx", "args": ["action": "UninstallAddonLocal", "args": temporaryDescriptor]], field: "ctx")
+        await facade.settled()
         // A native mutation republishes library, but must retain the selected type/sort even when
         // the matching type later has no rows.
         check(try field("library")["selectable"]?["sorts"]?.array?.contains { $0["sort"] == .string("name") && $0["selected"] == .bool(true) } == true)
@@ -148,7 +198,6 @@ import CryptoKit
         // Ctx add-on mutations use the exact kernel actions. Invalid new descriptors are rejected before
         // old membership is considered; replacement, order and removal are committed through one FIFO.
         let replacementURL = "http://127.0.0.1:\(port)/replacement/manifest.json"
-        let manifestObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(fixture["manifest"]!))
         let originalDescriptor: [String: Any] = ["transportUrl": addon.transportUrl, "manifest": manifestObject]
         let replacementDescriptor: [String: Any] = ["transportUrl": replacementURL, "manifest": manifestObject]
         let invalidReplacement: [String: Any] = ["action": "Ctx", "args": [
@@ -164,6 +213,34 @@ import CryptoKit
         try dispatch(["action": "Ctx", "args": ["action": "UninstallAddonLocal", "args": replacementDescriptor]], field: "ctx")
         await facade.settled()
         check(try field("ctx")["profile"]?["addons"] == .array([]))
+        // Removed identities remain in CRDT order. A fresh install and replacement must use the
+        // kernel's filtered-live ordering rather than reject that ordinary tombstone history.
+        let laterURL = "http://127.0.0.1:\(port)/later/manifest.json"
+        let laterDescriptor: [String: Any] = ["transportUrl": laterURL, "manifest": manifestObject]
+        try dispatch(["action": "Ctx", "args": ["action": "InstallAddonLocal", "args": laterDescriptor]], field: "ctx")
+        await facade.settled()
+        try dispatch(["action": "Ctx", "args": ["action": "ReplaceAddonLocal", "args": ["old": laterDescriptor, "new": originalDescriptor]]], field: "ctx")
+        await facade.settled()
+        check(try field("ctx")["profile"]?["addons"]?.array?.map { $0["transportUrl"] } == [.string(addon.transportUrl)])
+        // Kernel keys scheme/host case-insensitively but preserves descriptor spelling. A disabled
+        // uppercase-host source is hidden from resourceRegistry yet still must participate in the
+        // unfiltered owner-bucket replacement order.
+        let uppercaseURL = "http://LOCALHOST:\(port)/uppercase/manifest.json"
+        let uppercaseDescriptor: [String: Any] = ["transportUrl": uppercaseURL, "manifest": manifestObject]
+        try dispatch(["action": "Ctx", "args": ["action": "InstallAddonLocal", "args": uppercaseDescriptor]], field: "ctx")
+        await facade.settled()
+        let caseOnlyURL = "http://localhost:\(port)/uppercase/manifest.json"
+        let caseOnlyDescriptor: [String: Any] = ["transportUrl": caseOnlyURL, "manifest": manifestObject]
+        try dispatch(["action": "Ctx", "args": ["action": "ReplaceAddonLocal", "args": ["old": uppercaseDescriptor, "new": caseOnlyDescriptor]]], field: "ctx")
+        await facade.settled()
+        check(try field("ctx")["profile"]?["addons"]?.array?.map { $0["transportUrl"] } == [.string(addon.transportUrl), .string(caseOnlyURL)])
+        try dispatch(["action": "Vortx", "args": ["type": "patch_profile", "id": "kid",
+                                                        "edits": [["field": "disabledAddons", "value": [caseOnlyURL]]]]], field: "native_state")
+        await facade.settled()
+        check(try field("ctx")["profile"]?["addons"]?.array?.map { $0["transportUrl"] } == [.string(addon.transportUrl)])
+        try dispatch(["action": "Ctx", "args": ["action": "ReplaceAddonLocal", "args": ["old": caseOnlyDescriptor, "new": laterDescriptor]]], field: "ctx")
+        await facade.settled()
+        check(try field("ctx")["profile"]?["addons"]?.array?.map { $0["transportUrl"] } == [.string(addon.transportUrl), .string(laterURL)])
         let lastState = try await session.stateJSON()
         await facade.shutdown()
         let reopened = try VortxNativeSession(scope: scope, ownerName: "Fixture", abi: VortxCABI(), store: checkpoint, transport: VortxCResourceTransport())

@@ -843,20 +843,11 @@ final class CoreBridge: ObservableObject {
         guard addonMutationStillAllowed(mutationToken) else { return }
 #if VORTX_NATIVE_DATA_ENGINE
         if usesNativeProfileState {
-            // Native removal is only admitted by the facade after it has identified the active
-            // owner bucket.  Do not advance the legacy deletion carrier or start a sync push just
-            // because a Ctx request was constructed; wait for the FIFO's durable acknowledgement.
+            // Native removal owns its tombstone in the kernel's profile bucket.  The legacy
+            // tombstone carrier cannot certify an asynchronous native transaction, so do not
+            // write or publish it on this path.
             guard let raw = rawAddonsByUrl[descriptor.transportUrl],
-                  dispatchCtx(["action": addonMutationAction("UninstallAddon", local: "UninstallAddonLocal"), "args": raw]),
-                  let facade = nativeFacade else { return }
-            guard tombstone, !descriptor.isProtected else { return }
-            Task { @MainActor [weak self, facade] in
-                await facade.settled()
-                guard let self, self.addonMutationStillAllowed(mutationToken),
-                      !self.addons.contains(where: { $0.transportUrl == descriptor.transportUrl }) else { return }
-                AddonTombstones.tombstone(descriptor.transportUrl)
-                _ = await VortXSyncManager.shared.pushThisDevice()
-            }
+                  dispatchCtx(["action": addonMutationAction("UninstallAddon", local: "UninstallAddonLocal"), "args": raw]) else { return }
             return
         }
 #endif
@@ -1044,10 +1035,13 @@ final class CoreBridge: ObservableObject {
         guard installConfirmed else {
             return .failed(retryable: true, message: "Install did not confirm. Check your connection and try again.")
         }
-#if VORTX_NATIVE_DATA_ENGINE
-        if usesNativeProfileState { AddonTombstones.forget(identityURL.absoluteString) }
-#endif
         if let replacingDescriptor, replacingDescriptor.transportUrl != identityURL.absoluteString {
+#if VORTX_NATIVE_DATA_ENGINE
+            // The native replacement committed the old identity's CRDT tombstone atomically with
+            // the new descriptor and order.  Do not mutate the legacy carrier from a published
+            // view that can lag or omit disabled membership.
+            if usesNativeProfileState { return .installed }
+#endif
             guard addonMutationStillAllowed(mutationToken) else {
                 return .failed(retryable: true, message: Self.accountTransitionMessage)
             }

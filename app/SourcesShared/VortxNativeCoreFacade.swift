@@ -82,11 +82,16 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// Caller-confirmed registry replacement is bound to the accepted account/profile generation.
     /// New loads stay rejected during replacement; all previous resource publications are revoked.
     func rebindRegistry(_ replacement: [VortxResourceAddon], expected: RegistryBinding) async throws {
-        let admitted = lock.withLock { () -> Bool in
-            guard Set(replacement.map(\.id)).count == replacement.count, registryBinding == expected else { return false }
-            invalidateResourcePublications(); return true
+        let admission = lock.withLock { () -> (Bool, Task<Void, Never>?) in
+            guard Set(replacement.map(\.id)).count == replacement.count, registryBinding == expected else { return (false, nil) }
+            // A watched-card admission may already have passed its lock check and be waiting to
+            // enter the session actor. Wait for that exact FIFO member before invalidating the
+            // resource host; otherwise a rebind can land between the facade check and dispatch.
+            let predecessor = tasks["native_state"]
+            invalidateResourcePublications(); return (true, predecessor)
         }
-        guard admitted else { throw VortxNativeError.superseded }
+        guard admission.0 else { throw VortxNativeError.superseded }
+        await admission.1?.value
         await session.invalidateResources()
         let accepted = lock.withLock { () -> Bool in
             guard !closed, expected.scope == session.scope, expected.generation == registryGeneration,
@@ -148,6 +153,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func enqueueMutation(type: String, raw: String, legacyMaterial: Data? = nil,
                                  actions: [String]? = nil, hostRemote: VortxJSON? = nil,
                                  hostEdits: [VortxNativeHostPreferences.Edit] = [],
+                                 admission: (@Sendable () -> Bool)? = nil,
                                  completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
         let predecessor = tasks["native_state"]
@@ -163,6 +169,14 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             var durableCommitted = false
             do {
                 try Task.checkCancellation()
+                // Resource-backed gestures may wait behind an add-on/profile mutation.  Their
+                // metadata was accepted for an earlier registry generation, so revalidate at
+                // the FIFO boundary rather than treating the pre-enqueue check as durable.
+                guard admission?() ?? true else {
+                    _ = self.fail("stale_native_mutation")
+                    completion?(.failure(VortxNativeError.superseded))
+                    return
+                }
                 _ = try await session.dispatch(actions ?? [raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial,
                                                hostRemote: hostRemote, hostEdits: hostEdits)
                 durableCommitted = true
@@ -206,6 +220,20 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             }
         }
         return true
+    }
+    /// Resource-backed public actions need a durable result, unlike synchronous UI wires whose
+    /// Bool only reports admission.  In particular, a registry may change while this intent is
+    /// waiting behind another state mutation; report that rejection to the card caller.
+    private func enqueueWatchedMutation(type: String, actions: [String], admission: @escaping @Sendable () -> Bool) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let admitted = enqueueMutation(type: type, raw: "", actions: actions, admission: admission) { result in
+                switch result {
+                case .success: continuation.resume(returning: true)
+                case .failure: continuation.resume(returning: false)
+                }
+            }
+            if !admitted { continuation.resume(returning: false) }
+        }
     }
     /// Merge the fresh authenticated remote carrier and export only the accepted CRDT document.
     /// This shares the exact FIFO with profile/progress intents; a stale read cannot overwrite a
@@ -281,6 +309,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
               Set(uniqueIDs).isSubset(of: Set(inventory)) else {
             return fail("stale_or_empty_watched_inventory")
         }
+        let generation = registryGeneration
         do {
             let actions = try uniqueIDs.map { videoID -> String in
                 let action: VortxJSON = .object([
@@ -290,7 +319,17 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 ])
                 return String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
             }
-            return enqueueMutation(type: watched ? "mark_watched" : "reset_watched", raw: "", actions: actions)
+            return enqueueMutation(type: watched ? "mark_watched" : "reset_watched", raw: "", actions: actions,
+                                   admission: { [weak self] in
+                guard let self else { return false }
+                return self.lock.withLock {
+                    guard !self.closed, self.pendingProfileTransitions == 0,
+                          self.resourceRegistryValid, self.registryGeneration == generation,
+                          self.values["native_state"]?["activeProfileId"] == .string(profileID),
+                          let current = self.acceptedMetadataInventory(metaID: metaID, type: type) else { return false }
+                    return Set(uniqueIDs).isSubset(of: Set(current))
+                }
+            })
         } catch { return fail("invalid_watched_inventory") }
     }
     /// Card actions may not have a resident detail page. Resolve their exact metadata through the
@@ -304,24 +343,35 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return (registryGeneration, registry)
         }
         guard let captured else { return fail("stale_watched_resolution") }
-        let request = VortxResourceRequest(resource: .meta, type: type, id: metaID)
-        guard let projection = try? await session.loadMeta(request: request, stream: nil, addons: captured.1),
-              let meta = projection["metaItems"]?.array?.compactMap({ $0["content"]?["content"] }).first(where: { $0["id"] == .string(metaID) && $0["type"] == .string(type) }) else {
+        // libraryMetadata owns a unique resource-host slot.  In particular, this must not use
+        // loadMeta: that owns the visible meta_details slot and would cancel/clobber navigation.
+        guard let meta = try? await session.libraryMetadata(id: metaID, type: type, profileID: profileID, addons: captured.1) else {
             return fail("watched_metadata_unavailable")
         }
         let ids = (meta["videos"]?.array ?? []).filter { season == nil || (try? $0["season"]?.decode(Int.self)) == season }.compactMap { string($0["id"]) }
         guard !ids.isEmpty else { return fail("watched_metadata_unavailable") }
-        return lock.withLock {
+        let actions: [String]? = lock.withLock {
             guard !closed, pendingProfileTransitions == 0, registryGeneration == captured.0,
-                  values["native_state"]?["activeProfileId"] == .string(profileID) else { return fail("stale_watched_resolution") }
+                  values["native_state"]?["activeProfileId"] == .string(profileID) else {
+                _ = fail("stale_watched_resolution"); return nil
+            }
             do {
-                let actions = try Array(Set(ids)).sorted().map { videoID in
+                return try Array(Set(ids)).sorted().map { videoID in
                     let action: VortxJSON = .object(["type": .string(watched ? "mark_watched" : "reset_watched"), "metaId": .string(metaID), "videoId": .string(videoID), "name": .string(name), "metadata": .object(["type": .string(type), "poster": poster.map(VortxJSON.string) ?? .null])])
                     return String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
                 }
-                return enqueueMutation(type: watched ? "mark_watched" : "reset_watched", raw: "", actions: actions)
-            } catch { return fail("invalid_watched_inventory") }
+            } catch { _ = fail("invalid_watched_inventory"); return nil }
         }
+        guard let actions else { return false }
+        return await enqueueWatchedMutation(type: watched ? "mark_watched" : "reset_watched", actions: actions,
+                                            admission: { [weak self] in
+            guard let self else { return false }
+            return self.lock.withLock {
+                !self.closed && self.pendingProfileTransitions == 0 && self.resourceRegistryValid
+                    && self.registryGeneration == captured.0
+                    && self.values["native_state"]?["activeProfileId"] == .string(profileID)
+            }
+        })
     }
     /// Metadata comes only from the accepted native registry. The return value acknowledges the
     /// durable FIFO add, not merely HTTP success or UI dispatch. Legacy recovery may only confirm
@@ -561,11 +611,18 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// immutable transport identity and the manifest's required human/API identity here as well,
     /// because a raw Ctx action can otherwise bypass that async installer boundary.
     private func addonDescriptor(_ value: VortxJSON?) -> (url: String, addon: VortxJSON)? {
-        guard let url = string(value?["transportUrl"]), let parts = URLComponents(string: url),
-              ["http", "https"].contains(parts.scheme?.lowercased() ?? ""), parts.host != nil,
+        guard let url = string(value?["transportUrl"]), addonMemberKey(url) != nil,
               let manifest = value?["manifest"], case .object = manifest,
               let id = string(manifest["id"]), !id.isEmpty, let name = string(manifest["name"]), !name.isEmpty else { return nil }
         return (url, .object(["transportUrl": .string(url), "manifest": manifest]))
+    }
+    /// Kernel membership keys fold only URL scheme and host. The descriptor keeps the original
+    /// transport URL, including path and presentation casing, for actions and resource hosting.
+    private func addonMemberKey(_ url: String) -> String? {
+        guard var parts = URLComponents(string: url), let scheme = parts.scheme?.lowercased(),
+              ["http", "https"].contains(scheme), let host = parts.host, !host.isEmpty else { return nil }
+        parts.scheme = scheme; parts.host = host.lowercased()
+        return parts.string
     }
     private func dispatchAddonMutation(subaction: String, args: VortxJSON?) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -577,14 +634,16 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         do {
             switch subaction {
             case "InstallAddon", "InstallAddonLocal":
-                guard let descriptor = addonDescriptor(args), !current.contains(descriptor.url) else {
+                guard let descriptor = addonDescriptor(args), let identity = addonMemberKey(descriptor.url),
+                      !current.contains(where: { addonMemberKey($0) == identity }) else {
                     return fail("invalid_or_duplicate_addon")
                 }
                 return enqueueMutation(type: "install_addon", raw: try raw(.object([
                     "type": .string("install_addon"), "profileId": .string(owner), "addon": descriptor.addon,
                 ])))
             case "UninstallAddon", "UninstallAddonLocal":
-                guard let descriptor = addonDescriptor(args), current.contains(descriptor.url) else {
+                guard let descriptor = addonDescriptor(args), let identity = addonMemberKey(descriptor.url),
+                      current.contains(where: { addonMemberKey($0) == identity }) else {
                     return fail("unknown_addon_identity")
                 }
                 return enqueueMutation(type: "remove_addon", raw: try raw(.object([
@@ -595,15 +654,19 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 // the whole list against one throwaway runtime, so an install/reorder failure leaves
                 // the old membership, order and visible registry untouched.
                 guard let old = addonDescriptor(args?["old"]), let new = addonDescriptor(args?["new"]),
-                      let oldIndex = current.firstIndex(of: old.url),
-                      (old.url == new.url || !current.contains(new.url)) else {
+                      let oldIdentity = addonMemberKey(old.url), let newIdentity = addonMemberKey(new.url),
+                      let oldIndex = current.firstIndex(where: { addonMemberKey($0) == oldIdentity }),
+                      (oldIdentity == newIdentity || !current.contains(where: { addonMemberKey($0) == newIdentity })) else {
                     return fail("invalid_addon_replacement")
                 }
                 var order = current; order[oldIndex] = new.url
                 let install = VortxJSON.object(["type": .string("install_addon"), "profileId": .string(owner), "addon": new.addon])
                 let remove = VortxJSON.object(["type": .string("remove_addon"), "profileId": .string(owner), "transportUrl": .string(old.url)])
                 let reorder = VortxJSON.object(["type": .string("reorder_addons"), "profileId": .string(owner), "transportUrls": .array(order.map(VortxJSON.string))])
-                let actions = old.url == new.url ? [remove, install, reorder] : [install, remove, reorder]
+                // Case-only scheme/host changes address one kernel membership key. Remove that
+                // key before installing its replacement; install-then-remove would tombstone the
+                // newly written record and make the following canonical reorder fail.
+                let actions = oldIdentity == newIdentity ? [remove, install, reorder] : [install, remove, reorder]
                 return enqueueMutation(type: "replace_addon", raw: "", actions: try actions.map(raw))
             default: return fail("unsupported_addon_mutation")
             }
@@ -613,19 +676,22 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// owner-bucket identity exactly once, so mutation order comes from the unfiltered CRDT map.
     private func installedAddonURLs(state: VortxJSON, owner: String) -> [String]? {
         guard case .object(let records) = state["nativeSync"]?["addons"]?[owner]?["records"] else { return nil }
-        let live = records.compactMap { key, record -> (String, UInt64)? in
-            guard record["removedAt"] == .integer(0) || record["removedAt"] == .unsigned(0),
-                  case .object = record["value"], let url = string(record["value"]?["transportUrl"]), url == key,
-                  let addedAt = try? record["addedAt"]?.decode(UInt64.self) else { return nil }
-            return (url, addedAt)
+        let live = records.compactMap { key, record -> (String, String, UInt64)? in
+            guard case .object = record["value"], let url = string(record["value"]?["transportUrl"]), addonMemberKey(url) == key,
+                  let addedAt = try? record["addedAt"]?.decode(UInt64.self),
+                  let removedAt = try? record["removedAt"]?.decode(UInt64.self), addedAt > removedAt else { return nil }
+            return (key, url, addedAt)
         }
-        guard live.count == records.values.filter({ $0["removedAt"] == .integer(0) || $0["removedAt"] == .unsigned(0) }).count else { return nil }
-        let liveSet = Set(live.map(\.0))
-        let order = state["nativeSync"]?["addons"]?[owner]?["order"]?["ids"]?.array?.compactMap(string) ?? []
-        guard Set(order).isSubset(of: liveSet), Set(order).count == order.count else { return nil }
+        let liveByKey = Dictionary(uniqueKeysWithValues: live.map { ($0.0, ($0.1, $0.2)) })
+        guard liveByKey.count == live.count else { return nil }
+        // CRDT order retains removed identities. Mirror the kernel: retain only still-live ids,
+        // then append live records which have not yet entered the retained order.
+        let order = (state["nativeSync"]?["addons"]?[owner]?["order"]?["ids"]?.array?.compactMap(string) ?? [])
+            .filter { liveByKey[$0] != nil }
         let ordered = Set(order)
-        let remaining = live.filter { !ordered.contains($0.0) }.sorted { $0.1 == $1.1 ? $0.0 < $1.0 : $0.1 < $1.1 }.map(\.0)
-        return order + remaining
+        let remaining = live.filter { !ordered.contains($0.0) }
+            .sorted { $0.2 == $1.2 ? $0.0 < $1.0 : $0.2 < $1.2 }.map(\.0)
+        return order.compactMap { liveByKey[$0]?.0 } + remaining.compactMap { liveByKey[$0]?.0 }
     }
     private func acceptedMetadataInventory(metaID: String, type: String) -> [String]? {
         guard let detail = values["meta_details"], detail["selected"]?["metaPath"]?["id"] == .string(metaID),

@@ -250,7 +250,7 @@ check(installAddon.contains("let mutationToken = capturePublicationToken()")
                 && !installAddon.contains("dispatchCtx([\"action\": \"UninstallAddon\", \"args\": existing])")
                 && installAddon.contains("let clearTombstoneBeforeDispatch")
                 && installAddon.contains("guard !self.usesNativeProfileState else { return }")
-                && installAddon.contains("if usesNativeProfileState { AddonTombstones.forget(identityURL.absoluteString) }")
+                && !installAddon.contains("if usesNativeProfileState { AddonTombstones.forget(identityURL.absoluteString) }")
                 && installAddon.contains("AddonTombstones.forget(identityURL.absoluteString)"),
               "installer rechecks after awaits and atomically replaces without pre-uninstall or premature native tombstone changes")
 check(hydrateAddons.contains("guard !owned.isEmpty, addonMutationStillAllowed(mutationToken) else { return }")
