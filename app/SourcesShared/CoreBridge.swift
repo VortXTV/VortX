@@ -94,16 +94,21 @@ final class CoreBridge: ObservableObject {
     /// episodes.  The facade sends this list as one checkpointed kernel transaction.
     private func nativeWatchedInventoryIntent(id: String, videoIDs: [String], name: String, type: String,
                                               poster: String?, watched: Bool, target: PlaybackMutationTarget? = nil) {
-        guard let (facade, profile) = nativePlaybackBinding(target ?? .capture(core: self)) else { return }
+        let target = target ?? .capture(core: self)
+        guard let (facade, profile) = nativePlaybackBinding(target),
+              case .native(let binding?) = target, let epoch = binding.accountGeneration else { return }
         _ = facade.setWatchedVideos(metaID: id, videoIDs: videoIDs, name: name, type: type, poster: poster,
-                                    watched: watched, profileID: profile.uuidString)
+                                    watched: watched, profileID: profile.uuidString, expectedAccountGeneration: epoch)
     }
     private func resolveNativeWatchedInventory(id: String, name: String, type: String, poster: String?, watched: Bool,
                                                season: Int? = nil, target: PlaybackMutationTarget? = nil) {
-        guard let (facade, profile) = nativePlaybackBinding(target ?? .capture(core: self)) else { return }
+        let target = target ?? .capture(core: self)
+        guard let (facade, profile) = nativePlaybackBinding(target),
+              case .native(let binding?) = target, let epoch = binding.accountGeneration else { return }
         Task { [weak facade] in
             _ = await facade?.resolveAndSetWatchedVideos(metaID: id, type: type, name: name, poster: poster,
-                                                          watched: watched, profileID: profile.uuidString, season: season)
+                                                          watched: watched, profileID: profile.uuidString,
+                                                          expectedAccountGeneration: epoch, season: season)
         }
     }
     private func nativeDismissContinueWatching(id: String, target: PlaybackMutationTarget? = nil) {

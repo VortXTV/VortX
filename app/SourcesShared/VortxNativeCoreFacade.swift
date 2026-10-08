@@ -351,8 +351,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// actions deliberately contain only opaque IDs supplied by the current metadata response:
     /// a title-level mark would incorrectly claim future or unavailable episodes are watched.
     func setWatchedVideos(metaID: String, videoIDs: [String], name: String, type: String, poster: String?, watched: Bool,
-                          profileID: String) -> Bool {
+                          profileID: String, expectedAccountGeneration: UUID) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        guard accountEpoch == expectedAccountGeneration else { return fail("stale_watched_account") }
         let uniqueIDs = Array(Set(videoIDs.filter { !$0.isEmpty })).sorted()
         guard !closed, pendingProfileTransitions == 0,
               values["native_state"]?["activeProfileId"] == .string(profileID), !uniqueIDs.isEmpty,
@@ -374,7 +375,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                    admission: { [weak self] in
                 guard let self else { return false }
                 return self.lock.withLock {
-                    guard !self.closed, self.pendingProfileTransitions == 0,
+                    guard !self.closed, self.accountEpoch == expectedAccountGeneration, self.pendingProfileTransitions == 0,
                           self.resourceRegistryValid, self.registryGeneration == generation,
                           self.values["native_state"]?["activeProfileId"] == .string(profileID),
                           let current = self.acceptedMetadataInventory(metaID: metaID, type: type) else { return false }
@@ -387,9 +388,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// native resource host without publishing into the navigation slot, then recheck the captured
     /// profile and registry generation before one atomic episode transaction is admitted.
     func resolveAndSetWatchedVideos(metaID: String, type: String, name: String, poster: String?, watched: Bool,
-                                    profileID: String, season: Int? = nil) async -> Bool {
+                                    profileID: String, expectedAccountGeneration: UUID, season: Int? = nil) async -> Bool {
         let captured: (UUID, [VortxResourceAddon])? = lock.withLock {
-            guard !closed, pendingProfileTransitions == 0, resourceRegistryValid,
+            guard !closed, accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0, resourceRegistryValid,
                   values["native_state"]?["activeProfileId"] == .string(profileID) else { return nil }
             return (registryGeneration, registry)
         }
@@ -402,7 +403,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let ids = (meta["videos"]?.array ?? []).filter { season == nil || (try? $0["season"]?.decode(Int.self)) == season }.compactMap { string($0["id"]) }
         guard !ids.isEmpty else { return fail("watched_metadata_unavailable") }
         let actions: [String]? = lock.withLock {
-            guard !closed, pendingProfileTransitions == 0, registryGeneration == captured.0,
+            guard !closed, accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0, registryGeneration == captured.0,
                   values["native_state"]?["activeProfileId"] == .string(profileID) else {
                 _ = fail("stale_watched_resolution"); return nil
             }
@@ -418,7 +419,8 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                             admission: { [weak self] in
             guard let self else { return false }
             return self.lock.withLock {
-                !self.closed && self.pendingProfileTransitions == 0 && self.resourceRegistryValid
+                !self.closed && self.accountEpoch == expectedAccountGeneration
+                    && self.pendingProfileTransitions == 0 && self.resourceRegistryValid
                     && self.registryGeneration == captured.0
                     && self.values["native_state"]?["activeProfileId"] == .string(profileID)
             }

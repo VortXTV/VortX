@@ -356,6 +356,17 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
             authenticatedSourceArchive: VortxNativeOwnAccountProducer.archive([sourceB]))
         let stateB = try state(), diskB = try store.read(scope: scope)
         check(stateB["libraries"]?[own.id.uuidString]?["items"]?.array?.first?["id"] == .string("only-B"))
+        // A UI gesture can remain queued until after a same-profile A→B rebind has completed.
+        // Its captured epoch must fail before either resident inventory or a fresh B lookup can
+        // turn that old gesture into a watched mutation in B's bucket.
+        check(!facade.setWatchedVideos(metaID: "stale-A-series", videoIDs: ["opaque-A-episode"], name: "Old A", type: "series", poster: nil,
+                                      watched: true, profileID: own.id.uuidString, expectedAccountGeneration: epochA))
+        check(facade.lastFailure == "stale_watched_account")
+        check(await !facade.resolveAndSetWatchedVideos(metaID: "stale-A-series", type: "series", name: "Old A", poster: nil,
+                                                      watched: true, profileID: own.id.uuidString, expectedAccountGeneration: epochA))
+        check(facade.lastFailure == "stale_watched_resolution")
+        await facade.settled()
+        check(try state() == stateB && store.read(scope: scope) == diskB)
         check(try VortxNativeAccountCredentials.selectedSlot(scope: scope.account, profileID: own.id,
             binding: VortxNativeProfiles.expectedBinding(state: stateB, profileID: own.id).document) == credentialB)
         let staleCAS = try VortxNativeProfiles.AccountRebindRequest(scope: scope.account, ownerProfileID: scope.ownerProfileID,

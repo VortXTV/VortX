@@ -87,10 +87,10 @@ import CryptoKit
         check(try field("meta_details")["selected"] == detailBeforeAutoAdd["selected"])
         check(try field("meta_details")["metaItems"] == detailBeforeAutoAdd["metaItems"])
         check(!facade.setWatchedVideos(metaID: "tt-fixture", videoIDs: ["fabricated-episode"], name: "Fixture", type: "series", poster: nil,
-                                       watched: true, profileID: scope.ownerProfileID))
+                                       watched: true, profileID: scope.ownerProfileID, expectedAccountGeneration: facade.accountGeneration))
         check(facade.lastFailure == "stale_or_empty_watched_inventory")
         check(facade.setWatchedVideos(metaID: "tt-fixture", videoIDs: ["tt-fixture:1:2"], name: "Fixture", type: "series", poster: nil,
-                                      watched: true, profileID: scope.ownerProfileID))
+                                      watched: true, profileID: scope.ownerProfileID, expectedAccountGeneration: facade.accountGeneration))
         await facade.settled()
         check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("tt-fixture:1:2")) == true)
         // A catalog/library card has no resident detail inventory. Its isolated lookup must still
@@ -99,14 +99,14 @@ import CryptoKit
         let unloadedDetail = try field("meta_details")
         check(unloadedDetail["metaItems"] == .array([]))
         check(await facade.resolveAndSetWatchedVideos(metaID: "tt-fixture", type: "series", name: "Fixture", poster: nil,
-                                                       watched: false, profileID: scope.ownerProfileID))
+                                                       watched: false, profileID: scope.ownerProfileID, expectedAccountGeneration: facade.accountGeneration))
         await facade.settled()
         check(try field("meta_details") == unloadedDetail)
         check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("tt-fixture:1:2")) != true)
         // An authoritative lookup failure must not submit even a partial watch transaction.
         let playbackBeforeFailedResolution = try field("native_playback")
         check(await !facade.resolveAndSetWatchedVideos(metaID: "tt-fixture", type: "movie", name: "Fixture", poster: nil,
-                                                        watched: true, profileID: scope.ownerProfileID))
+                                                        watched: true, profileID: scope.ownerProfileID, expectedAccountGeneration: facade.accountGeneration))
         await facade.settled()
         check(try field("native_playback") == playbackBeforeFailedResolution)
         // Start normal detail navigation, then resolve a card action. libraryMetadata owns a
@@ -114,7 +114,7 @@ import CryptoKit
         try dispatch(["action": "Load", "args": ["model": "MetaDetails", "args": ["metaPath": metaPath, "streamPath": streamPath]]], field: "meta_details")
         let navigatingSelection = try field("meta_details")["selected"]
         check(await facade.resolveAndSetWatchedVideos(metaID: "tt-fixture", type: "series", name: "Fixture", poster: nil,
-                                                       watched: true, profileID: scope.ownerProfileID))
+                                                       watched: true, profileID: scope.ownerProfileID, expectedAccountGeneration: facade.accountGeneration))
         await facade.settled()
         check(try field("meta_details")["selected"] == navigatingSelection)
         check(try field("meta_details")["streams"]?.array?.count == 1)
@@ -126,8 +126,10 @@ import CryptoKit
         let manifestObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(fixture["manifest"]!))
         let temporaryDescriptor: [String: Any] = ["transportUrl": temporaryURL, "manifest": manifestObject]
         check(FileManager.default.createFile(atPath: delayPath, contents: Data()))
+        let watchedAccountEpoch = facade.accountGeneration
         let staleCardResolution = Task { await facade.resolveAndSetWatchedVideos(metaID: "tt-fixture", type: "series", name: "Fixture", poster: nil,
-                                                                                   watched: false, profileID: scope.ownerProfileID) }
+                                                                                   watched: false, profileID: scope.ownerProfileID,
+                                                                                   expectedAccountGeneration: watchedAccountEpoch) }
         let enteredPath = delayPath + ".entered"
         for _ in 0..<100 where !FileManager.default.fileExists(atPath: enteredPath) {
             try await Task.sleep(for: .milliseconds(10))

@@ -98,6 +98,14 @@ let nativeTarget = section(accountSource, from: "static func capture(core:", unt
 let nativeSave = section(accountSource, from: "func saveProgress(for", until: "/// Fetch a single library item")
 let nativeResume = section(accountSource, from: "func resumeOffset(for", until: "/// Upsert the library item")
 let nativeBinding = section(bridge, from: "func captureNativePlaybackTarget", until: "@MainActor @discardableResult")
+let watchedInventoryIntent = section(bridge, from: "private func nativeWatchedInventoryIntent", until: "private func resolveNativeWatchedInventory")
+let watchedInventoryResolution = section(bridge, from: "private func resolveNativeWatchedInventory", until: "private func nativeDismissContinueWatching")
+check(watchedInventoryIntent.contains("let epoch = binding.accountGeneration")
+      && watchedInventoryIntent.contains("expectedAccountGeneration: epoch"),
+      "resident watched inventory keeps the gesture's captured account epoch")
+check(appearsBefore("let epoch = binding.accountGeneration", "Task {", in: watchedInventoryResolution)
+      && watchedInventoryResolution.contains("expectedAccountGeneration: epoch"),
+      "deferred watched inventory captures account epoch before scheduling its task")
 for start in ["func add(_ profile:", "func update(_ profile:", "func remove(_ profile:", "func select(_ profile:"] {
     let admission = section(profileSource, from: start, until: "#endif")
     check(appearsBefore("let target = CoreBridge.shared.captureNativePlaybackTarget()", "Task { @MainActor", in: admission)
