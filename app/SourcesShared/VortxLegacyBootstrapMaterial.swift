@@ -269,7 +269,7 @@ enum VortxLegacyBootstrapMaterial {
             guard let envelope = try JSONSerialization.jsonObject(with: source) as? Object,
                   Set(envelope.keys) == ["schemaVersion", "libraryResponseBase64", "addonsResponseBase64", "profileOverlayBase64"],
                   let version = envelope["schemaVersion"] as? NSNumber,
-                  CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 1,
+                  CFGetTypeID(version) != CFBooleanGetTypeID(), (version.intValue == 1 || version.intValue == 2),
                   Double(version.intValue) == version.doubleValue,
                   let libraryBase64 = envelope["libraryResponseBase64"] as? String,
                   let addonsBase64 = envelope["addonsResponseBase64"] as? String,
@@ -415,6 +415,10 @@ enum VortxLegacyBootstrapMaterial {
                             "Own-account source has an invalid document digest")
                 try require(source.profileOverlaySHA256 == nil || source.profileOverlaySHA256!.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
                             "Own-account source has an invalid overlay witness")
+                let envelopeVersion = try Self.ownAccountEnvelopeVersion(source.sourceDocument)
+                try require(envelopeVersion == 1 || envelopeVersion == 2, "Own-account source has an unsupported envelope version")
+                try require(envelopeVersion == 2 ? source.profileOverlaySHA256 != nil : source.profileOverlaySHA256 == nil,
+                            envelopeVersion == 2 ? "Own-account source v2 requires an overlay witness" : "Own-account source v1 cannot invent an overlay witness")
                 if let witness = source.profileOverlaySHA256 {
                     try require(witness == Self.envelopeOverlayWitness(source.sourceDocument),
                                 "Own-account source overlay witness does not match its exact envelope")
@@ -460,6 +464,13 @@ enum VortxLegacyBootstrapMaterial {
                   let raw = envelope["profileOverlayBase64"] as? String, let bytes = Data(base64Encoded: raw),
                   bytes.base64EncodedString() == raw else { throw fail("Own-account source envelope lacks an exact overlay") }
             return try VortxProfileOverlayWitness.digest(json: bytes)
+        }
+
+        private static func ownAccountEnvelopeVersion(_ source: Data) throws -> Int {
+            guard let envelope = try JSONSerialization.jsonObject(with: source) as? Object,
+                  let version = envelope["schemaVersion"] as? NSNumber, CFGetTypeID(version) != CFBooleanGetTypeID(),
+                  Double(version.intValue) == version.doubleValue else { throw fail("Own-account source envelope is malformed") }
+            return version.intValue
         }
 
         /// A cold peer can retain only the kernel-validated typed tuple. The caller has already

@@ -44,7 +44,7 @@ enum VortxLegacyBootstrapMaterialTests {
     /// Models the producer boundary exactly: independently authenticated Stremio response bodies
     /// are retained byte-for-byte and put behind a small, token-free carrier. The bootstrapper
     /// never accepts a flattened host reconstruction as account proof.
-    static func ownSourceEnvelope(libraryRows: [Object], addons: [Object], profileOverlay: Object = [:],
+    static func ownSourceEnvelope(schemaVersion: Int = 1, libraryRows: [Object], addons: [Object], profileOverlay: Object = [:],
                                   libraryResponseExtra: Object = [:], addonsResponseExtra: Object = [:], extraEnvelope: Object = [:]) throws -> Data {
         var libraryResponseObject: Object = ["result": libraryRows]
         var addonsResponseObject: Object = ["result": ["addons": addons]]
@@ -53,7 +53,7 @@ enum VortxLegacyBootstrapMaterialTests {
         let libraryResponse = try JSONSerialization.data(withJSONObject: libraryResponseObject, options: [.sortedKeys])
         let addonsResponse = try JSONSerialization.data(withJSONObject: addonsResponseObject, options: [.sortedKeys])
         let overlayResponse = try JSONSerialization.data(withJSONObject: profileOverlay, options: [.sortedKeys])
-        var envelope: Object = ["schemaVersion": 1,
+        var envelope: Object = ["schemaVersion": schemaVersion,
                                 "libraryResponseBase64": libraryResponse.base64EncodedString(),
                                 "addonsResponseBase64": addonsResponse.base64EncodedString(),
                                 "profileOverlayBase64": overlayResponse.base64EncodedString()]
@@ -114,6 +114,13 @@ enum VortxLegacyBootstrapMaterialTests {
         let receipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
             verifiedStreamingUID: "verified-own-uid", sourceDocument: sourceBytes)
         let root = doc(["library": [movie("tt-root", position: 1)]])
+
+        let emptyOverlay = try JSONSerialization.data(withJSONObject: Object(), options: [.sortedKeys])
+        let witnessedV2 = try ownSourceEnvelope(schemaVersion: 2, libraryRows: [ownMovie], addons: [ownAddon])
+        let witness = try VortxProfileOverlayWitness.digest(json: emptyOverlay)
+        _ = try material(root, roster: [owner, own], ownAccountSources: [.init(profileID: own.id, verifiedStreamingUID: "verified-own-uid", sourceDocument: witnessedV2, profileOverlaySHA256: witness)])
+        do { _ = try material(root, roster: [owner, own], ownAccountSources: [.init(profileID: own.id, verifiedStreamingUID: "verified-own-uid", sourceDocument: witnessedV2)]) ; preconditionFailure("v2 witness omitted") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired { check(error.reason.contains("v2 requires"), "Fresh v2 source requires its raw-slice witness") }
 
         do { _ = try material(root, roster: [owner, own]); preconditionFailure("own account without source imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
