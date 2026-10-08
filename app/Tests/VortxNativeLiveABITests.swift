@@ -279,6 +279,25 @@ import CryptoKit
             "watches": .object([child.id.uuidString: .array([])]), "identityLinks": .object([child.id.uuidString: .array([])])
         ])
         let ownTarget = try VortxNativeProfiles.ownTarget(material: rebindMaterial, profileID: child.id)
+        // A fresh authenticated v2 source has the mandatory overlay witness. It must survive the
+        // public material encoder, target extraction and rebind action unchanged.
+        let emptyLibraryResponse = try JSONSerialization.data(withJSONObject: ["result": []])
+        let emptyAddonsResponse = try JSONSerialization.data(withJSONObject: ["result": ["addons": []]])
+        let emptyOverlayResponse = Data("{}".utf8)
+        let freshSourceEnvelope = try JSONSerialization.data(withJSONObject: [
+            "schemaVersion": 2,
+            "libraryResponseBase64": emptyLibraryResponse.base64EncodedString(),
+            "addonsResponseBase64": emptyAddonsResponse.base64EncodedString(),
+            "profileOverlayBase64": emptyOverlayResponse.base64EncodedString()
+        ], options: [.sortedKeys])
+        let freshWitness = try VortxProfileOverlayWitness.digest(json: emptyOverlayResponse)
+        let freshMaterialData = try VortxLegacyBootstrapMaterial.encode(
+            document: try JSONSerialization.data(withJSONObject: ["vortx": [:]]), roster: [owner, ownAccount], ownerProfileID: owner.id,
+            rosterModifiedSeconds: nil,
+            ownAccountSources: [.init(profileID: child.id, verifiedStreamingUID: "verified-own-uid",
+                                      sourceDocument: freshSourceEnvelope, profileOverlaySHA256: freshWitness)])
+        let freshMaterial = try JSONDecoder().decode(VortxJSON.self, from: freshMaterialData)
+        let freshOwnTarget = try VortxNativeProfiles.ownTarget(material: freshMaterial, profileID: child.id)
         let pendingRequest = try VortxNativeProfiles.AccountRebindRequest(scope: "fixture-account", ownerProfileID: owner.id.uuidString,
                                                                             transactionID: "pending-own-transaction", expected: expectedBinding,
                                                                             target: .pendingOwn)
@@ -297,6 +316,10 @@ import CryptoKit
         let rebindExisting = try VortxNativeProfiles.mutation(ownAccount, previous: child, ownerID: owner.id.uuidString, rebind: provenRequest)
         let provenAction = try VortxNativeProfiles.rebindAction(profileID: child.id, request: provenRequest)
         check(rebindExisting.0.last == provenAction)
+        let freshAction = try VortxNativeProfiles.rebindAction(profileID: child.id,
+            request: try .init(scope: "fixture-account", ownerProfileID: owner.id.uuidString,
+                               transactionID: "fresh-v2-own-transaction", expected: expectedBinding, target: .own(freshOwnTarget)))
+        check(freshAction["target"]?["carrier"]?["source"]?["profileOverlaySha256"] == .string(freshWitness))
         do { _ = try VortxNativeProfiles.mutation(ownAccount, previous: child, ownerID: owner.id.uuidString); fatalError("generic own selection accepted") }
         catch VortxNativeError.invalidSnapshot {}
         let ownRecord: VortxJSON = .object([

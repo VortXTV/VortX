@@ -122,6 +122,23 @@ enum VortxLegacyBootstrapMaterialTests {
         do { _ = try material(root, roster: [owner, own], ownAccountSources: [.init(profileID: own.id, verifiedStreamingUID: "verified-own-uid", sourceDocument: witnessedV2)]) ; preconditionFailure("v2 witness omitted") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired { check(error.reason.contains("v2 requires"), "Fresh v2 source requires its raw-slice witness") }
 
+        // Exercise the actual v2 source path with an overlay whose opaque watched identity is
+        // larger than the previously trapping UInt8 boundary. Root/source equality, raw bytes,
+        // witness and material projection must all survive intact.
+        let largeVideoID = String(repeating: "v", count: 65_536)
+        let largeBucket: Object = ["watched": ["tt-own": ["w": [largeVideoID]]]]
+        let largeOverlay: Object = ["vortx": ["byProfile": [own.id.uuidString: largeBucket]]]
+        let largeOverlayBytes = try JSONSerialization.data(withJSONObject: largeOverlay, options: [.sortedKeys])
+        let largeSource = try ownSourceEnvelope(schemaVersion: 2, libraryRows: [ownMovie], addons: [ownAddon], profileOverlay: largeOverlay)
+        let largeWitness = try VortxProfileOverlayWitness.digest(json: largeOverlayBytes)
+        let largeResult = try material(doc(["byProfile": [own.id.uuidString: largeBucket]]), roster: [owner, own],
+                                       ownAccountSources: [.init(profileID: own.id, verifiedStreamingUID: "verified-own-uid",
+                                                                  sourceDocument: largeSource, profileOverlaySHA256: largeWitness)])
+        let largeProof = ((largeResult["ownAccountSources"] as! [String: Object])[own.id.uuidString]!)
+        check(largeProof["profileOverlaySha256"] as? String == largeWitness
+              && watches(largeResult, profile: own).contains { $0["videoId"] as? String == largeVideoID },
+              "Large authenticated v2 overlay survives source projection without framing truncation")
+
         do { _ = try material(root, roster: [owner, own]); preconditionFailure("own account without source imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
             check(error.reason.contains("exactly one authenticated"), "Missing own receipt remains closed")
@@ -305,13 +322,46 @@ enum VortxLegacyBootstrapMaterialTests {
             ("{}", "f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a"),
             ("{\"b\":true,\"a\":\"x/y\",\"n\":null}", "48b922f092adb76b7fcddd4876a9ab2df9432d86dd80fe2a052cb51b23665a5f"),
             ("[-0,0,0.1,1e-7,1.25,9007199254740991]", "6dc7e298ab380f2d71eb83674092f89b1e869df5ae3c9ed460e936e6aaabfff3"),
-            ("{\"b\":[2,1],\"a\":{}}", "57a5fd5e71156114902a2d89fc3af92bbd5b6a90c3c6c5b080dcf72e5407a04f")
+            ("{\"😀\":\"é/😀\",\"\":\"x\",\"a\":\"\\u0000\"}", "3499509b587f664bd97f6b9b072ee439e1a49c7f5293fb21244f2e64c505b926"),
+            ("{\"b\":[2,1],\"a\":{}}", "57a5fd5e71156114902a2d89fc3af92bbd5b6a90c3c6c5b080dcf72e5407a04f"),
+            ("{\"a\":{},\"b\":[2,1]}", "57a5fd5e71156114902a2d89fc3af92bbd5b6a90c3c6c5b080dcf72e5407a04f"),
+            ("{\"vortx\":{\"byProfile\":{\"11111111-1111-4111-8111-111111111111\":{}}}}", "514bf86ebde04465948d571d0f76b016e6ec2b556cd4a69eae3f6fd915d3d9e8")
         ]
         for (json, digest) in vectors { let actual = try VortxProfileOverlayWitness.digest(json: Data(json.utf8)); check(actual == digest, "Overlay witness vector mismatch") }
-        for json in ["[1e400]", "[9007199254740992]", "[9007199254740991.1]", "{\"a\":1,\"a\":2}", "[\"\\uD800\"]"] {
+        // Swift String equality applies canonical Unicode equivalence. The wire grammar does not:
+        // these distinct UTF-8 keys must both remain representable, whereas two spellings of the
+        // same decoded key must still be rejected as a duplicate.
+        _ = try VortxProfileOverlayWitness.digest(json: Data("{\"é\":1,\"e\\u0301\":2}".utf8))
+        for json in ["[1e400]", "[9007199254740992]", "[9007199254740991.1]",
+                     "[9007199254740991.000000000000000000000000000001]", "{\"a\":1,\"\\u0061\":2}", "[\"\\uD800\"]"] {
             do { _ = try VortxProfileOverlayWitness.digest(json: Data(json.utf8)); preconditionFailure("Invalid overlay witness input accepted") }
             catch VortxProfileOverlayWitness.Failure.malformed {}
         }
+        for json in ["[1e-300]", "[0e999]"] { _ = try VortxProfileOverlayWitness.digest(json: Data(json.utf8)) }
+
+        let prefix = Array("vortx.profile-overlay/1".utf8) + [0]
+        func u32(_ value: Int) -> [UInt8] {
+            [UInt8(truncatingIfNeeded: value >> 24), UInt8(truncatingIfNeeded: value >> 16),
+             UInt8(truncatingIfNeeded: value >> 8), UInt8(truncatingIfNeeded: value)]
+        }
+        for count in [255, 256, 257, 65_535, 65_536] {
+            let raw = Array(repeating: "x", count: count).joined()
+            let framed = try VortxProfileOverlayWitness.framed(json: Data(("\"" + raw + "\"").utf8))
+            check(Array(framed.prefix(prefix.count + 5)) == prefix + [115] + u32(count), "String witness count is big-endian at \(count)")
+            check(framed.count == prefix.count + 1 + 4 + count && Array(framed.suffix(count)) == Array(raw.utf8),
+                  "String witness payload is retained at \(count)")
+
+            let arrayJSON = "[" + Array(repeating: "0", count: count).joined(separator: ",") + "]"
+            let arrayFrame = try VortxProfileOverlayWitness.framed(json: Data(arrayJSON.utf8))
+            check(Array(arrayFrame.prefix(prefix.count + 5)) == prefix + [97] + u32(count), "Array witness count is big-endian at \(count)")
+            check(arrayFrame.count == prefix.count + 1 + 4 + count * 9 && Array(arrayFrame.suffix(9)) == [100, 0, 0, 0, 0, 0, 0, 0, 0],
+                  "Array witness values are framed at \(count)")
+        }
+        let tooManyObjectEntries = "{" + (0..<50_000).map { "\"k\($0)\":0" }.joined(separator: ",") + "}"
+        do { _ = try VortxProfileOverlayWitness.digest(json: Data(tooManyObjectEntries.utf8)); preconditionFailure("Object key nodes were not bounded") }
+        catch VortxProfileOverlayWitness.Failure.malformed {}
+        do { _ = try VortxProfileOverlayWitness.digest(json: Data(repeating: 32, count: 16_777_217)); preconditionFailure("Oversize source was copied before rejection") }
+        catch VortxProfileOverlayWitness.Failure.malformed {}
     }
     static func savedVersusPlayed() throws {
         let saved = try material(doc(["library": [movie()]]))

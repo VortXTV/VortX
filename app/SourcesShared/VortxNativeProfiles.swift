@@ -32,25 +32,30 @@ enum VortxNativeProfiles {
     struct OwnAccountTarget: Sendable, Equatable {
         let verifiedStreamingUID: String
         let sourceDocumentSHA256: String
+        let profileOverlaySHA256: String?
         let addons: VortxJSON
         let library: VortxJSON
         let watches: VortxJSON
         let identityLinks: VortxJSON
 
-        init(verifiedStreamingUID: String, sourceDocumentSHA256: String, addons: VortxJSON,
-             library: VortxJSON, watches: VortxJSON, identityLinks: VortxJSON) throws {
+        init(verifiedStreamingUID: String, sourceDocumentSHA256: String, profileOverlaySHA256: String? = nil,
+             addons: VortxJSON, library: VortxJSON, watches: VortxJSON, identityLinks: VortxJSON) throws {
             guard validUID(verifiedStreamingUID), sourceDocumentSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                  profileOverlaySHA256 == nil || profileOverlaySHA256!.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
                   exactObjectKeys(addons, ["items", "order", "intents"]), exactObjectKeys(library, ["items", "intents"]),
                   watches.array != nil, identityLinks.array != nil else { throw VortxNativeError.invalidSnapshot }
             self.verifiedStreamingUID = verifiedStreamingUID
             self.sourceDocumentSHA256 = sourceDocumentSHA256
+            self.profileOverlaySHA256 = profileOverlaySHA256
             self.addons = addons; self.library = library; self.watches = watches; self.identityLinks = identityLinks
         }
 
         var document: VortxJSON {
-            .object(["kind": .string("own"), "carrier": .object([
-                "source": .object(["verifiedStreamingUid": .string(verifiedStreamingUID),
-                                    "sourceDocumentSha256": .string(sourceDocumentSHA256)]),
+            var source: [String: VortxJSON] = ["verifiedStreamingUid": .string(verifiedStreamingUID),
+                                               "sourceDocumentSha256": .string(sourceDocumentSHA256)]
+            if let profileOverlaySHA256 { source["profileOverlaySha256"] = .string(profileOverlaySHA256) }
+            return .object(["kind": .string("own"), "carrier": .object([
+                "source": .object(source),
                 "addons": addons, "library": library, "watches": watches, "identityLinks": identityLinks
             ])])
         }
@@ -61,7 +66,7 @@ enum VortxNativeProfiles {
         case shared
         case own(OwnAccountTarget)
 
-        fileprivate var document: VortxJSON {
+        var document: VortxJSON {
             switch self {
             case .pendingOwn: return .object(["kind": .string("pending_own")])
             case .shared: return .object(["kind": .string("shared")])
@@ -128,14 +133,22 @@ enum VortxNativeProfiles {
         let id = profileID.uuidString
         guard material["schemaVersion"] == .integer(2) || material["schemaVersion"] == .unsigned(2),
               let source = material["ownAccountSources"]?[id],
-              case .object(let sourceObject) = source, Set(sourceObject.keys) == ["verifiedStreamingUid", "sourceDocumentSha256"],
+              case .object(let sourceObject) = source,
+              Set(sourceObject.keys) == ["verifiedStreamingUid", "sourceDocumentSha256"]
+                || Set(sourceObject.keys) == ["verifiedStreamingUid", "sourceDocumentSha256", "profileOverlaySha256"],
               case .string(let uid)? = sourceObject["verifiedStreamingUid"],
               case .string(let digest)? = sourceObject["sourceDocumentSha256"],
               let addons = material["addons"]?[id], let library = material["libraries"]?[id],
               let watches = material["watches"]?[id], let links = material["identityLinks"]?[id] else {
             throw VortxNativeError.invalidSnapshot
         }
-        return try .init(verifiedStreamingUID: uid, sourceDocumentSHA256: digest, addons: addons,
+        let witness: String?
+        switch sourceObject["profileOverlaySha256"] {
+        case nil: witness = nil
+        case .string(let value)?: witness = value
+        default: throw VortxNativeError.invalidSnapshot
+        }
+        return try .init(verifiedStreamingUID: uid, sourceDocumentSHA256: digest, profileOverlaySHA256: witness, addons: addons,
                          library: library, watches: watches, identityLinks: links)
     }
 
