@@ -332,7 +332,8 @@ internal class VortxNativeSession private constructor(
                               hostProfiles: JSONObject? = null, notifyMutation: Boolean = true,
                               hostArchive: JSONObject? = null, remoteHostPreferences: JSONObject? = null,
                               globalChanges: JSONObject? = null, acknowledgeHostPreferences: JSONObject? = null,
-                              baselineHostProfiles: JSONObject? = null): List<String> = owned(owner) {
+                              baselineHostProfiles: JSONObject? = null,
+                              verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null): List<String> = owned(owner) {
         actions.forEach(scope::rejectCredentials)
         scope.rejectCredentials(hostProfiles)
         scope.rejectCredentials(hostArchive)
@@ -343,6 +344,9 @@ internal class VortxNativeSession private constructor(
             val results = actions.map { action ->
                 candidate.dispatch(action.toString()).also { check(JSONObject(it).getBoolean("ok")) { "Native action rejected" } }
             }
+            // Verify the requested public projection before installing any part of a batch. A
+            // successful action acknowledgement alone is not a watched/replacement receipt.
+            verifyCandidate?.invoke(candidate)
             var preferences = hostProfiles ?: hostProfilePreferences
             var pendingPreferences = hostProfileSyncPending
             var hostState = NativeHostPreferences.local(scope, nativeHostPreferenceState)

@@ -117,8 +117,11 @@ The real repository currently supports:
 - Durable per-profile standard library membership, library export, individual
   movie/episode watched changes, Continue Watching reads/dismissal, and explicitly
   identified offline/native-streaming playback progress callbacks.
-- Atomic season watched/reset over the exact metadata-provided episode IDs (no synthetic
-  episode identities). A changed owner or failed action rejects the whole transaction.
+- Atomic series/season watched/reset over the complete returned metadata inventory, and
+  exact episode membership checks (no synthetic episode identities or inferred episodes).
+  The isolated mutation lookup does not replace visible detail navigation. Missing/ambiguous
+  inventory, a changed owner, failed action or mismatched candidate playback projection
+  rejects the whole transaction before its checkpoint is committed.
 - Parental admission runs native catalog/meta queries on raw provider objects before
   presentation decoding, including Home/Discover/search/pages and embedded streams.
   Unknown certifications fail closed. A certified series cannot authorize a foreign
@@ -130,6 +133,10 @@ The real repository currently supports:
   native metadata genres. It never reads legacy JNI or disk buckets in native
   mode; unavailable ownership produces an explicit UI error. Native watch time is
   an estimate from retained durations/positions, not a cumulative time ledger.
+- Validated custom add-on endpoint replacement atomically installs/removes/reorders and
+  rekeys affected explicit profile visibility/order preferences. The original descriptor
+  survives lookup/validation/checkpoint failure; official/protected endpoints cannot change.
+  Candidate installed-add-on readback verifies order, flags and unchanged peer descriptors.
 - Installed add-on reads/install/remove/order/visibility, native profile listing,
   add/delete/rename/switch, and typed native-sync merge.
 - Existing profile UI commands use native durable CRUD/selection behind the gate;
@@ -155,8 +162,7 @@ unresolved own-Stremio-account migration, ambiguous or incomplete legacy carrier
 legacy changes without the shared reducer's required causal evidence (including pending
 website profile patches), unscoped legacy OAuth ownership attribution,
 global settings outside the explicit shared SettingsBackup type whitelist (and legacy
-flat native-profile theme changes), whole-series bulk watched mutation and add-on URL
-replacement. The existing profile UI verifies projected salted PINs before
+flat native-profile theme changes). The existing profile UI verifies projected salted PINs before
 selection; stale projected profiles are rejected. Direct repository PIN switching
 remains blocked rather than bypassing that gate. Source
 ordering does not yet implement `rememberedQuality`/`wantedAddon` continuity.

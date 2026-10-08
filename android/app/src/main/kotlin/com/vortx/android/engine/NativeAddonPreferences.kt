@@ -46,5 +46,30 @@ internal object NativeAddonPreferences {
         return host.put(read.owner.profileID, raw).put("modifiedSeconds",
             maxOf(System.currentTimeMillis() / 1000.0, host.optDouble("modifiedSeconds", 0.0) + 0.001))
     }
+    /** Change an installed member's identity without turning disabled configurations back on or
+     * moving a configured add-on out of a profile's explicit order. Unknown preferences survive. */
+    fun replacingHost(read: VortxNativeRead, bucket: String, oldKey: String, newKey: String): JSONObject? {
+        if (oldKey == newKey) return null
+        val host = JSONObject(read.state.getJSONObject("hostProfilePreferences").toString())
+        val profiles = read.state.getJSONObject("roster").getJSONObject("profiles")
+        var changed = false
+        fun replace(container: JSONObject?, key: String) {
+            val values = container?.optJSONArray(key)?.let(::strings) ?: return
+            if (values.none { AddonOrder.normalize(it) == oldKey }) return
+            container.put(key, JSONArray(values.map { if (AddonOrder.normalize(it) == oldKey) newKey else it }.distinct()))
+            changed = true
+        }
+        profiles.keys().forEach { id ->
+            val profile = profiles.getJSONObject(id)
+            if (profile.getBoolean("deleted") || !(id == bucket || profile.getString("addons") == "share_primary" && bucket == read.owner.scope.ownerProfileID)) return@forEach
+            val raw = host.optJSONObject(id) ?: return@forEach
+            replace(raw, "disabledAddons")
+            val prefs = raw.optJSONObject("addonPreferences")
+            replace(prefs, "disabledAddonURLsOverride")
+            replace(prefs?.optJSONObject("rankingOverride"), "addonOrder")
+            replace(raw.optJSONObject("playback"), "addonOrder")
+        }
+        return if (changed) host.put("modifiedSeconds", maxOf(System.currentTimeMillis() / 1000.0, host.optDouble("modifiedSeconds", 0.0) + 0.001)) else null
+    }
     private fun strings(values: JSONArray) = (0 until values.length()).map(values::getString)
 }

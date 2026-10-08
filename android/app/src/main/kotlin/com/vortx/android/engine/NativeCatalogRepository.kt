@@ -471,37 +471,82 @@ internal class NativeCatalogRepository(
         session.dispatch(listOf(action("remove_from_continue_watching").put("metaId", target.id)), read.owner); Unit
     }
     override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean) = attempt {
-        if (item.type == MediaType.SERIES) unsupported("whole-series watched mutation")
         val session = session(); val read = session.read(); requireWatchIdentity(read, item.type, item.id)
-        session.dispatch(listOf(action(if (isWatched) "mark_watched" else "reset_watched").put("metaId", item.id)
-            .put("name", item.name.takeIf { it.isNotBlank() }).put("metadata", JSONObject().put("type", item.type.id).put("poster", item.poster))), read.owner); Unit
+        if (item.type == MediaType.SERIES) {
+            mutateWatchInventory(session, read, item.type, item.id, isWatched) { it.videos.map(Episode::id) }
+        } else dispatchWatched(session, read, MetaDetail(item.id, item.type, item.name, poster = item.poster), null, isWatched)
+        Unit
     }
     override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = attempt {
-        if (type == MediaType.SERIES) unsupported("whole-series watched mutation")
-        val detail = peekMeta(type, id)
-        setCatalogWatched(MetaItem(id, type, detail?.name.orEmpty(), detail?.poster), isWatched).getOrThrow(); peekMeta(type, id) ?: meta(type, id).getOrThrow()
+        val session = session(); val read = session.read(); requireWatchIdentity(read, type, id)
+        mutateWatchInventory(session, read, type, id, isWatched) { if (type == MediaType.SERIES) it.videos.map(Episode::id) else null }
     }
     override suspend fun setVideoWatched(type: MediaType, id: String, videoId: String, season: Int?, episode: Int?, isWatched: Boolean): Result<MetaDetail> = attempt {
         val session = session(); val read = session.read(); requireWatchIdentity(read, type, id)
-        val detail = peekMeta(type, id)
-        session.dispatch(listOf(action(if (isWatched) "mark_watched" else "reset_watched").put("metaId", id).put("videoId", videoId)
-            .put("name", detail?.name).put("metadata", JSONObject().put("type", type.id).put("poster", detail?.poster))), read.owner)
-        peekMeta(type, id) ?: meta(type, id).getOrThrow()
+        mutateWatchInventory(session, read, type, id, isWatched) { detail ->
+            if (type == MediaType.MOVIE) {
+                require(videoId == id && season == null && episode == null) { "Exact movie identity required" }; null
+            } else {
+                val selected = requireNotNull(detail.videos.singleOrNull { it.id == videoId }) { "Video is not in the returned inventory" }
+                require((season == null || season == selected.season) && (episode == null || episode == selected.episode)) { "Episode identity mismatch" }
+                listOf(selected.id)
+            }
+        }
     }
     override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> = attempt {
         require(type == MediaType.SERIES && season >= 0) { "A series season is required" }
         val session = session(); val read = session.read(); requireWatchIdentity(read, type, id)
-        val detail = peekMeta(type, id) ?: meta(type, id).getOrThrow()
-        val episodes = detail.videos.filter { it.season == season }
-        require(episodes.isNotEmpty() && episodes.size <= 10_000 && episodes.all { it.id.isNotBlank() } &&
-            episodes.map { it.id }.distinct().size == episodes.size) { "Exact season episode metadata is required" }
-        // Provider-supplied opaque IDs are the only evidence. Never synthesize id:season:episode,
-        // infer missing seasons, or partially commit a bulk operation. The captured owner also
-        // fences an account/profile switch while metadata was loading.
-        session.dispatch(episodes.map { video -> action(if (isWatched) "mark_watched" else "reset_watched")
-            .put("metaId", id).put("videoId", video.id).put("name", detail.name)
-            .put("metadata", JSONObject().put("type", type.id).put("poster", detail.poster)) }, read.owner)
-        session.owned(read.owner) { decorate(detail, session.read()) }
+        mutateWatchInventory(session, read, type, id, isWatched) { detail ->
+            detail.videos.filter { it.season == season }.map(Episode::id).also { require(it.isNotEmpty()) { "Exact season inventory required" } }
+        }
+    }
+
+    private suspend fun mutateWatchInventory(session: VortxNativeSession, read: VortxNativeRead, type: MediaType, id: String,
+                                            watched: Boolean, select: (MetaDetail) -> List<String>?): MetaDetail {
+        // An isolated consumer never cancels/replaces the screen's visible meta or stream load.
+        val slot = "watch-mutation"; val addons = registry(read)
+        val page = session.load(slot, read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons)).single()
+        requireSettled(page)
+        val approved = policyPage(page, read, slot, listOf(page))
+        val raw = requireNotNull(approved.groups.firstNotNullOfOrNull { it.items(VortxResourceRequest.Resource.META).firstOrNull() }) {
+            "Authoritative watch metadata unavailable or blocked"
+        }
+        require(raw.getString("id") == id && raw.getString("type") == type.id) { "Watch metadata identity mismatch" }
+        if (type == MediaType.SERIES) {
+            val videos = raw.getJSONArray("videos").objects()
+            require(videos.isNotEmpty() && videos.size <= 10_000 && videos.map { it.getString("id") }.distinct().size == videos.size) { "Complete unambiguous returned inventory required" }
+            videos.forEach { video ->
+                require(video.getString("id").isNotBlank() && video.getString("id") != id)
+                for (key in listOf("season", "episode")) {
+                    val value = video.get(key)
+                    require(value is Number && java.math.BigDecimal(value.toString()).let { it.signum() >= 0 && it <= java.math.BigDecimal(Int.MAX_VALUE) && it.stripTrailingZeros().scale() <= 0 }) {
+                        "Exact episode coordinates required"
+                    }
+                }
+            }
+        }
+        val detail = requireNotNull(EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(approved, null, null, addons)))
+        val videos = select(detail)
+        return session.publish(slot, read.owner, listOf(page)) {
+            dispatchWatched(session, read, detail, videos, watched)
+            decorate(detail, session.read())
+        }
+    }
+    private fun dispatchWatched(session: VortxNativeSession, read: VortxNativeRead, detail: MetaDetail, videos: List<String>?, watched: Boolean) {
+        require(videos == null || videos.isNotEmpty())
+        val actions = (videos?.map { it as String? } ?: listOf(null)).map { video ->
+            action(if (watched) "mark_watched" else "reset_watched").put("metaId", detail.id).put("videoId", video)
+                .put("name", detail.name.takeIf { it.isNotBlank() }).put("metadata", JSONObject().put("type", detail.type.id).put("poster", detail.poster))
+        }
+        session.dispatch(actions, read.owner, verifyCandidate = { candidate ->
+            val proof = JSONObject(candidate.resolve(JSONObject().put("kind", "profile_playback").put("profileId", read.owner.profileID).toString()))
+            check(proof.getString("kind") == "profile_playback") { "Native watched receipt unavailable" }
+            if (videos == null) check((proof.getJSONObject("watchedTitles").optInt(detail.id) > 0) == watched) { "Native watched receipt mismatch" }
+            else {
+                val marked = proof.getJSONObject("watchedVideoIdsByTitle").optJSONArray(detail.id)?.strings().orEmpty().toSet()
+                check(videos.all { (it in marked) == watched }) { "Native episode batch receipt mismatch" }
+            }
+        })
     }
 
     override suspend fun installedAddons() = attempt {
@@ -532,7 +577,59 @@ internal class NativeCatalogRepository(
         check(addonOwner(read) == read.owner.profileID) { "Shared profiles customize visibility; remove add-ons from the owner profile" }
         session.dispatch(listOf(action("remove_addon").put("profileId", addonOwner(read)).put("transportUrl", addon.transportUrl)), read.owner); Unit
     }
-    override suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String) = attempt<Unit> { unsupported("add-on URL migration") }
+    override suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String) = attempt {
+        val session = session(); val read = session.read(); val bucket = addonOwner(read)
+        check(bucket == read.owner.profileID) { "Shared profiles cannot replace account add-ons" }
+        val before = addonDescriptors(read)
+        val oldKey = AddonOrder.normalize(oldAddon.transportUrl)
+        val current = requireNotNull(before.singleOrNull { AddonOrder.normalize(it.getString("transportUrl")) == oldKey }) { "Add-on no longer installed" }
+        check(NativeHostPreferences.equal(current, JSONObject(oldAddon.rawDescriptorJson))) { "Add-on descriptor changed; reload installed add-ons" }
+        val flags = current.getJSONObject("flags")
+        check(!flags.getBoolean("protected") && !flags.getBoolean("official")) { "Protected or official add-ons cannot change endpoint" }
+        val target = requireNotNull(normalizedAddonUrl(newUrl)) { "Unsupported add-on endpoint" }
+        val targetKey = AddonOrder.normalize(target)
+        require(targetKey == oldKey || before.none { AddonOrder.normalize(it.getString("transportUrl")) == targetKey }) { "Replacement endpoint is already installed" }
+        val response = session.load("addon-replacement", read.owner,
+            listOf(VortxResourceRequest(VortxResourceRequest.Resource.MANIFEST, "", "") to listOf(VortxResourceAddon(target, target)))).single()
+        requireSettled(response)
+        val manifest = response.groups.single().items(VortxResourceRequest.Resource.MANIFEST).single()
+        require(listOf("id", "name", "version").all { manifest.get(it) is String && manifest.getString(it).isNotBlank() }) { "Invalid replacement manifest" }
+        require(listOf("types", "resources", "catalogs").all { manifest.get(it) is JSONArray }) { "Incomplete replacement manifest" }
+        require(!manifest.optJSONObject("behaviorHints").let { it?.optBoolean("configurationRequired", false) ?: false }) { "Replacement add-on requires configuration" }
+        val replacement = JSONObject(current.toString()).put("transportUrl", target).put("manifest", manifest)
+        val order = before.map { if (AddonOrder.normalize(it.getString("transportUrl")) == oldKey) target else it.getString("transportUrl") }
+        val host = NativeAddonPreferences.replacingHost(read, bucket, oldKey, targetKey)
+        val actions = mutableListOf<JSONObject>()
+        // A same-member spelling change must remove the previous value before installing its new
+        // descriptor, otherwise the membership register may retain the old spelling on equal clocks.
+        if (targetKey == oldKey) actions += action("remove_addon").put("profileId", bucket).put("transportUrl", current.getString("transportUrl"))
+        actions += action("install_addon").put("profileId", bucket).put("addon", replacement)
+        if (targetKey != oldKey) actions += action("remove_addon").put("profileId", bucket).put("transportUrl", current.getString("transportUrl"))
+        actions += action("reorder_addons").put("profileId", bucket).put("transportUrls", JSONArray(order))
+        val profiles = read.state.getJSONObject("roster").getJSONObject("profiles")
+        profiles.keys().forEach { id ->
+            val profile = profiles.getJSONObject(id)
+            if (!profile.getBoolean("deleted") && (id == bucket || profile.getString("addons") == "share_primary" && bucket == read.owner.scope.ownerProfileID)) {
+                val disabled = profile.getJSONObject("settings").getJSONArray("disabledAddons").strings()
+                if (disabled.any { AddonOrder.normalize(it) == oldKey }) actions += action("patch_profile").put("id", id).put("edits", JSONArray().put(
+                    JSONObject().put("field", "disabledAddons").put("value", JSONArray(disabled.map { if (AddonOrder.normalize(it) == oldKey) targetKey else it }.distinct()))))
+            }
+        }
+        session.publish("addon-replacement", read.owner, listOf(response)) {
+            session.dispatch(actions, read.owner, host, verifyCandidate = { candidate ->
+                val query = JSONObject(candidate.resolve(JSONObject().put("kind", "installed_addons").put("profileId", bucket).toString()))
+                check(query.getString("kind") == "installed_addons") { "Native replacement receipt unavailable" }
+                val installed = query.getJSONArray("addons").objects()
+                check(installed.map { AddonOrder.normalize(it.getString("transportUrl")) } == order.map(AddonOrder::normalize)) { "Native replacement order mismatch" }
+                val accepted = installed.single { AddonOrder.normalize(it.getString("transportUrl")) == targetKey }
+                check(accepted.getString("transportUrl") == target && NativeHostPreferences.equal(accepted.getJSONObject("flags"), flags) &&
+                    listOf("id", "name", "version").all { accepted.getJSONObject("manifest").getString(it) == manifest.getString(it) }) { "Native replacement descriptor mismatch" }
+                before.filterNot { AddonOrder.normalize(it.getString("transportUrl")) == oldKey }.forEach { unchanged ->
+                    check(installed.any { NativeHostPreferences.equal(it, unchanged) }) { "Unrelated add-on changed during replacement" }
+                }
+            })
+        }; Unit
+    }
     override suspend fun setAddonDisabled(transportUrl: String, disabled: Boolean) = attempt {
         val session = session(); val read = session.read(); val values = NativeAddonPreferences.disabled(read).toMutableSet()
         if (disabled) values.add(AddonOrder.normalize(transportUrl)) else values.remove(AddonOrder.normalize(transportUrl))
