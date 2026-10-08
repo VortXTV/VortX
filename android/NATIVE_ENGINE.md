@@ -28,7 +28,10 @@ pass both Gradle properties for their engine-required builds. Their APK/AAB gate
 inspect each shipped `arm64-v8a`, `armeabi-v7a`, and `x86_64` slice with the pinned
 NDK `llvm-readelf`, require callable JNI exports and the resource-host ABI, and
 inspect packaged DEX with Android build-tools `dexdump` for
-`BuildConfig.NATIVE_ENGINE_ENABLED=true`. The signed candidate lane also retains
+`BuildConfig.NATIVE_ENGINE_ENABLED=true` (`classes*.dex` in APKs and
+`base/dex/classes*.dex` in AABs). The reusable
+`scripts/verify-android-native-build-config.sh` parser tracks the target static
+field/value pair and stops at whitespace-tolerant class boundaries. The signed candidate lane also retains
 `scripts/verify-native-android-artifacts.sh` before upload. A release artifact that
 contains a resource-host library but advertises `BuildConfig.NATIVE_ENGINE_ENABLED=false` is rejected.
 

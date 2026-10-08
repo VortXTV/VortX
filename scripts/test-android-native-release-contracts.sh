@@ -80,14 +80,20 @@ ok "debug/release Android workflow invocations select native mode and resource-h
 # BuildConfig and inspect each shipped ABI's JNI/resource-host surface with the pinned tools.
 for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     require_literal "$(basename "$workflow") uses the pinned dexdump for BuildConfig proof" 'DEXDUMP="$ANDROID_HOME/build-tools/36.0.0/dexdump"' "$workflow"
-    require_literal "$(basename "$workflow") names the native BuildConfig field in its artifact gate" 'NATIVE_ENGINE_ENABLED' "$workflow"
-    require_literal "$(basename "$workflow") rejects an artifact without native BuildConfig=true" 'does not prove BuildConfig.NATIVE_ENGINE_ENABLED=true' "$workflow"
-    require_literal "$(basename "$workflow") checks the AAB base dex path" 'prefix="base/"' "$workflow"
+    require_literal "$(basename "$workflow") delegates BuildConfig proof to the reusable archive helper" 'scripts/verify-android-native-build-config.sh' "$workflow"
+    require_literal "$(basename "$workflow") names the native BuildConfig field in its artifact gate" 'NATIVE_ENGINE_ENABLED' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
+    require_literal "$(basename "$workflow") rejects an artifact without native BuildConfig=true" 'does not prove BuildConfig.NATIVE_ENGINE_ENABLED=true' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
+    require_literal "$(basename "$workflow") checks the AAB base dex path" 'dex_prefix="base/dex/"' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
     require_literal "$(basename "$workflow") checks all shipped Android ABIs" 'for abi in arm64-v8a armeabi-v7a x86_64' "$workflow"
     require_literal "$(basename "$workflow") checks callable resource-host JNI exports" 'resource-host' "$workflow"
 done
 require_literal "candidate signed artifacts still run the complete native ABI verifier" 'bash scripts/verify-native-android-artifacts.sh "${apks[@]}" "${bundles[@]}"' "$ANDROID_CI_WF"
 ok "APK/AAB gates prove BuildConfig native mode and JNI/resource-host content"
+
+require_literal "BuildConfig helper tracks static field numbers" 'target_field=current_field' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
+require_literal "BuildConfig helper tracks static value numbers" 'current_value == target_field' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
+require_literal "BuildConfig helper uses a whitespace-safe exact class boundary" '^[[:space:]]*Class descriptor' "$REPO_ROOT/scripts/verify-android-native-build-config.sh"
+require_literal "BuildConfig parser negative fixtures are executable" 'native_whitespace_class_boundary.dump' "$REPO_ROOT/scripts/test-android-native-build-config.sh"
 
 # Native mode must not be able to fall back through the old repository or sync seams. This is a
 # read-only call-graph contract; the legacy implementation remains compiled and packaged for the
@@ -108,4 +114,5 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     printf 'pin: %s stremiox-core=%s vortx-core=%s (parent approval owns replacement)\n' "$(basename "$workflow")" "$stremio_pin" "$vortx_pin"
 done
 
+"$SCRIPT_DIR/test-android-native-build-config.sh"
 printf 'PASS: Android native 0.5 release selection/package contract\n'

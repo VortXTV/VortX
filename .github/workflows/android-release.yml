@@ -180,45 +180,8 @@ jobs:
           syms_libvortx_ffi="Java_com_vortx_android_engine_VortxCore_nativeInitRuntime Java_com_vortx_android_engine_VortxCore_nativeDispatchJson Java_com_vortx_android_engine_VortxCore_nativeResolveJson Java_com_vortx_android_engine_VortxCore_nativeGetStateJson Java_com_vortx_android_engine_VortxCore_nativeEngineFree Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
           workdir="$(mktemp -d)"
           trap 'rm -rf "$workdir"' EXIT
-          verify_native_build_config() {
-            local artifact="$1" prefix entry dex dump
-            case "$artifact" in
-              *.apk) prefix="" ;;
-              *.aab) prefix="base/" ;;
-              *) echo "::error::unsupported artifact for BuildConfig verification: $artifact"; return 1 ;;
-            esac
-            while IFS= read -r entry; do
-              [ -n "$entry" ] || continue
-              dex="$workdir/$(basename "$artifact").${entry##*/}"
-              dump="$dex.dump"
-              unzip -p "$artifact" "$entry" > "$dex" || return 1
-              "$DEXDUMP" -d "$dex" > "$dump"
-              if awk '
-                /Class descriptor[[:space:]]*:[[:space:]]*\047Lcom\/vortx\/android\/BuildConfig;\047/ { in_build=1; next }
-                in_build && /^Class descriptor/ { exit }
-                in_build && /NATIVE_ENGINE_ENABLED/ && /(true|0x0*1([[:space:]]|$))/ { found=1 }
-                in_build && /Static fields/ { in_fields=1; in_values=0; next }
-                in_build && /Static values/ { in_fields=0; in_values=1; next }
-                in_build && in_fields && /name[[:space:]]*:/ {
-                  field_count++
-                  if ($0 ~ /name[[:space:]]*:[[:space:]]*\047NATIVE_ENGINE_ENABLED\047/) target=field_count
-                  next
-                }
-                in_build && in_values && /value[[:space:]]*:/ { value_count++; values[value_count]=$0 }
-                END {
-                  if (found) exit 0
-                  if (target && values[target] ~ /(true|0x0*1([[:space:]]|$))/) exit 0
-                  exit 1
-                }
-              ' "$dump"; then
-                return 0
-              fi
-            done < <(unzip -Z1 "$artifact" | awk -v prefix="$prefix" '$0 ~ ("^" prefix "classes[0-9]*\\.dex$")')
-            echo "::error::$artifact does not prove BuildConfig.NATIVE_ENGINE_ENABLED=true"
-            return 1
-          }
+          DEXDUMP="$DEXDUMP" bash scripts/verify-android-native-build-config.sh "${apks[@]}" "${bundles[@]}"
           for apk in "${apks[@]}" "${bundles[@]}"; do
-            verify_native_build_config "$apk"
             prefix=lib
             [[ "$apk" == *.aab ]] && prefix=base/lib
             for abi in arm64-v8a armeabi-v7a x86_64; do
