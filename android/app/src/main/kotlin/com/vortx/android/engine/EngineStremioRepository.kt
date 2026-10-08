@@ -1087,27 +1087,45 @@ class EngineStremioRepository(
     override suspend fun playbackHistorySnapshot(
         expectedOwner: ContinueWatchingOwner,
     ): Result<ContinueWatchingSnapshot> = withContext(Dispatchers.Default) { runCatching {
-        ContinueWatchingOwnerGate.serialized { revision ->
+        // Capture the owner and route atomically, but never await an engine Load under the process-wide
+        // owner monitor. Profile/account transitions need that monitor to advance their revision; holding
+        // it across `loadFieldUntil` would both fail compilation (the load is suspend) and delay a switch.
+        val (capturedOwner, route) = ContinueWatchingOwnerGate.serialized { revision ->
             check(!authTransition.inProgress) { "Playback history account transition is in progress." }
             val owner = continueWatchingOwnerLocked(revision)
             check(owner == expectedOwner) { "Playback history owner changed." }
-            val items = when (val route = historyRouteLocked(owner)) {
-                is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
-                    overlay.playbackHistory()
-                }
-                HistoryRoute.Engine -> {
-                    check(started) { "Playback history native engine is not started." }
-                    requireEngineHistoryPrincipalMatch()
-                    // `library` is a persisted engine projection, but it still needs a Load before a
-                    // cold process can truthfully say that no history exists. This uses the same derived
-                    // field/action as LibraryViewModel and treats malformed/unavailable state as failure.
-                    val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary()) { true }
-                    EngineState.parsePlaybackHistoryStrict(
-                        state,
-                    ).getOrThrow()
-                }
+            val route = historyRouteLocked(owner)
+            if (route is HistoryRoute.Engine) {
+                check(started) { "Playback history native engine is not started." }
+                requireEngineHistoryPrincipalMatch()
             }
-            check(continueWatchingOwnerLocked(revision) == expectedOwner) { "Playback history owner changed." }
+            owner to route
+        }
+        val items = when (route) {
+            is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                overlay.playbackHistory()
+            }
+            HistoryRoute.Engine -> {
+                // `library` is a persisted engine projection, but it still needs a Load before a
+                // cold process can truthfully say that no history exists. This uses the same derived
+                // field/action as LibraryViewModel and treats malformed/unavailable state as failure.
+                val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary()) { true }
+                EngineState.parsePlaybackHistoryStrict(
+                    state,
+                ).getOrThrow()
+            }
+        }
+        // Reacquire immediately before publication. Owner equality includes the monotonically advanced
+        // revision, and historyRouteLocked re-checks both the active route and native principal.
+        ContinueWatchingOwnerGate.serialized { revision ->
+            check(!authTransition.inProgress) { "Playback history account transition is in progress." }
+            val owner = continueWatchingOwnerLocked(revision)
+            check(owner == capturedOwner && owner == expectedOwner) { "Playback history owner changed." }
+            check(historyRouteLocked(owner) == route) { "Playback history route changed." }
+            if (route is HistoryRoute.Engine) {
+                check(started) { "Playback history native engine is not started." }
+                requireEngineHistoryPrincipalMatch()
+            }
             ContinueWatchingSnapshot(owner, items)
         }
     } }
