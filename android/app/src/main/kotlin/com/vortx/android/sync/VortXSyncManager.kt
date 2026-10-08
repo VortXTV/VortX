@@ -1640,8 +1640,8 @@ class VortXSyncManager(context: Context) {
     // ---- Per-account version guards (H-1 downgrade ratchet, H-2 high-water floor) ----
 
     /**
-     * Newest doc version this device has pushed or applied FOR THE SIGNED-IN ACCOUNT (epoch-ms, a 64-bit
-     * value — always a [Long]). Per-account so an account switch (out of A at v1000, into B at v5) never
+     * Newest doc revision this device has pushed or applied FOR THE SIGNED-IN ACCOUNT (a safe integer
+     * represented as [Long], including historical epoch-ms values). Per-account so a switch never
      * treats B's pulls as stale. A fresh account key starts at 0, so the first pull is applied once.
      */
     private fun lastSyncedVersion(lease: SyncSessionLease): Long =
@@ -1731,11 +1731,10 @@ class VortXSyncManager(context: Context) {
         if (code == 404) return if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED &&
             (lastSyncedVersion(lease) > 0 || syncState.nativeBackupSeen(lease.accountId))) SyncDocPull.Failed else SyncDocPull.Empty
         if (code != 200) return SyncDocPull.Failed                // network/server error: do not clobber
-        val body = json ?: return if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) SyncDocPull.Failed else SyncDocPull.Empty
-        val docStr = body.optString("document", "").takeUnless { it.isEmpty() }
-            ?: return if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) SyncDocPull.Failed else SyncDocPull.Empty
-        // Version is a 64-bit epoch-ms value: read as LONG (optLong), NEVER optInt (which truncates it).
-        val pulledVersion = body.optLong("version", 0L)
+        val body = json ?: return SyncDocPull.Failed
+        val docStr = (body.opt("document") as? String)?.takeIf { it.isNotEmpty() } ?: return SyncDocPull.Failed
+        // Never coerce strings/fractions, truncate to Int, or infer revision zero from malformed 200.
+        val pulledVersion = BackupRevisionPolicy.parse(body.opt("version")) ?: return SyncDocPull.Failed
         // H-2: normal pulls refuse an honest-label replay of a doc OLDER than what this account already applied.
         // syncDown may authenticate and decrypt that envelope solely to max-fold add-on tombstones; it never
         // applies any other stale account data. A real server only returns a version >= our high-water mark.
@@ -1760,12 +1759,12 @@ class VortXSyncManager(context: Context) {
 
     private sealed interface PushOutcome {
         data class Accepted(val version: Long) : PushOutcome
-        data class Rejected(val storedVersion: Long?) : PushOutcome
+        data object Rejected : PushOutcome
         data object Error : PushOutcome
     }
 
     /**
-     * Seal + PUT the doc at an explicit [version] (epoch-ms, a [Long]). Advances the per-account
+     * Seal + PUT the doc at an explicit safe-integer [version]. Advances the per-account
      * high-water mark ONLY on accepted == true — advancing it on a rejected write would suppress the
      * recovery pull and silently drop a write that LOST the race. `accepted` defaults true so an older
      * worker without the field (which stored the write) still advances, matching the web's `accepted !== false`.
@@ -1775,7 +1774,7 @@ class VortXSyncManager(context: Context) {
         obj: JSONObject,
         version: Long,
     ): PushOutcome {
-        if (!isSyncLeaseCurrent(lease)) return PushOutcome.Error
+        if (!isSyncLeaseCurrent(lease) || BackupRevisionPolicy.parse(version) == null) return PushOutcome.Error
         val plaintext = obj.toString().toByteArray(Charsets.UTF_8)
         val ciphertext = VortXCrypto.sealDocument(
             lease.dataKeyCopy(),
@@ -1814,28 +1813,31 @@ class VortXSyncManager(context: Context) {
             if (!published) return PushOutcome.Error
             return PushOutcome.Accepted(version)
         }
-        // Rejected (a concurrent write won). The worker echoes the current stored version (a Long) so we can
-        // retry deterministically at stored+1 instead of racing epoch-ms again. Do NOT advance the version.
-        val stored = json?.takeIf { it.has("version") }?.optLong("version")
-        return PushOutcome.Rejected(stored)
+        // A winner echo is not the base of our document. Only a fresh authenticated GET + merge
+        // can grant the next candidate's revision. Do not advance the high-water mark on rejection.
+        if (json?.has("version") == true && !json.isNull("version") && BackupRevisionPolicy.parse(json.get("version")) == null)
+            return PushOutcome.Error
+        return PushOutcome.Rejected
     }
+
+    private data class DerivedBackup(val document: JSONObject, val baseVersion: Long?)
 
     /**
      * Push a doc DERIVED from a pulled base, with optimistic-concurrency recovery. On a lost race, [rebuild]
-     * re-runs the caller's exact merge onto a freshly pulled base and retries strictly above the winner
-     * (`max(stored + 1, epochMs)`, so a backward wall-clock can never lock the device out). On exhaustion or
+     * re-runs the caller's exact merge onto a freshly pulled base and retries at that base + 1.
+     * A stale GET cannot be promoted using a newer rejection echo or wall-clock. On exhaustion or
      * a failed rebuild, the version is left unadvanced so the next natural pull reconciles. Mirrors Apple
      * `pushDerivedDoc`.
      */
     private suspend fun pushDerivedDoc(
         lease: SyncSessionLease,
-        initial: JSONObject,
-        rebuild: suspend () -> JSONObject?,
+        initial: DerivedBackup,
+        rebuild: suspend () -> DerivedBackup?,
     ): Boolean {
-        var doc = initial
-        var version = System.currentTimeMillis()
+        var candidate = initial
         repeat(PUSH_MAX_RETRIES) { attempt ->
-            when (val outcome = pushSyncDocAt(lease, doc, version)) {
+            val version = BackupRevisionPolicy.next(candidate.baseVersion) ?: return false
+            when (pushSyncDocAt(lease, candidate.document, version)) {
                 is PushOutcome.Accepted -> return true
                 is PushOutcome.Error -> return false              // network/server/encode failure: reconcile later
                 is PushOutcome.Rejected -> {
@@ -1843,9 +1845,7 @@ class VortXSyncManager(context: Context) {
                     if (attempt >= PUSH_MAX_RETRIES - 1) return false
                     val rebuilt = rebuild() ?: return false       // rebuild's pull now fails: abort, do not clobber
                     if (!isSyncLeaseCurrent(lease)) return false
-                    doc = rebuilt
-                    version = outcome.storedVersion?.let { maxOf(it + 1, System.currentTimeMillis()) }
-                        ?: System.currentTimeMillis()
+                    candidate = rebuilt
                 }
             }
         }
@@ -1952,8 +1952,7 @@ class VortXSyncManager(context: Context) {
         var pushedStamps: Map<String, Double> = emptyMap()
         var pushedPreferences: JSONObject? = null
         var pushedProviders: JSONObject? = null
-        var seed = false
-        suspend fun derived(): JSONObject? {
+        suspend fun derived(): DerivedBackup? {
             var globals = JSONObject()
             if (!publishIfSyncLeaseCurrent(lease) {
                 pushedStamps = readDirtySettings().toMap()
@@ -1966,7 +1965,8 @@ class VortXSyncManager(context: Context) {
             // Unknown/platform-only dirty keys cannot be guessed into the shared carrier.
             if (pushedStamps.keys.any { it !in SettingsBackup.SYNCABLE_SETTING_TYPES || it in NATIVE_PROFILE_SETTING_KEYS }) return null
             val pulled = pullSyncDocResult(lease)
-            seed = pulled == SyncDocPull.Empty
+            val seed = pulled == SyncDocPull.Empty
+            val baseVersion = (pulled as? SyncDocPull.Doc)?.version
             val document = when (pulled) {
                 is SyncDocPull.Doc -> pulled.doc
                 SyncDocPull.Empty -> gateway.prepareEmptyAccount(account) { isSyncLeaseCurrent(lease) } ?: return null
@@ -1977,7 +1977,7 @@ class VortXSyncManager(context: Context) {
                 // setting intent for a subsequent normal transaction, never acknowledge it here.
                 pushedPreferences = null
                 pushedProviders = null
-                return document
+                return DerivedBackup(document, null)
             }
             if (!gateway.applyDocument(account, document) { isSyncLeaseCurrent(lease) }) return null
             if (globals.length() > 0 && !gateway.recordGlobalPreferences(account, globals)) return null
@@ -1995,26 +1995,26 @@ class VortXSyncManager(context: Context) {
             if (!publishIfSyncLeaseCurrent(lease) { providerCandidate = com.vortx.android.integrations.NativeProviderAccess.merge(account, merged) }) return null
             val withProviders = providerCandidate ?: return null
             pushedProviders = withProviders.getJSONObject("nativeProviderCredentials")
-            return withProviders
+            return DerivedBackup(withProviders, baseVersion)
         }
         val first = derived() ?: return false
-        val pushed = if (seed) {
+        val pushed = if (first.baseVersion == null) {
             // Deployed worker's atomic INSERT/strictly-greater update predicate makes zero a
             // create-only write against normal nonnegative backup versions. A collision or unknown
             // outcome must re-pull; never escalate a stale-empty candidate to epoch milliseconds.
-            when (pushSyncDocAt(lease, first, 0)) {
+            when (pushSyncDocAt(lease, first.document, 0)) {
                 is PushOutcome.Accepted -> {
-                    if (!gateway.applyDocument(account, first) { isSyncLeaseCurrent(lease) }) return false
+                    if (!gateway.applyDocument(account, first.document) { isSyncLeaseCurrent(lease) }) return false
                     if (pushedStamps.isNotEmpty() || com.vortx.android.integrations.NativeProviderAccess.hasPending(account) != false) return false
                     true
                 }
                 is PushOutcome.Error -> false
                 is PushOutcome.Rejected -> {
                     val merged = derived()
-                    if (merged == null || seed) false else pushDerivedDoc(lease, merged) { derived()?.takeUnless { seed } }
+                    if (merged?.baseVersion == null) false else pushDerivedDoc(lease, merged) { derived()?.takeIf { it.baseVersion != null } }
                 }
             }
-        } else pushDerivedDoc(lease, first) { derived()?.takeUnless { seed } }
+        } else pushDerivedDoc(lease, first) { derived()?.takeIf { it.baseVersion != null } }
         if (!pushed) return false
         // Only acknowledge the exact carrier accepted by the server. A local edit during the PUT
         // has a different register event and remains pending, including after a cold restart.
@@ -2063,10 +2063,11 @@ class VortXSyncManager(context: Context) {
      * wipes keys other surfaces wrote. UNIONs the cloud roster into the local one BEFORE building the vortx
      * block, so a device with FEWER profiles never shrinks the cloud's set. Mirrors Apple `mergeLocalIntoDoc`.
      */
-    private suspend fun mergeLocalIntoDoc(lease: SyncSessionLease): JSONObject? {
+    private suspend fun mergeLocalIntoDoc(lease: SyncSessionLease): DerivedBackup? {
         if (!isSyncLeaseCurrent(lease)) return null
         val store = resolveStore() ?: return null
-        val doc: JSONObject = when (val pull = pullSyncDocResult(lease)) {
+        val pull = pullSyncDocResult(lease)
+        val doc: JSONObject = when (pull) {
             is SyncDocPull.Failed -> return null
             is SyncDocPull.Empty -> JSONObject()
             is SyncDocPull.Doc -> pull.doc
@@ -2175,7 +2176,7 @@ class VortXSyncManager(context: Context) {
                 }
             }
         }
-        return doc.takeIf { published && isSyncLeaseCurrent(lease) }
+        return DerivedBackup(doc, (pull as? SyncDocPull.Doc)?.version).takeIf { published && isSyncLeaseCurrent(lease) }
     }
 
     /**
@@ -2940,7 +2941,8 @@ class VortXSyncManager(context: Context) {
                     val status = opened.responseCode
                     val stream = if (status in 200..399) opened.inputStream else opened.errorStream
                     val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-                    val json = runCatching { if (text.isNotEmpty()) JSONObject(text) else null }.getOrNull()
+                    val json = if (path == "/v1/backup") BackupRevisionPolicy.decodeResponse(text)
+                        else runCatching { if (text.isNotEmpty()) JSONObject(text) else null }.getOrNull()
                     status to json
                 } catch (_: IOException) {
                     0 to null
