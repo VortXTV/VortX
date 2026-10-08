@@ -1554,7 +1554,7 @@ final class MPVMetalViewController: PlatformViewController {
         var fields: [String] = []
         var userAgent = ""
         var referrer = ""
-        for (name, value) in StreamRequestHeaderPolicy.sanitized(headers) {
+        for (name, value) in StreamRequestHeaderPolicy.sanitized(headers).sorted(by: { $0.key < $1.key }) {
             switch name.lowercased() {
             case "user-agent":         userAgent = value
             case "referer", "referrer": referrer = value
@@ -1563,7 +1563,13 @@ final class MPVMetalViewController: PlatformViewController {
         }
         setString("user-agent", userAgent.isEmpty ? defaultUserAgent : userAgent)
         setString("referrer", referrer)
-        setString("http-header-fields", fields.joined(separator: ","))
+        let headerStatus = MPVHTTPHeaderOptions.set(fields, on: mpv)
+        guard headerStatus >= 0 else {
+            // Refuse this replacement before loadfile: a rejected option must not admit a source
+            // with the previous source's headers. Preserve the existing load's provenance.
+            checkError(headerStatus)
+            return issuedToken
+        }
 
         // yt-direct googlevideo streams no longer play when handed to mpv directly: googlevideo now 403s every
         // Range shape FFmpeg can send (open-ended `bytes=0-` and no-Range alike), so libmpv reports
@@ -1605,7 +1611,11 @@ final class MPVMetalViewController: PlatformViewController {
             setString("user-agent", requiredUA)
             // Referer/extra headers from a browser context would only confuse googlevideo's UA binding.
             setString("referrer", "")
-            setString("http-header-fields", "")
+            let clearHeaderStatus = MPVHTTPHeaderOptions.set([], on: mpv)
+            guard clearHeaderStatus >= 0 else {
+                checkError(clearHeaderStatus)
+                return issuedToken
+            }
             // Trailer audio-language belt-and-suspenders: the resolver already selects the preferred-language
             // audio LEG (the load-bearing fix for multi-language trailers). This additionally tells mpv which
             // language to auto-select IF a single opened file itself exposes more than one embedded audio track
