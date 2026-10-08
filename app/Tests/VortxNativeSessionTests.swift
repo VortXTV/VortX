@@ -112,6 +112,22 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: true))
         check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: false, overridingLegacySource: true))
         let scope = VortxAccountScope(account: "account-a", ownerProfileID: "owner")
+        let actorA = "00000000-0000-0000-0000-000000000001", actorB = "00000000-0000-0000-0000-000000000002"
+        var hostA = try VortxNativeHostPreferences(scope: scope, actor: actorA)
+        var hostB = try VortxNativeHostPreferences(scope: scope, actor: actorB)
+        try hostA.edit(profileID: "owner", fields: ["avatar": .string("🍿")], scope: scope)
+        try hostB.edit(profileID: "owner", fields: ["avatar": .string("moon")], scope: scope)
+        try hostA.merge(hostB.document, scope: scope)
+        check(try hostA.document["profiles"]?["owner"]?["fields"]?["avatar"]?["value"] == .string("moon"))
+        try hostA.edit(profileID: "owner", fields: ["avatar": .null], scope: scope)
+        check(try hostA.document["profiles"]?["owner"]?["fields"]?["avatar"]?["clock"] == .integer(2))
+        do { try hostA.edit(profileID: "owner", fields: ["pin": .string("1234")], scope: scope); fatalError("host carrier accepted native PIN") } catch {}
+        do { try hostA.edit(profileID: "owner", fields: ["future": .object(["apiKey": .string("fixture-secret")])], scope: scope); fatalError("host carrier accepted nested credential") } catch {}
+        var equivocal = try VortxNativeHostPreferences(scope: scope, actor: actorB)
+        try equivocal.edit(profileID: "owner", fields: ["avatar": .string("different")], scope: scope)
+        do { try hostB.merge(equivocal.document, scope: scope); fatalError("host carrier accepted equivocal event") } catch {}
+        let restoredHost = try VortxNativeHostPreferences(scope: scope, actor: actorB, sealed: hostA.encoded())
+        check(restoredHost.local.actor == actorB && restoredHost.local.counter == 2)
         let abi = SessionABI(), store = SessionStore(), transport = SessionTransport()
         let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: store, transport: transport, allowNewAccount: true)
         for _ in 0..<2 {
@@ -186,6 +202,13 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         let restarted = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: encrypted, transport: transport)
         check(try await restarted.stateJSON() == before)
         await restarted.close()
+        let hostSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: encrypted, transport: transport, hostActor: actorA)
+        _ = try await hostSession.dispatch([#"{"type":"edit","value":711}"#], now: 7,
+                                          hostEdits: [.init(profileID: "owner", fields: ["avatar": .string("moon")])])
+        let sealedHost = try encrypted.readHostPreferences(scope: scope)!
+        check(try await VortxNativeHostPreferences(scope: scope, actor: actorA, sealed: sealedHost).document == hostSession.hostPreferencesDocument())
+        check(try encrypted.read(scope: scope)?.contains("711") == true)
+        await hostSession.close()
         let legacyJSON = "{\"profiles\":[{\"id\":\"retained\"}]}"
         let legacy = try VortxLegacyImport(scope: scope, documents: [VortxLegacyImport.rosterID: legacyJSON])
         do { _ = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: SessionStore(), transport: transport, allowNewAccount: true, legacy: legacy); fatalError("legacy account overwritten") }

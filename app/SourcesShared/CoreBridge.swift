@@ -27,9 +27,15 @@ final class CoreBridge: ObservableObject {
     private var nativeFacadeStorage: VortxNativeCoreFacade?
     private var nativeCredentialCapture: CredentialScopeRegistry.Capture?
     private var nativeInstallGeneration = UUID()
+    private var nativeProfileBaseline: [UserProfile] = []
     private var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
     var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
     var hasNativeSession: Bool { nativeFacade?.isAvailable == true }
+    func nativePlaybackSnapshot() -> VortxJSON? {
+        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }),
+              let (facade, _) = nativePlaybackBinding(.native(binding)), let data = facade.stateData("native_playback") else { return nil }
+        return try? JSONDecoder().decode(VortxJSON.self, from: data)
+    }
     func captureNativePlaybackTarget() -> PlaybackMutationTarget {
         nativeFacadeLock.withLock { .native(currentNativePlaybackBinding()) }
     }
@@ -99,6 +105,69 @@ final class CoreBridge: ObservableObject {
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
         return document
     }
+    @MainActor
+    func mergeNativeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
+                                    legacyMaterial: Data, hostEdits: [VortxNativeHostPreferences.Edit] = []) async throws -> VortxJSON {
+        guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
+              let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
+        let document = try await facade.mergeAccountDocument(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial, hostEdits: hostEdits)
+        guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
+              nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
+        try refreshNativeProfiles()
+        return document
+    }
+    @MainActor
+    private func refreshNativeProfiles() throws {
+        guard let facade = nativeFacade, let stateBytes = facade.stateData("native_state"),
+              let hostBytes = facade.stateData("native_host_preferences") else { throw VortxNativeError.closed }
+        let state = try JSONDecoder().decode(VortxJSON.self, from: stateBytes)
+        let profiles = try VortxNativeProfiles.project(state: state, host: JSONDecoder().decode(VortxJSON.self, from: hostBytes), baseline: nativeProfileBaseline)
+        guard case .string(let active) = state["activeProfileId"], let activeID = UUID(uuidString: active) else { throw VortxNativeError.invalidSnapshot }
+        ProfileStore.shared.applyNativeProfiles(profiles, activeID: activeID)
+    }
+    @MainActor
+    func saveNativeProfile(_ profile: UserProfile, creating: Bool) async throws {
+        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }), let facade = nativeFacade,
+              let owner = facade.registryBinding?.scope.ownerProfileID else { throw VortxNativeError.closed }
+        let previous = ProfileStore.shared.profiles.first { $0.id == profile.id }
+        guard creating == (previous == nil) else { throw VortxNativeError.invalidSnapshot }
+        let mutation = try VortxNativeProfiles.mutation(profile, previous: previous, ownerID: owner)
+        try await facade.mutateProfiles(mutation.0, hostEdits: [mutation.1], expectedProfileID: binding.profileID.uuidString)
+        guard CredentialScopeRegistry.shared.isCurrent(binding.credential), ProfileStore.shared.activeID == binding.profileID,
+              nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeInstallGeneration == binding.sessionGeneration }) else { throw VortxNativeError.superseded }
+        try refreshNativeProfiles()
+    }
+    @MainActor
+    func deleteNativeProfile(_ id: UUID) async throws {
+        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }), let facade = nativeFacade,
+              facade.registryBinding?.scope.ownerProfileID != id.uuidString else { throw VortxNativeError.closed }
+        try await facade.mutateProfiles([.object(["type": .string("delete_profile"), "id": .string(id.uuidString)])], hostEdits: [], expectedProfileID: binding.profileID.uuidString)
+        guard CredentialScopeRegistry.shared.isCurrent(binding.credential), nativeFacade === facade else { throw VortxNativeError.superseded }
+        nativeFacadeLock.withLock { nativeInstallGeneration = UUID() }
+        try refreshNativeProfiles()
+        loadBoard(); loadLibrary()
+    }
+    @MainActor
+    func switchNativeProfile(_ id: UUID, outgoing: UserProfile?) async throws {
+        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }), let facade = nativeFacade,
+              let owner = facade.registryBinding?.scope.ownerProfileID else { throw VortxNativeError.closed }
+        var actions: [VortxJSON] = []; var hostEdits: [VortxNativeHostPreferences.Edit] = []
+        if let outgoing {
+            guard outgoing.id == binding.profileID else { throw VortxNativeError.superseded }
+            let mutation = try VortxNativeProfiles.mutation(outgoing, previous: ProfileStore.shared.active, ownerID: owner)
+            actions = mutation.0; hostEdits = [mutation.1]
+        }
+        actions.append(.object(["type": .string("switch_profile"), "id": .string(id.uuidString)]))
+        try await facade.mutateProfiles(actions, hostEdits: hostEdits, expectedProfileID: binding.profileID.uuidString)
+        guard CredentialScopeRegistry.shared.isCurrent(binding.credential),
+              nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeInstallGeneration == binding.sessionGeneration }) else { throw VortxNativeError.superseded }
+        nativeFacadeLock.withLock { nativeInstallGeneration = UUID() }
+        invalidatePublicationEpoch(); clearNativePublishedState()
+        try refreshNativeProfiles()
+        refreshAddons(capturedPublicationToken: capturePublicationToken())
+        rebuildContinueWatching(capturedPublicationToken: capturePublicationToken())
+        loadBoard(); loadLibrary()
+    }
 
     @MainActor
     func rebindNativeRegistry(_ registry: [VortxResourceAddon], expected: VortxNativeCoreFacade.RegistryBinding) async throws {
@@ -112,7 +181,7 @@ final class CoreBridge: ObservableObject {
     /// deliberately no empty-account fallback and no user-facing engine selector.
     @MainActor
     func installNativeSession(_ session: VortxNativeSession, registry: [VortxResourceAddon],
-                              capture: CredentialScopeRegistry.Capture) async throws {
+                              capture: CredentialScopeRegistry.Capture, hostProfiles: [UserProfile] = []) async throws {
         let installGeneration = UUID()
         nativeFacadeLock.withLock { nativeInstallGeneration = installGeneration }
         guard CredentialScopeRegistry.shared.isCurrent(capture), session.scope.account == capture.namespace else {
@@ -134,6 +203,8 @@ final class CoreBridge: ObservableObject {
         }
         guard result.0 else { facade.close(); throw VortxNativeError.superseded }
         result.1?.close()
+        nativeProfileBaseline = hostProfiles
+        try refreshNativeProfiles()
         // Native ctx is descriptor-only: never synthesize a Stremio login/token receipt.
         refreshAddons(capturedPublicationToken: capturePublicationToken())
         rebuildContinueWatching(capturedPublicationToken: capturePublicationToken())

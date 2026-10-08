@@ -56,6 +56,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
         facade.playback = try await session.playbackProjection()
         facade.values = try facade.stateFields(state)
+        facade.values["native_host_preferences"] = try await session.hostPreferencesDocument()
         return facade
     }
     private init(session: VortxNativeSession, registry: [VortxResourceAddon], mutationAccepted: @escaping @Sendable () -> Void, changed: @escaping @Sendable ([String]) -> Void) {
@@ -144,6 +145,8 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         lock.unlock(); return true
     }
     private func enqueueMutation(type: String, raw: String, legacyMaterial: Data? = nil,
+                                 actions: [String]? = nil, hostRemote: VortxJSON? = nil,
+                                 hostEdits: [VortxNativeHostPreferences.Edit] = [],
                                  completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
         let predecessor = tasks["native_state"]
@@ -154,14 +157,17 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         tasks["native_state"] = Task { [weak self] in
             await predecessor?.value
             guard let self else { completion?(.failure(VortxNativeError.closed)); return }
-            defer { if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 } } }
+            var transitionReleased = false
+            defer { if profileTransition && !transitionReleased { self.lock.withLock { self.pendingProfileTransitions -= 1 } } }
             var durableCommitted = false
             do {
                 try Task.checkCancellation()
-                _ = try await session.dispatch([raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial)
+                _ = try await session.dispatch(actions ?? [raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial,
+                                               hostRemote: hostRemote, hostEdits: hostEdits)
                 durableCommitted = true
                 let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
                 let playback = try await session.playbackProjection()
+                let host = try await session.hostPreferencesDocument()
                 let resourceChanged = self.lock.withLock { self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) }
                 // Only the native registry query determines installed membership/order. It also
                 // resolves own/share-primary before new-profile resource loads can be admitted.
@@ -176,14 +182,16 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                         if let replacement { self.registry = replacement; self.resourceRegistryValid = true }
                         else { self.failure = "registry_unavailable" }
                     }
-                    let fields = try self.stateFields(state)
+                    var fields = try self.stateFields(state)
+                    fields["native_host_preferences"] = host
                     fields.forEach { self.values[$0.key] = $0.value }; return fields
                 }
                 // FIFO intents each publish their acknowledged state before the next task executes.
                 // A later get_state must not hide the profile transition's accepted state.
+                if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 }; transitionReleased = true }
                 if let publishedFields { self.changed(Array(publishedFields.keys)) }
                 guard publishedFields != nil, let document = state["nativeSync"] else { throw VortxNativeError.closed }
-                if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) { self.mutationAccepted() }
+                if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) || !hostEdits.isEmpty { self.mutationAccepted() }
                 completion?(.success(document))
             } catch VortxNativeError.checkpointUncertain {
                 _ = self.fail("checkpoint_uncertain_reopen_required"); completion?(.failure(VortxNativeError.checkpointUncertain))
@@ -210,6 +218,39 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                 completion: { continuation.resume(with: $0) }) {
                 continuation.resume(throwing: VortxNativeError.closed)
             }
+        }
+    }
+    /// One durable transaction contains both private-kernel state and public host preferences.
+    /// Its returned carrier is read only after the same FIFO's merge/checkpoint acknowledgement.
+    func mergeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, legacyMaterial: Data?,
+                              hostEdits: [VortxNativeHostPreferences.Edit] = []) async throws -> VortxJSON {
+        let action = remote.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) }
+            ?? .object(["type": .string("get_state")])
+        let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
+        return try await withCheckedThrowingContinuation { continuation in
+            if !enqueueMutation(type: remote == nil ? "get_state" : "merge_native_sync", raw: raw, legacyMaterial: legacyMaterial,
+                                hostRemote: hostRemote, hostEdits: hostEdits, completion: { [weak self] result in
+                switch result {
+                case .success(let native):
+                    guard let self, let host = self.lock.withLock({ self.values["native_host_preferences"] }) else { continuation.resume(throwing: VortxNativeError.closed); return }
+                    continuation.resume(returning: .object(["nativeSync": native, "nativeHostPreferences": host]))
+                case .failure(let error): continuation.resume(throwing: error)
+                }
+            }) { continuation.resume(throwing: VortxNativeError.closed) }
+        }
+    }
+    func mutateProfiles(_ actions: [VortxJSON], hostEdits: [VortxNativeHostPreferences.Edit], expectedProfileID: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock(); defer { lock.unlock() }
+            guard !closed, pendingProfileTransitions == 0, values["native_state"]?["activeProfileId"] == .string(expectedProfileID),
+                  actions.allSatisfy({ ["add_profile", "patch_profile", "delete_profile", "switch_profile"].contains(string($0["type"]) ?? "") }) else { continuation.resume(throwing: VortxNativeError.superseded); return }
+            do {
+                let raw = try actions.map { String(decoding: try JSONEncoder().encode($0), as: UTF8.self) }
+                if !enqueueMutation(type: "patch_profile", raw: "", actions: raw, hostEdits: hostEdits,
+                                    completion: { result in continuation.resume(with: result.map { _ in () }) }) {
+                    continuation.resume(throwing: VortxNativeError.closed)
+                }
+            } catch { continuation.resume(throwing: error) }
         }
     }
     /// A synchronous UI admission receipt, not a durable-write acknowledgement. The native FIFO
@@ -535,6 +576,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
         let descriptors = (lock.withLock { resourceRegistryValid ? registry : [] }).map { addon in VortxJSON.object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest ?? .object([:])]) }
         var fields: [String: VortxJSON] = ["native_state": state, "ctx": .object(["profile": .object(["addons": .array(descriptors)])]),
+                "native_playback": playback ?? .null,
                 "continue_watching_preview": .object(["items": .array((playback?["continueWatching"]?.array ?? []).compactMap(playbackRow))]),
                 "native_history": .object(["items": .array((playback?["history"]?.array ?? []).compactMap(playbackRow))]),
                 "library": .object(["catalog": .array(projected), "selectable": .object(["types": .array([]), "sorts": .array([])])])]

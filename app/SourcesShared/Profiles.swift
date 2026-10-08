@@ -200,6 +200,42 @@ final class ProfileStore: ObservableObject {
 
     @Published private(set) var profiles: [UserProfile] = []
     @Published private(set) var activeID: UUID?
+    @Published private(set) var nativeProfileError: String?
+#if VORTX_NATIVE_DATA_ENGINE
+    /// Called only after the native transaction's checkpoint acknowledgement. The old global
+    /// roster is replaced as a presentation mirror, never unioned into native account authority.
+    func applyNativeProfiles(_ incoming: [UserProfile], activeID selected: UUID) {
+        guard incoming.contains(where: { $0.id == selected }) else { return }
+        profiles = incoming; activeID = selected; nativeProfileError = nil
+        persist(touch: false)
+        if let active {
+            VortXSyncManager.suppressHousekeeping {
+                self.applyTheme(active); self.applyPlayback(active, resetUnset: true); self.applyDiscovery(active, resetUnset: true)
+                SourcePreferences.shared.reload(); SourcePinStore.shared.reload()
+            }
+        }
+    }
+    @MainActor
+    func saveNative(_ profile: UserProfile, creating: Bool) async -> Bool {
+        do { try await CoreBridge.shared.saveNativeProfile(profile, creating: creating); nativeProfileError = nil; return true }
+        catch { nativeProfileError = "Profile could not be saved. Please retry."; return false }
+    }
+    @MainActor
+    func removeNative(_ profile: UserProfile) async -> Bool {
+        do { try await CoreBridge.shared.deleteNativeProfile(profile.id); nativeProfileError = nil; return true }
+        catch { nativeProfileError = "Profile could not be removed. Please retry."; return false }
+    }
+    @MainActor
+    func selectNative(_ profile: UserProfile) async -> Bool {
+        var outgoing = active
+        outgoing?.playback = currentPlaybackPrefs()
+        outgoing?.discovery = currentDiscoveryPrefs()
+        do {
+            try await CoreBridge.shared.switchNativeProfile(profile.id, outgoing: outgoing)
+            pickedThisLaunch = true; nativeProfileError = nil; return true
+        } catch { nativeProfileError = "Profile could not be opened. Please retry."; return false }
+    }
+#endif
     /// The launch picker shows once per cold start, and only when there is a real choice to make.
     /// Settings re-opens it by flipping this back to false.
     @Published var pickedThisLaunch = false
@@ -450,6 +486,9 @@ final class ProfileStore: ObservableObject {
     /// Make `profile` active: applies its theme immediately and reports the account work left.
     @discardableResult
     func select(_ profile: UserProfile) -> SwitchOutcome {
+#if VORTX_NATIVE_DATA_ENGINE
+        Task { @MainActor in _ = await selectNative(profile) }; return .sameAccount
+#endif
         // FIRST, before activeID moves: fold the live flat-key state into the OUTGOING profile. The
         // flat keys are, by the documented invariant, the ACTIVE profile's state, but the 13 stream
         // filters bind straight to the SourcePreferences singleton on both settings screens, so a
@@ -486,11 +525,17 @@ final class ProfileStore: ObservableObject {
     }
 
     func add(_ profile: UserProfile) {
+#if VORTX_NATIVE_DATA_ENGINE
+        Task { @MainActor in _ = await saveNative(profile, creating: true) }; return
+#endif
         profiles.append(profile)
         persist()
     }
 
     func update(_ profile: UserProfile) {
+#if VORTX_NATIVE_DATA_ENGINE
+        Task { @MainActor in _ = await saveNative(profile, creating: false) }; return
+#endif
         guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return }
         profiles[index] = profile
         persist()
@@ -657,6 +702,9 @@ final class ProfileStore: ObservableObject {
     /// outcome when the removed profile was the active one, nil otherwise.
     @discardableResult
     func remove(_ profile: UserProfile) -> SwitchOutcome? {
+#if VORTX_NATIVE_DATA_ENGINE
+        Task { @MainActor in _ = await removeNative(profile) }; return nil
+#endif
         guard profiles.count > 1,
               let target = profiles.first(where: { $0.id == profile.id }),
               !target.isOwner,
@@ -1824,7 +1872,11 @@ final class ProfileStore: ObservableObject {
     /// Episode ids the active overlay profile has watched for a title; drives the
     /// detail page's per-profile ticks.
     func watchedVideoIds(forMeta metaId: String) -> Set<String> {
+#if VORTX_NATIVE_DATA_ENGINE
+        return Set((try? CoreBridge.shared.nativePlaybackSnapshot()?["watchedVideoIdsByTitle"]?[metaId]?.decode([String].self)) ?? [])
+#else
         Set(watch[metaId]?.watchedVideoIds ?? [])
+#endif
     }
 
     /// Bulk watched toggle for the detail page's episode, season, and whole-series

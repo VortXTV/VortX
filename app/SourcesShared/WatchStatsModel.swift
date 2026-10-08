@@ -66,6 +66,26 @@ final class WatchStatsModel: ObservableObject {
     func load() {
         isLoading = true
         genresByID = Self.buildGenreIndex()
+#if VORTX_NATIVE_DATA_ENGINE
+        guard let playback = CoreBridge.shared.nativePlaybackSnapshot() else { records = []; stats = nil; isLoading = false; return }
+        records = (playback["history"]?.array ?? []).compactMap { row in
+            guard case .string(let id) = row["metaId"], case .string(let type) = row["type"],
+                  WatchStats.isVODType(type), !WatchStats.isInternalID(id) else { return nil }
+            let duration = (try? row["durationMs"]?.decode(Double.self)) ?? 0
+            let offset = (try? row["offsetMs"]?.decode(Double.self)) ?? 0
+            let played = (try? row["timesWatched"]?.decode(Int.self)) ?? 0
+            let episodes = playback["watchedVideoIdsByTitle"]?[id]?.array?.count ?? 0
+            let plays = type == "series" ? episodes : played
+            let timestamp = (try? row["updatedAt"]?.decode(Double.self)) ?? 0
+            // Same estimate as the existing live-state reader; the native query does not claim
+            // an accumulated watch-time counter. Saved membership never enters this history.
+            let seconds = max(offset, duration * Double(plays)) / 1000
+            return WatchRecord(id: id, type: type, name: (try? row["name"]?.decode(String.self)) ?? id,
+                               poster: try? row["poster"]?.decode(String.self), watchSeconds: WatchStats.clampSeconds(seconds),
+                               plays: plays, lastWatched: timestamp > 0 ? Date(timeIntervalSince1970: timestamp) : nil)
+        }
+        finishLoad(); return
+#endif
 
         guard ProfileStore.shared.activeUsesEngineHistory else {
             // Overlay profile: its private overlay only, never the engine buckets.
