@@ -41,9 +41,14 @@ enum VortxLegacyBootstrapMaterialTests {
     /// Models the producer boundary exactly: independently authenticated Stremio response bodies
     /// are retained byte-for-byte and put behind a small, token-free carrier. The bootstrapper
     /// never accepts a flattened host reconstruction as account proof.
-    static func ownSourceEnvelope(libraryRows: [Object], addons: [Object], profileOverlay: Object = [:], extraEnvelope: Object = [:]) throws -> Data {
-        let libraryResponse = try JSONSerialization.data(withJSONObject: ["result": libraryRows], options: [.sortedKeys])
-        let addonsResponse = try JSONSerialization.data(withJSONObject: ["result": ["addons": addons]], options: [.sortedKeys])
+    static func ownSourceEnvelope(libraryRows: [Object], addons: [Object], profileOverlay: Object = [:],
+                                  libraryResponseExtra: Object = [:], addonsResponseExtra: Object = [:], extraEnvelope: Object = [:]) throws -> Data {
+        var libraryResponseObject: Object = ["result": libraryRows]
+        var addonsResponseObject: Object = ["result": ["addons": addons]]
+        for (key, value) in libraryResponseExtra { libraryResponseObject[key] = value }
+        for (key, value) in addonsResponseExtra { addonsResponseObject[key] = value }
+        let libraryResponse = try JSONSerialization.data(withJSONObject: libraryResponseObject, options: [.sortedKeys])
+        let addonsResponse = try JSONSerialization.data(withJSONObject: addonsResponseObject, options: [.sortedKeys])
         let overlayResponse = try JSONSerialization.data(withJSONObject: profileOverlay, options: [.sortedKeys])
         var envelope: Object = ["schemaVersion": 1,
                                 "libraryResponseBase64": libraryResponse.base64EncodedString(),
@@ -134,6 +139,18 @@ enum VortxLegacyBootstrapMaterialTests {
         check((result["libraries"] as! [String: Object])[owner.id.uuidString] != nil
               && (result["identityLinks"] as! [String: [[String]]])[own.id.uuidString] == [],
               "Primary bucket is retained and own receipt invents no aliases")
+
+        let nullErrorReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [ownMovie], addons: [ownAddon],
+                libraryResponseExtra: ["error": NSNull()], addonsResponseExtra: ["error": NSNull()]))
+        _ = try material(root, roster: [owner, own], ownAccountSources: [nullErrorReceipt])
+        let unknownResponseReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [ownMovie], addons: [ownAddon],
+                libraryResponseExtra: ["lastModified": 1]))
+        do { _ = try material(root, roster: [owner, own], ownAccountSources: [unknownResponseReceipt]); preconditionFailure("unknown response metadata imported") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("exact library and add-on responses"), "Only documented null API error metadata is accepted")
+        }
 
         let retainedBaseline = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
         let coldResult = try material(root, roster: [owner, own], retainedOwnAccountBaseline: retainedBaseline)

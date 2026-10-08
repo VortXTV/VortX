@@ -254,8 +254,10 @@ enum VortxLegacyBootstrapMaterial {
                   let libraryEnvelope = try JSONSerialization.jsonObject(with: libraryBytes) as? Object,
                   let addonEnvelope = try JSONSerialization.jsonObject(with: addonBytes) as? Object,
                   let overlay = try JSONSerialization.jsonObject(with: overlayBytes) as? Object,
-                  Set(libraryEnvelope.keys) == ["result"],
-                  Set(addonEnvelope.keys) == ["result"],
+                  (Set(libraryEnvelope.keys) == ["result"] ||
+                    (Set(libraryEnvelope.keys) == ["result", "error"] && libraryEnvelope["error"] is NSNull)),
+                  (Set(addonEnvelope.keys) == ["result"] ||
+                    (Set(addonEnvelope.keys) == ["result", "error"] && addonEnvelope["error"] is NSNull)),
                   let libraryRows = libraryEnvelope["result"] as? [Any],
                   let addonResult = addonEnvelope["result"] as? Object,
                   Set(addonResult.keys) == ["addons"],
