@@ -17,8 +17,10 @@ enum CinemaUISmokeRendererApp {
 
     static func main() {
         let app = NSApplication.shared
-        app.setActivationPolicy(.prohibited)
         do {
+            guard app.setActivationPolicy(.accessory) else {
+                throw RendererError.activationPolicy
+            }
             let output = try outputDirectory()
             for surface in CinemaUISmokeSurface.allCases {
                 for viewport in viewports {
@@ -59,7 +61,14 @@ enum CinemaUISmokeRendererApp {
         window.isReleasedWhenClosed = false
         window.contentView = host
         window.orderFrontRegardless()
-        defer { window.orderOut(nil) }
+        var attachedSheet: NSWindow?
+        defer {
+            if let attachedSheet {
+                window.endSheet(attachedSheet)
+                attachedSheet.orderOut(nil)
+            }
+            window.orderOut(nil)
+        }
         drainMainRunLoop()
         host.layoutSubtreeIfNeeded()
 
@@ -68,6 +77,7 @@ enum CinemaUISmokeRendererApp {
             guard let sheet = window.attachedSheet, let sheetContent = sheet.contentView else {
                 throw RendererError.missingQuickViewSheet
             }
+            attachedSheet = sheet
             sheetContent.layoutSubtreeIfNeeded()
             capturedView = sheetContent
         } else {
@@ -97,13 +107,14 @@ enum CinemaUISmokeRendererApp {
     }
 
     private enum RendererError: LocalizedError {
-        case missingOutputDirectory, bitmapAllocation, pngEncoding, missingQuickViewSheet
+        case missingOutputDirectory, bitmapAllocation, pngEncoding, missingQuickViewSheet, activationPolicy
         var errorDescription: String? {
             switch self {
             case .missingOutputDirectory: return "CINEMA_UI_SMOKE_OUTPUT must be an absolute directory"
             case .bitmapAllocation: return "could not allocate an offscreen bitmap"
             case .pngEncoding: return "could not encode PNG output"
             case .missingQuickViewSheet: return "production CinemaQuickView sheet was not attached"
+            case .activationPolicy: return "could not enter isolated accessory application policy"
             }
         }
     }

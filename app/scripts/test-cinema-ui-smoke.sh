@@ -75,6 +75,12 @@ done
 rg -Fq '.sheet(isPresented: $isPresented)' SourcesiOS/CinemaUISmokeHarness.swift
 rg -Fq 'window.attachedSheet' SourcesiOS/CinemaUISmokeRendererApp.swift
 rg -Fq 'missingQuickViewSheet' SourcesiOS/CinemaUISmokeRendererApp.swift
+rg -Fq 'app.setActivationPolicy(.accessory)' SourcesiOS/CinemaUISmokeRendererApp.swift
+rg -Fq 'window.endSheet(attachedSheet)' SourcesiOS/CinemaUISmokeRendererApp.swift
+if rg -n 'setActivationPolicy\(\.prohibited\)' SourcesiOS/CinemaUISmokeRendererApp.swift >/dev/null; then
+  print -u2 'Cinema renderer needs its isolated accessory window to attach the production sheet'
+  exit 1
+fi
 
 # `SourceIndexClient` names this optional source even though the fixture never supplies it. The renderer
 # compiles a stub instead of the QuickJS runtime, so a compile-only dependency cannot construct its store,
