@@ -177,6 +177,9 @@ enum SIMKLAuthBoundary {
 /// no secret is read or shipped. `isConfigured` gates the whole feature so an unprovisioned build stays
 /// dormant.
 actor SIMKLAuth {
+#if VORTX_NATIVE_DATA_ENGINE
+    private var nativeCredentialGeneration = UUID()
+#endif
     static let shared = SIMKLAuth()
 
     // MARK: - Configuration (build-time; empty ships a dormant, invisible feature)
@@ -612,25 +615,27 @@ actor SIMKLAuth {
     func adoptTokens(
         access: String,
         expiryUnix: Int,
-        ownerCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil
+        ownerCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
+        mutationGuard: (@Sendable (() -> Bool) -> Bool)? = nil
     ) async -> CredentialMutationResult {
         guard !access.isEmpty else { return .failure }
         let capture = suppliedCapture ?? ownerCapture()
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return .failure }
         let namespace = capture.namespace
         loginAttempts.invalidate()
-        var result: CredentialMutationResult = .failure
         let installed = await performCredentialBoundary {
             guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
-            result = replaceCredentialsWithNewSession(
+            let mutate = {
+            return self.replaceCredentialsWithNewSession(
                 access: access,
                 expiryUnix: expiryUnix,
                 ownerCapture: capture,
                 ownerNamespace: namespace
-            )
-            return result == .success
+            ) == .success
+            }
+            return mutationGuard.map { $0(mutate) } ?? mutate()
         }
-        return installed ? result : .failure
+        return installed ? .success : .failure
     }
 
     /// Finish a legacy claim only after the account layer has established the exact owner capture. This is
@@ -855,6 +860,12 @@ actor SIMKLAuth {
                 guard !Task.isCancelled,
                       CredentialScopeRegistry.shared.isCurrent(capture),
                       loginAttempts.owns(code: userCode, generation: loginGeneration) else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+                guard let nativeIntent = await MainActor.run(body: { VortXSyncManager.shared.prepareNativeProviderMutation([
+                    "simklAccess": .string(token), "simklExpiry": .string("0")], capture: capture) }),
+                      CredentialScopeRegistry.shared.isCurrent(capture),
+                      loginAttempts.owns(code: userCode, generation: loginGeneration) else { return false }
+#endif
                 persisted = replaceCredentialsWithNewSession(
                     access: token,
                     expiryUnix: 0,
@@ -863,8 +874,7 @@ actor SIMKLAuth {
                 ) == .success
 #if VORTX_NATIVE_DATA_ENGINE
                 if persisted {
-                    persisted = await MainActor.run { VortXSyncManager.shared.noteNativeProviderMutation([
-                        "simklAccess": .string(token), "simklExpiry": .string("0")], capture: capture, suppressImportedApply: false) }
+                    persisted = await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
                 }
 #endif
                 if persisted { loginAttempts.invalidate() }
@@ -1076,6 +1086,9 @@ actor SIMKLAuth {
               let mutationLease = CredentialPublicationOutbox.beginMutation() else { return .failure }
         defer { CredentialPublicationOutbox.endMutation(mutationLease) }
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return .failure }
+#if VORTX_NATIVE_DATA_ENGINE
+        nativeCredentialGeneration = UUID()
+#endif
         guard Self.recoverCredentialAuthority(credentials: credentials, ownerNamespace: resolvedNamespace) else {
             return .failure
         }
@@ -1183,37 +1196,67 @@ actor SIMKLAuth {
 
     private func clearCredentialsAndPublishBoundary(
         ownerCapture capture: CredentialScopeRegistry.Capture,
-        explicitNativeDisconnect: Bool = false
+        explicitNativeDisconnect: Bool = false,
+        mutationGuard: ((() -> Bool) -> Bool)? = nil
     ) async -> Bool {
         let resolvedNamespace = capture.namespace
         guard await acquirePublicationBoundary() else { return false }
         defer { CredentialPublicationOutbox.endBoundary() }
         guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
-        guard CredentialTupleTransaction.clear(
-            baseAccounts: tupleAccounts(ownerNamespace: resolvedNamespace),
+#if VORTX_NATIVE_DATA_ENGINE
+        var nativeIntent: [String: VortxNativeProviderCredentials.Register]?
+        if explicitNativeDisconnect {
+            nativeIntent = await MainActor.run { VortXSyncManager.shared.prepareNativeProviderMutation([
+                "simklAccess": .null, "simklExpiry": .null], capture: capture) }
+            guard nativeIntent != nil, CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
+        }
+#endif
+        let mutate = {
+#if VORTX_NATIVE_DATA_ENGINE
+            self.nativeCredentialGeneration = UUID()
+#endif
+            return CredentialTupleTransaction.clear(
+            baseAccounts: self.tupleAccounts(ownerNamespace: resolvedNamespace),
             activePointer: SIMKLTokenSlots.active(resolvedNamespace),
             cleanupMarker: SIMKLTokenSlots.cleanup(resolvedNamespace),
             candidateMarker: SIMKLTokenSlots.candidate(resolvedNamespace),
             extraAccounts: [SIMKLTokenSlots.publication(resolvedNamespace)],
-            certifiedRead: credentials.certifiedRead,
-            recoveryRead: credentials.recoveryRead,
-            write: credentials.write
-        ) else { return false }
+            certifiedRead: self.credentials.certifiedRead,
+            recoveryRead: self.credentials.recoveryRead,
+            write: self.credentials.write)
+        }
+        guard mutationGuard.map({ $0(mutate) }) ?? mutate() else { return false }
         SIMKLAuthBoundary.publish(nil)
 #if VORTX_NATIVE_DATA_ENGINE
-        if explicitNativeDisconnect {
-            return await MainActor.run { VortXSyncManager.shared.noteNativeProviderMutation([
-                "simklAccess": .null, "simklExpiry": .null], capture: capture, suppressImportedApply: false) }
+        if let nativeIntent {
+            return await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
         }
 #endif
         return true
     }
 #if VORTX_NATIVE_DATA_ENGINE
-    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture) async -> Bool {
+    func certifiesNativePrepared(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
         guard ownerCapture() == capture else { return false }
+        let keys = VortxNativeProviderCredentials.groups[1]
+        guard Set(events.keys) == Set(keys) else { return false }
+        switch readCredentialTuple(ownerNamespace: capture.namespace) {
+        case .none: return events.values.allSatisfy { $0.value == .null }
+        case .authority(let tuple):
+            return tuple.values.count == 3 && keys.enumerated().allSatisfy { events[$0.element]?.value == .string(tuple.values[$0.offset]) }
+        case .failure: return false
+        }
+    }
+    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture, events: [String: VortxNativeProviderCredentials.Register]) async -> Bool {
+        guard ownerCapture() == capture else { return false }
+        let generation = nativeCredentialGeneration
+        let session = currentSessionID(ownerNamespace: capture.namespace)
         return await performCredentialBoundary {
             guard ownerCapture() == capture else { return false }
-            return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
+            return await clearCredentialsAndPublishBoundary(ownerCapture: capture, mutationGuard: { mutate in
+                guard self.nativeCredentialGeneration == generation,
+                      self.currentSessionID(ownerNamespace: capture.namespace) == session else { return false }
+                return VortXSyncManager.withNativeProviderEvents(events, capture: capture, mutation: mutate)
+            })
         }
     }
 #endif

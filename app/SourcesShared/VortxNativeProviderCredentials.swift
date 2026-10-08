@@ -4,7 +4,7 @@ import Foundation
 /// document, never a native snapshot, host preference, recovery archive, diagnostic or log.
 struct VortxNativeProviderCredentials {
     typealias Register = VortxNativeHostPreferences.Register
-    struct Document: Codable, Equatable {
+    struct Document: Codable, Equatable, Sendable {
         let schemaVersion: Int
         let scope: String
         var fields: [String: Register]
@@ -13,6 +13,13 @@ struct VortxNativeProviderCredentials {
         var counter: UInt64
         var document: Document
         var pending: [String: Register]
+        /// Secure local outbox only. Written before an OAuth tuple changes, and never exported.
+        /// A crash/failure leaves this explicit intent available for a certified retry.
+        var prepared: [String: Register]? = nil
+    }
+    private static let storeLock = NSRecursiveLock()
+    static func withStoreLock<T>(_ body: () throws -> T) rethrows -> T {
+        storeLock.lock(); defer { storeLock.unlock() }; return try body()
     }
     static let keys: Set<String> = ["tmdb", "mdblist", "fanart", "realDebrid", "allDebrid", "premiumize", "torBox",
                                     "traktAccess", "traktRefresh", "traktExpiry", "simklAccess", "simklExpiry"]
@@ -25,9 +32,10 @@ struct VortxNativeProviderCredentials {
         local = try sealed.map { try JSONDecoder().decode(Local.self, from: $0) }
             ?? Local(counter: 0, document: Document(schemaVersion: 1, scope: scope, fields: [:]), pending: [:])
         try Self.validate(local.document, scope: scope)
+        try Self.validate(Document(schemaVersion: 1, scope: scope, fields: local.prepared ?? [:]), scope: scope)
         guard local.counter <= VortxNativeHostPreferences.maxClock,
               local.pending.allSatisfy({ local.document.fields[$0.key] == $0.value }) else { throw VortxNativeError.invalidSnapshot }
-        local.counter = max(local.counter, local.document.fields.values.map(\.clock).max() ?? 0)
+        local.counter = max(local.counter, (Array(local.document.fields.values) + Array((local.prepared ?? [:]).values)).map(\.clock).max() ?? 0)
     }
     func encoded() throws -> Data { try JSONEncoder().encode(local) }
     var document: VortxJSON { get throws { try JSONDecoder().decode(VortxJSON.self, from: JSONEncoder().encode(local.document)) } }
@@ -42,7 +50,32 @@ struct VortxNativeProviderCredentials {
         try Self.validate(next.document, scope: local.document.scope)
         local = next
     }
+    var hasPreparedMutation: Bool { local.prepared?.isEmpty == false }
+    mutating func prepare(_ fields: [String: VortxJSON]) throws -> [String: Register] {
+        var candidate = self
+        try candidate.edit(fields)
+        let events = candidate.local.document.fields.filter { fields[$0.key] != nil }
+        var prepared = local.prepared ?? [:]
+        for (key, event) in events { prepared[key] = event }
+        try Self.validate(Document(schemaVersion: 1, scope: local.document.scope, fields: prepared), scope: local.document.scope)
+        local.counter = candidate.local.counter; local.prepared = prepared
+        return events
+    }
+    mutating func finishPrepared(_ events: [String: Register]) throws {
+        guard !events.isEmpty, events.allSatisfy({ local.prepared?[$0.key] == $0.value }) else { throw VortxNativeError.superseded }
+        var candidate = local
+        for (key, event) in events {
+            candidate.document.fields[key] = event; candidate.pending[key] = event
+            candidate.prepared?.removeValue(forKey: key)
+        }
+        try Self.validate(candidate.document, scope: local.document.scope)
+        local = candidate
+    }
+    func authorizes(_ events: [String: Register]) -> Bool {
+        !hasPreparedMutation && !events.isEmpty && events.allSatisfy { local.document.fields[$0.key] == $0.value }
+    }
     mutating func merge(_ wire: VortxJSON?) throws {
+        guard !hasPreparedMutation else { throw VortxNativeError.unavailable }
         guard let wire else { return }
         guard case .object(let root) = wire, Set(root.keys) == ["schemaVersion", "scope", "fields"],
               case .object(let fields) = root["fields"] else { throw VortxNativeError.invalidSnapshot }

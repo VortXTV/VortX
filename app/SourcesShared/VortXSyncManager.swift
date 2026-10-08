@@ -237,7 +237,17 @@ final class VortXSyncManager: ObservableObject {
         switch Keychain.confirmedString("vortx.native.providerState." + capture.namespace) {
         case .missing: bytes = nil
         case .value(let value): bytes = Data(value.utf8)
-        case .failure: throw VortxNativeError.unavailable
+        case .failure:
+            // An uncertain intent write may leave a complete prior prepared journal or complete
+            // finalized value. Recertify only those exact durable bytes; never infer absence.
+            let slot = "vortx.native.providerState." + capture.namespace
+            guard case .value(let retained) = Keychain.durableString(slot) else { throw VortxNativeError.unavailable }
+            _ = try VortxNativeProviderCredentials(scope: capture.namespace, actor: nativeHostActor(capture: capture), sealed: Data(retained.utf8))
+            try VortxNativeProviderCredentials.withStoreLock {
+                guard Keychain.set(retained, for: slot) == .success,
+                      case .value(let confirmed) = Keychain.confirmedString(slot), confirmed == retained else { throw VortxNativeError.unavailable }
+            }
+            bytes = Data(retained.utf8)
         }
         return try VortxNativeProviderCredentials(scope: capture.namespace, actor: nativeHostActor(capture: capture), sealed: bytes)
     }
@@ -245,10 +255,69 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture) else { throw VortxNativeError.superseded }
         let slot = "vortx.native.providerState." + capture.namespace
         let encoded = String(decoding: try value.encoded(), as: UTF8.self)
-        guard Keychain.set(encoded, for: slot), Keychain.string(slot) == encoded else { throw VortxNativeError.unavailable }
+        try VortxNativeProviderCredentials.withStoreLock {
+            guard Keychain.set(encoded, for: slot) == .success, Keychain.string(slot) == encoded else { throw VortxNativeError.unavailable }
+        }
+    }
+    func prepareNativeProviderMutation(_ fields: [String: VortxJSON], capture: CredentialScopeRegistry.Capture) -> [String: VortxNativeProviderCredentials.Register]? {
+        guard isCurrent(capture) else { return nil }
+        guard case .account = capture.scope else { return [:] }
+        do {
+            var state = try nativeProviderState(capture: capture)
+            let events = try state.prepare(fields)
+            try saveNativeProviderState(state, capture: capture)
+            return events
+        } catch { return nil }
+    }
+    func finishNativeProviderMutation(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
+        if events.isEmpty { return isCurrent(capture) }
+        do {
+            var state = try nativeProviderState(capture: capture)
+            try state.finishPrepared(events); try saveNativeProviderState(state, capture: capture)
+            requestSyncSoon(); return true
+        } catch { return false } // prepared secure intent remains; no remote hydration/export may pass it
+    }
+    /// Synchronous credential mutation linearization: the provider register cannot change between
+    /// this exact-event check and the secure tuple mutation. Never hold this lock across an await.
+    nonisolated static func withNativeProviderEvents(_ events: [String: VortxNativeProviderCredentials.Register],
+        capture: CredentialScopeRegistry.Capture, mutation: () -> Bool) -> Bool {
+        VortxNativeProviderCredentials.withStoreLock {
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  case .value(let encoded) = Keychain.confirmedString("vortx.native.providerState." + capture.namespace),
+                  let state = try? VortxNativeProviderCredentials(scope: capture.namespace,
+                    actor: "00000000-0000-0000-0000-000000000001", sealed: Data(encoded.utf8)),
+                  state.authorizes(events) else { return false }
+            return mutation()
+        }
+    }
+    nonisolated static func withNativeProviderSnapshot(_ expected: VortxNativeProviderCredentials.Document,
+        capture: CredentialScopeRegistry.Capture, mutation: () -> Bool) -> Bool {
+        VortxNativeProviderCredentials.withStoreLock {
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  case .value(let encoded) = Keychain.confirmedString("vortx.native.providerState." + capture.namespace),
+                  let state = try? VortxNativeProviderCredentials(scope: capture.namespace,
+                    actor: "00000000-0000-0000-0000-000000000001", sealed: Data(encoded.utf8)),
+                  !state.hasPreparedMutation, state.local.document == expected else { return false }
+            return mutation()
+        }
     }
     /// Called only after a successful account-scoped secure mutation, never on bind/sign-out.
     /// The caller rolls its mutation back if the durable explicit intent cannot be recorded.
+    private func settleNativeProviderJournal(capture: CredentialScopeRegistry.Capture) async -> Bool {
+        do {
+            let state = try nativeProviderState(capture: capture)
+            guard state.hasPreparedMutation else { return true }
+            for (index, group) in VortxNativeProviderCredentials.groups.enumerated() {
+                let events = (state.local.prepared ?? [:]).filter { group.contains($0.key) }
+                guard !events.isEmpty else { continue }
+                let certified: Bool
+                if index == 0 { certified = await TraktAuth.shared.certifiesNativePrepared(events, capture: capture) }
+                else { certified = await SIMKLAuth.shared.certifiesNativePrepared(events, capture: capture) }
+                guard certified, isCurrent(capture), finishNativeProviderMutation(events, capture: capture) else { return false }
+            }
+            return try !nativeProviderState(capture: capture).hasPreparedMutation
+        } catch { return false }
+    }
     func nativeProviderRevision(_ keys: [String], capture: CredentialScopeRegistry.Capture) -> [String: String]? {
         guard let state = try? nativeProviderState(capture: capture) else { return nil }
         return Dictionary(uniqueKeysWithValues: keys.map { key in
@@ -272,6 +341,7 @@ final class VortXSyncManager: ObservableObject {
     }
     private func mergedNativeProviderState(_ document: [String: Any], capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
         var state = try nativeProviderState(capture: capture)
+        guard !state.hasPreparedMutation else { throw VortxNativeError.unavailable }
         if let raw = document["nativeProviderCredentials"] {
             let wire = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: raw))
             // A legacy peer editing a registered key without its event is not silently promoted.
@@ -994,6 +1064,7 @@ final class VortXSyncManager: ObservableObject {
         capture: CredentialScopeRegistry.Capture,
         version: Int
     ) -> PendingProviderApply? {
+#if !VORTX_NATIVE_DATA_ENGINE
         if let pending = pendingProviderApply,
            pending.capture == capture,
            pending.version == version {
@@ -1006,6 +1077,11 @@ final class VortXSyncManager: ObservableObject {
         } else {
             priorValues = [:]
         }
+#else
+        // Native retries are reconstructed from the current merged register snapshot. Retaining an
+        // older value-only plan could resurrect a tuple superseded by a local reconnect or clear.
+        let priorValues: [ProviderApplyService: ProviderApplyValue] = [:]
+#endif
         var values: [ProviderApplyService: ProviderApplyValue] = [:]
         if let keys {
             if let access = keys["traktAccess"], let refresh = keys["traktRefresh"],
@@ -2467,6 +2543,7 @@ final class VortXSyncManager: ObservableObject {
         let capture = credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture) else { return false }
 #if VORTX_NATIVE_DATA_ENGINE
+        guard await settleNativeProviderJournal(capture: capture), isCurrent(capture) else { return false }
         guard VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: (try? nativeGlobalEdits()) == nil,
                                                                 hasLegacyAddonOrderIntent: pendingAddonOrderIntent != nil,
                                                                 overridingLegacySource: afterUserChoseThisDevice) else { return false }
@@ -2876,6 +2953,8 @@ final class VortXSyncManager: ObservableObject {
         }
         var doc = pulled.doc
 #if VORTX_NATIVE_DATA_ENGINE
+        let nativeProviderApplySnapshot: VortxNativeProviderCredentials.Document
+        guard await settleNativeProviderJournal(capture: capture), isCurrent(capture) else { return false }
         do {
             var providers = try mergedNativeProviderState(doc, capture: capture)
             let material = try Self.nativeLegacyMaterial(doc)
@@ -2890,13 +2969,20 @@ final class VortXSyncManager: ObservableObject {
             let mirrored = try mirrorNativeProviderKeys(providers, original: doc["apiKeys"])
             var keys = mirrored.compactMapValues { $0 as? String }
             if providers.local.document.fields["traktAccess"]?.value == .null {
-                guard await TraktAuth.shared.applyNativeCredentialClear(capture: capture), isCurrent(capture) else { return false }
+                let events = providers.local.document.fields.filter { VortxNativeProviderCredentials.groups[0].contains($0.key) }
+                guard await TraktAuth.shared.applyNativeCredentialClear(capture: capture, events: events), isCurrent(capture) else { return false }
                 retireNativeProviderApply(.trakt, capture: capture)
             }
             if providers.local.document.fields["simklAccess"]?.value == .null {
-                guard await SIMKLAuth.shared.applyNativeCredentialClear(capture: capture), isCurrent(capture) else { return false }
+                let events = providers.local.document.fields.filter { VortxNativeProviderCredentials.groups[1].contains($0.key) }
+                guard await SIMKLAuth.shared.applyNativeCredentialClear(capture: capture, events: events), isCurrent(capture) else { return false }
                 retireNativeProviderApply(.simkl, capture: capture)
             }
+            // OAuth boundaries suspend. A newer local edit/prepared transaction invalidates this
+            // entire apply snapshot, including metadata/Debrid and any queued provider plan.
+            let currentProviders = try nativeProviderState(capture: capture)
+            guard !currentProviders.hasPreparedMutation, currentProviders.local.document == providers.local.document else { return false }
+            nativeProviderApplySnapshot = currentProviders.local.document
             // Empty strings are a local secure-store apply instruction, never emitted on wire.
             for (key, event) in providers.local.document.fields where event.value == .null { keys[key] = "" }
             doc["apiKeys"] = keys
@@ -3334,11 +3420,18 @@ final class VortXSyncManager: ObservableObject {
                     guard case let .trakt(access, refresh, expiryUnix) = pending.values[.trakt] ?? .none else {
                         return false
                     }
+#if VORTX_NATIVE_DATA_ENGINE
+                    return await TraktAuth.shared.adoptTokens(access: access, refresh: refresh,
+                        expiryUnix: expiryUnix, ownerCapture: pending.capture, mutationGuard: { mutate in
+                            Self.withNativeProviderSnapshot(nativeProviderApplySnapshot, capture: pending.capture, mutation: mutate)
+                        }) == .success
+#else
                     return await TraktAuth.shared.adoptTokens(
                         access: access,
                         refresh: refresh,
                         expiryUnix: expiryUnix,
                         ownerCapture: pending.capture) == .success
+#endif
                 },
                 secondClaim: {
                     pending.values[.simkl] ?? .none
@@ -3352,10 +3445,17 @@ final class VortXSyncManager: ObservableObject {
                     guard case let .simkl(access, expiryUnix) = pending.values[.simkl] ?? .none else {
                         return false
                     }
+#if VORTX_NATIVE_DATA_ENGINE
+                    return await SIMKLAuth.shared.adoptTokens(access: access, expiryUnix: expiryUnix,
+                        ownerCapture: pending.capture, mutationGuard: { mutate in
+                            Self.withNativeProviderSnapshot(nativeProviderApplySnapshot, capture: pending.capture, mutation: mutate)
+                        }) == .success
+#else
                     return await SIMKLAuth.shared.adoptTokens(
                         access: access,
                         expiryUnix: expiryUnix,
                         ownerCapture: pending.capture) == .success
+#endif
                 },
                 sleepBeforeRetry: { [weak self] in
                     guard let self else { return false }
