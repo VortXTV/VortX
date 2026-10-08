@@ -1,0 +1,184 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "zeroPaddingProtocolExample",
+      "serialized": "tt2934286:1:5:5:eJyTZwAAAEAAIA==",
+      "inventory": [
+        {"id": "tt2934286:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "tt2934286:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "tt2934286:1:3", "season": 1, "episode": 3, "releasedMs": 3},
+        {"id": "tt2934286:1:4", "season": 1, "episode": 4, "releasedMs": 4},
+        {"id": "tt2934286:1:5", "season": 1, "episode": 5, "releasedMs": 5}
+      ],
+      "watched": ["tt2934286:1:1", "tt2934286:1:2", "tt2934286:1:3", "tt2934286:1:4", "tt2934286:1:5"]
+    },
+    {
+      "name": "insertedPrefixUsesAnchorOffset",
+      "serialized": "show:1:3:3:eJxjBQAABgAG",
+      "inventory": [
+        {"id": "show:1:0", "season": 0, "episode": 0, "releasedMs": 0},
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "show:1:3", "season": 1, "episode": 3, "releasedMs": 3}
+      ],
+      "watched": ["show:1:1", "show:1:3"]
+    },
+    {
+      "name": "missingAnchorRejects",
+      "serialized": "missing:3:eJxjBQAABgAG",
+      "inventory": [
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "show:1:3", "season": 1, "episode": 3, "releasedMs": 3}
+      ],
+      "error": true
+    },
+    {
+      "name": "malformedBase64Rejects",
+      "serialized": "show:1:1:%%",
+      "inventory": [{"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1}],
+      "error": true
+    },
+    {
+      "name": "duplicateIdRejects",
+      "serialized": "show:1:1:1:eJxjBQAABgAG",
+      "inventory": [
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:1:1", "season": 1, "episode": 2, "releasedMs": 2}
+      ],
+      "error": true
+    },
+    {
+      "name": "ambiguousCoordinatesReject",
+      "serialized": "show:1:1:1:eJxjBQAABgAG",
+      "inventory": [
+        {"id": "show:one", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:other", "season": 1, "episode": 1, "releasedMs": 1}
+      ],
+      "error": true
+    },
+    {
+      "name": "releasedTieBreakIsPartOfExactOrder",
+      "serialized": "show:alternate:2:eJxjBgAABAAE",
+      "inventory": [
+        {"id": "show:original", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:alternate", "season": 1, "episode": 1, "releasedMs": 2}
+      ],
+      "watched": ["show:original", "show:alternate"]
+    },
+    {
+      "name": "releasedNullPrecedesActualMinimum",
+      "serialized": "show:min:2:eJxjBgAABAAE",
+      "inventory": [
+        {"id": "show:none", "season": 1, "episode": 1, "releasedMs": null},
+        {"id": "show:min", "season": 1, "episode": 1, "releasedMs": -9223372036854775808}
+      ],
+      "watched": ["show:none", "show:min"]
+    },
+    {
+      "name": "releasedNullReverseOrderRejects",
+      "serialized": "show:none:2:eJxjBgAABAAE",
+      "inventory": [
+        {"id": "show:min", "season": 1, "episode": 1, "releasedMs": -9223372036854775808},
+        {"id": "show:none", "season": 1, "episode": 1, "releasedMs": null}
+      ],
+      "error": true
+    },
+    {
+      "name": "canonicalEquivalentUnicodeIdsRemainDistinct",
+      "serialized": "\u00e9:2:eJxjBgAABAAE",
+      "inventory": [
+        {"id": "e\u0301", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "\u00e9", "season": 1, "episode": 2, "releasedMs": 2}
+      ],
+      "watched": ["e\u0301", "\u00e9"]
+    },
+    {
+      "name": "unorderedInventoryRejects",
+      "serialized": "show:1:1:1:eJxjBQAABgAG",
+      "inventory": [
+        {"id": "show:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1}
+      ],
+      "error": true
+    },
+    {
+      "name": "incompleteInventoryWithTrueBitRejects",
+      "serialized": "show:1:4:4:eJyTBwAAIAAg",
+      "inventory": [
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "show:1:3", "season": 1, "episode": 3, "releasedMs": 3},
+        {"id": "show:1:4", "season": 1, "episode": 4, "releasedMs": 4}
+      ],
+      "error": true
+    },
+    {
+      "name": "overflowAnchorLengthRejects",
+      "serialized": "show:1:1:999999999999999999999999:eJxjBQAABgAG",
+      "inventory": [{"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1}],
+      "error": true
+    },
+    {
+      "name": "trailingZlibRejects",
+      "serialized": "show:1:5:5:eJyTZwAAAEAAIAA=",
+      "inventory": [
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "show:1:3", "season": 1, "episode": 3, "releasedMs": 3},
+        {"id": "show:1:4", "season": 1, "episode": 4, "releasedMs": 4},
+        {"id": "show:1:5", "season": 1, "episode": 5, "releasedMs": 5}
+      ],
+      "error": true
+    },
+    {
+      "name": "truncatedZlibRejects",
+      "serialized": "show:1:5:5:eJyTZwAAAEAA",
+      "inventory": [
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "show:1:3", "season": 1, "episode": 3, "releasedMs": 3},
+        {"id": "show:1:4", "season": 1, "episode": 4, "releasedMs": 4},
+        {"id": "show:1:5", "season": 1, "episode": 5, "releasedMs": 5}
+      ],
+      "error": true
+    },
+    {
+      "name": "compressionBombRejects",
+      "serialized": "show:1:1:1:eJztwQEBAAAAgiD/r25IQAEAAAAAAAAAAAAAAAAAAADwYEJoAAE=",
+      "inventory": [{"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1}],
+      "error": true
+    },
+    {
+      "name": "oversizedEncodedPayloadRejectsBeforeDecode",
+      "serializedPrefix": "show:1:1:1:",
+      "payloadCharacter": "A",
+      "payloadCount": 87385,
+      "inventory": [{"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1}],
+      "error": true
+    },
+    {
+      "name": "truePaddingRejects",
+      "serialized": "show:1:5:5:eJyTVwAAAGAAQA==",
+      "inventory": [
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "show:1:3", "season": 1, "episode": 3, "releasedMs": 3},
+        {"id": "show:1:4", "season": 1, "episode": 4, "releasedMs": 4},
+        {"id": "show:1:5", "season": 1, "episode": 5, "releasedMs": 5}
+      ],
+      "error": true
+    },
+    {
+      "name": "trueBitAfterAnchorRejects",
+      "serialized": "show:1:2:2:eJxjBwAACAAI",
+      "inventory": [
+        {"id": "show:1:1", "season": 1, "episode": 1, "releasedMs": 1},
+        {"id": "show:1:2", "season": 1, "episode": 2, "releasedMs": 2},
+        {"id": "show:1:3", "season": 1, "episode": 3, "releasedMs": 3}
+      ],
+      "error": true
+    }
+  ]
+}
