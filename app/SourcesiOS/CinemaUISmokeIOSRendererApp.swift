@@ -19,7 +19,10 @@ struct CinemaUISmokeIOSRendererApp: App {
                     surface: surface
                 )
             }
-            .ignoresSafeArea()
+            // Match the production scene: system chrome owns its safe area, only the canvas bleeds.
+            // This also avoids native light-mode glass being mistaken for the app's forced-dark glass.
+            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .preferredColorScheme(.dark)
         }
     }
 }

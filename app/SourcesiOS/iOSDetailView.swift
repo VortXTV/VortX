@@ -341,12 +341,21 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
 /// natural size, so labels never wrap. iOS 16+ Layout protocol (the deployment target).
 struct FlowLayout: Layout {
     var spacing: CGFloat = 8
+    /// Source badges can contain arbitrarily long add-on names. Ordinary action flows keep their
+    /// historical intrinsic-width behavior; this opt-in lets a single oversized badge truncate safely.
+    var constrainOversizedItems = false
+
+    private func itemSize(_ subview: LayoutSubview, maxWidth: CGFloat) -> CGSize {
+        let natural = subview.sizeThatFits(.unspecified)
+        guard constrainOversizedItems, natural.width > maxWidth else { return natural }
+        return subview.sizeThatFits(ProposedViewSize(width: maxWidth, height: nil))
+    }
 
     func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Void) -> CGSize {
         let maxWidth = proposal.width ?? .greatestFiniteMagnitude
         var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0, widest: CGFloat = 0
         for s in subviews {
-            let sz = s.sizeThatFits(.unspecified)
+            let sz = itemSize(s, maxWidth: maxWidth)
             if x > 0, x + sz.width > maxWidth { x = 0; y += rowHeight + spacing; rowHeight = 0 }
             x += sz.width + spacing
             rowHeight = max(rowHeight, sz.height)
@@ -359,7 +368,7 @@ struct FlowLayout: Layout {
         let maxWidth = bounds.width
         var x = bounds.minX, y = bounds.minY, rowHeight: CGFloat = 0
         for s in subviews {
-            let sz = s.sizeThatFits(.unspecified)
+            let sz = itemSize(s, maxWidth: maxWidth)
             if x > bounds.minX, x + sz.width - bounds.minX > maxWidth { x = bounds.minX; y += rowHeight + spacing; rowHeight = 0 }
             s.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(sz))
             x += sz.width + spacing
@@ -7034,30 +7043,25 @@ struct iOSStreamLabel: View {
                 .font(.system(size: 26))
                 .foregroundStyle(enabled ? Theme.Palette.accent : Theme.Palette.textTertiary)
             VStack(alignment: .leading, spacing: 6) {
-                // On a narrow iPhone (below `Theme.Space.wideLayoutMinWidth`) the source column runs to
-                // `.infinity` and the badge row's only width guard is each badge's `fixedSize`, so a long
-                // add-on name plus the TORRENT / CACHED pills could run off-screen. A horizontal scroll keeps
-                // every badge at its intrinsic width and lets the row scroll instead of overflowing; on wide
-                // layouts they all fit, so nothing scrolls and the look is unchanged.
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        if pinned {
-                            Image(systemName: "pin.fill")
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundStyle(Theme.Palette.accent)
-                                .accessibilityLabel("Pinned source")
-                        }
-                        badge(quality, prominent: true)
-                        // Skip the add-on badge when it only repeats the resolution: some add-on configs are
-                        // literally named "1080p" / "4K", which rendered as a second quality pill next to the
-                        // one above (the reported double tag). Real add-on names still show.
-                        if addon.uppercased() != quality.uppercased() { badge(addon.uppercased()) }
-                        if stream.isTorrent { badge("TORRENT") }
-                        // Cache chip: instant from the user's debrid account (coordinator-confirmed raw torrent)
-                        // OR the add-on already advertises the source as cached. Reuses the prominent (accent)
-                        // badge style with a bolt glyph; only shows when cached.
-                        if cached { badge("⚡ CACHED", prominent: true) }
+                // Whole badges wrap on phones, so the add-on/cache facts are visible without a nested
+                // horizontal gesture. Wide windows naturally retain one row; raw authored text stays below.
+                FlowLayout(spacing: 8, constrainOversizedItems: true) {
+                    if pinned {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(Theme.Palette.accent)
+                            .accessibilityLabel("Pinned source")
                     }
+                    badge(quality, prominent: true)
+                    // Skip the add-on badge when it only repeats the resolution: some add-on configs are
+                    // literally named "1080p" / "4K", which rendered as a second quality pill next to the
+                    // one above (the reported double tag). Real add-on names still show.
+                    if addon.uppercased() != quality.uppercased() { badge(addon.uppercased()) }
+                    if stream.isTorrent { badge("TORRENT") }
+                    // Cache chip: instant from the user's debrid account (coordinator-confirmed raw torrent)
+                    // OR the add-on already advertises the source as cached. Reuses the prominent (accent)
+                    // badge style with a bolt glyph; only shows when cached.
+                    if cached { badge("⚡ CACHED", prominent: true) }
                 }
                 // Parsed flavour tags + size, the clean line tvOS shows, minus the resolution (it is
                 // the prominent badge above), so the row never reads as a doubled "4K · 4K · HDR".
@@ -7099,11 +7103,10 @@ struct iOSStreamLabel: View {
 
     @ViewBuilder private func badge(_ text: String, prominent: Bool = false) -> some View {
         let label = Text(text).font(Theme.Typography.eyebrow).tracking(1)
-            // Keep the badge (including the add-on / debrid / source name) on a single horizontal line at
-            // its intrinsic width. Without fixedSize a sibling badge could squeeze the name pill to a
-            // near-zero width, wrapping the name to 2-3 characters per line (the reported vertical text).
+            // The flow places whole pills at natural width rather than compressing sibling labels into
+            // vertical slivers. Only a single name wider than the entire row truncates on one line.
             .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 10).padding(.vertical, 4)
             .foregroundStyle(prominent ? Theme.Palette.accent : Theme.Palette.textSecondary)
         if prominent {

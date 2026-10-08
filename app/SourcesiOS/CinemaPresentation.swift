@@ -6,6 +6,7 @@ struct CinemaQuickView: View {
     let item: RailItem
     let onWatch: () -> Void
     let onDetails: () -> Void
+    @State private var sheetDetent: PresentationDetent = .large
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isWatchlisted = false
@@ -30,7 +31,7 @@ struct CinemaQuickView: View {
             }
             .padding(Theme.Space.md)
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.medium, .large], selection: $sheetDetent)
         .presentationDragIndicator(.visible)
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .accessibilityElement(children: .contain)
