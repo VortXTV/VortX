@@ -154,7 +154,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: b6de6b861247ab10e304d6686d95660c887c441e
+          ref: ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -168,7 +168,7 @@ jobs:
           test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
           test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
           test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@b6de6b8 (promoted from monorepo subdir)"
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@ec96c6c (promoted from monorepo subdir)"
 
       - name: Select the newest Xcode on the runner
         run: |

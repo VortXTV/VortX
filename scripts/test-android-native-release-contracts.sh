@@ -73,6 +73,15 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     require_literal "$(basename "$workflow") pins stremiox-core immutably" 'repository: VortXTV/stremiox-core' "$workflow"
     require_regex "$(basename "$workflow") stremiox-core ref is a full SHA" 'ref: [0-9a-f]{40}' "$workflow"
     require_literal "$(basename "$workflow") pins vortx-core immutably" 'repository: VortXTV/vortx-core' "$workflow"
+    # rust-cache's explicit key survives its lockfile-prefix fallback. Bind that key to the
+    # private source, not only the branch, so updating engine code cannot restore older targets.
+    cache_key="$(awk '/^[[:space:]]*key:.*github.ref_name/{print; exit}' "$workflow")"
+    [[ "$cache_key" == *"hashFiles("* ]] || fail "$(basename "$workflow") private cache is not content-addressed"
+    for input in 'core/src/**' 'core/Cargo.*' 'vortx-core/crates/**' 'vortx-core/Cargo.*' \
+                 'vortx-core/rust-toolchain.toml' 'vortx-core/.cargo/**' 'android/app/build.gradle.kts'; do
+        [[ "$cache_key" == *"'$input'"* ]] || fail "$(basename "$workflow") cache key omits $input"
+    done
+    ok "$(basename "$workflow") private-source content is retained in the restore prefix"
 done
 ok "debug/release Android workflow invocations select native mode and resource-host together"
 
