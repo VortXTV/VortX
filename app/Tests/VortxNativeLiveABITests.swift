@@ -253,6 +253,52 @@ import CryptoKit
         owner.pin = UserProfile.pinHash("1234", profileID: owner.id)
         let child = UserProfile(id: UUID(uuidString: "10000000-0000-0000-0000-000000000001")!, name: "Child", avatar: "C")
         var ownAccount = child; ownAccount.usesOwnAccount = true
+        let pendingRecord: VortxJSON = .object([
+            "name": .string(child.name), "owner": .bool(false),
+            "account": .object(["kind": .string("pending_own")]), "addons": .string("own"),
+            "parental": .object(["kids": .bool(false), "familyEdit": .bool(false)]),
+            "settings": .object(["accent": .string("ember"), "oled": .bool(false), "textScale": .integer(1000), "disabledAddons": .array([])])
+        ])
+        let pendingState: VortxJSON = .object(["roster": .object(["profiles": .object([child.id.uuidString: pendingRecord])])])
+        check(try VortxNativeProfiles.project(state: pendingState, host: .object([:]), baseline: [child]).first?.usesOwnAccount == true)
+
+        let localBinding: VortxJSON = .object(["account": .object(["kind": .string("local_only")]),
+                                                "revision": .integer(0), "transactionId": .null])
+        let bindingState: VortxJSON = .object([
+            "roster": .object(["profiles": .object([child.id.uuidString: .object(["account": .object(["kind": .string("local_only")])])])]),
+            "nativeSync": .object(["accountSlots": .object([child.id.uuidString: .object(["activeBinding": localBinding])])])
+        ])
+        let expectedBinding = try VortxNativeProfiles.expectedBinding(state: bindingState, profileID: child.id)
+        check(expectedBinding.account == .object(["kind": .string("local_only")]) && expectedBinding.revision == .integer(0) && expectedBinding.transactionID == nil)
+        let rebindMaterial: VortxJSON = .object([
+            "schemaVersion": .integer(2),
+            "ownAccountSources": .object([child.id.uuidString: .object(["verifiedStreamingUid": .string("verified-own-uid"),
+                                                                          "sourceDocumentSha256": .string(String(repeating: "a", count: 64))])]),
+            "addons": .object([child.id.uuidString: .object(["items": .array([]), "order": .array([]), "intents": .array([])])]),
+            "libraries": .object([child.id.uuidString: .object(["items": .array([]), "intents": .array([])])]),
+            "watches": .object([child.id.uuidString: .array([])]), "identityLinks": .object([child.id.uuidString: .array([])])
+        ])
+        let ownTarget = try VortxNativeProfiles.ownTarget(material: rebindMaterial, profileID: child.id)
+        let pendingRequest = try VortxNativeProfiles.AccountRebindRequest(scope: "fixture-account", ownerProfileID: owner.id.uuidString,
+                                                                            transactionID: "pending-own-transaction", expected: expectedBinding,
+                                                                            target: .pendingOwn)
+        let pendingAction = try VortxNativeProfiles.rebindAction(profileID: child.id, request: pendingRequest)
+        check(pendingAction == .object(["type": .string("rebind_profile_account"), "scope": .string("fixture-account"),
+                                        "ownerProfileId": .string(owner.id.uuidString), "profileId": .string(child.id.uuidString),
+                                        "transactionId": .string("pending-own-transaction"), "expectedBinding": localBinding,
+                                        "target": .object(["kind": .string("pending_own")])]))
+        let provenRequest = try VortxNativeProfiles.AccountRebindRequest(scope: "fixture-account", ownerProfileID: owner.id.uuidString,
+                                                                           transactionID: "proven-own-transaction", expected: expectedBinding,
+                                                                           target: .own(ownTarget))
+        let createOwn = try VortxNativeProfiles.mutation(ownAccount, previous: nil, ownerID: owner.id.uuidString,
+                                                          rebind: try .initial(scope: "fixture-account", ownerProfileID: owner.id.uuidString,
+                                                                               transactionID: "new-own-transaction", target: .pendingOwn))
+        check(createOwn.0.compactMap { $0["type"] } == [.string("add_profile"), .string("patch_profile"), .string("rebind_profile_account")])
+        let rebindExisting = try VortxNativeProfiles.mutation(ownAccount, previous: child, ownerID: owner.id.uuidString, rebind: provenRequest)
+        let provenAction = try VortxNativeProfiles.rebindAction(profileID: child.id, request: provenRequest)
+        check(rebindExisting.0.last == provenAction)
+        do { _ = try VortxNativeProfiles.mutation(ownAccount, previous: child, ownerID: owner.id.uuidString); fatalError("generic own selection accepted") }
+        catch VortxNativeError.invalidSnapshot {}
         let ownRecord: VortxJSON = .object([
             "name": .string(ownAccount.name), "owner": .bool(false),
             "account": .object(["kind": .string("own"), "value": .string("verified-own-uid")]),
