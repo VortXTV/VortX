@@ -3,6 +3,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p app/build
 native_test_dir=$(mktemp -d app/build/native-cutover.XXXXXX)
+sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The profile roster and the active selection\./!p; }' app/SourcesShared/Profiles.swift > "$native_test_dir/UserProfile.swift"
+{
+    printf '%s\n' 'import Foundation'
+    sed -n '/^struct ProfileDiscoveryPreferences: /,/^}$/p' app/SourcesShared/ProfileDiscoveryPreferences.swift
+} > "$native_test_dir/Discovery.swift"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
   app/SourcesShared/VortxResourceProjection.swift app/Tests/VortxNativeBridgeTests.swift \
@@ -11,6 +16,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
   app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
+  "$native_test_dir/UserProfile.swift" "$native_test_dir/Discovery.swift" app/SourcesShared/ProfileAddonPreferences.swift \
   app/Tests/VortxNativeSessionTests.swift -o "$native_test_dir/native-session"
 "$native_test_dir/native-session" "$native_test_dir"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \

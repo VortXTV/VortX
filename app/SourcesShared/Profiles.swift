@@ -202,36 +202,56 @@ final class ProfileStore: ObservableObject {
     @Published private(set) var activeID: UUID?
     @Published private(set) var nativeProfileError: String?
 #if VORTX_NATIVE_DATA_ENGINE
+    private var nativeProjectionTarget: PlaybackMutationTarget?
+    private var nativePublishedPlayback: UserProfile.PlaybackPrefs?
+    private var nativePublishedDiscovery: ProfileDiscoveryPreferences?
     /// Called only after the native transaction's checkpoint acknowledgement. The old global
     /// roster is replaced as a presentation mirror, never unioned into native account authority.
     func applyNativeProfiles(_ incoming: [UserProfile], activeID selected: UUID) {
         guard incoming.contains(where: { $0.id == selected }) else { return }
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        let sameInstallation = nativeProjectionTarget == target && activeID == selected
+        // A same-session sync publication may run before a queued UI preference save. Preserve
+        // its captured flat values until that transaction acknowledges; real switches still reset.
+        let incomingActive = incoming.first { $0.id == selected }
+        let flatPlayback = currentPlaybackPrefs(), flatDiscovery = currentDiscoveryPrefs()
+        let pendingPlayback = sameInstallation && nativePublishedPlayback != flatPlayback && incomingActive?.playback != flatPlayback
+        let pendingDiscovery = sameInstallation && nativePublishedDiscovery != flatDiscovery && incomingActive?.discovery != flatDiscovery
         profiles = incoming; activeID = selected; nativeProfileError = nil
+        nativeProjectionTarget = target
         persist(touch: false)
         if let active {
             VortXSyncManager.suppressHousekeeping {
-                self.applyTheme(active); self.applyPlayback(active, resetUnset: true); self.applyDiscovery(active, resetUnset: true)
+                self.applyTheme(active)
+                if !pendingPlayback { self.applyPlayback(active, resetUnset: true) }
+                if !pendingDiscovery { self.applyDiscovery(active, resetUnset: true) }
+                if !pendingPlayback { self.nativePublishedPlayback = self.currentPlaybackPrefs() }
+                if !pendingDiscovery { self.nativePublishedDiscovery = self.currentDiscoveryPrefs() }
                 SourcePreferences.shared.reload(); SourcePinStore.shared.reload()
             }
         }
     }
     @MainActor
-    func saveNative(_ profile: UserProfile, creating: Bool) async -> Bool {
-        do { try await CoreBridge.shared.saveNativeProfile(profile, creating: creating); nativeProfileError = nil; return true }
+    func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget? = nil) async -> Bool {
+        let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
+        do { try await CoreBridge.shared.saveNativeProfile(profile, creating: creating, target: captured); nativeProfileError = nil; return true }
         catch { nativeProfileError = "Profile could not be saved. Please retry."; return false }
     }
     @MainActor
-    func removeNative(_ profile: UserProfile) async -> Bool {
-        do { try await CoreBridge.shared.deleteNativeProfile(profile.id); nativeProfileError = nil; return true }
+    func removeNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil) async -> Bool {
+        let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
+        do { try await CoreBridge.shared.deleteNativeProfile(profile.id, target: captured); nativeProfileError = nil; return true }
         catch { nativeProfileError = "Profile could not be removed. Please retry."; return false }
     }
     @MainActor
-    func selectNative(_ profile: UserProfile) async -> Bool {
+    func selectNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil) async -> Bool {
+        let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
+        guard CoreBridge.shared.nativePlaybackTargetIsCurrent(captured) else { return false }
         var outgoing = active
         outgoing?.playback = currentPlaybackPrefs()
         outgoing?.discovery = currentDiscoveryPrefs()
         do {
-            try await CoreBridge.shared.switchNativeProfile(profile.id, outgoing: outgoing)
+            try await CoreBridge.shared.switchNativeProfile(profile.id, outgoing: outgoing, target: captured)
             pickedThisLaunch = true; nativeProfileError = nil; return true
         } catch { nativeProfileError = "Profile could not be opened. Please retry."; return false }
     }
@@ -487,7 +507,8 @@ final class ProfileStore: ObservableObject {
     @discardableResult
     func select(_ profile: UserProfile) -> SwitchOutcome {
 #if VORTX_NATIVE_DATA_ENGINE
-        Task { @MainActor in _ = await selectNative(profile) }; return .sameAccount
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        Task { @MainActor in _ = await selectNative(profile, target: target) }; return .sameAccount
 #endif
         // FIRST, before activeID moves: fold the live flat-key state into the OUTGOING profile. The
         // flat keys are, by the documented invariant, the ACTIVE profile's state, but the 13 stream
@@ -526,7 +547,8 @@ final class ProfileStore: ObservableObject {
 
     func add(_ profile: UserProfile) {
 #if VORTX_NATIVE_DATA_ENGINE
-        Task { @MainActor in _ = await saveNative(profile, creating: true) }; return
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        Task { @MainActor in _ = await saveNative(profile, creating: true, target: target) }; return
 #endif
         profiles.append(profile)
         persist()
@@ -534,7 +556,8 @@ final class ProfileStore: ObservableObject {
 
     func update(_ profile: UserProfile) {
 #if VORTX_NATIVE_DATA_ENGINE
-        Task { @MainActor in _ = await saveNative(profile, creating: false) }; return
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        Task { @MainActor in _ = await saveNative(profile, creating: false, target: target) }; return
 #endif
         guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return }
         profiles[index] = profile
@@ -703,7 +726,8 @@ final class ProfileStore: ObservableObject {
     @discardableResult
     func remove(_ profile: UserProfile) -> SwitchOutcome? {
 #if VORTX_NATIVE_DATA_ENGINE
-        Task { @MainActor in _ = await removeNative(profile) }; return nil
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        Task { @MainActor in _ = await removeNative(profile, target: target) }; return nil
 #endif
         guard profiles.count > 1,
               let target = profiles.first(where: { $0.id == profile.id }),
@@ -1217,6 +1241,12 @@ final class ProfileStore: ObservableObject {
               let index = profiles.firstIndex(where: { $0.id == activeID }) else { return }
         let now = currentDiscoveryPrefs()
         guard profiles[index].discovery != now else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        var profile = profiles[index]
+        profile.discovery = now
+        update(profile)
+        return
+#endif
         profiles[index].discovery = now
         persist()
     }

@@ -36,6 +36,8 @@ private struct PlaybackMutationOwnershipPolicyTests {
         let reopenedA = Policy.NativeBinding(profileID: owner, credential: credential, sessionGeneration: UUID())
         check(Policy.allowsNative(nativeTarget, binding: nativeA), "native launch owns its exact installed session")
         check(!Policy.allowsNative(nativeTarget, binding: nativeB), "native A callback cannot write B")
+        let otherAccountSameOwner = Policy.NativeBinding(profileID: owner, credential: .init(generation: 8), sessionGeneration: UUID())
+        check(!Policy.allowsNative(nativeTarget, binding: otherAccountSameOwner), "queued profile save captured before Task cannot write another account with the same A11C owner")
         check(!Policy.allowsNative(nativeTarget, binding: reopenedA), "native A to B to A or same-profile reopen cannot revive old player")
         check(!Policy.allowsNative(nativeTarget, binding: nil), "revoked native session cannot accept callback")
         check(!Policy.allowsNative(.native(nil), binding: nativeA), "unavailable launch never acquires later native session")

@@ -100,6 +100,17 @@ struct VortxNativeHostPreferences: Sendable {
               !["stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textscale"].contains(normalized)
         else { throw VortxNativeError.invalidSnapshot }
         if global, knownGlobals.contains(name), !validGlobal(name, value: value) { throw VortxNativeError.invalidSnapshot }
+        if !global, value != .null {
+            // Validate the actual presentation DTO before durable commit. Unknown safe fields
+            // remain opaque, but a known field must never poison subsequent profile hydration.
+            switch name {
+            case "avatar", "email": _ = try value.decode(String.self)
+            case "playback": _ = try value.decode(UserProfile.PlaybackPrefs.self)
+            case "discovery": _ = try value.decode(ProfileDiscoveryPreferences.self)
+            case "addonPreferences": _ = try value.decode(ProfileAddonPreferences.self)
+            default: break
+            }
+        }
         let bytes = try JSONEncoder().encode(VortxJSON.object([name: value]))
         let archive = try VortxNativeBootstrapArchive.encode(document: bytes)
         let parsed = try JSONDecoder().decode(VortxJSON.self, from: archive)

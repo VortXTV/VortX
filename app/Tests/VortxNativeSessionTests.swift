@@ -208,6 +208,16 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         let sealedHost = try encrypted.readHostPreferences(scope: scope)!
         check(try await VortxNativeHostPreferences(scope: scope, actor: actorA, sealed: sealedHost).document == hostSession.hostPreferencesDocument())
         check(try encrypted.read(scope: scope)?.contains("711") == true)
+        let validHostState = try encrypted.read(scope: scope)
+        for (field, malformed) in [("avatar", VortxJSON.integer(1)), ("playback", .string("invalid")), ("discovery", .string("invalid")), ("addonPreferences", .array([]))] {
+            do {
+                _ = try await hostSession.dispatch([#"{"type":"edit","value":999}"#], now: 8,
+                    hostEdits: [.init(profileID: "owner", fields: [field: malformed])])
+                fatalError("malformed presentation field was committed")
+            } catch {}
+            check(try encrypted.read(scope: scope) == validHostState)
+            check(try encrypted.readHostPreferences(scope: scope) == sealedHost)
+        }
         await hostSession.close()
         let legacyJSON = "{\"profiles\":[{\"id\":\"retained\"}]}"
         let legacy = try VortxLegacyImport(scope: scope, documents: [VortxLegacyImport.rosterID: legacyJSON])

@@ -126,8 +126,8 @@ final class CoreBridge: ObservableObject {
         ProfileStore.shared.applyNativeProfiles(profiles, activeID: activeID)
     }
     @MainActor
-    func saveNativeProfile(_ profile: UserProfile, creating: Bool) async throws {
-        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }), let facade = nativeFacade,
+    func saveNativeProfile(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget) async throws {
+        guard let (facade, _) = nativePlaybackBinding(target), case .native(let binding?) = target,
               let owner = facade.registryBinding?.scope.ownerProfileID else { throw VortxNativeError.closed }
         let previous = ProfileStore.shared.profiles.first { $0.id == profile.id }
         guard creating == (previous == nil) else { throw VortxNativeError.invalidSnapshot }
@@ -138,8 +138,8 @@ final class CoreBridge: ObservableObject {
         try refreshNativeProfiles()
     }
     @MainActor
-    func deleteNativeProfile(_ id: UUID) async throws {
-        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }), let facade = nativeFacade,
+    func deleteNativeProfile(_ id: UUID, target: PlaybackMutationTarget) async throws {
+        guard let (facade, _) = nativePlaybackBinding(target), case .native(let binding?) = target,
               facade.registryBinding?.scope.ownerProfileID != id.uuidString else { throw VortxNativeError.closed }
         try await facade.mutateProfiles([.object(["type": .string("delete_profile"), "id": .string(id.uuidString)])], hostEdits: [], expectedProfileID: binding.profileID.uuidString)
         guard CredentialScopeRegistry.shared.isCurrent(binding.credential), nativeFacade === facade else { throw VortxNativeError.superseded }
@@ -148,8 +148,8 @@ final class CoreBridge: ObservableObject {
         loadBoard(); loadLibrary()
     }
     @MainActor
-    func switchNativeProfile(_ id: UUID, outgoing: UserProfile?) async throws {
-        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }), let facade = nativeFacade,
+    func switchNativeProfile(_ id: UUID, outgoing: UserProfile?, target: PlaybackMutationTarget) async throws {
+        guard let (facade, _) = nativePlaybackBinding(target), case .native(let binding?) = target,
               let owner = facade.registryBinding?.scope.ownerProfileID else { throw VortxNativeError.closed }
         var actions: [VortxJSON] = []; var hostEdits: [VortxNativeHostPreferences.Edit] = []
         if let outgoing {
