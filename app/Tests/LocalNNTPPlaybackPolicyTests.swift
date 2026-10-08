@@ -143,6 +143,41 @@ enum LocalNNTPPlaybackPolicyTests {
         check(unknown.observe(owner: 1, sample: sample(), now: 1) == .wait,
               "backwards clock starts fresh observation")
 
+        // Call the production deferred-seek policy, not only its caller: an opening-seconds
+        // nudge used to be issued by recovery and then silently cleared by this downstream gate.
+        for target in [0.034, 2.0, 5.0] {
+            check(DeferredResumePolicy.decision(targetSeconds: target, observedDurationSeconds: 1200,
+                      engineDurationSeconds: 1200, deadlineReached: false) == .clear,
+                  "ordinary short resume remains ignored at \(target)s")
+            check(DeferredResumePolicy.decision(targetSeconds: target, observedDurationSeconds: 1200,
+                      engineDurationSeconds: 1200, deadlineReached: false, allowShortResume: true) == .seek(to: target),
+                  "local NNTP recovery actually seeks to exact opening position \(target)s")
+        }
+        check(DeferredResumePolicy.decision(targetSeconds: 2, observedDurationSeconds: 0,
+                  engineDurationSeconds: 0, deadlineReached: false, allowShortResume: true) == .wait,
+              "short recovery waits for source duration rather than clearing its target")
+        check(DeferredResumePolicy.decision(targetSeconds: 2, observedDurationSeconds: 0,
+                  engineDurationSeconds: 1200, deadlineReached: false, allowShortResume: true) == .seek(to: 2),
+              "short recovery uses direct duration fallback")
+        for invalid in [0.0, -1, .nan, .infinity] {
+            check(DeferredResumePolicy.decision(targetSeconds: invalid, observedDurationSeconds: 1200,
+                      engineDurationSeconds: 1200, deadlineReached: false, allowShortResume: true) == .clear,
+                  "short-resume opt-in still rejects zero/invalid target")
+        }
+        check(DeferredResumePolicy.decision(targetSeconds: 2, observedDurationSeconds: 1200,
+                  engineDurationSeconds: 1200, deadlineReached: true, allowShortResume: true) == .clear,
+              "short-resume opt-in preserves deadline bound")
+        check(DeferredResumeFloorPolicy.armedFloor(targetSeconds: 2) == nil,
+              "ordinary short resume does not change persistence policy")
+        let shortFloor = DeferredResumeFloorPolicy.armedFloor(targetSeconds: 2, allowShortResume: true)
+        check(shortFloor == 2 && !DeferredResumeFloorPolicy.allowsPersistence(positionSeconds: 0.034, currentFloor: shortFloor),
+              "local short resume protects saved position from opening-frame persistence")
+        check(DeferredResumeFloorPolicy.floorAfterDecision(currentFloor: shortFloor, targetSeconds: 2,
+                  decision: .seek(to: 2)) == 2,
+              "issued short seek retains its floor until actual landing")
+        check(DeferredResumeFloorPolicy.floorAfterAcceptedPlayback(currentFloor: shortFloor, positionSeconds: 2) == nil,
+              "accepted short resume landing retires persistence floor")
+
         // Exercise wiring that cannot run in this dependency-free harness: pre-admission profile,
         // all-Apple compilation, raw ownership, real transport guards, and the existing resume/hop path.
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
@@ -187,8 +222,20 @@ enum LocalNNTPPlaybackPolicyTests {
               && failover.contains("let resume = retryResumeTarget()")
               && failover.contains("hopToNextSource(reason: \"local NNTP repeated starvation\", resumeOverride: resume)"),
               "starvation failover revalidates owner and retains existing exact episode/resume routing")
-        check(failover.contains("resume > 0, resume <= 5 { nudgeResume(to: resume) }"),
+        check(failover.contains("resume > 0, resume <= 5 { nudgeResume(to: resume, allowShortResume: true) }"),
               "even opening-seconds failover preserves the frozen resume position")
+        let recovery = section(player, "private func recoverFromStall(", "/// Show a small transient notice")
+        check(recovery.contains("nudgeResume(to: resume, allowShortResume: localNNTPStarvation)")
+              && recovery.contains("nudgeResume(to: resume, allowShortResume: true)"),
+              "accepted retry and rejected-retry hop opt in to exact short resume")
+        let spentBudget = section(recovery, "guard stallRecoveries < 3 else", "// Repeated stalls on one source")
+        check(spentBudget.contains("if localNNTPStarvation")
+              && spentBudget.contains("recoverFromLocalNNTPStarvation(owner: owner)"),
+              "exhausted generic budget retains local short-resume failover")
+        let nudge = section(player, "private func nudgeResume(", "/// The pinned source for this title")
+        check(nudge.contains("allowShortResume: Bool = false")
+              && nudge.components(separatedBy: "allowShortResume: allowShortResume").count == 4,
+              "per-call opt-in reaches real deferred policy and persistence floor without changing ordinary callers")
         for (first, end) in [("private func resetRuntimeForIssuedSourceSwitch", "private func resetRuntimeForIssuedEpisode"),
                              ("private func resetRuntimeForIssuedEpisode", "private func switchStream(")] {
             check(section(player, first, end).contains("localNNTPStallRecovery = .init()"),

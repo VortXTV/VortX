@@ -5442,7 +5442,7 @@ struct PlayerScreen: View {
         if hopToNextSource(reason: "local NNTP repeated starvation", resumeOverride: resume) {
             // The shared source-switch path normally ignores the first five seconds. This recovery
             // must not replay even that short opening when it is the exact frozen position.
-            if resume > 0, resume <= 5 { nudgeResume(to: resume) }
+            if resume > 0, resume <= 5 { nudgeResume(to: resume, allowShortResume: true) }
             return
         }
         loadErrorMsg = "Playback kept buffering on this source."
@@ -5488,6 +5488,10 @@ struct PlayerScreen: View {
             ? coordinator.player?.activeLoadToken : nil
         srcProbe("recoverFromStall ENTER (mid-play freeze) stallRecoveries=\(stallRecoveries)/3 at pos=\(String(format: "%.1f", currentTime))s")
         guard stallRecoveries < 3 else {
+            if localNNTPStarvation, let owner = coordinator.player?.activeLoadToken {
+                recoverFromLocalNNTPStarvation(owner: owner)
+                return
+            }
             // Repeated stalls on one source: hop to another at the current position, falling back to
             // the error overlay once candidates run out.
             srcProbe("recoverFromStall -> stall budget exhausted, trying hopToNextSource")
@@ -5521,13 +5525,13 @@ struct PlayerScreen: View {
                 loadErrorMsg = "Playback could not recover this source."
                 presentTerminalLoadFailure()
             } else if resume > 0, resume <= 5 {
-                nudgeResume(to: resume)
+                nudgeResume(to: resume, allowShortResume: true)
             }
             return
         }
         if issuedToken != nil { startLoadTimeout() }
         if issuedToken != nil, resume > 5 || (localNNTPStarvation && resume > 0) {
-            nudgeResume(to: resume)
+            nudgeResume(to: resume, allowShortResume: localNNTPStarvation)
         }
     }
 
@@ -6005,10 +6009,10 @@ struct PlayerScreen: View {
     /// so this waits for its authoritative achieved keyframe and never seeks into forward-only bytes. Other
     /// engines keep the ordinary post-load absolute seek.
     @State private var deferredResumeAttempt = DeferredResumeAttempt()
-    private func nudgeResume(to seconds: Double) {
+    private func nudgeResume(to seconds: Double, allowShortResume: Bool = false) {
         let ticket = deferredResumeAttempt.begin(targetSeconds: seconds)
         if let floor = DeferredResumeFloorPolicy.armedFloor(
-            targetSeconds: ticket.targetSeconds
+            targetSeconds: ticket.targetSeconds, allowShortResume: allowShortResume
         ) {
             suppressedResumeFloor = max(suppressedResumeFloor ?? 0, floor)
             lastReported = max(lastReported, suppressedResumeFloor ?? floor)
@@ -6076,7 +6080,8 @@ struct PlayerScreen: View {
                     targetSeconds: ticket.targetSeconds,
                     observedDurationSeconds: resumeDuration,
                     engineDurationSeconds: coordinator.player?.mediaDurationSeconds() ?? 0,
-                    deadlineReached: false
+                    deadlineReached: false,
+                    allowShortResume: allowShortResume
                 )
                 switch decision {
                 case .wait:
@@ -6121,7 +6126,8 @@ struct PlayerScreen: View {
                     targetSeconds: ticket.targetSeconds,
                     observedDurationSeconds: duration,
                     engineDurationSeconds: coordinator.player?.mediaDurationSeconds() ?? 0,
-                    deadlineReached: true
+                    deadlineReached: true,
+                    allowShortResume: allowShortResume
                   ) == .clear else { return }
             let ownedFloor = suppressedResumeFloor == ticket.targetSeconds
             suppressedResumeFloor = DeferredResumeFloorPolicy.floorAfterDecision(

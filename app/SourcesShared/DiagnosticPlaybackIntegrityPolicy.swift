@@ -210,16 +210,18 @@ enum DeferredResumePolicy {
 
     /// A source switch may publish its duration later than the first polling tick. Keep waiting while both
     /// duration views are unknown, prefer the surface's committed value when present, and use the engine's
-    /// direct property only as the durationless-event fallback.
+    /// direct property only as the durationless-event fallback. Local NNTP starvation recovery opts into
+    /// the exact opening-seconds target; ordinary launches/switches retain the five-second cutoff.
     static func decision(
         targetSeconds: Double,
         observedDurationSeconds: Double,
         engineDurationSeconds: Double,
-        deadlineReached: Bool
+        deadlineReached: Bool,
+        allowShortResume: Bool = false
     ) -> Decision {
         guard !deadlineReached,
               targetSeconds.isFinite,
-              targetSeconds > 5 else { return .clear }
+              targetSeconds > (allowShortResume ? 0 : 5) else { return .clear }
         let duration: Double
         if observedDurationSeconds.isFinite, observedDurationSeconds > 0 {
             duration = observedDurationSeconds
@@ -282,8 +284,8 @@ enum DeferredResumeUserSeekPolicy {
 enum DeferredResumeFloorPolicy {
     /// Arm the persistence fence synchronously with the deferred seek. A low first-frame or exit callback can
     /// otherwise overwrite the saved resume before the next polling tick observes a usable duration.
-    static func armedFloor(targetSeconds: Double) -> Double? {
-        guard targetSeconds.isFinite, targetSeconds > 5 else { return nil }
+    static func armedFloor(targetSeconds: Double, allowShortResume: Bool = false) -> Double? {
+        guard targetSeconds.isFinite, targetSeconds > (allowShortResume ? 0 : 5) else { return nil }
         return targetSeconds
     }
 

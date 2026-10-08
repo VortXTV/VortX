@@ -6,5 +6,6 @@ nntp_test_dir=$(mktemp -d app/build/local-nntp-tests.XXXXXX)
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/Sources/Player/CacheShedPolicy.swift \
   app/Sources/Player/TVOSProactiveMemoryPressurePolicy.swift \
+  app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift \
   app/Tests/LocalNNTPPlaybackPolicyTests.swift -o "$nntp_test_dir/local-nntp"
 "$nntp_test_dir/local-nntp"
