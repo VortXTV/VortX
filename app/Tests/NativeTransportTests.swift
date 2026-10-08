@@ -52,6 +52,12 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
                 precondition(NativeTransportPolicy.selectsNative(required: required, preference: preference) == (required || preference))
             }
         }
+        precondition(NativeTransportPolicy.boundNativePort(processRunning: true, receipt: nil) == nil)
+        precondition(NativeTransportPolicy.boundNativePort(processRunning: false, receipt: "11470") == nil)
+        precondition(NativeTransportPolicy.boundNativePort(processRunning: true, receipt: "11470\n") == 11470)
+        for receipt in ["", "11471", "0", "65536", "server ready"] {
+            precondition(NativeTransportPolicy.boundNativePort(processRunning: true, receipt: receipt) == nil)
+        }
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [TransportFixture.self]
         let session = URLSession(configuration: config)
@@ -107,6 +113,10 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         precondition(bootstrap.contains("if VortxNativeServerFlag.isOn {") && bootstrap.contains("VortxNativeServer.startIfNeeded()\n            return"))
         let selection = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/VortxNativeServer.swift"), encoding: .utf8)
         precondition(selection.contains("static let isOn = NativeTransportPolicy.selectsNative("))
+        let mac = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/MacNodeServer.swift"), encoding: .utf8)
+        precondition(mac.contains("native-server-\\(UUID().uuidString).port"))
+        precondition(mac.contains("env[\"VORTX_PORT_FILE\"] = nativePortReceipt"))
+        precondition(mac.contains("NativeTransportPolicy.boundNativePort("))
         for path in ["app/SourcesiOS/VortXiOSApp.swift", "app/SourcesTV/VortXTVApp.swift"] {
             let app = try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
             let initialBootstrap = app.components(separatedBy: "NodeServer.startIfNeeded()")[1].prefix(250)

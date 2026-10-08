@@ -28,6 +28,11 @@ enum NodeServer {
 
     /// The running child process, kept alive for the app's lifetime (and so we can terminate it).
     private static var process: Process?
+    /// Unique to the currently spawned native child. Never read the legacy Node port file.
+    private static var nativePortReceipt: String?
+    // Endpoint readers must never wait for process launch/reaping on the lifecycle queue.
+    private static let nativePublicationLock = NSLock()
+    private static var nativePublication: (process: Process, receipt: String)?
 
     /// Serializes all access to the mutable child state (`process`, `started`, `exitCode`,
     /// `shutdownRequested`). startIfNeeded/restart dispatch their work to this queue ASYNC so neither
@@ -143,12 +148,25 @@ enum NodeServer {
     /// Exposed for protocol routing; NNTP also requires an exact local capability check.
     static var isUsingNativeServer: Bool { usingNativeServer }
 
-    /// The child must actually be running before a native credential-control endpoint is offered.
+    /// Publication requires this exact child to be running AND to have bound its socket. A stale
+    /// Node listener on 11470 cannot become the native endpoint while the child retries its bind.
     static var nativeBaseURL: String? {
-        queue.sync {
-            guard usingNativeServer, started, exitCode == nil, process?.isRunning == true else { return nil }
-            return "http://127.0.0.1:11470"
-        }
+        guard usingNativeServer else { return nil }
+        nativePublicationLock.lock()
+        let published = nativePublication
+        nativePublicationLock.unlock()
+        guard let published else { return nil }
+        let receipt = try? String(contentsOfFile: published.receipt, encoding: .utf8)
+        guard let port = NativeTransportPolicy.boundNativePort(processRunning: published.process.isRunning,
+                                                               receipt: receipt) else { return nil }
+        return "http://127.0.0.1:\(port)"
+    }
+
+    private static func publishNativeProcess(_ process: Process?, receipt: String? = nil) {
+        nativePublicationLock.lock()
+        if let process, let receipt { nativePublication = (process, receipt) }
+        else { nativePublication = nil }
+        nativePublicationLock.unlock()
     }
 
     /// Locate an ffmpeg/ffprobe pair the server can use for VideoToolbox transcoding. server.js
@@ -255,6 +273,7 @@ enum NodeServer {
             // Reap whichever engine is running (node or native), then respawn per the flag, so
             // both the LAN-bind toggle and the native-engine toggle swap in place.
             func reapCurrent() {
+                publishNativeProcess(nil)
                 if let proc = process, proc.isRunning {
                     proc.terminationHandler = nil   // expected stop; don't surface it as a crash
                     proc.terminate()
@@ -262,6 +281,7 @@ enum NodeServer {
                 }
                 process = nil
                 exitCode = nil
+                retireNativePortReceipt()
             }
             if nativeServerEnabled {
                 reapCurrent()
@@ -293,6 +313,8 @@ enum NodeServer {
         queue.sync {
             shutdownRequested = true        // mark intentional: the terminationHandler must not treat this as a crash
             started = false
+            publishNativeProcess(nil)
+            defer { retireNativePortReceipt() }
             guard let proc = process else { return }
             process = nil
 
@@ -491,7 +513,7 @@ enum NodeServer {
         // the serial queue so the state write is race-free, and ignore it once shutdown began.
         proc.terminationHandler = { p in
             queue.async {
-                guard !shutdownRequested else { return }
+                guard !shutdownRequested, process === p else { return }
                 exitCode = p.terminationStatus
                 NSLog("%@", "StremioX: node server exited rc=\(p.terminationStatus)")
                 // Mirror the unexpected exit into the EXPORTABLE diagnostics log so a server death is visible
@@ -536,10 +558,8 @@ enum NodeServer {
         // crates/streaming-server/src/main.rs):
         //   VORTX_SERVER_HOME  data root (settings.json + stremio-cache/), the same
         //                      <AppSupport>/StremioX/stremio-server dir the node server uses
-        //   VORTX_PORT_FILE    where it writes the bound port: <caches>/stremio-server.port, the
-        //                      iOS/tvOS convention (nothing on the Mac reads it today because
-        //                      StremioServer stays fixed at 11470 on macOS; writing it keeps the
-        //                      contract uniform)
+        //   VORTX_PORT_FILE    a unique per-launch bind receipt, read before publishing the endpoint
+        //   VORTX_SERVER_PORT fixed 11470, overriding an inherited development port
         //   VORTX_BIND         0.0.0.0 (LAN sharing ON) vs 127.0.0.1 (private, the default),
         //                      replacing the node preload's listen() monkeypatch
         //   VORTX_LAN_IP       the advertised /settings baseUrl host while sharing
@@ -547,7 +567,10 @@ enum NodeServer {
         // 11471+), so lanURL's fixed :11470 and StremioServer.embedded stay correct.
         var env = ProcessInfo.processInfo.environment
         env["VORTX_SERVER_HOME"] = serverData
-        env["VORTX_PORT_FILE"] = portFilePath
+        retireNativePortReceipt()
+        nativePortReceipt = (home as NSString).appendingPathComponent("native-server-\(UUID().uuidString).port")
+        env["VORTX_PORT_FILE"] = nativePortReceipt
+        env["VORTX_SERVER_PORT"] = "11470"
         if sharedOnLAN {
             env["VORTX_BIND"] = "0.0.0.0"
             if let ip = lanIP { env["VORTX_LAN_IP"] = ip }
@@ -567,8 +590,9 @@ enum NodeServer {
         // (stop()/restart() detach it first), routed through the serial queue.
         proc.terminationHandler = { p in
             queue.async {
-                guard !shutdownRequested else { return }
+                guard !shutdownRequested, process === p else { return }
                 exitCode = p.terminationStatus
+                retireNativePortReceipt()
                 NSLog("%@", "StremioX: native streaming server exited rc=\(p.terminationStatus)")
                 DiagnosticsLog.log("server", "native server exited rc=\(p.terminationStatus) (unexpected; relaunch to restart)")
             }
@@ -578,18 +602,20 @@ enum NodeServer {
             NSLog("%@", "StremioX: starting native streaming server (bin=\(binPath), home=\(serverData))")
             try proc.run()
             process = proc
+            publishNativeProcess(proc, receipt: nativePortReceipt)
         } catch {
             started = false
+            retireNativePortReceipt()
             NSLog("%@", "StremioX: failed to launch native streaming server: \(error)")
         }
     }
 
-    /// The caches path for the port file the native server writes (the iOS/tvOS NodeServer
-    /// convention: <caches>/stremio-server.port).
-    private static var portFilePath: String {
-        let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
-            ?? NSTemporaryDirectory()
-        return (caches as NSString).appendingPathComponent("stremio-server.port")
+    /// Queue-only cleanup after the owning process has been reaped or failed to launch.
+    private static func retireNativePortReceipt() {
+        publishNativeProcess(nil)
+        guard let path = nativePortReceipt else { return }
+        nativePortReceipt = nil
+        try? FileManager.default.removeItem(atPath: path)
     }
 
     /// JSON-encode a string for safe embedding in the preload JS literal.

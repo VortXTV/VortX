@@ -13,6 +13,14 @@ enum NativeTransportPolicy {
 
     static func selectsNative(required: Bool, preference: Bool) -> Bool { required || preference }
 
+    /// A running process alone does not prove it owns its listening port. The caller supplies
+    /// only this launch's unique port-file receipt, emitted by the native daemon after bind.
+    static func boundNativePort(processRunning: Bool, receipt: String?) -> Int? {
+        guard processRunning, let receipt,
+              let port = Int(receipt.trimmingCharacters(in: .whitespacesAndNewlines)), port == 11470 else { return nil }
+        return port
+    }
+
     /// Only a literal loopback origin can receive provider credentials. No DNS aliases, URL
     /// credentials, custom paths or redirects are accepted by the credential-control client.
     static func localControlBase(_ raw: String) -> URL? {
