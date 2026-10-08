@@ -1901,6 +1901,7 @@ struct TVPlayerView: View {
     }
 
     private func handleProperty(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+        guard !loadFailed else { return }   // terminal UI owns the parked source until an accepted Retry
         if loadToken == recoveryPauseOwner, loadToken == coordinator.player?.activeLoadToken,
            name == MPVProperty.timePos, recoveryPauseIntent, !appliedResume {
             maybeResume()
