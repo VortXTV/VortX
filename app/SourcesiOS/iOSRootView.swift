@@ -483,6 +483,7 @@ struct iOSRootView: View {
         HStack(spacing: Theme.Space.sm) {
             VortXWordmark(fontSize: 22).fixedSize()
             horizontalTabBar
+            profileSwitchButton
             #if os(macOS)
             Button { macSearchPresented = true } label: {
                 Image(systemName: "magnifyingglass")
@@ -643,6 +644,10 @@ struct iOSRootView: View {
     private var overflowTabMenu: some View {
         let selected = compactTabLayout.overflow.contains(tab)
         return Menu {
+            Button { profiles.pickedThisLaunch = false } label: {
+                Label("Switch Profile", systemImage: "person.crop.circle")
+            }
+            Divider()
             ForEach(compactTabLayout.overflow, id: \.rawValue) { item in
                 Button { selectTab(item) } label: {
                     Label(item.title, systemImage: tab == item ? "checkmark" : item.inactiveIcon)
@@ -657,6 +662,21 @@ struct iOSRootView: View {
         .accessibilityValue(selected ? tab.title : "")
         .accessibilityHint("Opens Live, Add-ons and Settings when they are not in the main bar")
         .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+
+    /// A first-class profile affordance in the wide Cinema shell. It reuses the root's existing picker
+    /// gate, preserving profile/session fencing instead of inventing a parallel account sheet.
+    private var profileSwitchButton: some View {
+        Button { profiles.pickedThisLaunch = false } label: {
+            Image(systemName: "person.crop.circle")
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .frame(width: 44, height: 44)
+                .vortxGlassDisc()
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Switch Profile")
+        .accessibilityHint("Opens profile selection")
     }
 
     private func compactTabLabel(title: String, icon: String, selected: Bool,
@@ -2005,14 +2025,39 @@ struct iOSLibraryView: View {
             ScrollView {
                 Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Library tab -> scroll here
                 #if !os(tvOS)
-                // Downloads is reachable ONLY through this single pill inside Library (owner's final
-                // directive): no inline DownloadsView mount at the top, no Home/Discover hub tile. The pill
-                // shows only when there is at least one download and pushes the standalone screen.
-                if !downloads.records.isEmpty {
-                    iOSLibraryDownloadsPill(count: downloads.records.count)
-                        .padding(.horizontal, Theme.Space.md)
-                        .padding(.bottom, Theme.Space.lg)
+                // Cinema Library leads with durable destinations before the saved-title grid. They retain
+                // the existing value route / local filters: nothing here creates a second data source.
+                VStack(spacing: Theme.Space.sm) {
+                    NavigationLink(value: LibraryRoute.downloads) {
+                        CinemaLibraryEntryCard(
+                            title: "Downloads",
+                            subtitle: downloads.records.isEmpty
+                                ? "Saved episodes available offline appear here."
+                                : "\(downloads.records.count) saved \(downloads.records.count == 1 ? "item" : "items")",
+                            systemImage: "arrow.down.circle.fill",
+                            badge: downloads.records.isEmpty ? nil : "\(downloads.records.count)"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        segment = .all
+                        activeFilters.removeAll()
+                    } label: {
+                        CinemaLibraryEntryCard(title: "Watchlist", subtitle: "All saved titles", systemImage: "bookmark.fill",
+                                               badge: libraryItems.isEmpty ? nil : "\(libraryItems.count)")
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        segment = .all
+                        activeFilters = [.watched]
+                    } label: {
+                        CinemaLibraryEntryCard(title: "Previously Watched", subtitle: "Titles marked watched in this profile",
+                                               systemImage: "checkmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
                 }
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.bottom, Theme.Space.lg)
                 #endif
                 // The owner profile's Library is the account library (engine), with its type/sort filter
                 // chips; an overlay profile's Library is its own private watch overlay, with no engine
@@ -2908,7 +2953,9 @@ struct iOSSearchView: View {
                 ForEach(resultSections, id: \.title) { section in
                     PosterRail(title: section.title,
                                items: section.items.map {
-                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
+                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
+                                            background: $0.background, description: $0.description,
+                                            releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
                                },
                                onTap: { saveToHistory(query); path.append(FeaturedHeroItem.from(rail: $0)) },
                                menu: .catalog, showWatchedBadges: true)
@@ -3235,7 +3282,9 @@ struct iOSDiscoverView: View {
                 ForEach(sections, id: \.0) { section in
                     PosterRail(title: section.0,
                                items: section.1.map {
-                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
+                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
+                                            background: $0.background, description: $0.description,
+                                            releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
                                },
                                onTap: { path.append(FeaturedHeroItem.from(rail: $0)) },
                                menu: .catalog, showWatchedBadges: true)
@@ -4388,6 +4437,10 @@ struct PosterGrid: View {
     @ObservedObject private var apiKeys = ApiKeys.shared
     // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
     @ObservedObject private var watchedIndex = WatchedIndex.shared
+    /// Catalog cards open a compact, reversible preview before the full detail route. Continue Watching
+    /// remains outside this component's quick-view path and therefore keeps its one-tap resume contract.
+    @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
+    @State private var quickViewItem: RailItem?
     @Environment(\.horizontalSizeClass) private var hSize
     // Center the adaptive tracks so the cards distribute evenly across the available width.
     private var columns: [GridItem] {
@@ -4405,9 +4458,12 @@ struct PosterGrid: View {
     var body: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
             ForEach(items) { item in
-                Button { onTap(item) } label: {
+                Button {
+                    if shouldPresentQuickView(for: item) { quickViewItem = item }
+                    else { onTap(item) }
+                } label: {
                     PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
-                                  progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
+                                  releaseInfo: item.releaseInfo, progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
                                   isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id))
                 }
                 // S3: the shared card treatment (resting depth shadow, Mac pointer-hover lift, designed
@@ -4427,6 +4483,13 @@ struct PosterGrid: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, Theme.Space.md)
+        .sheet(item: $quickViewItem) { item in
+            CinemaQuickView(item: item, onWatch: { onTap(item) }, onDetails: { onTap(item) })
+        }
+    }
+
+    private func shouldPresentQuickView(for item: RailItem) -> Bool {
+        quickViewEnabled && menu != .continueWatching && item.cwVideoId == nil && item.resumeSeconds == nil
     }
 }
 
@@ -4493,6 +4556,8 @@ private struct PosterRail: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
     @ObservedObject private var watchedIndex = WatchedIndex.shared
+    @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
+    @State private var quickViewItem: RailItem?
     /// Pointer hovering the rail (#3). Never fires on pure-touch iPhone, so the
     /// scroll arrows reveal only on Mac / iPad-with-trackpad, where swiping a long
     /// row is awkward. On touch the row stays swipe-only.
@@ -4539,15 +4604,24 @@ private struct PosterRail: View {
             // authority and cards stay `.focusable()` only to show the ring. (Mac arrow-key nav; device-verify.)
         }
         .onHover { hovering = $0 }
+        .sheet(item: $quickViewItem) { item in
+            CinemaQuickView(item: item, onWatch: { onTap(item) }, onDetails: { onTap(item) })
+        }
     }
 
     /// One rail card. The touch/iOS body is identical across platforms; on macOS, when the rail opts in,
     /// the card additionally becomes `.focusable()` + shows the accent ring while focused and auto-scrolls
     /// into view, all additive modifiers so touch / VoiceOver / the existing tap + long-press are unchanged.
     @ViewBuilder private func railCard(_ item: RailItem, proxy: ScrollViewProxy) -> some View {
-        let base = Button { onTap(item) } label: {
+        let base = Button {
+            // Continue Watching carries a concrete resumed source and must never be interposed by a
+            // generic preview. Catalog and Library cards can use the quick view, which routes back to
+            // this exact `onTap` closure for the existing detail path.
+            if shouldPresentQuickView(for: item) { quickViewItem = item }
+            else { onTap(item) }
+        } label: {
             PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
-                          progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
+                          releaseInfo: item.releaseInfo, progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
                           isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id),
                           onDetails: onDetails.map { od in { od(item) } },
                           privateArtwork: accessibilityProvenance != nil)
@@ -4583,6 +4657,10 @@ private struct PosterRail: View {
         #else
         base
         #endif
+    }
+
+    private func shouldPresentQuickView(for item: RailItem) -> Bool {
+        quickViewEnabled && menu != .continueWatching && item.cwVideoId == nil && item.resumeSeconds == nil
     }
 
     /// Arrows matter only when a pointer is present and the row actually overflows a page.
@@ -4832,6 +4910,9 @@ struct PosterCardiOS: View {
     var caption: String? = nil
     /// IMDb rating to show as a small star badge on the poster, when the catalog item carries one. Nil hides it.
     var imdbRating: String? = nil
+    /// Release / year data carried by engine catalog previews. It is rendered only when present; never
+    /// infer a year, runtime, or episode count from a title string.
+    var releaseInfo: String? = nil
     let progress: Double
     /// The saved resume position in seconds, shown as a small "1:03" timecode badge on the poster (above
     /// the progress stripe) so Continue Watching cards say where playback resumes. Nil on every non-CW
@@ -4859,9 +4940,10 @@ struct PosterCardiOS: View {
     /// The poster to show: the pooled localized (language-matched) poster when available, else the add-on's.
     private var displayPoster: String? { privateArtwork ? poster : (l10n.poster(for: id) ?? poster) }
 
-    /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
-    /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
-    private var landscape: Bool { !privateArtwork && catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    /// Cinema uses the same wide landscape footprint for every public catalog card. `LandscapeArtiOS`
+    /// already fail-softs to intentional poster framing when no TMDB backdrop is available, so this does
+    /// not invent data or require provider-wide fetching. Private Trakt rows retain their local-only art.
+    private var landscape: Bool { !privateArtwork }
     /// Preserve this card's actual catalog identity for its context menu. CoreBridge uses it only if
     /// board/discover/search no longer has the engine's resident raw preview, then validates id/type.
     private var catalogPreview: LibraryWatchedMutationPolicy.MetaPreview {
@@ -4885,6 +4967,11 @@ struct PosterCardiOS: View {
     private var cardH: CGFloat { landscape ? cardW * 9.0 / 16.0 : cardW * 3.0 / 2.0 }
     /// The poster clip radius from the user's preset (default `.rounded` = Theme.Radius.card).
     private var cornerRadius: CGFloat { catalogPrefs.posterRadius.radius }
+    private var cinemaFacts: [String] {
+        [releaseInfo, imdbRating.map { "★ \($0)" }, caption]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
 
     var body: some View {
         card.modifier(PosterContextMenu(id: id, menu: menu, catalogPreview: catalogPreview, onDetails: onDetails))
@@ -4985,12 +5072,18 @@ struct PosterCardiOS: View {
             // it stays visible even with labels hidden.
             if !catalogPrefs.hidePosterLabels {
                 Text(displayName)
-                    .font(Theme.Typography.label)
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1).frame(width: cardW, alignment: .leading)
+            }
+            if !cinemaFacts.isEmpty {
+                Text(cinemaFacts.joined(separator: "  ·  "))
+                    .font(Theme.Typography.eyebrow)
                     .foregroundStyle(Theme.Palette.textSecondary)
                     .lineLimit(1).frame(width: cardW, alignment: .leading)
             }
             // Optional secondary caption (Upcoming Episodes: "S2E5 · Jun 30"); absent on every other rail.
-            if let caption {
+            if let caption, !cinemaFacts.contains(caption) {
                 Text(caption)
                     .font(Theme.Typography.eyebrow)
                     .foregroundStyle(Theme.Palette.textTertiary)
