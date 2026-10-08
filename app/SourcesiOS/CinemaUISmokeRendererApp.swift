@@ -79,6 +79,10 @@ enum CinemaUISmokeRendererApp {
             }
             attachedSheet = sheet
             sheetContent.layoutSubtreeIfNeeded()
+            // `cacheDisplay` captures the AppKit view tree, not the WindowServer compositor. Keep a
+            // renderer-only receipt of both layout and accessibility before interpreting a dark sheet
+            // bitmap as a production presentation defect.
+            logQuickViewDiagnostics(parent: window, sheet: sheet, content: sheetContent)
             capturedView = sheetContent
         } else {
             capturedView = host
@@ -104,6 +108,32 @@ enum CinemaUISmokeRendererApp {
         for _ in 0..<6 {
             RunLoop.main.run(until: Date().addingTimeInterval(0.03))
         }
+    }
+
+    private static func logQuickViewDiagnostics(parent: NSWindow, sheet: NSWindow, content: NSView) {
+        print("quick-view bounds parent=\(parent.contentView?.bounds.debugDescription ?? "nil") sheet=\(sheet.frame.debugDescription) content=\(content.bounds.debugDescription)")
+        logViewTree(content)
+        let accessibility = collectAccessibility(from: content)
+        print("quick-view accessibility labels=\(accessibility.joined(separator: " | "))")
+    }
+
+    private static func logViewTree(_ view: NSView, depth: Int = 0) {
+        let indent = String(repeating: "  ", count: depth)
+        print("quick-view view \(indent)\(String(describing: type(of: view))) frame=\(view.frame.debugDescription) hidden=\(view.isHidden)")
+        for child in view.subviews {
+            logViewTree(child, depth: depth + 1)
+        }
+    }
+
+    private static func collectAccessibility(from view: NSView) -> [String] {
+        var labels: [String] = []
+        if let label = view.accessibilityLabel(), !label.isEmpty {
+            labels.append(label)
+        }
+        for child in view.subviews {
+            labels.append(contentsOf: collectAccessibility(from: child))
+        }
+        return labels
     }
 
     private enum RendererError: LocalizedError {
