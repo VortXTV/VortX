@@ -24,16 +24,21 @@ enum VortxLegacyBootstrapMaterialTests {
         precondition(condition(), message)
     }
     static func material(_ document: Object, roster: [UserProfile] = [owner, child], modified: Double? = 1720000000.1234,
+                         documentData: Data? = nil,
                          deferProfileEdits: Bool = false,
                          ownAccountSources: [VortxLegacyBootstrapMaterial.OwnAccountSource] = [],
                          retainedOwnAccountBaseline: Data? = nil,
-                         retainedOwnAccountSourceEnvelopes: [VortxLegacyBootstrapMaterial.RetainedOwnAccountSourceEnvelope] = []) throws -> Object {
-        let data = try JSONSerialization.data(withJSONObject: document)
+                         retainedOwnAccountSourceEnvelopes: [VortxLegacyBootstrapMaterial.RetainedOwnAccountSourceEnvelope] = [],
+                         retainedOwnAccountSlotBaselines: [VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline] = [],
+                         deferredOwnAccountOverlays: [VortxLegacyBootstrapMaterial.RetainedOwnAccountOverlayDisposition] = []) throws -> Object {
+        let data = try documentData ?? JSONSerialization.data(withJSONObject: document)
         let result = try VortxLegacyBootstrapMaterial.encode(document: data, roster: roster, ownerProfileID: owner.id,
                                                               rosterModifiedSeconds: modified, deferProfileEdits: deferProfileEdits,
                                                               ownAccountSources: ownAccountSources,
                                                               retainedOwnAccountBaseline: retainedOwnAccountBaseline,
-                                                              retainedOwnAccountSourceEnvelopes: retainedOwnAccountSourceEnvelopes)
+                                                              retainedOwnAccountSourceEnvelopes: retainedOwnAccountSourceEnvelopes,
+                                                              retainedOwnAccountSlotBaselines: retainedOwnAccountSlotBaselines,
+                                                              deferredOwnAccountOverlays: deferredOwnAccountOverlays)
         return try JSONSerialization.jsonObject(with: result) as! Object
     }
     static func doc(_ vortx: Object = [:]) -> Object { ["vortx": vortx] }
@@ -242,6 +247,89 @@ enum VortxLegacyBootstrapMaterialTests {
             check(error.reason.contains("differs from its authenticated source"), "Changed own overlay remains pending until a new authenticated source proof exists")
         }
 
+        // A current schema-4 slot is newer than legacyImport.baseline after a same-UID rebind.
+        // Its complete typed carrier must therefore decide witness admission, rather than letting
+        // an immutable historical baseline fabricate a stale pending result.
+        let witnessedOverlayBytes = try JSONSerialization.data(withJSONObject: overlay, options: [.sortedKeys, .withoutEscapingSlashes])
+        let witnessedOverlayReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(schemaVersion: 2,
+                libraryRows: [ownMovie], addons: [ownAddon], profileOverlay: overlay),
+            profileOverlaySHA256: try VortxProfileOverlayWitness.digest(json: witnessedOverlayBytes))
+        let witnessedOverlayMaterial = try material(rootWithOwnOverlay, roster: [owner, own], ownAccountSources: [witnessedOverlayReceipt])
+        func sourceBaseline(_ material: Object) throws -> Data {
+            let id = own.id.uuidString
+            let source = (material["ownAccountSources"] as! [String: Object])[id]!
+            let carrier: Object = ["source": source,
+                                   "addons": (material["addons"] as! [String: Object])[id]!,
+                                   "library": (material["libraries"] as! [String: Object])[id]!,
+                                   "watches": (material["watches"] as! [String: [Object]])[id]!,
+                                   "identityLinks": (material["identityLinks"] as! [String: [[String]]])[id]!]
+            return try JSONSerialization.data(withJSONObject: carrier, options: [.sortedKeys, .withoutEscapingSlashes])
+        }
+        let activeSlot = VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline(profileID: own.id,
+            sourceBaseline: try sourceBaseline(witnessedOverlayMaterial))
+        let rootWithOwnOverlayBytes = try JSONSerialization.data(withJSONObject: rootWithOwnOverlay, options: [.sortedKeys, .withoutEscapingSlashes])
+        let witnessedDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: rootWithOwnOverlayBytes,
+            roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: retainedOverlayBaseline,
+            retainedOwnAccountSlotBaselines: [activeSlot])
+        check(witnessedDisposition.count == 1 && witnessedDisposition[0].status == .matchedWitness
+              && witnessedDisposition[0].sourceDocumentSHA256 == witnessedOverlayReceipt.sourceDocumentSHA256,
+              "The active schema-4 own slot takes precedence over historical legacyImport baseline")
+        let slottedCold = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes, retainedOwnAccountBaseline: retainedOverlayBaseline,
+                                       retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: witnessedDisposition)
+        check(((slottedCold["ownAccountSources"] as! [String: Object])[own.id.uuidString]!)["sourceDocumentSha256"] as? String == witnessedOverlayReceipt.sourceDocumentSHA256,
+              "Witness-admitted cold material copies the active slot tuple verbatim")
+
+        let changedRootOverlayBytes = try JSONSerialization.data(withJSONObject: changedRootOverlay, options: [.sortedKeys, .withoutEscapingSlashes])
+        let changedDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: changedRootOverlayBytes,
+            roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: retainedOverlayBaseline,
+            retainedOwnAccountSlotBaselines: [activeSlot])
+        check(changedDisposition.count == 1 && changedDisposition[0].status == .changedWitness,
+              "A changed raw own overlay remains distinguishably pending against the active slot witness")
+        let deferredChanged = try material(changedRootOverlay, roster: [owner, own], documentData: changedRootOverlayBytes, retainedOwnAccountBaseline: retainedOverlayBaseline,
+                                           retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: changedDisposition)
+        check(NSArray(array: watches(deferredChanged, profile: own)).isEqual(to: watches(witnessedOverlayMaterial, profile: own))
+              && !(watches(deferredChanged, profile: own).contains { $0["videoId"] as? String == "newer-overlay-video" }),
+              "A classifier-issued changed disposition preserves the kernel tuple and never acknowledges raw pending overlay")
+
+        let sealedDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: rootWithOwnOverlayBytes,
+            roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: retainedOverlayBaseline,
+            retainedOwnAccountSourceEnvelopes: [retainedEnvelope])
+        check(sealedDisposition.count == 1 && sealedDisposition[0].status == .matchedSealedEnvelope,
+              "An exact retained v1 envelope proves an unchanged overlay without inventing a witness")
+        let sealedCold = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes, retainedOwnAccountBaseline: retainedOverlayBaseline,
+                                      deferredOwnAccountOverlays: sealedDisposition)
+        check(NSArray(array: watches(sealedCold, profile: own)).isEqual(to: watches(overlayResult, profile: own)),
+              "A sealed-envelope disposition permits only the exact retained typed tuple")
+
+        // A different account B selected later in schema-4 is not an update of historical source
+        // A. Legacy reconciliation must retain A's tuple/overlay rather than re-importing B under
+        // the old root document; only a same-UID active slot may supersede its baseline.
+        var reboundCarrier = try JSONSerialization.jsonObject(with: activeSlot.sourceBaseline) as! Object
+        var reboundSource = reboundCarrier["source"] as! Object
+        reboundSource["verifiedStreamingUid"] = "verified-own-uid-b"
+        reboundSource["sourceDocumentSha256"] = String(repeating: "b", count: 64)
+        reboundSource["profileOverlaySha256"] = String(repeating: "c", count: 64)
+        reboundCarrier["source"] = reboundSource
+        let differentUIDSlot = VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline(profileID: own.id,
+            sourceBaseline: try JSONSerialization.data(withJSONObject: reboundCarrier, options: [.sortedKeys, .withoutEscapingSlashes]))
+        let differentUIDDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: rootWithOwnOverlayBytes,
+            roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: retainedOverlayBaseline,
+            retainedOwnAccountSourceEnvelopes: [retainedEnvelope], retainedOwnAccountSlotBaselines: [differentUIDSlot])
+        check(differentUIDDisposition.count == 1 && differentUIDDisposition[0].status == .matchedSealedEnvelope
+              && differentUIDDisposition[0].sourceDocumentSHA256 == overlayReceipt.sourceDocumentSHA256,
+              "A different-UID active slot cannot shadow the historical legacy source")
+        let differentUIDMaterial = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes,
+                                                retainedOwnAccountBaseline: retainedOverlayBaseline,
+                                                retainedOwnAccountSourceEnvelopes: [retainedEnvelope],
+                                                retainedOwnAccountSlotBaselines: [differentUIDSlot])
+        check(((differentUIDMaterial["ownAccountSources"] as! [String: Object])[own.id.uuidString]!)["verifiedStreamingUid"] as? String == "verified-own-uid",
+              "A→B active selection does not rewrite historical legacy A reconciliation")
+        let missingDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: rootWithOwnOverlayBytes,
+            roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: retainedOverlayBaseline)
+        check(missingDisposition.count == 1 && missingDisposition[0].status == .missingWitness,
+              "Missing own-source proof is explicit pending state, never treated as an empty overlay")
+
         var temporary = ownMovie; temporary["_id"] = "tt-temp"; temporary["temp"] = true
         var temporaryState = temporary["state"] as! Object; temporaryState["video_id"] = "tt-temp"; temporary["state"] = temporaryState
         var removed = ownMovie; removed["_id"] = "tt-removed"; removed["removed"] = true
@@ -342,6 +430,11 @@ enum VortxLegacyBootstrapMaterialTests {
               && (decodedIngress["items"] as? [Any])?.count == 2,
               "Strict ingress decoder retains correctly rounded values")
         do { _ = try VortxProfileOverlayWitness.decodeObject(json: Data("{\"é\":1,\"e\\u0301\":2}".utf8)); preconditionFailure("Lossy Unicode dictionary ingress accepted") }
+        catch VortxProfileOverlayWitness.Failure.malformed {}
+        // Raw JSON may fit the parser's 16 MiB input cap while its typed framing exceeds the same
+        // aggregate cap due to tags, lengths and the domain prefix. Ingress must refuse it too.
+        let frameOverflow = Data(("{\"x\":\"" + String(repeating: "a", count: 16_777_208) + "\"}").utf8)
+        do { _ = try VortxProfileOverlayWitness.decodeObject(json: frameOverflow); preconditionFailure("Ingress accepted an over-limit framed overlay") }
         catch VortxProfileOverlayWitness.Failure.malformed {}
         for json in ["[1e400]", "[9007199254740992]", "[9007199254740991.1]",
                      "[9007199254740991.000000000000000000000000000001]", "{\"a\":1,\"\\u0061\":2}", "[\"\\uD800\"]"] {

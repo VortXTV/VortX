@@ -23,6 +23,12 @@ enum VortxProfileOverlayWitness {
         var parser = try Parser(json)
         let value = try parser.value()
         try parser.finish()
+        // Parsing bounds raw input, while framing also accounts for type tags and length words.
+        // Exercise the writer here as well so ingress cannot accept a document that the witness
+        // codec would reject solely because its aggregate framed representation is too large.
+        var writer = Writer()
+        try writer.append(contentsOf: Array("vortx.profile-overlay/1".utf8) + [0])
+        try writer.write(value)
         guard case .object(let pairs) = value, let object = try materialize(value) as? [String: Any], object.count == pairs.count else {
             throw Failure.malformed
         }

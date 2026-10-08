@@ -291,9 +291,10 @@ import CryptoKit
         let ownTarget = try VortxNativeProfiles.ownTarget(material: rebindMaterial, profileID: child.id)
         // A fresh authenticated v2 source has the mandatory overlay witness. It must survive the
         // public material encoder, target extraction and rebind action unchanged.
-        let emptyLibraryResponse = try JSONSerialization.data(withJSONObject: ["result": []])
+        let rebindOverlay: [String: Any] = ["vortx": ["byProfile": [child.id.uuidString: ["watched": ["tt-rebind": ["w": ["tt-rebind"]]]]]]]
+        let emptyLibraryResponse = try JSONSerialization.data(withJSONObject: ["result": [["_id": "tt-rebind", "type": "movie", "name": "Rebind"]]])
         let emptyAddonsResponse = try JSONSerialization.data(withJSONObject: ["result": ["addons": []]])
-        let emptyOverlayResponse = Data("{}".utf8)
+        let emptyOverlayResponse = try JSONSerialization.data(withJSONObject: rebindOverlay, options: [.sortedKeys, .withoutEscapingSlashes])
         let freshSourceEnvelope = try JSONSerialization.data(withJSONObject: [
             "schemaVersion": 2,
             "libraryResponseBase64": emptyLibraryResponse.base64EncodedString(),
@@ -301,8 +302,9 @@ import CryptoKit
             "profileOverlayBase64": emptyOverlayResponse.base64EncodedString()
         ], options: [.sortedKeys])
         let freshWitness = try VortxProfileOverlayWitness.digest(json: emptyOverlayResponse)
+        let freshRootDocument = try JSONSerialization.data(withJSONObject: rebindOverlay, options: [.sortedKeys, .withoutEscapingSlashes])
         let freshMaterialData = try VortxLegacyBootstrapMaterial.encode(
-            document: try JSONSerialization.data(withJSONObject: ["vortx": [:]]), roster: [owner, ownAccount], ownerProfileID: owner.id,
+            document: freshRootDocument, roster: [owner, ownAccount], ownerProfileID: owner.id,
             rosterModifiedSeconds: nil,
             ownAccountSources: [.init(profileID: child.id, verifiedStreamingUID: "verified-own-uid",
                                       sourceDocument: freshSourceEnvelope, profileOverlaySHA256: freshWitness)])
@@ -346,6 +348,20 @@ import CryptoKit
         check(rebindState["nativeSync"]?["schemaVersion"] == .integer(4)
               && rebindState["roster"]?["profiles"]?[child.id.uuidString]?["account"]?["kind"] == .string("own")
               && activeOwnSource(rebindState)?["profileOverlaySha256"] == .string(freshWitness))
+        let activeSlotBaselines = try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: rebindState["nativeSync"]!)
+        guard activeSlotBaselines.count == 1 else { fatalError("Expected exactly one active own slot") }
+        let activeSlotSource = try JSONSerialization.jsonObject(with: activeSlotBaselines[0].sourceBaseline) as! [String: Any]
+        check(activeSlotBaselines[0].profileID == child.id
+              && ((activeSlotSource["source"] as? [String: Any])?["profileOverlaySha256"] as? String) == freshWitness)
+        let activeSlotDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: freshRootDocument,
+            roster: [owner, ownAccount], ownerProfileID: owner.id, retainedOwnAccountSlotBaselines: activeSlotBaselines)
+        check(activeSlotDisposition.count == 1 && activeSlotDisposition[0].status == .matchedWitness)
+        let activeSlotColdMaterial = try VortxLegacyBootstrapMaterial.encode(document: freshRootDocument,
+            roster: [owner, ownAccount], ownerProfileID: owner.id, rosterModifiedSeconds: nil,
+            retainedOwnAccountSlotBaselines: activeSlotBaselines, deferredOwnAccountOverlays: activeSlotDisposition)
+        let activeSlotColdTarget = try VortxNativeProfiles.ownTarget(material: try JSONDecoder().decode(VortxJSON.self, from: activeSlotColdMaterial), profileID: child.id)
+        check(activeSlotColdTarget.sourceDocumentSHA256 == freshOwnTarget.sourceDocumentSHA256
+              && activeSlotColdTarget.profileOverlaySHA256 == freshWitness)
         let coldRebindRuntime = try VortxNativeRuntime(abi: VortxCABI(), snapshot: rebindExport)
         defer { coldRebindRuntime.close() }
         let coldRebindExport = try coldRebindRuntime.stateJSON()

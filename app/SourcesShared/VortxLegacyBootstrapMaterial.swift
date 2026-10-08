@@ -51,6 +51,61 @@ enum VortxLegacyBootstrapMaterial {
         }
     }
 
+    /// A complete token-free carrier exported by the *active* schema-4 account slot.  The host
+    /// may obtain these only after it has validated/merged nativeSync with the private engine.
+    /// They deliberately remain distinct from `legacyImport.baseline`: a later same-UID rebind
+    /// changes the active slot while the historical baseline remains an immutable migration record.
+    struct RetainedOwnAccountSlotBaseline: Sendable, Equatable {
+        let profileID: UUID
+        /// Exact JSON bytes of the kernel-exported `sourceBaseline` carrier. No raw credential or
+        /// raw account response belongs here. The authenticated host must supply this only after
+        /// detached nativeSync validation; the importer then validates its complete typed shape.
+        let sourceBaseline: Data
+
+        init(profileID: UUID, sourceBaseline: Data) {
+            self.profileID = profileID
+            self.sourceBaseline = sourceBaseline
+        }
+    }
+
+    enum RetainedOwnAccountOverlayStatus: String, Sendable, Equatable {
+        /// A witnessed source tuple matches the current authenticated UUID-scoped overlay.
+        case matchedWitness = "matched_witness"
+        /// A legacy v1 source has no witness, but a sealed exact raw envelope proves equality.
+        case matchedSealedEnvelope = "matched_sealed_envelope"
+        /// The retained tuple has no witness and no sealed envelope can prove the live slice.
+        case missingWitness = "missing_witness"
+        /// A retained witness exists but does not describe the current live slice.
+        case changedWitness = "changed_witness"
+        /// No slot or historical tuple is available for this current own profile.
+        case missingRetainedSource = "missing_retained_source"
+    }
+
+    /// A classifier-issued authority to omit exactly one current own-profile overlay from this
+    /// material projection. The raw slice is not acknowledged or transformed: callers must retain
+    /// it together with this status while continuing unrelated reconciliation. The initializer and
+    /// binding fields are file-private so ordinary callers cannot turn an arbitrary omission into
+    /// a valid material projection.
+    struct RetainedOwnAccountOverlayDisposition: Sendable, Equatable {
+        let profileID: UUID
+        let sourceDocumentSHA256: String?
+        let retainedProfileOverlaySHA256: String?
+        let currentProfileOverlaySHA256: String
+        let status: RetainedOwnAccountOverlayStatus
+        fileprivate let rootDocumentSHA256: String
+
+        fileprivate init(profileID: UUID, sourceDocumentSHA256: String?, retainedProfileOverlaySHA256: String?,
+                         currentProfileOverlaySHA256: String, status: RetainedOwnAccountOverlayStatus,
+                         rootDocumentSHA256: String) {
+            self.profileID = profileID
+            self.sourceDocumentSHA256 = sourceDocumentSHA256
+            self.retainedProfileOverlaySHA256 = retainedProfileOverlaySHA256
+            self.currentProfileOverlaySHA256 = currentProfileOverlaySHA256
+            self.status = status
+            self.rootDocumentSHA256 = rootDocumentSHA256
+        }
+    }
+
     /// A Sendable UTF-8 JSON result that can cross the caller's authentication/MainActor boundary.
     /// The result is the `material` member of `import_legacy_sync`, not a runtime or sync document.
     ///
@@ -64,7 +119,9 @@ enum VortxLegacyBootstrapMaterial {
     static func encode(document: Data, roster: [UserProfile], ownerProfileID: UUID,
                        rosterModifiedSeconds: Double?, deferProfileEdits: Bool = false,
                        ownAccountSources: [OwnAccountSource] = [], retainedOwnAccountBaseline: Data? = nil,
-                       retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope] = []) throws -> Data {
+                       retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope] = [],
+                       retainedOwnAccountSlotBaselines: [RetainedOwnAccountSlotBaseline] = [],
+                       deferredOwnAccountOverlays: [RetainedOwnAccountOverlayDisposition] = []) throws -> Data {
         guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else {
             throw ReconciliationRequired(reason: "Account document must be an object")
         }
@@ -72,7 +129,32 @@ enum VortxLegacyBootstrapMaterial {
                                   modified: rosterModifiedSeconds, deferProfileEdits: deferProfileEdits)
         return try JSONSerialization.data(withJSONObject: adapter.build(ownAccountSources: ownAccountSources,
                                                                          retainedOwnAccountBaseline: retainedOwnAccountBaseline,
-                                                                         retainedOwnAccountSourceEnvelopes: retainedOwnAccountSourceEnvelopes), options: [.sortedKeys, .withoutEscapingSlashes])
+                                                                         retainedOwnAccountSourceEnvelopes: retainedOwnAccountSourceEnvelopes,
+                                                                         retainedOwnAccountSlotBaselines: retainedOwnAccountSlotBaselines,
+                                                                         deferredOwnAccountOverlays: deferredOwnAccountOverlays,
+                                                                         rootDocumentSHA256: sha256(document)), options: [.sortedKeys, .withoutEscapingSlashes])
+    }
+
+    /// Classifies nonempty UUID-scoped own overlays before a cold material projection. Active
+    /// schema-4 slot baselines win over `legacyImport.baseline`; the latter is only a historical
+    /// fallback. A returned disposition is intentionally required by `encode` before it can omit
+    /// a current raw overlay from a retained typed tuple.
+    static func classifyDeferredOwnAccountOverlays(document: Data, roster: [UserProfile], ownerProfileID: UUID,
+                                                   rosterModifiedSeconds: Double? = nil,
+                                                   retainedOwnAccountBaseline: Data? = nil,
+                                                   retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope] = [],
+                                                   retainedOwnAccountSlotBaselines: [RetainedOwnAccountSlotBaseline] = []) throws -> [RetainedOwnAccountOverlayDisposition] {
+        let source = try VortxProfileOverlayWitness.decodeObject(json: document)
+        let adapter = try Adapter(document: source, roster: roster, ownerID: ownerProfileID,
+                                  modified: rosterModifiedSeconds, deferProfileEdits: true)
+        return try adapter.classifyDeferredOwnAccountOverlays(retainedBaseline: retainedOwnAccountBaseline,
+                                                              retainedSourceEnvelopes: retainedOwnAccountSourceEnvelopes,
+                                                              retainedSlotBaselines: retainedOwnAccountSlotBaselines,
+                                                              rootDocumentSHA256: sha256(document))
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private final class Adapter {
@@ -111,7 +193,10 @@ enum VortxLegacyBootstrapMaterial {
         }
 
         func build(ownAccountSources: [OwnAccountSource], retainedOwnAccountBaseline: Data?,
-                   retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope]) throws -> Object {
+                   retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope],
+                   retainedOwnAccountSlotBaselines: [RetainedOwnAccountSlotBaseline],
+                   deferredOwnAccountOverlays: [RetainedOwnAccountOverlayDisposition],
+                   rootDocumentSHA256: String) throws -> Object {
             if let modified { _ = try validClock(modified, "rosterModifiedSeconds") }
             // The native `own` binding represents a secondary independently authenticated
             // streaming persona. The resolved primary owner remains local-only, never silently
@@ -124,7 +209,8 @@ enum VortxLegacyBootstrapMaterial {
             })
             try require(!deleted.contains(owner.id.uuidString), "Owner profile is tombstoned")
             let sources = try resolveOwnAccountSources(ownAccountSources, retainedBaseline: retainedOwnAccountBaseline,
-                                                        retainedSourceEnvelopes: retainedOwnAccountSourceEnvelopes)
+                                                        retainedSourceEnvelopes: retainedOwnAccountSourceEnvelopes,
+                                                        retainedSlotBaselines: retainedOwnAccountSlotBaselines)
             for profile in roster {
                 watches[profile.id.uuidString] = []
                 titles[profile.id.uuidString] = [:]
@@ -132,7 +218,8 @@ enum VortxLegacyBootstrapMaterial {
             let nativeRoster = try roster.map { try projectProfile($0, ownSource: sources[$0.id.uuidString]) }
             let addons = try addonBucket()
             let library = try ownerLibrary()
-            try validateOwnProfileOverlayBindings(sources)
+            try validateOwnProfileOverlayBindings(sources, deferred: deferredOwnAccountOverlays,
+                                                  rootDocumentSHA256: rootDocumentSHA256)
             // An independent source owns its profile's overlay context. Avoid parsing the root
             // bucket first: watched-only rows can rely on metadata in that independent library,
             // and accepting then overwriting them would make a stale root slice authoritative.
@@ -400,7 +487,8 @@ enum VortxLegacyBootstrapMaterial {
         }
 
         private func resolveOwnAccountSources(_ rawSources: [OwnAccountSource], retainedBaseline: Data?,
-                                              retainedSourceEnvelopes: [RetainedOwnAccountSourceEnvelope]) throws -> [String: ResolvedOwnAccountSource] {
+                                              retainedSourceEnvelopes: [RetainedOwnAccountSourceEnvelope],
+                                              retainedSlotBaselines: [RetainedOwnAccountSlotBaseline]) throws -> [String: ResolvedOwnAccountSource] {
             let ownProfiles = roster.filter { !$0.isOwner && $0.usesOwnAccount }
             var sources: [String: ResolvedOwnAccountSource] = [:]
             for source in rawSources {
@@ -429,9 +517,11 @@ enum VortxLegacyBootstrapMaterial {
                     sourceDocumentSHA256: source.sourceDocumentSHA256, profileOverlaySHA256: source.profileOverlaySHA256, sourceDocument: document, retainedBuckets: nil)
             }
             let freshSourceIDs = Set(sources.keys)
-            let retained = try retainedOwnAccountSources(retainedBaseline, requiredProfiles: ownProfiles)
+            let historical = try retainedOwnAccountSources(retainedBaseline, requiredProfiles: ownProfiles)
+            let activeSlots = try retainedOwnAccountSlotSources(retainedSlotBaselines, requiredProfiles: ownProfiles)
             for profile in ownProfiles where sources[profile.id.uuidString] == nil {
-                guard let source = retained[profile.id.uuidString] else {
+                guard let source = Self.preferredRetainedSource(profileID: profile.id.uuidString,
+                                                                 activeSlots: activeSlots, historical: historical) else {
                     throw fail("Own-account profiles require exactly one authenticated streaming-account source")
                 }
                 sources[profile.id.uuidString] = source
@@ -441,7 +531,7 @@ enum VortxLegacyBootstrapMaterial {
                 let profileID = envelope.profileID.uuidString
                 try require(retainedEnvelopeIDs.insert(profileID).inserted, "Duplicate retained own-account source envelope")
                 try require(!freshSourceIDs.contains(profileID), "Retained source envelope conflicts with a fresh authenticated source")
-                guard let retainedSource = retained[profileID], let retainedBuckets = retainedSource.retainedBuckets else {
+                guard let retainedSource = sources[profileID], let retainedBuckets = retainedSource.retainedBuckets else {
                     throw fail("Retained source envelope lacks a validated own-account tuple")
                 }
                 try require(envelope.sourceDocumentSHA256 == retainedSource.sourceDocumentSHA256,
@@ -457,6 +547,85 @@ enum VortxLegacyBootstrapMaterial {
             let ownIDs = Set(ownProfiles.map { $0.id.uuidString })
             try require(Set(sources.keys) == ownIDs, "Own-account profiles require exactly one authenticated streaming-account source")
             return sources
+        }
+
+        /// `legacyImport.baseline` is the immutable historical account source. A current active
+        /// slot can replace it only for a verified refresh of that same UID; a distinct A→B rebind
+        /// remains a runtime account-selection fact and must not rewrite legacy reconciliation as
+        /// though historical A had been imported from B.
+        private static func preferredRetainedSource(profileID: String, activeSlots: [String: ResolvedOwnAccountSource],
+                                                    historical: [String: ResolvedOwnAccountSource]) -> ResolvedOwnAccountSource? {
+            guard let historical = historical[profileID] else { return activeSlots[profileID] }
+            guard let active = activeSlots[profileID], active.verifiedStreamingUID == historical.verifiedStreamingUID else {
+                return historical
+            }
+            return active
+        }
+
+        private func retainedOwnAccountSlotSources(_ baselines: [RetainedOwnAccountSlotBaseline],
+                                                   requiredProfiles: [UserProfile]) throws -> [String: ResolvedOwnAccountSource] {
+            let required = Set(requiredProfiles.map { $0.id.uuidString })
+            var result: [String: ResolvedOwnAccountSource] = [:]
+            for baseline in baselines {
+                let id = baseline.profileID.uuidString
+                try require(required.contains(id), "Active own-account slot does not belong to the current own roster")
+                try require(result[id] == nil, "Duplicate active own-account slot baseline")
+                let carrier = try Self.decodeSlotBaseline(baseline.sourceBaseline, profileID: id)
+                result[id] = carrier
+            }
+            return result
+        }
+
+        fileprivate func classifyDeferredOwnAccountOverlays(retainedBaseline: Data?,
+                                                        retainedSourceEnvelopes: [RetainedOwnAccountSourceEnvelope],
+                                                        retainedSlotBaselines: [RetainedOwnAccountSlotBaseline],
+                                                        rootDocumentSHA256: String) throws -> [RetainedOwnAccountOverlayDisposition] {
+            let ownProfiles = roster.filter { !$0.isOwner && $0.usesOwnAccount }
+            let historical = try retainedOwnAccountSources(retainedBaseline, requiredProfiles: ownProfiles)
+            let activeSlots = try retainedOwnAccountSlotSources(retainedSlotBaselines, requiredProfiles: ownProfiles)
+            var envelopes: [String: Object] = [:]
+            for envelope in retainedSourceEnvelopes {
+                let id = envelope.profileID.uuidString
+                try require(envelopes[id] == nil, "Duplicate retained own-account source envelope")
+                guard let retained = Self.preferredRetainedSource(profileID: id, activeSlots: activeSlots,
+                                                                   historical: historical) else {
+                    throw fail("Retained source envelope lacks a validated own-account tuple")
+                }
+                try require(envelope.sourceDocumentSHA256 == retained.sourceDocumentSHA256,
+                            "Retained source envelope does not match the acknowledged source digest")
+                envelopes[id] = try Self.decodeOwnAccountEnvelope(envelope.sourceDocument, profileID: id)
+            }
+            return try ownProfiles.compactMap { profile in
+                let id = profile.id.uuidString
+                let slice = try Self.profileOverlaySlice(document, profileID: id)
+                guard !slice.isEmpty else { return nil }
+                let currentWitness = try Self.profileOverlayWitness(slice)
+                guard let retained = Self.preferredRetainedSource(profileID: id, activeSlots: activeSlots,
+                                                                   historical: historical) else {
+                    return RetainedOwnAccountOverlayDisposition(profileID: profile.id, sourceDocumentSHA256: nil,
+                        retainedProfileOverlaySHA256: nil, currentProfileOverlaySHA256: currentWitness,
+                        status: .missingRetainedSource, rootDocumentSHA256: rootDocumentSHA256)
+                }
+                if let witness = retained.profileOverlaySHA256 {
+                    return RetainedOwnAccountOverlayDisposition(profileID: profile.id,
+                        sourceDocumentSHA256: retained.sourceDocumentSHA256, retainedProfileOverlaySHA256: witness,
+                        currentProfileOverlaySHA256: currentWitness,
+                        status: witness == currentWitness ? .matchedWitness : .changedWitness,
+                        rootDocumentSHA256: rootDocumentSHA256)
+                }
+                if let envelope = envelopes[id] {
+                    let sourceSlice = try Self.profileOverlaySlice(envelope, profileID: id)
+                    return RetainedOwnAccountOverlayDisposition(profileID: profile.id,
+                        sourceDocumentSHA256: retained.sourceDocumentSHA256, retainedProfileOverlaySHA256: nil,
+                        currentProfileOverlaySHA256: currentWitness,
+                        status: try Self.equivalentJSON(slice, sourceSlice) ? .matchedSealedEnvelope : .changedWitness,
+                        rootDocumentSHA256: rootDocumentSHA256)
+                }
+                return RetainedOwnAccountOverlayDisposition(profileID: profile.id,
+                    sourceDocumentSHA256: retained.sourceDocumentSHA256, retainedProfileOverlaySHA256: nil,
+                    currentProfileOverlaySHA256: currentWitness, status: .missingWitness,
+                    rootDocumentSHA256: rootDocumentSHA256)
+            }
         }
 
         private static func envelopeOverlayWitness(_ source: Data) throws -> String {
@@ -545,7 +714,17 @@ enum VortxLegacyBootstrapMaterial {
             return retained
         }
 
-        private func validateOwnProfileOverlayBindings(_ sources: [String: ResolvedOwnAccountSource]) throws {
+        private func validateOwnProfileOverlayBindings(_ sources: [String: ResolvedOwnAccountSource],
+                                                       deferred: [RetainedOwnAccountOverlayDisposition],
+                                                       rootDocumentSHA256: String) throws {
+            var deferrals: [String: RetainedOwnAccountOverlayDisposition] = [:]
+            for disposition in deferred {
+                let id = disposition.profileID.uuidString
+                try require(deferrals[id] == nil, "Duplicate deferred own-account overlay")
+                try require(disposition.rootDocumentSHA256 == rootDocumentSHA256,
+                            "Deferred own-account overlay belongs to another root document")
+                deferrals[id] = disposition
+            }
             for (profileID, source) in sources {
                 let rootSlice = try Self.profileOverlaySlice(document, profileID: profileID)
                 if let sourceDocument = source.sourceDocument {
@@ -553,12 +732,19 @@ enum VortxLegacyBootstrapMaterial {
                     try require(try Self.equivalentJSON(rootSlice, sourceSlice),
                                 "Own-account root overlay differs from its authenticated source")
                 } else {
-                    // Retained material is a sealed typed tuple. A live root overlay needs a new
-                    // authenticated raw envelope so its clocks become part of a new source proof.
-                    try require(rootSlice.isEmpty,
-                                "Current own-account overlay requires an authenticated source refresh")
+                    if rootSlice.isEmpty { continue }
+                    guard let disposition = deferrals.removeValue(forKey: profileID) else {
+                        throw fail("Current own-account overlay requires an authenticated source refresh")
+                    }
+                    try require(disposition.sourceDocumentSHA256 == source.sourceDocumentSHA256,
+                                "Deferred own-account overlay does not match the retained source digest")
+                    try require(disposition.retainedProfileOverlaySHA256 == source.profileOverlaySHA256,
+                                "Deferred own-account overlay does not match the retained source witness")
+                    try require(disposition.currentProfileOverlaySHA256 == Self.profileOverlayWitness(rootSlice),
+                                "Deferred own-account overlay does not match the current root slice")
                 }
             }
+            try require(deferrals.isEmpty, "Deferred own-account overlay has no retained own-account profile")
         }
 
         /// Extract the only two scoped overlay carriers. A lowercased or duplicate UUID key would
@@ -591,6 +777,47 @@ enum VortxLegacyBootstrapMaterial {
         private static func equivalentJSON(_ lhs: Object, _ rhs: Object) throws -> Bool {
             try JSONSerialization.data(withJSONObject: lhs, options: [.sortedKeys, .withoutEscapingSlashes]) ==
                 JSONSerialization.data(withJSONObject: rhs, options: [.sortedKeys, .withoutEscapingSlashes])
+        }
+
+        private static func profileOverlayWitness(_ slice: Object) throws -> String {
+            try VortxProfileOverlayWitness.digest(json: JSONSerialization.data(withJSONObject: slice,
+                                                                                 options: [.sortedKeys, .withoutEscapingSlashes]))
+        }
+
+        private static func decodeSlotBaseline(_ bytes: Data, profileID: String) throws -> ResolvedOwnAccountSource {
+            guard let carrier = try JSONSerialization.jsonObject(with: bytes) as? Object,
+                  Set(carrier.keys) == ["source", "addons", "library", "watches", "identityLinks"],
+                  let source = try object(carrier, "source"),
+                  Set(source.keys) == ["verifiedStreamingUid", "sourceDocumentSha256"]
+                    || Set(source.keys) == ["verifiedStreamingUid", "sourceDocumentSha256", "profileOverlaySha256"],
+                  let uid = try optionalString(source, "verifiedStreamingUid"),
+                  uid == uid.trimmingCharacters(in: .whitespacesAndNewlines), !uid.isEmpty,
+                  uid.utf8.count <= 256, uid.rangeOfCharacter(from: .controlCharacters) == nil,
+                  let digest = try optionalString(source, "sourceDocumentSha256"),
+                  digest.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                  let addons = try object(carrier, "addons"), Set(addons.keys) == ["items", "order", "intents"],
+                  let addonItems = try array(addons, "items"), let addonOrder = try array(addons, "order"),
+                  let addonIntents = try array(addons, "intents"),
+                  let library = try object(carrier, "library"), Set(library.keys) == ["items", "intents"],
+                  let libraryItems = try array(library, "items"), let libraryIntents = try array(library, "intents"),
+                  let watches = try array(carrier, "watches"), let links = try array(carrier, "identityLinks") else {
+                throw fail("Active own-account slot baseline is malformed")
+            }
+            let identityLinks = try links.map { raw -> [String] in
+                guard let row = raw as? [String] else { throw fail("Active own-account slot baseline has malformed identity links") }
+                return row
+            }
+            let witness = try optionalString(source, "profileOverlaySha256")
+            try require(witness == nil || witness!.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                        "Active own-account slot baseline has an invalid overlay witness")
+            return ResolvedOwnAccountSource(profileID: profileID, verifiedStreamingUID: uid,
+                sourceDocumentSHA256: digest, profileOverlaySHA256: witness, sourceDocument: nil,
+                retainedBuckets: OwnAccountBuckets(addons: ["items": addonItems, "order": addonOrder, "intents": addonIntents],
+                                                   library: ["items": libraryItems, "intents": libraryIntents],
+                                                   watches: try watches.map { raw in
+                    guard let row = raw as? Object else { throw fail("Active own-account slot baseline has malformed watches") }
+                    return row
+                }, titles: [:], identityLinks: identityLinks))
         }
 
         func addonBucket() throws -> Object {

@@ -158,6 +158,48 @@ enum VortxNativeProfiles {
                          library: library, watches: watches, identityLinks: links)
     }
 
+    /// Selects the exact active own-account slot from a kernel-validated schema-4 nativeSync.
+    /// This is intentionally separate from historical `legacyImport.baseline`: after a same-UID
+    /// rebind, only the active slot carries the current source proof and typed tuple. The returned
+    /// carrier has no token or raw source response and is structurally rechecked by the importer.
+    static func activeOwnAccountSlotBaselines(nativeSync: VortxJSON) throws -> [VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline] {
+        guard nativeSync["schemaVersion"] == .integer(4) || nativeSync["schemaVersion"] == .unsigned(4),
+              case .object(let accountSlots)? = nativeSync["accountSlots"] else { throw VortxNativeError.invalidSnapshot }
+        return try accountSlots.compactMap { profileID, raw -> VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline? in
+            guard let profile = UUID(uuidString: profileID), profile.uuidString == profileID,
+                  case .object(let slotRecord) = raw,
+                  let active = slotRecord["activeBinding"]?["account"],
+                  case .object(let activeAccount) = active else { throw VortxNativeError.invalidSnapshot }
+            guard activeAccount["kind"] == .string("own") else { return nil }
+            guard case .string(let uid)? = activeAccount["value"], case .object(let slots)? = slotRecord["slots"] else {
+                throw VortxNativeError.invalidSnapshot
+            }
+            let matching = slots.values.filter { $0["account"] == active }
+            guard matching.count == 1, let carrier = matching[0]["sourceBaseline"],
+                  case .object(let object) = carrier,
+                  Set(object.keys) == ["source", "addons", "library", "watches", "identityLinks"],
+                  case .object(let source)? = object["source"],
+                  Set(source.keys) == ["verifiedStreamingUid", "sourceDocumentSha256"]
+                    || Set(source.keys) == ["verifiedStreamingUid", "sourceDocumentSha256", "profileOverlaySha256"],
+                  case .string(let carrierUID)? = source["verifiedStreamingUid"], carrierUID == uid,
+                  case .string(let digest)? = source["sourceDocumentSha256"],
+                  let addons = object["addons"], let library = object["library"],
+                  let watches = object["watches"], let identityLinks = object["identityLinks"] else {
+                throw VortxNativeError.invalidSnapshot
+            }
+            let witness: String?
+            switch source["profileOverlaySha256"] {
+            case nil: witness = nil
+            case .string(let value)?: witness = value
+            default: throw VortxNativeError.invalidSnapshot
+            }
+            _ = try OwnAccountTarget(verifiedStreamingUID: uid, sourceDocumentSHA256: digest,
+                                     profileOverlaySHA256: witness, addons: addons, library: library,
+                                     watches: watches, identityLinks: identityLinks)
+            return .init(profileID: profile, sourceBaseline: try JSONEncoder().encode(carrier))
+        }.sorted { $0.profileID.uuidString < $1.profileID.uuidString }
+    }
+
     /// Builds the only native action permitted to move an account binding.  The caller supplies a
     /// captured CAS receipt and proven target; no profile field is used as account authority.
     static func rebindAction(profileID: UUID, request: AccountRebindRequest) throws -> VortxJSON {
