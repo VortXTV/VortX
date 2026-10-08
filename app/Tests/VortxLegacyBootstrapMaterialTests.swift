@@ -131,6 +131,19 @@ enum VortxLegacyBootstrapMaterialTests {
               && (result["identityLinks"] as! [String: [[String]]])[own.id.uuidString] == [],
               "Primary bucket is retained and own receipt invents no aliases")
 
+        let highMilliseconds: Int64 = 9_007_199_254_740_989
+        var highState = ownMovie["state"] as! Object
+        highState["timeOffset"] = NSNumber(value: highMilliseconds)
+        highState["duration"] = NSNumber(value: highMilliseconds)
+        var highMovie = ownMovie; highMovie["state"] = highState
+        let highReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [highMovie], addons: [ownAddon]))
+        let highResult = try material(root, roster: [owner, own], ownAccountSources: [highReceipt])
+        let highWatch = watches(highResult, profile: own).first!
+        check((highWatch["positionMs"] as? NSNumber)?.int64Value == highMilliseconds
+              && (highWatch["durationMs"] as? NSNumber)?.int64Value == highMilliseconds,
+              "Own raw millisecond state round-trips exactly at the safe upper bound")
+
         var sameUID = UserProfile(id: UUID(uuidString: "10000000-0000-0000-0000-000000000002")!, name: "Second", avatar: "S")
         sameUID.usesOwnAccount = true
         let second = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: sameUID.id,
@@ -265,6 +278,8 @@ enum VortxLegacyBootstrapMaterialTests {
         try fail(doc(), "Invalid clock", modified: .infinity)
         var own = child; own.usesOwnAccount = true
         try fail(doc(), "authenticated streaming-account", roster: [owner, own])
+        var ownerOwn = owner; ownerOwn.usesOwnAccount = true
+        try fail(doc(), "Owner profile cannot use", roster: [ownerOwn, child])
         for pin in ["1234", "sha256:bad"] { var bad = child; bad.pin = pin; try fail(doc(), "malformed PIN", roster: [owner, bad]) }
         var boolProgress = movie(); boolProgress["t"] = true
         try fail(doc(["library": [boolProgress]]), "Malformed clock")

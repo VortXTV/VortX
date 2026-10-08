@@ -87,6 +87,11 @@ enum VortxLegacyBootstrapMaterial {
 
         func build(ownAccountSources: [OwnAccountSource]) throws -> Object {
             if let modified { _ = try validClock(modified, "rosterModifiedSeconds") }
+            // The native `own` binding represents a secondary independently authenticated
+            // streaming persona. The resolved primary owner remains local-only, never silently
+            // downgraded from an impossible owner-owned source claim.
+            try require(!roster.contains { $0.isOwner && $0.usesOwnAccount },
+                        "Owner profile cannot use an independent streaming account")
             deleted = Set(try strings(vortx, "deletedProfiles").map { raw in
                 guard let id = UUID(uuidString: raw) else { throw fail("Invalid deleted profile identity") }
                 return id.uuidString
@@ -265,8 +270,8 @@ enum VortxLegacyBootstrapMaterial {
             if let removed = try boolean(row, "removed") { projected["removed"] = removed }
             if let temporary = try boolean(row, "temp") { projected["temp"] = temporary }
             guard let state = try object(row, "state") else { return projected }
-            if let offset = try ownMilliseconds(state, "timeOffset") { projected["t"] = Double(offset) / 1000 }
-            if let duration = try ownMilliseconds(state, "duration") { projected["d"] = Double(duration) / 1000 }
+            if let offset = try ownMilliseconds(state, "timeOffset") { projected["t"] = ownSeconds(offset) }
+            if let duration = try ownMilliseconds(state, "duration") { projected["d"] = ownSeconds(duration) }
             if let watchedAt = try optionalString(state, "lastWatched") { projected["lastWatched"] = watchedAt }
             if let video = try optionalString(state, "video_id") { projected["v"] = video }
             if let count = try ownCount(state, "timesWatched") { projected["timesWatched"] = count }
@@ -284,6 +289,14 @@ enum VortxLegacyBootstrapMaterial {
                 throw fail("Malformed own-account millisecond state " + key)
             }
             return number.int64Value
+        }
+
+        /// `milliseconds` below parses the decimal representation and multiplies it by 1,000.
+        /// Preserve an incoming integral millisecond value as Decimal seconds so values close to
+        /// the documented 2^53-safe bound do not take an IEEE-754 rounding detour.
+        private static func ownSeconds(_ milliseconds: Int64) -> NSDecimalNumber {
+            let decimal = Decimal(string: String(milliseconds), locale: Locale(identifier: "en_US_POSIX"))!
+            return NSDecimalNumber(decimal: decimal / 1000)
         }
 
         private static func ownCount(_ root: Object, _ key: String) throws -> Int64? {
