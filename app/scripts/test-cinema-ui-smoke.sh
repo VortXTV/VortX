@@ -46,6 +46,9 @@ for renderer_contract in \
   'cinema-phone.png' \
   'cinema-tablet.png' \
   'cinema-mac.png' \
+  'cinema-search-phone.png' \
+  'cinema-quickView-phone.png' \
+  'cinema-episodeSources-phone.png' \
   'ENABLE_DEBUG_DYLIB: "NO"' \
   'DEAD_CODE_STRIPPING: "YES"'; do
   rg -Fq "$renderer_contract" SourcesiOS/CinemaUISmokeRendererApp.swift CinemaUISmokeRenderer.yml project.yml scripts/render-cinema-ui-smoke.sh SourcesiOS/VortXiOSApp.swift SourcesShared/WatchedIndex.swift
@@ -66,6 +69,9 @@ fixture_rail="$(sed -n '/struct CinemaFixturePosterRail/,/#endif/p' SourcesiOS/i
 }
 rg -Fq 'preconditionFailure("Cinema UI renderer must not construct WatchedIndex.shared")' SourcesShared/WatchedIndex.swift
 rg -Fq 'usesInertArtwork: true' SourcesiOS/iOSRootView.swift
+for surface in 'CinemaQuickView' 'CinemaSearchResults' 'CinemaUISmokeDetailSection' 'CinemaUISmokeSurface'; do
+  rg -Fq "$surface" SourcesiOS/CinemaUISmokeHarness.swift SourcesiOS/CinemaUISmokeRendererApp.swift
+done
 
 # `SourceIndexClient` names this optional source even though the fixture never supplies it. The renderer
 # compiles a stub instead of the QuickJS runtime, so a compile-only dependency cannot construct its store,

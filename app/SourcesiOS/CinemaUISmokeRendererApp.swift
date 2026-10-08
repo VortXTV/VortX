@@ -20,8 +20,10 @@ enum CinemaUISmokeRendererApp {
         app.setActivationPolicy(.prohibited)
         do {
             let output = try outputDirectory()
-            for viewport in viewports {
-                try render(viewport, into: output)
+            for surface in CinemaUISmokeSurface.allCases {
+                for viewport in viewports {
+                    try render(viewport, surface: surface, into: output)
+                }
             }
         } catch {
             fputs("Cinema UI renderer failed: \(error)\n", stderr)
@@ -39,10 +41,15 @@ enum CinemaUISmokeRendererApp {
         return url
     }
 
-    private static func render(_ viewport: (name: String, width: CGFloat, height: CGFloat), into output: URL) throws {
+    private static func render(
+        _ viewport: (name: String, width: CGFloat, height: CGFloat),
+        surface: CinemaUISmokeSurface,
+        into output: URL
+    ) throws {
         let size = NSSize(width: viewport.width, height: viewport.height)
         let root = CinemaUISmokeFixtureRoot(name: viewport.name.capitalized,
-                                            width: viewport.width, height: viewport.height)
+                                            width: viewport.width, height: viewport.height,
+                                            surface: surface)
         let host = NSHostingView(rootView: root)
         host.frame = NSRect(origin: .zero, size: size)
         host.layoutSubtreeIfNeeded()
@@ -58,9 +65,9 @@ enum CinemaUISmokeRendererApp {
         guard let png = bitmap.representation(using: .png, properties: [:]) else {
             throw RendererError.pngEncoding
         }
-        let file = output.appendingPathComponent("cinema-\(viewport.name).png")
+        let file = output.appendingPathComponent("cinema-\(surface.artifactPrefix)\(viewport.name).png")
         try png.write(to: file, options: .atomic)
-        print("rendered \(file.path) \(Int(size.width))x\(Int(size.height))")
+        print("rendered \(file.path) \(surface.title) \(Int(size.width))x\(Int(size.height))")
     }
 
     private enum RendererError: LocalizedError {

@@ -26,15 +26,56 @@ struct CinemaUISmokeFixtureRoot: View {
     let name: String
     let width: CGFloat
     let height: CGFloat
+    var surface: CinemaUISmokeSurface = .home
 
     var body: some View {
         VStack(spacing: 0) {
-            Text(name)
+            Text("\(name) · \(surface.title)")
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.accent)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(Theme.Space.sm)
                 .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous), shadow: .flat)
+            CinemaUISmokeSurfaceContent(surface: surface)
+        }
+        .frame(width: width, height: height)
+        .background(Theme.Palette.canvas)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+            .stroke(Theme.Palette.hairline, lineWidth: 1))
+        .safeAreaInset(edge: .bottom, spacing: 0) { CinemaUISmokeTabBar() }
+        .environmentObject(ThemeManager.shared)
+        .environment(\.cinemaFixtureDisablesArtworkLoading, true)
+        .accessibilityLabel("\(name) \(surface.title) Cinema viewport")
+    }
+}
+
+enum CinemaUISmokeSurface: String, CaseIterable {
+    case home, search, quickView, episodeSources
+
+    var title: String {
+        switch self {
+        case .home: "Home"
+        case .search: "Search"
+        case .quickView: "Detail"
+        case .episodeSources: "Episode sources"
+        }
+    }
+
+    var artifactPrefix: String {
+        switch self {
+        case .home: ""
+        default: "\(rawValue)-"
+        }
+    }
+}
+
+private struct CinemaUISmokeSurfaceContent: View {
+    let surface: CinemaUISmokeSurface
+
+    var body: some View {
+        switch surface {
+        case .home:
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                     CinemaFixturePosterRail(
@@ -49,21 +90,22 @@ struct CinemaUISmokeFixtureRoot: View {
                         items: CinemaUISmokeFixtures.catalog,
                         includesSeeAll: true
                     )
-                    CinemaSearchResults(items: CinemaUISmokeFixtures.search, onOpen: { _ in })
-                    CinemaUISmokeDetailSection()
                 }
                 .padding(.vertical, Theme.Space.md)
             }
+        case .search:
+            ScrollView {
+                CinemaSearchResults(items: CinemaUISmokeFixtures.search, onOpen: { _ in })
+                    .padding(.vertical, Theme.Space.md)
+            }
+        case .quickView:
+            CinemaQuickView(item: CinemaUISmokeFixtures.search[0], onWatch: {}, onDetails: {})
+        case .episodeSources:
+            ScrollView {
+                CinemaUISmokeDetailSection()
+                    .padding(.vertical, Theme.Space.md)
+            }
         }
-        .frame(width: width, height: height)
-        .background(Theme.Palette.canvas)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-            .stroke(Theme.Palette.hairline, lineWidth: 1))
-        .safeAreaInset(edge: .bottom, spacing: 0) { CinemaUISmokeTabBar() }
-        .environmentObject(ThemeManager.shared)
-        .environment(\.cinemaFixtureDisablesArtworkLoading, true)
-        .accessibilityLabel("\(name) Cinema viewport")
     }
 }
 
