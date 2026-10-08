@@ -9,11 +9,19 @@ import Foundation
 /// server admission, so deferred pre-ready and item-replacement intents cannot create phantom pins.
 struct VortXHLSSeekAnchorState {
     private(set) var currentPlaybackSeconds: Double?
+    private var confirmedPlaybackSeconds: Double?
     private(set) var pendingAdmissionRequestID: UInt64?
     private(set) var pendingReceipt: (requestID: UInt64, playerSeconds: Double)?
     private(set) var latestRequestID: UInt64 = 0
     /// A periodic observer captures this when installed. Old queued samples cannot cross a seek boundary.
     private(set) var playbackReceiptEpoch: UInt64 = 0
+
+    /// An admitted seek needs refill at its destination before AVPlayer can complete it. This reservation
+    /// is not display proof: cancellation returns to the last confirmed clock, including while paused.
+    /// Before the first clock receipt, local media zero conservatively reserves every produced segment.
+    var producerBudgetAnchorSeconds: Double {
+        pendingReceipt?.playerSeconds ?? confirmedPlaybackSeconds ?? 0
+    }
 
     @discardableResult
     mutating func reportPlaybackPosition(_ playerSeconds: Double, receiptEpoch: UInt64? = nil) -> Bool {
@@ -23,6 +31,7 @@ struct VortXHLSSeekAnchorState {
               pendingAdmissionRequestID == nil,
               pendingReceipt == nil else { return false }
         currentPlaybackSeconds = playerSeconds
+        confirmedPlaybackSeconds = playerSeconds
         return true
     }
 
@@ -66,6 +75,7 @@ struct VortXHLSSeekAnchorState {
         playbackReceiptEpoch &+= 1
         pendingReceipt = nil
         currentPlaybackSeconds = playerSeconds
+        confirmedPlaybackSeconds = playerSeconds
         return true
     }
 
@@ -85,5 +95,6 @@ struct VortXHLSSeekAnchorState {
         pendingAdmissionRequestID = nil
         pendingReceipt = nil
         currentPlaybackSeconds = nil
+        confirmedPlaybackSeconds = nil
     }
 }

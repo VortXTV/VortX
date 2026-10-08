@@ -306,8 +306,8 @@ struct VortXRemuxProducerLeadLedger: Sendable {
     private var latestPlayhead: Double?
     private var aheadBytes = 0
 
-    /// Only an accepted post-seek clock may reset the monotonic frontier. Rebuild from the real retained
-    /// window: the compacted consumption ledger no longer contains segments a backward seek can revisit.
+    /// An explicit seek reservation or its confirmed landing/cancellation may reset the monotonic frontier.
+    /// Rebuild from the real retained window: the compacted ledger no longer contains revisitable segments.
     mutating func reanchor(to seconds: Double, retainedSegments: [Segment]) {
         guard seconds.isFinite, seconds >= 0 else { return }
         self = Self()

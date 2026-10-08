@@ -692,11 +692,22 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     func registerLatestSeekRequest(requestID: UInt64) {
         playbackClockLock.lock()
+        let retiresProvisionalReservation = seekAnchorState.pendingReceipt != nil
         seekAnchorState.registerSeek(requestID: requestID)
+        // Ordinary registration already has the confirmed producer budget. Do not snapshot the spool on
+        // the UI caller; the background admission below rebuilds it only once the target is accepted.
+        if retiresProvisionalReservation { reanchorProducerAfterSeekChange() }
+        playbackClockLock.unlock()
+    }
+
+    /// Called under playbackClockLock. Admission reserves refill at the accepted destination; registration,
+    /// cancellation and completion replace that provisional budget with the appropriate confirmed clock.
+    /// Rebuild even when the landing is earlier: ordinary monotonic receipts cannot undo seek compaction.
+    private func reanchorProducerAfterSeekChange() {
         producerLeadLock.lock()
         producerLeadNeedsReanchor = true
         producerLeadLock.unlock()
-        playbackClockLock.unlock()
+        refreshProducerLeadGate(playbackReceipt: seekAnchorState.producerBudgetAnchorSeconds)
     }
 
     /// Establishes an explicit seek destination before AVPlayer receives the asynchronous seek. Waiting happens
@@ -733,6 +744,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                     requestID: requestID,
                     playerSeconds: playerSeconds,
                     targetIsPublished: targetIsPublished)
+                if admitted {
+                    // Waiting for native completion here deadlocks a forward seek near a parked tail:
+                    // AVPlayer needs new media to finish, while the producer still budgets at the old clock.
+                    self.reanchorProducerAfterSeekChange()
+                }
                 self.playbackClockLock.unlock()
                 self.publicationLock.unlock()
                 continuation.resume(returning: admitted)
@@ -742,18 +758,27 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     func completePreparedSeek(requestID: UInt64, playerSeconds: Double) {
         playbackClockLock.lock()
-        if seekAnchorState.completeSeek(requestID: requestID, playerSeconds: playerSeconds) {
+        let hadProvisionalReservation = seekAnchorState.pendingReceipt?.requestID == requestID
+        let previousEpoch = seekAnchorState.playbackReceiptEpoch
+        let completed = seekAnchorState.completeSeek(requestID: requestID, playerSeconds: playerSeconds)
+        if completed || (hadProvisionalReservation && seekAnchorState.playbackReceiptEpoch != previousEpoch) {
             // Completion supplies a genuine landing receipt, including when the viewer remains paused.
             // Reconcile the producer before reopening normal observer admission instead of waiting for
             // an optional later periodic tick. A stale completion must never touch the newer ledger.
-            refreshProducerLeadGate(playbackReceipt: playerSeconds)
+            // An invalid owned landing cancels the reservation, so it must restore the confirmed budget too.
+            reanchorProducerAfterSeekChange()
         }
         playbackClockLock.unlock()
     }
 
     func cancelPreparedSeek(requestID: UInt64) {
         playbackClockLock.lock()
+        let hadProvisionalReservation = seekAnchorState.pendingReceipt?.requestID == requestID
+        let previousEpoch = seekAnchorState.playbackReceiptEpoch
         seekAnchorState.cancelSeek(requestID: requestID)
+        if hadProvisionalReservation && seekAnchorState.playbackReceiptEpoch != previousEpoch {
+            reanchorProducerAfterSeekChange()
+        }
         playbackClockLock.unlock()
     }
 
