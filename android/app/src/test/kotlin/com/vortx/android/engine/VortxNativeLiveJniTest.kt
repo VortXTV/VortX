@@ -156,7 +156,7 @@ class VortxNativeLiveJniTest {
                 JSONObject("""{"type":"add_library_item","profileId":"owner","item":{"kind":"standard","id":"saved-only","type":"movie","name":"Never played"}}"""),
                 JSONObject("""{"type":"report_progress","metaId":"unsaved-resume","videoId":"unsaved-resume","name":"Partial unsaved","metadata":{"type":"movie","poster":"https://fixture.invalid/partial"},"positionMs":12000,"durationMs":100000}"""),
             ))
-            repository.setCatalogWatched(MetaItem("unsaved-watched", MediaType.MOVIE, "Finished unsaved", "https://fixture.invalid/finished"), true).getOrThrow()
+            repository.setCatalogWatched(com.vortx.android.model.MetaItem("unsaved-watched", MediaType.MOVIE, "Finished unsaved", "https://fixture.invalid/finished"), true).getOrThrow()
             val captured = repository.continueWatchingOwner()
             val snapshot = repository.playbackHistorySnapshot(captured).getOrThrow()
             assertEquals(captured, snapshot.owner)
