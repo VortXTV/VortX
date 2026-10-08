@@ -63,15 +63,15 @@ enum VortxNativeServer {
     /// The opaque ServerHandle from `vortx_server_start`. Touched only on `queue`. Nulled BEFORE
     /// `vortx_server_stop` consumes it (the pointer is freed by that call; a second stop with the
     /// same pointer would be a double free).
-    private static var handle: UnsafeMutableRawPointer?
+    nonisolated(unsafe) private static var handle: UnsafeMutableRawPointer?
 
     /// Publishes the running server's address to readers on other threads
     /// (`StremioServer.embeddedPort` is read from the player and Settings). Lock-guarded because
     /// the writer is `queue` and the readers are arbitrary threads.
     private static let publishLock = NSLock()
-    private static var _port: Int?
-    private static var _baseURL: String?
-    private static var _failure: String?
+    nonisolated(unsafe) private static var _port: Int?
+    nonisolated(unsafe) private static var _baseURL: String?
+    nonisolated(unsafe) private static var _failure: String?
 
     /// The ACTUAL bound port while the engine server runs, else nil. Ephemeral (port 0 bind), so
     /// it changes across background/foreground cycles; `StremioServer.embeddedPort` re-reads it
@@ -163,23 +163,28 @@ enum VortxNativeServer {
     /// The publish is cleared BEFORE the (briefly blocking) stop so no reader routes a new request
     /// at a server that is shutting down.
     static func stop() {
-        queue.sync {
-            guard let h = handle else { return }
-            handle = nil
-            publish(port: nil, baseURL: nil)
-            vortx_server_stop(h)
-            DiagnosticsLog.log("server", "engine in-process server stopped")
-        }
+        queue.sync { stopOnQueue() }
     }
 
-    /// Background-transition stop, detached so the (up to ~4 s) graceful shutdown never runs on
-    /// the main thread during the OS's backgrounding window. Known trade-off, documented rather
+    /// Queue-only teardown, shared by synchronous shutdown and FIFO background transitions.
+    private static func stopOnQueue() {
+        guard let h = handle else { return }
+        handle = nil
+        publish(port: nil, baseURL: nil)
+        vortx_server_stop(h)
+        DiagnosticsLog.log("server", "engine in-process server stopped")
+    }
+
+    /// Enqueue the background stop immediately. A subsequent foreground start enters the SAME
+    /// FIFO queue after this stop, even if shutdown takes time. A detached Task could enqueue its
+    /// stop after that foreground start and leave the newly active app without its native server.
+    /// Shutdown never runs on the main thread. Known trade-off, documented rather
     /// than hidden: with the flag ON, backgrounding tears the engine server down, so a torrent
     /// stream continued in PiP/background dies with it; foreground restarts on a fresh ephemeral
     /// port and `StremioServer.embeddedPort` follows. The node path (flag OFF) is unaffected.
     static func stopOnBackground() {
         guard VortxNativeServerFlag.isOn else { return }
-        Task.detached(priority: .utility) { stop() }
+        queue.async { stopOnQueue() }
     }
 
     #else

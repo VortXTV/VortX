@@ -16,6 +16,15 @@ xcrun swiftc -parse-as-library -swift-version 5 -D VORTX_NATIVE_DATA_ENGINE \
   app/SourcesShared/NativeTransportPolicy.swift app/SourcesShared/MacNodeServer.swift \
   app/Tests/MacNativeTransportBootstrapTests.swift -o "$transport_test_dir/mac-bootstrap"
 "$transport_test_dir/mac-bootstrap"
+# Compile the actual mobile lifecycle on the host, substituting only platform/ABI availability
+# and its filesystem root. No engine, app, network listener or provider account is started.
+sed '1d;$d;s/#if canImport(VortxEngine) \&\& VORTX_ENGINE_SERVER/#if VORTX_NATIVE_SERVER_LIFECYCLE_TEST/g;s/NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first/ProcessInfo.processInfo.environment["VORTX_TEST_NATIVE_CACHES"]/g' \
+  app/SourcesShared/VortxNativeServer.swift > "$transport_test_dir/MobileNativeServer.swift"
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  -D VORTX_NATIVE_DATA_ENGINE -D VORTX_NATIVE_SERVER_LIFECYCLE_TEST \
+  app/SourcesShared/NativeTransportPolicy.swift "$transport_test_dir/MobileNativeServer.swift" \
+  app/Tests/MobileNativeServerLifecycleTests.swift -o "$transport_test_dir/mobile-lifecycle"
+VORTX_TEST_NATIVE_CACHES="$PWD/$transport_test_dir" "$transport_test_dir/mobile-lifecycle"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/UsenetStreamValidation.swift app/Tests/UsenetNodeRoutingContractTests.swift \
   -o "$transport_test_dir/routing-contract"
