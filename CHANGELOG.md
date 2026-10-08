@@ -4,6 +4,30 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.5.0-beta.1 - Draft: Native core, Cinema, and durable watch state
+
+**Unpublished release candidate.** Apple build **260** and Android version code **241** are
+proposed, not yet set or package-verified. The reviewed source since Beta 21 adds VortX's own
+native account/resource/streaming path; encrypted checkpoint-first mutation and recovery;
+profile-qualified independent streaming accounts; acknowledged per-title Watchlist edits;
+source-backed watched-bitmap migration with retained pending history and historical Retry;
+unified Cinema Home/Browse/Search/Library/History/Watchlist/Downloads navigation on Apple and
+Android; per-profile add-on visibility/ranking; bounded Continue Watching next-episode
+preparation; actual selected-audio continuity; regular-episode defaults that preserve explicit
+specials; pause and accepted resume/seek targets across replacement; real mpv subtitle
+backgrounds; native NNTP article concurrency and seek cancellation; and fresh FFmpeg 9 /
+Apple SecureTransport MPV build inputs with the Mac CoreAudio lifecycle repair.
+
+Existing Beta 21 player controls, integrations, downloads, catalog/source workflows and
+profile/account fixes are retained. Complete native CI and focused fixtures have passed;
+Android watched/Watchlist host completion, native-default/package activation, final Apple
+whole-app rebuilding, combined Android checks, versions, signing, deployment and physical
+device/provider acceptance remain pending. No public release, installation or universal
+playback/parity closure is established by this entry.
+
+See [the draft 0.5 Beta 1 notes](docs/releases/0.5.0-beta.1.md) for the full behavior, retained
+features, precise remaining gates, proposed assets and post-publication test checklist.
+
 ## 0.4.0-beta.21 - Profile sync, chosen-source binge playback, and recovery fixes
 
 Apple build **259**, Android version code **240**. Carries the reviewed changes since Beta 20:
