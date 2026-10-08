@@ -11,6 +11,7 @@ enum VortxNativeProfiles {
             guard let record = records[id], record["deleted"] != .bool(true) else { return nil }
             guard let uuid = UUID(uuidString: id), case .string(let name) = record["name"],
                   case .bool(let owner) = record["owner"] else { throw VortxNativeError.invalidSnapshot }
+            let usesOwnAccount = try accountUsesOwn(record: record, isOwner: owner)
             let base = prior[id] ?? UserProfile(id: uuid, name: name, avatar: "🍿", isOwner: owner)
             guard case .object(var object) = try JSONDecoder().decode(VortxJSON.self, from: JSONEncoder().encode(base)) else { throw VortxNativeError.invalidSnapshot }
             if case .object(let registers) = host["profiles"]?[id]?["fields"] {
@@ -23,7 +24,7 @@ enum VortxNativeProfiles {
                 }
             }
             object["id"] = .string(id); object["name"] = .string(name); object["isOwner"] = .bool(owner)
-            object["usesOwnAccount"] = .bool(false)
+            object["usesOwnAccount"] = .bool(usesOwnAccount)
             object["pin"] = record["pin"] ?? .null
             object["isKids"] = record["parental"]?["kids"] ?? .bool(false)
             object["familyEdit"] = record["parental"]?["familyEdit"] ?? .bool(false)
@@ -36,10 +37,32 @@ enum VortxNativeProfiles {
             return try VortxJSON.object(object).decode(UserProfile.self)
         }
     }
+
+    /// Native state is authoritative for the account binding. A host roster may retain display
+    /// fields (including email), but it must never decide that a profile owns an independently
+    /// authenticated streaming account or manufacture an `addons: own` bucket.
+    private static func accountUsesOwn(record: VortxJSON, isOwner: Bool) throws -> Bool {
+        guard case .object(let binding)? = record["account"], case .string("own")? = binding["kind"] else {
+            // Schema-1/private-kernel account variants remain kernel-owned and are non-own to the
+            // host. Do not reinterpret or reject a historical representation here.
+            return false
+        }
+        guard !isOwner, case .string(let uid) = binding["value"], !uid.isEmpty,
+              uid == uid.trimmingCharacters(in: .whitespacesAndNewlines), record["addons"] == .string("own") else {
+            throw VortxNativeError.invalidSnapshot
+        }
+        return true
+    }
     static func mutation(_ desired: UserProfile, previous: UserProfile?, ownerID: String) throws -> ([VortxJSON], VortxNativeHostPreferences.Edit) {
-        guard !desired.usesOwnAccount, desired.isOwner == (desired.id.uuidString == ownerID),
+        guard desired.isOwner == (desired.id.uuidString == ownerID),
               desired.textScale.isFinite, desired.textScale > 0, desired.textScale <= 100,
               !desired.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw VortxNativeError.invalidSnapshot }
+        // An own-account bind/rebind is an authenticated, source-bound migration transaction.
+        // Ordinary profile edits may preserve that binding, but may never create, clear, or move it.
+        guard !desired.usesOwnAccount || (!desired.isOwner && previous?.usesOwnAccount == true),
+              previous.map({ $0.usesOwnAccount == desired.usesOwnAccount }) ?? !desired.usesOwnAccount else {
+            throw VortxNativeError.invalidSnapshot
+        }
         if let pin = desired.pin, !pin.isEmpty {
             guard pin.range(of: "^sha256:[0-9a-fA-F]{64}$", options: .regularExpression) != nil else { throw VortxNativeError.invalidSnapshot }
         }

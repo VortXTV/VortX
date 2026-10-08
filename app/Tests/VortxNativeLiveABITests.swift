@@ -252,6 +252,23 @@ import CryptoKit
         var owner = UserProfile(id: UUID(uuidString: "20000000-0000-0000-0000-000000000001")!, name: "Owner", avatar: "O", isOwner: true)
         owner.pin = UserProfile.pinHash("1234", profileID: owner.id)
         let child = UserProfile(id: UUID(uuidString: "10000000-0000-0000-0000-000000000001")!, name: "Child", avatar: "C")
+        var ownAccount = child; ownAccount.usesOwnAccount = true
+        let ownRecord: VortxJSON = .object([
+            "name": .string(ownAccount.name), "owner": .bool(false),
+            "account": .object(["kind": .string("own"), "value": .string("verified-own-uid")]),
+            "addons": .string("own"), "parental": .object(["kids": .bool(false), "familyEdit": .bool(false)]),
+            "settings": .object(["accent": .string("ember"), "oled": .bool(false), "textScale": .integer(1000), "disabledAddons": .array([])])
+        ])
+        let ownState: VortxJSON = .object(["roster": .object(["profiles": .object([ownAccount.id.uuidString: ownRecord])])])
+        check(try VortxNativeProfiles.project(state: ownState, host: .object([:]), baseline: [ownAccount]).first?.usesOwnAccount == true)
+        var renamedOwn = ownAccount; renamedOwn.name = "Renamed own account"
+        let retainedOwnBinding = try VortxNativeProfiles.mutation(renamedOwn, previous: ownAccount, ownerID: owner.id.uuidString)
+        check(retainedOwnBinding.0.count == 1 && retainedOwnBinding.0[0]["type"] == .string("patch_profile"))
+        do { _ = try VortxNativeProfiles.mutation(ownAccount, previous: nil, ownerID: owner.id.uuidString); fatalError("unproven own binding created") }
+        catch VortxNativeError.invalidSnapshot {}
+        var shared = ownAccount; shared.usesOwnAccount = false
+        do { _ = try VortxNativeProfiles.mutation(shared, previous: ownAccount, ownerID: owner.id.uuidString); fatalError("own binding cleared by generic patch") }
+        catch VortxNativeError.invalidSnapshot {}
         let legacyScope = VortxAccountScope(account: "fixture-legacy-account", ownerProfileID: owner.id.uuidString)
         var source = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "app/Tests/Fixtures/legacy-bootstrap-apple.json"))) as! [String: Any]
         source.removeValue(forKey: "settings") // fixture's deliberately opaque placeholder is not a real settings backup

@@ -1,5 +1,6 @@
 import Foundation
 import CoreFoundation
+import CryptoKit
 
 /// Pure projection of a COMPLETE, authenticated, host-reconciled legacy account snapshot.
 /// The caller supplies the resolved roster and actual owner UUID, and must atomically retain the
@@ -12,6 +13,25 @@ enum VortxLegacyBootstrapMaterial {
         var errorDescription: String? { "Native migration reconciliation required: " + reason }
     }
 
+    /// A caller-owned, server-authenticated source receipt for one secondary profile's independent
+    /// streaming account. The caller must keep its credential-generation proof private; neither a
+    /// token nor a token-derived fingerprint may enter this value or the native material.
+    struct OwnAccountSource: Sendable, Equatable {
+        let profileID: UUID
+        let verifiedStreamingUID: String
+        let sourceDocument: Data
+
+        init(profileID: UUID, verifiedStreamingUID: String, sourceDocument: Data) {
+            self.profileID = profileID
+            self.verifiedStreamingUID = verifiedStreamingUID
+            self.sourceDocument = sourceDocument
+        }
+
+        var sourceDocumentSHA256: String {
+            SHA256.hash(data: sourceDocument).map { String(format: "%02x", $0) }.joined()
+        }
+    }
+
     /// A Sendable UTF-8 JSON result that can cross the caller's authentication/MainActor boundary.
     /// The result is the `material` member of `import_legacy_sync`, not a runtime or sync document.
     ///
@@ -20,13 +40,14 @@ enum VortxLegacyBootstrapMaterial {
     /// material-side reconciliation check; the edits themselves never enter this projection.
     /// The default remains strict so ordinary legacy imports cannot acknowledge pending edits.
     static func encode(document: Data, roster: [UserProfile], ownerProfileID: UUID,
-                       rosterModifiedSeconds: Double?, deferProfileEdits: Bool = false) throws -> Data {
+                       rosterModifiedSeconds: Double?, deferProfileEdits: Bool = false,
+                       ownAccountSources: [OwnAccountSource] = []) throws -> Data {
         guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else {
             throw ReconciliationRequired(reason: "Account document must be an object")
         }
         let adapter = try Adapter(document: source, roster: roster, ownerID: ownerProfileID,
                                   modified: rosterModifiedSeconds, deferProfileEdits: deferProfileEdits)
-        return try JSONSerialization.data(withJSONObject: adapter.build(), options: [.sortedKeys, .withoutEscapingSlashes])
+        return try JSONSerialization.data(withJSONObject: adapter.build(ownAccountSources: ownAccountSources), options: [.sortedKeys, .withoutEscapingSlashes])
     }
 
     private final class Adapter {
@@ -38,56 +59,77 @@ enum VortxLegacyBootstrapMaterial {
         let modified: Double?
         let profiles: [String: UserProfile]
         let deferProfileEdits: Bool
+        let independentSource: Bool
         var deleted = Set<String>()
         var watches: [String: [Object]] = [:]
         var titles: [String: [String: Object]] = [:]
 
         init(document: Object, roster: [UserProfile], ownerID: UUID, modified: Double?,
-             deferProfileEdits: Bool) throws {
+             deferProfileEdits: Bool, allowIndependentSource: Bool = false) throws {
             self.document = document
             self.vortx = try object(document, "vortx") ?? [:]
             self.roster = roster
             self.modified = modified
             self.deferProfileEdits = deferProfileEdits
-            let owners = roster.filter(\.isOwner)
-            try require(owners.count == 1 && owners[0].id == ownerID, "A unique resolved owner UUID is required")
-            self.owner = owners[0]
+            self.independentSource = allowIndependentSource
             try require(!roster.isEmpty && Set(roster.map(\.id)).count == roster.count, "Duplicate or empty profile roster")
+            let owners = roster.filter(\.isOwner)
+            if allowIndependentSource {
+                try require(roster.count == 1 && roster[0].id == ownerID,
+                            "Independent account source must bind exactly one profile")
+                self.owner = roster[0]
+            } else {
+                try require(owners.count == 1 && owners[0].id == ownerID, "A unique resolved owner UUID is required")
+                self.owner = owners[0]
+            }
             profiles = Dictionary(uniqueKeysWithValues: roster.map { ($0.id.uuidString, $0) })
         }
 
-        func build() throws -> Object {
+        func build(ownAccountSources: [OwnAccountSource]) throws -> Object {
             if let modified { _ = try validClock(modified, "rosterModifiedSeconds") }
             deleted = Set(try strings(vortx, "deletedProfiles").map { raw in
                 guard let id = UUID(uuidString: raw) else { throw fail("Invalid deleted profile identity") }
                 return id.uuidString
             })
             try require(!deleted.contains(owner.id.uuidString), "Owner profile is tombstoned")
+            let sources = try resolveOwnAccountSources(ownAccountSources)
             for profile in roster {
-                try require(!profile.usesOwnAccount, "Own-account profile requires an authenticated streaming-account identity")
                 watches[profile.id.uuidString] = []
                 titles[profile.id.uuidString] = [:]
             }
-            let nativeRoster = try roster.map(projectProfile)
+            let nativeRoster = try roster.map { try projectProfile($0, ownSource: sources[$0.id.uuidString]) }
             let addons = try addonBucket()
             let library = try ownerLibrary()
             try importOverlays()
             try importOwnerIntents()
             if !deferProfileEdits { try validateProfileEdits(ownerLibrary: library) }
+            var addonBuckets: [String: Object] = [owner.id.uuidString: addons]
+            var libraryBuckets: [String: Object] = [owner.id.uuidString: library]
+            var ownSourceMaterial: [String: Object] = [:]
+            for (profileID, source) in sources {
+                let buckets = try source.buckets()
+                addonBuckets[profileID] = buckets.addons
+                libraryBuckets[profileID] = buckets.library
+                watches[profileID] = buckets.watches
+                titles[profileID] = buckets.titles
+                ownSourceMaterial[profileID] = ["verifiedStreamingUid": source.verifiedStreamingUID,
+                                                "sourceDocumentSha256": source.sourceDocumentSHA256]
+            }
             var result: Object = [
-                "schemaVersion": 1, "roster": nativeRoster, "deletedProfileIds": deleted.sorted(),
-                "addons": [owner.id.uuidString: addons], "libraries": [owner.id.uuidString: library],
+                "schemaVersion": sources.isEmpty ? 1 : 2, "roster": nativeRoster, "deletedProfileIds": deleted.sorted(),
+                "addons": addonBuckets, "libraries": libraryBuckets,
                 "watches": try watches.mapValues(resolveWatches),
                 // Removal keys do not establish an IMDb/TMDB equivalence edge. The caller must
                 // reconcile such aliases explicitly; this adapter never guesses an identity link.
                 "identityLinks": Dictionary(uniqueKeysWithValues: roster.map { ($0.id.uuidString, [[String]]()) })
             ]
+            if !ownSourceMaterial.isEmpty { result["ownAccountSources"] = ownSourceMaterial }
             if let modified { result["rosterModifiedSeconds"] = modified }
             try rejectCredentials(result)
             return result
         }
 
-        func projectProfile(_ profile: UserProfile) throws -> Object {
+        private func projectProfile(_ profile: UserProfile, ownSource: ResolvedOwnAccountSource?) throws -> Object {
             try require(profile.textScale.isFinite && profile.textScale > 0 && profile.textScale <= 100,
                         "Invalid profile text scale")
             let inherited = owner.addonPreferences?.disabledAddonURLsOverride ?? owner.disabledAddons ?? []
@@ -119,9 +161,17 @@ enum VortxLegacyBootstrapMaterial {
                 }
                 settings["ranking"] = ranking
             }
+            let account: Object
+            let addons: String
+            if let ownSource {
+                account = ["kind": "own", "value": ownSource.verifiedStreamingUID]
+                addons = "own"
+            } else {
+                account = profile.isOwner ? ["kind": "local_only"] : ["kind": "shared", "value": owner.id.uuidString]
+                addons = "share_primary"
+            }
             var result: Object = ["id": profile.id.uuidString, "name": profile.name, "owner": profile.isOwner,
-                                  "account": profile.isOwner ? ["kind": "local_only"] : ["kind": "shared", "value": owner.id.uuidString],
-                                  "addons": "share_primary", "settings": settings,
+                                  "account": account, "addons": addons, "settings": settings,
                                   "parental": ["kids": profile.isKids, "familyEdit": profile.familyEdit]]
             if let pin = profile.pin, !pin.isEmpty {
                 try require(pin.range(of: "^sha256:[0-9a-fA-F]{64}$", options: .regularExpression) != nil,
@@ -129,6 +179,71 @@ enum VortxLegacyBootstrapMaterial {
                 result["pin"] = pin
             }
             return result
+        }
+
+        private struct OwnAccountBuckets {
+            let addons: Object
+            let library: Object
+            let watches: [Object]
+            let titles: [String: Object]
+        }
+
+        private struct ResolvedOwnAccountSource {
+            let profileID: String
+            let verifiedStreamingUID: String
+            let sourceDocumentSHA256: String
+            let sourceDocument: Object
+
+            func buckets() throws -> OwnAccountBuckets {
+                // An independently authenticated account has the same root membership/history
+                // carriers as the primary account, but never borrows root-document or byProfile
+                // data from the profile roster's account. This short-lived adapter intentionally
+                // does not import overlay buckets from the independent source.
+                let profile = UserProfile(id: UUID(uuidString: profileID)!, name: "Independent", avatar: "🍿")
+                let adapter = try Adapter(independentSource: sourceDocument, profile: profile)
+                try require((try object(adapter.vortx, "byProfile") ?? [:]).isEmpty
+                            && (try object(adapter.document, "webProgress") ?? [:]).isEmpty,
+                            "Own-account source overlay carrier requires reconciliation")
+                adapter.watches[profileID] = []
+                adapter.titles[profileID] = [:]
+                let addons = try adapter.addonBucket()
+                let library = try adapter.ownerLibrary()
+                try adapter.validateProfileEdits(ownerLibrary: library)
+                return OwnAccountBuckets(addons: addons, library: library,
+                                         watches: try VortxLegacyBootstrapMaterial.resolveWatches(adapter.watches[profileID] ?? []),
+                                         titles: adapter.titles[profileID] ?? [:])
+            }
+        }
+
+        private convenience init(independentSource document: Object, profile: UserProfile) throws {
+            try self.init(document: document, roster: [profile], ownerID: profile.id, modified: nil,
+                          deferProfileEdits: false, allowIndependentSource: true)
+        }
+
+        private func resolveOwnAccountSources(_ rawSources: [OwnAccountSource]) throws -> [String: ResolvedOwnAccountSource] {
+            let ownProfiles = roster.filter { !$0.isOwner && $0.usesOwnAccount }
+            var sources: [String: ResolvedOwnAccountSource] = [:]
+            for source in rawSources {
+                let profileID = source.profileID.uuidString
+                try require(sources[profileID] == nil, "Duplicate own-account source receipt")
+                try require(source.verifiedStreamingUID == source.verifiedStreamingUID.trimmingCharacters(in: .whitespacesAndNewlines)
+                            && !source.verifiedStreamingUID.isEmpty
+                            && source.verifiedStreamingUID.utf8.count <= 256
+                            && !source.verifiedStreamingUID.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) },
+                            "Own-account source lacks a verified streaming identity")
+                try require(source.sourceDocumentSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                            "Own-account source has an invalid document digest")
+                guard let document = try JSONSerialization.jsonObject(with: source.sourceDocument) as? Object else {
+                    throw fail("Own-account source document must be an object")
+                }
+                try VortxLegacyBootstrapMaterial.rejectCredentials(document)
+                sources[profileID] = ResolvedOwnAccountSource(profileID: profileID,
+                    verifiedStreamingUID: source.verifiedStreamingUID,
+                    sourceDocumentSHA256: source.sourceDocumentSHA256, sourceDocument: document)
+            }
+            let ownIDs = Set(ownProfiles.map { $0.id.uuidString })
+            try require(Set(sources.keys) == ownIDs, "Own-account profiles require exactly one authenticated streaming-account source")
+            return sources
         }
 
         func addonBucket() throws -> Object {
@@ -219,14 +334,16 @@ enum VortxLegacyBootstrapMaterial {
                 try importWatch(ownerID, id, row, history: false, overlay: false)
                 try importMarks(ownerID, id, row)
             }
-            let buckets = try object(vortx, "byProfile") ?? [:]
-            for (rawID, value) in buckets where UUID(uuidString: rawID) == UserProfile.ownerID || UUID(uuidString: rawID) == owner.id {
-                guard let bucket = value as? Object else { throw fail("Malformed owner-history bucket") }
-                for row in try objects(bucket, "ownerHistory") {
-                    let id = try string(row, "id")
-                    try known(ownerID, id, row)
-                    try importWatch(ownerID, id, row, history: true, overlay: false)
-                    try importMarks(ownerID, id, row)
+            if !independentSource {
+                let buckets = try object(vortx, "byProfile") ?? [:]
+                for (rawID, value) in buckets where UUID(uuidString: rawID) == UserProfile.ownerID || UUID(uuidString: rawID) == owner.id {
+                    guard let bucket = value as? Object else { throw fail("Malformed owner-history bucket") }
+                    for row in try objects(bucket, "ownerHistory") {
+                        let id = try string(row, "id")
+                        try known(ownerID, id, row)
+                        try importWatch(ownerID, id, row, history: true, overlay: false)
+                        try importMarks(ownerID, id, row)
+                    }
                 }
             }
             func keyFor(_ raw: String) throws -> String {
