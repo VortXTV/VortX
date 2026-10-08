@@ -351,6 +351,14 @@ internal fun detailSourceAudioLanguages(
 /// load. Watched-state and library mutations dispatch through [repo] and swap [meta] with the
 /// engine's freshly re-pulled snapshot, so ticks/progress/the library chip flip live with no
 /// separate reload.
+internal fun selectedPlaybackStartPosition(nativeEnabled: Boolean, resolved: Long, cached: Long,
+                                           explicitOverride: Long? = null, fromStart: Boolean = false): Long = when {
+    fromStart -> 0L
+    nativeEnabled -> explicitOverride?.coerceAtLeast(0L) ?: resolved.coerceAtLeast(0L)
+    cached > 0L -> cached
+    else -> resolved
+}
+
 class DetailViewModel(
     private val repo: CatalogRepository,
     private val type: MediaType,
@@ -1314,7 +1322,8 @@ class DetailViewModel(
                     } else {
                         Playback.Ready(
                             playable.copy(
-                            startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
+                            startPositionMs = selectedPlaybackStartPosition(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED,
+                                playable.startPositionMs, resumeMs, startPositionOverrideMs),
                             mediaRef = ref,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),
@@ -1654,7 +1663,7 @@ class DetailViewModel(
                 return@launch
             }
             // 1) CW resume: replay the exact stored debrid source for this target if we have one.
-            resumeRef?.takeIf { it.targetId == targetId && it.ref.owner == actionOwner }?.let { stored ->
+            resumeRef?.takeIf { !com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED && it.targetId == targetId && it.ref.owner == actionOwner }?.let { stored ->
                 val resumed = debrid.resumePlaybackURL(stored.ref, stored.url, stored.savedAtMs)
                 if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
                     publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
@@ -1673,7 +1682,9 @@ class DetailViewModel(
                 }
             }
             // 2) Failover among the account-confirmed-cached candidates (label-authoritative gate applied).
-            val winner = resolveBestViaFailover(groups, best, debridEpisode, actionOwner)
+            // Native sources carry an immutable session/source lease. Resolve through the repository
+            // so cached debrid fast paths cannot manufacture an unowned Playable after account changes.
+            val winner = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) null else resolveBestViaFailover(groups, best, debridEpisode, actionOwner)
             if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
                 winner?.ref?.progressiveSession?.close()
                 publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
@@ -1703,7 +1714,8 @@ class DetailViewModel(
                 onSuccess = { playable ->
                     Playback.Ready(
                         playable.copy(
-                            startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
+                            startPositionMs = selectedPlaybackStartPosition(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED,
+                                playable.startPositionMs, resumeMs, startPositionOverrideMs, fromStart),
                             mediaRef = ref,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),

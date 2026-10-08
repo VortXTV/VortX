@@ -3,7 +3,7 @@ package com.vortx.android.model
 import com.vortx.android.integrations.buildMediaRef
 
 /**
- * Immutable identity for ONE LOCAL playback session (an offline download played from disk), bound
+ * Immutable identity for one offline or native-streaming playback session, bound
  * BEFORE any consumer may act on it. This is the Android port of Apple's `PlaybackMeta` play-from-local
  * rebuild (`app/SourcesShared/DownloadModels.swift` `record.playbackMeta`) plus the owner binding Apple
  * gets implicitly from its per-profile engine routing.
@@ -43,6 +43,8 @@ data class PlaybackContext(
     val title: String,
     val poster: String?,
     val provenance: Provenance,
+    /** Native streaming attribution includes the process-unique owner epoch; null on legacy/offline records. */
+    val nativeSessionRevision: Long? = null,
 ) {
     /**
      * Who is watching. [usesEngineHistory] mirrors `ProfileStore.activeUsesEngineHistory` (true =

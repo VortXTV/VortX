@@ -38,6 +38,9 @@ import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.diagnostics.CrashReporter
 import com.vortx.android.engine.EngineStremioRepository
 import com.vortx.android.engine.NativeCatalogRepository
+import com.vortx.android.engine.AndroidNativePlaybackResolver
+import com.vortx.android.engine.NativeAccountCoordinator
+import com.vortx.android.engine.NativeProfileAccess
 import com.vortx.android.engine.VortxAccountScope
 import com.vortx.android.engine.VortxAndroidCheckpointKey
 import com.vortx.android.engine.VortxEncryptedCheckpointStore
@@ -60,6 +63,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.map
 
 /// Owns the ONE [EngineStremioRepository] instance for the process's lifetime.
 ///
@@ -104,32 +109,27 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     private val fallbackCatalogRepository by lazy { PreviewCatalogRepository() }
     private val fallbackAuthRepository by lazy { PreviewAuthRepository() }
-    @Volatile private var nativeSession: VortxNativeSession? = null
-    private val nativeRepository by lazy { NativeCatalogRepository {
-        checkNotNull(nativeSession) { "Native account requires explicit activation; authentication and legacy migration are not enabled" }
-            .also { it.read() }
+    private val nativeAccounts: NativeAccountCoordinator by lazy { NativeAccountCoordinator(VortxJniBindings,
+        VortxEncryptedCheckpointStore(java.io.File(noBackupFilesDir, "native-state"), VortxAndroidCheckpointKey::get),
+        ::VortxJniResourceTransport, { syncManager?.sessionOwnerSnapshot() == it },
+        { close -> applicationScope.launch { close() }; Unit },
+        { withContext(Dispatchers.Main) {
+            ProfileStore.sharedOrNull()?.attachNativeGateway(nativeProfiles)
+            syncManager?.account?.value?.let { nativeRepository.publishAuthentication(com.vortx.android.model.AuthState.SignedIn(it.email, it.id)) }
+        } },
+        { applicationScope.launch { syncManager?.onLocalOwnerLibraryChanged() }; Unit },
+        { applicationScope.launch(Dispatchers.Main) {
+            if (runCatching { nativeAccounts.session() }.isFailure) {
+                ProfileStore.sharedOrNull()?.clearNativeProjection()
+                nativeRepository.publishAuthentication(com.vortx.android.model.AuthState.SignedOut)
+            }
+        }; Unit }) }
+    private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess { nativeAccounts.session() } }
+    private val nativeRepository: NativeCatalogRepository by lazy { NativeCatalogRepository(AndroidNativePlaybackResolver(this), nativeAccounts.changes.map { Unit },
+        { check(syncManager?.signOut() == true) { "Account sign-out could not be stored securely" } }) {
+        nativeAccounts.session().also { it.read() }
     } }
 
-    /** Explicit host entry point. The owner UUID must come from authenticated native account setup,
-     * never the unscoped legacy ProfileStore. No credentials are passed to the kernel or checkpoint.
-     * No production UI invokes this until account/bootstrap/migration parity has been approved.
-     */
-    @Synchronized internal fun activateNativeAccount(accountID: String, ownerProfileID: String, ownerName: String, allowNewAccount: Boolean = false) {
-        check(BuildConfig.NATIVE_ENGINE_ENABLED) { "Native engine compile gate is disabled" }
-        val manager = checkNotNull(syncManager) { "Authenticated account unavailable" }
-        val account = manager.sessionOwnerSnapshot() as? SessionOwnerSnapshot.Account
-        check(account != null && account.id == accountID) { "Authenticated native account mismatch" }
-        // Retire the prior writer before reading/replacing this account's checkpoint. A failed open
-        // leaves native mode unavailable instead of running two writers against the same account file.
-        nativeSession?.close(); nativeSession = null
-        val transport = VortxJniResourceTransport() // requires the additive resource-host ABI
-        val candidate = try {
-            VortxNativeSession.open(VortxAccountScope(accountID, ownerProfileID), ownerName, VortxJniBindings,
-                VortxEncryptedCheckpointStore(java.io.File(noBackupFilesDir, "native-state"), VortxAndroidCheckpointKey::get),
-                transport, allowNewAccount) { manager.sessionOwnerSnapshot() == account }
-        } catch (error: Throwable) { transport.close(); throw error }
-        nativeSession = candidate
-    }
 
     /// Warm the media-server store from disk at process start (idempotent), so a Plex/Jellyfin/Emby server
     /// connected in a previous run is queryable for direct-play sources on the very first detail page WITHOUT
@@ -326,7 +326,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                             DebridAccountOwnerState.UnknownOrUnavailable
                     }
                 }
-                manager.attachSyncSeams(store)
+                if (!BuildConfig.NATIVE_ENGINE_ENABLED) manager.attachSyncSeams(store)
             }
         }
             .getOrElse {
@@ -334,6 +334,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 return
             }
         syncManager = manager
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) manager.attachNativeGateway(nativeAccounts)
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             /// Count of currently-started activities. Touched only from the main thread (every
             /// ActivityLifecycleCallbacks callback is delivered on the main looper), so a plain Int is safe.

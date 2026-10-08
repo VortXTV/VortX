@@ -131,7 +131,37 @@ class ProfileStore private constructor(context: Context) {
      * private overlay (every other shared profile). The split every watch path must respect. Mirrors
      * Apple `activeUsesEngineHistory`.
      */
-    val activeUsesEngineHistory: Boolean get() = active?.usesEngineHistory ?: true
+    val activeUsesEngineHistory: Boolean get() = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) true else active?.usesEngineHistory ?: true
+
+    private var nativeGateway: NativeProfileGateway? = null
+    private var applyingNativeAccountSettings = false
+    internal fun <T> withoutNativePreferenceCapture(action: () -> T): T {
+        check(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+        applyingNativeAccountSettings = true
+        return try { action() } finally { applyingNativeAccountSettings = false }
+    }
+    internal fun attachNativeGateway(gateway: NativeProfileGateway) {
+        check(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+        nativeGateway = gateway
+        refreshNativeProjection()
+    }
+    internal fun refreshNativeProjection(forceSettings: Boolean = false) = ContinueWatchingOwnerGate.serialized {
+        applyNativeProjection(checkNotNull(nativeGateway).read(), forceSettings)
+    }
+    internal fun clearNativeProjection() = ContinueWatchingOwnerGate.serialized {
+        check(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+        ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            profiles = emptyList(); activeID = null; pickedThisLaunch = false
+            notifyHomeTransitionListeners(); publishActiveProfile(); notifySwitchListeners()
+        }
+    }
+    private fun applyNativeProjection(value: NativeProfileGateway.Projection, forceSettings: Boolean = false) {
+        if (!forceSettings && profiles == value.profiles && activeID == value.activeID) return
+        ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            profiles = value.profiles; activeID = value.activeID
+            active?.let { activateProfileState(it, resetUnset = true) }
+        }
+    }
 
     /** The token slot the rest of the app reads the session from right now. Mirrors Apple `activeKeychainAccount`. */
     val activeKeychainAccount: String get() = active?.let { keychainAccount(it) } ?: PRIMARY_TOKEN_ACCOUNT
@@ -256,6 +286,10 @@ class ProfileStore private constructor(context: Context) {
     // ---- Lifecycle ----
 
     private fun bootstrap() {
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+            // The unscoped legacy roster is not authenticated account ownership evidence.
+            profiles = emptyList(); activeID = null; publishActiveProfile(); return
+        }
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
             loadDeletedTombstones()
             load()
@@ -291,6 +325,14 @@ class ProfileStore private constructor(context: Context) {
 
     /** Make [candidate] active: applies its prefs immediately and reports the account work left. Apple `select`. */
     fun select(candidate: UserProfile): SwitchOutcome = ContinueWatchingOwnerGate.serialized {
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+            check(profiles.firstOrNull { it.id == candidate.id } == candidate) { "Profile changed; unlock the current profile again" }
+            capturePlaybackLocked()
+            captureDiscoveryLocked()
+            applyNativeProjection(checkNotNull(nativeGateway).select(candidate.id))
+            pickedThisLaunch = true
+            return@serialized SwitchOutcome.SameAccount
+        }
         val profile = profiles.firstOrNull { it.id == candidate.id }
             ?: return@serialized SwitchOutcome.SameAccount
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) { before ->
@@ -321,11 +363,17 @@ class ProfileStore private constructor(context: Context) {
     }
 
     fun add(profile: UserProfile) {
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+            applyNativeProjection(checkNotNull(nativeGateway).save(profile, adding = true)); return
+        }
         profiles = profiles + profile
         persist()
     }
 
     fun update(profile: UserProfile) = ContinueWatchingOwnerGate.serialized {
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+            applyNativeProjection(checkNotNull(nativeGateway).save(profile, adding = false)); return@serialized
+        }
         val idx = profiles.indexOfFirst { it.id == profile.id }
         if (idx < 0) return@serialized
         if (profile.id == activeID) {
@@ -365,6 +413,9 @@ class ProfileStore private constructor(context: Context) {
 
     /** Remove a profile (never the last one). Mirrors Apple `remove`. */
     fun remove(profile: UserProfile): SwitchOutcome? = ContinueWatchingOwnerGate.serialized {
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+            applyNativeProjection(checkNotNull(nativeGateway).remove(profile.id)); return@serialized SwitchOutcome.SameAccount
+        }
         if (profiles.size <= 1 || profiles.none { it.id == profile.id }) return@serialized null
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) { before ->
             val removedActiveProfile = activeID == profile.id
@@ -555,6 +606,7 @@ class ProfileStore private constructor(context: Context) {
     }
 
     private fun capturePlaybackLocked() {
+        if (applyingNativeAccountSettings) return
         val profile = active ?: return
         val now = currentPlaybackPrefs(profile.playback)
         if (samePlayback(profile.playback, now)) return
@@ -564,6 +616,7 @@ class ProfileStore private constructor(context: Context) {
 
     /** Capture live catalog/discovery keys before a profile switch advances [activeID]. */
     private fun captureDiscoveryLocked() {
+        if (applyingNativeAccountSettings) return
         val profile = active ?: return
         val now = ProfileDiscoveryPreferencesStore.capture(prefs)
         val idx = profiles.indexOfFirst { it.id == profile.id }
@@ -635,6 +688,19 @@ class ProfileStore private constructor(context: Context) {
      * `suppressHousekeeping`.
      */
     private fun persist(touch: Boolean = true) {
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+            // Flat preference listeners may capture native profile settings. Persist them through the
+            // account-bound encrypted transaction, never the unscoped legacy roster file.
+            if (touch) active?.let { profile ->
+                val gateway = checkNotNull(nativeGateway)
+                try { gateway.save(profile, adding = false) }
+                catch (error: Throwable) {
+                    val durable = gateway.read(); profiles = durable.profiles; activeID = durable.activeID
+                    throw error
+                }
+            }
+            return
+        }
         prefs.edit()
             .putString(LIST_KEY, UserProfile.encodeRoster(profiles))
             .putString(ACTIVE_PROFILE_KEY, activeID)

@@ -12,15 +12,27 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import org.json.JSONArray
 import org.json.JSONObject
 
 /** Actual UI repository for the explicit native compile gate. Never constructs the legacy engine.
  * The authenticated host provides the session; absence/unavailable/migration required is an error.
- * Auth, player resolution and automatic legacy import remain explicit unsupported capabilities.
+ * VortX authentication and complete legacy bootstrap are admitted only by the captured account host.
  */
-internal class NativeCatalogRepository(private val sessionProvider: () -> VortxNativeSession) : CatalogRepository, AuthRepository {
+internal class NativeCatalogRepository(
+    private val playbackResolver: NativePlaybackResolver = NativePlaybackResolver { source, _ ->
+        requireNotNull(nativeDirectPlayable(source)) { "Native platform resolver unavailable" }
+    },
+    private val sessionChanges: Flow<Unit> = flowOf(Unit),
+    private val signOutAccount: (suspend () -> Unit)? = null,
+    private val sessionProvider: () -> VortxNativeSession,
+) : CatalogRepository, AuthRepository {
     private data class CatalogSpec(val addon: VortxResourceAddon, val catalog: JSONObject) {
         val type: String get() = catalog.getString("type")
         val id: String get() = catalog.getString("id")
@@ -35,10 +47,19 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
                                     val items: List<MetaItem>, val count: Int)
     private data class Playing(val token: PlaybackSessionToken, val owner: VortxNativeOwner, val context: PlaybackContext)
     private var discoverPage: DiscoverPage? = null
+    private data class HomePage(val owner: VortxNativeOwner, val spec: CatalogSpec, val catalog: Catalog, val count: Int)
+    private val homePages = linkedMapOf<String, HomePage>()
+    private val homePageChanges = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     private val detailCache = mutableMapOf<Pair<MediaType, String>, Pair<VortxNativeOwner, MetaDetail>>()
     private var playing: Playing? = null
+    private data class SourceBinding(val owner: VortxNativeOwner, val context: PlaybackContext)
+    private val sourceBindings = mutableMapOf<String, SourceBinding>()
+    private val resolveSequence = AtomicLong()
     private val playbackSequence = AtomicLong()
-    override val authState: StateFlow<AuthState> = MutableStateFlow(AuthState.SignedOut)
+    private val nativeAuth = MutableStateFlow<AuthState>(AuthState.SignedOut)
+    override val authState: StateFlow<AuthState> = nativeAuth
+    fun publishAuthentication(state: AuthState) { nativeAuth.value = state }
+    private val unavailableOwner = ContinueWatchingOwner("native-unavailable", "native-unavailable", "native-unavailable", true, 0)
 
     private suspend fun <T> attempt(action: suspend () -> T): Result<T> = withContext(Dispatchers.IO) {
         try { Result.success(action()) } catch (error: CancellationException) { throw error }
@@ -52,22 +73,21 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
     private fun profile(read: VortxNativeRead) = read.state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(read.owner.profileID)
     private fun addonOwner(read: VortxNativeRead): String = if (profile(read).getString("addons") == "share_primary") read.owner.scope.ownerProfileID else read.owner.profileID
     private fun addonDescriptors(read: VortxNativeRead): List<JSONObject> {
-        val bucket = read.state.getJSONObject("nativeSync").getJSONObject("addons").optJSONObject(addonOwner(read)) ?: return emptyList()
-        val records = bucket.getJSONObject("records")
-        val live = records.keys().asSequence().filter { id -> records.getJSONObject(id).let {
-            it.optJSONObject("value") != null && it.getLong("addedAt") > it.getLong("removedAt")
-        } }.toList()
-        val spine = bucket.getJSONObject("order").getJSONArray("ids").strings().filter { it in live }
-        val rest = live.filterNot { it in spine }.sortedWith(compareBy<String> { records.getJSONObject(it).getLong("addedAt") }.thenBy { it })
-        return (spine + rest).map { records.getJSONObject(it).getJSONObject("value") }
+        val response = session().resolve(JSONObject().put("kind", "installed_addons").put("profileId", addonOwner(read)), read.owner)
+        check(response.getString("kind") == "installed_addons" && response.getString("profileId") == addonOwner(read)) { "Native addon projection unavailable" }
+        return response.getJSONArray("addons").objects()
     }
     private fun registry(read: VortxNativeRead): List<VortxResourceAddon> {
         val parental = profile(read).getJSONObject("parental")
         check(!parental.getBoolean("kids") && parental.opt("maturityCeiling").let { it == null || it == JSONObject.NULL }) {
             "Native parental resource filtering is not enabled"
         }
-        val disabled = profile(read).getJSONObject("settings").getJSONArray("disabledAddons").strings().toSet()
-        return addonDescriptors(read).filterNot { it.getString("transportUrl") in disabled }.map {
+        val disabled = NativeAddonPreferences.disabled(read)
+        val order = NativeAddonPreferences.order(read)
+        val descriptors = addonDescriptors(read).let { values -> if (order == null) values else values.sortedBy {
+            order.indexOf(AddonOrder.normalize(it.getString("transportUrl"))).let { index -> if (index < 0) Int.MAX_VALUE else index }
+        } }
+        return descriptors.filterNot { AddonOrder.normalize(it.getString("transportUrl")) in disabled }.map {
             // Transport is the stable membership identity; duplicate manifest IDs are valid configurations.
             VortxResourceAddon(it.getString("transportUrl"), it.getString("transportUrl"), it.getJSONObject("manifest").toString())
         }
@@ -77,27 +97,27 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
     }
     private fun canLoad(spec: CatalogSpec, extras: Set<String>) = spec.extras.none { it.optBoolean("isRequired") && it.getString("name") !in extras }
     private fun owner(value: VortxNativeOwner) = ContinueWatchingOwner(value.profileID, value.scope.digest, value.scope.accountID, true, value.revision)
-    override fun continueWatchingOwner() = owner(session().read().owner)
+    override fun continueWatchingOwner() = runCatching { owner(session().read().owner) }.getOrDefault(unavailableOwner)
 
     private fun savedItems(read: VortxNativeRead): List<MetaItem> = library(read).getJSONArray("items").objects().filter {
         it.getString("kind") == "standard"
     }.map { MetaItem(it.getString("id"), MediaType.fromId(it.getString("type")), it.getString("name"), poster = it.optStringOrNull("poster")) }
     private fun cw(read: VortxNativeRead): List<MetaItem> {
-        val lib = library(read)
         val saved = savedItems(read)
-        val contexts = lib.optJSONObject("watchContexts") ?: JSONObject()
-        return lib.optJSONArray("cwBoard").objects().map { item ->
-            val id = item.getString("id")
+        return playback(read).getJSONArray("continueWatching").objects().map { item ->
+            val id = item.getString("metaId")
             val matches = saved.filter { it.id == id }
             check(matches.size <= 1) { "Ambiguous native watch media identity" }
-            val context = contexts.keys().asSequence().map { contexts.getJSONObject(it) }.filter { it.getString("metaId") == id }
-                .maxByOrNull { it.optLong("updatedAt") }
-            val type = matches.singleOrNull()?.type ?: if (context?.optStringOrNull("videoId")?.let { it != id } == true) MediaType.SERIES else MediaType.MOVIE
-            val unit = context?.optStringOrNull("videoId") ?: id
-            val resume = lib.optJSONObject("resume")?.optJSONObject(unit)
-            MetaItem(id, type, item.getString("name"), poster = matches.singleOrNull()?.poster,
-                progress = item.getInt("progress") / 1000f, resumeSeconds = resume?.getLong("offsetSecs")?.toDouble())
+            val type = item.optStringOrNull("type")?.let(MediaType::fromId) ?: matches.singleOrNull()?.type
+                ?: if (item.optStringOrNull("videoId")?.let { it != id } == true) MediaType.SERIES else MediaType.MOVIE
+            val offset = item.getLong("offsetMs"); val duration = item.getLong("durationMs")
+            MetaItem(id, type, item.getString("name"), poster = item.optStringOrNull("poster") ?: matches.singleOrNull()?.poster,
+                progress = if (duration > 0) (offset.toFloat() / duration).coerceIn(0f, 1f) else 0f, resumeSeconds = offset / 1000.0)
         }
+    }
+    private fun playback(read: VortxNativeRead): JSONObject = session().resolve(
+        JSONObject().put("kind", "profile_playback").put("profileId", read.owner.profileID), read.owner).also {
+        check(it.getString("kind") == "profile_playback" && it.getString("profileId") == read.owner.profileID) { "Native playback projection unavailable" }
     }
     override suspend fun continueWatchingSnapshot(expectedOwner: ContinueWatchingOwner) = attempt {
         val session = session(); val read = session.read()
@@ -110,20 +130,56 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
         val pages = session.load("board", read.owner, specs.map { it.request() to listOf(it.addon) })
         requireAnySettled(pages)
         val rows = EngineState.parseCatalogs(VortxResourceProjection.board(pages, registry(read)), specs.associate { it.key to it.title })
-            .map { it.copy(hasNextPage = false) }
-        session.publish("board", read.owner, pages) { listOf(Catalog("continue", "Continue Watching", cw(session.read()))) + rows }
-    }
-    override fun homeUpdates(): Flow<HomeUpdate> = flow {
-        val session = session()
-        session.updates.collectLatest { sequence ->
-            val read = session.read()
-            val rows = home().getOrThrow()
-            session.owned(read.owner) { check(sessionProvider() === session) }
-            emit(HomeUpdate(rows, read.owner.revision, sequence, read.owner.profileID, true, owner(read.owner)))
+            .map { it.copy(hasNextPage = specs.find { spec -> spec.key == it.id }?.accepts("skip") == true && it.items.isNotEmpty()) }
+        session.publish("board", read.owner, pages) {
+            synchronized(this) {
+                homePages.clear()
+                rows.forEach { row -> specs.find { it.key == row.id }?.let { homePages[row.id] = HomePage(read.owner, it, row, row.items.size) } }
+            }
+            listOf(Catalog("continue", "Continue Watching", cw(session.read()))) + rows
         }
     }
-    override fun ctxUpdates(): Flow<Unit> = flow { session().updates.collect { session(); emit(Unit) } }
-    override suspend fun loadHomeRowNextPage(catalog: Catalog) = attempt<Unit> { unsupported("Home pagination") }
+    override fun homeUpdates(): Flow<HomeUpdate> = kotlinx.coroutines.flow.channelFlow {
+        sessionChanges.collectLatest {
+            val session = runCatching { session() }.getOrNull()
+            if (session == null) {
+                send(HomeUpdate(emptyList(), profileId = unavailableOwner.profileId, authoritative = true, owner = unavailableOwner))
+                return@collectLatest
+            }
+            merge(session.updates.map { true }, homePageChanges.map { false }).collectLatest update@ { reload ->
+                val read = runCatching { session.read() }.getOrNull() ?: return@update
+                val result = if (reload) home() else runCatching { session.owned(read.owner) {
+                    listOf(Catalog("continue", "Continue Watching", cw(read))) + synchronized(this) { homePages.values.filter { it.owner == read.owner }.map { it.catalog } }
+                } }
+                if (!runCatching { sessionProvider() === session && session.accepts(read.owner) }.getOrDefault(false)) return@update
+                send(HomeUpdate(result.getOrThrow(), read.owner.revision, session.updates.value, read.owner.profileID, true, owner(read.owner)))
+            }
+        }
+    }
+    override fun ctxUpdates(): Flow<Unit> = kotlinx.coroutines.flow.channelFlow { sessionChanges.collectLatest {
+        val session = runCatching { session() }.getOrNull() ?: return@collectLatest
+        session.updates.collect {
+            if (runCatching { check(sessionProvider() === session); session.read() }.isSuccess) send(Unit)
+        }
+    } }
+    override suspend fun loadHomeRowNextPage(catalog: Catalog) = attempt {
+        val session = session(); val read = session.read()
+        val previous = synchronized(this) { requireNotNull(homePages[catalog.id]) }
+        check(previous.owner == read.owner && previous.spec.accepts("skip")) { "Native catalog changed" }
+        if (!previous.catalog.hasNextPage) return@attempt Unit
+        val page = session.load("board:${catalog.id}", read.owner,
+            listOf(previous.spec.request(listOf("skip" to previous.count.toString())) to listOf(previous.spec.addon))).single()
+        requireSettled(page)
+        val next = EngineState.parseCatalogs(VortxResourceProjection.board(listOf(page), listOf(previous.spec.addon))).flatMap { it.items }
+        session.publish("board:${catalog.id}", read.owner, listOf(page)) {
+            synchronized(this) {
+                check(homePages[catalog.id] === previous) { "Native catalog reload superseded page" }
+                homePages[catalog.id] = previous.copy(catalog = previous.catalog.copy(
+                    items = (previous.catalog.items + next).distinctBy { it.type to it.id }, hasNextPage = next.isNotEmpty()), count = previous.count + next.size)
+            }
+            homePageChanges.tryEmit(Unit)
+        }; Unit
+    }
     override suspend fun loadMoreHomeRows() = attempt { session(); Unit } // all available catalogs already loaded
     override suspend fun ensureLiveCatalogsLoaded() = home().map { true }
 
@@ -213,7 +269,22 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
         val pages = session.load("streams", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons, stream to addons))
         val groups = EngineState.parseStreamGroups(VortxResourceProjection.metaDetails(pages[0], pages[1], stream, addons), episodeId ?: id)
         if (groups.none { it.streams.isNotEmpty() }) requireSettled(pages[1])
-        session.publish("streams", read.owner, pages) { groups }
+        val detail = EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(pages[0], null, null, addons))
+        check(detail == null || (detail.id == id && detail.type == type)) { "Native metadata identity mismatch" }
+        val selectedEpisode = detail?.videos?.find { it.id == episodeId }
+        session.publish("streams", read.owner, pages) {
+            synchronized(this) {
+                sourceBindings.clear()
+                groups.map { group -> group.copy(streams = group.streams.map { source ->
+                    val token = java.util.UUID.randomUUID().toString()
+                    sourceBindings[token] = SourceBinding(read.owner, PlaybackContext(
+                        PlaybackContext.Owner(read.owner.profileID, true), id, episodeId ?: id, type.id,
+                        selectedEpisode?.season, selectedEpisode?.episode, detail?.name ?: id, detail?.poster,
+                        PlaybackContext.Provenance(source.addon, source.quality, false, null, null), nativeSessionRevision = read.owner.revision))
+                    source.copy(nativePlaybackToken = token)
+                }) }
+            }
+        }
     }
     suspend fun subtitles(type: MediaType, videoID: String, extra: List<Pair<String, String>> = emptyList()): Result<String> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)
@@ -230,15 +301,13 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
         check(groups.isEmpty() || groups.any { it.status == "ready" }) { "Native resources unavailable" }
     }
     private fun decorate(detail: MetaDetail, read: VortxNativeRead): MetaDetail {
-        val lib = library(read); val saved = savedItems(read).any { it.id == detail.id && it.type == detail.type }
-        val watched = lib.getJSONObject("watched").optJSONObject(detail.id)?.getJSONArray("videoIds")?.strings()?.toSet().orEmpty()
-        val contexts = lib.optJSONObject("watchContexts") ?: JSONObject()
-        val context = contexts.keys().asSequence().map { contexts.getJSONObject(it) }.filter { it.getString("metaId") == detail.id }.maxByOrNull { it.getLong("updatedAt") }
-        val unit = context?.optStringOrNull("videoId") ?: detail.id
-        val resume = lib.getJSONObject("resume").optJSONObject(unit)
+        val saved = savedItems(read).any { it.id == detail.id && it.type == detail.type }
+        val playback = playback(read)
+        val watched = playback.getJSONObject("watchedVideoIdsByTitle").optJSONArray(detail.id)?.strings()?.toSet().orEmpty()
+        val resume = playback.getJSONArray("continueWatching").objects().find { it.getString("metaId") == detail.id }
         return detail.copy(watchedVideoIds = watched, libraryItem = LibraryItemInfo(detail.id, !saved, !saved,
-            context?.optStringOrNull("videoId"), (resume?.getLong("offsetSecs") ?: 0) * 1000, (resume?.getLong("durationSecs") ?: 0) * 1000,
-            if (detail.id in watched) 1 else 0))
+            resume?.optStringOrNull("videoId"), resume?.getLong("offsetMs") ?: 0, resume?.getLong("durationMs") ?: 0,
+            playback.getJSONObject("watchedTitles").optInt(detail.id, 0)))
     }
 
     override suspend fun library(requestJson: String?): Result<LibraryResult> = attempt {
@@ -289,24 +358,28 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
     override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean) = attempt {
         if (item.type == MediaType.SERIES) unsupported("whole-series watched mutation")
         val session = session(); val read = session.read(); requireWatchIdentity(read, item.type, item.id)
-        session.dispatch(listOf(action(if (isWatched) "mark_watched" else "reset_watched").put("metaId", item.id)), read.owner); Unit
+        session.dispatch(listOf(action(if (isWatched) "mark_watched" else "reset_watched").put("metaId", item.id)
+            .put("name", item.name.takeIf { it.isNotBlank() }).put("metadata", JSONObject().put("type", item.type.id).put("poster", item.poster))), read.owner); Unit
     }
     override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = attempt {
         if (type == MediaType.SERIES) unsupported("whole-series watched mutation")
-        setCatalogWatched(MetaItem(id, type, ""), isWatched).getOrThrow(); peekMeta(type, id) ?: meta(type, id).getOrThrow()
+        val detail = peekMeta(type, id)
+        setCatalogWatched(MetaItem(id, type, detail?.name.orEmpty(), detail?.poster), isWatched).getOrThrow(); peekMeta(type, id) ?: meta(type, id).getOrThrow()
     }
     override suspend fun setVideoWatched(type: MediaType, id: String, videoId: String, season: Int?, episode: Int?, isWatched: Boolean): Result<MetaDetail> = attempt {
         val session = session(); val read = session.read(); requireWatchIdentity(read, type, id)
-        session.dispatch(listOf(action(if (isWatched) "mark_watched" else "reset_watched").put("metaId", id).put("videoId", videoId)), read.owner)
+        val detail = peekMeta(type, id)
+        session.dispatch(listOf(action(if (isWatched) "mark_watched" else "reset_watched").put("metaId", id).put("videoId", videoId)
+            .put("name", detail?.name).put("metadata", JSONObject().put("type", type.id).put("poster", detail?.poster))), read.owner)
         peekMeta(type, id) ?: meta(type, id).getOrThrow()
     }
     override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> = attempt { unsupported("season watched mutation") }
 
     override suspend fun installedAddons() = attempt {
         val session = session(); val read = session.read()
-        val disabled = profile(read).getJSONObject("settings").getJSONArray("disabledAddons").strings()
+        val disabled = NativeAddonPreferences.disabled(read)
         val ctx = JSONObject().put("profile", JSONObject().put("addons", JSONArray(addonDescriptors(read))))
-        session.owned(read.owner) { EngineState.parseInstalledAddons(ctx.toString()).map { it.copy(isDisabled = it.transportUrl in disabled) } }
+        session.owned(read.owner) { EngineState.parseInstalledAddons(ctx.toString()).map { it.copy(isDisabled = AddonOrder.normalize(it.transportUrl) in disabled) } }
     }
     override fun normalizedAddonUrl(raw: String): String? = runCatching {
         val uri = URI(raw.trim()); require(uri.scheme in setOf("https", "http") && !uri.host.isNullOrEmpty() && uri.userInfo == null && uri.fragment == null && uri.query == null)
@@ -315,6 +388,7 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
     }.getOrNull()
     override suspend fun installAddon(url: String) = attempt {
         val session = session(); val read = session.read(); val normalized = requireNotNull(normalizedAddonUrl(url))
+        check(addonOwner(read) == read.owner.profileID) { "Shared profiles customize visibility; install add-ons from the owner profile" }
         val addon = VortxResourceAddon(normalized, normalized)
         val response = session.load("install", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.MANIFEST, "", "") to listOf(addon))).single()
         requireSettled(response)
@@ -326,17 +400,26 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
     }
     override suspend fun removeAddon(addon: InstalledAddon) = attempt {
         val session = session(); val read = session.read()
+        check(addonOwner(read) == read.owner.profileID) { "Shared profiles customize visibility; remove add-ons from the owner profile" }
         session.dispatch(listOf(action("remove_addon").put("profileId", addonOwner(read)).put("transportUrl", addon.transportUrl)), read.owner); Unit
     }
     override suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String) = attempt<Unit> { unsupported("add-on URL migration") }
     override suspend fun setAddonDisabled(transportUrl: String, disabled: Boolean) = attempt {
-        val session = session(); val read = session.read(); val values = profile(read).getJSONObject("settings").getJSONArray("disabledAddons").strings().toMutableSet()
-        if (disabled) values.add(transportUrl) else values.remove(transportUrl)
-        session.dispatch(listOf(action("patch_profile").put("id", read.owner.profileID).put("edits", JSONArray().put(JSONObject().put("field", "disabledAddons").put("value", JSONArray(values.toList()))))), read.owner); Unit
+        val session = session(); val read = session.read(); val values = NativeAddonPreferences.disabled(read).toMutableSet()
+        if (disabled) values.add(AddonOrder.normalize(transportUrl)) else values.remove(AddonOrder.normalize(transportUrl))
+        val host = read.state.getJSONObject("hostProfilePreferences")
+        val raw = host.optJSONObject(read.owner.profileID) ?: NativeProfileAccess.projection(read).profiles.single { it.id == read.owner.profileID }.encode()
+        val prefs = raw.optJSONObject("addonPreferences") ?: JSONObject().also { raw.put("addonPreferences", it) }
+        prefs.put("disabledAddonURLsOverride", JSONArray(values.toList()))
+        raw.put("disabledAddons", JSONArray(values.toList()))
+        host.put(read.owner.profileID, raw).put("modifiedSeconds", maxOf(System.currentTimeMillis() / 1000.0, host.optDouble("modifiedSeconds", 0.0) + 0.001))
+        session.dispatch(listOf(action("patch_profile").put("id", read.owner.profileID).put("edits", JSONArray().put(JSONObject().put("field", "disabledAddons").put("value", JSONArray(values.toList()))))), read.owner, host); Unit
     }
     override suspend fun applyAddonOrder(transportUrls: List<String>) = attempt {
         val session = session(); val read = session.read()
-        session.dispatch(listOf(action("reorder_addons").put("profileId", addonOwner(read)).put("transportUrls", JSONArray(transportUrls))), read.owner); Unit
+        val shared = read.owner.profileID != addonOwner(read)
+        val actions = if (shared) emptyList() else listOf(action("reorder_addons").put("profileId", addonOwner(read)).put("transportUrls", JSONArray(transportUrls)))
+        session.dispatch(actions, read.owner, NativeAddonPreferences.reorderedHost(read, transportUrls, shared)); Unit
     }
     suspend fun profiles(): Result<String> = attempt { session().read().state.getJSONObject("roster").toString() }
     fun watchStatsSnapshot(): NativeWatchStatsSnapshot {
@@ -360,8 +443,10 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
     suspend fun mergeNativeSync(document: String) = attempt { session().dispatch(listOf(action("merge_native_sync").put("document", JSONObject(document)))); Unit }
 
     override suspend fun beginPlaybackSession(context: PlaybackContext?, ownerToken: ContinueWatchingOwner?) = attempt {
-        val session = session(); val read = session.read(); val captured = context ?: unsupported("streaming player lifecycle")
+        val session = session(); val read = session.read()
+        val captured = context ?: return@attempt PlaybackSessionToken.NOOP
         check(ownerToken == owner(read.owner) && captured.owner.profileId == read.owner.profileID && captured.owner.usesEngineHistory)
+        check(captured.nativeSessionRevision == null || captured.nativeSessionRevision == read.owner.revision) { "Native playback owner expired" }
         require(captured.type in setOf("movie", "series"))
         requireWatchIdentity(read, MediaType.fromId(captured.type), captured.contentId)
         require(captured.contentId.isNotBlank() && captured.videoId.isNotBlank())
@@ -377,18 +462,54 @@ internal class NativeCatalogRepository(private val sessionProvider: () -> VortxN
             synchronized(this) {
                 if (playing !== current) return@owned
                 session.dispatch(listOf(action("report_progress").put("metaId", current.context.contentId).put("videoId", current.context.videoId)
-                    .put("name", current.context.title).put("positionMs", positionMs).put("durationMs", durationMs)), current.owner)
+                    .put("name", current.context.title).put("positionMs", positionMs).put("durationMs", durationMs)
+                    .put("metadata", JSONObject().put("type", current.context.type).put("poster", current.context.poster))), current.owner)
                 if (end) playing = null
             }
         }
     }
     override suspend fun reportProgress(session: PlaybackSessionToken, positionMs: Long, durationMs: Long) = attempt { progress(session, positionMs, durationMs, false) }
     override suspend fun endPlaybackSession(session: PlaybackSessionToken, positionMs: Long, durationMs: Long) = attempt { progress(session, positionMs, durationMs, true) }
-    override suspend fun resolve(source: StreamSource, episode: Episode?): Result<Playable> = attempt { unsupported("player resolution") }
-    override suspend fun resolveDirectLink(url: String, title: String): Result<Playable> = attempt { unsupported("direct-link player resolution") }
-    override suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int?): Result<Playable> = attempt { unsupported("magnet player resolution") }
+    override suspend fun resolve(source: StreamSource, episode: Episode?): Result<Playable> = attempt {
+        val session = session(); val read = session.read()
+        val binding = synchronized(this) { sourceBindings[source.nativePlaybackToken] }
+        check(binding != null && binding.owner == read.owner) { "Native source selection expired; reload sources" }
+        check(episode == null || episode.id == binding.context.videoId) { "Native episode selection changed" }
+        resolveOwned(session, read, source, episode, binding).copy(playbackContext = binding.context)
+    }
+    private suspend fun resolveOwned(session: VortxNativeSession, read: VortxNativeRead, source: StreamSource, episode: Episode?, binding: SourceBinding? = null): Playable {
+        val sequence = resolveSequence.incrementAndGet()
+        val playable = playbackResolver.resolve(source, episode)
+        try {
+            currentCoroutineContext().ensureActive()
+            return session.owned(read.owner) {
+                check(sessionProvider() === session && resolveSequence.get() == sequence) { "Native playback superseded" }
+                if (binding != null) synchronized(this) { check(sourceBindings[source.nativePlaybackToken] === binding) { "Native source selection expired" } }
+                if (binding == null) playable else {
+                    val resume = session.resolve(JSONObject().put("kind", "resume_point").put("id", binding.context.videoId), read.owner)
+                    check(resume.getString("kind") == "resume_point") { "Native resume projection unavailable" }
+                    playable.copy(startPositionMs = resume.optJSONObject("resume")?.getLong("offsetMs") ?: 0L)
+                }
+            }
+        } catch (error: Throwable) { playable.playbackLease?.close(); throw error }
+    }
+    override suspend fun resolveDirectLink(url: String, title: String): Result<Playable> = attempt {
+        val session = session(); val read = session.read()
+        val source = StreamSource(id = url, addon = "Direct link", title = title, url = url)
+        requireNotNull(nativeDirectPlayable(source)) { "Only HTTP(S) direct links are supported" }
+        resolveOwned(session, read, source, null)
+    }
+    override suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int?): Result<Playable> = attempt {
+        val session = session(); val read = session.read()
+        require(Regex("[a-fA-F0-9]{40}").matches(infoHash) && (fileIdx == null || fileIdx >= 0))
+        resolveOwned(session, read, StreamSource(id = infoHash, addon = "Magnet", title = title,
+            infoHash = infoHash, fileIdx = fileIdx, isTorrent = true), null)
+    }
     override suspend fun signIn(email: String, password: String) = attempt<Unit> { unsupported("Stremio authentication") }
-    override suspend fun signOut() { session().close() }
+    override suspend fun signOut() {
+        if (signOutAccount != null) signOutAccount.invoke() else session().close()
+        nativeAuth.value = AuthState.SignedOut
+    }
 }
 
 private fun JSONArray?.objects(): List<JSONObject> = this?.let { array -> (0 until array.length()).map(array::getJSONObject) }.orEmpty()

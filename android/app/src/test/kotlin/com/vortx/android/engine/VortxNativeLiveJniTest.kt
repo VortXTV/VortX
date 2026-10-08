@@ -5,6 +5,8 @@ import java.nio.file.Files
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.runBlocking
 import com.vortx.android.model.MediaType
+import com.vortx.android.profile.UserProfile
+import com.vortx.android.sync.SessionOwnerSnapshot
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -13,6 +15,15 @@ import org.junit.Test
 
 /** Explicit local host artifact only. Never launches an app, player, provider or network request. */
 class VortxNativeLiveJniTest {
+    private fun bindings() = object : VortxRuntimeBindings {
+        override fun create(ownerId: String, ownerName: String) = VortxCore.nativeInitRuntime(JSONObject().put("ownerId", ownerId).put("ownerName", ownerName).toString())
+        override fun hydrate(snapshot: String) = VortxCore.nativeInitFromStateJson(snapshot)
+        override fun dispatch(handle: Long, action: String) = VortxCore.nativeDispatchJson(handle, action)
+        override fun resolve(handle: Long, request: String) = VortxCore.nativeResolveJson(handle, request)
+        override fun state(handle: Long) = VortxCore.nativeGetStateJson(handle)
+        override fun delta(handle: Long) = VortxCore.nativeGetStateDeltaJson(handle)
+        override fun free(handle: Long) = VortxCore.nativeEngineFree(handle)
+    }
     private fun load() {
         val path = System.getenv("VORTX_JNI_LIBRARY")
         assumeTrue("Set VORTX_JNI_LIBRARY to the reviewed host JNI artifact", !path.isNullOrBlank())
@@ -74,7 +85,28 @@ class VortxNativeLiveJniTest {
                 assertEquals("Local fixture", repository.library().getOrThrow().items.single().name)
                 assertEquals("Fixture Series", repository.home().getOrThrow().last().items.single().name)
                 assertEquals("Fixture Series", repository.meta(MediaType.SERIES, "tt-fixture").getOrThrow().name)
-                assertTrue(repository.streams(MediaType.SERIES, "tt-fixture", "tt-fixture:1:2").getOrThrow().isNotEmpty())
+                val source = repository.streams(MediaType.SERIES, "tt-fixture", "tt-fixture:1:2").getOrThrow().flatMap { it.streams }.first { it.url != null }
+                val playable = repository.resolve(source).getOrThrow()
+                val playback = repository.beginPlaybackSession(playable.playbackContext, repository.continueWatchingOwner()).getOrThrow()
+                repository.reportProgress(playback, 43210, 123450).getOrThrow()
+                assertEquals(43210L, repository.resolve(source).getOrThrow().startPositionMs)
+                val priorSync = session.read()
+                session.dispatch(listOf(JSONObject().put("type", "merge_native_sync").put("document", priorSync.state.getJSONObject("nativeSync"))),
+                    priorSync.owner, priorSync.state.getJSONObject("hostProfilePreferences"), notifyMutation = false)
+                assertEquals(priorSync.owner, session.read().owner)
+                repository.reportProgress(playback, 44000, 123450).getOrThrow()
+                val remote = bindings.hydrate(session.read().state.toString())
+                try {
+                    assertTrue(JSONObject(bindings.dispatch(remote, """{"type":"patch_profile","id":"native-owner","edits":[{"field":"name","value":"Remote name"}]}""")!!).getBoolean("ok"))
+                    session.dispatch(listOf(JSONObject().put("type", "merge_native_sync").put("document", JSONObject(bindings.state(remote)!!).getJSONObject("nativeSync"))))
+                    assertNotEquals(priorSync.owner, session.read().owner)
+                    assertTrue(repository.reportProgress(playback, 45000, 123450).isFailure)
+                } finally { bindings.free(remote) }
+                repository.setCatalogWatched(com.vortx.android.model.MetaItem("unsaved", MediaType.MOVIE, "Unsaved movie", "https://fixture.invalid/poster"), true).getOrThrow()
+                val projection = session.resolve(JSONObject().put("kind", "profile_playback").put("profileId", "native-owner"))
+                val history = projection.getJSONArray("history")
+                val marked = (0 until history.length()).map(history::getJSONObject).single { it.getString("metaId") == "unsaved" }
+                assertEquals("Unsaved movie", marked.getString("name")); assertEquals("movie", marked.getString("type"))
                 assertEquals(1, JSONArray(repository.subtitles(MediaType.SERIES, "tt-fixture:1:2").getOrThrow()).length())
                 val state = session.read().state
                 assertEquals(1, state.getJSONObject("libraries").getJSONObject("native-owner").getJSONArray("items").length())
@@ -92,5 +124,70 @@ class VortxNativeLiveJniTest {
                 assertEquals(0, restored.read().state.getJSONObject("libraries").getJSONObject("guest").getJSONArray("items").length())
             }
         } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+
+    @Test fun `authenticated legacy bootstrap native profile lifecycle and same-account reopen use real JNI`() = runBlocking {
+        assumeTrue("Requires reviewed importer JNI", System.getenv("VORTX_JNI_SYNC") == "1")
+        load()
+        val noNetwork = object : VortxResourceTransport {
+            override fun makeCancellation(): VortxResourceCancellation = error("No resource request permitted")
+            override fun load(requestJson: String, cancellation: VortxResourceCancellation): String = error("No network permitted")
+        }
+        val directory = Files.createTempDirectory(File("build").toPath(), "native-bootstrap-jni-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val checkpoints = VortxEncryptedCheckpointStore(directory) { key }
+        val account = SessionOwnerSnapshot.Account("00000000-0000-0000-0000-000000000123", 4)
+        var current: SessionOwnerSnapshot.Account? = account
+        var mutations = 0
+        fun coordinator() = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork }, { current == it }, { it() }, {}, { mutations++ })
+        val owner = UserProfile(id = "00000000-0000-0000-0000-000000000111", name = "Historical owner", avatar = "star", isOwner = true)
+        val doc = JSONObject().put("vortx", JSONObject().put("roster", JSONArray().put(owner.encode()
+            .put("auth", "never-copy-secret-profile-auth").put("dataKey", "never-copy-secret-profile-key"))).put("rosterModified", 123.5)
+            .put("library", JSONArray()).put("addons", JSONArray())).put("futurePreference", JSONObject().put("mode", "preserved"))
+            .put("apiKeys", JSONObject().put("fixture", "never-copy-secret"))
+        var runtime = coordinator()
+        try {
+            assertTrue(runtime.applyDocument(account, doc) { current == account })
+            val first = runtime.session().read().owner
+            assertEquals("account.00000000-0000-0000-0000-000000000123", first.scope.accountID)
+            assertEquals(0, mutations)
+            val retained = runtime.session().read().state.getJSONObject("legacyImportMaterial").toString()
+            assertEquals(123.5, JSONObject(retained).getDouble("rosterModifiedSeconds"), 0.0)
+            assertFalse(runtime.session().read().state.toString().contains("never-copy-secret"))
+            assertFalse(runtime.session().read().state.getJSONObject("hostDocument").has("apiKeys"))
+            assertFalse(runtime.session().read().state.getJSONObject("hostProfilePreferences").getJSONObject(owner.id).has("auth"))
+            assertFalse(runtime.session().read().state.getJSONObject("hostProfilePreferences").getJSONObject(owner.id).has("dataKey"))
+            assertTrue(runtime.session().read().state.getJSONArray("excludedCredentialPaths").toString().contains("/vortx/roster/0/dataKey"))
+            assertEquals("preserved", runtime.session().read().state.getJSONObject("hostDocument").getJSONObject("futurePreference").getString("mode"))
+            val profiles = NativeProfileAccess { runtime.session() }
+            val changed = profiles.read().profiles.single().copy(name = "Native owner", avatar = "moon")
+            profiles.save(changed, adding = false)
+            val guest = UserProfile(id = "00000000-0000-0000-0000-000000000456", name = "Guest", avatar = "person")
+            profiles.save(guest, adding = true); profiles.select(guest.id)
+            assertEquals(guest.id, runtime.session().read().owner.profileID)
+            profiles.remove(guest.id)
+            assertEquals(owner.id, runtime.session().read().owner.profileID)
+            assertTrue(mutations >= 4)
+            val exported = runtime.exportDocument(account)!!
+            assertEquals("moon", exported.roster.single().avatar)
+            assertFalse(exported.nativeSync.has("activeProfileId"))
+            assertFalse(exported.nativeSync.has("legacyImportMaterial"))
+            runtime.retire(); runtime = coordinator()
+            // Identical authenticated legacy material is a no-op receipt, not a reset of local edits.
+            assertTrue(runtime.applyDocument(account, doc) { true })
+            assertNotEquals(first, runtime.session().read().owner)
+            assertEquals("Native owner", NativeProfileAccess { runtime.session() }.read().profiles.single().name)
+            assertEquals("moon", NativeProfileAccess { runtime.session() }.read().profiles.single().avatar)
+            assertEquals(retained, runtime.session().read().state.getJSONObject("legacyImportMaterial").toString())
+            assertEquals("preserved", runtime.session().read().state.getJSONObject("hostDocument").getJSONObject("futurePreference").getString("mode"))
+            val before = runtime.session().read().state.toString()
+            val changedLegacy = JSONObject(doc.toString())
+            changedLegacy.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).put("name", "Old client edit")
+            assertTrue(runCatching { runtime.applyDocument(account, changedLegacy) { true } }.isFailure)
+            assertEquals(before, runtime.session().read().state.toString())
+            current = account.copy(generation = 5)
+            assertTrue(runCatching { runtime.session() }.isFailure)
+            assertNull(runtime.exportDocument(account))
+        } finally { runtime.retire(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
 }

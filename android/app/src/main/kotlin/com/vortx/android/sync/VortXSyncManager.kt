@@ -976,6 +976,20 @@ class VortXSyncManager(context: Context) {
     /** Bound by the application after the single native repository is available. */
     @Volatile private var addonGateway: AccountAddonSyncGateway? = null
     @Volatile private var libraryGateway: AccountLibrarySyncGateway? = null
+    @Volatile private var nativeGateway: NativeAccountGateway? = null
+
+    internal fun attachNativeGateway(gateway: NativeAccountGateway) {
+        check(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+        nativeGateway = gateway
+        scope.launch { syncDown(force = true) }
+        scope.launch { sessionUiState.collect { state ->
+            if (state !is SessionUiState.SignedIn) gateway.retire()
+        } }
+    }
+    internal fun installNativeGatewayTestSeam(gateway: NativeAccountGateway) {
+        check(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+        nativeGateway = gateway
+    }
 
     /**
      * Set while syncDown is applying a remote pull. The writes it makes (roster fold, overlay hydrate) must
@@ -1449,6 +1463,7 @@ class VortXSyncManager(context: Context) {
                 AddonPrefsStore.activateAccount(null)
                 _account.value = null
                 _sessionUiState.value = SessionUiState.SignedOut
+                nativeGateway?.retire()
             }
         }
         if (!cleared) {
@@ -1675,8 +1690,9 @@ class VortXSyncManager(context: Context) {
         if (!isSyncLeaseCurrent(lease)) return SyncDocPull.Failed
         if (code == 404) return SyncDocPull.Empty                 // no backup yet
         if (code != 200) return SyncDocPull.Failed                // network/server error: do not clobber
-        val body = json ?: return SyncDocPull.Empty               // 200 with no readable body: no backup
-        val docStr = body.optString("document", "").takeUnless { it.isEmpty() } ?: return SyncDocPull.Empty
+        val body = json ?: return if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) SyncDocPull.Failed else SyncDocPull.Empty
+        val docStr = body.optString("document", "").takeUnless { it.isEmpty() }
+            ?: return if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) SyncDocPull.Failed else SyncDocPull.Empty
         // Version is a 64-bit epoch-ms value: read as LONG (optLong), NEVER optInt (which truncates it).
         val pulledVersion = body.optLong("version", 0L)
         // H-2: normal pulls refuse an honest-label replay of a doc OLDER than what this account already applied.
@@ -1800,6 +1816,7 @@ class VortXSyncManager(context: Context) {
 
     private suspend fun syncUp(lease: SyncSessionLease): Boolean {
         if (!isSyncLeaseCurrent(lease)) return false
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return nativeSyncUp(lease)
         // Stamp snapshot taken when the push BEGINS, before the blob is built: a key re-edited while this
         // push is in flight gets a newer stamp and stays dirty (its newer value was not necessarily carried).
         val pushedStamps = readDirtySettings()
@@ -1817,6 +1834,79 @@ class VortXSyncManager(context: Context) {
             }
         }
         return synced && isSyncLeaseCurrent(lease)
+    }
+
+    private suspend fun nativeSyncDown(lease: SyncSessionLease): Boolean {
+        val gateway = nativeGateway ?: return false
+        if (retryPendingPushBeforePull(lease)) return false
+        val pull = pullSyncDocResult(lease) as? SyncDocPull.Doc ?: return false
+        if (!isSyncLeaseCurrent(lease)) return false
+        if (retryPendingPushBeforePull(lease)) return false
+        val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
+        val applied = try { gateway.applyDocument(account, pull.doc) { isSyncLeaseCurrent(lease) } }
+            catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
+            catch (_: Exception) { false }
+        if (!applied) return false
+        var credentialsStored = true
+        val hostApplied = withContext(Dispatchers.Main) {
+            val previousSettings = settingsPrefs.all
+            fun apply(): Boolean = publishIfSyncLeaseCurrent(lease) {
+                    applyingRemote = true
+                    try { applyDeviceSettings(pull.doc.opt("settings")) }
+                    finally { applyingRemote = false }
+            }
+            val profileStore = resolveStore()
+            val result = if (profileStore != null) profileStore.withoutNativePreferenceCapture { apply() } else apply()
+            // Re-project profile-owned flat keys only after releasing the auth lock. Remote global
+            // settings must not mint local profile edits or introduce auth-lock/runtime-lock inversion.
+            if (result && profileStore != null && previousSettings != settingsPrefs.all && isSyncLeaseCurrent(lease)) profileStore.refreshNativeProjection(forceSettings = true)
+            result
+        }
+        if (!hostApplied) return false
+        // Host-only credential storage stays outside the kernel. Keep the complete lease locked
+        // through each write so an account switch cannot redirect a captured account's keys.
+        if (!publishIfSyncLeaseCurrent(lease) {
+            val apiKeys = pull.doc.optJSONObject("apiKeys")
+            for (service in DebridService.entries) {
+                val value = apiKeys?.optString(service.id, "").orEmpty()
+                if (value.isNotEmpty() && !debridKeys.setKey(service, value)) credentialsStored = false
+            }
+            val metadata = apiKeys?.optJSONObject("metadata")
+            for (slot in MetadataProviderKeys.Slot.entries) {
+                val value = metadata?.optString(slot.syncKey, "").orEmpty()
+                if (value.isNotEmpty() && !metadataKeys.set(slot, value)) credentialsStored = false
+            }
+        }) return false
+        return credentialsStored && advanceVersion(lease, pull.version)
+    }
+
+    private suspend fun nativeSyncUp(lease: SyncSessionLease): Boolean {
+        val gateway = nativeGateway ?: return false
+        val pushedStamps = readDirtySettings()
+        suspend fun derived(): JSONObject? {
+            // A missing or failed cloud document is not authority to seed an account.
+            val pull = pullSyncDocResult(lease) as? SyncDocPull.Doc ?: return null
+            val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
+            if (!gateway.applyDocument(account, pull.doc) { isSyncLeaseCurrent(lease) }) return null
+            val exported = gateway.exportDocument(account) ?: return null
+            if (!isSyncLeaseCurrent(lease)) return null
+            // Preserve every adjacent encrypted legacy/settings field, including unknown keys.
+            val merged = JSONObject(pull.doc.toString())
+            merged.put("nativeSync", exported.nativeSync)
+            val vortx = merged.optJSONObject("vortx") ?: JSONObject().also { merged.put("vortx", it) }
+            vortx.put("roster", exported.rawRoster)
+                .put("rosterModified", exported.rosterModifiedSeconds)
+            val settings = SettingsBackup.settingsBlobFor(merged.opt("settings"), exported.roster,
+                exported.rosterModifiedSeconds, settingsBundleId, deviceSettings = SettingsBackup.plistSettingsFrom(settingsPrefs.all),
+                rawRosterJson = exported.rawRoster.toString()) ?: return null
+            merged.put("settings", settings)
+            if (!publishIfSyncLeaseCurrent(lease) { mergeDebridKeysIntoDoc(merged); mergeMetadataKeysIntoDoc(merged) }) return null
+            return merged
+        }
+        val first = derived() ?: return false
+        val pushed = pushDerivedDoc(lease, first) { derived() } && isSyncLeaseCurrent(lease)
+        if (pushed) publishIfSyncLeaseCurrent(lease) { clearPushedDirtySettings(pushedStamps) }
+        return pushed
     }
 
     private fun applyLibraryTombstonesToVortx(vortx: JSONObject): JSONObject {
@@ -2097,6 +2187,7 @@ class VortXSyncManager(context: Context) {
         force: Boolean = false,
     ): Boolean {
         if (!isSyncLeaseCurrent(lease)) return false
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return nativeSyncDown(lease)
         // PENDING-EDIT GUARD: restore a durable process-death marker and retry its push before any
         // foreground pull. Even a forced pull must not overwrite a fresh local edit.
         if (retryPendingPushBeforePull(lease)) return false
@@ -2616,6 +2707,7 @@ class VortXSyncManager(context: Context) {
                 onCommitted = ::cancelSessionWork,
             ) {
                 sessionState.replace(s) {
+                    nativeGateway?.retire()
                     bindLibraryAccount(account.id)
                     AddonTombstones.activateAccount(account.id)
                     AddonPrefsStore.activateAccount(account.id)
@@ -2632,6 +2724,7 @@ class VortXSyncManager(context: Context) {
             captureSyncLease()
                 ?.takeIf { it.accountId == account.id && it.token == token }
                 ?.let { armPendingSync(it, recordEdit = false) }
+            if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) scope.launch { syncDown(force = true) }
         }
         return adoption
     }

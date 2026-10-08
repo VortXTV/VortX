@@ -488,6 +488,8 @@ data class StreamSource(
     val externalSubtitles: List<String> = emptyList(),
     /** Structured sidecars preserve provider-specific request metadata without changing URL-only callers. */
     val externalSubtitleTracks: List<ExternalSubtitle> = emptyList(),
+    /** Opaque repository-issued attribution. Never a credential or media URL. */
+    val nativePlaybackToken: String? = null,
 ) {
     override fun toString(): String =
         "StreamSource(id=$id, addon=$addon, title=$title, url=${redactedTransportUrl(url)}, " +

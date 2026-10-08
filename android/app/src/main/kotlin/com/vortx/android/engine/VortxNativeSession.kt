@@ -47,14 +47,37 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
                 sync.getString("ownerProfileId") == ownerProfileID) { "Native snapshot scope mismatch" }
             sync.getJSONObject("profiles"); sync.getJSONObject("addons"); sync.getJSONObject("libraries"); sync.getJSONObject("watches")
         }
+        if (state.has("hostProfilePreferences")) {
+            val host = state.getJSONObject("hostProfilePreferences")
+            host.keys().forEach { key ->
+                if (key == "modifiedSeconds") require(host.getDouble(key).let { it.isFinite() && it >= 0.0 })
+                else host.getJSONObject(key)
+            }
+        }
+        if (state.has("legacyImportMaterial")) {
+            val material = state.getJSONObject("legacyImportMaterial")
+            require(material.getInt("schemaVersion") == 1)
+            material.getJSONArray("roster"); material.getJSONArray("deletedProfileIds")
+            material.getJSONObject("addons"); material.getJSONObject("libraries")
+            material.getJSONObject("watches"); material.getJSONObject("identityLinks")
+        }
+        if (state.has("hostDocument")) {
+            state.getJSONObject("hostDocument")
+            val excluded = state.getJSONArray("excludedCredentialPaths")
+            (0 until excluded.length()).forEach { require(excluded.get(it) is String) }
+        } else require(!state.has("excludedCredentialPaths"))
         rejectCredentials(state)
         return state
     }
 
-    private fun rejectCredentials(value: Any?) {
+    internal fun rejectCredentials(value: Any?) {
         when (value) {
             is JSONObject -> value.keys().forEach { key ->
-                require(key.lowercase() !in setOf("token", "accesstoken", "refreshtoken", "authkey", "password", "authorization", "bearer")) {
+                val field = key.lowercase().replace("_", "").replace("-", "")
+                val urlKey = runCatching { java.net.URI(key) }.getOrNull()
+                val transportIdentity = urlKey?.scheme?.lowercase() in setOf("https", "http") && !urlKey?.host.isNullOrBlank()
+                require(transportIdentity || (field !in setOf("token", "auth", "authkey", "datakey", "password", "authorization", "bearer", "apikey", "apikeys", "credentials") &&
+                    !field.endsWith("token") && !field.endsWith("password") && !field.endsWith("secret"))) {
                     "Credentials are not native state"
                 }
                 rejectCredentials(value.get(key))
@@ -143,6 +166,10 @@ internal class VortxNativeSession private constructor(
     private val transport: VortxResourceTransport,
     private var runtime: VortxNativeRuntime,
     private val isAccountCurrent: () -> Boolean,
+    private var hostProfilePreferences: JSONObject,
+    private var legacyImportMaterial: JSONObject?,
+    private var hostDocumentArchive: JSONObject?,
+    private val onMutation: () -> Unit,
 ) : AutoCloseable {
     private data class Slot(val ticket: UUID, val owner: VortxNativeOwner, val bridge: VortxResourceBridge,
                             var completed: List<Pair<String, Long>>? = null)
@@ -156,14 +183,23 @@ internal class VortxNativeSession private constructor(
         private val nextRevision = AtomicLong()
         fun open(scope: VortxAccountScope, ownerName: String, bindings: VortxRuntimeBindings,
                  store: VortxCheckpointStore, transport: VortxResourceTransport,
-                 allowNewAccount: Boolean = false, isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
+                 allowNewAccount: Boolean = false, bootstrapActions: List<JSONObject> = emptyList(),
+                 initialHostProfiles: JSONObject = JSONObject(), initialHostArchive: JSONObject? = null,
+                 onMutation: () -> Unit = {}, isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
             check(isAccountCurrent()) { "Native account changed" }
+            scope.rejectCredentials(initialHostProfiles)
+            scope.rejectCredentials(initialHostArchive)
+            bootstrapActions.forEach(scope::rejectCredentials)
             val stored = store.read(scope)
             val runtime = if (stored != null) {
                 scope.validateSnapshot(stored)
-                VortxNativeRuntime.hydrate(bindings, stored)
+                val core = JSONObject(stored).also {
+                    it.remove("hostProfilePreferences"); it.remove("legacyImportMaterial")
+                    it.remove("hostDocument"); it.remove("excludedCredentialPaths")
+                }
+                VortxNativeRuntime.hydrate(bindings, core.toString())
             } else {
-                check(allowNewAccount) { "Native account has no checkpoint; explicit creation or migration required" }
+                check(allowNewAccount || bootstrapActions.isNotEmpty()) { "Native account has no checkpoint; explicit creation or migration required" }
                 VortxNativeRuntime.create(bindings, scope.ownerProfileID, ownerName)
             }
             try {
@@ -171,12 +207,27 @@ internal class VortxNativeSession private constructor(
                 check(JSONObject(runtime.dispatch(JSONObject().put("type", "bind_sync_scope").put("scope", scope.accountID).toString())).getBoolean("ok")) {
                     "Native sync artifact required"
                 }
-                val snapshot = runtime.stateJson()
+                for (action in bootstrapActions) {
+                    check(JSONObject(runtime.dispatch(action.toString())).getBoolean("ok")) { "Native account bootstrap rejected" }
+                }
+                val storedProfiles = stored?.let(::JSONObject)?.optJSONObject("hostProfilePreferences")
+                val hostProfiles = if (storedProfiles == null || initialHostProfiles.optDouble("modifiedSeconds", 0.0) > storedProfiles.optDouble("modifiedSeconds", 0.0))
+                    initialHostProfiles else storedProfiles
+                // Preserve exact typed source clocks beside the receipt, never the credential-bearing cloud document.
+                val legacyMaterial = stored?.let(::JSONObject)?.optJSONObject("legacyImportMaterial")
+                    ?: bootstrapActions.firstOrNull { it.getString("type") == "import_legacy_sync" }?.getJSONObject("material")
+                val old = stored?.let(::JSONObject)
+                val archive = initialHostArchive ?: old?.optJSONObject("hostDocument")?.let {
+                    JSONObject().put("document", it).put("excludedCredentialPaths", old.getJSONArray("excludedCredentialPaths"))
+                }
+                val snapshot = JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfiles).put("legacyImportMaterial", legacyMaterial)
+                    .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths")).toString()
                 scope.validateSnapshot(snapshot)
                 store.commit(scope, snapshot)
                 check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
                 check(isAccountCurrent()) { "Native account changed" }
-                return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent)
+                return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent, JSONObject(hostProfiles.toString()),
+                    legacyMaterial?.let { JSONObject(it.toString()) }, archive?.let { JSONObject(it.toString()) }, onMutation)
             } catch (error: Throwable) { runtime.close(); throw error }
         }
     }
@@ -184,14 +235,24 @@ internal class VortxNativeSession private constructor(
     @Synchronized fun read(): VortxNativeRead {
         check(!closed) { "Native session closed" }
         check(isAccountCurrent()) { "Native account changed" }
-        val state = scope.validateSnapshot(runtime.stateJson())
+        val state = scope.validateSnapshot(JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfilePreferences)
+            .put("legacyImportMaterial", legacyImportMaterial).put("hostDocument", hostDocumentArchive?.getJSONObject("document"))
+            .put("excludedCredentialPaths", hostDocumentArchive?.getJSONArray("excludedCredentialPaths")).toString())
         return VortxNativeRead(VortxNativeOwner(scope, state.getString("activeProfileId"), revision), state)
     }
     @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && isAccountCurrent() && read().owner == owner
+    @Synchronized fun resolve(request: JSONObject, owner: VortxNativeOwner = read().owner): JSONObject = owned(owner) {
+        JSONObject(runtime.resolve(request.toString())).also { check(it.getString("kind") != "error") { "Native query rejected" } }
+    }
     @Synchronized fun <T> owned(owner: VortxNativeOwner, action: () -> T): T {
         check(accepts(owner)) { "Native owner changed" }; return action()
     }
-    @Synchronized fun dispatch(actions: List<JSONObject>, owner: VortxNativeOwner = read().owner): List<String> = owned(owner) {
+    @Synchronized fun dispatch(actions: List<JSONObject>, owner: VortxNativeOwner = read().owner,
+                              hostProfiles: JSONObject? = null, notifyMutation: Boolean = true,
+                              hostArchive: JSONObject? = null): List<String> = owned(owner) {
+        actions.forEach(scope::rejectCredentials)
+        scope.rejectCredentials(hostProfiles)
+        scope.rejectCredentials(hostArchive)
         val before = runtime.stateJson()
         val candidate = VortxNativeRuntime.hydrate(bindings, before)
         var installed = false
@@ -199,17 +260,29 @@ internal class VortxNativeSession private constructor(
             val results = actions.map { action ->
                 candidate.dispatch(action.toString()).also { check(JSONObject(it).getBoolean("ok")) { "Native action rejected" } }
             }
-            val updated = candidate.stateJson()
+            val preferences = hostProfiles ?: hostProfilePreferences
+            val retained = legacyImportMaterial ?: actions.firstOrNull { it.getString("type") == "import_legacy_sync" }?.getJSONObject("material")
+            val archive = hostArchive ?: hostDocumentArchive
+            val updated = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("legacyImportMaterial", retained)
+                .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths")).toString()
             val state = scope.validateSnapshot(updated)
             store.commit(scope, updated)
             check(store.read(scope) == updated) { "Native checkpoint readback failed" }
             check(isAccountCurrent()) { "Native account changed" }
+            val prior = JSONObject(before)
+            val profileOrRegistryChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString() ||
+                prior.getJSONObject("nativeSync").getJSONObject("addons").toString() != state.getJSONObject("nativeSync").getJSONObject("addons").toString()
+            val hostChanged = preferences.toString() != hostProfilePreferences.toString()
             val previous = runtime; runtime = candidate; installed = true; previous.close()
+            hostProfilePreferences = JSONObject(preferences.toString())
+            legacyImportMaterial = retained?.let { JSONObject(it.toString()) }
+            hostDocumentArchive = archive?.let { JSONObject(it.toString()) }
             // Any profile/registry mutation invalidates in-flight resources. Progress does not.
-            if (state.getString("activeProfileId") != owner.profileID || actions.any {
-                    it.getString("type") in setOf("merge_native_sync", "patch_profile", "delete_profile", "install_addon", "remove_addon", "reorder_addons")
+            if (hostChanged || profileOrRegistryChanged || state.getString("activeProfileId") != owner.profileID || actions.any {
+                    it.getString("type") in setOf("patch_profile", "delete_profile", "install_addon", "remove_addon", "reorder_addons")
                 }) invalidate()
             changes.value += 1
+            if (notifyMutation) onMutation()
             results
         } finally { if (!installed) candidate.close() }
     }
