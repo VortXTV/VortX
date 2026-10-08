@@ -174,7 +174,7 @@ index e5f872c..dcaca5b 100644
          // ./configure --list-protocols
          "--enable-protocols",
          // ./configure --list-demuxers
-@@ -778,10 +865,164 @@ private class BuildLuaJIT: ZipBaseBuild {
+@@ -778,10 +865,181 @@ private class BuildLuaJIT: ZipBaseBuild {
  }
  
  
@@ -237,14 +237,17 @@ index e5f872c..dcaca5b 100644
 +    }
 +
 +    private static func output(_ command: String, in directoryURL: URL) throws -> String {
-+        guard let value = Utility.shell(command, currentDirectoryURL: directoryURL) else {
++        // Utility.shell returns an empty string on success unless isOutput is true. Every
++        // validation command below consumes stdout, so keep that flag explicit rather than
++        // accidentally treating a successful command as missing state.
++        guard let value = Utility.shell(command, isOutput: true, currentDirectoryURL: directoryURL) else {
 +            throw failure("git command failed in \(directoryURL.path): \(command)")
 +        }
 +        return value.trimmingCharacters(in: .whitespacesAndNewlines)
 +    }
 +
 +    private static func succeeds(_ command: String, in directoryURL: URL) -> Bool {
-+        Utility.shell(command, currentDirectoryURL: directoryURL) != nil
++        Utility.shell(command, isOutput: true, currentDirectoryURL: directoryURL) != nil
 +    }
 +
 +    private static func patchFiles(for library: Library) throws -> [String] {
@@ -254,6 +257,30 @@ index e5f872c..dcaca5b 100644
 +            .filter { $0.hasSuffix(".patch") }
 +            .sorted()
 +            .map { (patchDirectory + $0).path }
++    }
++
++    private static func matchesExactPatchTree(_ patchPaths: [String], in directoryURL: URL) -> Bool {
++        // A reverse `git apply --check` proves only that each patch's hunks can be removed. It
++        // does not prove that another edit was not made in the same file. Compare every tracked
++        // path with a clean HEAD archive after applying the approved patch set instead.
++        let quotedPatches = patchPaths
++            .map { "'\($0)'" }
++            .joined(separator: " ")
++        let command = """
++        set -euo pipefail
++        temporary=$(mktemp -d)
++        trap 'rm -rf \"$temporary\"' EXIT
++        git archive HEAD | tar -x -C \"$temporary\"
++        for patch in \(quotedPatches); do
++            git apply --unsafe-paths --directory=\"$temporary\" \"$patch\"
++        done
++        while IFS= read -r path; do
++            [ -f \"$temporary/$path\" ] || [ -L \"$temporary/$path\" ]
++            cmp -s \"$temporary/$path\" \"$path\"
++        done < <(git ls-tree -r --name-only HEAD)
++        test -z \"$(git status --porcelain --untracked-files=all)\"
++        """
++        return succeeds(command, in: directoryURL)
 +    }
 +
 +    private static func validateExisting(url directoryURL: URL, sha: String, library: Library) throws {
@@ -274,18 +301,8 @@ index e5f872c..dcaca5b 100644
 +        guard !patchPaths.isEmpty else {
 +            throw failure("pinned checkout at \(directoryURL.path) is dirty and has no known patch set to validate")
 +        }
-+        let changedPaths = try output("git diff --name-only", in: directoryURL)
-+            .split(separator: "\n", omittingEmptySubsequences: true)
-+            .map(String.init)
-+        for patchPath in patchPaths {
-+            let forward = succeeds("git apply --check \"\(patchPath)\"", in: directoryURL)
-+            let reverse = succeeds("git apply --reverse --check \"\(patchPath)\"", in: directoryURL)
-+            guard forward || reverse else {
-+                throw failure("pinned checkout at \(directoryURL.path) has a conflicting or unrelated change; inspect before retrying")
-+            }
-+        }
-+        guard !changedPaths.isEmpty else {
-+            throw failure("pinned checkout at \(directoryURL.path) has unexpected untracked files; inspect before retrying")
++        guard matchesExactPatchTree(patchPaths, in: directoryURL) else {
++            throw failure("pinned checkout at \(directoryURL.path) has a conflicting, partial, or unrelated change; only the exact approved patch set may be reused")
 +        }
 +    }
 +

@@ -78,7 +78,14 @@
 # of FFmpeg, libplacebo and mpv from source. Budget hours, not minutes, and ~20 GB of scratch.
 set -euo pipefail
 
+# Fixture-only source/ref/patch overrides are accepted only in preflight mode; ordinary builds
+# retain the pinned source and patch below. The explicit worktree and destination overrides remain
+# available to the release/build orchestration after its compatibility gates.
+PREFLIGHT_ONLY="${MPVKIT_DVFEL_PREFLIGHT_ONLY:-0}"
 MPVKIT_REF="2103893078c5e339073b11737b86f7f22b9c4491"   # MPVKit 1.0.0 tip, the base for our patch
+if [ "$PREFLIGHT_ONLY" = "1" ] && [ -n "${MPVKIT_DVFEL_REF:-}" ]; then
+  MPVKIT_REF="$MPVKIT_DVFEL_REF"
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 # The canonical source checkout is deliberately a sibling of VortX, so the build does not silently
@@ -88,11 +95,52 @@ MPVKIT_DIR="${MPVKIT_DVFEL_WORK:-$REPO/../MPVKit}"
 # Keep the short name for the focused archive-gate fixture and older local wrappers; it aliases the
 # exact checkout above rather than reintroducing a second cache root.
 WORK="$MPVKIT_DIR"
-DEST="$REPO/app/Vendor/MPVKit-DVFEL"
+MPVKIT_SOURCE_URL="https://github.com/mpvkit/MPVKit.git"
+if [ "$PREFLIGHT_ONLY" = "1" ] && [ -n "${MPVKIT_DVFEL_SOURCE_URL:-}" ]; then
+  MPVKIT_SOURCE_URL="$MPVKIT_DVFEL_SOURCE_URL"
+fi
+# Keep the rebuilt package in the canonical stage directory until the application compatibility
+# build accepts it. Callers may provide an explicit destination after that gate has passed.
+DEST="${MPVKIT_DVFEL_DEST:-$REPO/_build/MPVKit-DVFEL}"
+DEST_ROOT="$(dirname "$DEST")"
+PATCH="$REPO/scripts/mpvkit-dvfel.patch"
+if [ "$PREFLIGHT_ONLY" = "1" ] && [ -n "${MPVKIT_DVFEL_PATCH:-}" ]; then
+  PATCH="$MPVKIT_DVFEL_PATCH"
+fi
 
 fail() {
   echo "build-mpvkit-dvfel: $*" >&2
   exit 1
+}
+
+mkdir -p "$DEST_ROOT"
+
+matches_exact_patch_tree() {
+  local patch_path="$1"
+  local temporary path
+  temporary="$(mktemp -d "$DEST_ROOT/mpvkit-state.XXXXXX")"
+
+  if ! (cd "$MPVKIT_DIR" && git archive HEAD | tar -x -C "$temporary"); then
+    rm -rf "$temporary"
+    return 1
+  fi
+  if ! (cd "$MPVKIT_DIR" && git apply --unsafe-paths --directory="$temporary" "$patch_path"); then
+    rm -rf "$temporary"
+    return 1
+  fi
+  while IFS= read -r path; do
+    if [ ! -f "$temporary/$path" ] && [ ! -L "$temporary/$path" ]; then
+      rm -rf "$temporary"
+      return 1
+    fi
+    if ! cmp -s "$temporary/$path" "$MPVKIT_DIR/$path"; then
+      rm -rf "$temporary"
+      return 1
+    fi
+  done < <(git -C "$MPVKIT_DIR" ls-tree -r --name-only HEAD)
+
+  rm -rf "$temporary"
+  return 0
 }
 
 for tool in meson ninja cmake pkg-config nasm wget; do
@@ -101,7 +149,7 @@ done
 
 if [ ! -e "$MPVKIT_DIR" ]; then
   mkdir -p "$(dirname "$MPVKIT_DIR")"
-  git clone --no-checkout https://github.com/mpvkit/MPVKit.git "$MPVKIT_DIR" ||
+  git clone --no-checkout "$MPVKIT_SOURCE_URL" "$MPVKIT_DIR" ||
     fail "fresh MPVKit clone failed: $MPVKIT_DIR"
   git -C "$MPVKIT_DIR" fetch --quiet --depth 1 origin "$MPVKIT_REF" ||
     fail "fresh MPVKit clone does not contain pinned commit $MPVKIT_REF"
@@ -121,20 +169,13 @@ else
     fail "existing MPVKit checkout has staged changes; refusing to reuse it"
   fi
   STATUS="$(git -C "$MPVKIT_DIR" status --porcelain --untracked-files=all)"
-  TRACKED="$(git -C "$MPVKIT_DIR" diff --name-only)"
-  if [ -n "$TRACKED" ]; then
-    git -C "$MPVKIT_DIR" apply --reverse --check "$REPO/scripts/mpvkit-dvfel.patch" >/dev/null 2>&1 ||
-      fail "existing MPVKit checkout has tracked changes that are not the exact applied VortX patch"
-    while IFS= read -r path; do
-      case "$path" in
-        Package.swift|Sources/BuildScripts/XCFrameworkBuild/main.swift) ;;
-        *) fail "existing MPVKit checkout has unrelated tracked change: $path" ;;
-      esac
-    done <<< "$TRACKED"
+  if [ -n "$STATUS" ] && ! matches_exact_patch_tree "$PATCH"; then
+    fail "existing MPVKit checkout differs from the exact approved VortX patch; refusing arbitrary or partial dirty state"
   fi
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     case "$line" in
+      ' M Package.swift'|'M Package.swift'|' M Sources/BuildScripts/XCFrameworkBuild/main.swift'|'M Sources/BuildScripts/XCFrameworkBuild/main.swift') ;;
       '?? .build/'*|'?? dist/'*|'?? Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch'|'?? Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch') ;;
       *) fail "existing MPVKit checkout has unexpected dirty state: $line" ;;
     esac
@@ -142,13 +183,17 @@ else
 fi
 
 cd "$MPVKIT_DIR"
-PATCH="$REPO/scripts/mpvkit-dvfel.patch"
 if git apply --check "$PATCH" >/dev/null 2>&1; then
   git apply "$PATCH"
 elif git apply --reverse --check "$PATCH" >/dev/null 2>&1; then
   echo "build-mpvkit-dvfel: exact MPVKit patch already applied; reusing it"
 else
   fail "MPVKit patch neither applies cleanly nor matches the already-applied exact patch; inspect $MPVKIT_DIR"
+fi
+
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+  echo "build-mpvkit-dvfel: preflight-only checkout and patch validation passed"
+  exit 0
 fi
 
 # Install our mpv-side patch alongside MPVKit's own libmpv patches. SpikeGit.applyPatches (added by
@@ -199,6 +244,7 @@ done
 rm -f "$BUILD_STARTED_MARKER"
 trap - EXIT
 
+mkdir -p "$DEST_ROOT"
 STAGED_DEST="$(mktemp -d "${DEST}.staged.XXXXXX")"
 PREVIOUS_DEST="${DEST}.previous"
 trap 'rm -rf "$STAGED_DEST"' EXIT

@@ -60,8 +60,35 @@ version_major_pattern() {
   case "$1" in
     Libavcodec-GPL) echo '^[[:space:]]*#define[[:space:]]+LIBAVCODEC_VERSION_MAJOR[[:space:]]+63([[:space:]]|$)' ;;
     Libavformat-GPL) echo '^[[:space:]]*#define[[:space:]]+LIBAVFORMAT_VERSION_MAJOR[[:space:]]+63([[:space:]]|$)' ;;
-    *) return 1 ;;
+    Libmpv-GPL) echo '' ;;
+    *) fail "unknown FFmpeg version target $1" ;;
   esac
+}
+
+expected_arches() {
+  case "$1" in
+    ios-arm64) echo 'arm64' ;;
+    ios-arm64_x86_64-simulator) echo 'arm64 x86_64' ;;
+    tvos-arm64_arm64e) echo 'arm64 arm64e' ;;
+    tvos-arm64_x86_64-simulator) echo 'arm64 x86_64' ;;
+    macos-arm64_x86_64) echo 'arm64 x86_64' ;;
+    *) fail "unknown XCFramework slice $1" ;;
+  esac
+}
+
+normalize_arches() {
+  # lipo's order is not a package contract; the set is. Sort both sides before comparing so a
+  # slice with an extra architecture cannot pass merely because it has at least one expected arch.
+  printf '%s\n' $1 | LC_ALL=C sort | paste -sd' ' -
+}
+
+verify_arches() {
+  local binary="$1" slice="$2" actual expected
+  actual="$(lipo -archs "$binary")" || fail "cannot enumerate architectures in $binary"
+  [ -n "$actual" ] || fail "no architectures found in $binary"
+  expected="$(expected_arches "$slice")"
+  [ "$(normalize_arches "$actual")" = "$(normalize_arches "$expected")" ] ||
+    fail "$binary has architectures [$actual], expected exactly [$expected]"
 }
 
 if command -v xcrun >/dev/null 2>&1; then
@@ -71,7 +98,7 @@ else
 fi
 command -v lipo >/dev/null 2>&1 || fail "lipo is required to inspect every framework architecture"
 
-for target in Libavcodec-GPL Libavformat-GPL; do
+for target in Libavcodec-GPL Libavformat-GPL Libmpv-GPL; do
   binary_name="$(framework_binary "$target")"
   pattern="$(version_major_pattern "$target")"
   framework="$ARTIFACTS/$target.xcframework"
@@ -81,33 +108,40 @@ for target in Libavcodec-GPL Libavformat-GPL; do
     headers="$slice_root/Headers"
     [ -f "$binary" ] || fail "missing $target binary in slice $slice"
     [ -d "$headers" ] || fail "missing $target headers in slice $slice"
+    verify_arches "$binary" "$slice"
 
-    version_header=""
-    while IFS= read -r candidate; do
-      if grep -Eq "$pattern" "$candidate"; then
-        version_header="$candidate"
-        break
-      fi
-    done < <(find "$headers" -type f \( -name 'version_major.h' -o -name 'version.h' \) | LC_ALL=C sort)
-    [ -n "$version_header" ] || fail "$target/$slice does not declare required FFmpeg 9 major 63"
+    if [ -n "$pattern" ]; then
+      version_header=""
+      while IFS= read -r candidate; do
+        if grep -Eq "$pattern" "$candidate"; then
+          version_header="$candidate"
+          break
+        fi
+      done < <(find "$headers" -type f \( -name 'version_major.h' -o -name 'version.h' \) | LC_ALL=C sort)
+      [ -n "$version_header" ] || fail "$target/$slice does not declare required FFmpeg 9 major 63"
+    fi
 
-    arch_list="$(lipo -archs "$binary")" || fail "cannot enumerate architectures in $binary"
-    read -r -a arches <<<"$arch_list"
-    [ "${#arches[@]}" -gt 0 ] || fail "no architectures found in $binary"
-    for arch in "${arches[@]}"; do
-      thin="$TMP/$target-$slice-$arch"
-      if [ "${#arches[@]}" -eq 1 ]; then
-        cp "$binary" "$thin"
-      else
-        lipo "$binary" -thin "$arch" -output "$thin"
-      fi
-      symbols="$("${NM[@]}" -gU "$thin" 2>/dev/null)" ||
-        fail "cannot inspect defined symbols in $target/$slice [$arch]"
-      # nm -gU reports only defined external symbols; the symbol must therefore be real code/data,
-      # not an undefined reference or a string/comment mentioning dovi_split.
-      grep -Eq '(^|[[:space:]])_?(ff_)?dovi_split(_bsf)?$' <<<"$symbols" ||
-        fail "$target/$slice [$arch] lacks the defined dovi_split bitstream filter symbol"
-    done
+    # dovi_split is an externally defined libavcodec capability. Keep the check per exact
+    # slice/architecture; libavformat still gets its own FFmpeg 9 major/version and exact-arch
+    # checks, while the Libmpv pass above prevents a CoreAudio player artifact from disappearing.
+    if [ "$target" = Libavcodec-GPL ]; then
+      arch_list="$(lipo -archs "$binary")"
+      read -r -a arches <<<"$arch_list"
+      for arch in "${arches[@]}"; do
+        thin="$TMP/$target-$slice-$arch"
+        if [ "${#arches[@]}" -eq 1 ]; then
+          cp "$binary" "$thin"
+        else
+          lipo "$binary" -thin "$arch" -output "$thin"
+        fi
+        symbols="$("${NM[@]}" -gU "$thin" 2>/dev/null)" ||
+          fail "cannot inspect defined symbols in $target/$slice [$arch]"
+        # nm -gU reports only defined external symbols; the symbol must therefore be real code/data,
+        # not an undefined reference or a string/comment mentioning dovi_split.
+        grep -Eq '(^|[[:space:]])_?(ff_)?dovi_split(_bsf)?$' <<<"$symbols" ||
+          fail "$target/$slice [$arch] lacks the defined dovi_split bitstream filter symbol"
+      done
+    fi
   done
 done
 
