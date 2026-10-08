@@ -5,25 +5,19 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.21"
+    static let version = "0.5.0-beta.1"
     static let highlights: [String] = [
-        "Profile creation and edits propagate through updated Apple and Android clients and the deployed dashboard. Real roster clocks and sparse edits preserve unrelated PIN, account and preference fields; the selected viewer stays device-local.",
-        "Binge navigation, next-episode preloading and batch downloads prefer the add-on and release you accepted, with ordered fallback when it is unavailable. Complete local and cloud resolution respects the episode deadline.",
-        "Terminal playback failures retain a useful error and the correct failed-episode Retry target. Manual seeking retires stale automatic resume work, and preview exit preserves its owned source, position and pause choice.",
-        "Shared Apple mpv seek accounting requires an owned restart with explicit non-seeking/non-EOF state before completing resume or paused recovery. Requested timestamps and ambiguous overlapping commands cannot falsely certify completion; this is not a claim that every decoder or source stall is solved.",
-        "Mac window traffic lights are enabled above the content and the detail route has one Back control. The dedicated Mac Search page has its own visible search field, independent of the global shortcut popover.",
-        "Completed downloads on iPhone, iPad and Mac resume by their own library/episode identity, with active-profile and file checks around the lookup. Preview exit saves the original position; accepted same-media source/player changes preserve the preview's original paused choice.",
-        "Android TV now wires halfway prewarming, automatic episode advance and the binge-prompt counter. Back revokes pending auto-pick even after source assembly has started, and accepted source changes retire obsolete next-episode warm choices.",
-        "Add-on removal/re-add and ordering receipts retain their account owner rather than following a later account switch. Local tombstone stamps survive settings restoration.",
-        "The immediate iPhone/iPad crash when opening playback is repaired. Smaller player-control components preserve the seek, chapter, preview and skip-editor actions without constructing the overflowing view type.",
-        "A cleaner iPhone/iPad player keeps the title, transport and useful controls easy to reach. Secondary actions live in More, including volume, AirPlay, sleep, frame capture, playback settings, lock and the skip editor.",
-        "Your chosen seek-bar style now appears in the phone/tablet player, including Wave and all fourteen styles. The real draggable track supports buffered progress, chapter/skip markers and VoiceOver; paused playback and Reduce Motion stop its animation.",
-        "Pinch out to Fill and pinch in to Fit on iPhone/iPad. Sizing changes the current AVPlayer or VortX Player surface without restarting playback. The aspect selector retains Fit, Fill and Stretch.",
-        "Mac and wide iPad use cinematic horizontal navigation instead of the Mac sidebar. Phone and narrow-iPad navigation stays compact, with other destinations in More. The iPad capsule hugs its labels and keeps a scrolling fallback.",
-        "Mobile navigation reserves its own layout space, keeping All sources and other detail controls above the bottom bar. Filter chips use one clean edge instead of doubled glass outlines.",
-        "The phone/tablet Search field stays at the top of the page instead of behind the bottom navigation. Inline suggestions, clear, keyboard submit and the existing debounced search remain available.",
-        "The chosen add-on in All sources has a clear accent fill and checkmark, with a selected accessibility state, while filtering remains bound to the same add-on choice.",
-        "All earlier reviewed playback, account, source and Usenet work is retained. Apple build 259 and Android version code 240 are fresh packages. Broader provider playback, physical cross-device acceptance and complete Android visual parity are not claimed universally fixed."
+        "VortX's native core now owns account, catalog, resource and streaming work. Native packages omit the legacy core and Node runtime; optional Stremio sign-in remains a separate integration. Full, Lite and Mac retain their documented server boundaries.",
+        "Profile, add-on, watched and Watchlist changes retain the viewer that initiated them and publish after a durable checkpoint. Independent streaming accounts cannot borrow another profile's credentials or relabel its old history.",
+        "Watchlist is separate from Library and viewing history, with per-title edits, retained removals and acknowledged buttons. Authenticated legacy lists seed missing entries without replacing newer changes; a capacity limit reports an error instead of silently deleting an older title.",
+        "Previously watched episode bitmaps migrate against their original episode inventory. Missing or ambiguous metadata stays visibly pending with Retry and retained evidence; changing a streaming account cannot redirect its old history into the new account.",
+        "Cinema brings rich catalog cards, Quick View, episode rails, detailed source groups and clearer Library destinations to Apple and Android. Phone actions fit the narrow layout; Mac and wide iPad keep horizontal navigation and a visible Search field.",
+        "Continue Watching prepares the next episode for the captured viewer, episode and chosen source. Discovery, resolution and Usenet share a bounded handoff; an obsolete preparation cannot replace a newer episode or profile.",
+        "Binge selection remembers the audio language actually selected, alongside the chosen add-on and release. Fresh shows prefer regular seasons while explicitly chosen or resumed specials remain authoritative.",
+        "Accepted same-media player or source replacements preserve Pause. AVPlayer recovery retains its accepted seek target, manual seeking retires stale resume intent, and terminal errors cannot restart an outgoing item behind the error screen.",
+        "Native NNTP read-ahead now warms bounded article batches concurrently instead of serial small reads. Seeks cancel older warm work, nearby useful coverage takes priority, and foreground reads retain connection headroom without increasing the memory budget.",
+        "Subtitle background styles drive the actual mpv renderer. Player accent controls stay within their shapes and respect Reduce Transparency. Fresh FFmpeg 9/SecureTransport MPV inputs retain Dolby Vision split support and repair a Mac CoreAudio initialization-failure lifetime defect.",
+        "Existing seek-bar styles, pinch Fit/Fill, chapters, subtitle controls, skip editing and countdown cancellation, downloads, live TV, debrid, indexers, ordered Usenet servers and integrations remain available. No blanket claim of uninterrupted provider playback, physical-device acceptance or complete Apple/Android parity replaces the detailed release notes."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses
