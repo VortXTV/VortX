@@ -53,6 +53,7 @@ run_fixture() {
   local calls="$tmp/$name/calls"
   local creates="$tmp/$name/creates"
   mkdir -p "$output"
+  rm -f "$creates"
   PATH="$fakebin:$PATH" \
     FIXTURE_MODE="$mode" \
     FIXTURE_CALLS="$calls" \
@@ -98,7 +99,8 @@ fi
 
 # A successful fixture has three actual TSV fields per record and deletes only its two generated UUIDs.
 run_fixture success success
-success_receipt="$tmp/success/output/simulators.tsv"
+success_receipt="$(print -l "$tmp/success/output"/simulators.completed.*.tsv)"
+[[ ! -e "$tmp/success/output/simulators.tsv" ]]
 awk -F $'\t' '
   NR == 1 { if (NF != 3) bad = 1; next }
   { if (NF != 3 || $3 != "com.stremiox.cinema-ui-smoke.ios") bad = 1; records += 1 }
@@ -112,4 +114,11 @@ for kind in phone ipad; do
     [[ -s "$tmp/success/output/cinema-ios-$kind-$surface.png" ]]
   done
 done
+
+# A completed receipt is archived, not treated as an active failed run. The exact same output directory
+# can therefore produce a fresh device pair without touching the old receipt or any user simulator.
+run_fixture success success
+completed_receipts=("$tmp/success/output"/simulators.completed.*.tsv(N))
+[[ "${#completed_receipts[@]}" -eq 2 ]]
+[[ ! -e "$tmp/success/output/simulators.tsv" ]]
 print 'ok: native Cinema renderer simulator ownership fixtures pass'

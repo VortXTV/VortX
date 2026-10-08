@@ -11,6 +11,7 @@ project="$root/CinemaUISmokeIOSRenderer.xcodeproj"
 derived="${CINEMA_UI_SMOKE_IOS_DERIVED_DATA:-$root/build/cinema-ui-smoke-ios-derived}"
 output="${CINEMA_UI_SMOKE_IOS_OUTPUT:-$root/build/cinema-ui-smoke-ios-png}"
 receipt="$output/simulators.tsv"
+completed_receipt="$output/simulators.completed.$$.tsv"
 runtime='com.apple.CoreSimulator.SimRuntime.iOS-26-5'
 bundle='com.stremiox.cinema-ui-smoke.ios'
 
@@ -121,4 +122,17 @@ render_device() {
 render_device phone "$phone_uuid"
 render_device ipad "$ipad_uuid"
 completed=true
-print "ok: native Cinema UI screenshots written to $output; owned simulator UUIDs recorded in $receipt"
+# Complete the same exact-ID cleanup now, rather than relying on an EXIT trap that would leave an active
+# recovery receipt behind after success. Verify the two device IDs have actually disappeared before moving
+# the record out of the active-recovery name; a failure leaves `simulators.tsv` intact and blocks reruns.
+cleanup
+for uuid in "${created[@]}"; do
+  is_uuid "$uuid" || continue
+  if xcrun simctl list devices | /usr/bin/grep -Fq "$uuid"; then
+    print -u2 "owned native Cinema simulator still exists after delete: $uuid"
+    exit 1
+  fi
+done
+mv "$receipt" "$completed_receipt"
+trap - EXIT
+print "ok: native Cinema UI screenshots written to $output; completed simulator receipt: $completed_receipt"
