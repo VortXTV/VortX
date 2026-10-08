@@ -4869,6 +4869,33 @@ private struct PosterRail: View {
     }
 }
 
+// MARK: - Debug-only Cinema fixture seam
+
+#if DEBUG
+/// An inert entry point to the shipping shelf.  The UI smoke host deliberately owns only static
+/// `RailItem` values and no `CoreBridge`/account lifecycle, so it can exercise Cinema card geometry
+/// without booting an engine, resolving artwork, or issuing a catalog request.
+struct CinemaFixturePosterRail: View {
+    let title: String
+    var eyebrow: String? = nil
+    let items: [RailItem]
+    var continueWatching = false
+    var includesSeeAll = false
+
+    var body: some View {
+        PosterRail(
+            title: title,
+            eyebrow: eyebrow,
+            items: items,
+            onTap: { _ in },
+            onSeeAll: includesSeeAll ? {} : nil,
+            menu: continueWatching ? .continueWatching : .none,
+            onDetails: { _ in }
+        )
+    }
+}
+#endif
+
 // The old image-only `iOSHeroBackdrop` was replaced by the interactive `FeaturedHeroView`
 // (FeaturedHeroView.swift) on all three browse screens; its 16:9-art helpers now live on
 // `FeaturedHeroItem`.
@@ -4899,7 +4926,7 @@ struct CachedPosterImage: View {
     }
 
     var body: some View {
-        Group {
+        let image = Group {
             if let image = image ?? synchronousCache {
                 imageView(image).resizable().scaledToFill()
             } else if failed {
@@ -4909,7 +4936,15 @@ struct CachedPosterImage: View {
                 Theme.Palette.surface1
             }
         }
-        .task(id: url) { await load() }
+        #if DEBUG
+        if CinemaUISmokeRuntime.disablesArtworkLoading {
+            image
+        } else {
+            image.task(id: url) { await load() }
+        }
+        #else
+        image.task(id: url) { await load() }
+        #endif
     }
 
     private func imageView(_ img: VXPosterImage) -> Image {
