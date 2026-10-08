@@ -5,6 +5,13 @@ const { test } = require("node:test");
 const path = require("node:path");
 const source = fs.readFileSync(path.join(__dirname, "../app/Sources/PlayerScreen.swift"), "utf8");
 
+function section(from, to) {
+    const start = source.indexOf(from);
+    const end = source.indexOf(to, start);
+    assert(start >= 0 && end > start, `missing source section: ${from}`);
+    return source.slice(start, end);
+}
+
 test("the entire bottom bar terminates metadata at concrete rendering boundaries", () => {
     const bottom = source.slice(source.indexOf("private var bottomBar: PlayerBottomBarLayout"),
         source.indexOf("private var bottomTimeline:"));
@@ -110,4 +117,59 @@ test("decorative layers preserve order, identities and non-interactive hit testi
         const layer = source.slice(source.indexOf(`private struct ${name}:`), source.indexOf(`private struct ${next}:`));
         assert(layer.includes(".allowsHitTesting(false)"), `${name} must not intercept slider input`);
     }
+});
+
+test("player controls opt out of native button chrome and confine profile accent to their shape", () => {
+    const surface = section("private struct PlayerControlSurfaceModifier", "private struct PlayerControlButton:");
+    for (const contract of [
+        "@Environment(\\.accessibilityReduceTransparency)",
+        "@Environment(\\.isEnabled)",
+        ".background { shape.fill(fill) }",
+        ".overlay { shape.strokeBorder(border, lineWidth: 1) }",
+        ".clipShape(shape)",
+        ".contentShape(shape)",
+        ".shadow(color: .black.opacity(shadowOpacity)",
+        "Theme.Palette.accent.opacity",
+        "guard isEnabled else { return .black.opacity(0.32) }",
+        "let alpha = reduceTransparency ? 0.32 : (active ? 0.28 : 0.17)"
+    ]) {
+        assert(surface.includes(contract), `player surface contract: ${contract}`);
+    }
+    assert(!surface.includes("shadow(color: Theme.Palette.accent"),
+        "player surface must never cast an accent-colored outer shadow");
+    assert(surface.includes("prominent ? Theme.Palette.onAccent : Theme.Palette.accent"),
+        "solid primary face and secondary ink must use the profile-aware palette");
+
+    const controls = [
+        ["toolbar control", section("private struct PlayerControlButton:", "private struct PlayerTransportToolbar:")],
+        ["touch icon", section("private struct PlayerTouchIconButton:", "private struct PlayerTouchAspectButton:")],
+        ["touch aspect", section("private struct PlayerTouchAspectButton:", "private struct PlayerTouchOptionAction:")],
+        ["touch transport", section("private struct PlayerTouchTransport:", "/// One provider refresh")],
+        ["legacy center", section("private var legacyCenterTransport:", "/// The seek-step setting")],
+        ["legacy seek", section("private func seekButton(", "private var skipEditorTimelineValues:")],
+        ["legacy top icon", section("private func iconButton(", "#if os(iOS) || os(macOS)")],
+        ["PiP", section("private struct AVPlayerPictureInPictureButton:", "// MARK: - Skip intro / outro")]
+    ];
+    for (const [name, body] of controls) {
+        assert(body.includes(".buttonStyle(.plain)"), `${name} must explicitly use plain button style`);
+        assert(body.includes("playerControlSurface"), `${name} must use the player shape surface`);
+    }
+    const primaryFaces = [
+        section("private struct PlayerTouchTransport:", "/// One provider refresh"),
+        section("private var legacyCenterTransport:", "/// The seek-step setting")
+    ];
+    for (const body of primaryFaces) {
+        assert(body.includes("playerControlSurface(in: Circle(), prominent: true)"),
+            "play/pause must be a solid profile-accent face");
+    }
+
+    const panelClose = section("private func selectionSheet(_ p: Panel)", "@ViewBuilder private func panelRow");
+    const panelRows = section("@ViewBuilder private func panelRow", "/// Rows for a panel");
+    assert(panelClose.includes(".buttonStyle(.plain)"), "selection-panel close must not inherit AppKit chrome");
+    assert(panelRows.includes(".buttonStyle(.plain)"), "selection-panel rows must not inherit AppKit chrome");
+    assert(source.includes("struct AirPlayRoutePickerButton: View"), "native AirPlay wrapper remains present");
+    assert(source.includes(".playerControlSurface(in: Circle())\n            .accessibilityLabel(\"AirPlay\")"),
+        "AirPlay wrapper keeps the player accent surface without replacing AVRoutePickerView");
+    assert(source.includes("private struct AVPlayerPictureInPictureButton: View"),
+        "native PiP wrapper remains present");
 });

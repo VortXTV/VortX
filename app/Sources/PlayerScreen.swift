@@ -407,6 +407,65 @@ private struct PlayerSeekTimelineTrack: View {
 /// The build-255 failure was in the OUTER bottom-bar metadata, not only the slider.
 /// These non-generic view boundaries keep each toolbar button and optional editor section's
 /// glass/conditional tree out of its parent's metadata. Keep transport ownership in PlayerScreen.
+///
+/// Player controls intentionally own their tint and shape. SwiftUI's default macOS Button style can
+/// paint a rectangular native button surface around a circular/pill label; that surface is the dark
+/// rectangle visible outside the control in the profile-accent screenshots. Keeping the presentation in
+/// one player-only modifier makes the plain-button contract explicit without changing shared browse/TV
+/// button styles or the global glass presets.
+private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
+    let shape: S
+    let prominent: Bool
+    let active: Bool
+
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.isEnabled) private var isEnabled
+
+    func body(content: Content) -> some View {
+        content
+            .foregroundStyle(foreground)
+            // The chosen accent is painted INSIDE the same shape as the label. The shadow below is
+            // deliberately neutral black, so no profile hue can escape as a rectangular halo.
+            .background { shape.fill(fill) }
+            .overlay { shape.strokeBorder(border, lineWidth: 1) }
+            .clipShape(shape)
+            .contentShape(shape)
+            .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, x: 0, y: shadowY)
+    }
+
+    private var fill: Color {
+        guard isEnabled else { return .black.opacity(0.32) }
+        if prominent { return Theme.Palette.accent }
+        let alpha = reduceTransparency ? 0.32 : (active ? 0.28 : 0.17)
+        return Theme.Palette.accent.opacity(alpha)
+    }
+
+    private var foreground: Color {
+        guard isEnabled else { return .white.opacity(0.38) }
+        return prominent ? Theme.Palette.onAccent : Theme.Palette.accent
+    }
+
+    private var border: Color {
+        guard isEnabled else { return .white.opacity(0.14) }
+        return prominent
+            ? Theme.Palette.accentBright.opacity(0.50)
+            : Theme.Palette.accent.opacity(active ? 0.78 : 0.55)
+    }
+
+    private var shadowOpacity: Double { isEnabled ? (prominent ? 0.30 : 0.28) : 0.18 }
+    private var shadowRadius: CGFloat { prominent ? 6 : 4 }
+    private var shadowY: CGFloat { prominent ? 3 : 2 }
+}
+
+private extension View {
+    /// Player-only shape-first tinting. Callers still decide the visual size/tap target before the modifier.
+    func playerControlSurface<S: InsettableShape>(in shape: S,
+                                                   prominent: Bool = false,
+                                                   active: Bool = false) -> some View {
+        modifier(PlayerControlSurfaceModifier(shape: shape, prominent: prominent, active: active))
+    }
+}
+
 private struct PlayerControlButton: View {
     let icon: String
     let title: String
@@ -414,33 +473,28 @@ private struct PlayerControlButton: View {
     let action: () -> Void
 
     var body: some View {
-    Button(action: action) {
-        HStack(spacing: 7) {
-            Image(systemName: icon).font(.system(size: 15, weight: .semibold))
-            // #135: force a single line + allow the font to shrink instead of wrapping mid-word
-            // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
-            // fit at full size so minimumScaleFactor is a no-op there.
-            Text(title).font(.subheadline.weight(.medium))
-                .lineLimit(1)
-                #if !os(iOS)
-                .minimumScaleFactor(0.75)
-                #endif
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: icon).font(.system(size: 15, weight: .semibold))
+                // #135: force a single line + allow the font to shrink instead of wrapping mid-word
+                // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
+                // fit at full size so minimumScaleFactor is a no-op there.
+                Text(title).font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                    #if !os(iOS)
+                    .minimumScaleFactor(0.75)
+                    #endif
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            #if os(iOS)
+            .frame(minHeight: 44)
+            .fixedSize(horizontal: true, vertical: false)
+            #endif
+            .playerControlSurface(in: RoundedRectangle(cornerRadius: 11, style: .continuous), active: active)
         }
-        // Glass control pill (mockup .gp / .gp.on): a subtle chip that turns to the ember active variant
-        // when its feature is engaged. Purely visual; the button's action is unchanged.
-        .foregroundStyle(active ? Theme.Palette.accent : .white)
-        .padding(.horizontal, 12).padding(.vertical, 7)
-        #if os(iOS)
-        .frame(minHeight: 44)
-        .fixedSize(horizontal: true, vertical: false)
-        #endif
-        .background { RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.white.opacity(active ? 0 : 0.06)) }
-        .vortxGlassActive(active, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(active ? Theme.Palette.accent.opacity(0.4) : .white.opacity(0.14), lineWidth: 1)
-        }
-    }
+        // A player toolbar button must not inherit AppKit's rounded-rectangle Button chrome around the
+        // label. Its own Capsule/RoundedRectangle is the complete visual and hit surface.
+        .buttonStyle(.plain)
     }
 }
 
@@ -691,10 +745,8 @@ private struct PlayerTouchIconButton: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.white)
                 .frame(width: 44, height: 44)
-                .background(.black.opacity(0.24), in: Circle())
-                .contentShape(Circle())
+                .playerControlSurface(in: Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
@@ -713,9 +765,8 @@ private struct PlayerTouchAspectButton: View {
                 Image(systemName: "aspectratio")
                 Text(title).font(.caption.weight(.semibold))
             }
-            .foregroundStyle(.white)
             .padding(.horizontal, 10).frame(height: 44)
-            .background(.black.opacity(0.24), in: Capsule())
+            .playerControlSurface(in: Capsule(), active: mode != "original")
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Video size: \(title)")
@@ -851,10 +902,8 @@ private struct PlayerTouchTransport: View {
             Button(action: toggle) {
                 Image(systemName: paused ? "play.fill" : "pause.fill")
                     .font(.system(size: 32, weight: .semibold))
-                    .foregroundStyle(.white)
                     .frame(width: 64, height: 64)
-                    .background(.black.opacity(0.3), in: Circle())
-                    .contentShape(Circle())
+                    .playerControlSurface(in: Circle(), prominent: true)
             }
             .buttonStyle(.plain)
             .accessibilityLabel(paused ? "Play" : "Pause")
@@ -2081,10 +2130,11 @@ struct PlayerScreen: View {
                     HStack {
                         Button { leavePlayback() } label: {
                             Image(systemName: "xmark")
-                                .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                                // Escape-hatch close on the shared TIGHT glass disc (shape-clipped material,
-                                // never glassEffect, so no un-clipped dark halo). Background only; action unchanged.
-                                .padding(12).vortxGlassDisc()
+                                .font(.system(size: 17, weight: .bold))
+                                // Escape-hatch close uses the same player accent surface as the visible
+                                // top-bar close; its cancel shortcut and action remain unchanged.
+                                .frame(width: 44, height: 44)
+                                .playerControlSurface(in: Circle())
                         }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
@@ -7866,9 +7916,9 @@ struct PlayerScreen: View {
                 showExternalChooser = true
             }
         }
-        // NO GlassEffectContainer here (the old .glassChromeCluster() wrap). Two reasons: (1) the discs are
-        // now the tight material variant (vortxGlassDisc, never glassEffect), so there are no glass panes to
-        // merge and the container only produced the "one continuous blurred slab" over-blur; (2) on OS 26 a
+        // NO GlassEffectContainer here (the old .glassChromeCluster() wrap). Two reasons: (1) the controls
+        // are shape-clipped player accent surfaces with black-only shadows, so there are no glass panes to
+        // merge and the container would only produce the "one continuous blurred slab" over-blur; (2) on OS 26 a
         // GlassEffectContainer renders interactive descendants with its own monochrome/vibrancy treatment,
         // which visually suppressed the volume Slider's ember accent tint (volumeControl lives in this bar).
         // Dropping the container restores the slider's .tint(Theme.Palette.accent) minimum track.
@@ -7923,15 +7973,16 @@ struct PlayerScreen: View {
             }
             Button { Haptics.tap(); viewerToggle(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
-                    .font(.system(size: 50)).foregroundStyle(.white).shadow(radius: 8)
-                    // Glass transport disc (mockup .big) on the TIGHT disc variant: shape-clipped material,
-                    // never glassEffect (whose un-clipped ambient bloom drew a dark rounded halo around the
-                    // disc over bright video). The inner 84pt disc is purely visual; the outer 100pt frame
-                    // keeps the original tap target.
+                    .font(.system(size: 50))
+                    // The inner 84pt accent face is purely visual; the outer 100pt frame keeps the original
+                    // tap target. The player surface clips the accent to the Circle and owns a black-only
+                    // depth shadow, so AppKit cannot add a rectangular button patch around it.
                     .frame(width: 84, height: 84)
-                    .vortxGlassDisc()
+                    .playerControlSurface(in: Circle(), prominent: true)
                     .frame(width: 100, height: 100)
+                    .contentShape(Circle())
             }
+            .buttonStyle(.plain)
             .accessibilityLabel(isPaused ? "Play" : "Pause")
             if !isLive {
                 seekButton("goforward.\(seekStep)", by: seekStepSeconds)
@@ -7975,13 +8026,13 @@ struct PlayerScreen: View {
             seekBy(delta)
         } label: {
             Image(systemName: icon).font(.system(size: 30, weight: .semibold))
-                .foregroundStyle(.white).shadow(radius: 4)
-                // Glass transport disc (mockup .skip) on the TIGHT disc variant (shape-clipped material,
-                // never glassEffect, no halo): inner 54pt visual disc, outer 60pt frame keeps the tap target.
                 .frame(width: 54, height: 54)
-                .vortxGlassDisc()
+                // Inner 54pt accent surface; outer 60pt frame retains the existing tap target.
+                .playerControlSurface(in: Circle())
                 .frame(width: 60, height: 60)
+                .contentShape(Circle())
         }
+        .buttonStyle(.plain)
         .accessibilityLabel(delta < 0 ? "Skip back 10 seconds" : "Skip forward 10 seconds")
     }
 
@@ -8472,13 +8523,12 @@ struct PlayerScreen: View {
     private func iconButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white).padding(11)
-                // Floating top-bar disc (mockup .disc) on the TIGHT disc variant: a shape-clipped material,
-                // never glassEffect, so the top-row buttons read as tight pucks (no dark halo, no over-blur).
-                // Background only, hit shape unchanged.
-                .vortxGlassDisc()
-                .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
+                .frame(width: 44, height: 44)
+                // The accent stays inside the Circle; this helper is shared by every legacy top-bar
+                // action, including macOS, where an unstyled Button would otherwise paint a square.
+                .playerControlSurface(in: Circle())
         }
+        .buttonStyle(.plain)
         .accessibilityLabel(label)
     }
 
@@ -8508,9 +8558,8 @@ struct PlayerScreen: View {
                         }
                     }
                         .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.white).padding(11)
-                        .vortxGlassDisc()
-                        .frame(width: 44, height: 44).contentShape(Circle())
+                        .frame(width: 44, height: 44)
+                        .playerControlSurface(in: Circle())
                 }
                 .buttonStyle(.plain)
                 .disabled(controller.isPictureInPictureTransitioning)
@@ -9207,13 +9256,10 @@ struct PlayerScreen: View {
                     Spacer()
                     Button { close() } label: {
                         Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
-                            // Panel close on the shared TIGHT glass disc, matching the transport discs
-                            // (shape-clipped material, never glassEffect, no halo). Background only;
-                            // close() action unchanged.
-                            .foregroundStyle(.white.opacity(0.7)).padding(7)
-                            .vortxGlassDisc()
-                            .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
+                            .frame(width: 44, height: 44)
+                            .playerControlSurface(in: Circle())
                     }
+                    .buttonStyle(.plain)
                     .accessibilityLabel("Close panel")
                 }
                 .padding(.horizontal).padding(.vertical, 14)
@@ -9291,6 +9337,7 @@ struct PlayerScreen: View {
             }
             .disabled(!row.isEnabled)
             .opacity(row.isEnabled ? 1 : 0.6)
+            .buttonStyle(.plain)
             .accessibilityLabel(row.label)
             .accessibilityValue(row.detail)
             .accessibilityHint(row.accessibilityHint)
@@ -10590,10 +10637,10 @@ struct AirPlayRoutePickerButton: View {
     var body: some View {
         AirPlayPickerRepresentable()
             .frame(width: 44, height: 44)
-            // AirPlay disc on the shared TIGHT glass disc, matching the sibling transport discs
-            // (shape-clipped material, never glassEffect, no halo). Background only; the
-            // AVRoutePickerView behavior is unchanged.
-            .vortxGlassDisc()
+            // Keep AVRoutePickerView as the native interaction surface, but give its clear wrapper the
+            // same player-owned accent face as sibling controls. The accent is clipped to the Circle;
+            // the route picker behavior and VoiceOver label remain native.
+            .playerControlSurface(in: Circle())
             .accessibilityLabel("AirPlay")
     }
 }
