@@ -186,7 +186,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: feaa0e074133137625e5e143c80715d5cb2a5ffe
+          ref: 8c5295e1dc6e7e1a18bc196f2020d389f6694eeb
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -195,7 +195,7 @@ jobs:
         run: |
           set -euo pipefail
           NATIVE_REVISION="$(git -C _vortx_core_src rev-parse HEAD)"
-          [ "$NATIVE_REVISION" = feaa0e074133137625e5e143c80715d5cb2a5ffe ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
+          [ "$NATIVE_REVISION" = 8c5295e1dc6e7e1a18bc196f2020d389f6694eeb ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
           echo "VORTX_ENGINE_SOURCE_REVISION=$NATIVE_REVISION" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
