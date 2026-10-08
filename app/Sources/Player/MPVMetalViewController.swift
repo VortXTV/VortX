@@ -168,6 +168,14 @@ final class MPVMetalViewController: PlatformViewController {
         let audioSidecar: URL?
     }
     private var seekEOFRecovery = SeekEOFRecoveryPolicy<PlayerLoadToken>()
+    /// Protected by loadTokenLock, including command admission and raw event dequeue.
+    private var seekSettlement = MPVSeekSettlementPolicy<PlayerLoadToken>()
+    private func acceptsSettledPosition(_ evidence: MPVSeekSettlementEvidence?,
+                                        owner: PlayerLoadToken) -> Bool {
+        guard let evidence, evidence.settled else { return false }
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        return seekSettlement.accepts(evidence, owner: owner)
+    }
     private var seekEOFReloadSource: SeekEOFReloadSource?
     private var seekEOFRecoveryTimeout: DispatchWorkItem?
     private static let seekEOFRecoveryTimeoutSeconds: TimeInterval = 12
@@ -186,6 +194,7 @@ final class MPVMetalViewController: PlatformViewController {
     var playUrl: URL?
     var playHeaders: [String: String]?
     var playUrlLive = false
+    var startPaused = false
     /// yt-direct adaptive pair: an EXTERNAL AUDIO stream mounted alongside `playUrl` at load (mpv
     /// `--audio-files`). Set BEFORE viewDidLoad by MPVMetalPlayerView when a trailer resolved to a
     /// video-only adaptive stream + separate audio; nil (the normal case) changes nothing.
@@ -415,6 +424,7 @@ final class MPVMetalViewController: PlatformViewController {
         }
         VXProbe.log(probeChannel, "vo-start surfaceValidAtInit=\(!initialVideoSurface.needsInitialRebuild)")
         setupMpv()
+        if startPaused { pause() }
 
         #if canImport(UIKit)
         // Jetsam relief: the system memory warning is the last call before tvOS/iOS kills the app. mpv's
@@ -1243,6 +1253,7 @@ final class MPVMetalViewController: PlatformViewController {
         seekEOFRecovery.reset()
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         loadProvenance.invalidate()
+        seekSettlement.reset(owner: nil)
         initializationFailure.invalidateLoad()
         freshOrigin.supersede()
         requestedFreshOrigin = nil
@@ -1718,6 +1729,7 @@ final class MPVMetalViewController: PlatformViewController {
             token: issuedToken
         )
         if commandResult >= 0 {
+            seekSettlement.reset(owner: issuedToken)
             // Refused replacements do not consume configuration. A concurrent newer configure call
             // belongs to a later load and must not be cleared by this command's admission.
             if requestedFreshOriginGeneration == requestedOriginGeneration {
@@ -2194,11 +2206,16 @@ final class MPVMetalViewController: PlatformViewController {
         // evidence, and a real EOF is still terminal rather than being hidden as an internal maintenance edge.
         loadTokenLock.lock()
         cacheReanchorEventWitness = .init(id: flight.id, owner: flight.owner, attempt: flight.reissues)
-        loadTokenLock.unlock()
+        let settlementLease = seekSettlement.beginIssue(
+            owner: flight.owner, seeking: diagnosticFlag("seeking", handle: handle))
         let commandResult = mpv_command_string(
             handle,
             "no-osd seek \(flight.targetArgument) absolute+exact"
         )
+        if let settlementLease {
+            seekSettlement.completeIssue(settlementLease, accepted: commandResult >= 0)
+        }
+        loadTokenLock.unlock()
         if commandResult >= 0 {
             _ = cacheFlushFlight.markSeekCommandAccepted(id: flight.id, owner: flight.owner)
             // This is still only command acceptance for the cache flight. The separate EOF policy waits for
@@ -3967,7 +3984,20 @@ final class MPVMetalViewController: PlatformViewController {
             }
         }
         //print("\(command) -- \(args)")
-        let returnValue = mpv_command(mpv, &cargs)
+        let returnValue: Int32
+        if command == "seek" {
+            loadTokenLock.lock()
+            let settlementLease = loadProvenance.callbackToken(requiresLoadedFile: true).flatMap {
+                seekSettlement.beginIssue(owner: $0, seeking: diagnosticFlag("seeking"))
+            }
+            returnValue = mpv_command(mpv, &cargs)
+            if let settlementLease {
+                seekSettlement.completeIssue(settlementLease, accepted: returnValue >= 0)
+            }
+            loadTokenLock.unlock()
+        } else {
+            returnValue = mpv_command(mpv, &cargs)
+        }
         if checkForErrors {
             checkError(returnValue)
         }
@@ -4090,8 +4120,19 @@ final class MPVMetalViewController: PlatformViewController {
                   PlayerLoadProvenanceState.accepts(
                     callbackToken: capturedToken, activeToken: self.activeLoadToken
                   ) else { return }
+            var deliveredData = data
+            if let position = data as? PlayerTimePositionEvent,
+               let evidence = position.mpvSeekSettlement {
+                // Preserve raw UI positions; only downgrade authority after an intervening seek.
+                deliveredData = PlayerTimePositionEvent(
+                    seconds: position.seconds, loadToken: position.loadToken,
+                    mpvSeekSettlement: MPVSeekSettlementEvidence(
+                        generation: evidence.generation,
+                        settled: self.acceptsSettledPosition(evidence, owner: capturedToken),
+                        attributed: evidence.attributed))
+            }
             self.playDelegate?.propertyChange(
-                propertyName: name, data: data, loadToken: capturedToken
+                propertyName: name, data: deliveredData, loadToken: capturedToken
             )
         }
     }
@@ -4181,8 +4222,11 @@ final class MPVMetalViewController: PlatformViewController {
         })
     }
 
-    private func completeSeekEOFRecovery(loadToken: PlayerLoadToken, position: Double) {
-        guard let intent = seekEOFRecovery.completeReloadAtPosition(owner: loadToken, position: position) else { return }
+    private func completeSeekEOFRecovery(loadToken: PlayerLoadToken, position: Double,
+                                         settlement: MPVSeekSettlementEvidence?) {
+        guard acceptsSettledPosition(settlement, owner: loadToken),
+              settlement?.attributed == true,
+              let intent = seekEOFRecovery.completeReloadAtPosition(owner: loadToken, position: position) else { return }
         seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
         setFlag(MPVProperty.pause, intent.wasPaused)
         DiagnosticsLog.log("player", "seek-eof-recovery restored origin=\(intent.origin) target=\(String(format: "%.3f", intent.target)) paused=\(intent.wasPaused) loadToken=\(loadToken.hashValue)")
@@ -4264,7 +4308,34 @@ final class MPVMetalViewController: PlatformViewController {
                 // thread mid-drain, and the handle itself stays valid until stop()'s destroy
                 // block, which is queued BEHIND this drain on the same serial queue.
                 guard let handle = self.mpv else { break }
+                // Command admission and dequeue share this boundary; queued main callbacks carry
+                // immutable evidence instead of adopting a newer transport generation.
+                self.loadTokenLock.lock()
                 let event = mpv_wait_event(handle, 0)
+                let rawSeekOwner = self.loadProvenance.callbackToken(requiresLoadedFile: true)
+                let eventID = event?.pointee.event_id
+                var samplesPosition = eventID == MPV_EVENT_PLAYBACK_RESTART
+                if eventID == MPV_EVENT_PROPERTY_CHANGE,
+                   let data = event?.pointee.data {
+                    let property = UnsafePointer<mpv_event_property>(OpaquePointer(data)).pointee
+                    samplesPosition = String(cString: property.name) == MPVProperty.timePos
+                }
+                let rawSeeking = samplesPosition ? self.diagnosticFlag("seeking", handle: handle) : nil
+                // RESTART also fires with both streams at EOF; time-pos can then be last_seek_pts.
+                // Explicit non-EOF evidence is required even for an otherwise settled property sample.
+                let rawEOF = samplesPosition ? self.diagnosticFlag("eof-reached", handle: handle) : nil
+                if let owner = rawSeekOwner {
+                    if eventID == MPV_EVENT_SEEK { self.seekSettlement.observeSeek(owner: owner) }
+                    if eventID == MPV_EVENT_PLAYBACK_RESTART {
+                        self.seekSettlement.observeRestart(owner: owner, seeking: rawSeeking, eofReached: rawEOF)
+                    }
+                }
+                let rawSeekEvidence = rawSeekOwner.map {
+                    self.seekSettlement.evidence(owner: $0, seeking: rawSeeking, eofReached: rawEOF)
+                }
+                let rawRestartPosition = eventID == MPV_EVENT_PLAYBACK_RESTART
+                    ? self.diagnosticDouble(MPVProperty.timePos, handle: handle) : nil
+                self.loadTokenLock.unlock()
                 if event?.pointee.event_id == MPV_EVENT_NONE {
                     break
                 }
@@ -4442,7 +4513,7 @@ final class MPVMetalViewController: PlatformViewController {
                             }
                         case MPVProperty.timePos:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
-                                guard let originOwner = self.callbackLoadToken(requiresLoadedFile: true),
+                                guard let originOwner = rawSeekOwner,
                                       self.acceptsFreshOriginPosition(value, owner: originOwner) else { break }
                                 let now = ProcessInfo.processInfo.systemUptime
                                 #if os(tvOS)
@@ -4457,10 +4528,11 @@ final class MPVMetalViewController: PlatformViewController {
                                 if now - self.lastTimePosEmit >= minInterval {
                                     self.lastTimePosEmit = now
                                     if self.ownsSharedProbeState { VXProbeState.shared.setPlayer(pos: Int(value)) }
-                                    if let loadToken = self.callbackLoadToken(requiresLoadedFile: true) {
+                                    if let loadToken = rawSeekOwner {
                                         self.emit(
                                             propertyName,
-                                            PlayerTimePositionEvent(seconds: value, loadToken: loadToken),
+                                            PlayerTimePositionEvent(seconds: value, loadToken: loadToken,
+                                                                    mpvSeekSettlement: rawSeekEvidence),
                                             loadToken: loadToken
                                         )
                                         #if canImport(UIKit)
@@ -4491,7 +4563,8 @@ final class MPVMetalViewController: PlatformViewController {
                                                 DiagnosticsLog.log("playback", "resume seek observed position=\(value) target=\(receipt.target) generation=\(receipt.transportGeneration)")
                                             }
                                             self.completeSeekEOFRecovery(
-                                                loadToken: loadToken, position: value
+                                                loadToken: loadToken, position: value,
+                                                settlement: rawSeekEvidence
                                             )
                                         }
                                     }
@@ -4549,6 +4622,21 @@ final class MPVMetalViewController: PlatformViewController {
                         }
                     }
                 case MPV_EVENT_PLAYBACK_RESTART:
+                    // Shared on macOS/iOS/tvOS. Paused exact seeks and audio-only items may have no
+                    // later time-pos change. Publish this restart sample without unpausing or delay.
+                    if let owner = rawSeekOwner, let evidence = rawSeekEvidence, evidence.settled,
+                       let position = rawRestartPosition, position.isFinite, position >= 0,
+                       self.acceptsFreshOriginPosition(position, owner: owner) {
+                        self.emit(MPVProperty.timePos,
+                                  PlayerTimePositionEvent(seconds: position, loadToken: owner,
+                                                          mpvSeekSettlement: evidence),
+                                  loadToken: owner)
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.activeLoadToken == owner else { return }
+                            self.completeSeekEOFRecovery(loadToken: owner, position: position,
+                                                         settlement: evidence)
+                        }
+                    }
                     #if canImport(UIKit)
                     guard let loadToken = self.callbackLoadToken(requiresLoadedFile: true) else { break }
                     let cacheWitness = self.captureCacheReanchorEventWitness()

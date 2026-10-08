@@ -1759,7 +1759,8 @@ struct TVPlayerView: View {
         if let loadToken, loadToken == recoveryPauseOwner,
            loadToken == coordinator.player?.activeLoadToken,
            name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
-           event.loadToken == loadToken, abs(event.seconds - recoveryPauseTarget) <= 2 {
+           event.loadToken == loadToken, event.transportSettled,
+           abs(event.seconds - recoveryPauseTarget) <= 2 {
             recoveryPauseOwner = nil
             if recoveryPauseIntent { coordinator.player?.pause() }
         }
@@ -1883,9 +1884,19 @@ struct TVPlayerView: View {
                ) {
                 let d = event.seconds
                 guard d.isFinite, d >= 0 else { return }
-                lastRawTimePos = d
-                lastRawTimePosOwner = event.loadToken
-                lastRawTimePosMountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
+                // Recovery retains the last settled position; the UI can still show raw seek targets.
+                if event.positionSettled {
+                    lastRawTimePos = d
+                    lastRawTimePosOwner = event.loadToken
+                    lastRawTimePosMountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
+                }
+                // An optimistic target may already have cleared the UI snap guard. Resume completion
+                // must also be checked independently when the later settled sample arrives.
+                if event.transportSettled, let target = postFrameResumeSeekWatchdogTarget,
+                   postFrameResumeSeekWatchdogOwner == event.loadToken,
+                   abs(d - target) <= inFlightSeekSnapRadius {
+                    settlePostFrameResumeSeekIfOwned(target: target, loadToken: event.loadToken)
+                }
                 if pendingAdvance?.issued != true, supersededAdvance == nil {
                     committedLoadToken = event.loadToken
                 }
@@ -2060,7 +2071,7 @@ struct TVPlayerView: View {
                     if landedNearTarget
                         || Date().timeIntervalSinceReferenceDate - inFlightSeekIssuedAt > inFlightSeekSettleWindow {
                         inFlightSeekTarget = nil   // settled near the target, or the window expired: trust ticks again
-                        if landedNearTarget {
+                        if landedNearTarget && event.transportSettled {
                             // The deferred resume obligation is complete. Retire its watchdog now, while
                             // the landed tick still proves the target, so a later user seek backward cannot
                             // make the old target look failed when the 12-second task wakes.

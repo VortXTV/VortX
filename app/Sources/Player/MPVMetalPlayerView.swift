@@ -16,6 +16,11 @@ typealias PlatformViewControllerRepresentable = NSViewControllerRepresentable
 
 struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
     @ObservedObject var coordinator: Coordinator
+    private var startsPaused = false
+
+    init(coordinator: Coordinator) {
+        self.coordinator = coordinator
+    }
 
     /// Shared construction + wiring of the player controller (identical on every platform).
     private func makeController(_ context: Context) -> MPVMetalViewController {
@@ -28,6 +33,7 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         mpv.contentIsDolbyVision = coordinator.contentIsDolbyVision
         mpv.dolbyVisionFallbackInfo = coordinator.dolbyVisionFallbackInfo
         mpv.startMuted = coordinator.muted
+        mpv.startPaused = startsPaused
         mpv.loopPlayback = coordinator.loops
         mpv.probeChannel = coordinator.probeChannel
         mpv.forceFillVideo = coordinator.forceFill
@@ -66,6 +72,13 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
     func live(_ live: Bool) -> Self {
         coordinator.playLive = live
         return self
+    }
+
+    /// Opt-in transport carry; ambient previews and ordinary mounts keep their defaults.
+    func initiallyPaused(_ paused: Bool) -> Self {
+        var copy = self
+        copy.startsPaused = paused
+        return copy
     }
 
     /// Hero-preview only (#44): mount this libmpv instance muted and looping for an ambient background

@@ -928,6 +928,20 @@ struct PlayerLoadToken: Hashable, Sendable {
 struct PlayerTimePositionEvent: Sendable {
     let seconds: Double
     let loadToken: PlayerLoadToken
+    /// nil preserves the existing AVPlayer/non-mpv contract. MPV supplies explicit evidence.
+    let mpvSeekSettlement: MPVSeekSettlementEvidence?
+    var positionSettled: Bool { mpvSeekSettlement?.settled ?? true }
+    var transportSettled: Bool {
+        guard let evidence = mpvSeekSettlement else { return true }
+        return evidence.settled && evidence.attributed
+    }
+
+    init(seconds: Double, loadToken: PlayerLoadToken,
+         mpvSeekSettlement: MPVSeekSettlementEvidence? = nil) {
+        self.seconds = seconds
+        self.loadToken = loadToken
+        self.mpvSeekSettlement = mpvSeekSettlement
+    }
 }
 
 /// Pure callback-provenance state used by the libmpv bridge and its standalone regressions. The controller

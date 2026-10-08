@@ -5,8 +5,16 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.4.0-beta.20"
+    static let version = "0.4.0-beta.21"
     static let highlights: [String] = [
+        "Profile creation and edits propagate through updated Apple and Android clients and the deployed dashboard. Real roster clocks and sparse edits preserve unrelated PIN, account and preference fields; the selected viewer stays device-local.",
+        "Binge navigation, next-episode preloading and batch downloads prefer the add-on and release you accepted, with ordered fallback when it is unavailable. Complete local and cloud resolution respects the episode deadline.",
+        "Terminal playback failures retain a useful error and the correct failed-episode Retry target. Manual seeking retires stale automatic resume work, and preview exit preserves its owned source, position and pause choice.",
+        "Shared Apple mpv seek accounting requires an owned restart with explicit non-seeking/non-EOF state before completing resume or paused recovery. Requested timestamps and ambiguous overlapping commands cannot falsely certify completion; this is not a claim that every decoder or source stall is solved.",
+        "Mac window traffic lights are enabled above the content and the detail route has one Back control. The dedicated Mac Search page has its own visible search field, independent of the global shortcut popover.",
+        "Completed downloads on iPhone, iPad and Mac resume by their own library/episode identity, with active-profile and file checks around the lookup. Preview exit saves the original position; accepted same-media source/player changes preserve the preview's original paused choice.",
+        "Android TV now wires halfway prewarming, automatic episode advance and the binge-prompt counter. Back revokes pending auto-pick even after source assembly has started, and accepted source changes retire obsolete next-episode warm choices.",
+        "Add-on removal/re-add and ordering receipts retain their account owner rather than following a later account switch. Local tombstone stamps survive settings restoration.",
         "The immediate iPhone/iPad crash when opening playback is repaired. Smaller player-control components preserve the seek, chapter, preview and skip-editor actions without constructing the overflowing view type.",
         "A cleaner iPhone/iPad player keeps the title, transport and useful controls easy to reach. Secondary actions live in More, including volume, AirPlay, sleep, frame capture, playback settings, lock and the skip editor.",
         "Your chosen seek-bar style now appears in the phone/tablet player, including Wave and all fourteen styles. The real draggable track supports buffered progress, chapter/skip markers and VoiceOver; paused playback and Reduce Motion stop its animation.",
@@ -15,7 +23,7 @@ enum WhatsNew {
         "Mobile navigation reserves its own layout space, keeping All sources and other detail controls above the bottom bar. Filter chips use one clean edge instead of doubled glass outlines.",
         "The phone/tablet Search field stays at the top of the page instead of behind the bottom navigation. Inline suggestions, clear, keyboard submit and the existing debounced search remain available.",
         "The chosen add-on in All sources has a clear accent fill and checkmark, with a selected accessibility state, while filtering remains bound to the same add-on choice.",
-        "All Beta 18 playback, account, source and Usenet work is retained. This is Apple build 258; Android remains on its existing Beta 18 build. Broader provider playback and full Android visual parity are not newly claimed fixed."
+        "All earlier reviewed playback, account, source and Usenet work is retained. Apple build 259 and Android version code 240 are fresh packages. Broader provider playback, physical cross-device acceptance and complete Android visual parity are not claimed universally fixed."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses

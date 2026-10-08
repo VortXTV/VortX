@@ -2282,8 +2282,8 @@ struct iOSLibraryView: View {
 /// pause/resume/cancel/delete plus a total-storage footer. Device-local only; nothing here syncs or
 /// touches the account library.
 struct DownloadsView: View {
-    /// Hand a ready-to-play local-file launch up to the Library view, which presents the player cover.
-    let onPlay: (iOSPlayerLaunch) -> Void
+    /// The presenter owns resume lookup and account/profile fencing before opening the local file.
+    let onPlay: (DownloadRecord) -> Void
 
     @ObservedObject private var store = DownloadStore.shared
     private let manager = DownloadManager.shared
@@ -2486,11 +2486,7 @@ struct DownloadsView: View {
             if record.state == .completed { manager.cancel(id: record.id) }   // file gone → clean up the stale row
             return
         }
-        let url = store.fileURL(for: record)
-        let launch = iOSPlayerLaunch(url: url, title: record.displayTitle, headers: nil,
-                                     resume: 0, meta: record.playbackMeta,
-                                     qualityText: record.qualityText, isTorrent: false)
-        onPlay(launch)
+        onPlay(record)
     }
 }
 
@@ -2542,6 +2538,8 @@ struct iOSDownloadsScreen: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @State private var downloadPlayer: iOSPlayerLaunch?
+    @State private var downloadLaunchTask: Task<Void, Never>?
+    @State private var downloadLaunchRequest: UUID?
 
     var body: some View {
         ScrollView {
@@ -2575,7 +2573,7 @@ struct iOSDownloadsScreen: View {
                 }
                 .buttonStyle(.plain)
 
-                DownloadsView(onPlay: { launch in downloadPlayer = launch })
+                DownloadsView(onPlay: playDownload)
             }
             .padding(.horizontal, Theme.Space.md)
             .padding(.vertical, Theme.Space.lg)
@@ -2587,6 +2585,46 @@ struct iOSDownloadsScreen: View {
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         .iOSPlayerCover($downloadPlayer, account: account, core: core)
+        .onDisappear {
+            downloadLaunchTask?.cancel()
+            downloadLaunchTask = nil
+            downloadLaunchRequest = nil
+        }
+    }
+
+    @MainActor private func playDownload(_ record: DownloadRecord) {
+        downloadLaunchTask?.cancel()
+        let request = UUID()
+        downloadLaunchRequest = request
+        let owner = PlaybackMutationTarget.capture(core: core)
+        let activeProfileID = ProfileStore.shared.activeID
+        let meta = record.playbackMeta
+        downloadLaunchTask = Task { @MainActor in
+            guard !Task.isCancelled, downloadLaunchRequest == request,
+                  ProfileStore.shared.activeID == activeProfileID,
+                  owner.stillOwnsCurrentContext(core: core) else { return }
+            // Match by library/episode ID, not whichever unrelated detail is still resident.
+            let engine = core.engineResumeSecondsByLibraryId(for: meta)
+            let resume: Double
+            if let engine, engine.isFinite, engine > 5 {
+                resume = engine
+            } else {
+                resume = await account.resumeOffset(for: meta)
+            }
+            guard !Task.isCancelled, downloadLaunchRequest == request,
+                  ProfileStore.shared.activeID == activeProfileID,
+                  owner.stillOwnsCurrentContext(core: core),
+                  let current = DownloadStore.shared.records.first(where: { $0.id == record.id }),
+                  current.state == .completed, current.playbackMeta == meta,
+                  DownloadStore.shared.fileExists(for: current) else { return }
+            downloadPlayer = iOSPlayerLaunch(
+                url: DownloadStore.shared.fileURL(for: current), title: current.displayTitle,
+                headers: nil, resume: resume.isFinite ? max(0, resume) : 0, meta: meta,
+                qualityText: current.qualityText, isTorrent: false
+            )
+            downloadLaunchTask = nil
+            downloadLaunchRequest = nil
+        }
     }
 }
 #endif
@@ -2608,6 +2646,8 @@ struct iOSSearchView: View {
     #if os(iOS)
     @FocusState private var searchFocused: Bool
     @State private var submittedSuggestion: String?
+    #elseif os(macOS)
+    @FocusState private var macInlineSearchFocused: Bool
     #endif
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
@@ -2627,13 +2667,9 @@ struct iOSSearchView: View {
                     Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Search tab -> scroll here
                     quickActions
 
-                    // macOS search lives in the PERSISTENT window top bar (iOSRootView.macTopBar), NOT in
-                    // a toolbar `.searchable`: a toolbar search item is realized as an NSToolbarItem on the
-                    // single shared window toolbar and crashes in _insertNewItemWithItemIdentifier (the Mac
-                    // crash class the wordmark/sign-in toolbar items are #if os(iOS)-gated for). The old
-                    // in-content field here was invisible to the owner: it only existed inside this tab's
-                    // scroll content (and vanished entirely in merged Discover+Search mode, which drops the
-                    // Search tab), so the top bar replaces it and hands the query over via MacSearchBridge.
+                    // The dedicated Search route always owns a visible field. The global Mac search
+                    // popover remains a shortcut, not a substitute for the page's primary action.
+                    // Keep both out of NSToolbar: native searchable reconciliation crashed this shell.
 
                     #if os(iOS)
                     if isTyping && !suggestionTitles.isEmpty { touchSearchSuggestions }
@@ -2651,6 +2687,8 @@ struct iOSSearchView: View {
             // accessory, where it competes with our custom navigation on newer iOS versions.
             .safeAreaInset(edge: .top, spacing: 0) { touchSearchField }
             .scrollDismissesKeyboard(.interactively)
+            #elseif os(macOS)
+            .safeAreaInset(edge: .top, spacing: 0) { macInlineSearchField }
             #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Search"), isActive: isActive)
@@ -2675,6 +2713,9 @@ struct iOSSearchView: View {
             #if os(iOS)
             .onChange(of: isActive) { active in if !active { searchFocused = false } }
             .onChange(of: path.count) { count in if count > 0 { searchFocused = false } }
+            #elseif os(macOS)
+            .onChange(of: isActive) { active in if !active { macInlineSearchFocused = false } }
+            .onChange(of: path.count) { count in if count > 0 { macInlineSearchFocused = false } }
             #endif
             .onChange(of: profiles.activeID) { _ in
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
@@ -2715,6 +2756,45 @@ struct iOSSearchView: View {
         }
         #endif
     }
+
+    #if os(macOS)
+    private var macInlineSearchField: some View {
+        HStack(spacing: Theme.Space.sm) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(Theme.Palette.textSecondary)
+            TextField("Movies or series", text: $query)
+                .textFieldStyle(.plain)
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .focused($macInlineSearchFocused)
+                .onSubmit {
+                    searchTask?.cancel()
+                    searchDebouncePending = false
+                    let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                    core.suggestSearch(value)
+                    core.search(value)
+                }
+                .accessibilityLabel("Search movies or series")
+            if !query.isEmpty {
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.horizontal, Theme.Space.md)
+        .frame(minHeight: 52)
+        .vortxGlassField(in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .frame(maxWidth: 900)
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.vertical, Theme.Space.sm)
+        .frame(maxWidth: .infinity)
+        .background(Theme.Palette.canvas)
+    }
+    #endif
 
     #if os(iOS)
     private var touchSearchField: some View {

@@ -4,6 +4,27 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.4.0-beta.21 - Profile sync, chosen-source binge playback, and recovery fixes
+
+Apple build **259**, Android version code **240**. Carries the reviewed changes since Beta 20:
+cross-client profile creation/edit propagation; sparse website profile updates; owner-scoped
+add-on removal/reorder receipts; chosen add-on/release continuity for episode advance, preload
+and batch downloads; bounded source resolution; terminal playback errors with the correct failed
+episode Retry target; manual-seek retirement of stale resume work; owned preview exit; Mac native
+window controls, a single detail Back and a visible Mac Search field; owned downloaded resume;
+preview original-position/pause carry into accepted replacements; Android TV halfway prewarm,
+automatic advance and Back-safe asynchronous auto-pick; source-owned mpv restart/non-EOF
+settlement accounting instead of optimistic seek-target success; and accepted-seek diagnostics.
+
+The website profile fixes are deployed separately and require updated native clients for the
+complete path. Active profile selection remains device-local. This beta includes Apple and Android,
+retains the Beta 20 touch-player/crash repairs and the earlier Android Beta 18 feature set, and
+does not claim universal Dolby Vision/NNTP stability or complete Apple/Android visual parity.
+
+See [the full Beta 21 notes](docs/releases/0.4.0-beta.21.md) for behavior, checks, remaining limits
+and installation. Publication is gated on exact tagged packages, production Android signing,
+immutable source/provenance, launch/package checks and update-feed verification.
+
 ## 0.4.0-beta.20 - Working iPhone/iPad playback and cleaner touch controls
 
 Apple build **258**. Publishes the complete reviewed iPhone/iPad crash repair, cleaner touch player,

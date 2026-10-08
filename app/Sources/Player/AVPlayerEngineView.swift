@@ -16,6 +16,7 @@ import AVFoundation
 struct AVPlayerEngineView: PlatformViewRepresentable {
     @ObservedObject var coordinator: MPVMetalPlayerView.Coordinator
     private var resumeOriginSeconds = 0.0
+    private var startsPaused = false
 
     init(coordinator: MPVMetalPlayerView.Coordinator) {
         self.coordinator = coordinator
@@ -31,6 +32,12 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
         return self
     }
     func live(_ live: Bool) -> Self { coordinator.playLive = live; return self }
+    /// Opt-in transport carry for a replacement surface; ordinary mounts still autoplay.
+    func initiallyPaused(_ paused: Bool) -> Self {
+        var copy = self
+        copy.startsPaused = paused
+        return copy
+    }
     /// Configure the source-timeline origin before the initial synchronous `loadFile` in `makeHostView`.
     /// A later SwiftUI `onAppear` is too late: by then a remux mount has already consumed its one-shot origin.
     func resumeOrigin(_ seconds: Double?) -> Self {
@@ -67,6 +74,7 @@ struct AVPlayerEngineView: PlatformViewRepresentable {
         if let url = coordinator.playUrl {
             engine.configureResumeOrigin(seconds: resumeOriginSeconds)
             engine.loadFile(url, headers: coordinator.playHeaders, live: coordinator.playLive)
+            if startsPaused { engine.pause() }
         }
         return view
     }

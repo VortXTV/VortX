@@ -80,3 +80,7 @@ swiftc -strict-concurrency=complete -warnings-as-errors \
   app/Sources/Player/SubtitleRenditionPolicy.swift app/Tests/PlayerLiveContractTests.swift \
   -o "$build_dir/player-live"
 "$build_dir/player-live"
+swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/Tests/DownloadResumeLaunchContractTests.swift -o "$build_dir/download-resume-launch"
+"$build_dir/download-resume-launch"
+bash scripts/test-mpv-seek-settlement.sh

@@ -29,6 +29,8 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.player.BadSourceAutoRetrySetting
 import com.vortx.android.player.MpvEngineFactory
+import com.vortx.android.player.NextEpisodePreloadPolicy
+import com.vortx.android.player.NextEpisodePreloadTaskOwner
 import com.vortx.android.player.PlayerEngineRouter
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import com.vortx.android.player.PlayerLaunchPolicy
@@ -102,6 +104,7 @@ fun TvApp(
         var playingEngineOverride by remember {
             mutableStateOf(PlayerLaunchPolicy.defaultPreference(MpvEngineFactory.isBundled))
         }
+        val autoAdvanceStreak = remember { intArrayOf(0) }
         // The browse destination belongs above the player overlay. Returning from a cloud or link play must
         // recreate the same Search surface rather than a fresh HOME shell.
         var shellDestination by remember { mutableStateOf(TvDestination.HOME) }
@@ -119,6 +122,7 @@ fun TvApp(
             val target = event.target
             playing = null
             playingMeta = null
+            autoAdvanceStreak[0] = 0
             detailGeneration += 1
             detail = target.toMetaItem()
         }
@@ -180,7 +184,7 @@ fun TvApp(
         fun returnToBrowse() {
             // Revoke an unresolved attempt before hiding the player. Coroutine cancellation is cooperative,
             // so the lease fence must lose authority before any late resolver callback can publish.
-            playerVm?.abandonPlaybackResolve()
+            playerVm?.abandonPlaybackRoute()
             playing = null
             if (shellDestination == TvDestination.SEARCH) searchFocusRestoreSignal++
         }
@@ -216,15 +220,68 @@ fun TvApp(
             val playerEpisodeOptions = remember(playerVm, playerSourceState) {
                 playerVm?.playerEpisodeOptions().orEmpty()
             }
+            // A warm task belongs to this accepted episode and complete profile/source owner.
+            // Disposing or replacing either cancels real I/O, not just its eventual publication.
+            val playerOwnerKey = "${activeProfile?.id}:$detailSourceEpoch:${playerDetail?.type}:${playerDetail?.id}"
+            val currentPlayerPrincipal = activeProfile?.id to debridOwnerEpoch
+            val launchedPlayerPrincipal = remember(playable) { currentPlayerPrincipal }
+            val launchedPlayerViewModel = remember(playable) { playerVm }
+            val preloadPolicy = remember(historyIdentity, playerOwnerKey) { NextEpisodePreloadPolicy() }
+            val preloadScope = rememberCoroutineScope()
+            val preloadTaskOwner = remember(historyIdentity, playerOwnerKey) {
+                NextEpisodePreloadTaskOwner(preloadScope)
+            }
+            fun cancelPreload() {
+                preloadTaskOwner.cancel()
+                preloadPolicy.invalidate()
+            }
+            DisposableEffect(historyIdentity, playerOwnerKey) {
+                onDispose { cancelPreload() }
+            }
             var retryingSource by remember(playable) { mutableStateOf(false) }
+            var advancingEpisode by remember(playable) { mutableStateOf(false) }
             var retryResumePositionMs by remember(playable) { mutableStateOf(playable.startPositionMs) }
             val retryPlayback = if (playerVm != null) {
                 playerVm.playback.collectAsStateWithLifecycle().value
             } else {
                 Playback.Idle
             }
+            fun exitPlayer() {
+                cancelPreload()
+                advancingEpisode = false
+                retryingSource = false
+                autoAdvanceStreak[0] = 0
+                returnToBrowse()
+            }
+            // The VM can rebuild its selected episode for another profile while the old file
+            // is still mounted. Never advance/retry that file against the new viewer's route.
+            LaunchedEffect(currentPlayerPrincipal, playerVm, advancingEpisode, retryingSource, playable) {
+                if (launchedPlayerPrincipal != currentPlayerPrincipal ||
+                    (launchedPlayerViewModel !== playerVm && (advancingEpisode || retryingSource))) {
+                    exitPlayer()
+                } else if (launchedPlayerViewModel !== playerVm) {
+                    // Audio/source preference edits must not stop healthy mounted playback.
+                    // Retire only continuation work; the rebuilt VM does not own this episode.
+                    cancelPreload()
+                }
+            }
+            LaunchedEffect(advancingEpisode, retryPlayback) {
+                if (!advancingEpisode || playerVm == null || launchedPlayerViewModel !== playerVm || launchedPlayerPrincipal != currentPlayerPrincipal) return@LaunchedEffect
+                when (val state = retryPlayback) {
+                    is Playback.Ready -> {
+                        playerVm.clearPlayback()
+                        advancingEpisode = false
+                        playing = state.playable
+                    }
+                    is Playback.Failed -> {
+                        playerVm.clearPlayback()
+                        exitPlayer()
+                    }
+                    else -> Unit
+                }
+            }
             LaunchedEffect(retryingSource, retryPlayback) {
-                if (!retryingSource || playerVm == null) return@LaunchedEffect
+                if (!retryingSource || playerVm == null || launchedPlayerViewModel !== playerVm || launchedPlayerPrincipal != currentPlayerPrincipal) return@LaunchedEffect
                 when (val state = retryPlayback) {
                     is Playback.Ready -> {
                         playerVm.clearPlayback()
@@ -242,7 +299,7 @@ fun TvApp(
                 }
             }
             // D-pad Back pops the player back to the detail page rather than exiting the app.
-            BackHandler(onBack = ::returnToBrowse)
+            BackHandler(onBack = ::exitPlayer)
             DisposableEffect(historyIdentity) {
                 playbackHistory.begin()
                 onDispose {
@@ -252,30 +309,85 @@ fun TvApp(
             PlayerScreen(
                 playable = playable,
                 engineOverride = playingEngineOverride,
+                autoAdvanceCount = autoAdvanceStreak[0],
+                onBingePrompted = { autoAdvanceStreak[0] = 0 },
                 sourceOptions = playerSourceOptions,
                 qualityOptions = playerQualityOptions,
                 episodeOptions = playerEpisodeOptions,
                 currentSource = playerVm?.currentPlayerSource(),
-                onSwitchSource = playerVm?.let { vm ->
-                    { source -> vm.resolveSourceSwitch(source) }
+                onSwitchSource = playerVm?.takeIf { it === launchedPlayerViewModel && !advancingEpisode && !retryingSource }?.let { vm ->
+                    { source ->
+                        check(!advancingEpisode && !retryingSource) { "Episode handoff in progress" }
+                        check(launchedPlayerPrincipal == currentPlayerPrincipal) { "Playback owner changed" }
+                        cancelPreload()
+                        advancingEpisode = false
+                        autoAdvanceStreak[0] = 0
+                        try { vm.resolveSourceSwitch(source) } finally { cancelPreload() }
+                    }
                 },
-                onSwitchEpisode = playerVm?.let { vm ->
-                    { episodeId -> vm.resolveEpisodeSwitch(episodeId) }
+                onSwitchEpisode = playerVm?.takeIf { it === launchedPlayerViewModel && !advancingEpisode && !retryingSource }?.let { vm ->
+                    { episodeId ->
+                        check(!advancingEpisode && !retryingSource) { "Episode handoff in progress" }
+                        check(launchedPlayerPrincipal == currentPlayerPrincipal) { "Playback owner changed" }
+                        cancelPreload()
+                        advancingEpisode = false
+                        autoAdvanceStreak[0] = 0
+                        vm.resolveEpisodeSwitch(episodeId)
+                    }
                 },
                 onEpisodeSwitched = { replacement, acceptedRevision ->
+                    autoAdvanceStreak[0] = 0
                     historyIdentity = advancePlayerEpisodeHistory(
                         current = historyIdentity,
                         replacement = replacement,
                         acceptedRevision = acceptedRevision,
                     )
                 },
-                onBack = ::returnToBrowse,
-                onError = ::returnToBrowse,
-                onSourceFailed = if (playerVm != null && BadSourceAutoRetrySetting.isEnabled(appContext)) {
+                onWarmNext = onWarmNext@{ positionMs, durationMs ->
+                    if (advancingEpisode || retryingSource) return@onWarmNext
+                    if (launchedPlayerViewModel !== playerVm) return@onWarmNext
+                    if (launchedPlayerPrincipal != currentPlayerPrincipal) return@onWarmNext
+                    val vm = playerVm ?: return@onWarmNext
+                    val next = vm.nextEpisode() ?: return@onWarmNext
+                    val target = NextEpisodePreloadPolicy.Target(next.id, historyIdentity.acceptedRevision)
+                    val attempt = preloadPolicy.evaluate(
+                        target, positionMs, durationMs, android.os.SystemClock.elapsedRealtime(),
+                    ) ?: return@onWarmNext
+                    preloadTaskOwner.launch(
+                        target = target,
+                        prepare = { vm.warmNextEpisode(next.id) },
+                        onComplete = { ready ->
+                            preloadPolicy.complete(attempt, ready, android.os.SystemClock.elapsedRealtime())
+                        },
+                    )
+                },
+                onBack = ::exitPlayer,
+                onError = ::exitPlayer,
+                onEnded = {
+                    val vm = playerVm
+                    if (launchedPlayerPrincipal != currentPlayerPrincipal || launchedPlayerViewModel !== playerVm) {
+                        exitPlayer()
+                    } else if (!advancingEpisode && vm != null && vm.nextEpisode() != null) {
+                        cancelPreload()
+                        retryingSource = false
+                        autoAdvanceStreak[0]++
+                        advancingEpisode = true
+                        vm.playNextEpisode()
+                    } else if (!advancingEpisode) {
+                        exitPlayer()
+                    }
+                },
+                onSourceFailed = if (playerVm != null && playerVm === launchedPlayerViewModel && !advancingEpisode && BadSourceAutoRetrySetting.isEnabled(appContext)) {
                     { positionMs ->
+                        if (launchedPlayerPrincipal != currentPlayerPrincipal) {
+                            exitPlayer()
+                        } else {
+                        cancelPreload()
+                        advancingEpisode = false
                         retryResumePositionMs = positionMs
                         // SAME-SOURCE TIER FIRST (audit 05.1), then the hop ladder (see VortXApp note).
                         retryingSource = playerVm.retrySameSource(positionMs) || playerVm.retryNextSource(positionMs)
+                        }
                     }
                 } else {
                     null
@@ -331,10 +443,11 @@ fun TvApp(
                         viewModel = detailVm,
                         title = current.name,
                         onBack = {
-                            detailVm.abandonPlaybackResolve()
+                            detailVm.abandonPlaybackRoute()
                             detail = null
                         },
                         onPlay = { resolved, loadedMeta, requestedEngine ->
+                            autoAdvanceStreak[0] = 0
                             playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
                                 requested = requestedEngine,
                                 playable = resolved,
@@ -372,6 +485,7 @@ fun TvApp(
                     // slot a streamed source resolves into. Clears any stale detail meta so the player reads the
                     // local file, not a previous title's badges.
                     onPlayLocal = {
+                        autoAdvanceStreak[0] = 0
                         playingEngineOverride = automaticEngineFor(it)
                         playingMeta = null
                         playing = it

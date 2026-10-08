@@ -1628,6 +1628,11 @@ struct PlayerScreen: View {
     @State private var recoveryPauseOwner: PlayerLoadToken?
     @State private var recoveryPauseIntent = false
     @State private var recoveryPauseTarget: Double = 0
+    private struct PreviewPauseSurfaceTransfer {
+        let retiringOwner: PlayerLoadToken
+        let context: DeferredResumeSeekReconciliationPolicy.SurfaceContext
+    }
+    @State private var previewPauseSurfaceTransfer: PreviewPauseSurfaceTransfer?
     @State private var reconnecting = false          // showing the "Recovering…" auto-retry state
     @State private var reconnectMsg = "Recovering…"
     @State private var autoRetryCount = 0
@@ -1945,6 +1950,7 @@ struct PlayerScreen: View {
                         engineSurfaceUsesActiveTuple ? (curHint ?? recordQualityText ?? "") : (recordQualityText ?? "")))
                 .live(engineSurfaceUsesActiveTuple ? isLive : initialIsLive)
                 .resumeOrigin(avSurfaceResumeOrigin ?? resumeSeconds)
+                .initiallyPaused(previewPauseForSurface(engine: .avPlayer))
                 .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
                 .ignoresSafeArea()
         } else {
@@ -1963,6 +1969,7 @@ struct PlayerScreen: View {
                   audioSidecar: mpvSurfacePlayback.audioSidecar,
                   isDolbyVision: mpvSurfacePlayback.isDolbyVision)
             .live(mpvSurfacePlayback.live)
+            .initiallyPaused(previewPauseForSurface(engine: .libmpv))
             .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
             .ignoresSafeArea()
     }
@@ -2681,10 +2688,22 @@ struct PlayerScreen: View {
         // A late first-frame/EOF event cannot resurrect a terminal attempt. A deliberate retry or
         // accepted replacement reopens callbacks; the existing load-token gates still fence old events.
         guard !loadFailed else { return }
+        if let loadToken, let transfer = previewPauseSurfaceTransfer,
+           loadToken != transfer.retiringOwner,
+           loadToken == coordinator.player?.activeLoadToken {
+            if previewPauseForSurface(engine: isAVPlayerActive ? .avPlayer : .libmpv) {
+                recoveryPauseOwner = loadToken
+                recoveryPauseTarget = avSurfaceResumeOrigin ?? currentTime
+                recoveryPauseIntent = true
+                coordinator.player?.pause()
+            }
+            previewPauseSurfaceTransfer = nil
+        }
         if let loadToken, loadToken == recoveryPauseOwner,
            loadToken == coordinator.player?.activeLoadToken,
            name == MPVProperty.timePos, let event = data as? PlayerTimePositionEvent,
-           event.loadToken == loadToken, abs(event.seconds - recoveryPauseTarget) <= 2 {
+           event.loadToken == loadToken, event.transportSettled,
+           abs(event.seconds - recoveryPauseTarget) <= 2 {
             recoveryPauseOwner = nil
             if recoveryPauseIntent { coordinator.player?.pause() }
         }
@@ -2754,9 +2773,12 @@ struct PlayerScreen: View {
                ) {
                 let d = event.seconds
                 guard d.isFinite, d >= 0 else { return }
-                lastRawTimePos = d
-                lastRawTimePosOwner = event.loadToken
-                lastRawTimePosMountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
+                // Recovery retains the last settled position; the UI can still show raw seek targets.
+                if event.positionSettled {
+                    lastRawTimePos = d
+                    lastRawTimePosOwner = event.loadToken
+                    lastRawTimePosMountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
+                }
                 if pendingAdvance?.issued != true, supersededAdvance == nil {
                     committedLoadToken = event.loadToken
                 }
@@ -2771,8 +2793,9 @@ struct PlayerScreen: View {
                        positionSeconds: d, avPlayerRenderedFrame: renderedAVFrame) { return }
                 if let target = postFrameResumeSeekWatchdogTarget,
                    postFrameResumeSeekWatchdogOwner == event.loadToken,
+                   event.transportSettled,
                    abs(d - target) <= 5 {
-                    // A provenance-accepted raw tick proves this generation's deferred seek landed. Retire the
+                    // A source/generation-owned settled sample proves the deferred seek landed. Retire the
                     // watchdog before later manual seeking can make its old target appear to have failed.
                     cancelPostFrameResumeSeekWatchdog()
                 }
@@ -3843,6 +3866,7 @@ struct PlayerScreen: View {
                                 contentHint: String? = nil,
                                 resumeOrigin: Double? = nil,
                                 preservingAbandonedResume: Bool = false,
+                                preservingPreviewPause: Bool = false,
                                 recoveryOwner: PlayerLoadToken? = nil,
                                 preparedRemux: VortXPreparedRemuxAttachment? = nil,
                                 expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> PlayerLoadToken? {
@@ -3930,7 +3954,8 @@ struct PlayerScreen: View {
             // Same-source recovery retains the latest viewer pause across the new file's startup.
             recoveryPauseIntent = capturedRecoveryPause
             recoveryPauseTarget = requestedResumeOrigin
-            recoveryPauseOwner = preservingAbandonedResume && recoveryPauseIntent ? issuedToken : nil
+            recoveryPauseOwner = (preservingAbandonedResume || preservingPreviewPause) && recoveryPauseIntent
+                ? issuedToken : nil
             if recoveryPauseOwner != nil { player.pause() }
             abandonedResumeRecovery = DeferredResumeSeekReconciliationPolicy.afterAdmission(
                 current: abandonedResumeRecovery, retiringOwner: retiringOwner, acceptedOwner: issuedToken,
@@ -4025,10 +4050,26 @@ struct PlayerScreen: View {
         )
     }
 
+    private var ownedPausedPreviewOwner: PlayerLoadToken? {
+        guard skipDBPreviewing, pendingAdvance == nil, skipDBPreviewWasPaused,
+              let owner = skipDBPreviewOwner, owner == coordinator.player?.activeLoadToken else { return nil }
+        return owner
+    }
+
+    private func previewPauseForSurface(engine: DeferredResumeSeekReconciliationPolicy.Engine) -> Bool {
+        guard !playbackExited, pendingAdvance == nil, recoveryPauseIntent,
+              playbackDeadlineClock.isPaused, let transfer = previewPauseSurfaceTransfer else { return false }
+        return transfer.context == resumeSurfaceContext(engine: engine)
+    }
+
     /// Capture the resume origin owned by the exact active load before replacing it. An unframed source hop or
     /// episode advance can differ from the immutable launch resume, while a started load resumes from its live
     /// clock. The persistence floor remains authoritative when a forward-only engine has not reached it yet.
     private func retryResumeTarget(confirmedPositionOverride: Double? = nil) -> Double {
+        let ownedPreviewPosition = skipDBPreviewing && pendingAdvance == nil &&
+            skipDBPreviewOwner != nil &&
+            skipDBPreviewOwner == coordinator.player?.activeLoadToken
+            ? skipDBPreviewReturnPosition : nil
         if let confirmedPositionOverride, confirmedPositionOverride.isFinite, confirmedPositionOverride >= 0 {
             return confirmedPositionOverride   // proven premature EOF evidence, not the saved floor
         }
@@ -4042,7 +4083,7 @@ struct PlayerScreen: View {
         let target = RetryResumeTargetPolicy.target(
             isLive: isLive,
             hasStartedPlaying: hasStartedPlaying,
-            currentTimeSeconds: currentTime,
+            currentTimeSeconds: ownedPreviewPosition ?? currentTime,
             // A MID-PLAY failure hands the ladder a load that had already reached the viewer's position, so the
             // position - not this load's origin - is what its retry must resume at (see midPlayFailureResume).
             // nil in every other case, which is every case that existed before, so the policy is unchanged there.
@@ -4500,6 +4541,7 @@ struct PlayerScreen: View {
     }
 
     private func viewerPlay() {
+        previewPauseSurfaceTransfer = nil
         recoveryPauseIntent = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         coordinator.player?.play()
@@ -5375,7 +5417,7 @@ struct PlayerScreen: View {
     /// it is not a failover attempt and the "trying another source" overlay never appears; libmpv just
     /// tone-maps a DV link to HDR10 (an acceptable fallback). `silent` suppresses the DV notice: the no-frame
     /// start watchdog demotes silently, while a genuine mid-play decode failure keeps the informative notice.
-    private func demoteAVPlayerToMPV(silent: Bool) {
+    private func demoteAVPlayerToMPV(silent: Bool, preservingPreviewPause: Bool = false) {
         // Consume the one-shot dead-input evidence FIRST, so it can never leak into a later demote.
         // See `demoteFollowedDeadInput`.
         let followedDeadInput = demoteFollowedDeadInput
@@ -5384,6 +5426,9 @@ struct PlayerScreen: View {
         guard let retiringAVPlayer = coordinator.player as? AVPlayerEngineController else { return }
         if let owner = retiringAVPlayer.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
         resumeRetryGeneration &+= 1
+        if preservingPreviewPause, let owner = retiringAVPlayer.activeLoadToken {
+            previewPauseSurfaceTransfer = .init(retiringOwner: owner, context: resumeSurfaceContext(engine: .libmpv))
+        }
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueSourceGeneration = sourceSwitchGeneration
         let reissueMediaGeneration = resumeRetryGeneration
@@ -5536,6 +5581,8 @@ struct PlayerScreen: View {
         toAVPlayer: Bool,
         preservingNativeDebridRecoveryGeneration: Bool = false
     ) {
+        let previewPauseOwner = ownedPausedPreviewOwner
+        if skipDBPreviewing, pendingAdvance == nil { stopSkipDBPreview() }
         // Re-validate against the ACTIVE source before committing: the picker row is gated by
         // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
         // non-DV MKV, or a mid-session switch to a torrent) so we never feed a dead URL into AVPlayer.
@@ -5558,12 +5605,16 @@ struct PlayerScreen: View {
         // Resolve a stale provider URL (or join its current refresh) BEFORE the physical AV→MPV handoff.
         // Otherwise the direct demotion bypasses fresh-link recovery and loads the same failed transport.
         if !toAVPlayer, coordinator.player is AVPlayerEngineController {
-            demoteAVPlayerToMPV(silent: true)
+            demoteAVPlayerToMPV(silent: true, preservingPreviewPause: previewPauseOwner != nil)
             close()
             return
         }
         srcProbe("user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
         if !preservingNativeDebridRecoveryGeneration { resumeRetryGeneration &+= 1 }
+        if let previewPauseOwner {
+            previewPauseSurfaceTransfer = .init(retiringOwner: previewPauseOwner,
+                context: resumeSurfaceContext(engine: toAVPlayer ? .avPlayer : .libmpv))
+        }
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueMediaGeneration = resumeRetryGeneration
         let reissuePendingVideoID = pendingAdvance?.meta.videoId
@@ -6156,6 +6207,8 @@ struct PlayerScreen: View {
                               mediaGenerationAlreadyClaimed: Bool = false,
                               preparedRemux: VortXPreparedRemuxAttachment? = nil,
                               expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> Bool {
+        let preservingPreviewPause = ownedPausedPreviewOwner != nil
+        if skipDBPreviewing, pendingAdvance == nil { stopSkipDBPreview() }
         if userInitiated, loadFailed {
             playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         }
@@ -6228,6 +6281,7 @@ struct PlayerScreen: View {
         let issuedToken = loadIntoPlayer(
             newURL, headers: nextHeaders, live: nextLive, contentHint: nextHint,
             resumeOrigin: resume,
+            preservingPreviewPause: preservingPreviewPause,
             preparedRemux: preparedRemux,
             expectedPreparedRemuxOwner: expectedPreparedRemuxOwner
         )
@@ -9958,7 +10012,11 @@ struct PlayerScreen: View {
     /// the cover down - so a stuck load can never trap the user with a Task still spinning. Routed from
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
+        // Preview time is temporary editor state, not the viewer's watch progress.
+        // Restore it under the original owner before terminal/history/scrobble decisions.
+        if skipDBPreviewing { stopSkipDBPreview() }
         let exitLoadToken = coordinator.player?.activeLoadToken
+        previewPauseSurfaceTransfer = nil
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         cancelTerminalFinalityRefresh()
         cancelDirectResumeInventoryRefresh()
