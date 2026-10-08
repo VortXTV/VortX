@@ -62,13 +62,15 @@
 # succeeded, with `--enable-decoder=sonic` warning ("did not match anything") and not dying. shaderc
 # itself is still built and still shipped; only FFmpeg stopped linking it.
 #
-# Our delta to MPVKit is TWO files, and they are deliberately kept apart:
+# Our delta to MPVKit is kept in separate reviewable patches:
 #   scripts/mpvkit-dvfel.patch        patches MPVKit's Package.swift and build driver: dependency
 #                                     pins, libplacebo source build, Security.framework linkage,
 #                                     Apple TLS selection, and the E-AC-3 encoder.
 #   scripts/mpv-moltenvk-resize.patch patches MPV itself. Installed below as patch 0004 next to
 #                                     MPVKit's own 0001-0003, because it edits the file MPVKit's 0001
 #                                     creates and so must be applied after it.
+#   scripts/mpv-coreaudio-hotplug-lifecycle.patch patches MPV's native CoreAudio init-failure
+#                                     cleanup. Installed as 0005; no mpv version/audio policy bump.
 # Everything not listed above still comes from upstream MPVKit's own prebuilt zips at the versions
 # the MPVKit 1.0.0 base already used.
 #
@@ -104,6 +106,8 @@ git apply "$REPO/scripts/mpvkit-dvfel.patch"
 # copy from a previous run is simply overwritten.
 cp "$REPO/scripts/mpv-moltenvk-resize.patch" \
    "$WORK/MPVKit/Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch"
+cp "$REPO/scripts/mpv-coreaudio-hotplug-lifecycle.patch" \
+   "$WORK/MPVKit/Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch"
 
 # A prior interrupted experiment installed this exact VortX-only FFmpeg patch as
 # an untracked file. `git checkout -- .` cannot remove untracked files, so clear
@@ -119,15 +123,19 @@ swift run --build-path ./.build --package-path Sources/BuildScripts \
 
 # Assembly reads the per-library release ZIP, not slice scratch directories.
 # Refuse to package a stale ZIP after an interrupted or incorrectly cached run.
-LIBAVFORMAT_ZIP="$WORK/MPVKit/dist/release/Libavformat.xcframework.zip"
-[ -f "$LIBAVFORMAT_ZIP" ] || {
-  echo "missing rebuilt artifact: $LIBAVFORMAT_ZIP" >&2
-  exit 1
-}
-[ "$LIBAVFORMAT_ZIP" -nt "$BUILD_STARTED_MARKER" ] || {
-  echo "refusing stale Libavformat ZIP: $LIBAVFORMAT_ZIP" >&2
-  exit 1
-}
+# Libmpv must be fresh too: a rebuilt FFmpeg archive alone cannot carry the
+# CoreAudio lifetime fix. Never silently repackage the old vulnerable player.
+for library in Libavformat Libmpv; do
+  library_zip="$WORK/MPVKit/dist/release/$library.xcframework.zip"
+  [ -f "$library_zip" ] || {
+    echo "missing rebuilt artifact: $library_zip" >&2
+    exit 1
+  }
+  [ "$library_zip" -nt "$BUILD_STARTED_MARKER" ] || {
+    echo "refusing stale $library ZIP: $library_zip" >&2
+    exit 1
+  }
+done
 rm -f "$BUILD_STARTED_MARKER"
 trap - EXIT
 

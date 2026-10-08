@@ -1,0 +1,166 @@
+VortX patch 0005: close CoreAudio init-failure listener lifetimes.
+
+Base: mpv 8c67647b50059406c5c0444903597281b81516cf (unchanged).
+Backports the intent of upstream fixes:
+  af067b5ea8e5fe396ebd9d3f895e51a7e75b3c09 (cleanup ao on init failure)
+  c5d391adba7bd024954d0df1e0405f5749f4d4ca (register after audiounit init)
+  https://github.com/mpv-player/mpv/pull/18383
+
+The generic AO owner calls driver uninit only after successful init. Registering
+listeners before channel-map/AudioUnit setup therefore leaves a dangling AO
+context when setup fails and mpv falls back to another output. The next device
+notification reaches hotplug_cb -> mp_msg through freed memory (mpv#18274).
+
+Also close adjacent failure edges exercised by our actual-source fixture:
+  - clear a locally disposed AudioUnit before shared cleanup (no double disposal);
+  - roll back only successfully added listeners if either registration fails,
+    including the hotplug-only initializer (which also has no failure uninit);
+  - keep zero/partial/repeated cleanup and registration refcounts balanced;
+  - detach listeners before disposing resources inspected by their callback.
+
+This is NOT a callback-queue redesign, leaked-context workaround, audio-format
+override, or a whole-mpv upgrade. It does not claim to prove what triggered a
+particular HAL notification or to solve an undocumented late callback after a
+successful AudioObjectRemovePropertyListener. Removal errors remain logged.
+
+Regression: python3 scripts/test-mpv-coreaudio-lifecycle.py
+The fixture verifies SHA-pinned source, applies THIS patch, compiles the actual
+lifecycle functions with ASan/UBSan and fake HAL calls, and requires baseline UAF
+failures plus patched success. No app, playback, device mutation or provider use.
+
+--- a/audio/out/ao_coreaudio.c
++++ b/audio/out/ao_coreaudio.c
+@@ -53,6 +53,7 @@
+     dispatch_queue_t queue;
+
+     int hotplug_cb_registration_times;
++    int hotplug_listener_count;
+ };
+
+ static int64_t ca_get_hardware_latency(struct ao *ao) {
+@@ -141,6 +142,7 @@
+ static void reinit_latency(struct ao *ao);
+ static bool register_hotplug_cb(struct ao *ao);
+ static void unregister_hotplug_cb(struct ao *ao);
++static void uninit(struct ao *ao);
+
+ static bool reinit_device(struct ao *ao) {
+     struct priv *p = ao->priv;
+@@ -167,9 +169,6 @@
+     if (!reinit_device(ao))
+         goto coreaudio_error;
+
+-    if (!register_hotplug_cb(ao))
+-        goto coreaudio_error;
+-
+     if (p->change_physical_format)
+         init_physical_format(ao);
+
+@@ -185,6 +184,8 @@
+     talloc_free(layout);
+
+     if (!r)
++        goto coreaudio_error;
++    if (!register_hotplug_cb(ao))
+         goto coreaudio_error;
+
+     reinit_latency(ao);
+@@ -196,6 +197,7 @@
+     return CONTROL_OK;
+
+ coreaudio_error:
++    uninit(ao);
+     return CONTROL_ERROR;
+ }
+
+@@ -347,6 +349,7 @@
+     AudioUnitUninitialize(p->audio_unit);
+ coreaudio_error_component:
+     AudioComponentInstanceDispose(p->audio_unit);
++    p->audio_unit = NULL;
+ coreaudio_error:
+     return false;
+ }
+@@ -436,23 +439,31 @@
+ {
+     struct priv *p = ao->priv;
+
+-    dispatch_sync(p->queue, ^{
+-        cancel_and_release_idle_work(p);
+-    });
+-    dispatch_release(p->queue);
++    // Detach callbacks before releasing resources they can inspect.
++    unregister_hotplug_cb(ao);
+
+-    AudioOutputUnitStop(p->audio_unit);
+-    AudioUnitUninitialize(p->audio_unit);
+-    AudioComponentInstanceDispose(p->audio_unit);
++    if (p->queue) {
++        dispatch_sync(p->queue, ^{
++            cancel_and_release_idle_work(p);
++        });
++        dispatch_release(p->queue);
++        p->queue = NULL;
++    }
+
++    if (p->audio_unit) {
++        AudioOutputUnitStop(p->audio_unit);
++        AudioUnitUninitialize(p->audio_unit);
++        AudioComponentInstanceDispose(p->audio_unit);
++        p->audio_unit = NULL;
++    }
++
+     if (p->original_asbd.mFormatID) {
+         OSStatus err = CA_SET(p->original_asbd_stream,
+                               kAudioStreamPropertyPhysicalFormat,
+                               &p->original_asbd);
+         CHECK_CA_WARN("could not restore physical stream format");
++        p->original_asbd = (AudioStreamBasicDescription){0};
+     }
+-
+-    unregister_hotplug_cb(ao);
+ }
+
+ static OSStatus hotplug_cb(AudioObjectID id, UInt32 naddr,
+@@ -512,11 +523,14 @@
+             MP_ERR(ao, "failed to set device listener %s (%s)", c1, c2);
+             goto coreaudio_error;
+         }
++        p->hotplug_listener_count++;
+     }
+
+     return true;
+
+ coreaudio_error:
++    // Neither failed init caller receives a matching driver uninit.
++    unregister_hotplug_cb(ao);
+     return false;
+ }
+
+@@ -524,11 +538,13 @@
+ {
+     struct priv *p = ao->priv;
+
++    if (!p->hotplug_cb_registration_times)
++        return;
+     if (--p->hotplug_cb_registration_times)
+         return;
+
+     OSStatus err = noErr;
+-    for (int i = 0; i < MP_ARRAY_SIZE(hotplug_properties); i++) {
++    for (int i = 0; i < p->hotplug_listener_count; i++) {
+         AudioObjectPropertyAddress addr = {
+             hotplug_properties[i],
+             kAudioObjectPropertyScopeGlobal,
+@@ -539,9 +555,10 @@
+         if (err != noErr) {
+             char *c1 = mp_tag_str(hotplug_properties[i]);
+             char *c2 = mp_tag_str(err);
+-            MP_ERR(ao, "failed to set device listener %s (%s)", c1, c2);
++            MP_ERR(ao, "failed to remove device listener %s (%s)", c1, c2);
+         }
+     }
++    p->hotplug_listener_count = 0;
+ }
+
+ #define OPT_BASE_STRUCT struct priv
