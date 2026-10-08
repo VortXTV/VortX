@@ -177,6 +177,32 @@ class VortxNativeSessionTest {
             assertTrue(runCatching { VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), true) }.isFailure)
         } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
+    @Test fun `encrypted account locator preserves exact owner and rejects corruption missing state or rebind`() {
+        val directory = Files.createTempDirectory(File("build").toPath(), "native-locator-test-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val store = VortxEncryptedCheckpointStore(directory) { key }
+        try {
+            assertNull(store.discover(scope.accountID))
+            assertTrue(runCatching { store.remember(scope) }.isFailure)
+            VortxNativeSession.open(scope, "Owner", Runtime(), store, Transport(), true).close()
+            assertTrue(runCatching { store.verifyFreshAccount(scope.copy(accountID = "new-account")) }.isFailure)
+            store.remember(scope)
+            store.verifyFreshAccount(scope.copy(accountID = "new-account"))
+            assertEquals(scope, VortxEncryptedCheckpointStore(directory) { key }.discover(scope.accountID))
+            assertTrue(runCatching { store.remember(scope.copy(ownerProfileID = "different")) }.isFailure)
+            assertNull(store.discover("foreign-account"))
+            val locator = directory.listFiles()!!.single { it.name.startsWith("native-account-") }
+            val state = directory.listFiles()!!.single { it.name.startsWith("native-state-") }
+            assertFalse(locator.readBytes().toString(Charsets.UTF_8).contains(scope.ownerProfileID))
+            val sealedState = state.readBytes(); state.delete()
+            assertTrue(runCatching { store.discover(scope.accountID) }.isFailure)
+            state.writeBytes(sealedState)
+            val sealedLocator = locator.readBytes(); sealedLocator[12] = (sealedLocator[12].toInt() xor 1).toByte(); locator.writeBytes(sealedLocator)
+            assertTrue(runCatching { store.discover(scope.accountID) }.isFailure)
+            assertEquals(String(sealedState, Charsets.ISO_8859_1), String(state.readBytes(), Charsets.ISO_8859_1))
+        } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+
     @Test fun `old encrypted adjacent encoded credentials fail before hydration without rewriting checkpoint`() {
         val directory = Files.createTempDirectory(File("build").toPath(), "native-retained-guard-").toFile()
         val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
@@ -360,6 +386,26 @@ class VortxNativeSessionTest {
         }
     }
 
+    @Test fun `malformed remote applied preferences never replace warm or cold checkpoint`() {
+        val runtime = Runtime(); val store = Store()
+        for ((field, value) in listOf("playback" to JSONObject().put("useAddonOrder", JSONObject()),
+            "discovery" to JSONObject().put("selectedProviders", JSONArray().put("7")),
+            "stremiox.autoSkip" to "yes")) {
+            val wire = NativeHostPreferences.empty(scope)
+            val fields = if (field.startsWith("stremiox")) wire.getJSONObject("globals").getJSONObject("fields") else
+                JSONObject().also { wire.getJSONObject("profiles").put("owner", JSONObject().put("fields", it)) }
+            fields.put(field, JSONObject().put("clock", 1).put("actor", "00000000-0000-0000-0000-000000000001").put("value", value))
+            open(runtime, store).use { session ->
+                val disk = store.value; val state = session.read().state.toString()
+                assertTrue(runCatching { session.dispatch(emptyList(), remoteHostPreferences = wire) }.isFailure)
+                assertEquals(disk, store.value); assertEquals(state, session.read().state.toString())
+            }
+            val disk = store.value
+            assertTrue(runCatching { VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), initialHostPreferences = wire) }.isFailure)
+            assertEquals(disk, store.value)
+        }
+    }
+
     @Test fun `adjacent full profile preferences commit and reopen with state or remain unchanged`() {
         val runtime = Runtime(); val store = Store()
         val preferences = JSONObject().put("owner", JSONObject().put("avatar", "fixture").put("playback", JSONObject().put("audioLang", "fr")))
@@ -374,17 +420,18 @@ class VortxNativeSessionTest {
         open(runtime, store).use { assertEquals(preferences.toString(), it.read().state.getJSONObject("hostProfilePreferences").toString()) }
         val newer = JSONObject().put("modifiedSeconds", 20).put("owner", JSONObject().put("avatar", "newer"))
         VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), initialHostProfiles = newer).use {
-            assertEquals("newer", it.read().state.getJSONObject("hostProfilePreferences").getJSONObject("owner").getString("avatar"))
-            assertTrue(it.read().state.getBoolean("hostProfileSyncPending"))
+            assertEquals("fixture", it.read().state.getJSONObject("hostProfilePreferences").getJSONObject("owner").getString("avatar"))
+            assertTrue(it.read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
         }
         VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), initialHostProfiles = JSONObject().put("modifiedSeconds", 10)).use {
-            assertEquals("newer", it.read().state.getJSONObject("hostProfilePreferences").getJSONObject("owner").getString("avatar"))
-            assertTrue(it.read().state.getBoolean("hostProfileSyncPending"))
+            assertEquals("fixture", it.read().state.getJSONObject("hostProfilePreferences").getJSONObject("owner").getString("avatar"))
+            assertTrue(it.read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
         }
         store.value = JSONObject(store.value!!).also { it.remove("hostProfileSyncPending") }.toString()
         VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), initialHostProfiles =
             JSONObject().put("modifiedSeconds", 10).put("owner", JSONObject().put("avatar", "older"))).use {
-            assertTrue(it.read().state.getBoolean("hostProfileSyncPending"))
+            assertFalse(it.read().state.getBoolean("hostProfileSyncPending"))
+            assertTrue(it.read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
         }
         val cleanStore = Store()
         VortxNativeSession.open(scope, "Owner", Runtime(), cleanStore, Transport(), allowNewAccount = true,

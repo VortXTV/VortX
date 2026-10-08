@@ -18,8 +18,13 @@ transaction as native merge. Pending/malformed website `profileEdits` and missin
 native-carrier import receipts fail closed before checkpoint publication. Unchanged
 legacy material remains a no-op after native edits; differing material never silently
 mounts an older native state. The exact account/mount is checked again after UI projection.
-404, malformed success, network/key/decrypt failure and missing full rosters never
-create a blank account. New-account/no-backup provisioning remains a separate gate.
+An authenticated never-backed account can provision a deterministic Main/A11C baseline
+only after a proven missing backup and acknowledged create-only version-zero PUT.
+The candidate stays detached until acceptance; collisions re-pull the winner before
+mounting, including a different historical owner. Unknown outcomes leave no provisional
+checkpoint. A persistent account-scoped backup-seen marker prevents later 404s from
+resetting an account, including backups stored at version zero. Malformed success,
+network/key/decrypt failures and incomplete rosters never create blank accounts.
 Logout/account replacement retires the writer and clears native profile/UI state;
 reopening waits for retired transactions before touching the account checkpoint.
 
@@ -47,21 +52,25 @@ Older checkpoints' adjacent host fields are checked before hydration; detected
 credentials or malformed encoded carriers reject the original file without rewriting
 it. Fresh typed import material is checked without sanitizing or changing its receipt.
 Native sync derives from a freshly authenticated full cloud document and replaces
-only `nativeSync`, preserving the original legacy roster/settings/library/watch
+only `nativeSync` and the separate `nativeHostPreferences` carrier, preserving the original legacy roster/settings/library/watch
 baseline and all unknown/credential fields. Rewriting that baseline from native
-projections would invalidate the import receipt on the next pull. Outbound host-only
-profile preferences, global settings and credential changes need a versioned
-reconciliation contract; pending dirty global settings or changed host credentials
-block push rather than reporting an upload or clearing unapplied intent. Existing
+projections would invalidate the import receipt on the next pull. Unsupported dirty
+global settings or changed host credentials block push rather than reporting an upload
+or clearing unapplied intent. Existing
 host credential/global-settings restoration on pull is retained. Native profile,
 library and watch changes still synchronize through the native carrier using the
 existing encrypted optimistic-concurrency push. Active profile selection is never
 exported in `nativeSync`.
 Host-only profile preferences (including avatar, playback and discovery settings)
-are accepted locally and retained in the encrypted checkpoint. Such edits set durable
-`hostProfileSyncPending` intent and block native push until explicit outbound
-reconciliation exists; sync cannot report those changes uploaded or clear that intent.
-The flag survives cold reopen/remote merge and is never sent to the kernel or cloud.
+use shared schema-one per-field registers: `{clock,actor,value}`, ordered by safe-integer
+Lamport clock then lowercase UUID actor. Null is explicit deletion; equal-event unequal
+values are rejected. Profile and global buckets both wrap `fields`; native authority,
+device selection and credentials are forbidden. Unknown safe fields survive without
+being applied. Known nested profile/global types are validated before commit.
+`nativeHostPreferenceState` atomically retains the local actor/counter, merged carrier
+and pending state adjacent to the kernel. Only the carrier is uploaded; an exact accepted
+generation is acknowledged, so edits during PUT remain pending across cold restart.
+Old `hostProfileSyncPending` intent migrates only against an authenticated baseline.
 Native-owned name/PIN/parental/theme fields remain pushable through `nativeSync`.
 
 Checkpoints live in Android's `noBackupFilesDir/native-state`. Android Keystore
@@ -71,7 +80,11 @@ holds a non-exportable AES-256 key per scope. The sealed payload is
 Writes flush the temporary file, atomically rename within the directory, flush
 the directory and authenticate/read back the result. Only a missing file counts
 as absence. Key/decrypt/access/malformed-state failures do not create an empty
-account. Account bearer tokens and passwords are not accepted by the session.
+account. An independently sealed account-to-owner locator supports offline recovery with
+the verified persisted account lease, including historical owner UUIDs. It is published
+after the full checkpoint; missing/corrupt/unindexed prior state is not fresh-account
+authority. Cached global registers and archived settings project under the same lease
+before network access. Account bearer tokens and passwords are not accepted by the session.
 
 The real repository currently supports:
 
@@ -83,6 +96,13 @@ The real repository currently supports:
 - Durable per-profile standard library membership, library export, individual
   movie/episode watched changes, Continue Watching reads/dismissal, and explicitly
   identified offline/native-streaming playback progress callbacks.
+- Atomic season watched/reset over the exact metadata-provided episode IDs (no synthetic
+  episode identities). A changed owner or failed action rejects the whole transaction.
+- Parental admission runs native catalog/meta queries on raw provider objects before
+  presentation decoding, including Home/Discover/search/pages and embedded streams.
+  Unknown certifications fail closed. A certified series cannot authorize a foreign
+  episode ID. Pagination advances by raw counts, and empty filtered Home pages expose
+  a native-only Continue catalog button on phone/TV, one bounded page per user action.
 - Watch Stats reads the native active-profile history/resume projection and cached
   native metadata genres. It never reads legacy JNI or disk buckets in native
   mode; unavailable ownership produces an explicit UI error. Native watch time is
@@ -109,10 +129,10 @@ cannot overwrite the kernel's exact resume offset or explicit reset-to-zero.
 
 Still unsupported, exposed as errors rather than success/no-op: Stremio login,
 unresolved own-Stremio-account migration, ambiguous or incomplete legacy carriers,
-new-account/no-backup provisioning, continuous old-client reconciliation,
-outbound global-settings/credential reconciliation,
-whole-series/season bulk watched mutation, add-on URL replacement and parental
-resource filtering. The existing profile UI verifies projected salted PINs before
+continuous old-client reconciliation, outbound provider credential reconciliation,
+global settings outside the explicit shared SettingsBackup type whitelist (and legacy
+flat native-profile theme changes), whole-series bulk watched mutation and add-on URL
+replacement. The existing profile UI verifies projected salted PINs before
 selection; stale projected profiles are rejected. Direct repository PIN switching
 remains blocked rather than bypassing that gate. Source
 ordering does not yet implement `rememberedQuality`/`wantedAddon` continuity.

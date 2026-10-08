@@ -161,6 +161,9 @@ internal object NativeHostDocument {
         /** Only recognizable structured base64 is a carrier; opaque ordinary strings remain exact. */
         private fun encodedStructure(value: String, path: String, depth: Int): String? {
             budget(depth)
+            // UUIDs (including random register actors) are identifiers, not base64url carriers.
+            // Some random UUID bytes otherwise happen to start with a quote or JSON delimiter.
+            if (Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").matches(value)) return null
             val candidate = value.filterNot { it in " \t\r\n" }
             if (candidate.isEmpty()) return null
             requireArchive(candidate.length <= 44 * 1024 * 1024, "Encoded host document exceeds inspection limits")

@@ -29,11 +29,28 @@ class NativeAccountSyncTest {
     @org.junit.After fun resetDispatcher() { Dispatchers.resetMain() }
     private val key = ByteArray(32) { (it + 1).toByte() }
     private val account = VortXSyncManager.Account("00000000-0000-0000-0000-000000000123", "fixture@example.invalid", "Fixture", false)
+    private fun bindings() = object : VortxRuntimeBindings {
+        override fun create(ownerId: String, ownerName: String) = VortxCore.nativeInitRuntime(JSONObject().put("ownerId", ownerId).put("ownerName", ownerName).toString())
+        override fun hydrate(snapshot: String) = VortxCore.nativeInitFromStateJson(snapshot)
+        override fun dispatch(handle: Long, action: String) = VortxCore.nativeDispatchJson(handle, action)
+        override fun resolve(handle: Long, request: String) = VortxCore.nativeResolveJson(handle, request)
+        override fun state(handle: Long) = VortxCore.nativeGetStateJson(handle)
+        override fun delta(handle: Long) = VortxCore.nativeGetStateDeltaJson(handle)
+        override fun free(handle: Long) = VortxCore.nativeEngineFree(handle)
+    }
+    private fun noNetwork() = object : VortxResourceTransport {
+        override fun makeCancellation(): VortxResourceCancellation = error("No provider request permitted")
+        override fun load(requestJson: String, cancellation: VortxResourceCancellation): String = error("No provider request permitted")
+    }
     private class Gateway : NativeAccountGateway {
         var applied = 0
         var retired = 0
+        var reopened = 0
         var last: JSONObject? = null
         override fun retire() { retired++ }
+        override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean {
+            check(isCurrent()); reopened++; return true
+        }
         override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean {
             check(isCurrent()); applied++; last = JSONObject(document.toString()); return true
         }
@@ -53,6 +70,7 @@ class NativeAccountSyncTest {
                 manager.installNativeGatewayTestSeam(gateway)
                 assertFalse(manager.syncDown(true)); assertFalse(manager.syncUp())
                 assertEquals(0, gateway.applied); assertEquals(0, puts)
+                assertEquals(1, gateway.reopened)
             } finally { manager.cancelSyncTestWork() }
         }
     }
@@ -106,7 +124,7 @@ class NativeAccountSyncTest {
         } finally { manager.cancelSyncTestWork() }
     }
 
-    @Test fun `real JNI native name and PIN upload but host preference intent survives rejected push and cold reopen`() = runBlocking {
+    @Test fun `real JNI native and host fields sync separately with failed push cold persistence and exact event acknowledgement`() = runBlocking {
         org.junit.Assume.assumeTrue("Requires reviewed local JNI", System.getenv("VORTX_JNI_SYNC") == "1")
         System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))
         val bindings = object : VortxRuntimeBindings {
@@ -125,20 +143,26 @@ class NativeAccountSyncTest {
         val directory = java.nio.file.Files.createTempDirectory(java.io.File("build").toPath(), "native-host-intent-").toFile()
         val checkpointKey = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
         val checkpoints = VortxEncryptedCheckpointStore(directory) { checkpointKey }
-        val manager = VortXSyncManager(TestContext())
+        val context = TestContext()
+        val manager = VortXSyncManager(context)
         fun coordinator() = NativeAccountCoordinator(bindings, checkpoints, { noNetwork }, { true }, { it() }, {})
         var runtime = coordinator()
         val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Legacy owner", avatar = "star", isOwner = true)
         var cloud = JSONObject().put("vortx", JSONObject().put("roster", org.json.JSONArray().put(owner.encode()))
             .put("rosterModified", 123.5).put("library", org.json.JSONArray()).put("addons", org.json.JSONArray()))
-        var cloudVersion = 100L; var uploads = 0
+        var cloudVersion = 100L; var uploads = 0; var rejectPut = false; var failGet = false
+        var whileUploading: (() -> Unit)? = null
         try {
             manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0, transport = { method, _, body, _ ->
-                if (method == "GET") 200 to JSONObject().put("version", cloudVersion).put("document",
-                    VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, cloudVersion, true))
+                if (method == "GET") {
+                    if (failGet) 500 to null else 200 to JSONObject().put("version", cloudVersion).put("document",
+                        VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, cloudVersion, true))
+                }
                 else {
+                    if (rejectPut) return@installSyncTestSeam 500 to null
                     val request = requireNotNull(body); cloudVersion = request.getLong("version")
                     cloud = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, request.getString("document"), account.id, cloudVersion))))
+                    whileUploading?.invoke(); whileUploading = null
                     uploads++; 200 to JSONObject().put("accepted", true)
                 }
             })
@@ -154,18 +178,106 @@ class NativeAccountSyncTest {
             assertEquals("Legacy owner", cloud.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).getString("name"))
             profiles.save(profiles.read().profiles.single().copy(avatar = "moon"), false)
             val read = runtime.session().read()
-            assertTrue(read.state.getBoolean("hostProfileSyncPending"))
-            assertTrue(JSONObject(checkpoints.read(read.owner.scope)!!).getBoolean("hostProfileSyncPending"))
+            assertTrue(read.state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+            assertTrue(JSONObject(checkpoints.read(read.owner.scope)!!).getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+            rejectPut = true
             assertFalse(manager.syncUp()); assertEquals(1, uploads)
-            assertTrue(runtime.session().read().state.getBoolean("hostProfileSyncPending"))
+            assertTrue(runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
             runtime.retire(); runtime = coordinator(); manager.installNativeGatewayTestSeam(runtime)
             assertTrue(manager.syncDown(true))
             assertEquals("moon", NativeProfileAccess { runtime.session() }.read().profiles.single().avatar)
-            assertTrue(runtime.session().read().state.getBoolean("hostProfileSyncPending"))
-            assertFalse(manager.syncUp()); assertEquals(1, uploads)
+            assertTrue(runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+            rejectPut = false
+            context.getSharedPreferences("vortx_settings", 0).edit().putBoolean("stremiox.autoSkip", true).commit()
+            context.getSharedPreferences("vortx_sync_dirty", 0).edit().putString("vortx.sync.dirtySettings.${account.id}", "{\"stremiox.autoSkip\":123.25}").commit()
+            whileUploading = { profiles.save(profiles.read().profiles.single().copy(avatar = "sun"), false) }
+            assertTrue(manager.syncUp()); assertEquals(2, uploads)
+            assertTrue(runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+            assertEquals("sun", profiles.read().profiles.single().avatar)
+            val fields = cloud.getJSONObject("nativeHostPreferences").getJSONObject("profiles").getJSONObject(owner.id).getJSONObject("fields")
+            assertEquals("moon", fields.getJSONObject("avatar").getString("value"))
+            assertTrue(cloud.getJSONObject("nativeHostPreferences").getJSONObject("globals").getJSONObject("fields").getJSONObject("stremiox.autoSkip").getBoolean("value"))
+            assertFalse(context.getSharedPreferences("vortx_sync_dirty", 0).contains("vortx.sync.dirtySettings.${account.id}"))
+            assertTrue(manager.syncUp()); assertEquals(3, uploads)
+            assertFalse(runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
+            assertEquals("sun", cloud.getJSONObject("nativeHostPreferences").getJSONObject("profiles").getJSONObject(owner.id).getJSONObject("fields").getJSONObject("avatar").getString("value"))
             assertFalse(cloud.getJSONObject("nativeSync").has("hostProfileSyncPending"))
+            assertFalse(cloud.has("nativeHostPreferenceState"))
             assertEquals("star", cloud.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).getString("avatar"))
+            runtime.retire(); runtime = coordinator(); manager.installNativeGatewayTestSeam(runtime)
+            // Another account/process may have left a different flat preference. A's sealed
+            // account register must project before the failed network pull, without cloud access.
+            context.getSharedPreferences("vortx_settings", 0).edit().putBoolean("stremiox.autoSkip", false).commit()
+            failGet = true
+            assertFalse(manager.syncDown(true))
+            assertTrue(context.getSharedPreferences("vortx_settings", 0).getBoolean("stremiox.autoSkip", false))
+            assertEquals("sun", profiles.read().profiles.single().avatar)
         } finally { runtime.retire(); manager.cancelSyncTestWork(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+
+    @Test fun `real JNI first backup uses zero and collisions or unknown outcomes require authenticated repull`() = runBlocking {
+        org.junit.Assume.assumeTrue("Requires reviewed local JNI", System.getenv("VORTX_JNI_SYNC") == "1")
+        System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))
+        for (mode in listOf("accepted", "collision-zero", "collision-positive", "collision-other-owner", "timeout-created", "missing-ack")) {
+            val directory = java.nio.file.Files.createTempDirectory(java.io.File("build").toPath(), "native-first-backup-").toFile()
+            val checkpointKey = javax.crypto.KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+            val checkpoints = VortxEncryptedCheckpointStore(directory) { checkpointKey }
+            val context = TestContext(); val manager = VortXSyncManager(context)
+            val runtime = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { true }, { it() }, {})
+            var cloud: JSONObject? = null; var cloudVersion = 0L; val versions = mutableListOf<Long>(); var gets = 0
+            try {
+                manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0, transport = { method, _, body, _ ->
+                    if (method == "GET") {
+                        gets++
+                        cloud?.let { 200 to JSONObject().put("version", cloudVersion).put("document",
+                            VortXCrypto.sealDocument(key, it.toString().toByteArray(), account.id, cloudVersion, true)) } ?: (404 to null)
+                    } else {
+                        val request = requireNotNull(body); val version = request.getLong("version"); versions += version
+                        val candidate = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, request.getString("document"), account.id, version))))
+                        if (versions.size == 1) {
+                            assertEquals(0L, version)
+                            assertTrue(directory.listFiles().orEmpty().isEmpty())
+                            assertTrue(runCatching { runtime.session() }.isFailure)
+                            cloud = candidate.put("peerUnknownPreference", "preserve")
+                            if (mode == "collision-other-owner") {
+                                val peer = UserProfile(id = "00000000-0000-0000-0000-000000001234", name = "Peer", avatar = "🍿", isOwner = true)
+                                cloud = JSONObject().put("peerUnknownPreference", "preserve").put("vortx", JSONObject()
+                                    .put("roster", org.json.JSONArray().put(peer.encode())).put("rosterModified", 7)
+                                    .put("library", org.json.JSONArray()).put("addons", org.json.JSONArray()))
+                            }
+                            cloudVersion = if (mode == "collision-positive") 123 else 0
+                            when (mode) {
+                                "collision-zero", "collision-positive", "collision-other-owner" -> 200 to JSONObject().put("accepted", false).put("version", cloudVersion)
+                                "timeout-created" -> 0 to null
+                                "missing-ack" -> 200 to JSONObject().put("ok", true)
+                                else -> 200 to JSONObject().put("accepted", true)
+                            }
+                        } else {
+                            assertTrue(gets >= 2); assertTrue(version > cloudVersion)
+                            assertEquals("preserve", candidate.getString("peerUnknownPreference"))
+                            cloud = candidate; cloudVersion = version
+                            200 to JSONObject().put("accepted", true)
+                        }
+                    }
+                })
+                manager.installNativeGatewayTestSeam(runtime)
+                val unknown = mode in setOf("timeout-created", "missing-ack")
+                assertEquals(!unknown, manager.syncUp())
+                if (unknown) {
+                    assertEquals(listOf(0L), versions); assertTrue(directory.listFiles().orEmpty().isEmpty())
+                    assertTrue(runCatching { runtime.session() }.isFailure); assertTrue(manager.syncUp())
+                }
+                val peerWon = mode == "collision-other-owner"
+                assertEquals(if (peerWon) "Peer" else "Main", NativeProfileAccess { runtime.session() }.read().profiles.single().name)
+                assertEquals(if (peerWon) "00000000-0000-0000-0000-000000001234" else UserProfile.OWNER_ID, runtime.session().scope.ownerProfileID)
+                if (!peerWon) assertEquals("authenticated-empty-v1", cloud!!.getString("nativeAccountBootstrap"))
+                assertTrue(context.getSharedPreferences("vortx_sync_state", 0).getBoolean("nativeBackupSeen.${account.id}", false))
+                val before = runtime.session().read().state.toString(); val writes = versions.size
+                cloud = null // A previously existing backup disappearing is not a new account.
+                assertFalse(manager.syncDown(true)); assertFalse(manager.syncUp())
+                assertEquals(before, runtime.session().read().state.toString()); assertEquals(writes, versions.size)
+            } finally { runtime.retire(); manager.cancelSyncTestWork(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+        }
     }
 
     private class TestContext : ContextWrapper(null) {

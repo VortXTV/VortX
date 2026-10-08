@@ -78,10 +78,6 @@ internal class NativeCatalogRepository(
         return response.getJSONArray("addons").objects()
     }
     private fun registry(read: VortxNativeRead): List<VortxResourceAddon> {
-        val parental = profile(read).getJSONObject("parental")
-        check(!parental.getBoolean("kids") && parental.opt("maturityCeiling").let { it == null || it == JSONObject.NULL }) {
-            "Native parental resource filtering is not enabled"
-        }
         val disabled = NativeAddonPreferences.disabled(read)
         val order = NativeAddonPreferences.order(read)
         val descriptors = addonDescriptors(read).let { values -> if (order == null) values else values.sortedBy {
@@ -96,6 +92,58 @@ internal class NativeCatalogRepository(
         JSONObject(requireNotNull(addon.manifestJson)).getJSONArray("catalogs").objects().map { CatalogSpec(addon, it) }
     }
     private fun canLoad(spec: CatalogSpec, extras: Set<String>) = spec.extras.none { it.optBoolean("isRequired") && it.getString("name") !in extras }
+    private fun parental(read: VortxNativeRead): Boolean = profile(read).getJSONObject("parental").let {
+        it.getBoolean("kids") || (!it.isNull("maturityCeiling") && it.has("maturityCeiling"))
+    }
+    private fun policyPage(page: VortxResourceSnapshot, read: VortxNativeRead): VortxResourceSnapshot {
+        if (!parental(read)) return page
+        val kind = when (page.request.resource) {
+            VortxResourceRequest.Resource.CATALOG -> "catalog"
+            VortxResourceRequest.Resource.META -> "meta"
+            else -> error("Parental metadata evidence required")
+        }
+        return page.copy(groups = page.groups.map { group ->
+            if (group.status != "ready") return@map group
+            val raw = JSONObject(requireNotNull(group.contentJson))
+            if (kind == "meta" && !raw.isNull("meta")) {
+                val value = raw.getJSONObject("meta")
+                require(value.getString("id") == page.request.id && value.getString("type") == page.request.type) { "Native metadata identity mismatch" }
+            }
+            if (kind == "catalog") {
+                val identities = raw.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }
+                require(identities.distinct().size == identities.size) { "Ambiguous parental catalog identity" }
+            }
+            val response = session().resolve(JSONObject().put("kind", kind).also {
+                if (kind == "catalog") it.put("metas", raw.getJSONArray("metas"))
+                else it.put("meta", raw.get("meta"))
+            }, read.owner)
+            check(response.getString("kind") == kind) { "Native parental projection unavailable" }
+            val field = if (kind == "catalog") "metas" else "meta"
+            // The policy DTO may omit provider extensions (notably embedded streams). Use it
+            // only as an admission decision; retain the exact approved provider object.
+            val allowed: Any = if (kind == "meta") {
+                if (response.isNull("meta")) JSONObject.NULL else raw.get("meta")
+            } else {
+                val ids = response.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }.toSet()
+                JSONArray(raw.getJSONArray("metas").objects().filter { (it.getString("type") to it.getString("id")) in ids })
+            }
+            group.copy(contentJson = JSONObject(raw.toString()).put(field, allowed).toString())
+        })
+    }
+    private fun board(pages: List<VortxResourceSnapshot>, addons: List<VortxResourceAddon>, read: VortxNativeRead) =
+        VortxResourceProjection.board(pages.map { policyPage(it, read) }, addons)
+    private fun rawCount(page: VortxResourceSnapshot) = page.groups.sumOf { it.items(page.request.resource).size }
+    private fun visibleLocal(items: List<MetaItem>, read: VortxNativeRead): List<MetaItem> {
+        if (!parental(read) || items.isEmpty()) return items
+        // Library/watch records deliberately do not invent a certification. Unknown is blocked by
+        // the same kernel policy until authenticated provider metadata supplies evidence.
+        val raw = JSONArray(items.map { JSONObject().put("id", it.id).put("type", it.type.id).put("name", it.name) })
+        val allowed = session().resolve(JSONObject().put("kind", "catalog").put("metas", raw), read.owner)
+        check(allowed.getString("kind") == "catalog")
+        val cached = synchronized(this) { detailCache.values.filter { it.first == read.owner }.map { it.second.type.id to it.second.id }.toSet() }
+        val identities = allowed.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }.toSet() + cached
+        return items.filter { (it.type.id to it.id) in identities }
+    }
     private fun owner(value: VortxNativeOwner) = ContinueWatchingOwner(value.profileID, value.scope.digest, value.scope.accountID, true, value.revision)
     override fun continueWatchingOwner() = runCatching { owner(session().read().owner) }.getOrDefault(unavailableOwner)
 
@@ -104,7 +152,7 @@ internal class NativeCatalogRepository(
     }.map { MetaItem(it.getString("id"), MediaType.fromId(it.getString("type")), it.getString("name"), poster = it.optStringOrNull("poster")) }
     private fun cw(read: VortxNativeRead): List<MetaItem> {
         val saved = savedItems(read)
-        return playback(read).getJSONArray("continueWatching").objects().map { item ->
+        return visibleLocal(playback(read).getJSONArray("continueWatching").objects().map { item ->
             val id = item.getString("metaId")
             val matches = saved.filter { it.id == id }
             check(matches.size <= 1) { "Ambiguous native watch media identity" }
@@ -113,7 +161,7 @@ internal class NativeCatalogRepository(
             val offset = item.getLong("offsetMs"); val duration = item.getLong("durationMs")
             MetaItem(id, type, item.getString("name"), poster = item.optStringOrNull("poster") ?: matches.singleOrNull()?.poster,
                 progress = if (duration > 0) (offset.toFloat() / duration).coerceIn(0f, 1f) else 0f, resumeSeconds = offset / 1000.0)
-        }
+        }, read)
     }
     private fun playback(read: VortxNativeRead): JSONObject = session().resolve(
         JSONObject().put("kind", "profile_playback").put("profileId", read.owner.profileID), read.owner).also {
@@ -129,12 +177,18 @@ internal class NativeCatalogRepository(
         val specs = catalogs(read).filter { canLoad(it, emptySet()) }
         val pages = session.load("board", read.owner, specs.map { it.request() to listOf(it.addon) })
         requireAnySettled(pages)
-        val rows = EngineState.parseCatalogs(VortxResourceProjection.board(pages, registry(read)), specs.associate { it.key to it.title })
-            .map { it.copy(hasNextPage = specs.find { spec -> spec.key == it.id }?.accepts("skip") == true && it.items.isNotEmpty()) }
+        val rawCounts = specs.zip(pages).associate { (spec, page) -> spec.key to rawCount(page) }
+        val parsedRows = EngineState.parseCatalogs(board(pages, registry(read), read), specs.associate { it.key to it.title }).associateBy { it.id }
+        val rows = specs.mapNotNull { spec ->
+            val more = spec.accepts("skip") && (rawCounts[spec.key] ?: 0) > 0
+            // The presentation decoder omits empty rows; retain this cursor when policy filtered
+            // the entire raw page, otherwise an allowed later page becomes unreachable.
+            (parsedRows[spec.key] ?: if (more) Catalog(spec.key, spec.title, emptyList()) else null)?.copy(hasNextPage = more)
+        }
         session.publish("board", read.owner, pages) {
             synchronized(this) {
                 homePages.clear()
-                rows.forEach { row -> specs.find { it.key == row.id }?.let { homePages[row.id] = HomePage(read.owner, it, row, row.items.size) } }
+                rows.forEach { row -> specs.find { it.key == row.id }?.let { homePages[row.id] = HomePage(read.owner, it, row, rawCounts[row.id] ?: 0) } }
             }
             listOf(Catalog("continue", "Continue Watching", cw(session.read()))) + rows
         }
@@ -170,12 +224,12 @@ internal class NativeCatalogRepository(
         val page = session.load("board:${catalog.id}", read.owner,
             listOf(previous.spec.request(listOf("skip" to previous.count.toString())) to listOf(previous.spec.addon))).single()
         requireSettled(page)
-        val next = EngineState.parseCatalogs(VortxResourceProjection.board(listOf(page), listOf(previous.spec.addon))).flatMap { it.items }
+        val next = EngineState.parseCatalogs(board(listOf(page), listOf(previous.spec.addon), read)).flatMap { it.items }
         session.publish("board:${catalog.id}", read.owner, listOf(page)) {
             synchronized(this) {
                 check(homePages[catalog.id] === previous) { "Native catalog reload superseded page" }
                 homePages[catalog.id] = previous.copy(catalog = previous.catalog.copy(
-                    items = (previous.catalog.items + next).distinctBy { it.type to it.id }, hasNextPage = next.isNotEmpty()), count = previous.count + next.size)
+                    items = (previous.catalog.items + next).distinctBy { it.type to it.id }, hasNextPage = rawCount(page) > 0), count = previous.count + rawCount(page))
             }
             homePageChanges.tryEmit(Unit)
         }; Unit
@@ -199,10 +253,10 @@ internal class NativeCatalogRepository(
         check(canLoad(spec, extras.map { it.first }.toSet())) { "Catalog requires a selection" }
         val page = session.load("discover", read.owner, listOf(spec.request(extras) to listOf(spec.addon))).single()
         requireSettled(page)
-        val items = EngineState.parseCatalogs(VortxResourceProjection.board(listOf(page), listOf(spec.addon))).flatMap { it.items }
+        val items = EngineState.parseCatalogs(board(listOf(page), listOf(spec.addon), read)).flatMap { it.items }
         session.publish("discover", read.owner, listOf(page)) {
-            synchronized(this) { discoverPage = DiscoverPage(read.owner, spec, extras, items, items.size) }
-            DiscoverResult(items, discoverFilters(specs, spec, extras, items.isNotEmpty()))
+            synchronized(this) { discoverPage = DiscoverPage(read.owner, spec, extras, items, rawCount(page)) }
+            DiscoverResult(items, discoverFilters(specs, spec, extras, rawCount(page) > 0))
         }
     }
     override suspend fun discoverNextPage(): Result<DiscoverResult> = attempt {
@@ -213,11 +267,11 @@ internal class NativeCatalogRepository(
         val request = previous.spec.request(previous.extra + ("skip" to previous.count.toString()))
         val page = session.load("discover", read.owner, listOf(request to listOf(previous.spec.addon))).single()
         requireSettled(page)
-        val next = EngineState.parseCatalogs(VortxResourceProjection.board(listOf(page), listOf(previous.spec.addon))).flatMap { it.items }
+        val next = EngineState.parseCatalogs(board(listOf(page), listOf(previous.spec.addon), read)).flatMap { it.items }
         val items = (previous.items + next).distinctBy { it.type to it.id }
         session.publish("discover", read.owner, listOf(page)) {
-            synchronized(this) { check(discoverPage === previous); discoverPage = previous.copy(items = items, count = previous.count + next.size) }
-            DiscoverResult(items, discoverFilters(catalogs(read), previous.spec, previous.extra, next.isNotEmpty()))
+            synchronized(this) { check(discoverPage === previous); discoverPage = previous.copy(items = items, count = previous.count + rawCount(page)) }
+            DiscoverResult(items, discoverFilters(catalogs(read), previous.spec, previous.extra, rawCount(page) > 0))
         }
     }
     private fun discoverFilters(specs: List<CatalogSpec>, selected: CatalogSpec, extra: List<Pair<String, String>>, more: Boolean): DiscoverFilters {
@@ -238,7 +292,7 @@ internal class NativeCatalogRepository(
         val specs = catalogs(read).filter { it.accepts("search") && canLoad(it, setOf("search")) }
         val pages = session.load("search", read.owner, specs.map { it.request(listOf("search" to text)) to listOf(it.addon) })
         requireAnySettled(pages)
-        session.publish("search", read.owner, pages) { EngineState.parseCatalogs(VortxResourceProjection.board(pages, registry(read))).flatMap { it.items }.distinctBy { it.type to it.id } }
+        session.publish("search", read.owner, pages) { EngineState.parseCatalogs(board(pages, registry(read), read)).flatMap { it.items }.distinctBy { it.type to it.id } }
     }
     override fun searchUpdates(query: String): Flow<Pair<List<MetaItem>, Boolean>> = flow {
         if (query.trim().length >= 2) emit(emptyList<MetaItem>() to true)
@@ -250,7 +304,7 @@ internal class NativeCatalogRepository(
         val session = session(); val read = session.read(); val addons = registry(read)
         val page = session.load("meta", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons)).single()
         requireSettled(page)
-        val detail = requireNotNull(EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(page, null, null, addons))) { "Native metadata unavailable" }
+        val detail = requireNotNull(EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(policyPage(page, read), null, null, addons))) { "Native metadata unavailable or blocked" }
         check(detail.id == id && detail.type == type) { "Native metadata identity mismatch" }
         session.publish("meta", read.owner, listOf(page)) {
             val decorated = decorate(detail, session.read())
@@ -267,13 +321,22 @@ internal class NativeCatalogRepository(
         val session = session(); val read = session.read(); val addons = registry(read)
         val stream = VortxResourceRequest(VortxResourceRequest.Resource.STREAM, type.id, episodeId ?: id)
         val pages = session.load("streams", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons, stream to addons))
-        val groups = EngineState.parseStreamGroups(VortxResourceProjection.metaDetails(pages[0], pages[1], stream, addons), episodeId ?: id)
-        if (groups.none { it.streams.isNotEmpty() }) requireSettled(pages[1])
-        val detail = EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(pages[0], null, null, addons))
+        val metaPage = policyPage(pages[0], read)
+        if (parental(read)) check(metaPage.groups.any { it.items(VortxResourceRequest.Resource.META).isNotEmpty() }) { "Native metadata blocked or uncertified" }
+        val detail = EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(metaPage, null, null, addons))
         check(detail == null || (detail.id == id && detail.type == type)) { "Native metadata identity mismatch" }
+        if (parental(read)) check(detail != null && if (type == MediaType.SERIES) {
+            episodeId != null && detail.videos.any { it.id == episodeId }
+        } else episodeId == null || episodeId == id) { "Stream identity is not in approved metadata" }
+        val rawGroups = EngineState.parseStreamGroups(VortxResourceProjection.metaDetails(metaPage, pages[1], stream, addons), episodeId ?: id)
+        val groups = if (parental(read)) rawGroups.map { group -> group.copy(streams = group.streams.filter {
+            StreamRanking.passesUserFilters(it, com.vortx.android.sources.SourcePrefsSnapshot.DEFAULT.copy(isKids = true))
+        }) } else rawGroups
+        if (groups.none { it.streams.isNotEmpty() }) requireSettled(pages[1])
         val selectedEpisode = detail?.videos?.find { it.id == episodeId }
         session.publish("streams", read.owner, pages) {
             synchronized(this) {
+                if (detail != null) detailCache[type to id] = read.owner to detail
                 sourceBindings.clear()
                 groups.map { group -> group.copy(streams = group.streams.map { source ->
                     val token = java.util.UUID.randomUUID().toString()
@@ -288,6 +351,8 @@ internal class NativeCatalogRepository(
     }
     suspend fun subtitles(type: MediaType, videoID: String, extra: List<Pair<String, String>> = emptyList()): Result<String> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)
+        if (parental(read)) check(synchronized(this) { detailCache.values.any { (owner, meta) -> owner == read.owner && meta.type == type &&
+            (meta.id == videoID || meta.videos.any { it.id == videoID }) } }) { "Approved native metadata required for subtitles" }
         val page = session.load("subtitles", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.SUBTITLES, type.id, videoID, extra) to addons)).single()
         requireSettled(page)
         session.publish("subtitles", read.owner, listOf(page)) { VortxResourceProjection.subtitles(page, addons) }
@@ -315,7 +380,7 @@ internal class NativeCatalogRepository(
         val request = requestJson?.let(::JSONObject) ?: JSONObject().put("type", "all").put("sort", "recent")
         val type = request.getString("type"); val sort = request.getString("sort")
         require(sort in setOf("recent", "name"))
-        val all = savedItems(read); var items = all.filter { type == "all" || it.type.id == type }
+        val all = visibleLocal(savedItems(read), read); var items = all.filter { type == "all" || it.type.id == type }
         if (sort == "name") items = items.sortedBy { it.name.lowercase() }
         fun wire(t: String = type, s: String = sort) = JSONObject().put("type", t).put("sort", s).toString()
         session.owned(read.owner) { LibraryResult(items, LibraryFilters(
@@ -373,7 +438,21 @@ internal class NativeCatalogRepository(
             .put("name", detail?.name).put("metadata", JSONObject().put("type", type.id).put("poster", detail?.poster))), read.owner)
         peekMeta(type, id) ?: meta(type, id).getOrThrow()
     }
-    override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> = attempt { unsupported("season watched mutation") }
+    override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> = attempt {
+        require(type == MediaType.SERIES && season >= 0) { "A series season is required" }
+        val session = session(); val read = session.read(); requireWatchIdentity(read, type, id)
+        val detail = peekMeta(type, id) ?: meta(type, id).getOrThrow()
+        val episodes = detail.videos.filter { it.season == season }
+        require(episodes.isNotEmpty() && episodes.size <= 10_000 && episodes.all { it.id.isNotBlank() } &&
+            episodes.map { it.id }.distinct().size == episodes.size) { "Exact season episode metadata is required" }
+        // Provider-supplied opaque IDs are the only evidence. Never synthesize id:season:episode,
+        // infer missing seasons, or partially commit a bulk operation. The captured owner also
+        // fences an account/profile switch while metadata was loading.
+        session.dispatch(episodes.map { video -> action(if (isWatched) "mark_watched" else "reset_watched")
+            .put("metaId", id).put("videoId", video.id).put("name", detail.name)
+            .put("metadata", JSONObject().put("type", type.id).put("poster", detail.poster)) }, read.owner)
+        session.owned(read.owner) { decorate(detail, session.read()) }
+    }
 
     override suspend fun installedAddons() = attempt {
         val session = session(); val read = session.read()
@@ -426,7 +505,9 @@ internal class NativeCatalogRepository(
         val session = session(); val read = session.read()
         return session.owned(read.owner) {
             val genres = synchronized(this) { detailCache.values.filter { it.first == read.owner }.associate { it.second.id to it.second.genres } }
-            NativeWatchStatsSnapshot(read.owner, NativeWatchStatsProjection.records(library(read)), genres)
+            val records = NativeWatchStatsProjection.records(library(read))
+            val allowed = if (parental(read)) visibleLocal(records.map { MetaItem(it.id, MediaType.fromId(it.type), it.name) }, read).map { it.id }.toSet() else null
+            NativeWatchStatsSnapshot(read.owner, records.filter { allowed == null || it.id in allowed }, genres)
         }
     }
     fun <T> withWatchStatsSnapshot(snapshot: NativeWatchStatsSnapshot, publish: () -> T): T = session().owned(snapshot.owner, publish)
@@ -450,6 +531,11 @@ internal class NativeCatalogRepository(
         require(captured.type in setOf("movie", "series"))
         requireWatchIdentity(read, MediaType.fromId(captured.type), captured.contentId)
         require(captured.contentId.isNotBlank() && captured.videoId.isNotBlank())
+        if (parental(read)) check(synchronized(this) {
+            detailCache[MediaType.fromId(captured.type) to captured.contentId]?.let { (cachedOwner, detail) ->
+                cachedOwner == read.owner && (captured.videoId == detail.id || detail.videos.any { it.id == captured.videoId })
+            } == true
+        }) { "Approved native metadata required for playback" }
         session.owned(read.owner) { synchronized(this) {
             PlaybackSessionToken(playbackSequence.incrementAndGet()).also { playing = Playing(it, read.owner, captured) }
         } }
@@ -495,12 +581,14 @@ internal class NativeCatalogRepository(
     }
     override suspend fun resolveDirectLink(url: String, title: String): Result<Playable> = attempt {
         val session = session(); val read = session.read()
+        check(!parental(read)) { "Uncertified direct links are blocked by parental settings" }
         val source = StreamSource(id = url, addon = "Direct link", title = title, url = url)
         requireNotNull(nativeDirectPlayable(source)) { "Only HTTP(S) direct links are supported" }
         resolveOwned(session, read, source, null)
     }
     override suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int?): Result<Playable> = attempt {
         val session = session(); val read = session.read()
+        check(!parental(read)) { "Uncertified magnets are blocked by parental settings" }
         require(Regex("[a-fA-F0-9]{40}").matches(infoHash) && (fileIdx == null || fileIdx >= 0))
         resolveOwned(session, read, StreamSource(id = infoHash, addon = "Magnet", title = title,
             infoHash = infoHash, fileIdx = fileIdx, isTorrent = true), null)

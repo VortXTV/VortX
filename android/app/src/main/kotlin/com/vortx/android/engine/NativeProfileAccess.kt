@@ -61,7 +61,7 @@ internal class NativeProfileAccess(private val session: () -> VortxNativeSession
             val profiles = native.keys().asSequence().map { native.getJSONObject(it) }.filterNot { it.getBoolean("deleted") }.map { value ->
                 val id = value.getString("id"); val settings = value.getJSONObject("settings"); val parental = value.getJSONObject("parental")
                 val previous = host.optJSONObject(id)?.let(UserProfile::decodeProfile) ?: UserProfile(id = id, name = value.getString("name"), avatar = "person.fill")
-                previous.copy(name = value.getString("name"), isOwner = value.getBoolean("owner"),
+                previous.copy(id = id, name = value.getString("name"), isOwner = value.getBoolean("owner"),
                     pin = value.optString("pin").takeUnless { it.isEmpty() || it == "null" },
                     isKids = parental.getBoolean("kids"), familyEdit = parental.getBoolean("familyEdit"),
                     accentID = settings.optString("accent", previous.accentID), oled = settings.getBoolean("oled"),

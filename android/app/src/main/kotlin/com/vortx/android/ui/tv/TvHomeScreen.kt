@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.grid.itemsIndexed as gridItemsIndexed
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Text
+import com.vortx.android.ui.components.showEmptyCatalogContinuation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -342,6 +343,11 @@ private fun TvCatalogRow(
 
     Column(modifier = Modifier.focusGroup()) {
         TvCatalogHeader(catalog)
+        if (onEndReached != null && showEmptyCatalogContinuation(catalog)) {
+            androidx.compose.material3.Button(onClick = onEndReached, modifier = Modifier.padding(horizontal = TvDimens.edge)) {
+                Text("Continue catalog")
+            }
+        }
         LazyRow(
             state = rowState,
             contentPadding = PaddingValues(horizontal = TvDimens.edge),
@@ -444,6 +450,9 @@ private fun TvCatalogWall(
                             LaunchedEffect(catalogs.size, catalog.id) { onLoadMoreRows() }
                         }
                         TvCatalogHeader(catalog, edgePadding = false)
+                        if (showEmptyCatalogContinuation(catalog)) {
+                            androidx.compose.material3.Button(onClick = { onLoadRowPage(catalog) }) { Text("Continue catalog") }
+                        }
                     }
                     val visibleItems = tvHomeItems(catalog.items)
                     gridItemsIndexed(

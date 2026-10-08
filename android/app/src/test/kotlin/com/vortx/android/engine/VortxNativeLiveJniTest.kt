@@ -92,6 +92,12 @@ class VortxNativeLiveJniTest {
                 assertEquals("Local fixture", repository.library().getOrThrow().items.single().name)
                 assertEquals("Fixture Series", repository.home().getOrThrow().last().items.single().name)
                 assertEquals("Fixture Series", repository.meta(MediaType.SERIES, "tt-fixture").getOrThrow().name)
+                val season = repository.setSeasonWatched(MediaType.SERIES, "tt-fixture", 1, true).getOrThrow()
+                assertEquals(season.videos.filter { it.season == 1 }.map { it.id }.toSet(), season.watchedVideoIds)
+                assertTrue(repository.setSeasonWatched(MediaType.SERIES, "tt-fixture", 1, false).getOrThrow().watchedVideoIds.isEmpty())
+                val beforeInvalidSeason = session.read().state.toString()
+                assertTrue(repository.setSeasonWatched(MediaType.SERIES, "tt-fixture", 99, true).isFailure)
+                assertEquals(beforeInvalidSeason, session.read().state.toString())
                 val source = repository.streams(MediaType.SERIES, "tt-fixture", "tt-fixture:1:2").getOrThrow().flatMap { it.streams }.first { it.url != null }
                 val playable = repository.resolve(source).getOrThrow()
                 val playback = repository.beginPlaybackSession(playable.playbackContext, repository.continueWatchingOwner()).getOrThrow()
@@ -179,6 +185,13 @@ class VortxNativeLiveJniTest {
             assertEquals("moon", exported.roster.single().avatar)
             assertFalse(exported.nativeSync.has("activeProfileId"))
             assertFalse(exported.nativeSync.has("legacyImportMaterial"))
+            runtime.retire(); runtime = coordinator()
+            // No cloud document or global roster is supplied: the sealed account locator retains
+            // this historical (non-A11C) identity and the exact locally edited account state.
+            assertTrue(runtime.reopenCheckpoint(account) { current == account })
+            assertEquals(owner.id, runtime.session().scope.ownerProfileID)
+            assertNotEquals(first, runtime.session().read().owner)
+            assertEquals("moon", NativeProfileAccess { runtime.session() }.read().profiles.single().avatar)
             runtime.retire(); runtime = coordinator()
             // Identical authenticated legacy material is a no-op receipt, not a reset of local edits.
             assertTrue(runtime.applyDocument(account, doc) { true })
@@ -271,6 +284,78 @@ class VortxNativeLiveJniTest {
         } finally { runtime.retire(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
 
+    @Test fun `real JNI parental catalog metadata embedded streams and pagination fail closed on missing certification`() = runBlocking {
+        assumeTrue("Requires reviewed native JNI", System.getenv("VORTX_JNI_SYNC") == "1"); load()
+        val requests = mutableListOf<JSONObject>()
+        var firstPageBlocked = false
+        fun meta(id: String) = JSONObject().put("id", id).put("type", "movie").put("name", id).also {
+            if (id.startsWith("g")) it.put("certification", "G")
+            if (id == "r") it.put("certification", "R")
+            it.put("streams", JSONArray().put(JSONObject().put("url", "https://fixture.invalid/$id.mp4").put("name", "1080p")))
+        }
+        val transport = object : VortxResourceTransport {
+            override fun makeCancellation() = object : VortxResourceCancellation { override fun cancel() {}; override fun close() {} }
+            override fun load(requestJson: String, cancellation: VortxResourceCancellation): String {
+                val input = JSONObject(requestJson); val request = input.getJSONObject("request"); requests += request
+                val content = when (request.getString("resource")) {
+                    "catalog" -> JSONObject().put("metas", if (request.getJSONArray("extra").toString().contains("skip")) JSONArray().put(meta("g2"))
+                        else if (firstPageBlocked) JSONArray().put(meta("r")).put(meta("u")) else JSONArray().put(meta("g")).put(meta("r")).put(meta("u")))
+                    "meta" -> JSONObject().put("meta", meta(request.getString("id")).also {
+                        if (request.getString("type") == "series") it.put("type", "series").put("videos", JSONArray()
+                            .put(JSONObject().put("id", "g-series:1:1").put("title", "Episode").put("season", 1).put("episode", 1)))
+                    })
+                    "stream" -> JSONObject().put("streams", JSONArray().put(JSONObject().put("url", "https://fixture.invalid/unsafe.mp4").put("name", "CAM porn XXX")))
+                    "subtitles" -> JSONObject().put("subtitles", JSONArray())
+                    else -> error("Unexpected request")
+                }
+                return JSONObject().put("kind", "resource_result").put("requestId", input.getString("requestId")).put("generation", input.getLong("generation"))
+                    .put("request", request).put("cancelled", false).put("groups", JSONArray().put(JSONObject()
+                        .put("addonId", input.getJSONArray("addons").getJSONObject(0).getString("id")).put("status", "ready").put("content", content))).toString()
+            }
+        }
+        val store = object : VortxCheckpointStore {
+            var state: String? = null
+            override fun read(scope: VortxAccountScope) = state
+            override fun commit(scope: VortxAccountScope, snapshot: String) { state = snapshot }
+        }
+        val scope = VortxAccountScope("parental-fixture", "owner")
+        VortxNativeSession.open(scope, "Owner", bindings(), store, transport, allowNewAccount = true).use { session ->
+            val manifest = JSONObject().put("id", "fixture").put("name", "Fixture").put("version", "1.0.0").put("types", JSONArray().put("movie").put("series"))
+                .put("resources", JSONArray().put("catalog").put("meta").put("stream").put("subtitles"))
+                .put("catalogs", JSONArray().put(JSONObject().put("type", "movie").put("id", "fixture").put("extra", JSONArray()
+                    .put(JSONObject().put("name", "skip")).put(JSONObject().put("name", "search")))))
+            session.dispatch(listOf(JSONObject().put("type", "install_addon").put("profileId", "owner").put("addon", JSONObject()
+                .put("transportUrl", "https://fixture.invalid/manifest.json").put("manifest", manifest).put("flags", JSONObject().put("official", false).put("protected", false))),
+                JSONObject("""{"type":"patch_profile","id":"owner","edits":[{"field":"kids","value":true}]}""")))
+            val repo = NativeCatalogRepository { session }
+            val row = repo.home().getOrThrow().last()
+            assertEquals(listOf("g"), row.items.map { it.id })
+            repo.loadHomeRowNextPage(row).getOrThrow()
+            assertEquals("3", requests.last().getJSONArray("extra").getJSONArray(0).getString(1))
+            assertEquals(listOf("g"), repo.discover().getOrThrow().items.map { it.id })
+            assertEquals(listOf("g", "g2"), repo.discoverNextPage().getOrThrow().items.map { it.id })
+            assertEquals("3", requests.last().getJSONArray("extra").getJSONArray(0).getString(1))
+            assertEquals(listOf("g"), repo.search("fixture").getOrThrow().map { it.id })
+            assertTrue(repo.meta(MediaType.MOVIE, "r").isFailure); assertTrue(repo.meta(MediaType.MOVIE, "u").isFailure)
+            assertTrue(repo.streams(MediaType.MOVIE, "r").isFailure); assertTrue(repo.streams(MediaType.MOVIE, "u").isFailure)
+            assertTrue(repo.subtitles(MediaType.MOVIE, "r").isFailure)
+            assertTrue(repo.streams(MediaType.SERIES, "g-series", "foreign:1:1").isFailure)
+            assertTrue(repo.streams(MediaType.MOVIE, "g", "foreign").isFailure)
+            val groups = repo.streams(MediaType.MOVIE, "g").getOrThrow()
+            assertEquals(listOf("https://fixture.invalid/g.mp4"), groups.flatMap { it.streams }.map { it.url })
+            assertTrue(repo.resolveDirectLink("https://fixture.invalid/unknown.mp4", "Uncertified").isFailure)
+            assertTrue(repo.resolveMagnet("a".repeat(40), "Uncertified").isFailure)
+            firstPageBlocked = true
+            val blocked = repo.home().getOrThrow().last()
+            assertTrue(blocked.items.isEmpty()); assertTrue(blocked.hasNextPage)
+            assertTrue(com.vortx.android.ui.components.showEmptyCatalogContinuation(blocked))
+            assertFalse(com.vortx.android.ui.components.showEmptyCatalogContinuation(blocked, false))
+            assertFalse(com.vortx.android.ui.components.showEmptyCatalogContinuation(row))
+            repo.loadHomeRowNextPage(blocked).getOrThrow()
+            assertEquals("2", requests.last().getJSONArray("extra").getJSONArray(0).getString(1))
+        }
+    }
+
     @Test fun `account retirement during suspended projection never reports a successful native install`() = runBlocking {
         assumeTrue("Requires reviewed importer JNI", System.getenv("VORTX_JNI_SYNC") == "1")
         load()
@@ -278,7 +363,7 @@ class VortxNativeLiveJniTest {
         val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Owner", avatar = "star", isOwner = true)
         val doc = JSONObject().put("vortx", JSONObject().put("roster", JSONArray().put(owner.encode()))
             .put("rosterModified", 123.5).put("library", JSONArray()).put("addons", JSONArray()))
-        for (warm in listOf(false, true)) {
+        for (mode in listOf("warm", "cold", "offline")) {
             var current = account
             var suspendProjection = false
             val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
@@ -286,6 +371,7 @@ class VortxNativeLiveJniTest {
                 var checkpoint: String? = null
                 override fun read(scope: VortxAccountScope) = checkpoint
                 override fun commit(scope: VortxAccountScope, snapshot: String) { checkpoint = snapshot }
+                override fun discover(accountID: String) = checkpoint?.let { VortxAccountScope(accountID, owner.id) }
             }
             val runtime = NativeAccountCoordinator(bindings(), store, { noNetwork() }, { it == current }, { it() }, {
                 if (suspendProjection) { entered.complete(Unit); release.await() }
@@ -293,10 +379,13 @@ class VortxNativeLiveJniTest {
             try {
                 assertTrue(runtime.applyDocument(account, doc) { account == current })
                 val carrier = JSONObject(doc.toString()).put("nativeSync", runtime.exportDocument(account)!!.nativeSync)
-                if (!warm) runtime.retire()
+                if (mode != "warm") runtime.retire()
                 suspendProjection = true
                 val applying = async(start = CoroutineStart.UNDISPATCHED) {
-                    runCatching { runtime.applyDocument(account, carrier) { account == current } }
+                    runCatching {
+                        if (mode == "offline") runtime.reopenCheckpoint(account) { account == current }
+                        else runtime.applyDocument(account, carrier) { account == current }
+                    }
                 }
                 entered.await()
                 current = account.copy(generation = 5)
