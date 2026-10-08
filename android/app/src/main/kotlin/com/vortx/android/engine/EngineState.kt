@@ -470,6 +470,32 @@ internal object EngineState {
         return watched
     }
 
+    /**
+     * Decode the complete persisted playback projection from the engine's live Library model. The engine
+     * writes catalog-only watches as temporary entries, so filtering `temp` here would wrongly omit an
+     * unsaved title that has real watched/progress state. Conversely a plain saved entry is deliberately
+     * excluded unless it has watched ticks or a resume offset. Engine order is retained (most-recent first).
+     */
+    fun parsePlaybackHistoryStrict(json: String): Result<List<MetaItem>> = runCatching {
+        val root = JSONObject(json)
+        val catalog = root.getJSONArray("catalog")
+        buildList {
+            for (index in 0 until catalog.length()) {
+                val item = catalog.getJSONObject(index)
+                val id = item.optString("_id").ifEmpty { item.optString("id") }
+                require(id.isNotBlank() && id != "null") { "Playback history item $index is missing id." }
+                val type = item.optString("type", "movie")
+                require(MediaType.entries.any { it.id.equals(type, ignoreCase = true) }) {
+                    "Playback history item $index has an invalid media type."
+                }
+                val state = item.optJSONObject("state")
+                val watched = (state?.optInt("timesWatched", 0) ?: 0) > 0
+                val resumed = (state?.optDouble("timeOffset", 0.0) ?: 0.0) > 0.0
+                if (watched || resumed) add(parseLibraryItem(item))
+            }
+        }
+    }
+
     /// Parse the `meta_details` field into a UI [MetaDetail] plus its grouped [StreamGroup]s. The meta
     /// lives in `metaItems: [{ request, content: Loadable<metaItem> }]` (first Ready wins); streams
     /// live in `streams: [{ request, content: Loadable<[stream]> }]` grouped by the source add-on.

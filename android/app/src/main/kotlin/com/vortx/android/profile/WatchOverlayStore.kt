@@ -106,6 +106,18 @@ class WatchOverlayStore(
             .sortedByDescending { it.first }
             .map { it.second }
 
+    /**
+     * Full private playback history, newest first. This intentionally differs from [libraryItems]: a
+     * saved title with neither resume state nor a watched video is not history, while an unsaved finished
+     * title is. It is the overlay counterpart to native playback's persisted history projection.
+     */
+    fun playbackHistory(): List<MetaItem> =
+        watch.asSequence()
+            .filter { (_, entry) -> entry.watchedVideoIds.isNotEmpty() || entry.timeOffsetMs > 0 }
+            .sortedByDescending { (_, entry) -> entry.lastWatched }
+            .map { (metaId, entry) -> metaItem(metaId, entry) }
+            .toList()
+
     private fun metaItem(metaId: String, entry: WatchEntry): MetaItem = MetaItem(
         id = metaId,
         type = MediaType.fromId(entry.type),
@@ -113,6 +125,7 @@ class WatchOverlayStore(
         poster = entry.poster,
         progress = if (entry.durationMs > 0) entry.progress.toFloat() else null,
         resumeSeconds = if (entry.timeOffsetMs > 0) entry.timeOffsetMs / 1000.0 else null,
+        watched = entry.watchedVideoIds.isNotEmpty(),
     )
 
     // ---- Player / detail writes (overlay-active only) ----
