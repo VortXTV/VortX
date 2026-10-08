@@ -98,6 +98,20 @@ import CryptoKit
         check(try await facade.mergeSyncDocument(exported) == exported)
         try dispatch(["action": "Load", "args": ["model": "CatalogWithFilters", "args": NSNull()]], field: "discover")
         await facade.settled(); check(try field("discover")["catalog"]?.array?.count == 1)
+        let kidProgress: VortxJSON = .object(["type": .string("report_progress"), "metaId": .string("unsaved-kid"), "videoId": .string("opaque-kid-episode"),
+                                             "name": .string("Kid episode"), "positionMs": .integer(3001), "durationMs": .integer(100001),
+                                             "metadata": .object(["type": .string("series")])])
+        check(!facade.dispatchForProfile(kidProgress, profileID: scope.ownerProfileID))
+        check(facade.dispatchForProfile(kidProgress, profileID: "kid")); await facade.settled()
+        check(try field("library")["catalog"] == .array([]))
+        check(try field("continue_watching_preview")["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-kid-episode"))
+        check(facade.cachedResumeSeconds(id: "opaque-kid-episode") == 3.001)
+        check(try await facade.resumeSeconds(id: "opaque-kid-episode", profileID: "kid") == 3.001)
+        let watchedMovie: VortxJSON = .object(["type": .string("mark_watched"), "metaId": .string("unsaved-movie"), "name": .string("Watched without saving"),
+                                              "metadata": .object(["type": .string("movie")])])
+        check(facade.dispatchForProfile(watchedMovie, profileID: "kid")); await facade.settled()
+        check(try field("native_history")["items"]?.array?.contains { $0["_id"] == .string("unsaved-movie") && $0["state"]?["timesWatched"] == .integer(1) } == true)
+        check(try field("library")["catalog"] == .array([]))
         let lastState = try await session.stateJSON()
         await facade.shutdown()
         let reopened = try VortxNativeSession(scope: scope, ownerName: "Fixture", abi: VortxCABI(), store: checkpoint, transport: VortxCResourceTransport())

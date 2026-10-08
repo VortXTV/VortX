@@ -25,6 +25,28 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var playback: VortxJSON?
     var lastFailure: String? { lock.withLock { failure } }
     var isAvailable: Bool { lock.withLock { !closed } }
+    func cachedResumeSeconds(id: String) -> Double? {
+        lock.withLock {
+            guard !closed, pendingProfileTransitions == 0, let value = playback?["resumeById"]?[id] else { return nil }
+            if value == .null { return 0 }
+            guard let offset = try? value["offsetMs"]?.decode(UInt64.self) else { return nil }
+            return Double(offset) / 1000
+        }
+    }
+    func resumeSeconds(id: String, profileID: String) async throws -> Double {
+        let accepted = lock.withLock { !closed && pendingProfileTransitions == 0 && values["native_state"]?["activeProfileId"] == .string(profileID) }
+        guard accepted else { throw VortxNativeError.superseded }
+        let seconds = try await session.resumeSeconds(id: id, profileID: profileID)
+        guard lock.withLock({ !closed && pendingProfileTransitions == 0 && values["native_state"]?["activeProfileId"] == .string(profileID) }) else { throw VortxNativeError.superseded }
+        return seconds
+    }
+    func dispatchForProfile(_ action: VortxJSON, profileID: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, pendingProfileTransitions == 0, values["native_state"]?["activeProfileId"] == .string(profileID),
+              let type = string(action["type"]), ["report_progress", "mark_watched", "reset_watched", "remove_from_continue_watching"].contains(type),
+              let bytes = try? JSONEncoder().encode(action) else { return fail("stale_profile_intent") }
+        return enqueueMutation(type: type, raw: String(decoding: bytes, as: UTF8.self))
+    }
 
     static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
                        mutationAccepted: @escaping @Sendable () -> Void = {},

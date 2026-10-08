@@ -136,6 +136,10 @@ extension PlaybackMutationTarget {
 
     static func capture(core: CoreBridge) -> PlaybackMutationTarget {
         let profiles = ProfileStore.shared
+#if VORTX_NATIVE_DATA_ENGINE
+        let capture = CredentialScopeRegistry.shared.capture()
+        return .engine(profileID: profiles.activeID, keychainAccount: capture.namespace, uid: nil, historyCapture: capture)
+#else
         if profiles.activeUsesEngineHistory {
             // History is an owner-account carrier, never a generic native-engine carrier. A
             // secondary profile may use its own Stremio account, but its callbacks must not
@@ -155,9 +159,16 @@ extension PlaybackMutationTarget {
                            uid: core.currentUID(), historyCapture: nil)
         }
         return .overlay(profileID: profileID)
+#endif
     }
 
     func stillOwnsCurrentContext(core: CoreBridge) -> Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        guard case let .engine(profileID?, namespace, _, capture?) = self,
+              profileID == ProfileStore.shared.activeID, namespace == capture.namespace,
+              CredentialScopeRegistry.shared.isCurrent(capture), core.hasNativeSession else { return false }
+        return true
+#else
         let profiles = ProfileStore.shared
         let context = PlaybackMutationOwnershipPolicy.Context(
             activeProfileID: profiles.activeID,
@@ -167,9 +178,13 @@ extension PlaybackMutationTarget {
             extantOverlayProfileIDs: Set(profiles.profiles.filter { !$0.usesEngineHistory }.map(\.id))
         )
         return PlaybackMutationOwnershipPolicy.allows(self, in: context)
+#endif
     }
 
     func stillOwnsAccountContext(core: CoreBridge) -> Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        return stillOwnsCurrentContext(core: core)
+#else
         let profiles = ProfileStore.shared
         let context = PlaybackMutationOwnershipPolicy.Context(
             activeProfileID: profiles.activeID,
@@ -179,6 +194,7 @@ extension PlaybackMutationTarget {
             extantOverlayProfileIDs: Set(profiles.profiles.filter { !$0.usesEngineHistory }.map(\.id))
         )
         return PlaybackMutationOwnershipPolicy.allowsAccountMutation(self, in: context)
+#endif
     }
 
     /// A player progress event may enter the owner-history carrier only if its immutable launch
@@ -186,6 +202,9 @@ extension PlaybackMutationTarget {
     /// `usesEngineHistory` alone is deliberately insufficient: secondary profiles can have their
     /// own native account but must never write the owner's membership-neutral history.
     func stillOwnsOwnerHistoryContext(core: CoreBridge) -> Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        return false // nativeSync is the account carrier; never duplicate native writes into legacy caches
+#else
         guard case let .engine(profileID, _, _, historyCapture?) = self,
               profileID == UserProfile.ownerID,
               ProfileStore.shared.activeID == UserProfile.ownerID,
@@ -193,6 +212,7 @@ extension PlaybackMutationTarget {
               CredentialScopeRegistry.shared.isCurrent(historyCapture),
               stillOwnsCurrentContext(core: core) else { return false }
         return true
+#endif
     }
 
     var ownerHistoryCapture: CredentialScopeRegistry.Capture? {
@@ -454,6 +474,12 @@ final class StremioAccount: ObservableObject {
     /// when the stored progress is for the same episode the user is opening. Overlay profiles
     /// (a non-owner shared profile) resume from their own private history instead.
     func resumeOffset(for meta: PlaybackMeta) async -> Double {
+#if VORTX_NATIVE_DATA_ENGINE
+        if CoreBridge.shared.usesNativeProfileState {
+            let target = PlaybackMutationTarget.capture(core: CoreBridge.shared)
+            return await CoreBridge.shared.nativeResumeSeconds(for: meta, target: target)
+        }
+#endif
         if !ProfileStore.shared.activeUsesEngineHistory {
             return ProfileStore.shared.resumeOffset(for: meta)
         }
@@ -485,6 +511,12 @@ final class StremioAccount: ObservableObject {
                       target: PlaybackMutationTarget? = nil) async {
         let target = target ?? PlaybackMutationTarget.capture(core: CoreBridge.shared)
         guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        if CoreBridge.shared.usesNativeProfileState {
+            CoreBridge.shared.reportNativeProgress(for: meta, positionSeconds: positionSeconds, durationSeconds: durationSeconds, target: target)
+            return
+        }
+#endif
         if let profileID = target.overlayProfileID {
             ProfileStore.shared.recordProgress(meta: meta, positionSeconds: positionSeconds,
                                                durationSeconds: durationSeconds, profileID: profileID)

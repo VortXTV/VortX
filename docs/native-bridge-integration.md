@@ -70,6 +70,17 @@ until reopen; neither path is reported as successful empty history. The new quer
 metadata-enriched progress need the next exact native artifact/live receipt.
 Watched/statistics readers, recommendations and remaining overlay mutation paths remain gates.
 
+Native playback targets capture the exact account namespace/generation for every profile, including
+historical owner IDs. Native `StremioAccount` resume/progress entry points use kernel reads/writes
+instead of overlay caches or the optional legacy network mirror. Synchronous resume reads consume
+the kernel-provided `resumeById` map; unknown IDs use the same kernel `resume_point` query asynchronously.
+The facade fences explicit profile progress/marks under its mutation-admission lock. Detail/card
+library actions, individual episode/movie watched actions, and CW dismissal have native branches.
+Unproven bulk-season/series marks remain unavailable; these adapters do not invent episode completeness.
+The shipping player can produce both a selected-player progress tick and an explicit metadata save;
+the kernel treats repeated completion as one watched count, but duplicate durable commits remain an
+optimization opportunity. No audible playback/device receipt is claimed by source tests.
+
 ## Artifact gate
 
 Root integration must update the exact private-core pin, copied header, feature set, required

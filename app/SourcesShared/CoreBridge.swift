@@ -30,6 +30,46 @@ final class CoreBridge: ObservableObject {
     private var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
     var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
     var hasNativeSession: Bool { nativeFacade?.isAvailable == true }
+    private func nativePlaybackBinding(_ target: PlaybackMutationTarget) -> (VortxNativeCoreFacade, UUID)? {
+        guard case let .engine(profile?, namespace, _, capture?) = target,
+              profile == ProfileStore.shared.activeID, namespace == capture.namespace else { return nil }
+        return nativeFacadeLock.withLock {
+            guard nativeCredentialCapture == capture, CredentialScopeRegistry.shared.isCurrent(capture),
+                  let facade = nativeFacadeStorage, facade.isAvailable else { return nil }
+            return (facade, profile)
+        }
+    }
+    func nativeResumeSeconds(for meta: PlaybackMeta, target: PlaybackMutationTarget) async -> Double {
+        guard let (facade, profile) = nativePlaybackBinding(target) else { return 0 }
+        let id = meta.usesSeriesLifecycle ? meta.videoId : meta.libraryId
+        guard let value = try? await facade.resumeSeconds(id: id, profileID: profile.uuidString),
+              nativePlaybackBinding(target)?.0 === facade else { return 0 }
+        return value
+    }
+    func reportNativeProgress(for meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double,
+                              target: PlaybackMutationTarget) {
+        guard let (facade, profile) = nativePlaybackBinding(target),
+              positionSeconds.isFinite, durationSeconds.isFinite, positionSeconds >= 0, durationSeconds > 0,
+              positionSeconds * 1000 < Double(UInt64.max), durationSeconds * 1000 < Double(UInt64.max) else { return }
+        var action: [String: VortxJSON] = ["type": .string("report_progress"), "metaId": .string(meta.libraryId),
+                                          "name": .string(meta.name), "positionMs": .unsigned(UInt64(positionSeconds * 1000)),
+                                          "durationMs": .unsigned(UInt64(durationSeconds * 1000)),
+                                          "metadata": .object(["type": .string(meta.type), "poster": meta.poster.map(VortxJSON.string) ?? .null])]
+        if meta.usesSeriesLifecycle { action["videoId"] = .string(meta.videoId) }
+        _ = facade.dispatchForProfile(.object(action), profileID: profile.uuidString)
+    }
+    private func nativeWatchedIntent(id: String, videoID: String? = nil, name: String, type: String,
+                                     poster: String?, watched: Bool, target: PlaybackMutationTarget? = nil) {
+        guard let (facade, profile) = nativePlaybackBinding(target ?? .capture(core: self)) else { return }
+        var action: [String: VortxJSON] = ["type": .string(watched ? "mark_watched" : "reset_watched"), "metaId": .string(id),
+                                          "name": .string(name), "metadata": .object(["type": .string(type), "poster": poster.map(VortxJSON.string) ?? .null])]
+        if let videoID { action["videoId"] = .string(videoID) }
+        _ = facade.dispatchForProfile(.object(action), profileID: profile.uuidString)
+    }
+    private func nativeDismissContinueWatching(id: String, target: PlaybackMutationTarget? = nil) {
+        guard let (facade, profile) = nativePlaybackBinding(target ?? .capture(core: self)) else { return }
+        _ = facade.dispatchForProfile(.object(["type": .string("remove_from_continue_watching"), "metaId": .string(id)]), profileID: profile.uuidString)
+    }
 
     @MainActor @discardableResult
     func reorderAddonsForActiveProfile(_ urls: [String], profileID: UUID) -> Bool {
@@ -87,6 +127,7 @@ final class CoreBridge: ObservableObject {
         result.1?.close()
         // Native ctx is descriptor-only: never synthesize a Stremio login/token receipt.
         refreshAddons(capturedPublicationToken: capturePublicationToken())
+        rebuildContinueWatching(capturedPublicationToken: capturePublicationToken())
         loadBoard(); loadLibrary()
     }
     @MainActor
@@ -115,6 +156,7 @@ final class CoreBridge: ObservableObject {
         continueWatching = []; boardRows = []; library = nil; metaDetails = nil; discover = nil
         discoverPublishedFingerprint = nil; resetDiscoverPagination()
         searchResults = []; searchSuggestions = []; searchIsLoading = false
+        searchLoaded = false
         addons = []; rawAddonsByUrl = [:]; manifestPreviewCache = [:]
         AddonMetaGate.publish(false)
         boardCatalogTotal = 0; boardPageInFlight = false; boardRowPageInFlight = [:]; boardRowExhausted = []
@@ -2384,6 +2426,15 @@ final class CoreBridge: ObservableObject {
         guard let residentMeta = metaDetails?.meta,
               LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
                                                            residentType: residentMeta.type) else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            // Whole-series/season completeness is not proved by an addon page. Individual native
+            // episode marks are supported; bulk-series UI stays a cutover gate.
+            guard !EpisodePlaybackIdentity.usesSeriesLifecycle(type: residentMeta.type) else { return }
+            nativeWatchedIntent(id: residentMeta.id, name: residentMeta.name, type: residentMeta.type, poster: residentMeta.poster, watched: isWatched)
+            return
+        }
+#endif
         switch LibraryWatchedMutationPolicy.route(usesEngineHistory: ProfileStore.shared.activeUsesEngineHistory) {
         case .profileOverlay:
             // Keep this local to the active overlay. Missing detail context must remain a no-op,
@@ -2429,6 +2480,9 @@ final class CoreBridge: ObservableObject {
     /// Mark every episode of a season watched/unwatched.
     func markSeasonWatched(_ season: Int, _ isWatched: Bool,
                            expected: LibraryWatchedMutationPolicy.DetailTarget) {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState { return } // no native bulk-season completeness proof yet
+#endif
         guard let residentMeta = metaDetails?.meta,
               LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
                                                            residentType: residentMeta.type),
@@ -2456,6 +2510,12 @@ final class CoreBridge: ObservableObject {
               LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
                                                            residentType: residentMeta.type),
               residentMeta.videos?.contains(where: { $0.id == video.id }) == true else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            nativeWatchedIntent(id: residentMeta.id, videoID: video.id, name: residentMeta.name, type: residentMeta.type, poster: residentMeta.poster, watched: isWatched)
+            return
+        }
+#endif
         if overlayMarkWatched(isWatched, videoIds: { _ in [video.id] }) { return }
         guard !logoutAccountMutationPending else { return }
         if !isWatched {
@@ -2546,6 +2606,14 @@ final class CoreBridge: ObservableObject {
             NSLog("[playback] dropped watched callback after profile/account ownership changed")
             return
         }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            guard allowEngineWrite else { return }
+            nativeWatchedIntent(id: meta.libraryId, videoID: meta.usesSeriesLifecycle ? meta.videoId : nil,
+                                name: meta.name, type: meta.type, poster: meta.poster, watched: true, target: target)
+            return
+        }
+#endif
         if let profileID = target.overlayProfileID {
             ProfileStore.shared.markWatched(meta: meta, profileID: profileID)
             return
@@ -2663,6 +2731,9 @@ final class CoreBridge: ObservableObject {
     /// nil to mean "consult the account fallback" and 0 to mean "genuinely start fresh". Once that
     /// lands, the caller reverts to trusting any non-nil answer.
     @MainActor func engineResumeSeconds(for meta: PlaybackMeta) -> Double? {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState { return nativeFacade?.cachedResumeSeconds(id: meta.usesSeriesLifecycle ? meta.videoId : meta.libraryId) }
+#endif
         // Overlay (non-owner) profile: the engine library item belongs to the owner account, so its saved
         // resume position is not this profile's. Decline here so the caller falls back to account.resumeOffset,
         // which reads the active overlay profile's own history. Mirrors the activeUsesEngineHistory guard used
@@ -2699,6 +2770,9 @@ final class CoreBridge: ObservableObject {
     /// mirroring `engineResumeSeconds`.
     @MainActor
     func engineResumeSecondsByLibraryId(for meta: PlaybackMeta) -> Double? {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState { return nativeFacade?.cachedResumeSeconds(id: meta.usesSeriesLifecycle ? meta.videoId : meta.libraryId) }
+#endif
         guard ProfileStore.shared.activeUsesEngineHistory else { return nil }   // overlay: not this profile's item
         // The engine's own library item for this id: the loaded meta, else the published CW, else the RAW preview
         // (which still includes finished movies / mid-series roll-forwards the published CW prunes), else the
@@ -2785,6 +2859,12 @@ final class CoreBridge: ObservableObject {
     /// removal, matching the reference apps) and the Library tab's "Remove from Library". The engine
     /// re-emits `continue_watching_preview` + `library`, so both rails update on their own.
     func removeFromLibrary(id: String) {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            if library?.catalog.contains(where: { $0.id == id }) == true { dispatchCtx(["action": "RemoveFromLibrary", "args": id]) }
+            nativeDismissContinueWatching(id: id); return
+        }
+#endif
         guard ProfileStore.shared.activeUsesEngineHistory else {
             // Overlay profile: dismissing CW must touch only the profile's private history,
             // never the owner account's library. That path is already tombstone-safe via ProfileStore,
@@ -2821,6 +2901,14 @@ final class CoreBridge: ObservableObject {
     /// (not one per title, unlike the single-item path) so the tombstones land promptly without N round
     /// trips. Never "just delete locally": a bare local clear would be resurrected by the next union pull.
     func clearContinueWatching() {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            for item in continueWatching {
+                nativeDismissContinueWatching(id: item.id)
+            }
+            return
+        }
+#endif
         guard ProfileStore.shared.activeUsesEngineHistory else {
             // Overlay profile: CW renders from the profile's private overlay; clear those entries only.
             for item in ProfileStore.shared.cwItems {
@@ -2847,6 +2935,12 @@ final class CoreBridge: ObservableObject {
     /// library entry (no `MetaItemPreview` needed), so it fits the Library tab, where items are library
     /// entries rather than full catalog previews. A no-op if the id isn't in the library.
     func setLibraryItemWatched(id: String, _ isWatched: Bool) {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            guard let item = library?.catalog.first(where: { $0.id == id }), !EpisodePlaybackIdentity.usesSeriesLifecycle(type: item.type) else { return }
+            nativeWatchedIntent(id: id, name: item.name, type: item.type, poster: item.poster, watched: isWatched); return
+        }
+#endif
         guard ProfileStore.shared.activeUsesEngineHistory else {
             overlaySetWatchedById(id, isWatched)   // overlay profile: private history only
             return
@@ -3106,6 +3200,9 @@ final class CoreBridge: ObservableObject {
             NSLog("[playback] dropped finish callback after profile/account ownership changed")
             return
         }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState { nativeDismissContinueWatching(id: libraryId, target: target); return }
+#endif
         if let profileID = target.overlayProfileID {
             ProfileStore.shared.finishedWatching(metaId: libraryId, profileID: profileID)
             return
@@ -3128,6 +3225,10 @@ final class CoreBridge: ObservableObject {
     /// Whether the open detail page's title is saved to the library proper (present,
     /// not removed, not a temporary watched-marker entry). Drives the Library button.
     var detailInLibrary: Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        guard !enginePublicationBlocked, let item = metaDetails?.libraryItem else { return false }
+        return item.removed != true && item.temp != true
+#else
         // Overlay (non-owner) profile: the engine's libraryItem belongs to the account, so the
         // chip must reflect the profile's own overlay, kept symmetric with the guarded add/remove.
         if !ProfileStore.shared.activeUsesEngineHistory {
@@ -3136,6 +3237,7 @@ final class CoreBridge: ObservableObject {
         }
         guard let item = metaDetails?.libraryItem else { return false }
         return item.removed != true && item.temp != true
+#endif
     }
 
     /// Add the OPEN detail page's title to the library. Catalog adds round-trip a
@@ -3143,6 +3245,12 @@ final class CoreBridge: ObservableObject {
     /// Library tab or Continue Watching is in no catalog, so this hands the engine
     /// its own full meta JSON instead (a superset of the preview it expects).
     func addDetailToLibrary() {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            guard let meta = detailMetaPreview() else { return }
+            dispatchCtx(["action": "AddToLibrary", "args": meta]); return
+        }
+#endif
         switch LibraryWatchedMutationPolicy.route(usesEngineHistory: ProfileStore.shared.activeUsesEngineHistory) {
         case .profileOverlay:
             // Overlay profile: save to the profile's private overlay, never the account library.
@@ -3237,6 +3345,14 @@ final class CoreBridge: ObservableObject {
                       target: PlaybackMutationTarget? = nil) -> Bool {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
         guard target.stillOwnsCurrentContext(core: self) else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            let preview = rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary
+            guard let preview, LibraryWatchedMutationPolicy.canDispatchCatalogAdd(
+                metaID: metaId, expectedType: expectedType, previewID: preview["id"] as? String, previewType: preview["type"] as? String) else { return false }
+            return dispatchCtx(["action": "AddToLibrary", "args": preview])
+        }
+#endif
         guard target.overlayProfileID == nil else {
             // Overlay profile: save to the profile's private overlay, never the account library.
             if let info = overlayDisplayInfo(forId: metaId, fallbackPreview: fallbackPreview) {
@@ -3263,6 +3379,9 @@ final class CoreBridge: ObservableObject {
     /// `tmdb…` id), never a synthetic magnet item, or it poisons official-client account sync.
     func addRawMetaToLibrary(_ meta: [String: Any]) {
         guard let id = meta["id"] as? String, !id.isEmpty else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState { dispatchCtx(["action": "AddToLibrary", "args": meta]); return }
+#endif
         guard ProfileStore.shared.activeUsesEngineHistory else {
             // Overlay profile: save to the profile's private overlay, never the account library.
             ProfileStore.shared.addLibraryEntry(metaId: id,
@@ -3357,6 +3476,14 @@ final class CoreBridge: ObservableObject {
     /// creates a temporary library item if one doesn't exist, which is exactly this discover use case.
     func setCatalogWatched(metaId: String, _ isWatched: Bool,
                            fallbackPreview: LibraryWatchedMutationPolicy.MetaPreview? = nil) {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            let preview = rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary
+            guard let preview, preview["id"] as? String == metaId, let type = preview["type"] as? String,
+                  let name = preview["name"] as? String, !EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) else { return }
+            nativeWatchedIntent(id: metaId, name: name, type: type, poster: preview["poster"] as? String, watched: isWatched); return
+        }
+#endif
         guard ProfileStore.shared.activeUsesEngineHistory else {
             overlaySetWatchedById(metaId, isWatched, fallbackPreview: fallbackPreview)   // overlay profile: private history only
             return

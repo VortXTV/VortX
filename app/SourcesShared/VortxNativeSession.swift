@@ -237,8 +237,19 @@ actor VortxNativeSession {
         let response = try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))
         guard response["kind"] == .string("profile_playback"), response["profileId"] == profile,
               response["continueWatching"]?.array != nil, response["history"]?.array != nil,
-              case .object = response["watchedVideoIdsByTitle"], case .object = response["watchedTitles"] else { throw VortxNativeError.invalidResponse }
+              case .object = response["watchedVideoIdsByTitle"], case .object = response["watchedTitles"],
+              case .object = response["resumeById"] else { throw VortxNativeError.invalidResponse }
         return response
+    }
+    func resumeSeconds(id: String, profileID: String) throws -> Double {
+        guard try scope.validateSnapshot(stateJSON())["activeProfileId"] == .string(profileID) else { throw VortxNativeError.superseded }
+        let query = VortxJSON.object(["kind": .string("resume_point"), "id": .string(id)])
+        let result = try lease.withActive { try runtime.resolve(String(decoding: JSONEncoder().encode(query), as: UTF8.self)) }
+        let response = try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))
+        guard response["kind"] == .string("resume_point") else { throw VortxNativeError.invalidResponse }
+        if response["resume"] == .null { return 0 }
+        guard let offset = try response["resume"]?["offsetMs"]?.decode(UInt64.self) else { throw VortxNativeError.invalidResponse }
+        return Double(offset) / 1000
     }
     /// The kernel materializes membership/order; hosts do not reproduce its merge reducer.
     func resourceRegistry() throws -> [VortxResourceAddon] {

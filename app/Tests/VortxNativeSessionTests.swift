@@ -46,7 +46,9 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
             query["history"] = [["metaId": "watched-movie", "name": "Watched movie", "type": "movie", "offsetMs": 0, "durationMs": 1000000, "updatedAt": 1700000001, "watched": true, "timesWatched": 2]]
             query["watchedVideoIdsByTitle"] = ["unsaved-series": ["other-video"]]
             query["watchedTitles"] = ["watched-movie": 2]
+            query["resumeById"] = ["opaque-video": ["offsetMs": 120001, "durationMs": 1200001, "updatedAt": 1700000000], "finished": NSNull()]
         }
+        if query["kind"] as? String == "resume_point" { query["resume"] = ["offsetMs": 3001, "durationMs": 100000, "updatedAt": 1700000000] }
         return String(decoding: try! JSONSerialization.data(withJSONObject: query), as: UTF8.self)
     }
     func state(_ handle: UInt) -> String? { lock.lock(); defer { lock.unlock() }; return states[handle] }
@@ -183,18 +185,24 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         check(nativeCW["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-video"))
         let nativeLibrary = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("library")!)
         check(nativeLibrary["catalog"] == .array([])) // history/resume is not saved membership
+        check(facade.cachedResumeSeconds(id: "opaque-video") == 120.001)
+        check(facade.cachedResumeSeconds(id: "finished") == 0)
+        check(facade.cachedResumeSeconds(id: "unknown") == nil)
+        check(try await facade.resumeSeconds(id: "unknown", profileID: "owner") == 3.001)
         transitionStore.blockNextWrite()
         check(facade.dispatch(data: Data(#"{"action":"Vortx","args":{"type":"switch_profile","id":"kid"}}"#.utf8), field: nil))
         await withCheckedContinuation { done in DispatchQueue.global().async { precondition(transitionStore.entered.wait(timeout: .now() + 5) == .success); done.resume() } }
         check(!facade.dispatch(data: Data(#"{"action":"Ctx","args":{"action":"AddToLibrary","args":{"id":"tt-old","type":"movie","name":"Old"}}}"#.utf8), field: nil))
         check(facade.lastFailure == "profile_transition_pending")
+        check(!facade.dispatchForProfile(.object(["type": .string("report_progress")]), profileID: "owner"))
         check(facade.dispatch(data: Data(#"{"action":"Vortx","args":{"type":"get_state"}}"#.utf8), field: nil))
         transitionStore.release.signal(); await facade.settled()
         let published = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("native_state")!)
         check(published["activeProfileId"] == .string("kid"))
         check(facade.registryBinding?.profileID == "kid")
-        check(mutations.value == 1) // switch acknowledged; queued get_state does not schedule a push
         check(facade.lastFailure == nil)
+        check(!facade.dispatchForProfile(.object(["type": .string("mark_watched"), "metaId": .string("late")]), profileID: "owner"))
+        check(mutations.value == 1) // switch acknowledged; queued get_state does not schedule a push
         check(!facade.reorderAddonURLs([], profileID: "owner"))
         check(facade.reorderAddonURLs([], profileID: "kid"))
         await facade.settled()
