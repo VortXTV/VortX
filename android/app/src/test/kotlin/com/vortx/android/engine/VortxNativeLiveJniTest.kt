@@ -277,9 +277,45 @@ class VortxNativeLiveJniTest {
             assertEquals("Native name", NativeProfileAccess { runtime.session() }.read().profiles.single().name)
             assertEquals("native-only", NativeCatalogRepository { runtime.session() }.library().getOrThrow().items.single().id)
             assertEquals(originalMaterial, runtime.session().read().state.getJSONObject("legacyImportMaterial").toString())
+            // Unsupported website aggregates no longer invalidate otherwise valid native data.
+            // They remain exact, durable pending source rather than being applied or acknowledged.
+            val nativeBeforeDeferred = JSONObject(runtime.session().read().state.getJSONObject("nativeSync").toString())
+            for (raw in listOf(
+                JSONObject().put(owner.id, JSONObject().put("name", "Pending web edit")),
+                JSONArray(),
+            )) {
+                val deferred = JSONObject(carrier.toString()).put("profileEdits", raw)
+                fun assertDeferred(gateway: NativeAccountCoordinator) {
+                    val state = gateway.session().read().state
+                    assertTrue(NativeHostPreferences.equal(nativeBeforeDeferred, state.getJSONObject("nativeSync")))
+                    assertEquals("Native name", NativeProfileAccess { gateway.session() }.read().profiles.single().name)
+                    assertEquals(originalMaterial, state.getJSONObject("legacyImportMaterial").toString())
+                    val pending = state.getJSONObject("websiteProfileEditPending").getJSONArray("events")
+                    assertTrue((0 until pending.length()).any { index ->
+                        NativeHostPreferences.equal(raw, pending.getJSONObject(index).opt("legacyAggregate"))
+                    })
+                }
+                assertTrue(runtime.applyDocument(account, deferred) { true })
+                assertDeferred(runtime)
+                assertEquals(runtime.session().read().state.toString(), checkpoints.read(scope))
+                runtime.retire(); runtime = coordinator()
+                assertTrue(runtime.applyDocument(account, deferred) { true })
+                assertDeferred(runtime)
+                // A new device must preserve the same unresolved source without fabricating a
+                // website receipt from its first adoption of someone else's native checkpoint.
+                val firstStore = object : VortxCheckpointStore {
+                    var committed: String? = null
+                    override fun read(scope: VortxAccountScope) = committed
+                    override fun commit(scope: VortxAccountScope, snapshot: String) { committed = snapshot }
+                }
+                val first = NativeAccountCoordinator(bindings(), firstStore, { noNetwork() }, { true }, { it() }, {})
+                try {
+                    assertTrue(first.applyDocument(account, deferred) { true })
+                    assertDeferred(first)
+                    assertEquals(first.session().read().state.toString(), firstStore.committed)
+                } finally { first.retire() }
+            }
             val rejected = listOf(
-                JSONObject(carrier.toString()).put("profileEdits", JSONObject().put(owner.id, JSONObject().put("name", "Pending web edit"))),
-                JSONObject(carrier.toString()).put("profileEdits", JSONArray()),
                 JSONObject(carrier.toString()).also { it.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).put("name", "Old client name") },
                 JSONObject(carrier.toString()).also { it.getJSONObject("vortx").getJSONArray("library").put(JSONObject().put("id", "legacy-only").put("type", "movie").put("name", "Old client film")) },
                 JSONObject(carrier.toString()).also { it.getJSONObject("nativeSync").remove("legacyImport") },
