@@ -24,11 +24,13 @@ enum VortxLegacyBootstrapMaterialTests {
     }
     static func material(_ document: Object, roster: [UserProfile] = [owner, child], modified: Double? = 1720000000.1234,
                          deferProfileEdits: Bool = false,
-                         ownAccountSources: [VortxLegacyBootstrapMaterial.OwnAccountSource] = []) throws -> Object {
+                         ownAccountSources: [VortxLegacyBootstrapMaterial.OwnAccountSource] = [],
+                         retainedOwnAccountBaseline: Data? = nil) throws -> Object {
         let data = try JSONSerialization.data(withJSONObject: document)
         let result = try VortxLegacyBootstrapMaterial.encode(document: data, roster: roster, ownerProfileID: owner.id,
                                                               rosterModifiedSeconds: modified, deferProfileEdits: deferProfileEdits,
-                                                              ownAccountSources: ownAccountSources)
+                                                              ownAccountSources: ownAccountSources,
+                                                              retainedOwnAccountBaseline: retainedOwnAccountBaseline)
         return try JSONSerialization.jsonObject(with: result) as! Object
     }
     static func doc(_ vortx: Object = [:]) -> Object { ["vortx": vortx] }
@@ -132,6 +134,31 @@ enum VortxLegacyBootstrapMaterialTests {
         check((result["libraries"] as! [String: Object])[owner.id.uuidString] != nil
               && (result["identityLinks"] as! [String: [[String]]])[own.id.uuidString] == [],
               "Primary bucket is retained and own receipt invents no aliases")
+
+        let retainedBaseline = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+        let coldResult = try material(root, roster: [owner, own], retainedOwnAccountBaseline: retainedBaseline)
+        let coldSources = coldResult["ownAccountSources"] as! [String: Object]
+        check(NSDictionary(dictionary: coldSources[own.id.uuidString]!).isEqual(to: sources[own.id.uuidString]!)
+              && NSDictionary(dictionary: (coldResult["addons"] as! [String: Object])[own.id.uuidString]!).isEqual(to: addons)
+              && NSDictionary(dictionary: (coldResult["libraries"] as! [String: Object])[own.id.uuidString]!).isEqual(to: library)
+              && NSArray(array: watches(coldResult, profile: own)).isEqual(to: watches(result, profile: own))
+              && (coldResult["identityLinks"] as! [String: [[String]]])[own.id.uuidString] == [],
+              "Validated retained baseline copies the exact own tuple without raw source fabrication")
+        var malformedBaseline = result
+        var malformedSourceRows = malformedBaseline["ownAccountSources"] as! [String: Object]
+        malformedSourceRows[own.id.uuidString] = ["verifiedStreamingUid": "other-uid", "sourceDocumentSha256": receipt.sourceDocumentSHA256]
+        malformedBaseline["ownAccountSources"] = malformedSourceRows
+        do { _ = try material(root, roster: [owner, own], retainedOwnAccountBaseline: JSONSerialization.data(withJSONObject: malformedBaseline)); preconditionFailure("mismatched retained UID imported") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("complete authenticated profile tuple"), "Retained baseline cannot substitute a mismatched own identity")
+        }
+        var incompleteBaseline = result
+        var incompleteWatches = incompleteBaseline["watches"] as! [String: [Object]]
+        incompleteWatches.removeValue(forKey: own.id.uuidString); incompleteBaseline["watches"] = incompleteWatches
+        do { _ = try material(root, roster: [owner, own], retainedOwnAccountBaseline: JSONSerialization.data(withJSONObject: incompleteBaseline)); preconditionFailure("partial retained tuple imported") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("complete authenticated profile tuple"), "Retained baseline requires every own typed bucket")
+        }
 
         let overlay: Object = ["vortx": ["byProfile": [own.id.uuidString: ["watched": [
             "tt-own": ["w": ["overlay-video"]]

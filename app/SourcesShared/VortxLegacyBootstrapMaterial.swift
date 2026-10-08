@@ -39,15 +39,19 @@ enum VortxLegacyBootstrapMaterial {
     /// caller that has retained and will process that channel separately may defer only its
     /// material-side reconciliation check; the edits themselves never enter this projection.
     /// The default remains strict so ordinary legacy imports cannot acknowledge pending edits.
+    /// `retainedOwnAccountBaseline` is accepted only from the authenticated nativeSync helper after
+    /// it has detached-merged and validated a nativeSync 3 / legacyImport 2 receipt. It is the
+    /// exact `legacyImport.baseline` material 2 bytes, never an engine snapshot or raw source.
     static func encode(document: Data, roster: [UserProfile], ownerProfileID: UUID,
                        rosterModifiedSeconds: Double?, deferProfileEdits: Bool = false,
-                       ownAccountSources: [OwnAccountSource] = []) throws -> Data {
+                       ownAccountSources: [OwnAccountSource] = [], retainedOwnAccountBaseline: Data? = nil) throws -> Data {
         guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else {
             throw ReconciliationRequired(reason: "Account document must be an object")
         }
         let adapter = try Adapter(document: source, roster: roster, ownerID: ownerProfileID,
                                   modified: rosterModifiedSeconds, deferProfileEdits: deferProfileEdits)
-        return try JSONSerialization.data(withJSONObject: adapter.build(ownAccountSources: ownAccountSources), options: [.sortedKeys, .withoutEscapingSlashes])
+        return try JSONSerialization.data(withJSONObject: adapter.build(ownAccountSources: ownAccountSources,
+                                                                         retainedOwnAccountBaseline: retainedOwnAccountBaseline), options: [.sortedKeys, .withoutEscapingSlashes])
     }
 
     private final class Adapter {
@@ -85,7 +89,7 @@ enum VortxLegacyBootstrapMaterial {
             profiles = Dictionary(uniqueKeysWithValues: roster.map { ($0.id.uuidString, $0) })
         }
 
-        func build(ownAccountSources: [OwnAccountSource]) throws -> Object {
+        func build(ownAccountSources: [OwnAccountSource], retainedOwnAccountBaseline: Data?) throws -> Object {
             if let modified { _ = try validClock(modified, "rosterModifiedSeconds") }
             // The native `own` binding represents a secondary independently authenticated
             // streaming persona. The resolved primary owner remains local-only, never silently
@@ -97,7 +101,7 @@ enum VortxLegacyBootstrapMaterial {
                 return id.uuidString
             })
             try require(!deleted.contains(owner.id.uuidString), "Owner profile is tombstoned")
-            let sources = try resolveOwnAccountSources(ownAccountSources)
+            let sources = try resolveOwnAccountSources(ownAccountSources, retainedBaseline: retainedOwnAccountBaseline)
             for profile in roster {
                 watches[profile.id.uuidString] = []
                 titles[profile.id.uuidString] = [:]
@@ -111,22 +115,28 @@ enum VortxLegacyBootstrapMaterial {
             var addonBuckets: [String: Object] = [owner.id.uuidString: addons]
             var libraryBuckets: [String: Object] = [owner.id.uuidString: library]
             var ownSourceMaterial: [String: Object] = [:]
+            var identityLinks = Dictionary(uniqueKeysWithValues: roster.map { ($0.id.uuidString, [[String]]()) })
+            var retainedWatchProfiles = Set<String>()
             for (profileID, source) in sources {
                 let buckets = try source.buckets()
                 addonBuckets[profileID] = buckets.addons
                 libraryBuckets[profileID] = buckets.library
                 watches[profileID] = buckets.watches
                 titles[profileID] = buckets.titles
+                identityLinks[profileID] = buckets.identityLinks
+                if source.isRetained { retainedWatchProfiles.insert(profileID) }
                 ownSourceMaterial[profileID] = ["verifiedStreamingUid": source.verifiedStreamingUID,
                                                 "sourceDocumentSha256": source.sourceDocumentSHA256]
             }
             var result: Object = [
                 "schemaVersion": sources.isEmpty ? 1 : 2, "roster": nativeRoster, "deletedProfileIds": deleted.sorted(),
                 "addons": addonBuckets, "libraries": libraryBuckets,
-                "watches": try watches.mapValues(resolveWatches),
+                "watches": try Dictionary(uniqueKeysWithValues: watches.map { profileID, rows in
+                    (profileID, retainedWatchProfiles.contains(profileID) ? rows : try resolveWatches(rows))
+                }),
                 // Removal keys do not establish an IMDb/TMDB equivalence edge. The caller must
                 // reconcile such aliases explicitly; this adapter never guesses an identity link.
-                "identityLinks": Dictionary(uniqueKeysWithValues: roster.map { ($0.id.uuidString, [[String]]()) })
+                "identityLinks": identityLinks
             ]
             if !ownSourceMaterial.isEmpty { result["ownAccountSources"] = ownSourceMaterial }
             if let modified { result["rosterModifiedSeconds"] = modified }
@@ -191,15 +201,20 @@ enum VortxLegacyBootstrapMaterial {
             let library: Object
             let watches: [Object]
             let titles: [String: Object]
+            let identityLinks: [[String]]
         }
 
         private struct ResolvedOwnAccountSource {
             let profileID: String
             let verifiedStreamingUID: String
             let sourceDocumentSHA256: String
-            let sourceDocument: Object
+            let sourceDocument: Object?
+            let retainedBuckets: OwnAccountBuckets?
+            var isRetained: Bool { retainedBuckets != nil }
 
             func buckets() throws -> OwnAccountBuckets {
+                if let retainedBuckets { return retainedBuckets }
+                guard let sourceDocument else { throw fail("Missing own-account source material") }
                 // An independently authenticated account has the same root membership/history
                 // carriers as the primary account, but never borrows root-document data from the
                 // profile roster's account. Its envelope carries only the authenticated, exact
@@ -214,7 +229,7 @@ enum VortxLegacyBootstrapMaterial {
                 try adapter.validateProfileEdits(ownerLibrary: library)
                 return OwnAccountBuckets(addons: addons, library: library,
                                          watches: try VortxLegacyBootstrapMaterial.resolveWatches(adapter.watches[profileID] ?? []),
-                                         titles: adapter.titles[profileID] ?? [:])
+                                         titles: adapter.titles[profileID] ?? [:], identityLinks: [])
             }
         }
 
@@ -353,7 +368,7 @@ enum VortxLegacyBootstrapMaterial {
                           deferProfileEdits: false, allowIndependentSource: true)
         }
 
-        private func resolveOwnAccountSources(_ rawSources: [OwnAccountSource]) throws -> [String: ResolvedOwnAccountSource] {
+        private func resolveOwnAccountSources(_ rawSources: [OwnAccountSource], retainedBaseline: Data?) throws -> [String: ResolvedOwnAccountSource] {
             let ownProfiles = roster.filter { !$0.isOwner && $0.usesOwnAccount }
             var sources: [String: ResolvedOwnAccountSource] = [:]
             for source in rawSources {
@@ -369,11 +384,87 @@ enum VortxLegacyBootstrapMaterial {
                 let document = try Self.decodeOwnAccountEnvelope(source.sourceDocument, profileID: profileID)
                 sources[profileID] = ResolvedOwnAccountSource(profileID: profileID,
                     verifiedStreamingUID: source.verifiedStreamingUID,
-                    sourceDocumentSHA256: source.sourceDocumentSHA256, sourceDocument: document)
+                    sourceDocumentSHA256: source.sourceDocumentSHA256, sourceDocument: document, retainedBuckets: nil)
+            }
+            let retained = try retainedOwnAccountSources(retainedBaseline, requiredProfiles: ownProfiles)
+            for profile in ownProfiles where sources[profile.id.uuidString] == nil {
+                guard let source = retained[profile.id.uuidString] else {
+                    throw fail("Own-account profiles require exactly one authenticated streaming-account source")
+                }
+                sources[profile.id.uuidString] = source
             }
             let ownIDs = Set(ownProfiles.map { $0.id.uuidString })
             try require(Set(sources.keys) == ownIDs, "Own-account profiles require exactly one authenticated streaming-account source")
             return sources
+        }
+
+        /// A cold peer can retain only the kernel-validated typed tuple. The caller has already
+        /// validated nativeSync's receipt/history and selected `legacyImport.baseline`; this local
+        /// structural check prevents a stale, cross-profile, or partial tuple from standing in for
+        /// a fresh authenticated source. It intentionally never derives a new source digest.
+        private func retainedOwnAccountSources(_ bytes: Data?, requiredProfiles: [UserProfile]) throws -> [String: ResolvedOwnAccountSource] {
+            guard let bytes else { return [:] }
+            guard let baseline = try JSONSerialization.jsonObject(with: bytes) as? Object,
+                  let version = baseline["schemaVersion"] as? NSNumber,
+                  CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 2,
+                  Double(version.intValue) == version.doubleValue,
+                  let roster = try array(baseline, "roster"),
+                  let sourceRows = try object(baseline, "ownAccountSources"),
+                  let addons = try object(baseline, "addons"),
+                  let libraries = try object(baseline, "libraries"),
+                  let watches = try object(baseline, "watches"),
+                  let links = try object(baseline, "identityLinks") else {
+                throw fail("Retained own-account baseline is not complete material 2")
+            }
+            var profiles: [String: Object] = [:]
+            for raw in roster {
+                guard let profile = raw as? Object else { throw fail("Retained own-account baseline has a malformed roster") }
+                let id = try string(profile, "id")
+                try require(profiles[id] == nil, "Retained own-account baseline has duplicate profiles")
+                profiles[id] = profile
+            }
+            var retained: [String: ResolvedOwnAccountSource] = [:]
+            for profile in requiredProfiles {
+                let id = profile.id.uuidString
+                guard let source = try object(sourceRows, id),
+                      Set(source.keys) == ["verifiedStreamingUid", "sourceDocumentSha256"],
+                      let uid = try optionalString(source, "verifiedStreamingUid"),
+                      uid == uid.trimmingCharacters(in: .whitespacesAndNewlines), !uid.isEmpty,
+                      uid.utf8.count <= 256, uid.rangeOfCharacter(from: .controlCharacters) == nil,
+                      let digest = try optionalString(source, "sourceDocumentSha256"),
+                      digest.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                      let retainedProfile = profiles[id],
+                      try boolean(retainedProfile, "owner") == false,
+                      let account = try object(retainedProfile, "account"),
+                      try optionalString(account, "kind") == "own", try optionalString(account, "value") == uid,
+                      try optionalString(retainedProfile, "addons") == "own",
+                      let addonBucket = try object(addons, id),
+                      Set(addonBucket.keys) == ["items", "order", "intents"],
+                      let addonItems = try array(addonBucket, "items"),
+                      let addonOrder = try array(addonBucket, "order"),
+                      let addonIntents = try array(addonBucket, "intents"),
+                      let libraryBucket = try object(libraries, id),
+                      Set(libraryBucket.keys) == ["items", "intents"],
+                      let libraryItems = try array(libraryBucket, "items"),
+                      let libraryIntents = try array(libraryBucket, "intents"),
+                      let watchRows = try array(watches, id),
+                      let linkRows = try array(links, id) else {
+                    throw fail("Retained own-account baseline lacks a complete authenticated profile tuple")
+                }
+                let identityLinks = try linkRows.map { raw -> [String] in
+                    guard let row = raw as? [String] else { throw fail("Retained own-account baseline has malformed identity links") }
+                    return row
+                }
+                retained[id] = ResolvedOwnAccountSource(profileID: id, verifiedStreamingUID: uid,
+                    sourceDocumentSHA256: digest, sourceDocument: nil,
+                    retainedBuckets: OwnAccountBuckets(addons: ["items": addonItems, "order": addonOrder, "intents": addonIntents],
+                                                       library: ["items": libraryItems, "intents": libraryIntents],
+                                                       watches: try watchRows.map { raw in
+                        guard let row = raw as? Object else { throw fail("Retained own-account baseline has malformed watches") }
+                        return row
+                    }, titles: [:], identityLinks: identityLinks))
+            }
+            return retained
         }
 
         func addonBucket() throws -> Object {
