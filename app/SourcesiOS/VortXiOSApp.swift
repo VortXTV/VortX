@@ -3,6 +3,8 @@ import SwiftUI
 import UIKit
 #endif
 
+#if !CINEMA_UI_SMOKE_RENDERER
+
 /// Native iPhone / iPad entry point. Boots the SAME stremio-core engine + embedded server as the
 /// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors VortXTVApp's
 /// engine/server/profile wiring; the UI layer (SourcesiOS) is touch-native instead of focus-driven.
@@ -507,6 +509,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 #endif
+#endif // !CINEMA_UI_SMOKE_RENDERER
 
 #if os(iOS)
 /// Reports the app's currently-allowed interface orientations to UIKit. The player flips `lock` to

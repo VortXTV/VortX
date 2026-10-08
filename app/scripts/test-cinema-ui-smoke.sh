@@ -8,7 +8,9 @@ for source in \
   SourcesiOS/CinemaPresentation.swift \
   SourcesiOS/iOSRootView.swift \
   SourcesiOS/iOSDetailView.swift \
-  SourcesiOS/CinemaUISmokeHarness.swift; do
+  SourcesiOS/CinemaUISmokeHarness.swift \
+  SourcesiOS/CinemaUISmokeRendererApp.swift \
+  SourcesiOS/VortXiOSApp.swift; do
   swiftc -parse "$source"
 done
 
@@ -29,5 +31,18 @@ if rg -n 'CoreBridge|StremioAccount|PlayerScreen|iOSDetailView\(' SourcesiOS/Cin
   print -u2 'smoke harness must not boot production lifecycle owners'
   exit 1
 fi
+
+for renderer_contract in \
+  'CINEMA_UI_SMOKE_RENDERER' \
+  'NSHostingView(rootView: root)' \
+  'CINEMA_UI_SMOKE_OUTPUT' \
+  'CinemaUISmokeRenderer:' \
+  'PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.cinema-ui-smoke' \
+  'xcodebuild' \
+  'cinema-phone.png' \
+  'cinema-tablet.png' \
+  'cinema-mac.png'; do
+  rg -Fq "$renderer_contract" SourcesiOS/CinemaUISmokeRendererApp.swift project.yml scripts/render-cinema-ui-smoke.sh SourcesiOS/VortXiOSApp.swift
+done
 
 print 'ok: Cinema smoke harness is parseable, offline, and wired to production presentation components'

@@ -359,6 +359,42 @@ targets:
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
     # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
+  # Diagnostic-only, offline SwiftUI screenshot host. It compiles the real Cinema presentation tree but
+  # uses its own @main behind CINEMA_UI_SMOKE_RENDERER; it never starts CoreBridge, account/session state,
+  # NodeServer, or a player. This is not a release target and is intentionally absent from release schemes.
+  CinemaUISmokeRenderer:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - SourcesiOS
+      - path: SourcesShared
+        excludes: [".claude/**"]
+      - path: Sources/Player
+        excludes: [".claude/**"]
+      - Sources/PlayerScreen.swift
+      - Sources/ShareSheet.swift
+      - Sources/ExternalPlayer.swift
+      - Resources/Assets.xcassets
+      - Resources/Localizable.xcstrings
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL
+      - framework: Vendor/StremioXCore.xcframework
+        embed: false
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.cinema-ui-smoke
+        PRODUCT_NAME: CinemaUISmokeRenderer
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: Cinema UI Smoke
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
   # Native macOS app (NOT Catalyst, which MPVKit can't link). Reuses the same native SwiftUI UI
   # (SourcesiOS), shared engine, and the now-cross-platform libmpv player. Streaming server:
   # nodejs-mobile has no macOS slice, so instead of embedding node as a library (iOS/tvOS), the Mac
@@ -732,6 +768,12 @@ targets:
         CODE_SIGNING_REQUIRED: "NO"
     # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
 schemes:
+  CinemaUISmokeRenderer:
+    build:
+      targets:
+        CinemaUISmokeRenderer: all
+    run:
+      config: Debug
   VortX:
     build:
       targets:

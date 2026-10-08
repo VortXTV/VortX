@@ -10,20 +10,19 @@ struct CinemaUISmokeHarness: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: true) {
             HStack(alignment: .top, spacing: Theme.Space.lg) {
-                CinemaUISmokeViewport(name: "Phone", width: 390, height: 844)
-                CinemaUISmokeViewport(name: "Tablet", width: 834, height: 1112)
-                CinemaUISmokeViewport(name: "Mac", width: 1280, height: 800)
+                CinemaUISmokeFixtureRoot(name: "Phone", width: 390, height: 844)
+                CinemaUISmokeFixtureRoot(name: "Tablet", width: 834, height: 1112)
+                CinemaUISmokeFixtureRoot(name: "Mac", width: 1280, height: 800)
             }
             .padding(Theme.Space.md)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        .environmentObject(ThemeManager.shared)
-        .environment(\.cinemaFixtureDisablesArtworkLoading, true)
         .accessibilityLabel("Cinema UI smoke harness")
     }
 }
 
-private struct CinemaUISmokeViewport: View {
+/// The reusable root also gives the command-line renderer a single, side-effect-free production-view tree.
+struct CinemaUISmokeFixtureRoot: View {
     let name: String
     let width: CGFloat
     let height: CGFloat
@@ -62,6 +61,8 @@ private struct CinemaUISmokeViewport: View {
         .overlay(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
             .stroke(Theme.Palette.hairline, lineWidth: 1))
         .safeAreaInset(edge: .bottom, spacing: 0) { CinemaUISmokeTabBar() }
+        .environmentObject(ThemeManager.shared)
+        .environment(\.cinemaFixtureDisablesArtworkLoading, true)
         .accessibilityLabel("\(name) Cinema viewport")
     }
 }
