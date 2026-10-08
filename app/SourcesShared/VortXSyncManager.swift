@@ -258,7 +258,7 @@ final class VortXSyncManager: ObservableObject {
     private func rememberNativeBackup(capture: CredentialScopeRegistry.Capture) -> Bool {
         guard isCurrent(capture) else { return false }
         let slot = "vortx.native.backupSeen." + capture.namespace
-        return Keychain.set("1", for: slot) && Keychain.string(slot) == "1"
+        return Keychain.set("1", for: slot) == .success && Keychain.string(slot) == "1"
     }
     private func nativeHostActor(capture: CredentialScopeRegistry.Capture) throws -> String {
         guard isCurrent(capture) else { throw VortxNativeError.superseded }
@@ -267,7 +267,7 @@ final class VortXSyncManager: ObservableObject {
             guard VortxNativeHostPreferences.validActor(actor) else { throw VortxNativeError.invalidSnapshot }; return actor
         }
         let actor = UUID().uuidString.lowercased()
-        guard Keychain.set(actor, for: slot), Keychain.string(slot) == actor else { throw VortxNativeError.unavailable }
+        guard Keychain.set(actor, for: slot) == .success, Keychain.string(slot) == actor else { throw VortxNativeError.unavailable }
         return actor
     }
 
