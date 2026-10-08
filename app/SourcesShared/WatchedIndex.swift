@@ -65,6 +65,12 @@ final class WatchedIndex: ObservableObject {
     private static let resweepDelay: TimeInterval = 2
 
     private init() {
+        #if CINEMA_UI_SMOKE_RENDERER
+        // The diagnostic renderer must be a zero-owner surface: constructing this index would subscribe
+        // to CoreBridge/ProfileStore and schedule external watched-shadow refreshes. Keep a runtime
+        // tripwire here so a fixture regression fails before any screenshot can be accepted.
+        preconditionFailure("Cinema UI renderer must not construct WatchedIndex.shared")
+        #endif
         let core = CoreBridge.shared
         let profiles = ProfileStore.shared
         let events: [AnyPublisher<Void, Never>] = [

@@ -10,7 +10,8 @@ for source in \
   SourcesiOS/iOSDetailView.swift \
   SourcesiOS/CinemaUISmokeHarness.swift \
   SourcesiOS/CinemaUISmokeRendererApp.swift \
-  SourcesiOS/VortXiOSApp.swift; do
+  SourcesiOS/VortXiOSApp.swift \
+  SourcesShared/WatchedIndex.swift; do
   swiftc -parse "$source"
 done
 
@@ -42,7 +43,19 @@ for renderer_contract in \
   'cinema-phone.png' \
   'cinema-tablet.png' \
   'cinema-mac.png'; do
-  rg -Fq "$renderer_contract" SourcesiOS/CinemaUISmokeRendererApp.swift project.yml scripts/render-cinema-ui-smoke.sh SourcesiOS/VortXiOSApp.swift
+  rg -Fq "$renderer_contract" SourcesiOS/CinemaUISmokeRendererApp.swift project.yml scripts/render-cinema-ui-smoke.sh SourcesiOS/VortXiOSApp.swift SourcesShared/WatchedIndex.swift
 done
+
+fixture_rail="$(sed -n '/struct CinemaFixturePosterRail/,/#endif/p' SourcesiOS/iOSRootView.swift)"
+[[ "$fixture_rail" == *"PosterRailBody"* && "$fixture_rail" == *"watchedIDs: []"* ]] || {
+  print -u2 'fixture rail must pass an inert watched set to the shared rail body'
+  exit 1
+}
+[[ "$fixture_rail" != *"WatchedIndex.shared"* ]] || {
+  print -u2 'fixture rail must not construct WatchedIndex.shared'
+  exit 1
+}
+rg -Fq 'preconditionFailure("Cinema UI renderer must not construct WatchedIndex.shared")' SourcesShared/WatchedIndex.swift
+rg -Fq 'usesInertArtwork: true' SourcesiOS/iOSRootView.swift
 
 print 'ok: Cinema smoke harness is parseable, offline, and wired to production presentation components'
