@@ -62,7 +62,7 @@ struct VortxAccountScope: Codable, Hashable, Sendable {
               libraries.keys.allSatisfy({ profiles[$0] != nil }) else { throw VortxNativeError.invalidSnapshot }
         if let sync = value["nativeSync"], sync != .null {
             guard sync["scope"] == .string(account), sync["ownerProfileId"] == .string(ownerProfileID),
-                  [VortxJSON.integer(1), .integer(2)].contains(sync["schemaVersion"] ?? .null) else { throw VortxNativeError.invalidSnapshot }
+                  [VortxJSON.integer(1), .integer(2), .integer(3)].contains(sync["schemaVersion"] ?? .null) else { throw VortxNativeError.invalidSnapshot }
         }
         return value
     }
@@ -87,6 +87,11 @@ protocol VortxCheckpointStore: Sendable {
     func readLegacyMaterial(scope: VortxAccountScope) throws -> Data?
     func readLegacyProfileEdits(scope: VortxAccountScope) throws -> VortxJSON?
     func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws
+}
+/// Optional external-source authentication lease. Its implementation linearizes credential
+/// invalidation with the final checkpoint, without exposing credentials to the native runtime.
+protocol VortxMutationAuthority: Sendable {
+    func withActive(_ operation: () throws -> Void) throws
 }
 extension VortxCheckpointStore {
     func readHostPreferences(scope: VortxAccountScope) throws -> Data? { nil }
@@ -460,13 +465,16 @@ actor VortxNativeSession {
     init(scope: VortxAccountScope, ownerName: String, abi: any VortxRuntimeABI,
          store: any VortxCheckpointStore, transport: any VortxResourceTransport,
          allowNewAccount: Bool = false, legacy: VortxLegacyImport? = nil,
-         initialActions: [String] = [], hostActor: String = UUID().uuidString.lowercased()) throws {
+         initialActions: [String] = [], hostActor: String = UUID().uuidString.lowercased(),
+         sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) throws {
         try scope.validate()
         guard legacy == nil || legacy?.scope == scope else { throw VortxNativeError.invalidSnapshot }
         self.scope = scope; self.abi = abi; self.store = store; self.transport = transport
         legacyBaseline = try store.readLegacyMaterial(scope: scope)
         legacyProfileEdits = try store.readLegacyProfileEdits(scope: scope)
         hostPreferences = try VortxNativeHostPreferences(scope: scope, actor: hostActor, sealed: store.readHostPreferences(scope: scope))
+        try hostPreferences.retainAuthenticatedSourceArchive(authenticatedSourceArchive)
+        let initialHost = try hostPreferences.encoded()
         writer = try VortxScopeWriter(scope: scope, lease: lease)
         if let captured = try store.read(scope: scope) {
             _ = try scope.validateSnapshot(captured)
@@ -476,7 +484,14 @@ actor VortxNativeSession {
             try scope.validateHydration(from: captured, to: hydrated)
             try Self.bind(runtime, scope: scope)
             let bound = try runtime.stateJSON()
-            try lease.withActive { try store.commit(bound, scope: scope) }
+            try Self.validateAuthenticatedSources(authenticatedSourceArchive, state: scope.validateSnapshot(bound))
+            try lease.withActive {
+                func commit() throws {
+                    if authenticatedSourceArchive != nil { try store.commit(bound, scope: scope, hostPreferences: initialHost) }
+                    else { try store.commit(bound, scope: scope) }
+                }
+                if let sourceAuthority { try sourceAuthority.withActive(commit) } else { try commit() }
+            }
         } else {
             guard allowNewAccount, legacy?.documents.isEmpty != false else { throw VortxNativeError.invalidSnapshot }
             runtime = try VortxNativeRuntime(abi: abi, ownerID: scope.ownerProfileID, ownerName: ownerName)
@@ -484,7 +499,14 @@ actor VortxNativeSession {
             for action in initialActions { try Self.apply(runtime, action: action) }
             let bound = try runtime.stateJSON()
             _ = try scope.validateSnapshot(bound)
-            try lease.withActive { try store.commit(bound, scope: scope) }
+            try Self.validateAuthenticatedSources(authenticatedSourceArchive, state: scope.validateSnapshot(bound))
+            try lease.withActive {
+                func commit() throws {
+                    if authenticatedSourceArchive != nil { try store.commit(bound, scope: scope, hostPreferences: initialHost) }
+                    else { try store.commit(bound, scope: scope) }
+                }
+                if let sourceAuthority { try sourceAuthority.withActive(commit) } else { try commit() }
+            }
         }
     }
     private static func bind(_ runtime: VortxNativeRuntime, scope: VortxAccountScope) throws {
@@ -492,6 +514,21 @@ actor VortxNativeSession {
         try apply(runtime, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
         let bound = try scope.validateSnapshot(runtime.stateJSON())
         guard bound["nativeSync"]?["scope"] == .string(scope.account) else { throw VortxNativeError.invalidSnapshot }
+    }
+    private static func validateAuthenticatedSources(_ archive: Data?, state: VortxJSON) throws {
+        guard let archive else { return }
+        try VortxNativeBootstrapArchive.validate(archive)
+        let decoded = try JSONDecoder().decode(VortxJSON.self, from: archive)
+        guard case .object(let sources) = decoded["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
+        for (id, value) in sources {
+            guard case .object(let fields) = value, Set(fields.keys) == ["verifiedStreamingUid", "sourceDocumentBase64"],
+                  case .string(let raw) = fields["sourceDocumentBase64"], let bytes = Data(base64Encoded: raw), bytes.base64EncodedString() == raw,
+                  let proof = state["nativeSync"]?["legacyImport"]?["baseline"]?["ownAccountSources"]?[id],
+                  proof["verifiedStreamingUid"] == fields["verifiedStreamingUid"],
+                  proof["sourceDocumentSha256"] == .string(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()) else {
+                throw VortxNativeError.invalidSnapshot
+            }
+        }
     }
     private static func apply(_ runtime: VortxNativeRuntime, action: String) throws {
         let result = try runtime.dispatch(action, now: UInt64(Date().timeIntervalSince1970))
@@ -514,6 +551,30 @@ actor VortxNativeSession {
     /// Before durable reopen/adoption, prove the complete legacy material against a detached
     /// kernel candidate. Exact receipt replay is compatible with older artifacts; changed intent
     /// requires the private kernel's causal reconciliation action. Missing receipts never seed.
+    nonisolated static func authenticatedOwnAccountBaseline(scope: VortxAccountScope, ownerName: String,
+                                                            snapshot: String?, nativeSync: VortxJSON?,
+                                                            abi: any VortxRuntimeABI) throws -> Data? {
+        guard snapshot != nil || nativeSync != nil else { return nil }
+        try scope.validate()
+        let candidate: VortxNativeRuntime
+        if let snapshot {
+            _ = try scope.validateSnapshot(snapshot)
+            candidate = try VortxNativeRuntime(abi: abi, snapshot: snapshot)
+            try scope.validateHydration(from: snapshot, to: candidate.stateJSON())
+        } else { candidate = try VortxNativeRuntime(abi: abi, ownerID: scope.ownerProfileID, ownerName: ownerName) }
+        defer { candidate.close() }
+        try bind(candidate, scope: scope)
+        if let nativeSync {
+            let action = VortxJSON.object(["type": .string("merge_native_sync"), "document": nativeSync])
+            try apply(candidate, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
+        }
+        let sync = try scope.validateSnapshot(candidate.stateJSON())["nativeSync"]
+        guard sync?["schemaVersion"] == .integer(3) else { return nil }
+        guard sync?["legacyImport"]?["schemaVersion"] == .integer(2),
+              let baseline = sync?["legacyImport"]?["baseline"], baseline["schemaVersion"] == .integer(2),
+              case .object(let proofs) = baseline["ownAccountSources"], !proofs.isEmpty else { throw VortxNativeError.invalidSnapshot }
+        return try JSONEncoder().encode(baseline)
+    }
     nonisolated static func validateLegacyCompatibility(scope: VortxAccountScope, ownerName: String,
                                                         snapshot: String?, nativeSync: VortxJSON?, material: Data,
                                                         abi: any VortxRuntimeABI, baselineMaterial: Data? = nil) throws {
@@ -533,7 +594,7 @@ actor VortxNativeSession {
     }
     private static func validateLegacyReceipt(_ candidate: VortxNativeRuntime, scope: VortxAccountScope, material: Data, baselineMaterial: Data?) throws {
         let state = try scope.validateSnapshot(candidate.stateJSON())
-        guard state["nativeSync"]?["legacyImport"]?["schemaVersion"] == .integer(1) else { throw VortxNativeError.invalidSnapshot }
+        guard [VortxJSON.integer(1), .integer(2)].contains(state["nativeSync"]?["legacyImport"]?["schemaVersion"] ?? .null) else { throw VortxNativeError.invalidSnapshot }
         let replay: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account),
                                        "ownerProfileId": .string(scope.ownerProfileID),
                                        "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
@@ -616,7 +677,8 @@ actor VortxNativeSession {
     }
     @discardableResult func dispatch(_ actions: [String], now: UInt64, legacyMaterial: Data? = nil,
                                     hostRemote: VortxJSON? = nil, hostEdits: [VortxNativeHostPreferences.Edit] = [],
-                                    websiteEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:]) throws -> [String] {
+                                    websiteEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
+                                    sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) throws -> [String] {
         guard !closed else { throw VortxNativeError.closed }
         guard !persistenceFailed else { throw VortxNativeError.checkpointUncertain }
         let old = try stateJSON()
@@ -633,7 +695,9 @@ actor VortxNativeSession {
         }
         if let legacyMaterial { try Self.validateLegacyReceipt(candidate, scope: scope, material: legacyMaterial, baselineMaterial: legacyBaseline) }
         var state = try scope.validateSnapshot(candidate.stateJSON())
+        try Self.validateAuthenticatedSources(authenticatedSourceArchive, state: state)
         var candidateHost = hostPreferences
+        try candidateHost.retainAuthenticatedSourceArchive(authenticatedSourceArchive)
         try candidateHost.merge(hostRemote, scope: scope)
         for edit in hostEdits {
             if let profile = edit.profileID {
@@ -695,14 +759,19 @@ actor VortxNativeSession {
             state = try scope.validateSnapshot(candidate.stateJSON())
         }
         let updated = try candidate.stateJSON()
-        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty || hasWebsiteWork
+        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty || hasWebsiteWork || authenticatedSourceArchive != nil
+        let encodedHost = hasHostChanges ? try candidateHost.encoded() : nil
         do {
             try lease.withActive {
-                if hasHostChanges { try store.commit(updated, scope: scope, hostPreferences: candidateHost.encoded()) }
-                else { try store.commit(updated, scope: scope) }
+                func commit() throws {
+                    if let encodedHost { try store.commit(updated, scope: scope, hostPreferences: encodedHost) }
+                    else { try store.commit(updated, scope: scope) }
+                }
+                if let sourceAuthority { try sourceAuthority.withActive(commit) } else { try commit() }
             }
         }
         catch VortxNativeError.closed { throw VortxNativeError.closed }
+        catch VortxNativeError.superseded { throw VortxNativeError.superseded }
         catch {
             // A rename may have succeeded before a readback/fsync failure. Do not overwrite that
             // uncertain checkpoint with another transaction; reopen and validate it first.

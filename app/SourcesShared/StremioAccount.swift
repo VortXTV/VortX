@@ -263,7 +263,14 @@ final class StremioAccount: ObservableObject {
 
     private var authKey: String? {
         get { Keychain.string(tokenKey) }
-        set { Keychain.set(newValue, for: tokenKey) }
+        set { Self.storeAuthKey(newValue, account: tokenKey) }
+    }
+    private static func storeAuthKey(_ value: String?, account: String) {
+#if VORTX_NATIVE_DATA_ENGINE
+        VortxNativeOwnAccountProducer.withCredentialMutation(slot: account) { _ = Keychain.set(value, for: account) }
+#else
+        Keychain.set(value, for: account)
+#endif
     }
 
     private func captureAuthOperationContext() -> AuthOperationContext {
@@ -274,6 +281,9 @@ final class StremioAccount: ObservableObject {
     }
 
     private func beginAuthOperation() -> AuthOperationContext {
+#if VORTX_NATIVE_DATA_ENGINE
+        VortxNativeOwnAccountProducer.invalidate(slot: tokenKey)
+#endif
         authOperationGeneration &+= 1
         return captureAuthOperationContext()
     }
@@ -296,6 +306,9 @@ final class StremioAccount: ObservableObject {
 
     /// Re-read the session for the newly active profile (called after a profile switch).
     func reloadForActiveProfile() {
+#if VORTX_NATIVE_DATA_ENGINE
+        VortxNativeOwnAccountProducer.invalidateContext()
+#endif
         authOperationGeneration &+= 1
         signInError = nil
         streamSources = []
@@ -321,7 +334,7 @@ final class StremioAccount: ObservableObject {
     private func migrateTokenToKeychain() {
         guard authKey == nil,
               let legacy = UserDefaults.standard.string(forKey: tokenKey), !legacy.isEmpty else { return }
-        Keychain.set(legacy, for: tokenKey)
+        Self.storeAuthKey(legacy, account: tokenKey)
         UserDefaults.standard.removeObject(forKey: tokenKey)
     }
 
@@ -353,7 +366,7 @@ final class StremioAccount: ObservableObject {
             // destination dynamically from the profile selected after the response returned.
             // Never use a dynamically selected credential destination after this await: the selected
             // profile may have changed. Write only to the slot captured before the request started.
-            Keychain.set(key, for: context.keychainAccount)
+            Self.storeAuthKey(key, account: context.keychainAccount)
             guard authOperationStillCurrent(context) else { return }
             publishCredentialBoundary(wasSignedIn: wasSignedIn)
             // Publish the credential boundary before the email publisher so CoreBridge can rotate its
@@ -375,7 +388,7 @@ final class StremioAccount: ObservableObject {
         signInError = nil
         let context = beginAuthOperation()
         let wasSignedIn = isSignedIn
-        Keychain.set(token, for: context.keychainAccount)
+        Self.storeAuthKey(token, account: context.keychainAccount)
         guard authOperationStillCurrent(context) else { return }
         publishCredentialBoundary(wasSignedIn: wasSignedIn)
         await backfillEmail(for: context)
@@ -386,6 +399,9 @@ final class StremioAccount: ObservableObject {
     }
 
     func signOut() {
+#if VORTX_NATIVE_DATA_ENGINE
+        VortxNativeOwnAccountProducer.invalidate(slot: tokenKey)
+#endif
         authOperationGeneration &+= 1
         authKey = nil; isSignedIn = false; streamSources = []; addons = []
         setEmail(nil)

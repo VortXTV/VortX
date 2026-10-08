@@ -263,6 +263,7 @@ final class ProfileStore: ObservableObject {
     }
     @MainActor
     func removeNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil) async -> Bool {
+        VortxNativeOwnAccountProducer.invalidate(slot: keychainAccount(for: profile))
         let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
         do { try await CoreBridge.shared.deleteNativeProfile(profile.id, target: captured); nativeProfileError = nil; return true }
         catch { nativeProfileError = "Profile could not be removed. Please retry."; return false }
@@ -758,7 +759,12 @@ final class ProfileStore: ObservableObject {
               !target.isOwner,
               target.id != UserProfile.ownerID else { return nil }
         profiles.removeAll { $0.id == target.id }
-        if target.usesOwnAccount { Keychain.set(nil, for: keychainAccount(for: target)) }
+        if target.usesOwnAccount {
+#if VORTX_NATIVE_DATA_ENGINE
+            VortxNativeOwnAccountProducer.invalidate(slot: keychainAccount(for: target))
+#endif
+            Keychain.set(nil, for: keychainAccount(for: target))
+        }
         UserDefaults.standard.removeObject(forKey: Self.watchCacheKey(target.id))
         UserDefaults.standard.removeObject(forKey: Self.watchRemovalKey(target.id))
         savePendingAccountLibraryAdds(pendingAccountLibraryAdds().filter { $0.profileID != target.id })

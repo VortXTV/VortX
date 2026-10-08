@@ -9,7 +9,7 @@ enum VortxNativeBootstrapArchive {
         "auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
         "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials", "nativeprovidercredentials"
     ]
-    static func encode(document: Data, material: Data? = nil) throws -> Data {
+    static func encode(document: Data, material: Data? = nil, authenticatedSourceArchive: Data? = nil) throws -> Data {
         guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else { throw Failure.malformed }
         var exclusions: [String] = []
         let sanitized = try sanitize(source, path: "", exclusions: &exclusions)
@@ -17,11 +17,17 @@ enum VortxNativeBootstrapArchive {
                                       "excludedCredentialPaths": exclusions.sorted()]
         if let material {
             guard let typed = try JSONSerialization.jsonObject(with: material) as? [String: Any],
-                  typed["schemaVersion"] as? Int == 1 else { throw Failure.malformed }
+                  [1, 2].contains(typed["schemaVersion"] as? Int ?? 0) else { throw Failure.malformed }
             var forbidden: [String] = []
             _ = try sanitize(typed, path: "/legacyImportMaterial", exclusions: &forbidden)
             guard forbidden.isEmpty else { throw Failure.ambiguousCredentialCarrier }
             archive["legacyImportMaterial"] = typed // never rewrite typed input/receipt source clocks
+        }
+        if let authenticatedSourceArchive {
+            try validate(authenticatedSourceArchive)
+            guard let source = try JSONSerialization.jsonObject(with: authenticatedSourceArchive) as? [String: Any],
+                  let host = source["hostDocument"] as? [String: Any] else { throw Failure.malformed }
+            archive["authenticatedSourceArchive"] = host
         }
         return try JSONSerialization.data(withJSONObject: archive, options: [.sortedKeys, .withoutEscapingSlashes])
     }
@@ -30,13 +36,16 @@ enum VortxNativeBootstrapArchive {
               object["schemaVersion"] as? Int == 1, let host = object["hostDocument"] as? [String: Any],
               let excluded = object["excludedCredentialPaths"] as? [String],
               excluded.allSatisfy({ $0.hasPrefix("/") }),
-              Set(object.keys).isSubset(of: ["schemaVersion", "hostDocument", "excludedCredentialPaths", "legacyImportMaterial"])
+              Set(object.keys).isSubset(of: ["schemaVersion", "hostDocument", "excludedCredentialPaths", "legacyImportMaterial", "authenticatedSourceArchive"])
         else { throw Failure.malformed }
         var forbidden: [String] = []
         _ = try sanitize(host, path: "", exclusions: &forbidden)
         if let material = object["legacyImportMaterial"] {
             guard material is [String: Any] else { throw Failure.malformed }
             _ = try sanitize(material, path: "/legacyImportMaterial", exclusions: &forbidden)
+        }
+        if let source = object["authenticatedSourceArchive"] {
+            _ = try sanitize(source, path: "/authenticatedSourceArchive", exclusions: &forbidden)
         }
         guard forbidden.isEmpty else { throw Failure.ambiguousCredentialCarrier }
     }

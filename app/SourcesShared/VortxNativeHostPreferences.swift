@@ -18,6 +18,7 @@ struct VortxNativeHostPreferences: Sendable {
         var websitePending: [VortxJSON]? = nil
         var websiteReceipts: [String: String]? = nil
         var websiteConflicts: [VortxNativeProfileEditHost.Conflict]? = nil
+        var authenticatedSourceArchive: Data? = nil
     }
     struct Edit: Sendable { let profileID: String?; let fields: [String: VortxJSON] }
     var local: Local
@@ -45,11 +46,27 @@ struct VortxNativeHostPreferences: Sendable {
             guard Self.validActor(value.actor), value.counter <= Self.maxClock else { throw VortxNativeError.invalidSnapshot }
             try Self.validate(value.document, scope: scope)
             try VortxNativeProfileEditHost.validateJournal(value)
+            if let archive = value.authenticatedSourceArchive { try VortxNativeBootstrapArchive.validate(archive) }
             // The installation supplies its own keychain actor. Never adopt a restored actor.
             value.actor = actor; value.counter = max(value.counter, Self.maximum(value.document)); local = value
         } else { local = Local(actor: actor, counter: 0, document: Document(schemaVersion: 1, scope: scope.account, ownerProfileId: scope.ownerProfileID)) }
     }
     func encoded() throws -> Data { try JSONEncoder().encode(local) }
+    mutating func retainAuthenticatedSourceArchive(_ archive: Data?) throws {
+        guard let archive else { return }
+        try VortxNativeBootstrapArchive.validate(archive)
+        let incoming = try JSONDecoder().decode(VortxJSON.self, from: archive)
+        guard case .object(let sources) = incoming["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
+        var retained: [String: VortxJSON] = [:]
+        if let prior = local.authenticatedSourceArchive {
+            let old = try JSONDecoder().decode(VortxJSON.self, from: prior)
+            guard case .object(let values) = old["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
+            retained = values
+        }
+        for (id, source) in sources { retained[id] = source }
+        let document = try JSONEncoder().encode(VortxJSON.object(["ownAccountSources": .object(retained)]))
+        local.authenticatedSourceArchive = try VortxNativeBootstrapArchive.encode(document: document)
+    }
     mutating func merge(_ remote: VortxJSON?, scope: VortxAccountScope) throws {
         guard let remote else { return }
         guard case .object(let keys) = remote, Set(keys.keys) == ["schemaVersion", "scope", "ownerProfileId", "profiles", "globals"] else { throw VortxNativeError.invalidSnapshot }
