@@ -80,6 +80,22 @@ for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
 done
 ok "Apple and both Android lanes use one exact native engine revision"
 
+# A directly invoked gate must survive Git checkout as executable; otherwise CI fails before its
+# artifact checks run. Inspect the actual workflow commands and tracked modes, not a prose list.
+direct_helpers=0
+while IFS= read -r helper; do
+    [[ "$helper" =~ ^\./scripts/[A-Za-z0-9._-]+\.sh$ ]] || fail "unsafe direct Apple helper path: $helper"
+    relative="${helper#./}"
+    mode="$(git -C "$REPO_ROOT" ls-files -s -- "$relative" | awk '{print $1}')"
+    [[ "$mode" == 100755 && -x "$REPO_ROOT/$relative" ]] \
+        || fail "Apple directly executes a non-executable tracked helper: $relative (mode $mode)"
+    direct_helpers=$((direct_helpers + 1))
+done < <(awk '/^[[:space:]]*(run: )?\.\/scripts\// {
+    for (i=1; i<=NF; i++) if ($i ~ /^\.\/scripts\/.*\.sh$/) print $i
+}' "$APPLE_RELEASE_WF" | sort -u)
+[[ "$direct_helpers" -gt 0 ]] || fail "Apple direct-helper contract inspected no commands"
+ok "all actual direct Apple build and artifact-gate helpers have executable Git modes"
+
 # Execute only the real MPV selection prefix, stopping before its first network/download command.
 # This proves the reviewed default works with empty push/dispatch inputs, overrides are atomic,
 # and the retired digest remains rejected independently of the new EXPECTED digest.
