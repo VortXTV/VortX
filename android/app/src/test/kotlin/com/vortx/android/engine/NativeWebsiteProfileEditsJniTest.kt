@@ -97,6 +97,17 @@ class NativeWebsiteProfileEditsJniTest {
             assertTrue(gateway.applyDocument(account, original) { true })
             assertEquals("Original A", gateway.session().read().state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(owner.id).getString("name"))
             assertEquals(1, gateway.session().read().state.getJSONObject("nativeSync").getJSONObject("legacyProfileEditReceipts").length())
+            val peerSync = JSONObject(gateway.session().read().state.getJSONObject("nativeSync").toString())
+            val adoptionDirectory = Files.createTempDirectory(File("build").toPath(), "website-adopt-jni-").toFile()
+            val adoptionKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+            val adopting = NativeAccountCoordinator(bindings(), VortxEncryptedCheckpointStore(adoptionDirectory) { adoptionKey }, { noNetwork() }, { it == account }, { it() }, {})
+            try {
+                val adoptedB = document(aggregate("Later B")).put("nativeSync", peerSync)
+                assertTrue(adopting.applyDocument(account, adoptedB) { true })
+                assertEquals("Original A", adopting.session().read().state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(owner.id).getString("name"))
+                assertEquals(1, adopting.session().read().state.getJSONObject("nativeSync").getJSONObject("legacyProfileEditReceipts").length())
+                assertEquals(1, adopting.session().read().state.getJSONObject("websiteProfileEditPending").getJSONArray("events").length())
+            } finally { adopting.retire(); adoptionDirectory.listFiles()?.forEach { it.delete() }; adoptionDirectory.delete() }
             val later = document(aggregate("Later B"))
             assertTrue(gateway.applyDocument(account, later) { true })
             assertEquals("Original A", gateway.session().read().state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(owner.id).getString("name"))

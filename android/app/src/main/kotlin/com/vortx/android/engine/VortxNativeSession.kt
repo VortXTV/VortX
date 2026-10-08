@@ -313,7 +313,11 @@ internal class VortxNativeSession private constructor(
                 val archive = initialHostArchive ?: old?.optJSONObject("hostDocument")?.let {
                     JSONObject().put("document", it).put("excludedCredentialPaths", old.getJSONArray("excludedCredentialPaths"))
                 }
-                val legacyBootstrap = old?.optJSONObject("legacyWebsiteBootstrap") ?: if (stored == null) initialHostArchive
+                // A blank local checkpoint is not proof of an original aggregate when this open
+                // adopts a peer's native baseline. Only this account's first import action binds
+                // the sealed aggregate to its original legacy-import fingerprint.
+                val importedLocally = bootstrapActions.any { it.optString("type") == "import_legacy_sync" }
+                val legacyBootstrap = old?.optJSONObject("legacyWebsiteBootstrap") ?: if (stored == null && importedLocally) initialHostArchive
                     ?.getJSONObject("document")?.opt("profileEdits")?.takeIf { it != JSONObject.NULL && (it !is JSONObject || it.length() > 0) }
                     ?.let { raw -> JSONObject().put("aggregate", raw).put("legacyImportFingerprint", JSONObject(runtime.stateJson()).getJSONObject("nativeSync")
                         .getJSONObject("legacyImport").getString("fingerprint")) } else null

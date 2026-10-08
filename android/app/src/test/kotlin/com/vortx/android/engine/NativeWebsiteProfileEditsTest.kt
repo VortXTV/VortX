@@ -85,4 +85,16 @@ class NativeWebsiteProfileEditsTest {
         val retainedNewer = NativeWebsiteProfileEdits.admit(scope, event(), response(), newer, fallback, JSONObject(), receipt)
         assertTrue(retainedNewer.host.getJSONObject("document").getJSONObject("profiles").getJSONObject("owner").getJSONObject("fields").getJSONObject("avatar").isNull("value"))
     }
+
+    @Test fun `changed event identity conflict wrapper is idempotent and cannot starve later events`() {
+        val first = JSONObject().put("eventId", "same").put("value", "A")
+        val changed = JSONObject().put("eventId", "same").put("value", "B")
+        var pending = NativeWebsiteProfileEdits.retain(scope, JSONObject().put("events", JSONArray()), first)
+        pending = NativeWebsiteProfileEdits.retain(scope, pending, changed)
+        pending = NativeWebsiteProfileEdits.retain(scope, pending, changed)
+        NativeWebsiteProfileEdits.validateRetained(scope, pending, JSONObject())
+        assertEquals(2, pending.getJSONArray("events").length())
+        pending = NativeWebsiteProfileEdits.retain(scope, pending, JSONObject().put("eventId", "later").put("value", "C"))
+        assertEquals(3, pending.getJSONArray("events").length())
+    }
 }

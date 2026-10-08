@@ -69,7 +69,10 @@ internal object NativeWebsiteProfileEdits {
         for (index in 0 until events.length()) {
             val old = events.getJSONObject(index)
             if (old.getString("eventId") == id) {
-                if (!NativeHostPreferences.equal(old, event)) events.put(JSONObject().put("eventId", "conflict-${hash(event)}").put("conflictingEvent", copy(event)))
+                if (!NativeHostPreferences.equal(old, event)) {
+                    val wrapper = JSONObject().put("eventId", "conflict-${hash(event)}").put("conflictingEvent", copy(event))
+                    if ((0 until events.length()).none { candidate -> NativeHostPreferences.equal(events.getJSONObject(candidate), wrapper) }) events.put(wrapper)
+                }
                 return result
             }
         }
