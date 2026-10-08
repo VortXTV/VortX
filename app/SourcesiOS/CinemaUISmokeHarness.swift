@@ -38,12 +38,15 @@ struct CinemaUISmokeFixtureRoot: View {
                 .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.control, style: .continuous), shadow: .flat)
             CinemaUISmokeSurfaceContent(surface: surface)
         }
+        // Keep the fixture's requested viewport authoritative. Applying the inset outside this frame
+        // makes SwiftUI grow the exported host by the tab bar height, which turns a 390×844 phone
+        // capture into a 390×922 image and falsely looks like clipped bottom chrome.
+        .safeAreaInset(edge: .bottom, spacing: 0) { CinemaUISmokeTabBar() }
         .frame(width: width, height: height)
         .background(Theme.Palette.canvas)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
             .stroke(Theme.Palette.hairline, lineWidth: 1))
-        .safeAreaInset(edge: .bottom, spacing: 0) { CinemaUISmokeTabBar() }
         .environmentObject(ThemeManager.shared)
         .environment(\.cinemaFixtureDisablesArtworkLoading, true)
         .accessibilityLabel("\(name) \(surface.title) Cinema viewport")
