@@ -128,6 +128,16 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         do { try hostB.merge(equivocal.document, scope: scope); fatalError("host carrier accepted equivocal event") } catch {}
         let restoredHost = try VortxNativeHostPreferences(scope: scope, actor: actorB, sealed: hostA.encoded())
         check(restoredHost.local.actor == actorB && restoredHost.local.counter == 2)
+        var homePreference = try VortxNativeHostPreferences(scope: scope, actor: actorA)
+        check(try homePreference.document["globals"]?["fields"]?["vortx.mergeHomeDiscover"] == nil) // UI owns default-on; no synthetic edit.
+        try homePreference.edit(profileID: nil, fields: ["vortx.mergeHomeDiscover": .bool(false)], scope: scope)
+        var homePeer = try VortxNativeHostPreferences(scope: scope, actor: actorB)
+        try homePeer.merge(homePreference.document, scope: scope)
+        check(try homePeer.document["globals"]?["fields"]?["vortx.mergeHomeDiscover"]?["value"] == .bool(false))
+        try homePeer.edit(profileID: nil, fields: ["vortx.mergeHomeDiscover": .null], scope: scope)
+        try homePreference.merge(homePeer.document, scope: scope)
+        check(try homePreference.document["globals"]?["fields"]?["vortx.mergeHomeDiscover"]?["value"] == .null) // Clear restores UI default.
+        do { try homePeer.edit(profileID: nil, fields: ["vortx.mergeHomeDiscover": .integer(1)], scope: scope); fatalError("home/discover accepted non-Bool") } catch VortxNativeError.invalidSnapshot {}
         var credentials = try VortxNativeProviderCredentials(scope: scope.account, actor: actorA)
         try credentials.edit(["tmdb": .string("fixture-nonproduction")])
         let sentCredentials = credentials.local.pending
