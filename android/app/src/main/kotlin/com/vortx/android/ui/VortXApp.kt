@@ -174,6 +174,9 @@ import kotlinx.coroutines.launch
 /// TVPlayerView.swift:810. Expressed in ms because Android reports position in ms.
 private const val AUTO_ADD_AFTER_MS = 60_000L
 
+/** One-shot resume intent; type + id prevent an old card tap from arming a colliding later Detail route. */
+private data class DirectResumeTarget(val type: MediaType, val id: String)
+
 internal fun detailViewModelKey(
     prefix: String,
     typeId: String,
@@ -312,7 +315,11 @@ fun VortXApp(
                 null
             }
         }
+        var pendingDirectResumeTarget by remember { mutableStateOf<DirectResumeTarget?>(null) }
         val openDetail: (MetaItem?) -> Unit = { item ->
+            // Every ordinary Detail route revokes any previous one-shot direct-resume request. Direct
+            // Continue Watching callers install their exact target immediately after opening it.
+            pendingDirectResumeTarget = null
             savedDetailId = item?.id
             savedDetailType = item?.type?.id
             savedDetailEpisodeSeason = item?.preferredEpisode?.season
@@ -320,7 +327,6 @@ fun VortXApp(
             savedDetailEpisodeIdentity = item?.preferredEpisode?.videoIdentity
         }
         var detailGeneration by remember { mutableStateOf(0L) }
-        var pendingDirectResumeId by remember { mutableStateOf<String?>(null) }
         var playing by remember { mutableStateOf<Playable?>(null) }
         // Session-only route chosen on Detail. It rides source retries and episode advances inside the same
         // player, but every non-detail launch below explicitly resets it to Automatic. No preference store is
@@ -1337,9 +1343,13 @@ fun VortXApp(
                         appContext = appContext,
                     ),
                 )
-                LaunchedEffect(detailVm, pendingDirectResumeId) {
-                    if (pendingDirectResumeId == current.id && detailVm.playLastStream()) {
-                        pendingDirectResumeId = null
+                LaunchedEffect(detailVm, pendingDirectResumeTarget) {
+                    val target = pendingDirectResumeTarget
+                    if (target?.type == current.type && target.id == current.id) {
+                        // One attempt only. Cross-device history frequently has no local exact source;
+                        // that case remains a normal Detail screen and must never arm a later visit.
+                        detailVm.playLastStream()
+                        pendingDirectResumeTarget = null
                     }
                 }
                 // System Back closes the detail overlay back to the browse shell. Composed BEFORE
@@ -1439,9 +1449,9 @@ fun VortXApp(
                     onItem = onItem,
                     modifier = content,
                     onDirectResume = { item ->
-                        pendingDirectResumeId = item.id
-                        detailGeneration += 1
                         openDetail(item)
+                        pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
+                        detailGeneration += 1
                     },
                     onDiscover = { savedTabName = Tab.DISCOVER.name },
                     onBrowseCatalog = { catalog ->
@@ -1484,9 +1494,9 @@ fun VortXApp(
                     onItem = onItem,
                     modifier = content,
                     onDirectResume = { item ->
-                        pendingDirectResumeId = item.id
-                        detailGeneration += 1
                         openDetail(item)
+                        pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
+                        detailGeneration += 1
                     },
                     onDownloads = { showDownloads = true },
                     onWatchlist = { showWatchlist = true },
