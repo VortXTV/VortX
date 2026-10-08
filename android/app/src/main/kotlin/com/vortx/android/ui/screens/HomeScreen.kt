@@ -77,6 +77,9 @@ fun HomeScreen(
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
     onDirectResume: (MetaItem) -> Unit = onItem,
+    onDiscover: (() -> Unit)? = null,
+    onBrowseCatalog: ((Catalog) -> Unit)? = null,
+    onQuickView: ((MetaItem) -> Unit)? = null,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val collections by viewModel.collections.collectAsStateWithLifecycle()
@@ -119,6 +122,9 @@ fun HomeScreen(
                     hubHidden,
                     onItem,
                     onDirectResume,
+                    onDiscover,
+                    onBrowseCatalog,
+                    onQuickView,
                     lastStreamStore,
                     viewModel,
                     modifier,
@@ -135,6 +141,9 @@ private fun HomeContent(
     hubHidden: Boolean,
     onItem: (MetaItem) -> Unit,
     onDirectResume: (MetaItem) -> Unit,
+    onDiscover: (() -> Unit)?,
+    onBrowseCatalog: ((Catalog) -> Unit)?,
+    onQuickView: ((MetaItem) -> Unit)?,
     lastStreamStore: LastStreamStore,
     viewModel: HomeViewModel,
     modifier: Modifier,
@@ -166,6 +175,16 @@ private fun HomeContent(
         contentPadding = PaddingValues(bottom = VortXTheme.spacing.xl),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xl),
     ) {
+        // A single explicit doorway keeps Home and Discover connected without duplicating Discover's
+        // filters or creating a second navigation owner. It is optional for callers such as previews.
+        onDiscover?.let { discover ->
+            item {
+                TextButton(
+                    onClick = discover,
+                    modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+                ) { Text("Browse Discover") }
+            }
+        }
         if (initialHero != null) {
             item {
                 PhoneHeroHeader(
@@ -205,6 +224,13 @@ private fun HomeContent(
                         } else {
                             null
                         },
+                        // Only engine-board rows have a repository-backed grid/pagination route. Client-side
+                        // editorial rails deliberately keep their current tap-to-detail behavior instead of
+                        // exposing a See all button that could lead to an empty, duplicate fetch.
+                        onSeeAll = onBrowseCatalog
+                            ?.takeIf { catalog.engineIndex != null || catalog.id == "continue" }
+                            ?.let { browse -> { browse(catalog) } },
+                        onQuickView = onQuickView,
                     )
                 }
             }

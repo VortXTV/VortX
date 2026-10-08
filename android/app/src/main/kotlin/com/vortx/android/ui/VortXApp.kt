@@ -108,6 +108,7 @@ import com.vortx.android.ui.screens.AppearanceScreen
 import com.vortx.android.stats.WatchStatsScreen
 import com.vortx.android.ui.screens.BackupRestoreScreen
 import com.vortx.android.ui.screens.CustomizeHomeScreen
+import com.vortx.android.ui.screens.CinemaQuickViewScreen
 import com.vortx.android.ui.screens.DebridKeysScreen
 import com.vortx.android.ui.screens.DebridLibraryScreen
 import com.vortx.android.ui.screens.DetailScreen
@@ -115,6 +116,7 @@ import com.vortx.android.ui.screens.DiscoverScreen
 import com.vortx.android.ui.screens.DownloadQueueScreen
 import com.vortx.android.ui.screens.DownloadsScreen
 import com.vortx.android.ui.screens.HomeDiscoverSettingsScreen
+import com.vortx.android.ui.screens.HomeCatalogBrowseScreen
 import com.vortx.android.ui.screens.HomeScreen
 import com.vortx.android.ui.screens.IntegrationsScreen
 import com.vortx.android.ui.screens.LiveScreen
@@ -139,6 +141,7 @@ import com.vortx.android.ui.screens.ConfiguredNzbIndexerSettingsScreen
 import com.vortx.android.ui.screens.UnifiedSignInScreen
 import com.vortx.android.ui.screens.WhatsNewScreen
 import com.vortx.android.ui.screens.WhosWatchingScreen
+import com.vortx.android.ui.screens.WatchlistScreen
 import com.vortx.android.sync.AccountLibrarySync
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXIcons
@@ -153,6 +156,8 @@ import com.vortx.android.ui.viewmodel.AddonsViewModel
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.HomeViewModel
+import com.vortx.android.ui.viewmodel.HomeCatalogBrowseViewModel
+import com.vortx.android.ui.viewmodel.HomeCatalogTarget
 import com.vortx.android.ui.viewmodel.LibraryViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.SearchViewModel
@@ -356,6 +361,10 @@ fun VortXApp(
         var showIntegrations by remember { mutableStateOf(false) }
         var showMediaServers by remember { mutableStateOf(false) }
         var showDownloads by remember { mutableStateOf(false) }
+        var showWatchlist by remember { mutableStateOf(false) }
+        var catalogBrowseTarget by remember { mutableStateOf<HomeCatalogTarget?>(null) }
+        var quickViewItem by remember { mutableStateOf<MetaItem?>(null) }
+        var quickWatchIdentity by remember { mutableStateOf<String?>(null) }
         // Nested under Downloads: the queue manager (reorder / concurrency / storage). Checked BEFORE the
         // showDownloads overlay so it renders on top, and cleared on Back to reveal Downloads underneath.
         var showDownloadQueue by remember { mutableStateOf(false) }
@@ -417,6 +426,10 @@ fun VortXApp(
             showIntegrations = false
             showMediaServers = false
             showDownloads = false
+            showWatchlist = false
+            catalogBrowseTarget = null
+            quickViewItem = null
+            quickWatchIdentity = null
             showDownloadQueue = false
             showPlayback = false
             showSources = false
@@ -1073,6 +1086,19 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showWatchlist) {
+            BackHandler { showWatchlist = false }
+            WatchlistScreen(
+                store = com.vortx.android.library.WatchlistStore.shared(appContext),
+                onBack = { showWatchlist = false },
+                onItem = { item ->
+                    showWatchlist = false
+                    onItem(item)
+                },
+            )
+            return@VortXTheme
+        }
+
         if (showPlayback) {
             // Settings > Playback: device-scoped player preferences. Self-contained like the two above
             // (reads and writes the shared `vortx_settings` SharedPreferences the engines already read at
@@ -1218,6 +1244,46 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        quickViewItem?.let { item ->
+            BackHandler { quickViewItem = null }
+            CinemaQuickViewScreen(
+                item = item,
+                watchlistStore = com.vortx.android.library.WatchlistStore.shared(appContext),
+                onClose = { quickViewItem = null },
+                onWatch = {
+                    quickWatchIdentity = "${item.type.id}:${item.id}"
+                    quickViewItem = null
+                    onItem(item)
+                },
+                onDetails = {
+                    quickViewItem = null
+                    onItem(item)
+                },
+            )
+            return@VortXTheme
+        }
+
+        // Home's "See all" grid is a first-class touch route, backed by the same Home board row rather
+        // than a second provider request. It sits above the shell and below detail so opening a tile can
+        // transfer cleanly into the established detail route.
+        catalogBrowseTarget?.let { target ->
+            BackHandler { catalogBrowseTarget = null }
+            val catalogVm: HomeCatalogBrowseViewModel = viewModel(
+                key = "home-catalog-${target.id}",
+                factory = HomeCatalogBrowseViewModel.Factory(repo, target),
+            )
+            HomeCatalogBrowseScreen(
+                viewModel = catalogVm,
+                title = target.title,
+                onBack = { catalogBrowseTarget = null },
+                onItem = { item ->
+                    catalogBrowseTarget = null
+                    onItem(item)
+                },
+            )
+            return@VortXTheme
+        }
+
         val current = detail
         if (current != null) {
             // The generation boundary deliberately tears down DetailScreen's local person/nested-title
@@ -1277,6 +1343,8 @@ fun VortXApp(
                         playing = playable
                         autoAdvanceStreak[0] = 0
                     },
+                    autoWatch = quickWatchIdentity == "${current.type.id}:${current.id}",
+                    onAutoWatchConsumed = { quickWatchIdentity = null },
                 )
             }
             return@VortXTheme
@@ -1350,6 +1418,11 @@ fun VortXApp(
                         detailGeneration += 1
                         openDetail(item)
                     },
+                    onDiscover = { savedTabName = Tab.DISCOVER.name },
+                    onBrowseCatalog = { catalog ->
+                        catalogBrowseTarget = HomeCatalogTarget(catalog.id, catalog.title)
+                    },
+                    onQuickView = { item -> quickViewItem = item },
                 )
                 Tab.DISCOVER -> if (mergeDiscoverSearch) {
                     // SD-2: the combined surface hosts both the Discover browse and the folded-in Search.
@@ -1379,7 +1452,16 @@ fun VortXApp(
                     )
                 }
                 Tab.LIVE -> LiveScreen(viewModel<LiveViewModel>(factory = factory), onItem, content)
-                Tab.LIBRARY -> LibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem, content)
+                Tab.LIBRARY -> LibraryScreen(
+                    viewModel = viewModel<LibraryViewModel>(factory = factory),
+                    onItem = onItem,
+                    modifier = content,
+                    onDownloads = { showDownloads = true },
+                    onWatchlist = { showWatchlist = true },
+                    onContinueWatching = {
+                        catalogBrowseTarget = HomeCatalogTarget("continue", "Continue Watching")
+                    },
+                )
                 Tab.SEARCH -> SearchScreen(
                     viewModel<SearchViewModel>(factory = factory),
                     onItem,

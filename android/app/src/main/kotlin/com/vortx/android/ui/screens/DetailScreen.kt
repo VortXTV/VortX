@@ -166,6 +166,9 @@ fun DetailScreen(
     onBack: () -> Unit,
     onPlay: (Playable, MetaDetail, PlayerEngineRouter.Override) -> Unit,
     modifier: Modifier = Modifier,
+    /** A one-shot request from Cinema Quick View; normal detail visits retain manual playback. */
+    autoWatch: Boolean = false,
+    onAutoWatchConsumed: () -> Unit = {},
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
@@ -448,6 +451,14 @@ fun DetailScreen(
     val resolving = playback is Playback.Resolving
     var sourcesOpen by remember { mutableStateOf(false) }
 
+    // Quick View deliberately delegates to the ordinary ranked source path. The request is consumed before
+    // dispatch so recomposition, an arriving source group, or returning from the player cannot launch twice.
+    LaunchedEffect(autoWatch, metaState, streamsState, resolving) {
+        if (!autoWatch || resolving || metaState !is UiState.Success || viewModel.bestSource() == null) return@LaunchedEffect
+        onAutoWatchConsumed()
+        beginPlayback { viewModel.playBest() }
+    }
+
     Box(modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
         when (val m = metaState) {
             // A non-`tt` catalog id that neither an add-on nor the one-shot recovery could resolve sits in
@@ -600,55 +611,54 @@ fun DetailScreen(
                     val episodes = m.data.videos
                         .filter { it.season == (selectedSeason ?: m.data.videos.first().season) }
                         .sortedBy { it.episode }
-                    items(episodes, key = { it.id }) { episode ->
-                        val episodeFocus = remember(episode.id) { FocusRequester() }
-                        LaunchedEffect(episode.id, episodeFocus) {
-                            episodeFocusRequesters[episode.id] = episodeFocus
-                        }
-                        val currentForSources = episode.id == selectedEpisodeId
-                        val watched = episode.id in m.data.watchedVideoIds
-                        // DET spoiler-safe veil (read-only against watched state): an unwatched, not-yet-
-                        // revealed episode's thumbnail is blurred with an eye-slash overlay and its synopsis
-                        // is withheld behind "Tap to reveal". The first tap on a veiled row REVEALS it (a
-                        // session-only reveal) rather than navigating / choosing sources.
-                        val veiled = spoilerVeiled(spoilerSafe, watched, episode.id in revealedEpisodeIds)
-                        EpisodeRow(
-                            code = if (episode.season > 0) "S${episode.season} · E${episode.episode}" else "Episode ${episode.episode}",
-                            title = episode.title,
-                            overview = if (veiled) "Tap to reveal" else episode.overview,
-                            airDate = episode.released?.take(10),
-                            watched = watched,
-                            progress = episodeProgress(episode, m.data),
-                            onClick = {
-                                restoreEpisodeFocusId = episode.id
-                                if (veiled) {
-                                    // Reveal first: a veiled row's first tap never jumps into a spoilery
-                                    // source list. Session-only; never writes a watched tick.
-                                    revealedEpisodeIds = revealedEpisodeIds + episode.id
-                                } else {
-                                    // With Smart auto-pick on, the tap plays the best source straight away;
-                                    // opening the sources section under it is the escape hatch (backing out
-                                    // of the player reveals the full list, Apple's exact wording).
-                                    if (viewModel.autoPickEnabled) sourcesOpen = true
-                                    viewModel.selectEpisode(episode.id)
+                    item {
+                        // The phone/touch episode surface is intentionally a cinematic rail, not a long
+                        // flat list. Selection and source routing remain the existing per-episode owner.
+                        LazyRow(
+                            contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
+                            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+                        ) {
+                            items(episodes, key = { it.id }) { episode ->
+                                val episodeFocus = remember(episode.id) { FocusRequester() }
+                                LaunchedEffect(episode.id, episodeFocus) {
+                                    episodeFocusRequesters[episode.id] = episodeFocus
                                 }
-                            },
-                            onLongClick = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
-                            focusRequester = episodeFocus,
-                            thumb = { EpisodeThumb(episode, veiled = veiled, fallbackUrls = listOf(m.data.background, m.data.poster)) },
-                            modifier = Modifier
-                                .padding(horizontal = VortXTheme.spacing.edge)
-                                .then(
-                                    // The episode whose sources are currently shown up in the hero
-                                    // cluster gets an accent ring, so "what Watch/Resume will play"
-                                    // stays legible while browsing the rest of the season.
-                                    if (currentForSources) {
-                                        Modifier.border(BorderStroke(1.dp, VortXTheme.colors.accent), VortXShapes.card)
-                                    } else {
-                                        Modifier
+                                val currentForSources = episode.id == selectedEpisodeId
+                                val watched = episode.id in m.data.watchedVideoIds
+                                // A veiled row's first tap reveals only; it never writes watched state or
+                                // enters the source path before the viewer has chosen to see the spoiler.
+                                val veiled = spoilerVeiled(spoilerSafe, watched, episode.id in revealedEpisodeIds)
+                                EpisodeRow(
+                                    code = if (episode.season > 0) "S${episode.season} · E${episode.episode}" else "Episode ${episode.episode}",
+                                    title = episode.title,
+                                    overview = if (veiled) "Tap to reveal" else episode.overview,
+                                    airDate = episode.released?.take(10),
+                                    watched = watched,
+                                    progress = episodeProgress(episode, m.data),
+                                    onClick = {
+                                        restoreEpisodeFocusId = episode.id
+                                        if (veiled) {
+                                            revealedEpisodeIds = revealedEpisodeIds + episode.id
+                                        } else {
+                                            if (viewModel.autoPickEnabled) sourcesOpen = true
+                                            viewModel.selectEpisode(episode.id)
+                                        }
                                     },
-                                ),
-                        )
+                                    onLongClick = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
+                                    focusRequester = episodeFocus,
+                                    thumb = { EpisodeThumb(episode, veiled = veiled, fallbackUrls = listOf(m.data.background, m.data.poster)) },
+                                    modifier = Modifier
+                                        .width(304.dp)
+                                        .then(
+                                            if (currentForSources) {
+                                                Modifier.border(BorderStroke(1.dp, VortXTheme.colors.accent), VortXShapes.card)
+                                            } else {
+                                                Modifier
+                                            },
+                                        ),
+                                )
+                            }
+                        }
                     }
                 }
                 com.vortx.android.model.MediaRelation.visible(

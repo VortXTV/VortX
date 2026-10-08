@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -115,6 +116,8 @@ fun PosterRail(
     onRemoveFromContinueWatching: ((MetaItem) -> Unit)? = null,
     eyebrow: String? = null,
     onEndReached: (() -> Unit)? = null,
+    onSeeAll: (() -> Unit)? = null,
+    onQuickView: ((MetaItem) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     // Poster width preset (item 5): the rail card width follows the user's Poster Style choice (default
@@ -125,7 +128,15 @@ fun PosterRail(
         LocalizedMetadataStore.resolve(catalog.items.map { it.id })
     }
     Column(modifier = modifier) {
-        RailHeader(title = catalog.title, eyebrow = eyebrow)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            RailHeader(title = catalog.title, eyebrow = eyebrow, modifier = Modifier.weight(1f))
+            onSeeAll?.let { seeAll ->
+                androidx.compose.material3.TextButton(
+                    onClick = seeAll,
+                    modifier = Modifier.padding(end = VortXTheme.spacing.edge),
+                ) { androidx.compose.material3.Text("See all") }
+            }
+        }
         if (onEndReached != null && showEmptyCatalogContinuation(catalog)) {
             androidx.compose.material3.TextButton(onClick = onEndReached, modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
                 androidx.compose.material3.Text("Continue catalog")
@@ -153,6 +164,7 @@ fun PosterRail(
                     onRemoveFromContinueWatching = if (
                         menu == PosterCardMenu.CONTINUE_WATCHING && onRemoveFromContinueWatching != null
                     ) ({ onRemoveFromContinueWatching(item) }) else null,
+                    onQuickView = onQuickView?.let { quickView -> { quickView(item) } },
                     art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                     cinema = true,
                     modifier = Modifier.width(posterStyle.width.compactWidth).padding(end = VortXTheme.spacing.sm),

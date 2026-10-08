@@ -271,8 +271,16 @@ private fun DiscoverFilterChips(filters: DiscoverFilters?, hideLive: Boolean, on
 
 /// Library (S04, DESIGN-SYSTEM.md §4 "Library"): type/sort chips over the saved poster grid with the
 /// remove ("x") control per poster.
+/** Touch Library landing: functional large entries precede the existing filters and saved-title grid. */
 @Composable
-fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+fun LibraryScreen(
+    viewModel: LibraryViewModel,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+    onDownloads: (() -> Unit)? = null,
+    onWatchlist: (() -> Unit)? = null,
+    onContinueWatching: (() -> Unit)? = null,
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val result = (state as? UiState.Success<LibraryResult>)?.data
     val filters = result?.filters
@@ -286,6 +294,9 @@ fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modif
     val activeFilters = selectedFilters intersect applicableFilters.toSet()
 
     Column(modifier = modifier.fillMaxSize()) {
+        if (onDownloads != null || onWatchlist != null || onContinueWatching != null) {
+            LibraryEntryCards(onDownloads, onWatchlist, onContinueWatching)
+        }
         LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
         LibrarySegmentChips(segments = segments, active = activeSegment, onSelect = { selectedSegment = it })
         LibrarySmartFilterChips(
@@ -304,6 +315,49 @@ fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modif
                 onRemove = viewModel::remove,
             )
         }
+    }
+}
+
+@Composable
+private fun LibraryEntryCards(
+    onDownloads: (() -> Unit)?,
+    onWatchlist: (() -> Unit)?,
+    onContinueWatching: (() -> Unit)?,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+    ) {
+        onDownloads?.let { LibraryEntryCard("Downloads", "Offline", VortXIcons.download, it, Modifier.weight(1f)) }
+        onWatchlist?.let { LibraryEntryCard("Watchlist", "Plan to watch", VortXIcons.starFill, it, Modifier.weight(1f)) }
+        onContinueWatching?.let { LibraryEntryCard("Continue", "Pick up", VortXIcons.playFill, it, Modifier.weight(1f)) }
+    }
+}
+
+@Composable
+private fun LibraryEntryCard(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .clickable(onClick = onClick)
+            .vortxGlass(
+                shape = VortXShapes.card,
+                fillAlpha = VortXGlass.cardFillAlpha,
+                shadow = VortXGlass.Shadow.flat,
+            )
+            .padding(VortXTheme.spacing.md),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+    ) {
+        Icon(icon, contentDescription = title, tint = VortXTheme.colors.accent)
+        Text(title, style = VortXTheme.type.cardTitle, maxLines = 1)
+        Text(subtitle, style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary), maxLines = 1)
     }
 }
 

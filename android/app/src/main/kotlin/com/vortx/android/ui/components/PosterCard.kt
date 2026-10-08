@@ -84,6 +84,7 @@ fun PosterCard(
     menu: PosterCardMenu = if (menuItem == null) PosterCardMenu.NONE else PosterCardMenu.CATALOG,
     onDetails: (() -> Unit)? = null,
     onRemoveFromContinueWatching: (() -> Unit)? = null,
+    onQuickView: (() -> Unit)? = null,
     /** Touch presentation opts into the direct-accent cinema frame; TV retains its focus/elevation style. */
     cinema: Boolean = false,
     art: @Composable BoxScope.() -> Unit = { DefaultPosterArt(title) },
@@ -135,6 +136,7 @@ fun PosterCard(
                 onDismiss = { menuOpen = false },
                 onDetails = onDetails,
                 onRemoveFromContinueWatching = onRemoveFromContinueWatching,
+                onQuickView = onQuickView,
                 repository = { (appContext as? VortXApplication)?.catalogRepository },
             )
         }
@@ -219,6 +221,7 @@ internal fun PosterQuickActionMenu(
     onDismiss: () -> Unit,
     onDetails: (() -> Unit)? = null,
     onRemoveFromContinueWatching: (() -> Unit)? = null,
+    onQuickView: (() -> Unit)? = null,
     repository: () -> CatalogRepository?,
 ) {
     fun fire(action: suspend (CatalogRepository) -> Unit) {
@@ -230,6 +233,12 @@ internal fun PosterQuickActionMenu(
         when (menu) {
             PosterCardMenu.NONE -> Unit
             PosterCardMenu.CATALOG -> {
+                onQuickView?.let { quickView ->
+                    DropdownMenuItem(
+                        text = { Text("Quick view") },
+                        onClick = { onDismiss(); quickView() },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Text("Add to Library") },
                     onClick = { fire { it.addToLibrary(item) } },
