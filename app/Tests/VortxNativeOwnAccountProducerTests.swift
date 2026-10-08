@@ -39,12 +39,20 @@ private final class OwnerSelectorBackend {
     var failTargetWrites = false
     var failTargetReadOnce = false
     var failMarkerClearReadOnce = false
+    var rejectRollbackMarker = false
+    var deferReconciliation = false
+    var failNextMarkerWrite = false
     var failingRead: String?
     func store() -> KeychainFailureClosedStore {
         KeychainFailureClosedStore(readSecure: { key in
             if self.failingRead == key { self.failingRead = nil; return .failure }
             return self.values[key].map(CredentialDurableReadResult.value) ?? .missing
         }, writeSecure: { value, key in
+            if key == "marker:" + self.selector, value != nil, self.failNextMarkerWrite {
+                self.failNextMarkerWrite = false
+                if self.deferReconciliation { self.failingRead = self.selector }
+                return .failure // Before effect: the removed marker is NOT recreated.
+            }
             self.values[key] = value
             if key == self.selector, self.failTargetReadOnce { self.failTargetReadOnce = false; self.failingRead = key }
             if key == self.selector, self.failTargetWriteOnce || self.failTargetWrites {
@@ -52,6 +60,7 @@ private final class OwnerSelectorBackend {
             }
             if key == "marker:" + self.selector, value == nil, self.failMarkerClearReadOnce {
                 self.failMarkerClearReadOnce = false; self.failingRead = key
+                self.failNextMarkerWrite = self.rejectRollbackMarker
             }
             return .success
         }, invalidationAccount: { "marker:" + $0 }, invalidationSentinel: "blocked",
@@ -253,7 +262,7 @@ private final class OwnerSelectorBackend {
     }
     static func ownerSelectorAfterEffects() throws {
         let owner = UserProfile.ownerID, scope = "account-owner-faults"
-        for fault in ["readback", "mutated-failure", "marker-clear", "rollback-unavailable", "first-login"] {
+        for fault in ["readback", "mutated-failure", "marker-clear", "rollback-unavailable", "first-login", "combined", "combined-cold"] {
             let backend = OwnerSelectorBackend()
             backend.selector = try VortxNativeAccountCredentials.ownerSelectionKey(scope: scope, ownerProfileID: owner)
             let store = backend.store()
@@ -278,15 +287,20 @@ private final class OwnerSelectorBackend {
             backend.failTargetWriteOnce = fault == "mutated-failure"
             backend.failTargetWrites = fault == "rollback-unavailable"
             backend.failTargetReadOnce = fault == "readback" || fault == "first-login"
-            backend.failMarkerClearReadOnce = fault == "marker-clear"
+            backend.failMarkerClearReadOnce = fault == "marker-clear" || fault.hasPrefix("combined")
+            backend.rejectRollbackMarker = fault.hasPrefix("combined")
+            backend.deferReconciliation = fault == "combined-cold"
+            var reconciled = false
             do {
                 _ = try VortxNativeAccountCredentials.connectOwner(token: "new", scope: scope, ownerProfileID: owner,
                     verifiedUID: "UID-B", revision: UUID().uuidString.lowercased(), expectedSelection: old,
                     authority: authority(), read: read, write: { store.set($1, for: $0) == .success },
                     restoreSelection: { store.set($1, for: $0) == .success },
                     selectionAttempted: { VortxNativeOwnAccountProducer.invalidateContext() })
-                fatalError("selector after-effect reported success: " + fault)
-            } catch VortxNativeError.unavailable {}
+                check(fault == "combined"); reconciled = true
+            } catch is VortxNativeAccountCredentials.OwnerPublicationUncertain {
+                check(fault == "rollback-unavailable" || fault == "combined-cold")
+            } catch VortxNativeError.unavailable { check(!fault.hasPrefix("combined") && fault != "rollback-unavailable") }
             do { try staleAuthority.withActive {}; fatalError("selector attempt retained old producer authority") }
             catch VortxNativeError.superseded {}
             let cold = backend.store()
@@ -301,6 +315,16 @@ private final class OwnerSelectorBackend {
                 check(backend.values["marker:" + backend.selector] == "blocked")
                 do { _ = try VortxNativeAccountCredentials.selectedOwnerSlot(scope: scope, ownerProfileID: owner, read: coldRead); fatalError("uncertain rollback selected credential after cold reopen") }
                 catch VortxNativeError.unavailable {}
+            } else if fault.hasPrefix("combined") {
+                check(reconciled == (fault == "combined"))
+                check(backend.values["marker:" + backend.selector] == nil) // Exact independently reported counterexample.
+                let coldSlot = try VortxNativeAccountCredentials.selectedOwnerSlot(scope: scope, ownerProfileID: owner, read: coldRead)
+                check(coldSlot != nil && coldSlot != oldSlot && backend.values[coldSlot!] == "new")
+                let retained = backend.values
+                backend.values = backend.values.filter { !$0.key.hasPrefix("vortx.native.owner-intent.") }
+                do { _ = try VortxNativeAccountCredentials.selectedOwnerSlot(scope: scope, ownerProfileID: owner, read: coldRead); fatalError("orphan selector without durable intent was exposed") }
+                catch VortxNativeError.invalidSnapshot {}
+                backend.values = retained
             } else {
                 check(try coldRead(backend.selector) == old)
                 check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: scope, ownerProfileID: owner, read: coldRead) == oldSlot)
@@ -339,7 +363,7 @@ private final class OwnerSelectorBackend {
             case .failure: throw VortxNativeError.unavailable
             }
         }) == selected)
-        print("Native owner selector actual secure-store: after-effect write/readback/marker failure verified rollback, first-login absence, uncertain rollback cold block and pre-publication authority retirement passed")
+        print("Native owner selector actual secure-store: verified rollback, combined marker-clear/failed-marker-restore intent reconciliation, explicit unknown outcome, orphan refusal, cold recovery and authority retirement passed")
     }
 }
 private extension VortxNativeOwnAccountProducer.Generation {

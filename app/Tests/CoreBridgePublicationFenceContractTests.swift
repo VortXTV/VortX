@@ -69,6 +69,10 @@ check(appearsBefore("authenticatedIdentity(authKey: token)", "connectOwner(token
       && ownerConnection.contains("nativePlaybackBinding(.native(target.binding))")
       && !ownerConnection.contains("mutateProfiles"),
       "owner reauthentication verifies UID and captured revision before secure CAS without changing native library authority")
+check(accountSource.components(separatedBy: "error is VortxNativeAccountCredentials.OwnerPublicationUncertain").count == 3
+      && accountSource.contains("The connection outcome could not be confirmed. Secure account state will be checked before use")
+      && ownerConnection.contains("selectionAttempted: { VortxNativeOwnAccountProducer.invalidateContext() }"),
+      "uncertain owner publication is explicitly shown and credential authority retires before publication")
 let autoAddSource = source("SourcesShared/LibraryAutoAdd.swift")
 let seed = section(bridge, from: "private func seedInitialState()", until: "/// Refresh the installed-addons")
 let refresh = section(bridge, from: "private func refreshAddons()", until: "/// Remove an installed addon")

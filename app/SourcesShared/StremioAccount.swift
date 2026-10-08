@@ -391,6 +391,15 @@ final class StremioAccount: ObservableObject {
             log.info("signed in ok")
             await loadAddons(for: context)
         } catch {
+#if VORTX_NATIVE_DATA_ENGINE
+            if error is VortxNativeAccountCredentials.OwnerPublicationUncertain,
+               let nativeTarget, CredentialScopeRegistry.shared.isCurrent(nativeTarget.binding.credential),
+               authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID {
+                reloadForActiveProfile()
+                signInError = "The connection outcome could not be confirmed. Secure account state will be checked before use; retry when storage is available. Saved library and history are unchanged."
+                return
+            }
+#endif
             guard authOperationStillCurrent(context) else { return }
 #if VORTX_NATIVE_DATA_ENGINE
             if nativeTarget != nil {
@@ -410,6 +419,7 @@ final class StremioAccount: ObservableObject {
         var context = beginAuthOperation()
         let wasSignedIn = isSignedIn
 #if VORTX_NATIVE_DATA_ENGINE
+        let nativeCapture = CredentialScopeRegistry.shared.capture()
         do {
             if let target = try CoreBridge.shared.captureNativeAccountLogin() {
                 try await CoreBridge.shared.authenticateNativeOwnAccount(token: token, target: target)
@@ -417,6 +427,13 @@ final class StremioAccount: ObservableObject {
                 context = captureAuthOperationContext()
             } else { throw VortxNativeError.closed }
         } catch {
+            if error is VortxNativeAccountCredentials.OwnerPublicationUncertain,
+               CredentialScopeRegistry.shared.isCurrent(nativeCapture), authOperationGeneration == context.generation,
+               ProfileStore.shared.active?.id == context.profileID {
+                reloadForActiveProfile()
+                signInError = "The connection outcome could not be confirmed. Secure account state will be checked before use; retry when storage is available. Saved library and history are unchanged."
+                return
+            }
             guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
             signInError = "Account could not be connected. Your existing profile data is unchanged. Refresh the profile and retry."
             return

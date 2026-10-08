@@ -12,6 +12,22 @@ enum VortxNativeAccountCredentials {
         let verifiedUID: String
         let revision: String
     }
+    struct OwnerPublicationUncertain: Error {}
+    private struct OwnerIntent: Codable {
+        let schemaVersion: Int
+        let scope: String
+        let ownerProfileID: UUID
+        let revision: String
+        let previousSelection: String?
+        let proposedSelection: String
+        let credentialSHA256: String
+    }
+    private static func digest(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+    private static func ownerIntentKey(selector: String, revision: String) -> String {
+        "vortx.native.owner-intent.v1." + digest(selector + "\u{0}" + revision)
+    }
     static func ownerSelectionKey(scope: String, ownerProfileID: UUID) throws -> String {
         // Reuse exact namespace validation; this domain never aliases an immutable token slot.
         let qualified = try slot(scope: scope, profileID: ownerProfileID, uid: "owner-selector", transactionID: nil)
@@ -20,11 +36,21 @@ enum VortxNativeAccountCredentials {
     static func selectedOwnerSlot(scope: String, ownerProfileID: UUID,
                                   read: (String) throws -> String?) throws -> String? {
         try lock.withLock {
-            guard let raw = try read(ownerSelectionKey(scope: scope, ownerProfileID: ownerProfileID)) else { return nil }
+            let selector = try ownerSelectionKey(scope: scope, ownerProfileID: ownerProfileID)
+            guard let raw = try read(selector) else { return nil }
             let selection = try JSONDecoder().decode(OwnerSelection.self, from: Data(raw.utf8))
-            guard selection.schemaVersion == 1, selection.scope == scope, selection.ownerProfileID == ownerProfileID,
+            guard selection.schemaVersion == 2, selection.scope == scope, selection.ownerProfileID == ownerProfileID,
                   UUID(uuidString: selection.revision)?.uuidString.lowercased() == selection.revision else { throw VortxNativeError.invalidSnapshot }
-            return try slot(scope: scope, profileID: ownerProfileID, uid: selection.verifiedUID, transactionID: "owner:" + selection.revision)
+            // Cold and live selection both reconcile against the independently durable intent.
+            // A pointer alone, including one left by an uncertain secure mutation, is not authority.
+            guard let intentRaw = try read(ownerIntentKey(selector: selector, revision: selection.revision)) else { throw VortxNativeError.invalidSnapshot }
+            let intent = try JSONDecoder().decode(OwnerIntent.self, from: Data(intentRaw.utf8))
+            guard intent.schemaVersion == 1, intent.scope == scope, intent.ownerProfileID == ownerProfileID,
+                  intent.revision == selection.revision, intent.proposedSelection == raw else { throw VortxNativeError.invalidSnapshot }
+            let key = try slot(scope: scope, profileID: ownerProfileID, uid: selection.verifiedUID, transactionID: "owner:" + selection.revision)
+            guard let token = try read(key), !token.isEmpty else { return nil }
+            guard digest(token) == intent.credentialSHA256 else { throw VortxNativeError.invalidSnapshot }
+            return key
         }
     }
     /// A verified owner login changes only this captured account's device-local selector. The
@@ -37,14 +63,24 @@ enum VortxNativeAccountCredentials {
                              selectionAttempted: () -> Void) throws -> String {
         guard UUID(uuidString: revision)?.uuidString.lowercased() == revision else { throw VortxNativeError.invalidSnapshot }
         let selector = try ownerSelectionKey(scope: scope, ownerProfileID: ownerProfileID)
-        let selection = OwnerSelection(schemaVersion: 1, scope: scope, ownerProfileID: ownerProfileID, verifiedUID: verifiedUID, revision: revision)
-        let encoded = String(decoding: try JSONEncoder().encode(selection), as: UTF8.self)
+        let selection = OwnerSelection(schemaVersion: 2, scope: scope, ownerProfileID: ownerProfileID, verifiedUID: verifiedUID, revision: revision)
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        let encoded = String(decoding: try encoder.encode(selection), as: UTF8.self)
+        let intentKey = ownerIntentKey(selector: selector, revision: revision)
+        let intent = OwnerIntent(schemaVersion: 1, scope: scope, ownerProfileID: ownerProfileID, revision: revision,
+            previousSelection: expectedSelection, proposedSelection: encoded, credentialSHA256: digest(token))
+        let intentBytes = String(decoding: try encoder.encode(intent), as: UTF8.self)
         var result: String?
         try lock.withLock {
             try authority.withActive {
                 guard try read(selector) == expectedSelection else { throw VortxNativeError.superseded }
                 result = try stage(token: token, scope: scope, profileID: ownerProfileID, uid: verifiedUID,
                     transactionID: "owner:" + revision, authority: authority, read: read, write: write)
+                if let existing = try read(intentKey) {
+                    guard existing == intentBytes else { throw VortxNativeError.invalidSnapshot }
+                } else {
+                    guard try write(intentKey, intentBytes), try read(intentKey) == intentBytes else { throw VortxNativeError.unavailable }
+                }
                 // Retire every pre-publication producer before the secure write, including when
                 // that write takes effect but its acknowledgement/readback fails.
                 selectionAttempted()
@@ -54,11 +90,19 @@ enum VortxNativeAccountCredentials {
                     // turn that already committed publication into a reported authentication failure.
                     guard try write(selector, encoded) else { throw VortxNativeError.unavailable }
                 } catch {
-                    // Restore the exact captured value (or certified absence). The secure adapter
-                    // retains its durable invalidation tombstone if this recovery is uncertain.
-                    // Never claim the prior selection survived without certifying its readback.
-                    guard try restoreSelection(selector, expectedSelection),
-                          try read(selector) == expectedSelection else { throw VortxNativeError.unavailable }
+                    // Rollback can also fail before establishing an invalidation marker. Never
+                    // infer a tombstone or the old selection from a failed recovery acknowledgement.
+                    do {
+                        guard try restoreSelection(selector, expectedSelection),
+                              try read(selector) == expectedSelection else { throw OwnerPublicationUncertain() }
+                    } catch {
+                        // An exact intended candidate may be completed only by reconciling its
+                        // durable intent and credential. Otherwise expose uncertainty, not failure
+                        // with an assertion that the old account is still selected.
+                        if let reconciled = try? selectedOwnerSlot(scope: scope, ownerProfileID: ownerProfileID, read: read),
+                           reconciled == result { return }
+                        throw OwnerPublicationUncertain()
+                    }
                     throw error
                 }
             }
