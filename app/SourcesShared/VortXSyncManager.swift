@@ -2415,61 +2415,31 @@ final class VortXSyncManager: ObservableObject {
         return .rejected(storedVersion: stored)
     }
 
-    /// Blind single-shot push of a fully-formed doc the caller does not re-derive (it holds no local pending
-    /// changes to re-merge, so on a rejection it just re-pushes the SAME doc above the winner). The version is
-    /// `max(storedVersion+1, epochMs)` so a device whose wall clock has skewed BACKWARD (a lower epoch-ms than
-    /// the stored version) can never lock itself out: it retries strictly above the stored version instead of
-    /// racing a permanently-lower epoch-ms. A rejection is retried once at storedVersion+1 (same as
-    /// pushDerivedDoc); a lost second race or a .error leaves lastSyncedVersion unadvanced so the next pull
-    /// reconciles.
-    @discardableResult
-    func pushSyncDoc(_ obj: [String: Any], credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
-        let capture = suppliedCapture ?? credentialAuthority.capture()
-        guard isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
-        var version = Int(Date().timeIntervalSince1970 * 1000)
-        for attempt in 0..<2 {
-            switch await pushSyncDocAt(obj, version: version, credentialCapture: capture) {
-            case .accepted:
-                return true
-            case .error:
-                return false
-            case .rejected(let storedVersion):
-                // A concurrent write won. Retry strictly above the winner's echoed version (falling back to a
-                // fresh epoch-ms if the worker did not echo one). max(stored+1, epochMs) guarantees a backward
-                // clock still produces a higher version than the stored one, so the device is never locked out.
-                guard attempt < 1 else { return false }
-                if let stored = storedVersion {
-                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
-                } else {
-                    version = Int(Date().timeIntervalSince1970 * 1000)
-                }
-                guard isCurrent(capture) else { return false }
-            }
-        }
-        return false
+    private struct DerivedSyncDoc {
+        let document: [String: Any]
+        let baseRevision: Int?
     }
 
-    /// Push a doc that is DERIVED from a pulled base, with optimistic-concurrency recovery. `rebuild`
-    /// re-runs the caller's exact merge onto a freshly pulled base, so a lost race is recovered by
-    /// re-merging the local pending changes onto the winner's doc and retrying at storedVersion+1 (up to
-    /// `maxRetries`). This preserves the caller's merge semantics (LWW, never clobber libraryItem) on every
-    /// attempt. On exhaustion lastSyncedVersion is left unadvanced so the next natural pull reconciles.
-    private func pushDerivedDoc(_ initial: [String: Any], credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
+    /// Keep each merged document together with the revision it actually read. Two writers from
+    /// the same base propose the same revision, so the loser must pull and merge the winner.
+    /// The relay's echoed revision cannot substitute for the base of a later rebuilt document.
+    private func pushDerivedDoc(_ initial: DerivedSyncDoc, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
                                 onAccepted: ([String: Any]) -> Void = { _ in },
-                                rebuild: () async -> [String: Any]?) async -> Bool {
+                                rebuild: () async -> DerivedSyncDoc?) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
         let maxRetries = 3
         var doc = initial
-        var version = Int(Date().timeIntervalSince1970 * 1000)
         for attempt in 0..<maxRetries {
-            switch await pushSyncDocAt(doc, version: version, credentialCapture: capture) {
+            guard isCurrent(capture), !hasPendingAccountDocApply(for: capture),
+                  let version = SyncDocumentRevisionPolicy.next(after: doc.baseRevision) else { return false }
+            switch await pushSyncDocAt(doc.document, version: version, credentialCapture: capture) {
             case .accepted:
-                onAccepted(doc)
+                onAccepted(doc.document)
                 return true
             case .error:
                 return false   // network / server / encode failure: do not advance, next pull reconciles
-            case .rejected(let storedVersion):
+            case .rejected:
                 // A concurrent write won. Re-pull, re-merge the local pending changes onto it (same merge as
                 // the first attempt), and retry strictly above the winner's version. If the rebuild can no
                 // longer produce a doc (e.g. the account pull now fails), abort WITHOUT advancing so the next
@@ -2477,13 +2447,6 @@ final class VortXSyncManager: ObservableObject {
                 guard attempt < maxRetries - 1, isCurrent(capture), !hasPendingAccountDocApply(for: capture),
                       let rebuilt = await rebuild(), isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
                 doc = rebuilt
-                // storedVersion+1 beats the winner deterministically; fall back to a fresh epoch-ms if the
-                // worker did not echo a version (the row-vanished race), still strictly increasing.
-                if let stored = storedVersion {
-                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
-                } else {
-                    version = Int(Date().timeIntervalSince1970 * 1000)
-                }
             }
         }
         return false   // exhausted retries: leave lastSyncedVersion unadvanced, next pull reconciles
@@ -2949,7 +2912,7 @@ final class VortXSyncManager: ObservableObject {
         if nativePreparedSeedCapture == capture {
             // Deployed worker: version zero INSERT succeeds only while no row exists. Never
             // escalate a rejected/unknown first insert to an epoch version over a peer's seed.
-            switch await pushSyncDocAt(initial, version: 0, credentialCapture: capture) {
+            switch await pushSyncDocAt(initial.document, version: 0, credentialCapture: capture) {
             case .accepted:
                 guard isCurrent(capture) else { return false }
                 clearPushedDirtySettings(dirtyAtPushStart); return true
@@ -2987,23 +2950,27 @@ final class VortXSyncManager: ObservableObject {
     /// intent is captured once per push; a newer edit stays pending until its own push is acknowledged.
     /// Returns nil on a FAILED pull (network error / undecryptable doc): a failed pull must NEVER overwrite
     /// the account's existing document, or it wipes keys other surfaces wrote.
-    private func mergeLocalIntoDoc(orderIntent: AddonOrderIntent?, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> [String: Any]? {
+    private func mergeLocalIntoDoc(orderIntent: AddonOrderIntent?, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> DerivedSyncDoc? {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isCurrent(capture), isSignedIn else { return nil }
 #if VORTX_NATIVE_DATA_ENGINE
         nativePreparedSeedCapture = nil
 #endif
         var doc: [String: Any]
-        switch await pullSyncDocResult(credentialCapture: capture) {
+        let baseRevision: Int?
+        switch await pullDocVersionedResult(credentialCapture: capture) {
         case .failed: return nil
         case .empty:
+            baseRevision = nil
 #if VORTX_NATIVE_DATA_ENGINE
             guard let initial = try? nativeEmptyAccountDocument(capture: capture) else { return nil }
             doc = initial; nativePreparedSeedCapture = capture
 #else
             doc = [:]
 #endif
-        case .doc(let existing): doc = existing
+        case .doc(let existing, let version):
+            guard version >= lastSyncedVersion else { return nil }
+            doc = existing; baseRevision = version
         }
         guard isCurrent(capture) else { return nil }
 #if VORTX_NATIVE_DATA_ENGINE
@@ -3035,7 +3002,7 @@ final class VortXSyncManager: ObservableObject {
         } catch { return nil }
         // Never rewrite the legacy migration baseline from native/profile/overlay mirrors. Until
         // a versioned bidirectional adapter exists, native exports only its own accepted carrier.
-        return doc
+        return DerivedSyncDoc(document: doc, baseRevision: baseRevision)
 #else
         // Read-merge the pulled doc's tombstone stamps into the local stores BEFORE vortxSummary rebuilds them
         // from local state, so a push that raced a peer's fresh re-add stamp adopts that stamp instead of
@@ -3154,7 +3121,7 @@ final class VortXSyncManager: ObservableObject {
         let defaultTerms = SearchHistoryStore.allTerms(for: nil)
         if !defaultTerms.isEmpty { searches["default"] = defaultTerms }
         if searches.isEmpty { doc.removeValue(forKey: "searches") } else { doc["searches"] = searches }
-        return doc
+        return DerivedSyncDoc(document: doc, baseRevision: baseRevision)
 #endif
     }
 
