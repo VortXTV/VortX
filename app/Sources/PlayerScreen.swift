@@ -1711,11 +1711,9 @@ struct PlayerScreen: View {
     @State private var recoveryPauseOwner: PlayerLoadToken?
     @State private var recoveryPauseIntent = false
     @State private var recoveryPauseTarget: Double = 0
-    private struct PreviewPauseSurfaceTransfer {
-        let retiringOwner: PlayerLoadToken
-        let context: DeferredResumeSeekReconciliationPolicy.SurfaceContext
-    }
-    @State private var previewPauseSurfaceTransfer: PreviewPauseSurfaceTransfer?
+    @State private var engineSurfaceTransfer: AppleEngineSurfaceTransfer<
+        PlayerLoadToken, DeferredResumeSeekReconciliationPolicy.SurfaceContext
+    >?
     @State private var reconnecting = false          // showing the "Recovering…" auto-retry state
     @State private var reconnectMsg = "Recovering…"
     @State private var autoRetryCount = 0
@@ -2034,7 +2032,7 @@ struct PlayerScreen: View {
                         engineSurfaceUsesActiveTuple ? (curHint ?? recordQualityText ?? "") : (recordQualityText ?? "")))
                 .live(engineSurfaceUsesActiveTuple ? isLive : initialIsLive)
                 .resumeOrigin(avSurfaceResumeOrigin ?? resumeSeconds)
-                .initiallyPaused(previewPauseForSurface(engine: .avPlayer))
+                .initiallyPaused(enginePauseForSurface(engine: .avPlayer))
                 .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
                 .ignoresSafeArea()
         } else {
@@ -2053,7 +2051,7 @@ struct PlayerScreen: View {
                   audioSidecar: mpvSurfacePlayback.audioSidecar,
                   isDolbyVision: mpvSurfacePlayback.isDolbyVision)
             .live(mpvSurfacePlayback.live)
-            .initiallyPaused(previewPauseForSurface(engine: .libmpv))
+            .initiallyPaused(enginePauseForSurface(engine: .libmpv))
             .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
             .ignoresSafeArea()
     }
@@ -2779,16 +2777,17 @@ struct PlayerScreen: View {
         // A late first-frame/EOF event cannot resurrect a terminal attempt. A deliberate retry or
         // accepted replacement reopens callbacks; the existing load-token gates still fence old events.
         guard !loadFailed else { return }
-        if let loadToken, let transfer = previewPauseSurfaceTransfer,
-           loadToken != transfer.retiringOwner,
-           loadToken == coordinator.player?.activeLoadToken {
-            if previewPauseForSurface(engine: isAVPlayerActive ? .avPlayer : .libmpv) {
+        if let loadToken, let transfer = engineSurfaceTransfer,
+           transfer.accepts(observedOwner: loadToken, activeOwner: coordinator.player?.activeLoadToken,
+                            currentContext: resumeSurfaceContext(engine: isAVPlayerActive ? .avPlayer : .libmpv)) {
+            recoveryPauseOwner = nil
+            if enginePauseForSurface(engine: isAVPlayerActive ? .avPlayer : .libmpv) {
                 recoveryPauseOwner = loadToken
                 recoveryPauseTarget = avSurfaceResumeOrigin ?? currentTime
                 recoveryPauseIntent = true
                 coordinator.player?.pause()
             }
-            previewPauseSurfaceTransfer = nil
+            engineSurfaceTransfer = nil
         }
         if let loadToken, loadToken == recoveryPauseOwner,
            loadToken == coordinator.player?.activeLoadToken,
@@ -3967,7 +3966,7 @@ struct PlayerScreen: View {
                                 contentHint: String? = nil,
                                 resumeOrigin: Double? = nil,
                                 preservingAbandonedResume: Bool = false,
-                                preservingPreviewPause: Bool = false,
+                                preservingViewerPause: Bool = false,
                                 recoveryOwner: PlayerLoadToken? = nil,
                                 preparedRemux: VortXPreparedRemuxAttachment? = nil,
                                 expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> PlayerLoadToken? {
@@ -4055,7 +4054,7 @@ struct PlayerScreen: View {
             // Same-source recovery retains the latest viewer pause across the new file's startup.
             recoveryPauseIntent = capturedRecoveryPause
             recoveryPauseTarget = requestedResumeOrigin
-            recoveryPauseOwner = (preservingAbandonedResume || preservingPreviewPause) && recoveryPauseIntent
+            recoveryPauseOwner = (preservingAbandonedResume || preservingViewerPause) && recoveryPauseIntent
                 ? issuedToken : nil
             if recoveryPauseOwner != nil { player.pause() }
             abandonedResumeRecovery = DeferredResumeSeekReconciliationPolicy.afterAdmission(
@@ -4151,16 +4150,11 @@ struct PlayerScreen: View {
         )
     }
 
-    private var ownedPausedPreviewOwner: PlayerLoadToken? {
-        guard skipDBPreviewing, pendingAdvance == nil, skipDBPreviewWasPaused,
-              let owner = skipDBPreviewOwner, owner == coordinator.player?.activeLoadToken else { return nil }
-        return owner
-    }
-
-    private func previewPauseForSurface(engine: DeferredResumeSeekReconciliationPolicy.Engine) -> Bool {
-        guard !playbackExited, pendingAdvance == nil, recoveryPauseIntent,
-              playbackDeadlineClock.isPaused, let transfer = previewPauseSurfaceTransfer else { return false }
-        return transfer.context == resumeSurfaceContext(engine: engine)
+    private func enginePauseForSurface(engine: DeferredResumeSeekReconciliationPolicy.Engine) -> Bool {
+        engineSurfaceTransfer?.startsPaused(
+            requestedPause: playbackDeadlineClock.isPaused,
+            currentContext: resumeSurfaceContext(engine: engine), playbackExited: playbackExited
+        ) ?? false
     }
 
     /// Capture the resume origin owned by the exact active load before replacing it. An unframed source hop or
@@ -4638,7 +4632,7 @@ struct PlayerScreen: View {
     }
 
     private func viewerPause() {
-        guard coordinator.player != nil else { return }
+        // A surface handoff may temporarily have no controller. The next mount still owes this input.
         localNNTPStallRecovery.suspend()
         recoveryPauseIntent = true
         playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
@@ -4646,7 +4640,7 @@ struct PlayerScreen: View {
     }
 
     private func viewerPlay() {
-        previewPauseSurfaceTransfer = nil
+        // Keep an in-flight handoff: a later Pause before construction must also reach the new surface.
         recoveryPauseIntent = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         coordinator.player?.play()
@@ -4683,7 +4677,9 @@ struct PlayerScreen: View {
     }
 
     private func viewerToggle() {
-        if isPaused { viewerPlay() } else { viewerPause() }
+        // The old controller cannot echo transport while it is being replaced.
+        let paused = engineSurfaceTransfer != nil ? playbackDeadlineClock.isPaused : isPaused
+        if paused { viewerPlay() } else { viewerPause() }
     }
 
     /// Keep the existing recovery budget, but do not spend it while the viewer chose to pause.
@@ -5633,7 +5629,7 @@ struct PlayerScreen: View {
     /// it is not a failover attempt and the "trying another source" overlay never appears; libmpv just
     /// tone-maps a DV link to HDR10 (an acceptable fallback). `silent` suppresses the DV notice: the no-frame
     /// start watchdog demotes silently, while a genuine mid-play decode failure keeps the informative notice.
-    private func demoteAVPlayerToMPV(silent: Bool, preservingPreviewPause: Bool = false) {
+    private func demoteAVPlayerToMPV(silent: Bool) {
         // Consume the one-shot dead-input evidence FIRST, so it can never leak into a later demote.
         // See `demoteFollowedDeadInput`.
         let followedDeadInput = demoteFollowedDeadInput
@@ -5642,8 +5638,8 @@ struct PlayerScreen: View {
         guard let retiringAVPlayer = coordinator.player as? AVPlayerEngineController else { return }
         if let owner = retiringAVPlayer.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
         resumeRetryGeneration &+= 1
-        if preservingPreviewPause, let owner = retiringAVPlayer.activeLoadToken {
-            previewPauseSurfaceTransfer = .init(retiringOwner: owner, context: resumeSurfaceContext(engine: .libmpv))
+        if let owner = retiringAVPlayer.activeLoadToken {
+            engineSurfaceTransfer = .init(retiringOwner: owner, context: resumeSurfaceContext(engine: .libmpv))
         }
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueSourceGeneration = sourceSwitchGeneration
@@ -5797,7 +5793,6 @@ struct PlayerScreen: View {
         toAVPlayer: Bool,
         preservingNativeDebridRecoveryGeneration: Bool = false
     ) {
-        let previewPauseOwner = ownedPausedPreviewOwner
         if skipDBPreviewing, pendingAdvance == nil { stopSkipDBPreview() }
         // Re-validate against the ACTIVE source before committing: the picker row is gated by
         // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
@@ -5821,14 +5816,14 @@ struct PlayerScreen: View {
         // Resolve a stale provider URL (or join its current refresh) BEFORE the physical AV→MPV handoff.
         // Otherwise the direct demotion bypasses fresh-link recovery and loads the same failed transport.
         if !toAVPlayer, coordinator.player is AVPlayerEngineController {
-            demoteAVPlayerToMPV(silent: true, preservingPreviewPause: previewPauseOwner != nil)
+            demoteAVPlayerToMPV(silent: true)
             close()
             return
         }
         srcProbe("user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
         if !preservingNativeDebridRecoveryGeneration { resumeRetryGeneration &+= 1 }
-        if let previewPauseOwner {
-            previewPauseSurfaceTransfer = .init(retiringOwner: previewPauseOwner,
+        if let retiringOwner = coordinator.player?.activeLoadToken {
+            engineSurfaceTransfer = .init(retiringOwner: retiringOwner,
                 context: resumeSurfaceContext(engine: toAVPlayer ? .avPlayer : .libmpv))
         }
         let reissueEpisodeGeneration = episodeSwitchGeneration
@@ -6465,6 +6460,7 @@ struct PlayerScreen: View {
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        engineSurfaceTransfer = nil
         #if !os(tvOS)
         skipDBPreviewing = false
         skipDBPreviewReturnPosition = nil
@@ -6545,11 +6541,11 @@ struct PlayerScreen: View {
                               mediaGenerationAlreadyClaimed: Bool = false,
                               preparedRemux: VortXPreparedRemuxAttachment? = nil,
                               expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> Bool {
-        let preservingPreviewPause = ownedPausedPreviewOwner != nil
         if skipDBPreviewing, pendingAdvance == nil { stopSkipDBPreview() }
         if userInitiated, loadFailed {
             playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         }
+        let preservingViewerPause = playbackDeadlineClock.isPaused
         guard newURL != curURL else {
             if let pending = pendingAdvance, !pending.issued,
                pending.meta.videoId != curMeta?.videoId {
@@ -6619,7 +6615,7 @@ struct PlayerScreen: View {
         let issuedToken = loadIntoPlayer(
             newURL, headers: nextHeaders, live: nextLive, contentHint: nextHint,
             resumeOrigin: resume,
-            preservingPreviewPause: preservingPreviewPause,
+            preservingViewerPause: preservingViewerPause,
             preparedRemux: preparedRemux,
             expectedPreparedRemuxOwner: expectedPreparedRemuxOwner
         )
@@ -10399,7 +10395,7 @@ struct PlayerScreen: View {
         // Restore it under the original owner before terminal/history/scrobble decisions.
         if skipDBPreviewing { stopSkipDBPreview() }
         let exitLoadToken = coordinator.player?.activeLoadToken
-        previewPauseSurfaceTransfer = nil
+        engineSurfaceTransfer = nil
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         cancelTerminalFinalityRefresh()
         cancelDirectResumeInventoryRefresh()

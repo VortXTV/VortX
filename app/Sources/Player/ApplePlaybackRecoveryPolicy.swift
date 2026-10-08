@@ -1,5 +1,20 @@
 import Foundation
 
+/// The old controller can disappear before its replacement is constructed. Carry the exact
+/// handoff context, but read Play/Pause at construction/admission so input during teardown wins.
+struct AppleEngineSurfaceTransfer<Owner: Equatable, Context: Equatable> {
+    let retiringOwner: Owner
+    let context: Context
+
+    func startsPaused(requestedPause: Bool, currentContext: Context, playbackExited: Bool) -> Bool {
+        !playbackExited && requestedPause && context == currentContext
+    }
+
+    func accepts(observedOwner: Owner, activeOwner: Owner?, currentContext: Context) -> Bool {
+        observedOwner != retiringOwner && observedOwner == activeOwner && context == currentContext
+    }
+}
+
 /// Direct starts and asynchronously attached remuxes have distinct, bounded startup phases.
 /// Keep polling the current mount so a healthy late attach cannot be demoted by a one-shot sample.
 enum AppleAVStartWatchdogPolicy {

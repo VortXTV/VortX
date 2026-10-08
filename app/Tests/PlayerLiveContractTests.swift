@@ -3040,7 +3040,7 @@ enum PlayerLiveContractTests {
             to: "private func refreshPendingIntentTransport()")
         let playerScreenAVDemote = sourceSection(
             playerScreen,
-            from: "private func demoteAVPlayerToMPV(silent: Bool, preservingPreviewPause: Bool = false)",
+            from: "private func demoteAVPlayerToMPV(silent: Bool)",
             to: "/// User-invoked mid-title engine swap")
         let tvPlayerAVDemote = sourceSection(
             tvPlayer,

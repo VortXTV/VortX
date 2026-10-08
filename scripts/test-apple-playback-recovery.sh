@@ -17,6 +17,10 @@ shared_sources=(
   app/Sources/Player/PlayerStallPolicy.swift
 )
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  "${shared_sources[@]}" app/Tests/AppleEngineSurfaceTransferTests.swift \
+  -o "$recovery_test_dir/surface-transfer"
+"$recovery_test_dir/surface-transfer"
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   "${shared_sources[@]}" "$recovery_test_dir/remux-signal.swift" \
   app/Tests/TVAVStartWatchdogPolicyTests.swift -o "$recovery_test_dir/startup"
 "$recovery_test_dir/startup"

@@ -704,6 +704,9 @@ struct TVPlayerView: View {
     @State private var recoveryPauseOwner: PlayerLoadToken?
     @State private var recoveryPauseIntent = false
     @State private var recoveryPauseTarget: Double = 0
+    @State private var engineSurfaceTransfer: AppleEngineSurfaceTransfer<
+        PlayerLoadToken, DeferredResumeSeekReconciliationPolicy.SurfaceContext
+    >?
     @State private var playbackIdleTimerOwner = UUID()
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
@@ -1542,6 +1545,7 @@ struct TVPlayerView: View {
                             engineSurfaceUsesActiveTuple ? (curHint ?? sourceHint ?? "") : (sourceHint ?? "")))
                     .live(engineSurfaceUsesActiveTuple ? curIsLive : initialLiveMode)
                     .resumeOrigin(resumeOrigin)
+                    .initiallyPaused(enginePauseForSurface(engine: .avPlayer))
                     .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
                     .ignoresSafeArea()
             } else {
@@ -1553,6 +1557,7 @@ struct TVPlayerView: View {
                       audioSidecar: mpvSurfacePlayback.audioSidecar,
                       isDolbyVision: mpvSurfacePlayback.isDolbyVision)
                 .live(mpvSurfacePlayback.live)
+                .initiallyPaused(enginePauseForSurface(engine: .libmpv))
                 .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
                 .onAppear {
                     coordinator.player?.isFullPlayerPresentation = true
@@ -1901,6 +1906,19 @@ struct TVPlayerView: View {
 
     private func handleProperty(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
         guard !loadFailed else { return }   // terminal UI owns the parked source until an accepted Retry
+        if let loadToken, let transfer = engineSurfaceTransfer,
+           transfer.accepts(observedOwner: loadToken, activeOwner: coordinator.player?.activeLoadToken,
+                            currentContext: resumeSurfaceContext(engine: isAVPlayerActive ? .avPlayer : .libmpv)) {
+            recoveryPauseOwner = nil
+            bindIncomingTransportIntent(to: loadToken)
+            if enginePauseForSurface(engine: isAVPlayerActive ? .avPlayer : .libmpv) {
+                recoveryPauseOwner = loadToken
+                recoveryPauseTarget = resumeSeconds ?? currentTime
+                recoveryPauseIntent = true
+                coordinator.player?.pause()
+            }
+            engineSurfaceTransfer = nil
+        }
         if loadToken == recoveryPauseOwner, loadToken == coordinator.player?.activeLoadToken,
            name == MPVProperty.timePos, recoveryPauseIntent, !appliedResume {
             maybeResume()
@@ -4338,6 +4356,7 @@ struct TVPlayerView: View {
         preservingSubtitleChoice: SubtitleChoice? = nil,
         preservingAudioChoice: PlayerRecoveryAudioChoice? = nil
     ) {
+        engineSurfaceTransfer = nil
         clearCachedAudioOutputTruth()
         avToMPVHandoffTask?.cancel()
         avToMPVHandoff = nil
@@ -5289,6 +5308,13 @@ struct TVPlayerView: View {
             sourceGeneration: sourceSwitchGeneration,
             loadToken: nil
         )
+    }
+
+    private func enginePauseForSurface(engine: DeferredResumeSeekReconciliationPolicy.Engine) -> Bool {
+        engineSurfaceTransfer?.startsPaused(
+            requestedPause: playbackDeadlineClock.isPaused,
+            currentContext: resumeSurfaceContext(engine: engine), playbackExited: leftPlayback
+        ) ?? false
     }
 
     private func bindIncomingTransportIntent(to loadToken: PlayerLoadToken) {
@@ -6282,7 +6308,7 @@ struct TVPlayerView: View {
     }
 
     private func viewerPause() {
-        guard coordinator.player != nil else { return }
+        // Teardown can temporarily leave no controller; the replacement still owes this input.
         localNNTPStallRecovery.suspend()
         recoveryPauseIntent = true
         playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
@@ -6505,6 +6531,9 @@ struct TVPlayerView: View {
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueSourceGeneration = sourceSwitchGeneration
         let reissueMediaGeneration = resumeRetryGeneration
+        if let owner = retiringAVPlayer.activeLoadToken {
+            engineSurfaceTransfer = .init(retiringOwner: owner, context: resumeSurfaceContext(engine: .libmpv))
+        }
         if !hasStartedPlaying {
             directAVNoFrameRecovery = DirectAVNoFrameRecovery(
                 url: curURL ?? url,
@@ -6742,6 +6771,10 @@ struct TVPlayerView: View {
         let reissueSourceGeneration = sourceSwitchGeneration
         let reissueMediaGeneration = resumeRetryGeneration
         let reissuePendingVideoID = pendingAdvance?.meta.videoId
+        if let retiringOwner = coordinator.player?.activeLoadToken {
+            engineSurfaceTransfer = .init(retiringOwner: retiringOwner,
+                context: resumeSurfaceContext(engine: toAVPlayer ? .avPlayer : .libmpv))
+        }
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         libmpvResumeWatchdog?.cancel(); libmpvResumeWatchdog = nil   // fresh mount incoming: retire any deferred-resume safety net
         clearPostFrameResumeSeekWatchdog()
