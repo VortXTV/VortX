@@ -527,7 +527,21 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders"
 val vortxEngineCoreDir: File? = (
     System.getenv("VORTX_ENGINE_CORE_DIR")
         ?: (project.findProperty("vortx.engine.coreDir") as? String)
-    )?.let(::File)
+    )?.let(::File) ?: run {
+        // The same canonical/private-workspace resolver as Apple, including registered app worktrees.
+        // Missing local sources retain the existing development warn-skip/release fail-closed policy.
+        val resolver = rootProject.file("../scripts/resolve-native-engine.sh")
+        val result = providers.exec {
+            commandLine("bash", resolver.absolutePath, rootProject.file("..").canonicalPath, "ffi")
+            isIgnoreExitValue = true
+        }
+        if (result.result.get().exitValue == 0) result.standardOutput.asText.get().trim().takeIf { it.isNotEmpty() }?.let(::File) else null
+    }
+
+// Explicit integration build only. Release workflows keep their frozen private-core pins until the
+// parent updates pins, feature sets and required ABI symbols together after review.
+val nativeResourceHostEnabled = System.getenv("VORTX_NATIVE_RESOURCE_HOST") == "1" ||
+    (project.findProperty("vortx.nativeResourceHost") as? String)?.toBoolean() == true
 
 val vortxJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 
@@ -547,7 +561,7 @@ val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
             add("-p"); add(nativeApiLevel.toString())
             add("-o"); add(vortxJniLibsDir.asFile.absolutePath)
             add("build"); add("-p"); add("vortx-ffi")
-            add("--no-default-features"); add("--features"); add("jni,server")
+            add("--no-default-features"); add("--features"); add(if (nativeResourceHostEnabled) "jni,server,resource-host" else "jni,server")
             add("--release"); add("--locked")
         },
     )

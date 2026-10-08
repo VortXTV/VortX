@@ -61,31 +61,26 @@
 # Engine source resolution (first existing crates/ffi wins):
 #   1. $VORTX_ENGINE_DIR                 - explicit override (CI passes the in-repo path)
 #   2. <repo>/vortx-core                 - the vendored engine snapshot, once it carries crates/ffi
-#   3. <repo>/../vortx-engine/vortx-core - a sibling engine checkout (local dev layout)
-#   4. $HOME/vortx-engine/vortx-core     - the default local engine checkout
+#   3. <canonical-app>/../vortx-core/vortx-core (also from a registered app worktree)
 set -euo pipefail
 cd "$(dirname "$0")/.."   # repo root
 source "$HOME/.cargo/env" 2>/dev/null || true
 REPO_ROOT="$(pwd)"
 
 MODE=server
-if [ "${1:-}" = "--no-server" ]; then MODE=kernel; fi
+RESOURCE_HOST=0
+VERIFY_STATE=0
+for argument in "$@"; do
+    case "$argument" in
+        --no-server) MODE=kernel ;;
+        --state-bridge) VERIFY_STATE=1 ;;
+        --resource-host) RESOURCE_HOST=1; VERIFY_STATE=1 ;;
+        *) echo "Unknown option: $argument" >&2; exit 1 ;;
+    esac
+done
 
-ENGINE_DIR="${VORTX_ENGINE_DIR:-}"
-if [ -z "$ENGINE_DIR" ]; then
-    for cand in "$REPO_ROOT/vortx-core" "$REPO_ROOT/../vortx-engine/vortx-core" "$HOME/vortx-engine/vortx-core"; do
-        if [ -f "$cand/crates/ffi/Cargo.toml" ]; then ENGINE_DIR="$cand"; break; fi
-    done
-fi
-if [ -z "$ENGINE_DIR" ] || [ ! -f "$ENGINE_DIR/crates/ffi/Cargo.toml" ]; then
-    echo "ERROR: no vortx-ffi workspace found." >&2
-    echo "  Looked at: \$VORTX_ENGINE_DIR, $REPO_ROOT/vortx-core," >&2
-    echo "  $REPO_ROOT/../vortx-engine/vortx-core, $HOME/vortx-engine/vortx-core" >&2
-    echo "  Each candidate must contain crates/ffi/Cargo.toml (the vortx-ffi crate)." >&2
-    echo "  Point VORTX_ENGINE_DIR at a vortx-core workspace that carries the ffi crate." >&2
-    exit 1
-fi
-ENGINE_DIR="$(cd "$ENGINE_DIR" && pwd)"
+source "$REPO_ROOT/scripts/resolve-native-engine.sh"
+ENGINE_DIR=$(resolve_native_engine "$REPO_ROOT" ffi)
 echo "engine workspace: $ENGINE_DIR (mode: $MODE)"
 
 BUILDSTD="-Z build-std=std,panic_abort"
@@ -108,6 +103,10 @@ rustup +nightly-2026-07-19 target add aarch64-apple-ios aarch64-apple-ios-sim 2>
 # 4-symbol in-process streaming server. See the header comment for why `host` is never built.
 FEATURES_KERNEL="--no-default-features"
 FEATURES_SERVER="--no-default-features --features server"
+if [ "$RESOURCE_HOST" = 1 ]; then
+    FEATURES_KERNEL="--no-default-features --features resource-host"
+    FEATURES_SERVER="--no-default-features --features server,resource-host"
+fi
 
 build_slice() { # <triple> <sdk> <kernel|server>
     local features="$FEATURES_KERNEL"
@@ -199,3 +198,8 @@ for slice in ios-arm64 ios-arm64-simulator tvos-arm64 tvos-arm64-simulator macos
     echo "  $slice [$kind]: $(echo "$syms" | tr '\n' ' ')"
 done
 echo "OK: $OUT (iOS device+sim $IOS_KIND, tvOS device+sim $TV_KIND, macOS kernel-only; vortx_*-only exports)"
+if [ "$VERIFY_STATE" = 1 ]; then
+    ABI_MODE=state
+    [ "$RESOURCE_HOST" != 1 ] || ABI_MODE=resource-host
+    bash "$REPO_ROOT/scripts/verify-native-engine-abi.sh" apple "$OUT" "$ABI_MODE"
+fi
