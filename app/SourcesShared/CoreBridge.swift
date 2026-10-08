@@ -2074,7 +2074,7 @@ final class CoreBridge: ObservableObject {
         var indexByBase: [String: Int] = [:]
         for group in details.allStreamGroups {
             if let streamId, group.request.path.id != streamId { continue }
-            guard !disabledAddons.contains(group.request.base) else { continue }
+            guard !disabledAddons.contains(ProfileAddonPreferencesPolicy.identity(group.request.base)) else { continue }
             guard removed.isEmpty || !isTombstonedAddonBase(group.request.base, removed: removed) else { continue }
             guard let streams = group.content?.ready, !streams.isEmpty else { continue }
             if let i = indexByBase[group.request.base] {
@@ -5030,7 +5030,7 @@ final class CoreBridge: ObservableObject {
         var rows: [CoreBoardRow] = []
         for (engineIndex, catalog) in board.catalogs.enumerated() {
             guard let request = catalog.first?.request else { continue }
-            guard !disabledAddons.contains(request.base) else { continue }
+            guard !disabledAddons.contains(ProfileAddonPreferencesPolicy.identity(request.base)) else { continue }
             guard !ghostBases.contains(AddonTombstones.normalize(request.base)) else { continue }
             let items = catalog.compactMap { $0.content?.ready }.flatMap { $0 }
             guard !items.isEmpty else { continue }
@@ -5098,7 +5098,7 @@ final class CoreBridge: ObservableObject {
         let disabledAddons: Set<String> = includeDisabled ? [] : ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         let ghostBases: Set<String> = includeTombstoned ? [] : Self.tombstonedBases(in: ctx.profile.addons)
         for addon in ctx.profile.addons {
-            guard !disabledAddons.contains(addon.transportUrl) else { continue }
+            guard !disabledAddons.contains(ProfileAddonPreferencesPolicy.identity(addon.transportUrl)) else { continue }
             guard !ghostBases.contains(AddonTombstones.normalize(addon.transportUrl)) else { continue }
             for catalog in addon.manifest.catalogs {
                 let key = Self.catalogKey(base: addon.transportUrl, type: catalog.type, id: catalog.id)

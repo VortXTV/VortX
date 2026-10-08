@@ -14,5 +14,5 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
   sed -n '/^    private func observeDefaultsChange() {/,/^    }/p' app/SourcesShared/VortXSyncManager.swift | sed 's/private func /func /'
   printf '%s\n' '}'
 } > "$profile_test_dir/Observer.swift"
-xcrun swiftc -parse-as-library -warnings-as-errors "$profile_test_dir/UserProfile.swift" "$profile_test_dir/Discovery.swift" "$profile_test_dir/Observer.swift" app/SourcesShared/SettingsDirtyKeys.swift app/SourcesShared/ProfileRosterSyncPolicy.swift app/Tests/ProfileRosterPropagationTests.swift -o "$profile_test_dir/profile-tests"
+xcrun swiftc -parse-as-library -warnings-as-errors "$profile_test_dir/UserProfile.swift" "$profile_test_dir/Discovery.swift" "$profile_test_dir/Observer.swift" app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/SettingsDirtyKeys.swift app/SourcesShared/ProfileRosterSyncPolicy.swift app/Tests/ProfileRosterPropagationTests.swift -o "$profile_test_dir/profile-tests"
 "$profile_test_dir/profile-tests"

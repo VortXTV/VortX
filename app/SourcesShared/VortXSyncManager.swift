@@ -574,9 +574,8 @@ final class VortXSyncManager: ObservableObject {
     /// (a fresh install) keep their original relative order at the END so they are never hidden. An empty
     /// order returns the input unchanged, so this is a no-op until the user actually reorders.
     static func orderedByApplied<T>(_ items: [T], url: (T) -> String) -> [T] {
-        AddonAppliedOrder.sorted(items, order: appliedAddonOrder) {
-            AddonTombstones.normalize(url($0))
-        }
+        ProfileAddonPreferencesPolicy.sorted(items,
+            order: ProfileStore.activeAddonOrder(accountOrder: appliedAddonOrder), key: url)
     }
 
     /// Persist a user-chosen add-on order (the in-app Reorder screen) and push it to the account IMMEDIATELY

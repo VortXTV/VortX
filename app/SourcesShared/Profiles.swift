@@ -41,6 +41,11 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// without touching anyone else. Follows the profile across devices like the rest of the roster.
     var disabledAddons: [String]? = nil
 
+    /// nil is a legacy record; the resolver preserves its customized fields. New records carry an
+    /// empty value whose two nil overrides mean live inheritance from Main. Keep the legacy fields
+    /// alongside this full roster carrier for older clients and backups.
+    var addonPreferences: ProfileAddonPreferences? = ProfileAddonPreferences()
+
     /// Kids profile: a parental-controls flag. When this profile is active the source list hides adult
     /// content and CAM/fake junk regardless of the global source filters (see
     /// `StreamRanking.passesUserFilters`). Pair it with a PIN on the adult profiles (so a child can't
@@ -151,18 +156,21 @@ struct UserProfile: Codable, Identifiable, Equatable {
         playback = try c.decodeIfPresent(PlaybackPrefs.self, forKey: .playback)
         discovery = try c.decodeIfPresent(ProfileDiscoveryPreferences.self, forKey: .discovery)
         disabledAddons = try c.decodeIfPresent([String].self, forKey: .disabledAddons)
+        addonPreferences = try c.decodeIfPresent(ProfileAddonPreferences.self, forKey: .addonPreferences)
         isKids = try c.decodeIfPresent(Bool.self, forKey: .isKids) ?? false
     }
 
     init(id: UUID = UUID(), name: String, avatar: String, accentID: String = "ember",
          oled: Bool = false, textScale: Double = 1.0, pin: String? = nil, usesOwnAccount: Bool = false,
          email: String? = nil, isOwner: Bool = false, familyEdit: Bool = false, playback: PlaybackPrefs? = nil,
-         discovery: ProfileDiscoveryPreferences? = nil, disabledAddons: [String]? = nil, isKids: Bool = false) {
+         discovery: ProfileDiscoveryPreferences? = nil, disabledAddons: [String]? = nil, isKids: Bool = false,
+         addonPreferences: ProfileAddonPreferences? = ProfileAddonPreferences()) {
         self.id = id; self.name = name; self.avatar = avatar; self.accentID = accentID
         self.oled = oled; self.textScale = textScale; self.pin = pin; self.usesOwnAccount = usesOwnAccount
         self.email = email; self.isOwner = isOwner; self.familyEdit = familyEdit; self.playback = playback
         self.discovery = discovery
         self.disabledAddons = disabledAddons
+        self.addonPreferences = addonPreferences
         self.isKids = isKids
     }
 }
@@ -242,6 +250,19 @@ final class ProfileStore: ObservableObject {
         Set(UserDefaults.standard.stringArray(forKey: activeDisabledAddonsKey) ?? [])
     }
 
+    /// Only a custom ranking order is mirrored. Missing means read the current account order, so a
+    /// remote Main reorder becomes visible without materializing a child-profile snapshot.
+    static let activeAddonOrderOverrideKey = "stremiox.profile.addonOrderOverride"
+    static func activeAddonOrder(accountOrder: [String]) -> [String] {
+        #if VORTX_NATIVE_DATA_ENGINE
+        // Native descriptors already arrive in the kernel's account order. Never apply the older
+        // account mirror (which also folded case-sensitive URL paths) over that authoritative input.
+        return UserDefaults.standard.stringArray(forKey: activeAddonOrderOverrideKey) ?? []
+        #else
+        UserDefaults.standard.stringArray(forKey: activeAddonOrderOverrideKey) ?? accountOrder
+        #endif
+    }
+
     /// Flat mirror of the active profile's Kids flag, same off-main pattern as `activeDisabledAddonsKey`,
     /// so the stream filter (which may run off the main actor) can force the parental content guard on
     /// without decoding the roster.
@@ -286,7 +307,6 @@ final class ProfileStore: ObservableObject {
         // profile's set (no CoreBridge call here: the board is built later from the engine event).
         if let active {
             applyTheme(active)
-            UserDefaults.standard.set(active.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
             UserDefaults.standard.set(active.isKids, forKey: Self.activeKidsKey)
         }
         // One-time seed: pre-feature rosters share one flat set of playback preferences, so
@@ -298,6 +318,12 @@ final class ProfileStore: ObservableObject {
                 profiles[index].playback = seed
             }
             persist(touch: false)
+        }
+        // Seed old playback snapshots before flattening inheritance; otherwise an unseeded Main
+        // would overwrite the pre-upgrade flat source-ranking choices with defaults on first launch.
+        if let active {
+            applyAddonPreferences(active)
+            SourcePreferences.shared.reload()
         }
         // Unlike playback's original migration, discovery settings must NOT be copied to every old
         // profile: that would make a new or previously inactive viewer inherit the currently active
@@ -436,6 +462,9 @@ final class ProfileStore: ObservableObject {
         // (remove()'s select-after-removal: the removed profile is already gone from the roster).
         capturePlayback()
         captureDiscovery()
+        // A same-profile selection may have just captured a live Settings edit. Apply that stored
+        // record, not the stale value that the picker passed before capture.
+        let profile = profiles.first(where: { $0.id == profile.id }) ?? profile
         // Persist delayed progress against the outgoing profile before replacing the active watch dictionary.
         flushScheduledWatchCacheSave()
         let beforeAccount = active.map(keychainAccount(for:))
@@ -469,6 +498,12 @@ final class ProfileStore: ObservableObject {
             applyTheme(profile)
             applyPlayback(profile)
             applyDiscovery(profile)
+        } else if profile.isOwner, let active, activeSharesMainAddons {
+            // Main edits must reach a currently visible inheriting secondary immediately.
+            applyAddonPreferences(active)
+            SourcePreferences.shared.reload()
+            notifyAddonPreferencesDidChange(profileID: active.id)
+            CoreBridge.shared.rebuildBoardRows()
         }
     }
 
@@ -478,15 +513,143 @@ final class ProfileStore: ObservableObject {
     /// new set into the read key and rebuilds Home so the change shows at once.
     func toggleAddon(base: String) {
         guard var profile = active else { return }
-        var set = Set(profile.disabledAddons ?? [])
-        if set.contains(base) { set.remove(base) } else { set.insert(base) }
-        profile.disabledAddons = set.isEmpty ? nil : set.sorted()
+        var set = Set(effectiveDisabledAddons(for: profile))
+        let key = ProfileAddonPreferencesPolicy.identity(base)
+        if set.contains(key) { set.remove(key) } else { set.insert(key) }
+        var preferences = addonPreferences(for: profile)
+        preferences.disabledAddonURLsOverride = set.sorted()
+        profile.addonPreferences = preferences
+        profile.disabledAddons = set.sorted() // keep explicit [] distinct from inheriting
         update(profile)
     }
 
     /// Whether an add-on (by transport URL) is currently turned off for the active profile.
     func isAddonDisabledForActive(base: String) -> Bool {
-        Set(active?.disabledAddons ?? []).contains(base)
+        guard let active else { return false }
+        return Set(effectiveDisabledAddons(for: active)).contains(ProfileAddonPreferencesPolicy.identity(base))
+    }
+
+    var activeSharesMainAddons: Bool { active.map { !$0.isOwner && !$0.usesOwnAccount } ?? false }
+    var activeInheritsAddonVisibility: Bool {
+        activeSharesMainAddons && active.map { addonPreferences(for: $0).disabledAddonURLsOverride == nil } == true
+    }
+    var activeInheritsAddonRanking: Bool {
+        activeSharesMainAddons && active.map { addonPreferences(for: $0).rankingOverride == nil } == true
+    }
+
+    private var ownerAddonRanking: ProfileAddonRanking {
+        let owner = profiles.first(where: \.isOwner)
+        return ProfileAddonRanking(
+            sourceTypeOrder: owner?.playback?.sourceTypeOrder ?? SourcePreferences.defaultTypeOrder.map(\.rawValue),
+            useAddonOrder: owner?.playback?.useAddonOrder ?? SourcePreferences.defaultUseAddonOrder)
+    }
+
+    private func addonPreferences(for profile: UserProfile) -> ProfileAddonPreferences {
+        profile.addonPreferences ?? ProfileAddonPreferencesPolicy.migrated(
+            legacyDisabled: profile.disabledAddons, legacyTypes: profile.playback?.sourceTypeOrder,
+            legacyUseOrder: profile.playback?.useAddonOrder, inheritedRanking: ownerAddonRanking)
+    }
+
+    private func effectiveDisabledAddons(for profile: UserProfile) -> [String] {
+        let inherited: [String]
+        if !profile.isOwner, !profile.usesOwnAccount, let owner = profiles.first(where: \.isOwner) {
+            inherited = addonPreferences(for: owner).disabledAddonURLsOverride ?? owner.disabledAddons ?? []
+        } else {
+            inherited = profile.disabledAddons ?? []
+        }
+        return ProfileAddonPreferencesPolicy.disabled(
+            override: addonPreferences(for: profile).disabledAddonURLsOverride, inherited: inherited)
+    }
+
+    private func effectiveAddonRanking(for profile: UserProfile) -> ProfileAddonRanking {
+        if let custom = addonPreferences(for: profile).rankingOverride { return custom }
+        if !profile.isOwner, !profile.usesOwnAccount { return ownerAddonRanking }
+        return ProfileAddonRanking(
+            sourceTypeOrder: profile.playback?.sourceTypeOrder ?? SourcePreferences.defaultTypeOrder.map(\.rawValue),
+            useAddonOrder: profile.playback?.useAddonOrder ?? SourcePreferences.defaultUseAddonOrder)
+    }
+
+    private func applyAddonPreferences(_ profile: UserProfile) {
+        let defaults = UserDefaults.standard
+        defaults.set(effectiveDisabledAddons(for: profile), forKey: Self.activeDisabledAddonsKey)
+        let ranking = effectiveAddonRanking(for: profile)
+        if let order = ranking.addonOrder {
+            defaults.set(ProfileAddonPreferencesPolicy.unique(order), forKey: Self.activeAddonOrderOverrideKey)
+        } else {
+            defaults.removeObject(forKey: Self.activeAddonOrderOverrideKey)
+        }
+        defaults.set(ranking.sourceTypeOrder.joined(separator: ","), forKey: SourcePreferences.orderKey)
+        defaults.set(ranking.useAddonOrder, forKey: SourcePreferences.addonOrderKey)
+    }
+
+    private func notifyAddonPreferencesDidChange(profileID: UUID) {
+        Task { @MainActor in
+            guard ProfileStore.shared.activeID == profileID else { return }
+            CoreBridge.shared.addonOrderDidChange()
+            NotificationCenter.default.post(name: VortXSyncManager.addonOrderChangedNote, object: nil)
+        }
+    }
+
+    func customizeAddonVisibility() {
+        guard var profile = active, activeInheritsAddonVisibility else { return }
+        var preferences = addonPreferences(for: profile)
+        preferences.disabledAddonURLsOverride = effectiveDisabledAddons(for: profile)
+        profile.addonPreferences = preferences
+        profile.disabledAddons = preferences.disabledAddonURLsOverride
+        update(profile)
+    }
+
+    func resetAddonVisibilityToMain() {
+        guard var profile = active, activeSharesMainAddons else { return }
+        var preferences = addonPreferences(for: profile)
+        preferences.disabledAddonURLsOverride = nil
+        profile.addonPreferences = preferences
+        profile.disabledAddons = nil
+        update(profile)
+    }
+
+    func customizeAddonRanking() {
+        guard var profile = active, activeInheritsAddonRanking else { return }
+        var preferences = addonPreferences(for: profile)
+        var ranking = effectiveAddonRanking(for: profile)
+        ranking.addonOrder = ProfileAddonPreferencesPolicy.sorted(CoreBridge.shared.addons,
+            order: Self.activeAddonOrder(accountOrder: VortXSyncManager.appliedAddonOrder), key: { $0.transportUrl })
+            .map { ProfileAddonPreferencesPolicy.identity($0.transportUrl) }
+        preferences.rankingOverride = ranking
+        profile.addonPreferences = preferences
+        update(profile)
+    }
+
+    func resetAddonRankingToMain() {
+        guard var profile = active, activeSharesMainAddons else { return }
+        var preferences = addonPreferences(for: profile)
+        preferences.rankingOverride = nil
+        profile.addonPreferences = preferences
+        // These legacy fields remain mirrors only; nil avoids resurrecting a reset on older exports.
+        profile.playback?.sourceTypeOrder = nil
+        profile.playback?.useAddonOrder = nil
+        update(profile)
+        SourcePreferences.shared.reload()
+    }
+
+    /// The editor captures its profile ID when its rows load. A queued drag/remote action after a
+    /// profile switch is rejected before either the profile or account can be changed.
+    @MainActor func setAddonOrder(_ urls: [String], for profileID: UUID) {
+        guard var profile = active, profile.id == profileID else { return }
+        if !activeSharesMainAddons {
+            #if VORTX_NATIVE_DATA_ENGINE
+            CoreBridge.shared.reorderAddonsForActiveProfile(urls, profileID: profileID)
+            #else
+            VortXSyncManager.shared.applyInAppAddonOrder(urls)
+            #endif
+            return
+        }
+        var preferences = addonPreferences(for: profile)
+        var ranking = effectiveAddonRanking(for: profile)
+        ranking.addonOrder = ProfileAddonPreferencesPolicy.unique(urls)
+        preferences.rankingOverride = ranking
+        profile.addonPreferences = preferences
+        update(profile)
     }
 
     /// Remove a non-owner profile (never the last one). Its private session key is deleted with it.
@@ -563,6 +726,15 @@ final class ProfileStore: ObservableObject {
                         if let kids = st["isKids"] as? Bool, kids != p.isKids { p.isKids = kids; changed = true }
                         if let pbDict = st["playback"] as? [String: Any] {
                             let next = Self.playbackPrefs(from: pbDict, base: p.playback)
+                            if !p.isOwner, !p.usesOwnAccount,
+                               pbDict["sourceTypeOrder"] != nil || pbDict["useAddonOrder"] != nil {
+                                var preferences = addonPreferences(for: p)
+                                var ranking = effectiveAddonRanking(for: p)
+                                ranking.sourceTypeOrder = next.sourceTypeOrder ?? ranking.sourceTypeOrder
+                                ranking.useAddonOrder = next.useAddonOrder ?? ranking.useAddonOrder
+                                preferences.rankingOverride = ranking
+                                if preferences != p.addonPreferences { p.addonPreferences = preferences; changed = true }
+                            }
                             if next != p.playback { p.playback = next; changed = true }
                         }
                     }
@@ -570,7 +742,10 @@ final class ProfileStore: ObservableObject {
                     // the add-on list (doc.vortx.addons), so the dashboard only toggles which ones are off
                     // for this profile; that set rides the profileEdits channel, never doc.vortx.
                     if let da = e["disabledAddons"] as? [String] {
-                        let next = da.isEmpty ? nil : da.sorted()
+                        let next = ProfileAddonPreferencesPolicy.unique(da).sorted()
+                        var preferences = addonPreferences(for: p)
+                        preferences.disabledAddonURLsOverride = next
+                        if preferences != p.addonPreferences { p.addonPreferences = preferences; changed = true }
                         if next != p.disabledAddons { p.disabledAddons = next; changed = true }
                     }
                     if changed { update(p) }
@@ -590,9 +765,17 @@ final class ProfileStore: ObservableObject {
                         if let kids = st["isKids"] as? Bool { created.isKids = kids }
                         if let playback = st["playback"] as? [String: Any] {
                             created.playback = Self.playbackPrefs(from: playback, base: nil)
+                            if playback["sourceTypeOrder"] != nil || playback["useAddonOrder"] != nil {
+                                created.addonPreferences?.rankingOverride = ProfileAddonRanking(
+                                    sourceTypeOrder: created.playback?.sourceTypeOrder ?? ownerAddonRanking.sourceTypeOrder,
+                                    useAddonOrder: created.playback?.useAddonOrder ?? ownerAddonRanking.useAddonOrder)
+                            }
                         }
                     }
-                    created.disabledAddons = (e["disabledAddons"] as? [String]).flatMap { $0.isEmpty ? nil : $0.sorted() }
+                    if let disabled = e["disabledAddons"] as? [String] {
+                        created.disabledAddons = ProfileAddonPreferencesPolicy.unique(disabled).sorted()
+                        created.addonPreferences?.disabledAddonURLsOverride = created.disabledAddons
+                    }
                     add(created)
                 }
             }
@@ -835,7 +1018,7 @@ final class ProfileStore: ObservableObject {
         // Per-profile add-on visibility: flatten this profile's disabled set into the key the off-main
         // board build and streamGroups read, so Home, Discover, and stream sources all honor it the
         // moment this profile becomes active. (Empty array = nothing hidden, the default.)
-        d.set(profile.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
+        applyAddonPreferences(profile)
         d.set(profile.isKids, forKey: Self.activeKidsKey)   // Kids content guard for the stream filter
         let p = profile.playback
         // Track languages + subtitle style. These PlaybackPrefs fields are non-optional, so they are
@@ -865,16 +1048,7 @@ final class ProfileStore: ObservableObject {
         // filters. Every field below is OPTIONAL in PlaybackPrefs: nil means "this profile never recorded
         // it". On a SWITCH the nil is resolved to SourcePreferences' documented default (single source of
         // truth, no magic numbers here); on a sync fold the nil is left alone.
-        if let order = p?.sourceTypeOrder {
-            d.set(order.joined(separator: ","), forKey: SourcePreferences.orderKey)
-        } else if resetUnset {
-            d.set(SourcePreferences.defaultTypeOrderCSV, forKey: SourcePreferences.orderKey)
-        }
-        if let addon = p?.useAddonOrder {
-            d.set(addon, forKey: SourcePreferences.addonOrderKey)
-        } else if resetUnset {
-            d.set(SourcePreferences.defaultUseAddonOrder, forKey: SourcePreferences.addonOrderKey)
-        }
+        // Source ranking was resolved above from the explicit override or Main's live preferences.
         if let v = p?.safetyMode { d.set(v, forKey: SourcePreferences.safetyKey) }
         else if resetUnset { d.set(SourcePreferences.defaultSafetyMode, forKey: SourcePreferences.safetyKey) }
         if let v = p?.instantOnly { d.set(v, forKey: SourcePreferences.instantOnlyKey) }
@@ -924,6 +1098,7 @@ final class ProfileStore: ObservableObject {
         // board on every apply. Cheap: rebuildBoardRows recomputes the same rows and re-publishes,
         // so an unchanged set diffs to a no-op in SwiftUI.
         CoreBridge.shared.rebuildBoardRows()
+        notifyAddonPreferencesDidChange(profileID: profile.id)
     }
 
     /// Mirror of captureTheme for playback preferences: Settings and the in-player options write
@@ -932,9 +1107,28 @@ final class ProfileStore: ObservableObject {
     /// writes from echoing back as roster edits.
     func capturePlayback() {
         guard var profile = active else { return }
-        let now = currentPlaybackPrefs()
-        guard profile.playback != now else { return }
+        var now = currentPlaybackPrefs()
+        let effective = effectiveAddonRanking(for: profile)
+        var preferences = addonPreferences(for: profile)
+        if now.sourceTypeOrder != effective.sourceTypeOrder || now.useAddonOrder != effective.useAddonOrder {
+            if activeSharesMainAddons {
+                var custom = effective
+                custom.sourceTypeOrder = now.sourceTypeOrder ?? effective.sourceTypeOrder
+                custom.useAddonOrder = now.useAddonOrder ?? effective.useAddonOrder
+                preferences.rankingOverride = custom
+            }
+        }
+        // Capturing an outgoing inherited profile must not turn the effective Main values into
+        // personal settings. Preserve its stored legacy fields until the viewer makes a real edit.
+        if activeSharesMainAddons, preferences.rankingOverride == nil {
+            now.sourceTypeOrder = profile.playback?.sourceTypeOrder
+            now.useAddonOrder = profile.playback?.useAddonOrder
+        } else if !activeSharesMainAddons {
+            preferences.rankingOverride = nil // owners keep their established account-ranking fields
+        }
+        guard profile.playback != now || profile.addonPreferences != preferences else { return }
         profile.playback = now
+        profile.addonPreferences = preferences
         update(profile)
     }
 
@@ -1321,6 +1515,15 @@ final class ProfileStore: ObservableObject {
             if activeID == old { activeID = UserProfile.ownerID }
         }
         collapseEmptyDuplicateSecondaries()
+        // Freeze only evidence of legacy customization once, before a later Main edit can make an
+        // old equal snapshot look like a personal override. An empty object is a durable migration marker.
+        let inherited = ownerAddonRanking
+        for index in profiles.indices where profiles[index].addonPreferences == nil {
+            let profile = profiles[index]
+            profiles[index].addonPreferences = ProfileAddonPreferencesPolicy.migrated(
+                legacyDisabled: profile.disabledAddons, legacyTypes: profile.playback?.sourceTypeOrder,
+                legacyUseOrder: profile.playback?.useAddonOrder, inheritedRanking: inherited)
+        }
     }
 
     /// Collapse ACCIDENTAL duplicate secondaries: when two or more non-owner profiles share the same name
