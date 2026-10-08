@@ -1086,6 +1086,14 @@ struct iOSHomeView: View {
                     // back-to-top button appears; it hides again when you return to the top (#8).
                     // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
                     Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.home, active: isActive)
+                    // Home is the Cinema landing surface, but Discover stays a first-class browse owner.
+                    // This value link opens its existing paginated category screen; the main Discover tab
+                    // still retains all engine filters and its dedicated advanced-filter sheet.
+                    NavigationLink(value: HubTarget.discover(.trending)) {
+                        CinemaBrowseEntry()
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, Theme.Space.md)
                     #if os(macOS)
                     // macOS has no navigation-bar toolbar on Home (custom chrome), and this app's shared
                     // NSToolbar is fragile (see the Sign In toolbar note below), so the "Customize Home"
@@ -2020,6 +2028,18 @@ struct iOSLibraryView: View {
         return source.prefix(5).map(FeaturedHeroItem.from(cw:))
     }
 
+    /// The Library's compact Continue Watching shelf uses the same owner/profile source and the same
+    /// direct-resume primitive as Home. It is a second entry point, not a second history model.
+    private var libraryContinueWatchingItems: [RailItem] {
+        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory
+            ? core.continueWatching
+            : profiles.cwItems
+        return source.map {
+            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
+                     cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
+        }
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
@@ -2059,6 +2079,11 @@ struct iOSLibraryView: View {
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.bottom, Theme.Space.lg)
                 #endif
+                if !libraryContinueWatchingItems.isEmpty {
+                    PosterRail(title: "Continue Watching", eyebrow: "Pick up where you left off",
+                               items: libraryContinueWatchingItems, onTap: resumeLibraryContinueWatching,
+                               menu: .continueWatching, onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) })
+                }
                 // The owner profile's Library is the account library (engine), with its type/sort filter
                 // chips; an overlay profile's Library is its own private watch overlay, with no engine
                 // `selectable` so the filter chips are omitted. Both gate on the profile-aware
@@ -2174,6 +2199,21 @@ struct iOSLibraryView: View {
     private func handleTap(_ item: RailItem) {
         hero.noteInteraction()
         path.append(FeaturedHeroItem.from(rail: item))
+    }
+
+    private func resumeLibraryContinueWatching(_ item: RailItem) {
+        hero.noteInteraction()
+        #if !os(tvOS)
+        Task {
+            if let launch = await iOSDirectResume(for: item, core: core, account: account, expectedTraktSession: nil) {
+                downloadPlayer = launch
+            } else {
+                path.append(FeaturedHeroItem.from(rail: item))
+            }
+        }
+        #else
+        path.append(FeaturedHeroItem.from(rail: item))
+        #endif
     }
 
     /// The engine's SORT chip row (#15), mirroring the tvOS `LibraryView.sortChips`: each chip carries
@@ -2951,14 +2991,17 @@ struct iOSSearchView: View {
             // catalog actions (#14).
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(resultSections, id: \.title) { section in
-                    PosterRail(title: section.title,
-                               items: section.items.map {
-                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
-                                            background: $0.background, description: $0.description,
-                                            releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-                               },
-                               onTap: { saveToHistory(query); path.append(FeaturedHeroItem.from(rail: $0)) },
-                               menu: .catalog, showWatchedBadges: true)
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        Text(section.title).sectionTitleStyle().padding(.horizontal, Theme.Space.md)
+                        CinemaSearchResults(items: section.items.map {
+                            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
+                                     background: $0.background, description: $0.description,
+                                     releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
+                        }, onOpen: { item in
+                            saveToHistory(query)
+                            path.append(FeaturedHeroItem.from(rail: item))
+                        })
+                    }
                 }
             }
         }
@@ -4940,10 +4983,9 @@ struct PosterCardiOS: View {
     /// The poster to show: the pooled localized (language-matched) poster when available, else the add-on's.
     private var displayPoster: String? { privateArtwork ? poster : (l10n.poster(for: id) ?? poster) }
 
-    /// Cinema uses the same wide landscape footprint for every public catalog card. `LandscapeArtiOS`
-    /// already fail-softs to intentional poster framing when no TMDB backdrop is available, so this does
-    /// not invent data or require provider-wide fetching. Private Trakt rows retain their local-only art.
-    private var landscape: Bool { !privateArtwork }
+    /// The existing Appearance control remains authoritative. When Landscape is selected it applies to
+    /// every card, including private history rows; those rows use an already-warm-only renderer below.
+    private var landscape: Bool { catalogPrefs.landscapeCards }
     /// Preserve this card's actual catalog identity for its context menu. CoreBridge uses it only if
     /// board/discover/search no longer has the engine's resident raw preview, then validates id/type.
     private var catalogPreview: LibraryWatchedMutationPolicy.MetaPreview {
@@ -4985,7 +5027,11 @@ struct PosterCardiOS: View {
                 // portrait crops the poster to the card so non-2:3 add-on posters fill cleanly (F37).
                 Group {
                     if landscape {
-                        LandscapeArtiOS(id: id, type: type, title: displayName, poster: displayPoster ?? fallbackArt)
+                        if privateArtwork {
+                            privateLandscapeArt
+                        } else {
+                            LandscapeArtiOS(id: id, type: type, title: displayName, poster: displayPoster ?? fallbackArt)
+                        }
                     } else if privateArtwork, TraktArtworkPolicy.isFirstPartyArtwork(displayPoster ?? fallbackArt) {
                         // Trakt's documented first-party CDN art may use the normal cache-backed loader.
                         // Preserve the exact validated row URL and skip PosterArtwork enrichment: private
@@ -5095,8 +5141,21 @@ struct PosterCardiOS: View {
         // inter-child gap and rounded-corner regions are dead zones that fall through to the adjacent
         // grid cell, the reported "tap a card in row 1, the row-2 item opens". Rectangle (not the
         // poster's RoundedRectangle) so the title and gap are inside the target and corners aren't dead.
-        .frame(width: cardW, alignment: .leading)
+            .frame(width: cardW, alignment: .leading)
         .contentShape(Rectangle())
+    }
+
+    /// A wide private-history card must not call catalog/backdrop services. It simply re-frames the
+    /// already-warm poster over a dim canvas, preserving both privacy and the shared Cinema footprint.
+    private var privateLandscapeArt: some View {
+        ZStack {
+            Theme.Palette.surface1
+            WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
+                .blur(radius: 18).opacity(0.5)
+            WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
+                .scaledToFit()
+                .padding(6)
+        }
     }
 }
 
