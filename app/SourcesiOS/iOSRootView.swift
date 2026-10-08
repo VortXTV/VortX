@@ -1569,11 +1569,12 @@ struct iOSHomeView: View {
                                                  releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
                                                  genres: $0.genres)
                                     },
-                                    onTap: handleTap, showWatchedBadges: true,
+                                    onTap: handleTap,
                                     onSeeAll: {
                                         path.append(CinemaBoardCatalogTarget(rowID: row.id, title: row.title,
                                                                              engineIndex: row.engineIndex))
                                     },
+                                    showWatchedBadges: true,
                                     onReachEnd: { core.loadBoardRowNextPage(engineIndex: row.engineIndex) }))
                     .onAppear {
                         if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {

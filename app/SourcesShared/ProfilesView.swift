@@ -364,7 +364,8 @@ private struct ProfileCardContent: View {
             }
         }
         .padding(Theme.Space.md)
-        .frame(width: 320, minHeight: 100, alignment: .leading)
+        .frame(width: 320, alignment: .leading)
+        .frame(minHeight: 100, alignment: .leading)
         .vortxCinemaCard()
         #endif
     }
@@ -404,7 +405,8 @@ private struct AddProfileCard: View {
                     .foregroundStyle(Theme.Palette.textTertiary)
             }
             .padding(Theme.Space.md)
-            .frame(width: 320, minHeight: 76, alignment: .leading)
+            .frame(width: 320, alignment: .leading)
+            .frame(minHeight: 76, alignment: .leading)
             .vortxCinemaCard()
             #endif
         }
