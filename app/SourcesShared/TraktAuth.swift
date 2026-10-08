@@ -932,9 +932,12 @@ actor TraktAuth {
 #if VORTX_NATIVE_DATA_ENGINE
                 guard let nativeIntent = await MainActor.run(body: { VortXSyncManager.shared.prepareNativeProviderMutation([
                     "traktAccess": .string(token.accessToken), "traktRefresh": .string(token.refreshToken),
-                    "traktExpiry": .string(String(Int(token.expiresAt.timeIntervalSince1970)))], capture: capture) }),
-                      CredentialScopeRegistry.shared.isCurrent(capture),
-                      loginAttempts.owns(code: session, generation: loginGeneration) else { return false }
+                    "traktExpiry": .string(String(Int(token.expiresAt.timeIntervalSince1970)))], capture: capture) }) else { return false }
+                guard !Task.isCancelled, CredentialScopeRegistry.shared.isCurrent(capture),
+                      loginAttempts.owns(code: session, generation: loginGeneration) else {
+                    _ = await MainActor.run { VortXSyncManager.shared.abortNativeProviderMutation(nativeIntent, capture: capture) }
+                    return false
+                }
 #endif
                 mutationAttempted = true
                 persisted = replaceCredentialsWithNewSession(
@@ -1212,21 +1215,29 @@ actor TraktAuth {
             // A normal refresh rotates tokens inside the same authenticated account. Never rotate the local
             // session identity here: queued work and snapshots captured before refresh remain valid.
 #if VORTX_NATIVE_DATA_ENGINE
-            guard CredentialScopeRegistry.shared.isCurrent(capture), currentSessionID(ownerNamespace: capture.namespace) == expectedSession,
+            let persisted = await performCredentialBoundary {
+                guard !Task.isCancelled, CredentialScopeRegistry.shared.isCurrent(capture),
+                      currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return false }
+                guard
                   let nativeIntent = await MainActor.run(body: { VortXSyncManager.shared.prepareNativeProviderMutation([
                     "traktAccess": .string(token.accessToken), "traktRefresh": .string(token.refreshToken),
-                    "traktExpiry": .string(String(Int(token.expiresAt.timeIntervalSince1970)))], capture: capture) }) else { throw TraktAuthError.persistenceFailure }
-#endif
+                    "traktExpiry": .string(String(Int(token.expiresAt.timeIntervalSince1970)))], capture: capture) }) else { return false }
+                guard !Task.isCancelled, CredentialScopeRegistry.shared.isCurrent(capture),
+                      currentSessionID(ownerNamespace: capture.namespace) == expectedSession else {
+                    _ = await MainActor.run { VortXSyncManager.shared.abortNativeProviderMutation(nativeIntent, capture: capture) }
+                    return false
+                }
+                guard storeRefreshedToken(token, ownerCapture: capture) else { return false }
+                return await MainActor.run { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }
+            }
+            guard persisted else { throw TraktAuthError.persistenceFailure }
+#else
             guard CredentialScopeRegistry.shared.isCurrent(capture),
                   currentSessionID(ownerNamespace: capture.namespace) == expectedSession else {
                 throw TraktAuthError.sessionChanged
             }
             try Task.checkCancellation()
             guard storeRefreshedToken(token, ownerCapture: capture) else {
-                throw TraktAuthError.persistenceFailure
-            }
-#if VORTX_NATIVE_DATA_ENGINE
-            guard await MainActor.run(body: { VortXSyncManager.shared.finishNativeProviderMutation(nativeIntent, capture: capture) }) else {
                 throw TraktAuthError.persistenceFailure
             }
 #endif

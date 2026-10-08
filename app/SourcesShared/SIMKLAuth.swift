@@ -862,9 +862,12 @@ actor SIMKLAuth {
                       loginAttempts.owns(code: userCode, generation: loginGeneration) else { return false }
 #if VORTX_NATIVE_DATA_ENGINE
                 guard let nativeIntent = await MainActor.run(body: { VortXSyncManager.shared.prepareNativeProviderMutation([
-                    "simklAccess": .string(token), "simklExpiry": .string("0")], capture: capture) }),
-                      CredentialScopeRegistry.shared.isCurrent(capture),
-                      loginAttempts.owns(code: userCode, generation: loginGeneration) else { return false }
+                    "simklAccess": .string(token), "simklExpiry": .string("0")], capture: capture) }) else { return false }
+                guard !Task.isCancelled, CredentialScopeRegistry.shared.isCurrent(capture),
+                      loginAttempts.owns(code: userCode, generation: loginGeneration) else {
+                    _ = await MainActor.run { VortXSyncManager.shared.abortNativeProviderMutation(nativeIntent, capture: capture) }
+                    return false
+                }
 #endif
                 persisted = replaceCredentialsWithNewSession(
                     access: token,

@@ -71,6 +71,12 @@ struct VortxNativeOAuthIntentTests {
         check(!(await delayed.value))
         check(await auth.sessionID == newSession)
         precondition(manager.finishNativeProviderMutation(newerPrepared, capture: capture))
+        let abandoned = manager.prepareNativeProviderMutation(reconnected, capture: capture)!
+        let replacement = manager.prepareNativeProviderMutation(reconnected, capture: capture)!
+        check(!manager.abortNativeProviderMutation(abandoned, capture: capture))
+        check(try manager.testProviderState(capture: capture).hasPreparedMutation)
+        check(manager.abortNativeProviderMutation(replacement, capture: capture))
+        check(try !manager.testProviderState(capture: capture).hasPreparedMutation)
         print("Native OAuth production integration: failed prepare leaves tuple, failed finalize retains durable clear, retry settles, stale/newly-prepared same-account clear races rejected")
     }
 }

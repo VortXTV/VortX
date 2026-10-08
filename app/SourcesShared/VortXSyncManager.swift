@@ -277,6 +277,15 @@ final class VortXSyncManager: ObservableObject {
             requestSyncSoon(); return true
         } catch { return false } // prepared secure intent remains; no remote hydration/export may pass it
     }
+    /// Only an auth actor that has not attempted its tuple mutation may abort this exact event.
+    func abortNativeProviderMutation(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
+        if events.isEmpty { return isCurrent(capture) }
+        do {
+            var state = try nativeProviderState(capture: capture)
+            try state.abortPrepared(events); try saveNativeProviderState(state, capture: capture)
+            return true
+        } catch { return false }
+    }
     /// Synchronous credential mutation linearization: the provider register cannot change between
     /// this exact-event check and the secure tuple mutation. Never hold this lock across an await.
     nonisolated static func withNativeProviderEvents(_ events: [String: VortxNativeProviderCredentials.Register],

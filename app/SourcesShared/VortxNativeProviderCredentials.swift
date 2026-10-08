@@ -71,6 +71,10 @@ struct VortxNativeProviderCredentials {
         try Self.validate(candidate.document, scope: local.document.scope)
         local = candidate
     }
+    mutating func abortPrepared(_ events: [String: Register]) throws {
+        guard !events.isEmpty, events.allSatisfy({ local.prepared?[$0.key] == $0.value }) else { throw VortxNativeError.superseded }
+        for key in events.keys { local.prepared?.removeValue(forKey: key) }
+    }
     func authorizes(_ events: [String: Register]) -> Bool {
         !hasPreparedMutation && !events.isEmpty && events.allSatisfy { local.document.fields[$0.key] == $0.value }
     }
