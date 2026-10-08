@@ -17,6 +17,8 @@
     <exclude domain="sharedpref" path="vortx_sync_session_plain.xml" />
     <exclude domain="sharedpref" path="vortx_native_provider_credentials.xml" />
     <exclude domain="sharedpref" path="vortx_native_provider_credentials_plain.xml" />
+    <exclude domain="sharedpref" path="vortx_native_streaming_credentials.xml" />
+    <exclude domain="sharedpref" path="vortx_native_streaming_credentials_plain.xml" />
     <exclude domain="sharedpref" path="vortx_debrid_keys.xml" />
     <exclude domain="sharedpref" path="vortx_debrid_keys_plain.xml" />
     <exclude domain="sharedpref" path="vortx_auth_identity.xml" />

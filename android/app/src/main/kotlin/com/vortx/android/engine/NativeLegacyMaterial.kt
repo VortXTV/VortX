@@ -22,12 +22,25 @@ internal fun nativeLegacyMaterial(
     document: JSONObject,
     roster: List<UserProfile>,
     rosterModifiedSeconds: Double?,
-): JSONObject = LegacyMaterialAdapter(document, roster, rosterModifiedSeconds).build()
+    ownAccountSources: List<NativeOwnAccountSource> = emptyList(),
+    retainedOwnAccounts: NativeOwnAccountBaseline? = null,
+    accountScope: VortxAccountScope? = null,
+): JSONObject = withNativeOwnAccountSources(ownAccountSources) {
+    if (ownAccountSources.isNotEmpty() || retainedOwnAccounts != null) {
+        val scope = requireNotNull(accountScope) { "Authenticated own-account scope required" }
+        require(roster.single { it.isOwner }.id == scope.ownerProfileID && ownAccountSources.all { it.accountID == scope.accountID })
+        require(retainedOwnAccounts == null || retainedOwnAccounts.scope == scope) { "Own-account baseline scope changed" }
+    }
+    LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts).build()
+}
 
 private class LegacyMaterialAdapter(
     private val document: JSONObject,
     private val roster: List<UserProfile>,
     private val modified: Double?,
+    private val ownSources: List<NativeOwnAccountSource> = emptyList(),
+    private val retainedOwn: NativeOwnAccountBaseline? = null,
+    private val independentSource: Boolean = false,
 ) {
     private val vortx = objectField(document, "vortx") ?: JSONObject()
     private val owner = roster.singleOrNull { it.isOwner }
@@ -47,7 +60,7 @@ private class LegacyMaterialAdapter(
         requireMaterial(roster.isNotEmpty() && profiles.size == roster.size, "Duplicate or empty profile roster")
         roster.forEach {
             requireMaterial(runCatching { UUID.fromString(it.id).toString().equals(it.id, true) }.getOrDefault(false), "Invalid profile identity")
-            requireMaterial(!it.usesOwnAccount, "Own-account profile requires an authenticated streaming-account identity")
+            requireMaterial(!it.isOwner || !it.usesOwnAccount, "Owner cannot use an independent profile account")
             watchRows[it.id] = mutableListOf(); knownTitles[it.id] = linkedMapOf(); links[it.id] = mutableListOf()
         }
         modified?.let { validClock(it, "rosterModifiedSeconds") }
@@ -56,30 +69,55 @@ private class LegacyMaterialAdapter(
                 ?: runCatching { UUID.fromString(raw).toString().uppercase() }.getOrElse { fail("Invalid deleted profile identity") }
         }.distinct()
         requireMaterial(owner.id !in deleted, "Owner profile is tombstoned")
-        val nativeRoster = JSONArray(roster.map(::profile))
+        val ownIDs = roster.filter { it.usesOwnAccount }.map { it.id }.toSet()
+        requireMaterial(ownSources.map { it.profileID }.distinct().size == ownSources.size && ownSources.all { it.profileID in ownIDs }, "Unexpected own-account source")
+        val fresh = ownSources.associateBy { it.profileID }
+        requireMaterial(ownIDs.all { it in fresh || it in retainedOwn?.profileIDs().orEmpty() }, "Own-account profile requires an authenticated streaming-account source or validated native receipt")
+        val proofs = JSONObject()
+        for (id in ownIDs) {
+            requireMaterial(UUID.fromString(id).toString().uppercase() == id, "Own-account profile UUID must be canonical uppercase")
+            fresh[id]?.requireOverlayUnchanged(document) ?: requireNotNull(retainedOwn).requireOverlayUnchanged(document, id)
+            val proof = fresh[id]?.let { JSONObject().put("verifiedStreamingUid", it.verifiedUID).put("sourceDocumentSha256", it.digest) }
+                ?: requireNotNull(retainedOwn).proof(id)
+            proofs.put(id, proof)
+        }
+        val nativeRoster = JSONArray(roster.map { profile(it, proofs.optJSONObject(it.id)) })
         val addons = JSONObject().put(owner.id, addonBucket())
         val libraries = JSONObject().put(owner.id, ownerLibrary())
         importOverlays()
         importOwnerIntents()
-        val output = JSONObject().put("schemaVersion", 1).put("roster", nativeRoster)
+        val ownWatches = JSONObject(); val ownLinks = JSONObject()
+        for (id in ownIDs) {
+            val source = fresh[id]
+            val material = source?.let {
+                val isolated = profiles.getValue(id).copy(isOwner = true, usesOwnAccount = false)
+                LegacyMaterialAdapter(it.legacyDocument(), listOf(isolated), null, independentSource = true).build()
+            }
+            fun bucket(kind: String): Any = material?.getJSONObject(kind)?.get(id) ?: requireNotNull(retainedOwn).bucket(kind, id)
+            addons.put(id, bucket("addons")); libraries.put(id, bucket("libraries"))
+            ownWatches.put(id, bucket("watches")); ownLinks.put(id, bucket("identityLinks"))
+        }
+        val output = JSONObject().put("schemaVersion", if (ownIDs.isEmpty()) 1 else 2).put("roster", nativeRoster)
             .put("deletedProfileIds", JSONArray(deleted)).put("addons", addons).put("libraries", libraries)
-            .put("watches", JSONObject().also { out -> watchRows.forEach { (id, rows) -> out.put(id, JSONArray(resolveWatchRows(rows))) } })
-            .put("identityLinks", JSONObject().also { out -> links.forEach { (id, groups) -> out.put(id, JSONArray(groups.map(::JSONArray))) } })
+            .put("watches", JSONObject().also { out -> watchRows.forEach { (id, rows) -> out.put(id, ownWatches.optJSONArray(id) ?: JSONArray(resolveWatchRows(rows))) } })
+            .put("identityLinks", JSONObject().also { out -> links.forEach { (id, groups) -> out.put(id, ownLinks.optJSONArray(id) ?: JSONArray(groups.map(::JSONArray))) } })
+        if (ownIDs.isNotEmpty()) output.put("ownAccountSources", proofs)
         modified?.let { output.put("rosterModifiedSeconds", it) }
         requireNoCredentials(output)
         return output
     }
 
-    private fun profile(profile: UserProfile): JSONObject {
+    private fun profile(profile: UserProfile, own: JSONObject? = null): JSONObject {
         requireMaterial(profile.textScale.isFinite() && profile.textScale > 0 && profile.textScale <= 100, "Invalid profile text scale")
         val settings = JSONObject().put("accent", profile.accentID).put("oled", profile.oled)
             .put("textScale", (profile.textScale * 1000).roundToLong())
             .put("languages", JSONArray(listOfNotNull(profile.playback?.audioLang?.takeIf(String::isNotBlank), profile.playback?.subtitleLang?.takeIf(String::isNotBlank)).distinct()))
             .put("disabledAddons", JSONArray(profile.disabledAddons.orEmpty()))
-        val account = if (profile.isOwner) JSONObject().put("kind", "local_only")
+        val account = if (own != null) JSONObject().put("kind", "own").put("value", own.getString("verifiedStreamingUid"))
+            else if (profile.isOwner) JSONObject().put("kind", "local_only")
             else JSONObject().put("kind", "shared").put("value", owner.id)
         return JSONObject().put("id", profile.id).put("name", profile.name).put("owner", profile.isOwner)
-            .put("account", account).put("addons", "share_primary").put("settings", settings)
+            .put("account", account).put("addons", if (own == null) "share_primary" else "own").put("settings", settings)
             .put("parental", JSONObject().put("kids", profile.isKids).put("familyEdit", profile.familyEdit))
             .also { out -> profile.pin?.takeIf(String::isNotEmpty)?.let { pin ->
                 requireMaterial(Regex("sha256:[0-9a-fA-F]{64}").matches(pin), "Legacy plaintext or malformed PIN requires explicit reconciliation")
@@ -148,11 +186,19 @@ private class LegacyMaterialAdapter(
             optionalString(row, "poster")?.takeIf(String::isNotEmpty)?.let { item.put("poster", it) }
             // Keep the descriptor as payload; membership clocks below decide visibility. A viewing
             // clock is never evidence for a library deletion, even if this snapshot says removed.
-            items[key] = item
-            if (optionalBoolean(row, "removed") == true) declaredRemoved += key
+            val removed = optionalBoolean(row, "removed") == true
+            if (independentSource) {
+                // Initial full-source absence evidence only. No _mtime/lastWatched deletion clock.
+                // The kernel rejects a newly observed weak deletion after acknowledged live data.
+                if (removed) intents[key] = JSONObject().put("key", key).put("removedAtMs", 1)
+                else if (optionalBoolean(row, "temp") != true) items[key] = item
+            } else {
+                items[key] = item
+                if (removed) declaredRemoved += key
+            }
             importWatch(owner.id, id, row, ownerRow = true)
         }
-        val historyBucket = objectField(vortx, "byProfile")?.let { objectField(it, UserProfile.OWNER_ID) }
+        val historyBucket = objectField(vortx, "byProfile")?.let { objectField(it, if (independentSource) owner.id else UserProfile.OWNER_ID) }
         for (row in objects(historyBucket?.let { arrayField(it, "ownerHistory") }, "owner history")) {
             val id = string(row, "id"); known(owner.id, id, contentType(row))
             importWatch(owner.id, id, row, ownerRow = true, historyOnly = true)
@@ -182,6 +228,8 @@ private class LegacyMaterialAdapter(
         val byProfile = objectField(vortx, "byProfile") ?: JSONObject()
         val webRemoved = objectField(document, "webProgress")?.let { objectField(it, "removed") }?.let { objectField(it, "byProfile") } ?: JSONObject()
         for (rawID in (byProfile.keys().asSequence().toList() + webRemoved.keys().asSequence().toList()).distinct()) {
+            // A VortX overlay cannot establish an independent streaming account's ownership.
+            if (profiles.values.any { it.usesOwnAccount && it.id.equals(rawID, true) }) continue
             val bucket = objectField(byProfile, rawID) ?: JSONObject()
             // The fixed historical owner-history bucket is a carrier, not a second profile identity.
             if (rawID == UserProfile.OWNER_ID && rawID !in profiles) {
