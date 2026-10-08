@@ -332,10 +332,12 @@ final class StremioAccount: ObservableObject {
 
     /// Move a token saved by an older build (UserDefaults) into the Keychain, once.
     private func migrateTokenToKeychain() {
+#if !VORTX_NATIVE_DATA_ENGINE
         guard authKey == nil,
               let legacy = UserDefaults.standard.string(forKey: tokenKey), !legacy.isEmpty else { return }
         Self.storeAuthKey(legacy, account: tokenKey)
         UserDefaults.standard.removeObject(forKey: tokenKey)
+#endif
     }
 
     func signIn(email rawEmail: String, password: String) async {
@@ -376,7 +378,7 @@ final class StremioAccount: ObservableObject {
                 try await CoreBridge.shared.authenticateNativeOwnAccount(token: key, target: nativeTarget)
                 guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
                 context = captureAuthOperationContext()
-            } else { Self.storeAuthKey(key, account: context.keychainAccount) }
+            } else { throw VortxNativeError.closed }
 #else
             Self.storeAuthKey(key, account: context.keychainAccount)
 #endif
@@ -413,7 +415,7 @@ final class StremioAccount: ObservableObject {
                 try await CoreBridge.shared.authenticateNativeOwnAccount(token: token, target: target)
                 guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
                 context = captureAuthOperationContext()
-            } else { Self.storeAuthKey(token, account: context.keychainAccount) }
+            } else { throw VortxNativeError.closed }
         } catch {
             guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
             signInError = "Account could not be connected. Your existing profile data is unchanged. Refresh the profile and retry."

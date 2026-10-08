@@ -427,17 +427,20 @@ final class ProfileStore: ObservableObject {
     /// The Keychain slot the rest of the app reads the session from right now. StremioAccount and
     /// CoreBridge resolve their token through this, so a profile switch re-points both at once.
     var activeKeychainAccount: String {
+#if VORTX_NATIVE_DATA_ENGINE
+        return active.map(keychainAccount(for:)) ?? "vortx.native.streaming.unavailable.no-profile"
+#else
         active.map(keychainAccount(for:)) ?? Self.primaryTokenAccount
+#endif
     }
 
     func keychainAccount(for profile: UserProfile) -> String {
 #if VORTX_NATIVE_DATA_ENGINE
-        if !profile.isOwner && profile.usesOwnAccount {
-            return CoreBridge.shared.nativeCredentialSlot(profileID: profile.id)
-                ?? "vortx.native.streaming.unavailable." + profile.id.uuidString
-        }
-#endif
+        return CoreBridge.shared.nativeCredentialSlot(profileID: profile.id)
+            ?? "vortx.native.streaming.unavailable." + profile.id.uuidString
+#else
         return Self.legacyKeychainAccount(for: profile)
+#endif
     }
     static func legacyKeychainAccount(for profile: UserProfile) -> String {
         // The owner IS the primary account: it always reads the primary slot, no matter what the
@@ -1436,6 +1439,9 @@ final class ProfileStore: ObservableObject {
     ///   3. Keeps the legacy two-way Stremio sync alive ONLY while the opt-in "also sync to Stremio" mirror
     ///      is on. By default the roster + overlays stay fresh through the VortX realtime syncDown / poll.
     func bootstrapSync() {
+#if VORTX_NATIVE_DATA_ENGINE
+        return // Native imports use authenticated account-qualified source receipts, never this legacy repair.
+#else
         guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
         Task { [weak self] in
             guard let self else { return }
@@ -1453,6 +1459,7 @@ final class ProfileStore: ObservableObject {
                 await MainActor.run { self.refreshWatchFromServer() }
             }
         }
+#endif
     }
 
     /// ONE-TIME migration of the legacy Stremio-datastore roster + per-profile overlay watch history into the
@@ -1779,6 +1786,9 @@ final class ProfileStore: ObservableObject {
     }
 
     private func schedulePushRoster() {
+#if VORTX_NATIVE_DATA_ENGINE
+        return // The native account carrier owns roster changes; never mirror via the global legacy token.
+#else
         pushRosterTask?.cancel()
         // VortX authoritative: a roster edit already arms a debounced VortX syncUp (the persist() UserDefaults
         // write fires the sync manager's observer), which carries the roster in doc.settings + doc.vortx.profiles.
@@ -1791,6 +1801,7 @@ final class ProfileStore: ObservableObject {
             guard !Task.isCancelled else { return }
             await ProfileSync.pushRoster(snapshot, authKey: key)
         }
+#endif
     }
 
     // MARK: Watch overlay (a non-owner profile's own history, synced through the account)

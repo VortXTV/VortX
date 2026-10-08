@@ -165,6 +165,48 @@ private actor OwnSourceRequests {
         check(secure[missing] == nil) // Never borrow an earlier same-UID token.
         check(try VortxNativeAccountCredentials.selectedSlot(scope: "account-A", profileID: profileID,
             binding: .object(["account": .object(["kind": .string("pending_own")])])) == nil)
+        let owner = UserProfile.ownerID
+        let ownerKey = try VortxNativeAccountCredentials.ownerSelectionKey(scope: "account-A", ownerProfileID: owner)
+        secure["stremiox.authKey"] = "unqualified-global-token"
+        check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: "account-A", ownerProfileID: owner, read: { secure[$0] }) == nil)
+        func connectOwner(_ token: String, _ uid: String, _ revision: String, _ expected: String?) throws -> String {
+            try VortxNativeAccountCredentials.connectOwner(token: token, scope: "account-A", ownerProfileID: owner,
+                verifiedUID: uid, revision: revision, expectedSelection: expected, authority: journalAuthority,
+                read: { secure[$0] }, write: { secure[$0] = $1; return true })
+        }
+        let ownerA = try connectOwner("owner-token-A", "owner-A", UUID().uuidString.lowercased(), nil)
+        let selectionA = secure[ownerKey]
+        let ownerB = try connectOwner("owner-token-B", "owner-B", UUID().uuidString.lowercased(), selectionA)
+        do { _ = try connectOwner("stale-owner", "owner-A", UUID().uuidString.lowercased(), selectionA); fatalError("stale owner selector won") }
+        catch VortxNativeError.superseded {}
+        check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: "account-A", ownerProfileID: owner, read: { secure[$0] }) == ownerB)
+        let ownerA2 = try connectOwner("owner-token-A2", "owner-A", UUID().uuidString.lowercased(), secure[ownerKey])
+        check(ownerA2 != ownerA && secure[ownerA] == "owner-token-A" && secure[ownerB] == "owner-token-B")
+        check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: "account-B", ownerProfileID: owner, read: { secure[$0] }) == nil)
+        check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: "account-A", ownerProfileID: UUID(), read: { secure[$0] }) == nil)
+        do {
+            let other = UUID()
+            _ = try VortxNativeAccountCredentials.selectedOwnerSlot(scope: "account-A", ownerProfileID: other, read: { _ in secure[ownerKey] })
+            fatalError("foreign owner selector accepted")
+        } catch VortxNativeError.invalidSnapshot {}
+        let beforeFailedOwner = secure[ownerKey]
+        do {
+            _ = try VortxNativeAccountCredentials.connectOwner(token: "failed-write", scope: "account-A", ownerProfileID: owner,
+                verifiedUID: "owner-C", revision: UUID().uuidString.lowercased(), expectedSelection: beforeFailedOwner,
+                authority: journalAuthority, read: { secure[$0] }, write: { _, _ in false })
+            fatalError("failed secure owner write accepted")
+        } catch VortxNativeError.unavailable {}
+        check(secure[ownerKey] == beforeFailedOwner && secure["stremiox.authKey"] == "unqualified-global-token")
+        do {
+            _ = try VortxNativeAccountCredentials.connectOwner(token: "inactive-candidate", scope: "account-A", ownerProfileID: owner,
+                verifiedUID: "owner-C", revision: UUID().uuidString.lowercased(), expectedSelection: beforeFailedOwner,
+                authority: journalAuthority, read: { secure[$0] }, write: { key, value in
+                    guard key != ownerKey else { return false }; secure[key] = value; return true
+                })
+            fatalError("failed selector publication accepted")
+        } catch VortxNativeError.unavailable {}
+        check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: "account-A", ownerProfileID: owner, read: { secure[$0] }) == ownerA2)
+        check(secure.values.contains("inactive-candidate")) // Secure orphan remains inactive and recoverable.
         VortxNativeOwnAccountProducer.invalidateContext()
         do { try credentiallessAuthority.withActive {}; fatalError("empty credential list ignored context retirement") }
         catch VortxNativeError.superseded {}
@@ -172,6 +214,10 @@ private actor OwnSourceRequests {
         do { _ = try stage("retired", "account-A", profileID, "uid-A", "retired"); fatalError("retired credential candidate staged") }
         catch VortxNativeError.superseded {}
         check(secure == beforeRetired)
+        do { _ = try connectOwner("retired-owner", "owner-A", UUID().uuidString.lowercased(), secure[ownerKey]); fatalError("retired owner login committed") }
+        catch VortxNativeError.superseded {}
+        check(secure == beforeRetired)
+        print("Native owner credentials: account/owner isolation, verified selector CAS, same-UID ABA, failed publication and no legacy token adoption passed")
         print("Own-account authenticated producer: hardened identity redirect rejection, exact raw source bytes, independent read-only requests, token ABA/profile retirement and failed-source nonempty semantics passed")
     }
 }

@@ -96,6 +96,10 @@ struct ProfilePickerView: View {
                     Text(error).font(Theme.Typography.label).foregroundStyle(.red)
                 }
 #if VORTX_NATIVE_DATA_ENGINE
+                if !account.isSignedIn, let active = store.active, active.isOwner || !active.usesOwnAccount {
+                    Text("Reconnect the owner's Stremio account for external refresh. Credentials from another VortX account are not reused; saved library and watch history remain available.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                }
                 if !nativeSync.nativeOwnAccountResyncUnavailable.isEmpty {
                     Text("Some profiles need to reconnect for external refresh. Their saved library and watch history remain available.")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)

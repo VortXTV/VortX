@@ -52,6 +52,23 @@ check(nativeIngress.contains("VortxProfileOverlayWitness.decodeObject(json: plai
       && syncSource.components(separatedBy: "Self.decodeDecryptedSyncDocument(pt)").count == 4,
       "all decrypted native pull paths reject original duplicate/unsafe numeric JSON before Foundation projection")
 let profileSource = source("SourcesShared/Profiles.swift")
+let nativeCredentialResolver = section(bridge, from: "func nativeCredentialSlot", until: "func nativeAccountMode")
+let ownerConnection = section(bridge, from: "private func authenticateNativeOwnerAccount", until: "private static func readNativeCredential")
+let profileCredentialResolver = section(profileSource, from: "var activeKeychainAccount", until: "static func legacyKeychainAccount")
+let legacyTokenMigration = section(accountSource, from: "private func migrateTokenToKeychain", until: "func signIn(email")
+check(nativeCredentialResolver.contains("selectedOwnerSlot(scope: capture.namespace, ownerProfileID: ownerID")
+      && nativeCredentialResolver.contains(".string(\"shared\")")
+      && !nativeCredentialResolver.contains("primaryTokenAccount")
+      && profileCredentialResolver.contains("vortx.native.streaming.unavailable.no-profile")
+      && profileCredentialResolver.contains("#else\n        return Self.legacyKeychainAccount")
+      && legacyTokenMigration.contains("#if !VORTX_NATIVE_DATA_ENGINE"),
+      "native owner/shared credentials never borrow global legacy primary or migrate unqualified defaults")
+check(appearsBefore("authenticatedIdentity(authKey: token)", "connectOwner(token: token", in: ownerConnection)
+      && ownerConnection.contains("expectedSelection: target.expectedOwnerSelection")
+      && ownerConnection.contains("generations: [generation]")
+      && ownerConnection.contains("nativePlaybackBinding(.native(target.binding))")
+      && !ownerConnection.contains("mutateProfiles"),
+      "owner reauthentication verifies UID and captured revision before secure CAS without changing native library authority")
 let autoAddSource = source("SourcesShared/LibraryAutoAdd.swift")
 let seed = section(bridge, from: "private func seedInitialState()", until: "/// Refresh the installed-addons")
 let refresh = section(bridge, from: "private func refreshAddons()", until: "/// Remove an installed addon")
