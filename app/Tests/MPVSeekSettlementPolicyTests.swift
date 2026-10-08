@@ -211,6 +211,104 @@ enum MPVSeekSettlementPolicyTests {
         check(newerEOF.current?.phase == .awaitingSeekEvent && newerEOF.current?.positionAfterSeek == nil,
               "unattributed SEEK and restart cannot mutate B's EOF intent")
         check(overlapping.needsNativeWitness, "settled but unattributed native state retains bounded diagnostics")
+        // Fresh vendor2 silent fixture: pause at0.417, accept80.125 then104.146 before
+        // dequeuing; mpv emits SEEK80, SEEK104, RESTART104.167 with pause preserved.
+        var doubleScrub = MPVSeekSettlementPolicy<Int>()
+        doubleScrub.reset(owner: 11)
+        let firstScrub = doubleScrub.beginIssue(owner: 11, seeking: false)!
+        doubleScrub.completeIssue(firstScrub, accepted: true)
+        let lastScrub = doubleScrub.beginIssue(owner: 11, seeking: true)!
+        doubleScrub.completeIssue(lastScrub, accepted: true)
+        doubleScrub.observeSeek(owner: 11)
+        doubleScrub.observeSeek(owner: 11)
+        doubleScrub.observeRestart(owner: 11, seeking: false)
+        let ambiguousScrub = doubleScrub.evidence(owner: 11, seeking: false)
+        check(ambiguousScrub.generation != lastScrub && !ambiguousScrub.attributed,
+              "two native SEEKs retain transport and command identities separately")
+        let wrongLanding = doubleScrub.evidenceForLatestCommand(owner: 11, generation: lastScrub,
+                                                               seeking: false, eofReached: false)!
+        check(wrongLanding.generation == lastScrub && !wrongLanding.settled,
+              "native refresh cannot retire active resume deadline or fabricate landing")
+        check(MPVResumeSeekRecoveryPolicy.target(
+            ticket: .init(owner: 11, generation: lastScrub, target: 104.146), activeOwner: 11,
+            evidence: wrongLanding, playbackRequested: true, nativePaused: false,
+            nativeSeeking: false, nativeEOF: false, confirmedPosition: 0.417,
+            landingTolerance: 5) == 104.146,
+              "two native SEEKs cannot strand the original104.146 recovery deadline")
+        for sample in [(80.125, false, false), (104.146, true, false), (104.146, false, true),
+                       (Double.nan, false, false), (-1.0, false, false)] {
+            check(doubleScrub.confirmDrainedRestart(owner: 11, commandGeneration: lastScrub,
+                target: 104.146, position: sample.0, seeking: sample.1, eofReached: sample.2) == nil,
+                  "wrong position, optimistic seek, EOF and invalid native sample cannot confirm")
+        }
+        check(doubleScrub.confirmDrainedRestart(owner: 12, commandGeneration: lastScrub,
+            target: 104.146, position: 104.167, seeking: false, eofReached: false) == nil,
+              "source mismatch cannot confirm drained restart")
+        check(doubleScrub.confirmDrainedRestart(owner: 11, commandGeneration: firstScrub,
+            target: 104.146, position: 104.167, seeking: false, eofReached: false) == nil,
+              "older command with even the same target cannot claim new native position")
+        check(doubleScrub.confirmDrainedRestart(owner: 11, commandGeneration: lastScrub,
+            target: 104.146, position: nil, seeking: false, eofReached: false) == nil
+            && doubleScrub.confirmDrainedRestart(owner: 11, commandGeneration: lastScrub,
+                target: 104.146, position: 104.167, seeking: nil, eofReached: false) == nil,
+              "unknown native position or seeking state does not qualify")
+        let confirmedScrub = doubleScrub.confirmDrainedRestart(owner: 11, commandGeneration: lastScrub,
+            target: 104.146, position: 104.167, seeking: false, eofReached: false)!
+        check(doubleScrub.evidence(owner: 11, seeking: false).attributed,
+              "drained native104.167 restart can confirm latest104.146 paused scrub")
+        check(!doubleScrub.acceptsAttributedEvent(ambiguousScrub, owner: 11),
+              "confirmation never launders an earlier ambiguous queued event")
+        check(doubleScrub.acceptsAttributedEvent(confirmedScrub, owner: 11)
+            && !doubleScrub.needsNativeWitness,
+              "independent drained witness resumes trusted positions without another seek")
+        let nextScrub = doubleScrub.beginIssue(owner: 11, seeking: false)!
+        doubleScrub.completeIssue(nextScrub, accepted: true)
+        check(!doubleScrub.accepts(confirmedScrub, owner: 11)
+            && doubleScrub.evidenceForLatestCommand(owner: 11, generation: lastScrub,
+                seeking: false, eofReached: false) == nil,
+              "new command retires both queued confirmation and original command deadline")
+        doubleScrub.reset(owner: nil)
+        check(doubleScrub.lastAcceptedCommandGeneration == nil,
+              "stop retires accepted command identity")
+        for target in [0.0, 0.05, 104.146] {
+            var burst = MPVSeekSettlementPolicy<Int>()
+            burst.reset(owner: 11)
+            var latest: UInt64 = 0
+            for index in 0..<3 {
+                latest = burst.beginIssue(owner: 11, seeking: index == 0 ? false : true)!
+                burst.completeIssue(latest, accepted: true)
+            }
+            for _ in 0..<3 { burst.observeSeek(owner: 11) }
+            check(burst.confirmDrainedRestart(owner: 11, commandGeneration: latest,
+                target: target, position: target, seeking: false, eofReached: false) == nil,
+                  "three native SEEKs without restart cannot authorize a drained position")
+            burst.observeRestart(owner: 11, seeking: false)
+            check(burst.confirmDrainedRestart(owner: 11, commandGeneration: latest,
+                target: target, position: target + 0.501, seeking: false, eofReached: false) == nil,
+                  "position outside half-second landing window remains ambiguous")
+            for invalidTarget in [Double.nan, Double.infinity, -1.0] {
+                check(burst.confirmDrainedRestart(owner: 11, commandGeneration: latest,
+                    target: invalidTarget, position: target, seeking: false, eofReached: false) == nil,
+                      "invalid requested target never authorizes drained confirmation")
+            }
+            let witness = burst.confirmDrainedRestart(owner: 11, commandGeneration: latest,
+                target: target, position: target, seeking: false, eofReached: false)!
+            check(witness.attributed && witness.settled,
+                  "three-seek burst settles latest destination including zero and near start")
+            var sameOwnerReset = burst
+            sameOwnerReset.reset(owner: 11)
+            check(!sameOwnerReset.accepts(witness, owner: 11)
+                && sameOwnerReset.evidenceForLatestCommand(owner: 11, generation: latest,
+                    seeking: false, eofReached: false) == nil,
+                  "same-owner reset still invalidates queued witness and command ticket")
+            burst.reset(owner: 12)
+            check(!burst.accepts(witness, owner: 11) && !burst.accepts(witness, owner: 12),
+                  "source replacement cannot adopt queued confirmed position from prior load")
+        }
+        check(source.contains("eventID == MPV_EVENT_NONE,")
+            && source.contains("self.seekSettlement.confirmDrainedRestart(")
+            && source.contains("seekSettlement.evidenceForLatestCommand("),
+              "production drain and deadline execute the tested native confirmation policy")
         check(source.contains("return seekSettlement.acceptsAttributedEvent(evidence, owner: owner)"),
               "production queued event fence uses the actual attributed policy")
 

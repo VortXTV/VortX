@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--probe", required=True, type=pathlib.Path)
     parser.add_argument("--media", required=True, type=pathlib.Path)
     parser.add_argument("--mode", choices=["range", "bounded206", "ignored-range"], default="range")
+    parser.add_argument("--scenario", choices=["playing", "paused", "overlap-paused"], default="playing")
     args = parser.parse_args()
     media = args.media.read_bytes()
     source = pathlib.Path("app/Sources/Player/MPVMetalViewController.swift").read_text()
@@ -71,11 +72,11 @@ def main():
     try:
         url = f"http://127.0.0.1:{server.server_port}/synthetic.mkv"
         expected = "expect-stalled" if args.mode == "ignored-range" else "expect-settled"
-        result = subprocess.run([str(args.probe.resolve()), url, options, expected], timeout=50)
+        result = subprocess.run([str(args.probe.resolve()), url, options, expected, args.scenario], timeout=50)
     finally:
         server.shutdown()
         server.server_close()
-    print(f"fixture mode={args.mode} requests={len(requests)} coldRange={any(r[0] > 0 for r in requests)} exit={result.returncode}")
+    print(f"fixture mode={args.mode} scenario={args.scenario} requests={len(requests)} coldRange={any(r[0] > 0 for r in requests)} exit={result.returncode}")
     return result.returncode if any(r[0] > 0 for r in requests) else 1
 
 

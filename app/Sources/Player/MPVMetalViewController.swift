@@ -3168,12 +3168,18 @@ final class MPVMetalViewController: PlatformViewController {
         loadTokenLock.lock()
         let owner = loadProvenance.callbackToken(requiresLoadedFile: true)
         guard owner == ticket.owner,
-              seekSettlement.current?.generation == ticket.generation else {
+              latestAcceptedAbsoluteSeek?.generation == ticket.generation else {
             loadTokenLock.unlock()
             return nil
         }
         let snapshot = nativeSeekSnapshot(handle: handle)
-        let evidence = seekSettlement.evidence(owner: ticket.owner, seeking: snapshot.seeking, eofReached: snapshot.eof)
+        guard let evidence = seekSettlement.evidenceForLatestCommand(
+            owner: ticket.owner, generation: ticket.generation,
+            seeking: snapshot.seeking, eofReached: snapshot.eof
+        ) else {
+            loadTokenLock.unlock()
+            return nil
+        }
         let target = MPVResumeSeekRecoveryPolicy.target(
             ticket: ticket, activeOwner: owner, evidence: evidence, playbackRequested: !requestedPauseIntent,
             nativePaused: snapshot.paused, nativeSeeking: snapshot.seeking, nativeEOF: snapshot.eof,
@@ -4452,12 +4458,42 @@ final class MPVMetalViewController: PlatformViewController {
                     ? self.diagnosticDouble(MPVProperty.timePos, handle: handle) : nil
                 let nativeSeekSnapshot = (eventID == MPV_EVENT_SEEK || eventID == MPV_EVENT_PLAYBACK_RESTART)
                     && self.seekSettlement.current != nil ? self.nativeSeekSnapshot(handle: handle) : nil
+                var drainedRestart: (PlayerLoadToken, Double, MPVSeekSettlementEvidence)?
+                if eventID == MPV_EVENT_NONE,
+                   self.seekSettlement.needsDrainedRestartConfirmation,
+                   let owner = rawSeekOwner, let ticket = self.latestAcceptedAbsoluteSeek,
+                   ticket.owner == owner {
+                    // An immutable queued event stays ambiguous. Only a fresh native read after
+                    // the drain can prove the latest absolute destination actually rendered.
+                    let snapshot = self.nativeSeekSnapshot(handle: handle)
+                    if let evidence = self.seekSettlement.confirmDrainedRestart(
+                        owner: owner, commandGeneration: ticket.generation, target: ticket.target,
+                        position: snapshot.position, seeking: snapshot.seeking, eofReached: snapshot.eof
+                    ), let position = snapshot.position {
+                        drainedRestart = (owner, position, evidence)
+                    }
+                }
                 self.loadTokenLock.unlock()
                 if let snapshot = nativeSeekSnapshot, let owner = rawSeekOwner, let evidence = rawSeekEvidence {
                     let kind = eventID == MPV_EVENT_SEEK ? "seek" : "restart"
                     DiagnosticsLog.log("playback", "seek-native event=\(kind) load=\(owner.hashValue) seek=\(evidence.generation) settled=\(evidence.settled) attributed=\(evidence.attributed) \(snapshot.receipt)")
                 }
                 if event?.pointee.event_id == MPV_EVENT_NONE {
+                    if let (owner, position, evidence) = drainedRestart {
+                        DiagnosticsLog.log("playback", "seek-native drained-restart load=\(owner.hashValue) seek=\(evidence.generation) position=\(position)")
+                        self.emit(MPVProperty.timePos,
+                                  PlayerTimePositionEvent(seconds: position, loadToken: owner,
+                                                          mpvSeekSettlement: evidence), loadToken: owner)
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self, self.activeLoadToken == owner,
+                                  self.acceptsSettledPosition(evidence, owner: owner) else { return }
+                            // This independent witness may complete a parked reopen whose earlier
+                            // untagged events were quarantined. Its original EOF ambiguity stays intact.
+                            _ = self.seekEOFRecovery.observeSeek(owner: owner)
+                            self.completeSeekEOFRecovery(loadToken: owner, position: position,
+                                                         settlement: evidence)
+                        }
+                    }
                     break
                 }
                 

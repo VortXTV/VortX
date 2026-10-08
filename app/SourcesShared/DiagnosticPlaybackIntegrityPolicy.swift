@@ -389,17 +389,19 @@ enum MPVResumeSeekRecoveryPolicy {
 
 /// The controller serializes command admission and raw event dequeue under one lock. Native events
 /// have no command ID: overlapping seeks can settle physically without proving command attribution.
-/// A subsequent command after that observed settlement establishes a fresh, unambiguous boundary.
+/// A subsequent command establishes a fresh boundary. A drained-queue native read at the latest
+/// absolute destination can also confirm landing without attributing any previously queued event.
 struct MPVSeekSettlementPolicy<Owner: Equatable> {
     enum Phase: Equatable { case awaitingSeek, seekObserved, settled }
     struct Attempt: Equatable {
         let owner: Owner
         let generation: UInt64
         var phase: Phase
-        let ambiguous: Bool
+        var ambiguous: Bool
     }
     private(set) var owner: Owner?
     private(set) var current: Attempt?
+    private(set) var lastAcceptedCommandGeneration: UInt64?
     private var nextGeneration: UInt64 = 0
     private var admission: Attempt?
 
@@ -415,6 +417,7 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
         self.owner = owner
         current = nil
         admission = nil
+        lastAcceptedCommandGeneration = nil
     }
 
     /// Register before mpv_command while raw dequeue is excluded by the controller's same lock.
@@ -433,7 +436,10 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
     mutating func completeIssue(_ generation: UInt64, accepted: Bool) {
         guard let candidate = admission, candidate.generation == generation else { return }
         admission = nil
-        if accepted { current = candidate }
+        if accepted {
+            current = candidate
+            lastAcceptedCommandGeneration = candidate.generation
+        }
     }
 
     mutating func observeSeek(owner: Owner) {
@@ -456,6 +462,28 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
         current = attempt
     }
 
+    /// Call only after MPV_EVENT_NONE, with fresh native properties sampled under the same
+    /// lock as command admission/dequeue. Two accepted scrubs may produce two SEEK events,
+    /// advancing the transport generation beyond the last command. Preserve both identities:
+    /// a later native refresh is not a new viewer command, and a later command invalidates this
+    /// witness even when its target happens to be equal. Optimistic seeking time-pos never qualifies.
+    mutating func confirmDrainedRestart(
+        owner: Owner, commandGeneration: UInt64, target: Double, position: Double?,
+        seeking: Bool?, eofReached: Bool?
+    ) -> MPVSeekSettlementEvidence? {
+        guard self.owner == owner, admission == nil,
+              lastAcceptedCommandGeneration == commandGeneration,
+              var attempt = current, attempt.owner == owner,
+              attempt.phase == .settled, attempt.ambiguous,
+              seeking == false, eofReached == false,
+              target.isFinite, target >= 0,
+              let position, position.isFinite, position >= 0,
+              abs(position - target) <= 0.5 else { return nil }
+        attempt.ambiguous = false
+        current = attempt
+        return evidence(owner: owner, seeking: seeking, eofReached: eofReached)
+    }
+
     func evidence(owner: Owner, seeking: Bool?, eofReached: Bool?) -> MPVSeekSettlementEvidence {
         MPVSeekSettlementEvidence(
             generation: current?.generation ?? nextGeneration,
@@ -475,8 +503,24 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
         evidence.attributed && accepts(evidence, owner: owner)
     }
 
+    /// Deadline authority belongs to the accepted command, while native refresh SEEKs have
+    /// their own transport generations. Preserve the command ticket across those refreshes;
+    /// only an accepted newer command/source/stop retires it. This never certifies landing.
+    func evidenceForLatestCommand(owner: Owner, generation: UInt64,
+                                  seeking: Bool?, eofReached: Bool?) -> MPVSeekSettlementEvidence? {
+        guard self.owner == owner, admission == nil,
+              lastAcceptedCommandGeneration == generation else { return nil }
+        let transport = evidence(owner: owner, seeking: seeking, eofReached: eofReached)
+        return .init(generation: generation, settled: transport.settled && transport.attributed,
+                     attributed: transport.attributed)
+    }
+
     var needsNativeWitness: Bool {
         current.map { $0.phase != .settled || $0.ambiguous } ?? false
+    }
+
+    var needsDrainedRestartConfirmation: Bool {
+        current.map { $0.phase == .settled && $0.ambiguous } ?? false
     }
 }
 
