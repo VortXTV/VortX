@@ -91,10 +91,10 @@ final class CoreBridge: ObservableObject {
     }
 
     @MainActor
-    func mergeNativeSyncDocument(_ remote: VortxJSON?, capture: CredentialScopeRegistry.Capture) async throws -> VortxJSON {
+    func mergeNativeSyncDocument(_ remote: VortxJSON?, capture: CredentialScopeRegistry.Capture, legacyMaterial: Data) async throws -> VortxJSON {
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
-        let document = try await facade.mergeSyncDocument(remote)
+        let document = try await facade.mergeSyncDocument(remote, legacyMaterial: legacyMaterial)
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
         return document

@@ -51,6 +51,14 @@ Unresolved source attribution (including own streaming accounts, ambiguous episo
 and unreflected dashboard edits) requires reconciliation. Offline authenticated-roster recovery remains
 a gate; the production opener still requires a freshly authenticated full roster.
 
+Every cold open, native-peer adoption and warm native pull/push reprojects the authenticated legacy
+material (including the pending-profile-edit completeness check). An existing/adopted runtime must
+already carry a matching `legacyImport` receipt; the kernel's idempotent importer verifies it on a
+detached candidate or inside the merge/checkpoint transaction. Changed old-client watch, membership
+or profile material fails closed before persistence. Unrelated unknown document preferences do not
+enter that projection. This does not reconcile mixed-client edits: even changed source roster clocks
+can require reconciliation, and native-only carriers without a migration receipt are not admitted.
+
 CoreBridge exposes awaited shutdown and generation-checked installation. Owner boundaries revoke
 both installed sessions and candidates still awaiting installation. Native mutations use the same
 FIFO as remote sync merges. The freshly pulled carrier is merged before exporting only `nativeSync`
@@ -58,6 +66,11 @@ at the top level of the existing encrypted account document; full host preferenc
 remain adjacent. Local acknowledged mutations schedule sync; read-only export/remote merge does not
 self-echo. Profile/configuration changes resolve the kernel's ordered `installed_addons` query and
 rebind the accepted own/shared registry automatically; no restart or raw-token import is involved.
+Native push returns the freshly pulled document plus `nativeSync` only; it does not rebuild legacy
+settings/roster/watch/addon/library carriers from native or global mirrors. Native pull does not replay
+legacy overlay/tombstone/profileEdit mutations after accepting the native transaction. Outbound host
+preference and provider-credential changes still need a separately versioned authority path; existing
+captured-key/provider restore helpers remain in place. This limitation remains a default-cutover gate.
 
 Apple compatibility currently covers board/search Load + LoadRange, default/specific Discover loads,
 metadata/episode streams, subtitles, default library reads, standard AddToLibrary/RemoveFromLibrary,
@@ -106,7 +119,8 @@ noncredential `hostDocument` fields, and explicit `excludedCredentialPaths`; it 
 into the kernel or exported as `nativeSync`. Original raw cloud documents remain unchanged in the
 existing encrypted transport. This archive is not advertised as a byte-identical raw backup.
 Known auth/token/password/API-key carriers, including nested settings `kcfallback.*`, are excluded.
-SettingsBackup JSON/base64/binary-plist and inspectable nested Data are inspected recursively without
+SettingsBackup JSON/base64/binary-plist, structured base64 strings under arbitrary preference keys,
+and inspectable nested Data are inspected recursively (with a depth bound) without
 dropping unrelated preference keys. Unknown credential-like carriers or opaque preference Data fail
 closed for reconciliation. Configured addon URL strings and ordinary library `key` fields retain
 their exact values. Existing encrypted bootstrap material survives every acknowledged rewrite.

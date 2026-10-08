@@ -143,7 +143,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         if closed || generations[field] != ticket { task.cancel() } else { tasks[field] = task }
         lock.unlock(); return true
     }
-    private func enqueueMutation(type: String, raw: String,
+    private func enqueueMutation(type: String, raw: String, legacyMaterial: Data? = nil,
                                  completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
         let predecessor = tasks["native_state"]
@@ -158,7 +158,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             var durableCommitted = false
             do {
                 try Task.checkCancellation()
-                _ = try await session.dispatch([raw], now: UInt64(Date().timeIntervalSince1970))
+                _ = try await session.dispatch([raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial)
                 durableCommitted = true
                 let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
                 let playback = try await session.playbackProjection()
@@ -201,12 +201,12 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// Merge the fresh authenticated remote carrier and export only the accepted CRDT document.
     /// This shares the exact FIFO with profile/progress intents; a stale read cannot overwrite a
     /// concurrent local change, and a failed merge/checkpoint never becomes an outgoing snapshot.
-    func mergeSyncDocument(_ remote: VortxJSON?) async throws -> VortxJSON {
+    func mergeSyncDocument(_ remote: VortxJSON?, legacyMaterial: Data? = nil) async throws -> VortxJSON {
         let action = remote.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) }
             ?? .object(["type": .string("get_state")])
         let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
         return try await withCheckedThrowingContinuation { continuation in
-            if !enqueueMutation(type: remote == nil ? "get_state" : "merge_native_sync", raw: raw,
+            if !enqueueMutation(type: remote == nil ? "get_state" : "merge_native_sync", raw: raw, legacyMaterial: legacyMaterial,
                                 completion: { continuation.resume(with: $0) }) {
                 continuation.resume(throwing: VortxNativeError.closed)
             }

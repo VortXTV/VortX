@@ -43,8 +43,21 @@ enum VortxNativeBootstrapArchive {
     private static func pointer(_ key: String) -> String {
         key.replacingOccurrences(of: "~", with: "~0").replacingOccurrences(of: "/", with: "~1")
     }
-    private static func sanitize(_ value: Any, path: String, exclusions: inout [String]) throws -> Any {
-        if let object = value as? [String: Any] {
+    private static func sanitize(_ value: Any, path: String, exclusions: inout [String], depth: Int = 0) throws -> Any {
+        guard depth <= 64 else { throw Failure.opaquePreference }
+        if var object = value as? [String: Any] {
+            // Backups may be nested under future preference keys, not just `settings`. Recognize
+            // their envelope by content and inspect the plist before traversing envelope metadata.
+            if object["format"] as? String == "vortx-backup" {
+                guard object["schema"] as? Int == 1,
+                      let payload = object["payloadBase64"] as? String, let bytes = Data(base64Encoded: payload),
+                      let domain = try PropertyListSerialization.propertyList(from: bytes, options: [], format: nil) as? [String: Any]
+                else { throw Failure.opaquePreference }
+                let safe = try sanitize(domain, path: path + "/payloadBase64", exclusions: &exclusions, depth: depth + 1)
+                guard let safe = safe as? [String: Any] else { throw Failure.malformed }
+                object["payloadBase64"] = try PropertyListSerialization.data(fromPropertyList: safe, format: .binary, options: 0).base64EncodedString()
+                object["keyCount"] = safe.count
+            }
             var result: [String: Any] = [:]
             for key in object.keys.sorted() {
                 let child = path + "/" + pointer(key)
@@ -61,52 +74,68 @@ enum VortxNativeBootstrapArchive {
                     throw Failure.ambiguousCredentialCarrier
                 }
                 if key == "settings", let encoded = object[key] as? String {
-                    result[key] = try settings(encoded, path: child, exclusions: &exclusions)
-                } else { result[key] = try sanitize(object[key]!, path: child, exclusions: &exclusions) }
+                    result[key] = try settings(encoded, path: child, exclusions: &exclusions, depth: depth + 1)
+                } else { result[key] = try sanitize(object[key]!, path: child, exclusions: &exclusions, depth: depth + 1) }
             }
             return result
         }
         if let array = value as? [Any] {
-            return try array.enumerated().map { try sanitize($0.element, path: path + "/" + String($0.offset), exclusions: &exclusions) }
+            return try array.enumerated().map { try sanitize($0.element, path: path + "/" + String($0.offset), exclusions: &exclusions, depth: depth + 1) }
         }
         if let data = value as? Data {
             // Preference Data is frequently JSON (full roster/playback fields) or a plist. Inspect
             // both, preserving its Data type. Unknown binary payloads require reconciliation.
             if let object = try? JSONSerialization.jsonObject(with: data) {
-                let safe = try sanitize(object, path: path, exclusions: &exclusions)
+                let safe = try sanitize(object, path: path, exclusions: &exclusions, depth: depth + 1)
                 return try JSONSerialization.data(withJSONObject: safe, options: [.sortedKeys, .withoutEscapingSlashes])
             }
             var format = PropertyListSerialization.PropertyListFormat.binary
             if let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: &format) {
-                return try PropertyListSerialization.data(fromPropertyList: sanitize(object, path: path, exclusions: &exclusions), format: format, options: 0)
+                return try PropertyListSerialization.data(fromPropertyList: sanitize(object, path: path, exclusions: &exclusions, depth: depth + 1), format: format, options: 0)
             }
             throw Failure.opaquePreference
         }
         if let text = value as? String, let nested = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
            nested is [String: Any] || nested is [Any] {
             let prior = exclusions.count
-            let safe = try sanitize(nested, path: path, exclusions: &exclusions)
+            let safe = try sanitize(nested, path: path, exclusions: &exclusions, depth: depth + 1)
             // Keep the original noncredential string byte-for-byte unless actual exclusions were
             // necessary. A structured string must not hide credentials from the recursive policy.
             if exclusions.count == prior { return text }
             return String(decoding: try JSONSerialization.data(withJSONObject: safe, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)
         }
+        if let text = value as? String, let bytes = Data(base64Encoded: text) {
+            // Inspect recognizable base64 JSON/plist containers wherever they occur. Ordinary
+            // strings (including configured URLs) remain exact, and encoding stays base64.
+            let prior = exclusions.count
+            if let nested = try? JSONSerialization.jsonObject(with: bytes, options: [.fragmentsAllowed]),
+               nested is [String: Any] || nested is [Any] || nested is String {
+                let safe = try sanitize(nested, path: path, exclusions: &exclusions, depth: depth + 1)
+                if exclusions.count == prior { return text }
+                return try JSONSerialization.data(withJSONObject: safe, options: [.sortedKeys, .withoutEscapingSlashes, .fragmentsAllowed]).base64EncodedString()
+            }
+            var format = PropertyListSerialization.PropertyListFormat.binary
+            if let nested = try? PropertyListSerialization.propertyList(from: bytes, options: [], format: &format) {
+                let safe = try sanitize(nested, path: path, exclusions: &exclusions, depth: depth + 1)
+                if exclusions.count == prior { return text }
+                return try PropertyListSerialization.data(fromPropertyList: safe, format: format, options: 0).base64EncodedString()
+            }
+            if structuredPrefix(bytes) { throw Failure.opaquePreference }
+        }
+        if let text = value as? String, structuredPrefix(Data(text.utf8)) { throw Failure.opaquePreference }
         guard value is String || value is NSNumber || value is NSNull || value is Date else { throw Failure.malformed }
         return value
     }
-    private static func settings(_ encoded: String, path: String, exclusions: inout [String]) throws -> String {
+    private static func structuredPrefix(_ bytes: Data) -> Bool {
+        let prefix = String(decoding: bytes.prefix(32), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return ["{", "[", "bplist", "<?xml", "<!DOCTYPE", "<plist"].contains(where: prefix.hasPrefix)
+    }
+    private static func settings(_ encoded: String, path: String, exclusions: inout [String], depth: Int) throws -> String {
         guard let bytes = Data(base64Encoded: encoded),
-              var envelope = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
-              envelope["format"] as? String == "vortx-backup", envelope["schema"] as? Int == 1,
-              let payload = envelope["payloadBase64"] as? String, let plist = Data(base64Encoded: payload),
-              let domain = try PropertyListSerialization.propertyList(from: plist, options: [], format: nil) as? [String: Any]
+              let envelope = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              envelope["format"] as? String == "vortx-backup"
         else { throw Failure.opaquePreference }
-        let safe = try sanitize(domain, path: path + "/payloadBase64", exclusions: &exclusions)
-        guard let domain = safe as? [String: Any] else { throw Failure.malformed }
-        envelope["payloadBase64"] = try PropertyListSerialization.data(fromPropertyList: domain, format: .binary, options: 0).base64EncodedString()
-        envelope["keyCount"] = domain.count
-        // Inspect envelope metadata too; its payload is already inspected and no longer opaque.
-        let safeEnvelope = try sanitize(envelope, path: path, exclusions: &exclusions)
+        let safeEnvelope = try sanitize(envelope, path: path, exclusions: &exclusions, depth: depth + 1)
         return try JSONSerialization.data(withJSONObject: safeEnvelope, options: [.sortedKeys, .withoutEscapingSlashes]).base64EncodedString()
     }
 }

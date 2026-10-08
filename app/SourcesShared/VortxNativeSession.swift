@@ -245,6 +245,35 @@ actor VortxNativeSession {
         let result = try runtime.dispatch(action, now: UInt64(Date().timeIntervalSince1970))
         guard try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))["ok"] == .bool(true) else { throw VortxNativeError.invalidResponse }
     }
+    /// One-time migration is not ongoing old-client reconciliation. Before any durable reopen or
+    /// native-carrier adoption, replay the freshly extracted legacy material against a detached
+    /// candidate. The kernel's own receipt canonicalization accepts identical material after native
+    /// edits and rejects changed legacy intent. Never seed a missing receipt on an existing account.
+    nonisolated static func validateLegacyCompatibility(scope: VortxAccountScope, ownerName: String,
+                                                        snapshot: String?, nativeSync: VortxJSON?, material: Data,
+                                                        abi: any VortxRuntimeABI) throws {
+        try scope.validate()
+        let candidate: VortxNativeRuntime
+        if let snapshot {
+            _ = try scope.validateSnapshot(snapshot)
+            candidate = try VortxNativeRuntime(abi: abi, snapshot: snapshot)
+        } else { candidate = try VortxNativeRuntime(abi: abi, ownerID: scope.ownerProfileID, ownerName: ownerName) }
+        defer { candidate.close() }
+        try bind(candidate, scope: scope)
+        if let nativeSync {
+            let action: VortxJSON = .object(["type": .string("merge_native_sync"), "document": nativeSync])
+            try apply(candidate, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
+        }
+        try validateLegacyReceipt(candidate, scope: scope, material: material)
+    }
+    private static func validateLegacyReceipt(_ candidate: VortxNativeRuntime, scope: VortxAccountScope, material: Data) throws {
+        let state = try scope.validateSnapshot(candidate.stateJSON())
+        guard state["nativeSync"]?["legacyImport"]?["schemaVersion"] == .integer(1) else { throw VortxNativeError.invalidSnapshot }
+        let replay: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account),
+                                       "ownerProfileId": .string(scope.ownerProfileID),
+                                       "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
+        try apply(candidate, action: String(decoding: JSONEncoder().encode(replay), as: UTF8.self))
+    }
     func close() {
         revoke(); closed = true; invalidateScreens(); runtime.close(); writer.release()
     }
@@ -305,7 +334,7 @@ actor VortxNativeSession {
         }
     }
     /// Native action wire only; full Stremio Ctx/player action compatibility is still an explicit gate.
-    @discardableResult func dispatch(_ actions: [String], now: UInt64) throws -> [String] {
+    @discardableResult func dispatch(_ actions: [String], now: UInt64, legacyMaterial: Data? = nil) throws -> [String] {
         guard !closed else { throw VortxNativeError.closed }
         guard !persistenceFailed else { throw VortxNativeError.checkpointUncertain }
         let old = try stateJSON()
@@ -320,6 +349,7 @@ actor VortxNativeSession {
             guard value["ok"] == .bool(true) else { throw VortxNativeError.invalidResponse }
             results.append(result)
         }
+        if let legacyMaterial { try Self.validateLegacyReceipt(candidate, scope: scope, material: legacyMaterial) }
         let updated = try candidate.stateJSON()
         let state = try scope.validateSnapshot(updated)
         do { try lease.withActive { try store.commit(updated, scope: scope) } }

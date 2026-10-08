@@ -158,6 +158,31 @@ import CryptoKit
         check(stateObject["roster"]?["profiles"]?[owner.id.uuidString]?["pin"] == .string(owner.pin!))
         check(stateObject["nativeSync"]?["legacyImport"]?["schemaVersion"] == .integer(1))
         check(stateObject["libraries"]?[child.id.uuidString]?["items"] == .array([]))
+        let remoteCarrier = stateObject["nativeSync"]!
+        try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
+                                                          nativeSync: nil, material: material, abi: VortxCABI())
+        try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
+                                                          nativeSync: remoteCarrier, material: material, abi: VortxCABI())
+        let localCandidate = try VortxNativeRuntime(abi: VortxCABI(), snapshot: migrationState)
+        _ = try localCandidate.dispatch(#"{"type":"mark_watched","metaId":"new-native-movie","name":"New native movie","metadata":{"type":"movie"}}"#, now: 1720000010)
+        try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: localCandidate.stateJSON(),
+                                                          nativeSync: nil, material: material, abi: VortxCABI())
+        localCandidate.close()
+        if case .object(var noReceipt) = remoteCarrier {
+            noReceipt.removeValue(forKey: "legacyImport")
+            do { try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
+                                                                   nativeSync: .object(noReceipt), material: material, abi: VortxCABI()); fatalError("missing peer import receipt silently seeded") }
+            catch VortxNativeError.invalidSnapshot {}
+        }
+        var harmlessSource = source; harmlessSource["futureTheme"] = ["color": "blue", "unknown": true]
+        let harmlessMaterial = try VortxLegacyBootstrapMaterial.encode(document: JSONSerialization.data(withJSONObject: harmlessSource), roster: [owner, child], ownerProfileID: owner.id, rosterModifiedSeconds: 1720000000.1234)
+        check(try JSONDecoder().decode(VortxJSON.self, from: harmlessMaterial) == JSONDecoder().decode(VortxJSON.self, from: material))
+        try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
+                                                          nativeSync: remoteCarrier, material: harmlessMaterial, abi: VortxCABI())
+        var pendingSource = source; pendingSource["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(remoteCarrier))
+        pendingSource["profileEdits"] = ["editedAt": 1720000100000.5, "roster": [["id": owner.id.uuidString, "name": "Pending web rename"]]]
+        do { _ = try VortxLegacyBootstrapMaterial.encode(document: JSONSerialization.data(withJSONObject: pendingSource), roster: [owner, child], ownerProfileID: owner.id, rosterModifiedSeconds: 1720000000.1234); fatalError("native carrier bypassed pending web edits") }
+        catch is VortxLegacyBootstrapMaterial.ReconciliationRequired {}
         _ = try await migrated.dispatch([rawImport], now: 10)
         check(try await migrated.stateJSON() == migrationState) // exact replay cannot change imported clocks
         var different = try JSONSerialization.jsonObject(with: Data(rawImport.utf8)) as! [String: Any]
@@ -165,6 +190,21 @@ import CryptoKit
         different["material"] = changedMaterial
         do { _ = try await migrated.dispatch([String(decoding: JSONSerialization.data(withJSONObject: different), as: UTF8.self)], now: 11); fatalError("different legacy material replaced native authority") }
         catch VortxNativeError.invalidResponse {}
+        check(try migrationStore.read(scope: legacyScope) == migrationState)
+        let changedBytes = try JSONSerialization.data(withJSONObject: changedMaterial)
+        for remote in [nil, remoteCarrier] {
+            do { try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: migrationState,
+                                                                   nativeSync: remote, material: changedBytes, abi: VortxCABI()); fatalError("changed legacy material silently mounted") }
+            catch VortxNativeError.invalidResponse {}
+        }
+        do { try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
+                                                               nativeSync: remoteCarrier, material: changedBytes, abi: VortxCABI()); fatalError("incompatible native peer adopted") }
+        catch VortxNativeError.invalidResponse {}
+        let merge = String(decoding: try JSONEncoder().encode(VortxJSON.object(["type": .string("merge_native_sync"), "document": remoteCarrier])), as: UTF8.self)
+        do { _ = try await migrated.dispatch([merge], now: 12, legacyMaterial: changedBytes); fatalError("warm sync committed incompatible legacy source") }
+        catch VortxNativeError.invalidResponse {}
+        check(try migrationStore.read(scope: legacyScope) == migrationState)
+        _ = try await migrated.dispatch([merge], now: 13, legacyMaterial: material)
         check(try migrationStore.read(scope: legacyScope) == migrationState)
         await migrated.close()
         let migratedCold = try VortxNativeSession(scope: legacyScope, ownerName: "Owner", abi: VortxCABI(), store: migrationStore, transport: VortxCResourceTransport())
