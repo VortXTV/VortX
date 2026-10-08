@@ -46,7 +46,7 @@ elif [[ "$platform" == android ]]; then
     expected=(nativeInitRuntime nativeInitFromStateJson nativeDispatchJson nativeResolveJson nativeGetStateJson nativeGetStateDeltaJson nativeEngineFree)
     [[ "$mode" != resource-host ]] || expected+=(nativeResourceHostAbiVersion nativeResourceHostNew nativeResourceHostLoadJson nativeResourceHostFree nativeCancelNew nativeCancelCancel nativeCancelFree)
     for symbol in "${expected[@]}"; do
-        awk -v wanted="Java_com_vortx_android_engine_VortxCore_$symbol" '$7 != "UND" && $8 == wanted { found=1 } END { exit !found }' <<< "$exports" || {
+        awk -v wanted="Java_com_vortx_android_engine_VortxCore_$symbol" '$4 == "FUNC" && ($5 == "GLOBAL" || $5 == "WEAK") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $7 ~ /^[0-9]+$/ && $7 > 0 && $8 == wanted { found=1 } END { exit !found }' <<< "$exports" || {
             echo "missing JNI export $symbol: $artifact" >&2; exit 1;
         }
     done

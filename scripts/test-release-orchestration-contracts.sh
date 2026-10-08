@@ -64,7 +64,37 @@ for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
     [[ -z "$engine_pin" || "$engine_pin" = "$pin" ]] || fail "Apple/Android wrapper pins differ"
     engine_pin="$pin"
 done
+candidate_signing_step="$(awk '/name: Verify signed release artifacts against the pinned production signer/{active=1; next}
+    active && /^[[:space:]]+- name:/{exit} active{print}' "$ANDROID_CI_WF")"
+require_grep "signed candidate APK and AAB both verify complete engine ABIs" \
+    'bash scripts/verify-native-android-artifacts.sh "\$\{apks\[@\]\}" "\$\{bundles\[@\]\}"' \
+    <(printf '%s\n' "$candidate_signing_step")
 ok "Apple and both Android lanes use one exact wrapper revision"
+native_pin=""
+for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
+    pin="$(awk '/repository: VortXTV\/vortx-core/{active=1; next}
+        active && /^[[:space:]]+ref:/{print $2; exit}' "$wf")"
+    [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || fail "$(basename "$wf") native engine pin must be immutable"
+    [[ -z "$native_pin" || "$native_pin" = "$pin" ]] || fail "Apple/Android native engine pins differ"
+    native_pin="$pin"
+done
+ok "Apple and both Android lanes use one exact native engine revision"
+require_grep "Apple builds the native resource host" \
+    'run: ./scripts/build-ffi-xcframework.sh --resource-host$' "$APPLE_RELEASE_WF"
+require_grep "Apple verifies resource and state ABI on warm and cold builds" \
+    'run: ./scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework resource-host$' "$APPLE_RELEASE_WF"
+require_grep "Mac server is built from the same pinned private workspace" \
+    'run: ./scripts/build-mac-server.sh$' "$APPLE_RELEASE_WF"
+for wf in "$ANDROID_CI_WF" "$RELEASE_WF"; do
+    # Every engine-required Gradle invocation, including the separately signed
+    # build, must select the same resource-host feature set.
+    awk '/VORTX_REQUIRE_ENGINE: "1"/ { required++; waiting=1; next }
+         waiting { if ($0 !~ /VORTX_NATIVE_RESOURCE_HOST: "1"/) exit 1; enabled++; waiting=0 }
+         END { if (!required || required != enabled || waiting) exit 1 }' "$wf" ||
+        fail "$(basename "$wf") has an engine build without the resource host"
+    require_grep "$(basename "$wf") inspects the complete packaged native ABI" \
+        'verify-native-engine-abi.sh android .* resource-host' "$wf"
+done
 require_grep "Android quality analysis uses the NDK-aware traced build" \
     'queries: \./\.github/codeql/java-quality\.qls' "$CODEQL_WF"
 require_grep "Android quality suite retains GitHub's maintained selector" \

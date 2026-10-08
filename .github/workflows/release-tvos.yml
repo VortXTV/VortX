@@ -154,7 +154,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: df6b8f5a200dc9ad2c23ad823ebcf97ba1b9b602
+          ref: b6de6b861247ab10e304d6686d95660c887c441e
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -168,7 +168,7 @@ jobs:
           test -f core/Cargo.toml       || { echo "::error::stremiox-core crate missing after checkout (core/Cargo.toml)"; exit 1; }
           test -f vortx-core/Cargo.toml || { echo "::error::vortx-core engine workspace missing after promote (vortx-core/Cargo.toml)"; exit 1; }
           test -d vortx-core/crates     || { echo "::error::vortx-core engine crates/ missing after promote (vortx-core/crates)"; exit 1; }
-          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@df6b8f5 (promoted from monorepo subdir)"
+          echo "engines fetched: core@$(git -C core rev-parse --short HEAD) vortx-core@b6de6b8 (promoted from monorepo subdir)"
 
       - name: Select the newest Xcode on the runner
         run: |
@@ -368,13 +368,24 @@ jobs:
           path: |
             app/Vendor/VortxEngine.xcframework
             app/Vendor/engine-prelocalize/VortxEngine
-          key: vortx-ffi-xcframework-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh') }}
+          key: vortx-ffi-resource-host-v1-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh', 'scripts/verify-native-engine-abi.sh') }}
 
       - name: Build the vortx-ffi xcframework
         if: steps.cache-ffi-xcframework.outputs.cache-hit != 'true'
         env:
           VORTX_ENGINE_DIR: vortx-core
-        run: ./scripts/build-ffi-xcframework.sh
+        run: ./scripts/build-ffi-xcframework.sh --resource-host
+
+      # Check cold builds AND restored artifacts: a nonempty archive alone does
+      # not prove the state-import, delta, cancellation, and resource APIs exist.
+      - name: Verify complete native engine ABI
+        run: ./scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework resource-host
+
+      - name: Build native macOS streaming server from the same pin
+        if: inputs.tvos_test_only != true
+        env:
+          VORTX_ENGINE_DIR: vortx-core
+        run: ./scripts/build-mac-server.sh
 
       # Fail closed if either engine xcframework OR its retained pre-localization archives would
       # reintroduce the newer-minOS or missing-OSO warning families this repair removed. Runs
