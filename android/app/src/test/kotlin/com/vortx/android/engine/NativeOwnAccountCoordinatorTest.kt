@@ -12,6 +12,9 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
 import org.json.JSONArray
 import org.json.JSONObject
@@ -231,5 +234,68 @@ class NativeOwnAccountCoordinatorTest {
             access.save(access.read().profiles.single { it.id == child.id }.copy(name = "Remote update"), false)
             assertEquals("Remote update", model.state.value.profiles.single { it.id == child.id }.name)
         } finally { models.clear(); accounts.retire(); Dispatchers.resetMain() }
+    }
+
+    private fun ownerDocument() = document().also { it.getJSONObject("vortx")
+        .put("roster", JSONArray().put(owner.encode())).remove("byProfile") }
+
+    @Test fun `optional owner auth uses verified credentials not VortX login and does not mutate native data`() = runBlocking {
+        val store = Store(); val requests = mutableListOf<String>(); val journal = Journal()
+        val accounts = coordinator(store, journal, after = { requests += it })
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            assertTrue(accounts.applyDocument(account, ownerDocument()) { true })
+            val before = store.value
+            val auth = NativeStreamingAuthRepository(accounts, scope)
+            auth.refresh()
+            assertEquals(com.vortx.android.model.AuthState.SignedOut, auth.authState.value)
+            assertTrue(auth.management.value.canManage)
+            assertTrue(auth.signInForRevision("fake@example.invalid", "fake-password", auth.management.value.revision).isSuccess)
+            assertEquals(com.vortx.android.model.AuthState.SignedIn(null, uid), auth.authState.value)
+            assertEquals(listOf("login", "getUser"), requests) // Connection is not a hidden library import.
+            assertEquals(before, store.value)
+            auth.signOutForRevision(auth.management.value.revision)
+            assertEquals(com.vortx.android.model.AuthState.SignedOut, auth.authState.value)
+            assertEquals(before, store.value)
+            assertEquals(owner.id, accounts.session().read().owner.profileID)
+        } finally { scope.cancel(); accounts.retire() }
+    }
+
+    @Test fun `shared child cannot manage owner credential and old UI revision cannot survive profile ABA`() = runBlocking {
+        val accounts = coordinator(Store(), Journal()); val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            assertTrue(accounts.applyDocument(account, ownerDocument()) { true })
+            val access = NativeProfileAccess { accounts.session() }
+            access.save(child.copy(usesOwnAccount = false), true)
+            val auth = NativeStreamingAuthRepository(accounts, scope); auth.refresh()
+            assertTrue(auth.signIn("fake@example.invalid", "fake-password").isSuccess)
+            val old = auth.management.value.revision
+            access.select(child.id); auth.refresh()
+            assertEquals(com.vortx.android.model.AuthState.SignedIn(null, uid), auth.authState.value)
+            assertFalse(auth.management.value.canManage)
+            assertTrue(auth.signInForRevision("fake@example.invalid", "fake-password", auth.management.value.revision).isFailure)
+            assertTrue(runCatching { auth.signOutForRevision(auth.management.value.revision) }.isFailure)
+            access.select(owner.id); auth.refresh()
+            assertTrue(auth.management.value.canManage)
+            assertTrue(runCatching { auth.signOutForRevision(old) }.isFailure)
+            assertEquals(com.vortx.android.model.AuthState.SignedIn(null, uid), auth.authState.value)
+        } finally { scope.cancel(); accounts.retire() }
+    }
+
+    @Test fun `retirement after owner UID response leaves staged token inactive and never clears native account`() = runBlocking {
+        val journal = Journal(); val store = Store(); lateinit var accounts: NativeAccountCoordinator
+        accounts = coordinator(store, journal, after = { if (it == "getUser") accounts.retire() })
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        try {
+            assertTrue(accounts.applyDocument(account, ownerDocument()) { true })
+            val before = store.value
+            val auth = NativeStreamingAuthRepository(accounts, scope); auth.refresh()
+            assertTrue(auth.signIn("fake@example.invalid", "fake-password").isFailure)
+            assertEquals(before, store.value)
+            assertTrue(journal.values.keys.none { it.startsWith("owner-selection.") })
+            assertEquals(com.vortx.android.model.AuthState.SignedOut, auth.authState.value)
+            assertTrue(accounts.reopenCheckpoint(account) { true })
+            auth.refresh(); assertEquals(com.vortx.android.model.AuthState.SignedOut, auth.authState.value)
+        } finally { scope.cancel(); accounts.retire() }
     }
 }

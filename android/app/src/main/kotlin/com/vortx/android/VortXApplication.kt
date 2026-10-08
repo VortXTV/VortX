@@ -115,13 +115,11 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         { close -> applicationScope.launch { close() }; Unit },
         { withContext(Dispatchers.Main) {
             ProfileStore.sharedOrNull()?.attachNativeGateway(nativeProfiles)
-            syncManager?.account?.value?.let { nativeRepository.publishAuthentication(com.vortx.android.model.AuthState.SignedIn(it.email, it.id)) }
         } },
         { applicationScope.launch { syncManager?.onLocalOwnerLibraryChanged() }; Unit },
         { applicationScope.launch(Dispatchers.Main) {
             if (runCatching { nativeAccounts.session() }.isFailure) {
                 ProfileStore.sharedOrNull()?.clearNativeProjection()
-                nativeRepository.publishAuthentication(com.vortx.android.model.AuthState.SignedOut)
             }
         }; Unit },
         ownCredentials = com.vortx.android.engine.NativeOwnAccountCredentials.shared(this),
@@ -137,6 +135,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         return nativeAccounts
     }
     private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess { nativeAccounts.session() } }
+    private val nativeStreamingAuth by lazy { com.vortx.android.engine.NativeStreamingAuthRepository(nativeAccounts, applicationScope) }
     private val nativeRepository: NativeCatalogRepository by lazy { NativeCatalogRepository(AndroidNativePlaybackResolver(this), nativeAccounts.changes.map { Unit },
         { check(syncManager?.signOut() == true) { "Account sign-out could not be stored securely" } },
         captureReclaimAdmission = { session, owner ->
@@ -391,7 +390,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// The one [AuthRepository] the whole app shares -- the SAME underlying engine instance as
     /// [catalogRepository] when the engine is up (one repository class implements both contracts), so
     /// a sign-in immediately shows up in every catalog call that reads `ctx`-derived state.
-    val authRepository: AuthRepository get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeRepository else accountConnectedEngine() ?: fallbackAuthRepository
+    val authRepository: AuthRepository get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeStreamingAuth else accountConnectedEngine() ?: fallbackAuthRepository
 
     /** Keep initialization lazy; attach the real engine only when a normal app consumer requests it. */
     private fun accountConnectedEngine(): EngineStremioRepository? = engine?.also { repository ->

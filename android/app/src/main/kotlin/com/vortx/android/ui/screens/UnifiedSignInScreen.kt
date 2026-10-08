@@ -65,8 +65,9 @@ fun UnifiedSignInScreen(
 
             SectionHeader(
                 title = "Stremio",
-                subtitle = "Optional. Sign in to import your Stremio library and add-ons. VortX stays your " +
-                    "primary account.",
+                subtitle = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+                    "Optional. Connect a verified Stremio account from Main. Connecting does not replace your native library or profile identity."
+                else "Optional. Sign in to import your Stremio library and add-ons. VortX stays your primary account.",
             )
             AccountContent(stremioViewModel)
         }

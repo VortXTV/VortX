@@ -10,6 +10,9 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
@@ -41,7 +44,64 @@ internal class NativeAccountCoordinator(
     internal data class StreamingProfile(val profile: UserProfile, val pendingImport: Boolean, val pendingOverlay: Boolean)
     internal class StreamingTarget internal constructor(internal val account: SessionOwnerSnapshot.Account,
         val profile: UserProfile, internal val session: VortxNativeSession?, internal val owner: VortxNativeOwner?, internal val pendingID: UUID?)
+    internal class OwnerAuthTarget internal constructor(internal val account: SessionOwnerSnapshot.Account,
+        internal val session: VortxNativeSession, internal val owner: VortxNativeOwner,
+        internal val selection: NativeOwnAccountCredentials.OwnerSelection, val hasCredential: Boolean) {
+        val canManage get() = owner.profileID == owner.scope.ownerProfileID
+        val verifiedUID get() = selection.verifiedUID.takeIf { hasCredential }
+        fun matches(other: OwnerAuthTarget) = account == other.account && session === other.session && owner == other.owner &&
+            selection.raw == other.selection.raw && hasCredential == other.hasCredential
+    }
     val changes = MutableStateFlow(0L)
+
+    /** Optional owner credentials are not VortX login state and never relabel the native owner. */
+    fun ownerAuthTarget(): OwnerAuthTarget {
+        val current = checkNotNull(mounted.get()) { "Open the authenticated native account first" }
+        val read = current.session.read()
+        val credentials = checkNotNull(ownCredentials)
+        val admission = checkNotNull(captureOwnAccountAdmission(current.account))
+        return current.session.owned(read.owner) {
+            val selection = credentials.ownerSelection(current.account, read.owner.scope.ownerProfileID, admission)
+            val capture = credentials.captureOwner(current.account, selection, admission)
+            check(withMountedSession(current.session, current.account) { true }) { "Native account changed" }
+            OwnerAuthTarget(current.account, current.session, read.owner, selection, capture != null)
+        }
+    }
+    fun <T> withOwnerAuthTarget(target: OwnerAuthTarget, action: () -> T): T = target.session.owned(target.owner) {
+        check(ownerAuthTarget().matches(target)) { "Owner streaming account changed" }
+        var result: Result<T>? = null
+        check(withProfileMutation(target.session, target.account) { result = runCatching(action); true }) { "Native account changed" }
+        requireNotNull(result).getOrThrow()
+    }
+    suspend fun signInOwner(target: OwnerAuthTarget, email: String, password: String) {
+        val operationJob = currentCoroutineContext()[Job]
+        require(target.canManage) { "Open Main and unlock its PIN to manage this account" }
+        val credentials = checkNotNull(ownCredentials)
+        val admission = checkNotNull(captureOwnAccountAdmission(target.account))
+        target.session.owned(target.owner) {
+            check(withMountedSession(target.session, target.account) { true }) { "Native account changed" }
+        }
+        val candidate = ownProducer.signIn(credentials, target.account, target.owner.scope.ownerProfileID,
+            email, password, admission, "owner:${UUID.randomUUID()}")
+        try {
+            target.session.owned(target.owner) {
+                credentials.selectOwner(target.account, target.selection, candidate) { action ->
+                    withMountedSession(target.session, target.account) { operationJob?.ensureActive(); action() }
+                }
+            }
+        } finally { changes.value += 1 }
+    }
+    fun signOutOwner(target: OwnerAuthTarget) {
+        require(target.canManage) { "Open Main and unlock its PIN to manage this account" }
+        val admission = checkNotNull(captureOwnAccountAdmission(target.account))
+        try {
+            target.session.owned(target.owner) {
+                checkNotNull(ownCredentials).clearOwner(target.account, target.selection, admission) { action ->
+                    withMountedSession(target.session, target.account, action)
+                }
+            }
+        } finally { changes.value += 1 }
+    }
     fun streamingProfiles(): List<StreamingProfile> {
         val current = mounted.get()
         if (current != null && accountCurrent(current.account)) {

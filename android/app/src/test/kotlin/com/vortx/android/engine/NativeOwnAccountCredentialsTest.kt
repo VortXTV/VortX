@@ -13,9 +13,16 @@ class NativeOwnAccountCredentialsTest {
     private class Store {
         val records = mutableMapOf<String, String?>()
         var writes = true
+        var failReadAfterSelectorWrite = false
+        var rejectAfterSelectorWrite = false
+        var available = true
         fun journal() = NativeOwnAccountCredentials({ key -> PersistentCredentialSnapshot(
-            PersistentCredentialAvailability.AVAILABLE, mapOf(key to records[key])) }, { key, value ->
-            if (writes) { records[key] = value; true } else false
+            if (available) PersistentCredentialAvailability.AVAILABLE else PersistentCredentialAvailability.UNAVAILABLE,
+            mapOf(key to records[key])) }, { key, value ->
+            if (writes) { records[key] = value
+                if (key.startsWith("owner-selection.") && failReadAfterSelectorWrite) available = false
+                !(key.startsWith("owner-selection.") && rejectAfterSelectorWrite)
+            } else false
         })
     }
 
@@ -62,5 +69,117 @@ class NativeOwnAccountCredentialsTest {
         assertTrue(runCatching { current.request(JSONObject()) }.isFailure)
         active = true; journal.invalidateContext()
         assertTrue(runCatching { current.request(JSONObject()) }.isFailure)
+    }
+
+    @Test fun `owner selector is account and owner qualified and never adopts global or staged credentials`() {
+        val store = Store(); val journal = store.journal()
+        store.records["stremiox.authKey"] = "unscoped"
+        val initial = journal.ownerSelection(account, profile) { it() }
+        assertNull(journal.captureOwner(account, initial) { it() })
+        val revision = "owner:00000000-0000-0000-0000-000000000001"
+        val staged = journal.storeVerified(journal.begin(account, profile, { it() }, revision), "verified", "uid-a")
+        assertNull(journal.captureOwner(account, initial) { it() })
+        journal.selectOwner(account, initial, staged) { it() }
+        val selected = journal.ownerSelection(account, profile) { it() }
+        assertEquals("verified", journal.captureOwner(account, selected) { it() }!!.request(JSONObject()).getString("authKey"))
+        val other = account.copy(id = "00000000-0000-0000-0000-000000000789")
+        assertNull(journal.captureOwner(other, journal.ownerSelection(other, profile) { it() }) { it() })
+        val otherOwner = "22222222-2222-2222-2222-222222222222"
+        assertNull(journal.captureOwner(account, journal.ownerSelection(account, otherOwner) { it() }) { it() })
+        val reopened = store.journal()
+        assertEquals("uid-a", reopened.ownerSelection(account, profile) { it() }.verifiedUID)
+        assertTrue(store.records.values.filterNotNull().filter { it.startsWith("{") }.none { it.contains("unscoped") })
+    }
+
+    @Test fun `owner clear and reconnect ABA cannot revive captured selector or tokens`() {
+        val store = Store(); val journal = store.journal()
+        fun stage(revision: String) = journal.storeVerified(journal.begin(account, profile, { it() }, "owner:$revision"), "same-token", "uid")
+        val initial = journal.ownerSelection(account, profile) { it() }
+        journal.selectOwner(account, initial, stage("00000000-0000-0000-0000-000000000001")) { it() }
+        val a = journal.ownerSelection(account, profile) { it() }
+        val capture = journal.captureOwner(account, a) { it() }!!
+        journal.clearOwner(account, a, { it() }) { it() }
+        assertTrue(runCatching { capture.request(JSONObject()) }.isFailure)
+        journal.selectOwner(account, journal.ownerSelection(account, profile) { it() }, stage("00000000-0000-0000-0000-000000000002")) { it() }
+        val current = journal.ownerSelection(account, profile) { it() }
+        assertTrue(runCatching { journal.clearOwner(account, a, { it() }) { it() } }.isFailure)
+        assertEquals(current.raw, journal.ownerSelection(account, profile) { it() }.raw)
+        assertTrue(runCatching { journal.selectOwner(account, a, stage("00000000-0000-0000-0000-000000000003")) { it() } }.isFailure)
+        assertEquals(current.raw, journal.ownerSelection(account, profile) { it() }.raw)
+    }
+
+    @Test fun `certified selector commit is not reported failed by later read outage and cold intent reconciles actual revision`() {
+        val store = Store(); val journal = store.journal()
+        fun stage(n: Int) = journal.storeVerified(journal.begin(account, profile, { it() },
+            "owner:00000000-0000-0000-0000-${n.toString().padStart(12, '0')}"), "token-$n", "uid")
+        journal.selectOwner(account, journal.ownerSelection(account, profile) { it() }, stage(1)) { it() }
+        val before = journal.ownerSelection(account, profile) { it() }
+        val candidate = stage(2)
+        val oldCaptureAfterStaging = journal.captureOwner(account, before) { it() }!!
+        store.failReadAfterSelectorWrite = true
+        assertTrue(runCatching { journal.selectOwner(account, before, candidate) { it() } }.isSuccess)
+        assertTrue(runCatching { oldCaptureAfterStaging.request(JSONObject()) }.isFailure)
+        store.available = true // Simulated fresh secure-store reopen, not an in-process fallback.
+        val reopened = store.journal()
+        val installed = reopened.ownerSelection(account, profile) { it() }
+        assertEquals("token-2", reopened.captureOwner(account, installed) { it() }!!.request(JSONObject()).getString("authKey"))
+        assertTrue(runCatching { journal.clearOwner(account, before, { it() }) { it() } }.isFailure)
+    }
+
+    @Test fun `uncertified installed selector is explicitly uncertain and cold authority requires durable exact intent`() {
+        val store = Store(); val journal = store.journal()
+        val initial = journal.ownerSelection(account, profile) { it() }
+        val candidate = journal.storeVerified(journal.begin(account, profile, { it() },
+            "owner:00000000-0000-0000-0000-000000000001"), "verified", "uid")
+        store.failReadAfterSelectorWrite = true; store.rejectAfterSelectorWrite = true
+        assertTrue(runCatching { journal.selectOwner(account, initial, candidate) { it() } }.exceptionOrNull() is NativeOwnerPublicationUncertain)
+        assertTrue(runCatching { journal.ownerSelection(account, profile) { it() } }.isFailure)
+        store.available = true
+        val reopened = store.journal()
+        val reconciled = reopened.ownerSelection(account, profile) { it() }
+        assertEquals("verified", reopened.captureOwner(account, reconciled) { it() }!!.request(JSONObject()).getString("authKey"))
+        store.records.keys.single { it.startsWith("owner-intent.") }.let(store.records::remove)
+        assertTrue(runCatching { store.journal().ownerSelection(account, profile) { it() } }.isFailure)
+    }
+
+    @Test fun `owner selector failed write or retired admission cannot publish staged credentials`() {
+        val store = Store(); val journal = store.journal(); var current = true
+        val admission: (() -> Boolean) -> Boolean = { current && it() }
+        val initial = journal.ownerSelection(account, profile, admission)
+        val candidate = journal.storeVerified(journal.begin(account, profile, admission,
+            "owner:00000000-0000-0000-0000-000000000001"), "verified", "uid")
+        store.writes = false
+        assertTrue(runCatching { journal.selectOwner(account, initial, candidate) { it() } }.isFailure)
+        assertNull(journal.ownerSelection(account, profile, admission).verifiedUID)
+        current = false
+        assertTrue(runCatching { journal.captureOwner(account, initial, admission) }.isFailure)
+    }
+
+    @Test fun `production fail closed store poisoned after-effect reconciles intent only on fresh store`() {
+        val records = mutableMapOf<String, String?>(); var afterEffect = false
+        val backend = object : com.vortx.android.security.CredentialBackend {
+            override fun string(key: String) = records[key]
+            override fun write(values: Map<String, String?>): Boolean {
+                records.putAll(values)
+                return !(afterEffect && values.keys.any { it.startsWith("owner-selection.") })
+            }
+        }
+        fun open(): NativeOwnAccountCredentials {
+            val state = com.vortx.android.security.FailClosedCredentialState(backend, reopenBackend = { backend })
+            return NativeOwnAccountCredentials({ state.confirmedSnapshot(it) }, { key, value -> state.write(mapOf(key to value)) })
+        }
+        val journal = open(); val initial = journal.ownerSelection(account, profile) { it() }
+        val candidate = journal.storeVerified(journal.begin(account, profile, { it() },
+            "owner:00000000-0000-0000-0000-000000000001"), "verified", "uid")
+        afterEffect = true
+        assertTrue(runCatching { journal.selectOwner(account, initial, candidate) { it() } }.exceptionOrNull() is NativeOwnerPublicationUncertain)
+        assertTrue(runCatching { journal.ownerSelection(account, profile) { it() } }.isFailure)
+        afterEffect = false
+        val reopened = open(); val selection = reopened.ownerSelection(account, profile) { it() }
+        assertEquals("verified", reopened.captureOwner(account, selection) { it() }!!.request(JSONObject()).getString("authKey"))
+        reopened.clearOwner(account, selection, { it() }) { it() }
+        val cleared = open(); val tombstone = cleared.ownerSelection(account, profile) { it() }
+        assertNotNull(tombstone.raw); assertNull(tombstone.verifiedUID)
+        assertNull(cleared.captureOwner(account, tombstone) { it() })
     }
 }
