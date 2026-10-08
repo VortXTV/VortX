@@ -1,13 +1,36 @@
 # VortX Design System (single source of truth)
 
-One design, every platform. This is the canonical spec every VortX surface builds to: Apple
-(tvOS/iOS/iPad/Mac, the reference implementation), Web (`web.vortx.tv`), Desktop (Tauri), and Android.
-Different stacks, identical result. Derived from `app/SourcesShared/Theme.swift` + `ThemeManager.swift`
-(the code is the source of truth, not the old `DESIGN.md`, which lagged on the ember->gold switch).
+The approved 0.5 Cinema Glass direction below supersedes conflicting historical blueprints in
+Sections 1–7. Preserve one visual identity and feature set, adapted to touch, pointer and remote
+input—not an identical layout forced onto every device. The existing tvOS design remains the
+reference for cinematic presentation; porting selected new design ideas to TV is incremental,
+not permission to replace its remote-first layout wholesale.
 
-**Rule:** a screen is "done" only when it matches this spec on every platform. The only allowed
-cross-platform difference is capability, never look: the web client has **no built-in streaming server**
-(the tvOS-Lite model), so torrents are surfaced-but-not-playable there unless a server is connected.
+Implementation evidence must include the actual route and data source as well as its appearance.
+A placeholder tab, a history screen filtering only saved items, or a menu without its action is
+not feature parity. Source/compile verification is not a rendered-device verification.
+
+## 0. Approved 0.5 Cinema Glass choices
+
+| Surface | Required behavior and presentation |
+| --- | --- |
+| Home & Discover | Combined discovery experience preserving existing filters. Dense, wide artwork cards with details below: runtime or season/episode context, rating and year when available. Continue Watching uses the same card footprint and remains directly resumable. |
+| Add-on catalogs | Exactly one horizontally scrollable row per catalog, not hundreds of vertical rows or a doubled rail. Catalog title, chevron or See All opens a separately paginated full grid. Preserve installed add-on ordering. |
+| Quick View | Optional normal catalog-tap presentation with full artwork, metadata, ratings and working Watch, Watchlist and full-Details actions. A setting disables this and restores direct detail navigation. Do not intercept Continue Watching resume or replace its context menu. |
+| Library | Three prominent destinations: Downloads, Watchlist, Previously Watched. Continue Watching also appears below them, as well as on Home. History includes watched titles that are not saved to the watchlist; derive it from authoritative playback history, not a filtered saved-library grid. |
+| Search | Large landscape artwork cards with readable details below. Search input stays visible and accessible above navigation chrome. |
+| Detail & episodes | Cinematic large-image episode rail on phone, tablet and Mac, with title, overview, runtime, progress and watched actions; show quality only from real available source data. Preserve season controls and current/next-episode identity. Phone hero occupies roughly 75–80% of the initial screen with primary action at its lower transition. |
+| Sources | Detailed vertically stacked cards on phone; wider layouts may use additional columns. Retain add-on-authored text and newlines. Ordered add-on tabs remain above sources, visibly highlight selection and jump/filter to the chosen add-on. Preserve quality, player, language and existing source controls. |
+| Profiles, settings, add-ons | Compact rows on phone; spacious cards on tablet and Mac. Add-ons use ordered rows on phone. Preserve all existing settings and profile-specific controls. |
+| Player | Preserve existing transport and advanced controls, selected seek-bar style, aspect/zoom, source/audio/subtitle/episode controls and shortcuts. Use direct profile-accent fills/tints, not colored rectangular halos. Round, restrained glass styling must not create double outlines. |
+| Navigation | Touch-safe spacing above the phone bottom bar, balanced tablet/Mac top navigation, functional Mac window controls and one contextual Back action. Content and search fields must not disappear under chrome. |
+
+Keep rounded, elegant surfaces; respect reduced motion, text scaling and focus/touch targets.
+An absent rating, runtime, season count or source quality must remain absent rather than fabricated.
+
+The older baseline below is retained as token/history context. Where it specifies a narrow detail
+banner, portrait-only posters, saved-grid-only Library, two-line source truncation, accent glows,
+or identical layouts on every device, the approved choices above take precedence.
 
 ---
 
