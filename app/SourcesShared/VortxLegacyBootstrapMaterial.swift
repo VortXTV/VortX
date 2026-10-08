@@ -109,7 +109,11 @@ enum VortxLegacyBootstrapMaterial {
             let nativeRoster = try roster.map { try projectProfile($0, ownSource: sources[$0.id.uuidString]) }
             let addons = try addonBucket()
             let library = try ownerLibrary()
-            try importOverlays()
+            try validateOwnProfileOverlayBindings(sources)
+            // An independent source owns its profile's overlay context. Avoid parsing the root
+            // bucket first: watched-only rows can rely on metadata in that independent library,
+            // and accepting then overwriting them would make a stale root slice authoritative.
+            try importOverlays(excluding: Set(sources.keys))
             try importOwnerIntents()
             if !deferProfileEdits { try validateProfileEdits(ownerLibrary: library) }
             var addonBuckets: [String: Object] = [owner.id.uuidString: addons]
@@ -469,6 +473,54 @@ enum VortxLegacyBootstrapMaterial {
             return retained
         }
 
+        private func validateOwnProfileOverlayBindings(_ sources: [String: ResolvedOwnAccountSource]) throws {
+            for (profileID, source) in sources {
+                let rootSlice = try Self.profileOverlaySlice(document, profileID: profileID)
+                if let sourceDocument = source.sourceDocument {
+                    let sourceSlice = try Self.profileOverlaySlice(sourceDocument, profileID: profileID)
+                    try require(try Self.equivalentJSON(rootSlice, sourceSlice),
+                                "Own-account root overlay differs from its authenticated source")
+                } else {
+                    // Retained material is a sealed typed tuple. A live root overlay needs a new
+                    // authenticated raw envelope so its clocks become part of a new source proof.
+                    try require(rootSlice.isEmpty,
+                                "Current own-account overlay requires an authenticated source refresh")
+                }
+            }
+        }
+
+        /// Extract the only two scoped overlay carriers. A lowercased or duplicate UUID key would
+        /// make the root and source disagree about the authenticated identity, so refuse it rather
+        /// than normalizing a potentially unrelated bucket into a source proof.
+        private static func profileOverlaySlice(_ document: Object, profileID: String) throws -> Object {
+            var slice: Object = [:]
+            if let vortx = try object(document, "vortx"), let byProfile = try object(vortx, "byProfile") {
+                let keys = byProfile.keys.filter { UUID(uuidString: $0)?.uuidString == profileID }
+                try require(keys.count <= 1 && (keys.isEmpty || keys[0] == profileID),
+                            "Own-account overlay has an ambiguous profile identity")
+                if let bucket = byProfile[profileID] {
+                    guard bucket is Object else { throw fail("Own-account overlay has a malformed profile bucket") }
+                    slice["vortx"] = ["byProfile": [profileID: bucket]]
+                }
+            }
+            if let progress = try object(document, "webProgress"), let removed = try object(progress, "removed"),
+               let byProfile = try object(removed, "byProfile") {
+                let keys = byProfile.keys.filter { UUID(uuidString: $0)?.uuidString == profileID }
+                try require(keys.count <= 1 && (keys.isEmpty || keys[0] == profileID),
+                            "Own-account overlay removals have an ambiguous profile identity")
+                if let removals = byProfile[profileID] {
+                    guard removals is [Any] else { throw fail("Own-account overlay has malformed profile removals") }
+                    slice["webProgress"] = ["removed": ["byProfile": [profileID: removals]]]
+                }
+            }
+            return slice
+        }
+
+        private static func equivalentJSON(_ lhs: Object, _ rhs: Object) throws -> Bool {
+            try JSONSerialization.data(withJSONObject: lhs, options: [.sortedKeys, .withoutEscapingSlashes]) ==
+                JSONSerialization.data(withJSONObject: rhs, options: [.sortedKeys, .withoutEscapingSlashes])
+        }
+
         func addonBucket() throws -> Object {
             var descriptors: [String: Object] = [:]
             var descriptorOrder: [String] = []
@@ -619,7 +671,7 @@ enum VortxLegacyBootstrapMaterial {
             return ["items": items.keys.sorted().compactMap { items[$0] }, "intents": intents.keys.sorted().compactMap { intents[$0] }]
         }
 
-        func importOverlays() throws {
+        func importOverlays(excluding excludedProfiles: Set<String> = []) throws {
             let buckets = try object(vortx, "byProfile") ?? [:]
             let progress = try object(document, "webProgress") ?? [:]
             let removed = try object(progress, "removed") ?? [:]
@@ -628,6 +680,7 @@ enum VortxLegacyBootstrapMaterial {
             for rawID in Set(buckets.keys).union(web.keys).sorted() {
                 guard let uuid = UUID(uuidString: rawID) else { throw fail("Watch carrier references an unknown profile") }
                 let id = uuid.uuidString
+                if excludedProfiles.contains(id) { continue }
                 try require(seen.insert(id).inserted, "Duplicate profile bucket identity")
                 let bucket = try object(buckets, rawID) ?? [:]
                 if deleted.contains(id) { continue } // Retained verbatim in the original encrypted carrier.

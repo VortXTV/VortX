@@ -180,11 +180,21 @@ enum VortxLegacyBootstrapMaterialTests {
         let overlay: Object = ["vortx": ["byProfile": [own.id.uuidString: ["watched": [
             "tt-own": ["w": ["overlay-video"]]
         ]]]]]
+        let rootWithOwnOverlay = doc(["library": [movie("tt-root", position: 1)],
+                                      "byProfile": [own.id.uuidString: ["watched": ["tt-own": ["w": ["overlay-video"]]]]]])
         let overlayReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
             verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [ownMovie], addons: [ownAddon], profileOverlay: overlay))
-        let overlayResult = try material(root, roster: [owner, own], ownAccountSources: [overlayReceipt])
+        let overlayResult = try material(rootWithOwnOverlay, roster: [owner, own], ownAccountSources: [overlayReceipt])
         check(watches(overlayResult, profile: own).contains { $0["metaId"] as? String == "tt-own" && $0["videoId"] as? String == "overlay-video" && $0["watched"] as? Bool == true },
               "Authenticated UUID-scoped overlay marks survive alongside the independent source")
+        do { _ = try material(root, roster: [owner, own], ownAccountSources: [overlayReceipt]); preconditionFailure("unbound source overlay imported") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("differs from its authenticated source"), "Root own overlay must match its authenticated envelope slice")
+        }
+        do { _ = try material(rootWithOwnOverlay, roster: [owner, own], retainedOwnAccountBaseline: retainedBaseline); preconditionFailure("retained tuple silently overwrote root overlay") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("requires an authenticated source refresh"), "Retained baseline never discards a live own overlay")
+        }
 
         var temporary = ownMovie; temporary["_id"] = "tt-temp"; temporary["temp"] = true
         var temporaryState = temporary["state"] as! Object; temporaryState["video_id"] = "tt-temp"; temporary["state"] = temporaryState
