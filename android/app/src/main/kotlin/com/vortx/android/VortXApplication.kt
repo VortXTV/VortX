@@ -37,6 +37,13 @@ import com.vortx.android.debrid.DebridAccountOwnerState
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.diagnostics.CrashReporter
 import com.vortx.android.engine.EngineStremioRepository
+import com.vortx.android.engine.NativeCatalogRepository
+import com.vortx.android.engine.VortxAccountScope
+import com.vortx.android.engine.VortxAndroidCheckpointKey
+import com.vortx.android.engine.VortxEncryptedCheckpointStore
+import com.vortx.android.engine.VortxJniBindings
+import com.vortx.android.engine.VortxJniResourceTransport
+import com.vortx.android.engine.VortxNativeSession
 import com.vortx.android.iptv.IPTVCleanupCoordinator
 import com.vortx.android.iptv.IPTVPlaylists
 import com.vortx.android.iptv.iptvCleanupActions
@@ -97,6 +104,32 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     private val fallbackCatalogRepository by lazy { PreviewCatalogRepository() }
     private val fallbackAuthRepository by lazy { PreviewAuthRepository() }
+    @Volatile private var nativeSession: VortxNativeSession? = null
+    private val nativeRepository by lazy { NativeCatalogRepository {
+        checkNotNull(nativeSession) { "Native account requires explicit activation; authentication and legacy migration are not enabled" }
+            .also { it.read() }
+    } }
+
+    /** Explicit host entry point. The owner UUID must come from authenticated native account setup,
+     * never the unscoped legacy ProfileStore. No credentials are passed to the kernel or checkpoint.
+     * No production UI invokes this until account/bootstrap/migration parity has been approved.
+     */
+    @Synchronized internal fun activateNativeAccount(accountID: String, ownerProfileID: String, ownerName: String, allowNewAccount: Boolean = false) {
+        check(BuildConfig.NATIVE_ENGINE_ENABLED) { "Native engine compile gate is disabled" }
+        val manager = checkNotNull(syncManager) { "Authenticated account unavailable" }
+        val account = manager.sessionOwnerSnapshot() as? SessionOwnerSnapshot.Account
+        check(account != null && account.id == accountID) { "Authenticated native account mismatch" }
+        // Retire the prior writer before reading/replacing this account's checkpoint. A failed open
+        // leaves native mode unavailable instead of running two writers against the same account file.
+        nativeSession?.close(); nativeSession = null
+        val transport = VortxJniResourceTransport() // requires the additive resource-host ABI
+        val candidate = try {
+            VortxNativeSession.open(VortxAccountScope(accountID, ownerProfileID), ownerName, VortxJniBindings,
+                VortxEncryptedCheckpointStore(java.io.File(noBackupFilesDir, "native-state"), VortxAndroidCheckpointKey::get),
+                transport, allowNewAccount) { manager.sessionOwnerSnapshot() == account }
+        } catch (error: Throwable) { transport.close(); throw error }
+        nativeSession = candidate
+    }
 
     /// Warm the media-server store from disk at process start (idempotent), so a Plex/Jellyfin/Emby server
     /// connected in a previous run is queryable for direct-play sources on the very first detail page WITHOUT
@@ -334,12 +367,12 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// The one [CatalogRepository] the whole app shares. Falls back to the offline preview data (same
     /// fail-soft boundary [MainActivity] used to own directly) so a native-side problem degrades the
     /// UI instead of crashing it.
-    val catalogRepository: CatalogRepository get() = accountConnectedEngine() ?: fallbackCatalogRepository
+    val catalogRepository: CatalogRepository get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeRepository else accountConnectedEngine() ?: fallbackCatalogRepository
 
     /// The one [AuthRepository] the whole app shares -- the SAME underlying engine instance as
     /// [catalogRepository] when the engine is up (one repository class implements both contracts), so
     /// a sign-in immediately shows up in every catalog call that reads `ctx`-derived state.
-    val authRepository: AuthRepository get() = accountConnectedEngine() ?: fallbackAuthRepository
+    val authRepository: AuthRepository get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeRepository else accountConnectedEngine() ?: fallbackAuthRepository
 
     /** Keep initialization lazy; attach the real engine only when a normal app consumer requests it. */
     private fun accountConnectedEngine(): EngineStremioRepository? = engine?.also { repository ->

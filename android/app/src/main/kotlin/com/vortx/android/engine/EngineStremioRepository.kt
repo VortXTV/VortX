@@ -802,6 +802,8 @@ class EngineStremioRepository(
     private val loadTimeoutSeconds: Long = 12,
 ) : CatalogRepository, AuthRepository, AccountAddonSyncGateway, AccountLibrarySyncGateway {
 
+    init { check(!com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) { "Legacy engine is unavailable in explicit native mode" } }
+
     /**
      * The native account fence captured by VortX account sync. It intentionally carries the complete
      * owner, rather than a display UID alone: profile/account-slot transitions and a same-UID engine

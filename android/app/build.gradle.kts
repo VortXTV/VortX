@@ -105,6 +105,10 @@ android {
         versionCode = 240
         versionName = "0.4.0"
 
+        // Explicit experimental selection only; release/device/auth/player/migration parity is pending.
+        // Missing native session/artifact fails closed; this never falls back to Stremio or previews.
+        buildConfigField("boolean", "NATIVE_ENGINE_ENABLED", (providers.gradleProperty("vortx.nativeEngine").orNull == "true").toString())
+
         // External sync credentials -> BuildConfig (read by com.vortx.android.integrations.TraktAuth /
         // SIMKLAuth). Empty default keeps the feature dormant on a public/unprovisioned build; see the
         // externalSyncSecret() helper above. buildConfig = true is set in buildFeatures {} below.
