@@ -36,6 +36,12 @@ import Foundation
         precondition(EpisodeResolutionBudget.protectsPendingResolution(deadlineScheduled: true,
             owner: owner, currentOwner: owner, admitted: false, exited: false),
                      "TV20s EOF escape must not cancel a valid35s local leg")
+        // The main actor may deliver the prepared continuation BEFORE its overdue timer.
+        // Keep ownership/timer state unchanged and exercise the production time admission itself.
+        precondition(auto.canAdmit(at: 100), "an immediate prepared hit remains admissible")
+        precondition(!auto.canAdmit(at: auto.admissionDeadline)
+                     && !auto.canAdmit(at: auto.deadline + 1),
+                     "an expired prepared hit is rejected even while its owner and timer remain current")
         for (scheduled, current, admitted, exited) in [
             (false, owner, false, false), (true, replacement, false, false),
             (true, owner, true, false), (true, owner, false, true)
@@ -64,6 +70,13 @@ import Foundation
         precondition(tv.contains("guard !hasOwnedEpisodeResolutionDeadline else { return }"))
         precondition(tv.contains("if let target = failedEpisodeResolutionTarget {\n            play(episode: target)"))
         precondition(tv.contains("failedEpisodeResolutionTarget = v") && tv.contains("episodeResolutionAdmitted = true\n        failedEpisodeResolutionTarget = nil"))
+        let preparedStart = tv.range(of: "// The preload already fetched and ranked this episode across every add-on")!.lowerBound
+        let beforePreparedLoad = tv[preparedStart...].components(separatedBy: "guard let issuedToken = loadIntoPlayer(")[0]
+        precondition(beforePreparedLoad.components(separatedBy: "resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime)").count == 3,
+                     "prepared continuation and pre-issue guards both execute the production deadline admission")
+        precondition(beforePreparedLoad.contains("discardPreparedEpisode(pre, reason: \"episode admission became stale or expired\")")
+                     && beforePreparedLoad.contains("discardPreparedEpisode(pre, reason: \"episode admission became stale or expired before issue\")"),
+                     "expired prepared ownership is retired before pending source mutation and physical admission")
         print("PASS actual episode budget:20s settlement+35s NNTP+8s fallback+2s admission, automatic/manual parity, late candidate, owner/cancel fences")
     }
 }

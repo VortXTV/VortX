@@ -9635,8 +9635,8 @@ struct TVPlayerView: View {
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
                     videoID: v.id, choice: choice
-                ) else {
-                    discardPreparedEpisode(pre, reason: "episode admission became stale")
+                ), resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else {
+                    discardPreparedEpisode(pre, reason: "episode admission became stale or expired")
                     return
                 }
                 core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
@@ -9647,8 +9647,8 @@ struct TVPlayerView: View {
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
                     videoID: v.id, choice: choice
-                ) else {
-                    discardPreparedEpisode(pre, reason: "episode admission became stale before issue")
+                ), resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else {
+                    discardPreparedEpisode(pre, reason: "episode admission became stale or expired before issue")
                     return
                 }
                 DiagnosticsLog.log("binge", "auto-next PRELOAD: wanted binge=\(curBinge ?? "nil") got=\(pre.bingeGroup ?? "nil") name=\(pre.stream.name?.prefix(60) ?? "")")
