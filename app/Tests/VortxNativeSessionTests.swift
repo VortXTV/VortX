@@ -211,6 +211,29 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("missing index admitted new account") } catch {}
         try indexedA.rememberAuthenticatedScope(scope); try indexedB.rememberAuthenticatedScope(scopeB)
         check(try indexedC.authenticatedCheckpoint(scope: scopeC) == nil)
+        let pairedLocator = indexedFiles.first { $0.lastPathComponent.hasPrefix("native-account-v1-") }!
+        let pairedBytes = try Data(contentsOf: pairedLocator)
+        try FileManager.default.removeItem(at: pairedLocator)
+        do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("v2 inventory without paired v1 locator admitted absence") } catch {}
+        try Data("altered-account-locator".utf8).write(to: pairedLocator)
+        do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("corrupt paired v1 locator admitted absence") } catch {}
+        try pairedBytes.write(to: pairedLocator)
+        let orphanDirectory = directory.deletingLastPathComponent().appendingPathComponent("orphan-locator")
+        try FileManager.default.createDirectory(at: orphanDirectory, withIntermediateDirectories: true)
+        try pairedBytes.write(to: orphanDirectory.appendingPathComponent(pairedLocator.lastPathComponent))
+        let orphanNoKey = try VortxEncryptedCheckpointStore(directory: orphanDirectory, key: keyB)
+        do { _ = try orphanNoKey.authenticatedCheckpoint(scope: scopeC); fatalError("nil install key ignored orphan account locator") } catch {}
+        let orphanWithKey = try VortxEncryptedCheckpointStore(directory: orphanDirectory, key: keyB, installationKey: installKey)
+        do { _ = try orphanWithKey.authenticatedCheckpoint(scope: scopeC); fatalError("orphan legacy locator established absence") } catch {}
+        for prefix in [".native-checkpoint-", ".native-locator-", ".native-index-"] {
+            let staged = indexedDirectory.appendingPathComponent(prefix + "fixture.sealed")
+            try Data("interrupted-durable-stage".utf8).write(to: staged)
+            check(try indexedA.authenticatedCheckpoint(scope: scope) == before)
+            do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("interrupted durable stage established absence") } catch {}
+            try FileManager.default.removeItem(at: staged)
+        }
+        try Data("unrelated-file".utf8).write(to: indexedDirectory.appendingPathComponent("unrelated.txt"))
+        check(try indexedC.authenticatedCheckpoint(scope: scopeC) == nil)
         let stateDigest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
         let indexedStateA = indexedDirectory.appendingPathComponent("native-state-v1-\(stateDigest).sealed")
         let validIndexedState = try Data(contentsOf: indexedStateA)

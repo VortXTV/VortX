@@ -111,6 +111,7 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
     private struct AccountLocator: Codable {
         let format: String
         let scope: VortxAccountScope
+        var accountLocatorDigest: Data? = nil
     }
     private struct InventoryProof: Codable { let scope: VortxAccountScope; let ciphertextDigest: Data }
     private struct IndexedCiphertext: Codable { let format: String; let ciphertext: Data; let proof: Data }
@@ -157,8 +158,19 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         return indexed.ciphertext
     }
     private func authenticatedInventory(for requestedScope: VortxAccountScope) throws -> Set<String> {
-        guard let installationKey else { return [] }
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        func isStaging(_ name: String) -> Bool {
+            name.hasSuffix(".sealed") && [".native-checkpoint-", ".native-locator-", ".native-index-"].contains(where: name.hasPrefix)
+        }
+        // A durable stage may belong to an account whose final file/index was never published.
+        // Ignore unrelated files, but never turn recognized interrupted transaction state into absence.
+        guard !files.contains(where: { isStaging($0.lastPathComponent) }) else { throw VortxNativeError.invalidSnapshot }
+        guard let installationKey else {
+            guard !files.contains(where: { file in
+                ["native-state-v1-", "native-account-v1-", "native-account-v2-"].contains(where: file.lastPathComponent.hasPrefix)
+            }) else { throw VortxNativeError.invalidSnapshot }
+            return []
+        }
         var covered: Set<String> = []
         var authenticatedIndexes: Set<String> = []
         for file in files where file.lastPathComponent.hasPrefix("native-account-v2-") {
@@ -168,6 +180,8 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             try locator.scope.validate()
             guard locator.format == "vortx-native-account-locator-v2", indexURL(locator.scope.account).path == file.path else { throw VortxNativeError.invalidSnapshot }
             guard locator.scope.account != requestedScope.account || locator.scope == requestedScope else { throw VortxNativeError.invalidSnapshot }
+            let accountLocator = try Data(contentsOf: locatorURL(locator.scope.account))
+            guard locator.accountLocatorDigest == Data(SHA256.hash(data: accountLocator)) else { throw VortxNativeError.invalidSnapshot }
             let stateURL = url(locator.scope)
             let bytes = try Data(contentsOf: stateURL)
             guard bytes.starts(with: Self.indexedPrefix) else { throw VortxNativeError.invalidSnapshot }
@@ -232,7 +246,8 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             // either publication leaves the file unindexed and blocks new-account admission.
             let ciphertext = try accountCiphertext(Data(contentsOf: url(scope)))
             try durableInstall(indexedCiphertext(ciphertext, scope: scope), at: url(scope))
-            let indexPayload = try JSONEncoder().encode(AccountLocator(format: "vortx-native-account-locator-v2", scope: scope))
+            let indexPayload = try JSONEncoder().encode(AccountLocator(format: "vortx-native-account-locator-v2", scope: scope,
+                                                                       accountLocatorDigest: Data(SHA256.hash(data: bytes))))
             guard let indexBytes = try AES.GCM.seal(indexPayload, using: installationKey,
                 authenticating: indexAAD(indexURL(scope.account).lastPathComponent)).combined else { throw VortxNativeError.invalidSnapshot }
             try durableInstall(indexBytes, at: indexURL(scope.account))
