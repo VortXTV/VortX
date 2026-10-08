@@ -18,10 +18,16 @@ for attempt in {1..50}; do
     sleep 0.1
 done
 test -s "$native_live_dir/port"
+sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The profile roster and the active selection\./!p; }' app/SourcesShared/Profiles.swift > "$native_live_dir/UserProfile.swift"
+{
+    printf '%s\n' 'import Foundation'
+    sed -n '/^struct ProfileDiscoveryPreferences: /,/^}$/p' app/SourcesShared/ProfileDiscoveryPreferences.swift
+} > "$native_live_dir/Discovery.swift"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST -I "$native_live_dir" \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
     app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
+    "$native_live_dir/UserProfile.swift" "$native_live_dir/Discovery.swift" app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
     app/Tests/VortxNativeLiveABITests.swift "$library" -o "$native_live_dir/live-abi"
 DYLD_LIBRARY_PATH="$(dirname "$library"):$(dirname "$library")/deps" \
     "$native_live_dir/live-abi" test/fixtures/native-resource-contract.json "$(<"$native_live_dir/port")" "$native_live_dir/checkpoints"

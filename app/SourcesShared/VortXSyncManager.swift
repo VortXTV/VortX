@@ -230,8 +230,8 @@ final class VortXSyncManager: ObservableObject {
     private var nativeCheckpointGeneration = UUID()
     private(set) var nativeCheckpointStatus = "not_started"
 
-    /// The key never leaves this account owner. A missing/undecryptable native checkpoint is not
-    /// a fresh account: first-install legacy import is a separate, validated transaction.
+    /// The key never leaves this account owner. Only an absent checkpoint permits a complete
+    /// authenticated import/native-carrier adoption; failed reads/decryption never mean absence.
     @discardableResult
     func restoreNativeCheckpoint(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
@@ -256,7 +256,7 @@ final class VortXSyncManager: ObservableObject {
             // freshly authenticated/decrypted account roster, including historical PIN-bound IDs.
             guard case .doc(let document) = await self.pullSyncDocResult(credentialCapture: capture),
                   self.isCurrent(capture), !Task.isCancelled,
-                  let roster = Self.resolveRoster(from: document),
+                  let roster = Self.resolveRoster(from: document, fullOnly: true),
                   let keyBytes = self.dataKey, keyBytes.count == 32 else {
                 if self.isCurrent(capture) { self.nativeCheckpointStatus = "account_document_unavailable" }; return false
             }
@@ -271,11 +271,33 @@ final class VortXSyncManager: ObservableObject {
                 let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owners[0].id.uuidString)
                 let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
                     .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
-                let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
-                let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
-                                                    transport: VortxCResourceTransport())
-                do {
+                let documentBytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys, .withoutEscapingSlashes])
+                let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+                let hadCheckpoint = try probe.read(scope: scope) != nil
+                var material: Data?
+                var initialActions: [String] = []
+                if !hadCheckpoint {
+                    let initial: VortxJSON
                     if let raw = document["nativeSync"] {
+                        let native = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: raw))
+                        initial = .object(["type": .string("merge_native_sync"), "document": native])
+                    } else {
+                        let encoded = try VortxLegacyBootstrapMaterial.encode(document: documentBytes, roster: roster.profiles,
+                                                                              ownerProfileID: owners[0].id, rosterModifiedSeconds: roster.modified)
+                        material = encoded
+                        initial = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account),
+                                           "ownerProfileId": .string(scope.ownerProfileID),
+                                           "material": try JSONDecoder().decode(VortxJSON.self, from: encoded)])
+                    }
+                    initialActions = [String(decoding: try JSONEncoder().encode(initial), as: UTF8.self)]
+                }
+                let archive = try VortxNativeBootstrapArchive.encode(document: documentBytes, material: material)
+                let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes),
+                                                               bootstrap: archive, bootstrapScope: scope)
+                let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
+                                                    transport: VortxCResourceTransport(), allowNewAccount: !hadCheckpoint, initialActions: initialActions)
+                do {
+                    if hadCheckpoint, let raw = document["nativeSync"] {
                         let native = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: raw))
                         let action = VortxJSON.object(["type": .string("merge_native_sync"), "document": native])
                         _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970))
@@ -289,6 +311,9 @@ final class VortXSyncManager: ObservableObject {
                     let registry = try await session.resourceRegistry()
                     guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
                     try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture)
+                    // Upload only the new nativeSync carrier. The archive never enters the wire,
+                    // and adopting an existing remote carrier must not create an echo push.
+                    if material != nil { self.requestSyncSoon() }
                     self.nativeCheckpointStatus = "mounted"; return true
                 } catch { await session.close(); throw error }
             } catch {
@@ -2075,10 +2100,12 @@ final class VortXSyncManager: ObservableObject {
         return roster
     }
 
-    static func resolveRoster(from doc: [String: Any]) -> ProfileRosterSnapshot? {
+    static func resolveRoster(from doc: [String: Any], fullOnly: Bool = false) -> ProfileRosterSnapshot? {
         let domain = (doc["settings"] as? String).flatMap { Data(base64Encoded: $0) }
             .flatMap { try? SettingsBackup.decodeDomain(from: $0) }
-        return ProfileRosterSnapshot.resolve(settingsDomain: domain, vortx: doc["vortx"] as? [String: Any])
+        var vortx = doc["vortx"] as? [String: Any]
+        if fullOnly { vortx?.removeValue(forKey: "profiles") }
+        return ProfileRosterSnapshot.resolve(settingsDomain: domain, vortx: vortx)
     }
 
     /// Web patches are independent of the native carrier and must be consumed before we acknowledge

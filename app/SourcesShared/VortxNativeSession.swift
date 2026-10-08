@@ -46,8 +46,9 @@ protocol VortxCheckpointStore: Sendable {
     func commit(_ snapshot: String, scope: VortxAccountScope) throws
 }
 
-/// The host supplies a key from its existing account secure store. This class never stores that key,
-/// tokens or plaintext snapshots. The encrypted file is separate from all legacy/account documents.
+/// The host supplies a key from its existing account secure store. This class never persists that
+/// key or plaintext snapshots; the bootstrap archive excludes known credential carriers. The sealed
+/// file is separate from the original legacy/account documents and never replaces them.
 final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Sendable {
     private struct Envelope: Codable {
         let format: String
@@ -57,11 +58,15 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
     private let directory: URL
     private let key: SymmetricKey
     private let lock = NSLock()
-    private var bootstrap: Data?
-    init(directory: URL, key: SymmetricKey, bootstrap: Data? = nil) throws {
+    private var bootstraps: [VortxAccountScope: Data] = [:]
+    init(directory: URL, key: SymmetricKey, bootstrap: Data? = nil, bootstrapScope: VortxAccountScope? = nil) throws {
         guard key.bitCount == 256 else { throw VortxNativeError.invalidSnapshot }
-        if let bootstrap { try VortxNativeBootstrapArchive.validate(bootstrap) }
-        self.directory = directory; self.key = key; self.bootstrap = bootstrap
+        if let bootstrap {
+            guard let bootstrapScope else { throw VortxNativeError.invalidSnapshot }
+            try bootstrapScope.validate(); try VortxNativeBootstrapArchive.validate(bootstrap)
+            bootstraps[bootstrapScope] = bootstrap
+        }
+        self.directory = directory; self.key = key
     }
     private func url(_ scope: VortxAccountScope) -> URL {
         let digest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
@@ -86,7 +91,7 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         try scope.validate()
         do {
             let envelope = try open(Data(contentsOf: url(scope)), scope: scope)
-            if let retained = envelope.bootstrap { bootstrap = retained }
+            if let retained = envelope.bootstrap { bootstraps[scope] = retained }
             return envelope.state
         }
         catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
@@ -97,8 +102,9 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         do {
             // The first migration source is immutable, even for a fresh store instance making a
             // later commit. A decode/read failure must not replace it with a newer/empty carrier.
-            if let retained = try open(Data(contentsOf: url(scope)), scope: scope).bootstrap { bootstrap = retained }
+            if let retained = try open(Data(contentsOf: url(scope)), scope: scope).bootstrap { bootstraps[scope] = retained }
         } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {}
+        let bootstrap = bootstraps[scope]
         let envelope = Envelope(format: "vortx-native-checkpoint-v1", state: snapshot, bootstrap: bootstrap)
         let sealed = try AES.GCM.seal(JSONEncoder().encode(envelope), using: key, authenticating: scope.authenticatedData)
         guard let combined = sealed.combined else { throw VortxNativeError.invalidSnapshot }
@@ -181,8 +187,8 @@ private final class VortxScopeWriter: @unchecked Sendable {
     deinit { release() }
 }
 
-/// An explicitly constructed, account-owned native facade. Not selected by CoreBridge or any UI
-/// preference. All state mutation is copy/apply/checkpoint/swap: a failed durable write leaves the
+/// An explicitly constructed, account-owned native session, selected only by the compile-time gate,
+/// never a UI preference. All state mutation is copy/apply/checkpoint/swap: a failed durable write leaves the
 /// published runtime unchanged. Actor isolation fences logout/profile switches across async loads.
 actor VortxNativeSession {
     enum CatalogScreen: String, Sendable { case board, discover, search }
@@ -374,6 +380,23 @@ actor VortxNativeSession {
         } catch {
             if current(name, ticket, capturedEpoch) { screens[name] = .failed }; throw error
         }
+    }
+    /// Independent, non-UI metadata lookup for a deliberate library add. It cannot replace the
+    /// detail screen or cancel another title's add; account/profile/registry invalidation still wins.
+    func libraryMetadata(id: String, type: String, profileID: String, addons: [VortxResourceAddon]) async throws -> VortxJSON {
+        let name = "library_lookup:" + UUID().uuidString
+        let (bridge, ticket, capturedEpoch, profile) = try begin(name)
+        defer { bridge.invalidate(); bridges.removeValue(forKey: name); tickets.removeValue(forKey: name); screens.removeValue(forKey: name) }
+        guard profile == profileID else { throw VortxNativeError.superseded }
+        let result = try await bridge.load(ownerID: profile, request: .init(resource: .meta, type: type, id: id), addons: addons)
+        guard current(name, ticket, capturedEpoch), bridge.accepts(result) else { throw VortxNativeError.superseded }
+        for addon in addons {
+            guard let group = result.groups.first(where: { $0.addonId == addon.id }), group.status == .ready,
+                  let meta = group.content?["meta"], meta["id"] == .string(id), meta["type"] == .string(type),
+                  case .string(let title) = meta["name"], !title.isEmpty else { continue }
+            return meta
+        }
+        throw VortxNativeError.invalidResponse
     }
     func loadSubtitles(request: VortxResourceRequest, addons: [VortxResourceAddon]) async throws -> VortxJSON {
         guard request.resource == .subtitles else { throw VortxNativeError.invalidResponse }

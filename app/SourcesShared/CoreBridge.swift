@@ -3420,6 +3420,16 @@ final class CoreBridge: ObservableObject {
     func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool = true,
                                  target: PlaybackMutationTarget? = nil) async -> Bool {
         let target = target ?? PlaybackMutationTarget.capture(core: self)
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            guard let (facade, profile) = nativePlaybackBinding(target),
+                  LibraryWatchedMutationPolicy.isCanonicalCatalogID(id),
+                  let safeType = LibraryWatchedMutationPolicy.normalizedCatalogType(type),
+                  let accepted = try? await facade.addCatalogItem(id: id, type: safeType, profileID: profile.uuidString, allowInsert: stampIntent),
+                  nativePlaybackBinding(target)?.0 === facade else { return false }
+            return accepted
+        }
+#endif
         guard !logoutAccountMutationPending,
               target.stillOwnsAccountContext(core: self),
               let binding = settledActiveAccountBinding(),
@@ -3457,6 +3467,9 @@ final class CoreBridge: ObservableObject {
     @discardableResult
     func addCatalogItemLocalOnly(id: String, type: String,
                                  credentialCapture: CredentialScopeRegistry.Capture) async -> Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState { return false } // the authenticated native importer owns cold recovery
+#endif
         guard !logoutAccountMutationPending, localOnlyRecoveryAllowed(credentialCapture) else { return false }
         guard LibraryWatchedMutationPolicy.isCanonicalCatalogID(id),
               let safeType = LibraryWatchedMutationPolicy.normalizedCatalogType(type),

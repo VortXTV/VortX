@@ -28,7 +28,10 @@ enum VortxNativeBootstrapArchive {
     static func validate(_ archive: Data) throws {
         guard let object = try JSONSerialization.jsonObject(with: archive) as? [String: Any],
               object["schemaVersion"] as? Int == 1, let host = object["hostDocument"] as? [String: Any],
-              object["excludedCredentialPaths"] is [String] else { throw Failure.malformed }
+              let excluded = object["excludedCredentialPaths"] as? [String],
+              excluded.allSatisfy({ $0.hasPrefix("/") }),
+              Set(object.keys).isSubset(of: ["schemaVersion", "hostDocument", "excludedCredentialPaths", "legacyImportMaterial"])
+        else { throw Failure.malformed }
         var forbidden: [String] = []
         _ = try sanitize(host, path: "", exclusions: &forbidden)
         if let material = object["legacyImportMaterial"] {
@@ -46,13 +49,15 @@ enum VortxNativeBootstrapArchive {
             for key in object.keys.sorted() {
                 let child = path + "/" + pointer(key)
                 let normalized = key.lowercased().replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "")
-                if credentials.contains(normalized) || key.lowercased().hasPrefix("kcfallback.") {
+                let url = URLComponents(string: key)
+                let configuredIdentity = ["http", "https"].contains(url?.scheme?.lowercased() ?? "") && url?.host?.isEmpty == false
+                if !configuredIdentity && (credentials.contains(normalized) || key.lowercased().hasPrefix("kcfallback.")) {
                     exclusions.append(child); continue
                 }
                 // Unknown credential-like carriers require an explicit policy, not silent deletion
                 // or blind persistence. Do not classify ordinary keys or URL string contents.
-                if normalized.contains("secret") || normalized.contains("credential") ||
-                    ["token", "password", "authkey", "apikey"].contains(where: { normalized.hasSuffix($0) }) {
+                if !configuredIdentity && (normalized.contains("secret") || normalized.contains("credential") ||
+                    ["token", "password", "authkey", "apikey"].contains(where: { normalized.hasSuffix($0) })) {
                     throw Failure.ambiguousCredentialCarrier
                 }
                 if key == "settings", let encoded = object[key] as? String {
@@ -76,6 +81,15 @@ enum VortxNativeBootstrapArchive {
                 return try PropertyListSerialization.data(fromPropertyList: sanitize(object, path: path, exclusions: &exclusions), format: format, options: 0)
             }
             throw Failure.opaquePreference
+        }
+        if let text = value as? String, let nested = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
+           nested is [String: Any] || nested is [Any] {
+            let prior = exclusions.count
+            let safe = try sanitize(nested, path: path, exclusions: &exclusions)
+            // Keep the original noncredential string byte-for-byte unless actual exclusions were
+            // necessary. A structured string must not hide credentials from the recursive policy.
+            if exclusions.count == prior { return text }
+            return String(decoding: try JSONSerialization.data(withJSONObject: safe, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)
         }
         guard value is String || value is NSNumber || value is NSNull || value is Date else { throw Failure.malformed }
         return value

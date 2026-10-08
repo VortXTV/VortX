@@ -130,7 +130,7 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         let key = SymmetricKey(size: .bits256)
         let archive = try VortxNativeBootstrapArchive.encode(document: Data(#"{"futurePreference":{"keep":42},"apiKeys":{"provider":"fixture-excluded"}}"#.utf8),
                                                               material: Data(#"{"schemaVersion":1,"sourceClock":1000.125}"#.utf8))
-        let encrypted = try VortxEncryptedCheckpointStore(directory: directory, key: key, bootstrap: archive)
+        let encrypted = try VortxEncryptedCheckpointStore(directory: directory, key: key, bootstrap: archive, bootstrapScope: scope)
         try encrypted.commit(before, scope: scope)
         check(try encrypted.read(scope: scope) == before)
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
@@ -147,6 +147,12 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         check(try coldStore.read(scope: scope) == before)
         try coldStore.commit(before, scope: scope)
         check(try archived(Data(contentsOf: files[0])) == archive)
+        let otherScope = VortxAccountScope(account: "account-b", ownerProfileID: scope.ownerProfileID)
+        let otherState = before.replacingOccurrences(of: "account-a", with: "account-b")
+        try encrypted.commit(otherState, scope: otherScope)
+        let otherFile = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first { $0 != files[0] }!
+        let otherPlain = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: otherFile)), using: key, authenticating: otherScope.authenticatedData)
+        check((try JSONSerialization.jsonObject(with: otherPlain) as! [String: Any])["bootstrap"] == nil)
         // Prior raw-runtime files remain readable; their next commit adopts a sealed envelope.
         let legacySealed = try AES.GCM.seal(Data(before.utf8), using: key, authenticating: scope.authenticatedData).combined!
         try legacySealed.write(to: files[0], options: .atomic)

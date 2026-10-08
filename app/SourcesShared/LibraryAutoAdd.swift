@@ -26,8 +26,13 @@ enum LibraryAutoAdd {
 
     /// The per-profile storage key. Falls back to a shared key when there is no active profile id.
     private static func storageKey(profileID: UUID? = ProfileStore.shared.activeID) -> String {
+#if VORTX_NATIVE_DATA_ENGINE
+        let namespace = CredentialScopeRegistry.shared.capture().namespace
+        return "\(keyPrefix).native.\(namespace).\(profileID?.uuidString ?? "unavailable")"
+#else
         if let id = profileID { return "\(keyPrefix).\(id.uuidString)" }
         return keyPrefix
+#endif
     }
 
     /// Whether this (active-profile, id) has already been auto-added once. Public so the caller can cheaply
@@ -66,10 +71,23 @@ enum LibraryAutoAdd {
             switch target {
             case .overlay(let id): return id
             case .engine(let id, _, _, _): return id
+            case .native(let binding): return binding?.profileID
             }
         }()
         guard LibraryWatchedMutationPolicy.isCanonicalCatalogID(id),
               !hasAutoAdded(id, profileID: profileID) else { return }   // already auto-added once for this profile -> respect removal
+
+#if VORTX_NATIVE_DATA_ENGINE
+        if core.usesNativeProfileState {
+            Task { @MainActor in
+                if await core.addCatalogItemToAccount(id: id, type: meta.type, target: target),
+                   target.stillOwnsCurrentContext(core: core) {
+                    rememberAutoAdded(id, profileID: profileID)
+                }
+            }
+            return // only the acknowledged native save may stamp this account-scoped ledger
+        }
+#endif
 
         if target.overlayProfileID == nil {
             let type = meta.usesSeriesLifecycle ? "series" : "movie"

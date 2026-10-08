@@ -226,6 +226,38 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         guard let data = try? JSONEncoder().encode(action) else { return false }
         return enqueueMutation(type: "reorder_addons", raw: String(decoding: data, as: UTF8.self))
     }
+    /// Metadata comes only from the accepted native registry. The return value acknowledges the
+    /// durable FIFO add, not merely HTTP success or UI dispatch. Legacy recovery may only confirm
+    /// existing native membership; it cannot manufacture a new save over a native removal.
+    func addCatalogItem(id: String, type: String, profileID: String, allowInsert: Bool) async throws -> Bool {
+        let captured = try lock.withLock { () -> (UUID, [VortxResourceAddon], Bool) in
+            guard !closed, pendingProfileTransitions == 0, resourceRegistryValid,
+                  values["native_state"]?["activeProfileId"] == .string(profileID) else { throw VortxNativeError.superseded }
+            let saved = values["native_state"]?["libraries"]?[profileID]?["items"]?.array?.contains {
+                $0["kind"] == .string("standard") && $0["id"] == .string(id) && $0["type"] == .string(type)
+            } == true
+            return (registryGeneration, registry, saved)
+        }
+        if captured.2 { return true }
+        guard allowInsert else { return false }
+        let meta = try await session.libraryMetadata(id: id, type: type, profileID: profileID, addons: captured.1)
+        return try await withCheckedThrowingContinuation { continuation in
+            lock.lock(); defer { lock.unlock() }
+            guard !closed, pendingProfileTransitions == 0, resourceRegistryValid, registryGeneration == captured.0,
+                  values["native_state"]?["activeProfileId"] == .string(profileID) else {
+                continuation.resume(throwing: VortxNativeError.superseded); return
+            }
+            let item: VortxJSON = .object(["kind": .string("standard"), "id": .string(id), "type": .string(type),
+                                           "name": meta["name"]!, "poster": meta["poster"] ?? .null])
+            let action: VortxJSON = .object(["type": .string("add_library_item"), "profileId": .string(profileID), "item": item])
+            do {
+                let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
+                guard enqueueMutation(type: "add_library_item", raw: raw, completion: { result in continuation.resume(with: result.map { _ in true }) }) else {
+                    continuation.resume(throwing: VortxNativeError.closed); return
+                }
+            } catch { continuation.resume(throwing: error) }
+        }
+    }
     /// Testing/integration receipt: waits for currently admitted operations, never launches UI/media.
     func settled() async {
         let pending = lock.withLock { Array(tasks.values) }

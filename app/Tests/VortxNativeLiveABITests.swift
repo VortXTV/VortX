@@ -65,6 +65,14 @@ import CryptoKit
         await facade.settled(); check(try field("subtitles").array?.first?["content"]?["content"]?.array?.count == 2)
         try dispatch(["action": "Load", "args": ["model": "LibraryWithFilters", "args": ["request": ["sort": "lastwatched", "page": 1]]]], field: "library")
         await facade.settled(); check(try field("library")["catalog"] == .array([]))
+        check(try await !facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: scope.ownerProfileID, allowInsert: false))
+        let detailBeforeAutoAdd = try field("meta_details")
+        check(try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: scope.ownerProfileID, allowInsert: true))
+        check(try field("library")["catalog"]?.array?.count == 1)
+        check(try field("meta_details")["selected"] == detailBeforeAutoAdd["selected"])
+        check(try field("meta_details")["metaItems"] == detailBeforeAutoAdd["metaItems"])
+        do { _ = try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: "kid", allowInsert: true); fatalError("stale profile auto-add admitted") }
+        catch VortxNativeError.superseded {}
         try dispatch(["action": "Ctx", "args": ["action": "AddToLibrary", "args": ["id": "tt-fixture", "type": "series", "name": "Fixture"]]], field: "ctx")
         await facade.settled(); check(try field("library")["catalog"]?.array?.count == 1)
         try dispatch(["action": "Vortx", "args": ["type": "add_profile", "id": "kid", "name": "Kid"]], field: "native_state")
@@ -117,6 +125,54 @@ import CryptoKit
         let reopened = try VortxNativeSession(scope: scope, ownerName: "Fixture", abi: VortxCABI(), store: checkpoint, transport: VortxCResourceTransport())
         check(try await reopened.stateJSON() == lastState)
         await reopened.close()
+
+        // Full public Apple extractor -> real C import -> single sealed checkpoint -> cold reopen.
+        // The fixture uses no live credentials, provider call or media load.
+        var owner = UserProfile(id: UUID(uuidString: "20000000-0000-0000-0000-000000000001")!, name: "Owner", avatar: "O", isOwner: true)
+        owner.pin = UserProfile.pinHash("1234", profileID: owner.id)
+        let child = UserProfile(id: UUID(uuidString: "10000000-0000-0000-0000-000000000001")!, name: "Child", avatar: "C")
+        let legacyScope = VortxAccountScope(account: "fixture-legacy-account", ownerProfileID: owner.id.uuidString)
+        var source = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "app/Tests/Fixtures/legacy-bootstrap-apple.json"))) as! [String: Any]
+        source.removeValue(forKey: "settings") // fixture's deliberately opaque placeholder is not a real settings backup
+        source["apiKeys"] = ["provider": "fixture-must-not-persist"]
+        let sourceBytes = try JSONSerialization.data(withJSONObject: source)
+        let material = try VortxLegacyBootstrapMaterial.encode(document: sourceBytes, roster: [owner, child], ownerProfileID: owner.id, rosterModifiedSeconds: 1720000000.1234)
+        let archive = try VortxNativeBootstrapArchive.encode(document: sourceBytes, material: material)
+        let action: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(legacyScope.account), "ownerProfileId": .string(legacyScope.ownerProfileID),
+                                         "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
+        let rawImport = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
+        let rejectedScope = VortxAccountScope(account: "fixture-rejected-import", ownerProfileID: owner.id.uuidString)
+        let rejectedStore = try VortxEncryptedCheckpointStore(directory: URL(fileURLWithPath: CommandLine.arguments[3]).appendingPathComponent("rejected"), key: SymmetricKey(size: .bits256))
+        do {
+            _ = try VortxNativeSession(scope: rejectedScope, ownerName: "Owner", abi: VortxCABI(), store: rejectedStore,
+                                       transport: VortxCResourceTransport(), allowNewAccount: true, initialActions: [rawImport])
+            fatalError("wrong-scope first import committed")
+        } catch VortxNativeError.invalidResponse {}
+        check(try rejectedStore.read(scope: rejectedScope) == nil)
+        let migrationStore = try VortxEncryptedCheckpointStore(directory: URL(fileURLWithPath: CommandLine.arguments[3]).appendingPathComponent("migration"),
+                                                               key: SymmetricKey(size: .bits256), bootstrap: archive, bootstrapScope: legacyScope)
+        let migrated = try VortxNativeSession(scope: legacyScope, ownerName: "Owner", abi: VortxCABI(), store: migrationStore, transport: VortxCResourceTransport(),
+                                              allowNewAccount: true, initialActions: [rawImport])
+        let migrationState = try await migrated.stateJSON()
+        let stateObject = try JSONDecoder().decode(VortxJSON.self, from: Data(migrationState.utf8))
+        check(stateObject["roster"]?["profiles"]?[owner.id.uuidString]?["pin"] == .string(owner.pin!))
+        check(stateObject["nativeSync"]?["legacyImport"]?["schemaVersion"] == .integer(1))
+        check(stateObject["libraries"]?[child.id.uuidString]?["items"] == .array([]))
+        _ = try await migrated.dispatch([rawImport], now: 10)
+        check(try await migrated.stateJSON() == migrationState) // exact replay cannot change imported clocks
+        var different = try JSONSerialization.jsonObject(with: Data(rawImport.utf8)) as! [String: Any]
+        var changedMaterial = different["material"] as! [String: Any]; changedMaterial["rosterModifiedSeconds"] = 1720000001.1234
+        different["material"] = changedMaterial
+        do { _ = try await migrated.dispatch([String(decoding: JSONSerialization.data(withJSONObject: different), as: UTF8.self)], now: 11); fatalError("different legacy material replaced native authority") }
+        catch VortxNativeError.invalidResponse {}
+        check(try migrationStore.read(scope: legacyScope) == migrationState)
+        await migrated.close()
+        let migratedCold = try VortxNativeSession(scope: legacyScope, ownerName: "Owner", abi: VortxCABI(), store: migrationStore, transport: VortxCResourceTransport())
+        check(try await migratedCold.stateJSON() == migrationState)
+        _ = try await migratedCold.dispatch([#"{"type":"switch_profile","id":"10000000-0000-0000-0000-000000000001"}"#], now: 11)
+        check(try await migratedCold.resumeSeconds(id: "opaque-episode", profileID: child.id.uuidString) == 12.345)
+        await migratedCold.close()
         print("Live native Swift C ABI: hydration/deltas; full resources; facade Board/Discover/Search/Meta/streams/subtitles/library; scoped FIFO profile/progress, registry rebind and encrypted nativeSync/watchContexts cold reopen passed")
+        print("Live Apple authenticated importer: historical owner/PIN, fractional watch material, saved-vs-played separation, idempotent receipt and encrypted cold episode resume passed")
     }
 }
