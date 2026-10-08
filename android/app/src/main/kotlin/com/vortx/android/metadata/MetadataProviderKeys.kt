@@ -1,6 +1,8 @@
 package com.vortx.android.metadata
 
 import android.content.Context
+import com.vortx.android.BuildConfig
+import com.vortx.android.integrations.NativeProviderAccess
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.integrations.SecureTokenStore
@@ -56,6 +58,7 @@ class MetadataProviderKeys(context: Context) {
 
     /** The stored value for [slot], or empty when unset. The value never leaves the secure store otherwise. */
     fun value(slot: Slot): String = synchronized(OWNER_LOCK) {
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) return@synchronized NativeProviderAccess.read(setOf(slot.syncKey))?.values?.get(slot.syncKey).orEmpty()
         val owner = currentOwner() ?: return@synchronized ""
         observeOwner(owner)
         if (!adoptLegacy(owner)) return@synchronized ""
@@ -70,6 +73,7 @@ class MetadataProviderKeys(context: Context) {
      * rather than reporting a durable save that did not happen.
      */
     fun set(slot: Slot, value: String): Boolean = synchronized(OWNER_LOCK) {
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) return@synchronized NativeProviderAccess.edit(mapOf(slot.syncKey to value.trim().takeIf(String::isNotEmpty)))
         val owner = currentOwner() ?: return@synchronized false
         observeOwner(owner)
         if (!adoptLegacy(owner) || !debridKeys.isCurrent(owner)) return@synchronized false
@@ -89,6 +93,7 @@ class MetadataProviderKeys(context: Context) {
      * blocks the session mutation, so no later account can observe the prior account's credential.
      */
     internal fun runOwnerTransition(mutation: () -> Boolean): Boolean = synchronized(OWNER_LOCK) {
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) return@synchronized mutation()
         val owner = currentOwner() ?: return@synchronized false
         if (!adoptLegacy(owner)) return@synchronized false
         mutation()
@@ -140,7 +145,7 @@ class MetadataProviderKeys(context: Context) {
         private var observedOwner: DebridOwnerToken? = null
 
         /** Live key changes and owner switches repaint subscribers, matching [DebridKeys.credentialRevision]. */
-        internal val credentialRevision: StateFlow<Long> = _credentialRevision.asStateFlow()
+        internal val credentialRevision: StateFlow<Long> get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.revision else _credentialRevision.asStateFlow()
 
         private fun advanceRevision() {
             _credentialRevision.value = revisionCounter.incrementAndGet()

@@ -74,13 +74,25 @@ and pending state adjacent to the kernel. Only the carrier is uploaded; an exact
 generation is acknowledged, so edits during PUT remain pending across cold restart.
 Old `hostProfileSyncPending` intent migrates only against an authenticated baseline.
 Native-owned name/PIN/parental/theme fields remain pushable through `nativeSync`.
-Provider-credential completion is a separate, unresolved cutover blocker: Android
-does not yet record durable explicit-clear intent or consume the new provider registers.
-A local key removal can therefore leave the older remote key intact while unrelated
-native state uploads; it must not be described as credential synchronization. The known
-`nativeProviderCredentials` cloud carrier is excluded entirely from local host archives,
-not copied into checkpoints. Default native selection remains off until that secure-store
-intent/merge/ack path and its tests are complete.
+Native provider credentials use the shared `nativeProviderCredentials` schema-1
+account-scoped register carrier. The seven metadata/debrid keys and complete Trakt/SIMKL
+OAuth tuples use safe-integer Lamport clocks, canonical UUID actors, explicit null clears,
+and exact-event acknowledgements. Equal stamps with different values are rejected.
+One confirmed encrypted account record is both the actual credential backing and its
+pending sync journal: OAuth tuple publication cannot succeed separately from durable
+intent. A captured account epoch and selected credential event fence asynchronous OAuth
+publication, including same-account sign-out/reopen. Secure pending events re-arm sync
+after process death; edits during PUT remain pending. Metadata aliases are mirrored in
+both existing cloud locations while unknown `apiKeys` fields survive.
+
+Authenticated legacy cloud keys remain a secure fallback only while no native register
+exists; they are not promoted to register authority and cannot resurrect native clears.
+Existing explicitly account-qualified metadata/debrid slots can supply the initial local
+fallback. Unscoped legacy OAuth tuples require reauthentication; they are not assigned to
+the current account. The credential carrier is excluded entirely from local host archives
+and native checkpoints. Native provider backing stays solely in encrypted credential
+storage and encrypted cloud documents. Default native selection remains off; local
+fixtures do not establish Android Keystore, actual provider or device behavior.
 
 Checkpoints live in Android's `noBackupFilesDir/native-state`. Android Keystore
 holds a non-exportable AES-256 key per scope. The sealed payload is
@@ -138,11 +150,10 @@ Watch-only/idempotent cloud merges preserve an active playback lease; actual
 profile, registry and host-preference changes revoke it. A cached detail offset
 cannot overwrite the kernel's exact resume offset or explicit reset-to-zero.
 
-Still unsupported (repository operations fail explicitly; the provider-clear gap above
-is an unresolved exception and release blocker): Stremio login,
+Still unsupported (repository operations fail explicitly): Stremio login,
 unresolved own-Stremio-account migration, ambiguous or incomplete legacy carriers,
 legacy changes without the shared reducer's required causal evidence (including pending
-website profile patches), outbound provider credential reconciliation,
+website profile patches), unscoped legacy OAuth ownership attribution,
 global settings outside the explicit shared SettingsBackup type whitelist (and legacy
 flat native-profile theme changes), whole-series bulk watched mutation and add-on URL
 replacement. The existing profile UI verifies projected salted PINs before

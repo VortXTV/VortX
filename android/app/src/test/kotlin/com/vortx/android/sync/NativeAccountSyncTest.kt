@@ -25,8 +25,13 @@ import org.junit.Test
 /** Exercises the actual captured-lease crypto/pull/push path with local-only transport. */
 @OptIn(ExperimentalCoroutinesApi::class)
 class NativeAccountSyncTest {
+    private val providerStore = com.vortx.android.integrations.NativeProviderTestStore()
+    private fun installNative(manager: VortXSyncManager, gateway: NativeAccountGateway) {
+        manager.installSessionRestoreTestSeam(manager.currentSession())
+        manager.installNativeGatewayTestSeam(gateway, providerStore)
+    }
     @org.junit.Before fun mainDispatcher() { Dispatchers.setMain(UnconfinedTestDispatcher()) }
-    @org.junit.After fun resetDispatcher() { Dispatchers.resetMain() }
+    @org.junit.After fun resetDispatcher() { com.vortx.android.integrations.NativeProviderAccess.unbindForTest(); Dispatchers.resetMain() }
     private val key = ByteArray(32) { (it + 1).toByte() }
     private val account = VortXSyncManager.Account("00000000-0000-0000-0000-000000000123", "fixture@example.invalid", "Fixture", false)
     private fun bindings() = object : VortxRuntimeBindings {
@@ -67,7 +72,7 @@ class NativeAccountSyncTest {
                     if (method == "PUT") puts++
                     code to body
                 })
-                manager.installNativeGatewayTestSeam(gateway)
+                installNative(manager, gateway)
                 assertFalse(manager.syncDown(true)); assertFalse(manager.syncUp())
                 assertEquals(0, gateway.applied); assertEquals(0, puts)
                 assertEquals(1, gateway.reopened)
@@ -95,7 +100,7 @@ class NativeAccountSyncTest {
                     200 to JSONObject().put("accepted", true)
                 }
             })
-            manager.installNativeGatewayTestSeam(gateway)
+            installNative(manager, gateway)
             assertTrue(manager.syncDown(true)); assertTrue(manager.syncUp())
             val result = requireNotNull(uploaded)
             assertEquals(1, result.getJSONObject("foreign").getInt("keep"))
@@ -116,7 +121,7 @@ class NativeAccountSyncTest {
         try {
             manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0,
                 transport = { _, _, _, _ -> requests++; 500 to null })
-            manager.installNativeGatewayTestSeam(gateway)
+            installNative(manager, gateway)
             context.getSharedPreferences("vortx_sync_dirty", 0).edit().putString(storageKey, "{\"stremiox.audioLang\":123.25}").commit()
             assertFalse(manager.syncUp())
             assertEquals(0, requests)
@@ -166,7 +171,7 @@ class NativeAccountSyncTest {
                     uploads++; 200 to JSONObject().put("accepted", true)
                 }
             })
-            manager.installNativeGatewayTestSeam(runtime)
+            installNative(manager, runtime)
             assertTrue(manager.syncDown(true))
             val profiles = NativeProfileAccess { runtime.session() }
             val pin = UserProfile.pinHash("1234", owner.id)
@@ -183,7 +188,7 @@ class NativeAccountSyncTest {
             rejectPut = true
             assertFalse(manager.syncUp()); assertEquals(1, uploads)
             assertTrue(runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
-            runtime.retire(); runtime = coordinator(); manager.installNativeGatewayTestSeam(runtime)
+            runtime.retire(); runtime = coordinator(); installNative(manager, runtime)
             assertTrue(manager.syncDown(true))
             assertEquals("moon", NativeProfileAccess { runtime.session() }.read().profiles.single().avatar)
             assertTrue(runtime.session().read().state.getJSONObject("nativeHostPreferenceState").getBoolean("pending"))
@@ -204,7 +209,7 @@ class NativeAccountSyncTest {
             assertFalse(cloud.getJSONObject("nativeSync").has("hostProfileSyncPending"))
             assertFalse(cloud.has("nativeHostPreferenceState"))
             assertEquals("star", cloud.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).getString("avatar"))
-            runtime.retire(); runtime = coordinator(); manager.installNativeGatewayTestSeam(runtime)
+            runtime.retire(); runtime = coordinator(); installNative(manager, runtime)
             // Another account/process may have left a different flat preference. A's sealed
             // account register must project before the failed network pull, without cloud access.
             context.getSharedPreferences("vortx_settings", 0).edit().putBoolean("stremiox.autoSkip", false).commit()
@@ -260,7 +265,7 @@ class NativeAccountSyncTest {
                         }
                     }
                 })
-                manager.installNativeGatewayTestSeam(runtime)
+                installNative(manager, runtime)
                 val unknown = mode in setOf("timeout-created", "missing-ack")
                 assertEquals(!unknown, manager.syncUp())
                 if (unknown) {
@@ -278,6 +283,49 @@ class NativeAccountSyncTest {
                 assertEquals(before, runtime.session().read().state.toString()); assertEquals(writes, versions.size)
             } finally { runtime.retire(); manager.cancelSyncTestWork(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
         }
+    }
+
+    @Test fun `native provider clear is uploaded and acknowledged but edit during PUT remains pending`() = runBlocking {
+        val manager = VortXSyncManager(TestContext()); val gateway = Gateway()
+        val owner = SessionOwnerSnapshot.Account(account.id, 1)
+        val vault = com.vortx.android.integrations.NativeProviderVault(providerStore)
+        val credentials = vault.load(owner)
+        credentials.edit(mapOf("tmdb" to null, "realDebrid" to null))
+        vault.commit(owner, credentials)
+        val original = JSONObject("""{"apiKeys":{"tmdb":"legacy","realDebrid":"legacy","unknown":"keep","metadata":{"tmdb":"legacy","unknown":"keep"}}}""")
+        var cloud = original
+        var cloudVersion = 100L
+        var uploaded: JSONObject? = null
+        var editDuringPut = false
+        try {
+            manager.installSyncTestSeam(VortXSyncManager.Session("fixture-only", account, key), 0, transport = { method, _, body, _ ->
+                if (method == "GET") 200 to JSONObject().put("version", cloudVersion).put("document",
+                    VortXCrypto.sealDocument(key, cloud.toString().toByteArray(), account.id, cloudVersion, true))
+                else {
+                    val request = requireNotNull(body)
+                    uploaded = JSONObject(String(requireNotNull(VortXCrypto.openDocument(key, request.getString("document"), account.id, request.getLong("version")))))
+                    cloud = JSONObject(requireNotNull(uploaded).toString()); cloudVersion = request.getLong("version")
+                    if (editDuringPut) assertTrue(com.vortx.android.integrations.NativeProviderAccess.edit(mapOf("tmdb" to "newer-local")))
+                    200 to JSONObject().put("accepted", true)
+                }
+            })
+            installNative(manager, gateway)
+            assertTrue(manager.syncUp())
+            val clear = requireNotNull(uploaded)
+            assertFalse(clear.getJSONObject("apiKeys").has("realDebrid"))
+            assertFalse(clear.getJSONObject("apiKeys").has("tmdb"))
+            assertFalse(clear.getJSONObject("apiKeys").getJSONObject("metadata").has("tmdb"))
+            assertEquals("keep", clear.getJSONObject("apiKeys").getString("unknown"))
+            assertTrue(clear.getJSONObject("nativeProviderCredentials").getJSONObject("fields").getJSONObject("tmdb").isNull("value"))
+            val actualOwner = manager.sessionOwnerSnapshot() as SessionOwnerSnapshot.Account
+            assertFalse(com.vortx.android.integrations.NativeProviderAccess.hasPending(actualOwner)!!)
+            editDuringPut = true
+            assertTrue(manager.syncUp())
+            assertTrue(com.vortx.android.integrations.NativeProviderAccess.hasPending(actualOwner)!!)
+            assertEquals("newer-local", com.vortx.android.integrations.NativeProviderAccess.read(setOf("tmdb"))!!.values["tmdb"])
+            installNative(manager, gateway)
+            assertTrue(com.vortx.android.integrations.NativeProviderAccess.hasPending(actualOwner)!!)
+        } finally { manager.cancelSyncTestWork() }
     }
 
     private class TestContext : ContextWrapper(null) {

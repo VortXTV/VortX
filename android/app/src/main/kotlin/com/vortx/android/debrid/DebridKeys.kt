@@ -2,6 +2,8 @@ package com.vortx.android.debrid
 
 import android.content.Context
 import android.util.AtomicFile
+import com.vortx.android.BuildConfig
+import com.vortx.android.integrations.NativeProviderAccess
 import com.vortx.android.security.FailClosedCredentialStore
 import com.vortx.android.security.PersistentCredentialAvailability
 import java.io.ByteArrayInputStream
@@ -302,6 +304,7 @@ private class AndroidDebridKeyValueStore(context: Context) : DebridKeyValueStore
 class DebridKeys private constructor(
     private val store: DebridKeyValueStore,
     private val activeOwner: () -> DebridOwnerToken?,
+    private val nativeMode: Boolean = false,
 ) {
     internal constructor(
         store: DebridKeyValueStore,
@@ -314,6 +317,7 @@ class DebridKeys private constructor(
     constructor(context: Context) : this(
         store = AndroidDebridKeyValueStore(context.applicationContext),
         activeOwner = PROCESS_OWNER_BINDING::currentOwner,
+        nativeMode = BuildConfig.NATIVE_ENGINE_ENABLED,
     )
 
     /// The stored key for [service], or an empty string when none is set.
@@ -334,6 +338,12 @@ class DebridKeys private constructor(
      */
     internal fun credentialSnapshot(service: DebridService): DebridCredentialSnapshot =
         synchronized(CREDENTIAL_STATE_LOCK) {
+            if (nativeMode) {
+                val owner = currentOwner()
+                val read = NativeProviderAccess.read(setOf(service.id))
+                val valid = (owner?.scope as? DebridOwnerScope.Account)?.id == read?.owner?.id && currentOwner() == owner
+                return@synchronized DebridCredentialSnapshot(if (valid) read?.values?.get(service.id).orEmpty() else "", read?.revision ?: -1, owner)
+            }
             val owner = currentOwner()
             observeOwnerLocked(owner)
             if (owner == null) {
@@ -353,6 +363,7 @@ class DebridKeys private constructor(
 
     /** Current revision after observing any account-owner transition. */
     internal fun currentCredentialRevision(): Long = synchronized(CREDENTIAL_STATE_LOCK) {
+        if (nativeMode) return@synchronized NativeProviderAccess.read(emptySet())?.revision ?: -1
         observeOwnerLocked(currentOwner())
         credentialRevisionCounter.get()
     }
@@ -368,6 +379,7 @@ class DebridKeys private constructor(
         expectedRevision: Long,
         issue: () -> Unit,
     ): Boolean = synchronized(CREDENTIAL_STATE_LOCK) {
+        if (nativeMode) return@synchronized NativeProviderAccess.authorize(service.id, expectedKey, expectedRevision, issue)
         val current = credentialSnapshot(service)
         if (
             expectedKey.isEmpty() ||
@@ -389,6 +401,11 @@ class DebridKeys private constructor(
     /// read view and reports storage unavailable until a later secure read or commit succeeds.
     @Synchronized
     internal fun status(service: DebridService): DebridKeyStatus {
+        if (nativeMode) {
+            val read = NativeProviderAccess.read(setOf(service.id))
+            val hasValue = !read?.values?.get(service.id).isNullOrEmpty()
+            return DebridKeyStatus(hasValue, hasValue, read == null)
+        }
         val owner = currentOwner()
             ?: return DebridKeyStatus(
                 hasValue = false,
@@ -412,6 +429,7 @@ class DebridKeys private constructor(
     /// the process migration lock, matching every other two-lock path, and neither lock spans suspension.
     @Synchronized
     fun setKey(service: DebridService, value: String): Boolean {
+        if (nativeMode) return NativeProviderAccess.edit(mapOf(service.id to value.trim().takeIf(String::isNotEmpty)))
         return synchronized(CREDENTIAL_STATE_LOCK) credentialState@{
             val owner = currentOwner() ?: return@credentialState false
             observeOwnerLocked(owner)
@@ -539,6 +557,12 @@ class DebridKeys private constructor(
     private fun currentOwner(): DebridOwnerToken? = activeOwner()
 
     private fun keyFromStorage(service: DebridService, owner: DebridOwnerToken): String {
+        if (nativeMode) {
+            val read = NativeProviderAccess.read(setOf(service.id)) ?: return ""
+            return read.values[service.id].orEmpty().takeIf {
+                (owner.scope as? DebridOwnerScope.Account)?.id == read.owner.id && isCurrent(owner)
+            }.orEmpty()
+        }
         val storageKey = service.storageKey(owner.scope)
         val wasUnavailable = isStorageUnavailable(storageKey)
         synchronized(LEGACY_ADOPTION_LOCK) {
@@ -575,6 +599,7 @@ class DebridKeys private constructor(
      * Without it, two instances could both observe a missing marker and adopt the same legacy key for A and B.
      */
     private fun adoptLegacyForFirstOwner(owner: DebridOwnerToken) {
+        if (nativeMode) return // Global legacy values are not authenticated account ownership evidence.
         synchronized(LEGACY_ADOPTION_LOCK) {
             if (!isCurrent(owner)) return
             val domain = store.adoptionDomain
@@ -933,7 +958,7 @@ class DebridKeys private constructor(
         private var didObserveCredentialOwner = false
 
         /** Visible key changes, successful mutations, and observed owner transitions publish one revision. */
-        internal val credentialRevision: StateFlow<Long> = _credentialRevision.asStateFlow()
+        internal val credentialRevision: StateFlow<Long> get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.revision else _credentialRevision.asStateFlow()
 
         private fun advanceCredentialRevisionLocked() {
             val next = credentialRevisionCounter.incrementAndGet()

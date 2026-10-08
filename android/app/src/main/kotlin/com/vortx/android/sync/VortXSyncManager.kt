@@ -948,7 +948,8 @@ class VortXSyncManager(context: Context) {
         persist = store::persist,
         clear = store::clear,
         ownerTransition = { mutation ->
-            metadataKeys.runOwnerTransition { debridKeys.runOwnerTransition(mutation) }
+            if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) mutation()
+            else metadataKeys.runOwnerTransition { debridKeys.runOwnerTransition(mutation) }
         },
     )
     private val operations = SessionOperationCoordinator()
@@ -977,18 +978,57 @@ class VortXSyncManager(context: Context) {
     @Volatile private var addonGateway: AccountAddonSyncGateway? = null
     @Volatile private var libraryGateway: AccountLibrarySyncGateway? = null
     @Volatile private var nativeGateway: NativeAccountGateway? = null
+    private var nativeProviderStore: com.vortx.android.integrations.CredentialStoreAccess? = null
+    private var nativeProviderTestStore = false
+
+    private fun bindNativeProviders() {
+        val credentials = nativeProviderStore ?: com.vortx.android.integrations.SecureTokenStore(appContext, "vortx_native_provider_credentials")
+            .also { nativeProviderStore = it }
+        com.vortx.android.integrations.NativeProviderAccess.bind(
+            com.vortx.android.integrations.NativeProviderVault(credentials, if (nativeProviderTestStore) null else { owner ->
+                // Only explicitly account-qualified old slots can migrate. The legacy global
+                // debrid/metadata slots and unscoped OAuth tuples are never attributed here.
+                val debrid = com.vortx.android.integrations.SecureTokenStore(appContext, DebridKeys.ENCRYPTED_FILE)
+                val metadata = com.vortx.android.integrations.SecureTokenStore(appContext, "vortx_metadata_credentials")
+                val debridNames = DebridService.entries.associate { "vortx.debrid.${it.id}.account.${owner.id}" to it.id }
+                val metadataNames = MetadataProviderKeys.Slot.entries.associate { "${it.key}.account.${owner.id}" to it.syncKey }
+                val api = JSONObject()
+                for ((store, names) in listOf(debrid to debridNames, metadata to metadataNames)) {
+                    val values = store.confirmedSnapshot(*names.keys.toTypedArray())
+                    check(values.availability == com.vortx.android.security.PersistentCredentialAvailability.AVAILABLE)
+                    names.forEach { (key, wire) -> values.values[key]?.takeIf(String::isNotEmpty)?.let { api.put(wire, it) } }
+                }
+                JSONObject().put("apiKeys", api)
+            }),
+            object : com.vortx.android.integrations.NativeProviderAdmission {
+                override fun <T> withCurrent(expected: SessionOwnerSnapshot.Account?, action: (SessionOwnerSnapshot.Account) -> T): T? =
+                    operations.snapshot { sessionState.serialized {
+                        val owner = sessionOwnerSnapshot() as? SessionOwnerSnapshot.Account
+                        if (owner == null || (expected != null && expected != owner)) null else action(owner)
+                    } }
+            },
+            changed = { owner ->
+                val lease = captureSyncLease()
+                if (lease != null && lease.accountId == owner.id && lease.ownerEpoch == owner.generation) armPendingSync(lease, recordEdit = true)
+            },
+        )
+    }
 
     internal fun attachNativeGateway(gateway: NativeAccountGateway) {
         check(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
         nativeGateway = gateway
+        bindNativeProviders()
         scope.launch { syncDown(force = true) }
         scope.launch { sessionUiState.collect { state ->
+            com.vortx.android.integrations.NativeProviderAccess.accountChanged()
             if (state !is SessionUiState.SignedIn) gateway.retire()
         } }
     }
-    internal fun installNativeGatewayTestSeam(gateway: NativeAccountGateway) {
+    internal fun installNativeGatewayTestSeam(gateway: NativeAccountGateway, credentials: com.vortx.android.integrations.CredentialStoreAccess? = null) {
         check(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
         nativeGateway = gateway
+        if (credentials != null) { nativeProviderStore = credentials; nativeProviderTestStore = true }
+        bindNativeProviders()
     }
 
     /**
@@ -1858,6 +1898,9 @@ class VortXSyncManager(context: Context) {
         catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
         catch (_: Exception) { return false }
         if (reopened && !applyNativeHostSettings(lease, gateway.exportDocument(account))) return false
+        // The secure journal is authoritative even if the process died before the ordinary
+        // debounce marker was written. Re-arm its exact account before permitting a pull.
+        if (com.vortx.android.integrations.NativeProviderAccess.hasPending(account) == true) armPendingSync(lease, recordEdit = true)
         if (retryPendingPushBeforePull(lease)) return false
         val pulled = pullSyncDocResult(lease)
         if (pulled == SyncDocPull.Empty) {
@@ -1870,23 +1913,14 @@ class VortXSyncManager(context: Context) {
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
         if (!applied) return false
-        var credentialsStored = true
         if (!applyNativeHostSettings(lease, gateway.exportDocument(account))) return false
-        // Host-only credential storage stays outside the kernel. Keep the complete lease locked
-        // through each write so an account switch cannot redirect a captured account's keys.
+        // The same atomic secure record backs provider reads and register intent. No deferred
+        // credential application can replay an older pull over a newer local edit after suspension.
+        var credentialsStored = false
         if (!publishIfSyncLeaseCurrent(lease) {
-            val apiKeys = pull.doc.optJSONObject("apiKeys")
-            for (service in DebridService.entries) {
-                val value = apiKeys?.optString(service.id, "").orEmpty()
-                if (value.isNotEmpty() && !debridKeys.setKey(service, value)) credentialsStored = false
-            }
-            val metadata = apiKeys?.optJSONObject("metadata")
-            for (slot in MetadataProviderKeys.Slot.entries) {
-                val value = metadata?.optString(slot.syncKey, "").orEmpty()
-                if (value.isNotEmpty() && !metadataKeys.set(slot, value)) credentialsStored = false
-            }
-        }) return false
-        return credentialsStored && advanceVersion(lease, pull.version)
+            credentialsStored = com.vortx.android.integrations.NativeProviderAccess.merge(account, pull.doc) != null
+        } || !credentialsStored) return false
+        return advanceVersion(lease, pull.version)
     }
 
     private suspend fun applyNativeHostSettings(lease: SyncSessionLease, exported: NativeAccountExport?): Boolean {
@@ -1915,6 +1949,7 @@ class VortXSyncManager(context: Context) {
         val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
         var pushedStamps: Map<String, Double> = emptyMap()
         var pushedPreferences: JSONObject? = null
+        var pushedProviders: JSONObject? = null
         var seed = false
         suspend fun derived(): JSONObject? {
             var globals = JSONObject()
@@ -1939,6 +1974,7 @@ class VortXSyncManager(context: Context) {
                 // Fresh seed has no mounted writer or local actor. Preserve any queued local
                 // setting intent for a subsequent normal transaction, never acknowledge it here.
                 pushedPreferences = null
+                pushedProviders = null
                 return document
             }
             if (!gateway.applyDocument(account, document) { isSyncLeaseCurrent(lease) }) return null
@@ -1953,10 +1989,11 @@ class VortXSyncManager(context: Context) {
             merged.put("nativeSync", exported.nativeSync)
             pushedPreferences = exported.hostPreferences
             exported.hostPreferences?.let { merged.put("nativeHostPreferences", it) }
-            val hostCandidate = JSONObject(document.toString())
-            if (!publishIfSyncLeaseCurrent(lease) { mergeDebridKeysIntoDoc(hostCandidate); mergeMetadataKeysIntoDoc(hostCandidate) }) return null
-            if (hostCandidate.opt("apiKeys")?.toString() != document.opt("apiKeys")?.toString()) return null
-            return merged
+            var providerCandidate: JSONObject? = null
+            if (!publishIfSyncLeaseCurrent(lease) { providerCandidate = com.vortx.android.integrations.NativeProviderAccess.merge(account, merged) }) return null
+            val withProviders = providerCandidate ?: return null
+            pushedProviders = withProviders.getJSONObject("nativeProviderCredentials")
+            return withProviders
         }
         val first = derived() ?: return false
         val pushed = if (seed) {
@@ -1966,7 +2003,7 @@ class VortXSyncManager(context: Context) {
             when (pushSyncDocAt(lease, first, 0)) {
                 is PushOutcome.Accepted -> {
                     if (!gateway.applyDocument(account, first) { isSyncLeaseCurrent(lease) }) return false
-                    if (pushedStamps.isNotEmpty()) return false
+                    if (pushedStamps.isNotEmpty() || com.vortx.android.integrations.NativeProviderAccess.hasPending(account) != false) return false
                     true
                 }
                 is PushOutcome.Error -> false
@@ -1980,6 +2017,10 @@ class VortXSyncManager(context: Context) {
         // Only acknowledge the exact carrier accepted by the server. A local edit during the PUT
         // has a different register event and remains pending, including after a cold restart.
         pushedPreferences?.let { if (!gateway.acknowledgeHostPreferences(account, it)) return false }
+        pushedProviders?.let { sent ->
+            var acknowledged = false
+            if (!publishIfSyncLeaseCurrent(lease) { acknowledged = com.vortx.android.integrations.NativeProviderAccess.acknowledge(account, sent) } || !acknowledged) return false
+        }
         if (!publishIfSyncLeaseCurrent(lease) { clearPushedDirtySettings(pushedStamps) }) return false
         return isSyncLeaseCurrent(lease)
     }
