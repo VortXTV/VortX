@@ -21,7 +21,7 @@ test -s "$native_live_dir/port"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST -I "$native_live_dir" \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
-    app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
+    app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
     app/Tests/VortxNativeLiveABITests.swift "$library" -o "$native_live_dir/live-abi"
 DYLD_LIBRARY_PATH="$(dirname "$library"):$(dirname "$library")/deps" \
     "$native_live_dir/live-abi" test/fixtures/native-resource-contract.json "$(<"$native_live_dir/port")" "$native_live_dir/checkpoints"

@@ -10,9 +10,12 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
 "$native_test_dir/native-bridges" test/fixtures/native-resource-contract.json
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
-  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
+  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
   app/Tests/VortxNativeSessionTests.swift -o "$native_test_dir/native-session"
 "$native_test_dir/native-session" "$native_test_dir"
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/VortxNativeBootstrapArchive.swift app/Tests/VortxNativeBootstrapArchiveTests.swift -o "$native_test_dir/bootstrap-archive"
+"$native_test_dir/bootstrap-archive"
 xcrun swiftc -warnings-as-errors app/Tests/CoreBridgePublicationFenceContractTests.swift -o "$native_test_dir/publication-contract"
 "$native_test_dir/publication-contract"
 xcrun swiftc -warnings-as-errors app/SourcesShared/PlaybackMutationOwnershipPolicy.swift \

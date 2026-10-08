@@ -91,6 +91,18 @@ hashes. That covers real kernel queries/mutations and localhost resources, not f
 
 ## Artifact gate
 
+Native checkpoints now dual-read old sealed raw runtime snapshots and write an atomic sealed
+`vortx-native-checkpoint-v1` envelope containing `state` plus optional `bootstrap` archive bytes.
+The archive carries exact typed `legacyImportMaterial` (including fractional clocks), full
+noncredential `hostDocument` fields, and explicit `excludedCredentialPaths`; it is never hydrated
+into the kernel or exported as `nativeSync`. Original raw cloud documents remain unchanged in the
+existing encrypted transport. This archive is not advertised as a byte-identical raw backup.
+Known auth/token/password/API-key carriers, including nested settings `kcfallback.*`, are excluded.
+SettingsBackup JSON/base64/binary-plist and inspectable nested Data are inspected recursively without
+dropping unrelated preference keys. Unknown credential-like carriers or opaque preference Data fail
+closed for reconciliation. Configured addon URL strings and ordinary library `key` fields retain
+their exact values. Existing encrypted bootstrap material survives every acknowledged rewrite.
+
 Root integration must update the exact private-core pin, copied header, feature set, required
 symbols and cache keys together. Existing release pins must not acquire calls into absent exports.
 

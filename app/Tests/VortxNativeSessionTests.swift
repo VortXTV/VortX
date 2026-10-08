@@ -128,13 +128,31 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
 
         let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("sealed")
         let key = SymmetricKey(size: .bits256)
-        let encrypted = try VortxEncryptedCheckpointStore(directory: directory, key: key)
+        let archive = try VortxNativeBootstrapArchive.encode(document: Data(#"{"futurePreference":{"keep":42},"apiKeys":{"provider":"fixture-excluded"}}"#.utf8),
+                                                              material: Data(#"{"schemaVersion":1,"sourceClock":1000.125}"#.utf8))
+        let encrypted = try VortxEncryptedCheckpointStore(directory: directory, key: key, bootstrap: archive)
         try encrypted.commit(before, scope: scope)
         check(try encrypted.read(scope: scope) == before)
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         precondition(files.count == 1)
         let bytes = try Data(contentsOf: files[0])
         precondition(bytes.range(of: Data("Retain context".utf8)) == nil)
+        func archived(_ bytes: Data) throws -> Data? {
+            let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: bytes), using: key, authenticating: scope.authenticatedData)
+            let envelope = try JSONSerialization.jsonObject(with: plain) as! [String: Any]
+            return (envelope["bootstrap"] as? String).flatMap { Data(base64Encoded: $0) }
+        }
+        check(try archived(bytes) == archive)
+        let coldStore = try VortxEncryptedCheckpointStore(directory: directory, key: key)
+        check(try coldStore.read(scope: scope) == before)
+        try coldStore.commit(before, scope: scope)
+        check(try archived(Data(contentsOf: files[0])) == archive)
+        // Prior raw-runtime files remain readable; their next commit adopts a sealed envelope.
+        let legacySealed = try AES.GCM.seal(Data(before.utf8), using: key, authenticating: scope.authenticatedData).combined!
+        try legacySealed.write(to: files[0], options: .atomic)
+        check(try encrypted.read(scope: scope) == before)
+        try encrypted.commit(before, scope: scope)
+        check(try archived(Data(contentsOf: files[0])) == archive)
         let wrongKey = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(size: .bits256))
         do { _ = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: wrongKey, transport: transport, allowNewAccount: true); fatalError("decrypt failure seeded empty owner") }
         catch {}

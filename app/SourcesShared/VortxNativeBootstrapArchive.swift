@@ -1,0 +1,98 @@
+import Foundation
+
+/// Account-attributed recovery material, sealed beside (never inserted into) the kernel snapshot.
+/// This is deliberately NOT a byte-identical raw cloud backup: explicit credential carriers are
+/// excluded, while typed migration clocks and every inspectable noncredential host field survive.
+enum VortxNativeBootstrapArchive {
+    enum Failure: Error { case malformed, ambiguousCredentialCarrier, opaquePreference }
+    private static let credentials: Set<String> = [
+        "auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
+        "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials"
+    ]
+    static func encode(document: Data, material: Data? = nil) throws -> Data {
+        guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else { throw Failure.malformed }
+        var exclusions: [String] = []
+        let sanitized = try sanitize(source, path: "", exclusions: &exclusions)
+        var archive: [String: Any] = ["schemaVersion": 1, "hostDocument": sanitized,
+                                      "excludedCredentialPaths": exclusions.sorted()]
+        if let material {
+            guard let typed = try JSONSerialization.jsonObject(with: material) as? [String: Any],
+                  typed["schemaVersion"] as? Int == 1 else { throw Failure.malformed }
+            var forbidden: [String] = []
+            _ = try sanitize(typed, path: "/legacyImportMaterial", exclusions: &forbidden)
+            guard forbidden.isEmpty else { throw Failure.ambiguousCredentialCarrier }
+            archive["legacyImportMaterial"] = typed // never rewrite typed input/receipt source clocks
+        }
+        return try JSONSerialization.data(withJSONObject: archive, options: [.sortedKeys, .withoutEscapingSlashes])
+    }
+    static func validate(_ archive: Data) throws {
+        guard let object = try JSONSerialization.jsonObject(with: archive) as? [String: Any],
+              object["schemaVersion"] as? Int == 1, let host = object["hostDocument"] as? [String: Any],
+              object["excludedCredentialPaths"] is [String] else { throw Failure.malformed }
+        var forbidden: [String] = []
+        _ = try sanitize(host, path: "", exclusions: &forbidden)
+        if let material = object["legacyImportMaterial"] {
+            guard material is [String: Any] else { throw Failure.malformed }
+            _ = try sanitize(material, path: "/legacyImportMaterial", exclusions: &forbidden)
+        }
+        guard forbidden.isEmpty else { throw Failure.ambiguousCredentialCarrier }
+    }
+    private static func pointer(_ key: String) -> String {
+        key.replacingOccurrences(of: "~", with: "~0").replacingOccurrences(of: "/", with: "~1")
+    }
+    private static func sanitize(_ value: Any, path: String, exclusions: inout [String]) throws -> Any {
+        if let object = value as? [String: Any] {
+            var result: [String: Any] = [:]
+            for key in object.keys.sorted() {
+                let child = path + "/" + pointer(key)
+                let normalized = key.lowercased().replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "")
+                if credentials.contains(normalized) || key.lowercased().hasPrefix("kcfallback.") {
+                    exclusions.append(child); continue
+                }
+                // Unknown credential-like carriers require an explicit policy, not silent deletion
+                // or blind persistence. Do not classify ordinary keys or URL string contents.
+                if normalized.contains("secret") || normalized.contains("credential") ||
+                    ["token", "password", "authkey", "apikey"].contains(where: { normalized.hasSuffix($0) }) {
+                    throw Failure.ambiguousCredentialCarrier
+                }
+                if key == "settings", let encoded = object[key] as? String {
+                    result[key] = try settings(encoded, path: child, exclusions: &exclusions)
+                } else { result[key] = try sanitize(object[key]!, path: child, exclusions: &exclusions) }
+            }
+            return result
+        }
+        if let array = value as? [Any] {
+            return try array.enumerated().map { try sanitize($0.element, path: path + "/" + String($0.offset), exclusions: &exclusions) }
+        }
+        if let data = value as? Data {
+            // Preference Data is frequently JSON (full roster/playback fields) or a plist. Inspect
+            // both, preserving its Data type. Unknown binary payloads require reconciliation.
+            if let object = try? JSONSerialization.jsonObject(with: data) {
+                let safe = try sanitize(object, path: path, exclusions: &exclusions)
+                return try JSONSerialization.data(withJSONObject: safe, options: [.sortedKeys, .withoutEscapingSlashes])
+            }
+            var format = PropertyListSerialization.PropertyListFormat.binary
+            if let object = try? PropertyListSerialization.propertyList(from: data, options: [], format: &format) {
+                return try PropertyListSerialization.data(fromPropertyList: sanitize(object, path: path, exclusions: &exclusions), format: format, options: 0)
+            }
+            throw Failure.opaquePreference
+        }
+        guard value is String || value is NSNumber || value is NSNull || value is Date else { throw Failure.malformed }
+        return value
+    }
+    private static func settings(_ encoded: String, path: String, exclusions: inout [String]) throws -> String {
+        guard let bytes = Data(base64Encoded: encoded),
+              var envelope = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              envelope["format"] as? String == "vortx-backup", envelope["schema"] as? Int == 1,
+              let payload = envelope["payloadBase64"] as? String, let plist = Data(base64Encoded: payload),
+              let domain = try PropertyListSerialization.propertyList(from: plist, options: [], format: nil) as? [String: Any]
+        else { throw Failure.opaquePreference }
+        let safe = try sanitize(domain, path: path + "/payloadBase64", exclusions: &exclusions)
+        guard let domain = safe as? [String: Any] else { throw Failure.malformed }
+        envelope["payloadBase64"] = try PropertyListSerialization.data(fromPropertyList: domain, format: .binary, options: 0).base64EncodedString()
+        envelope["keyCount"] = domain.count
+        // Inspect envelope metadata too; its payload is already inspected and no longer opaque.
+        let safeEnvelope = try sanitize(envelope, path: path, exclusions: &exclusions)
+        return try JSONSerialization.data(withJSONObject: safeEnvelope, options: [.sortedKeys, .withoutEscapingSlashes]).base64EncodedString()
+    }
+}

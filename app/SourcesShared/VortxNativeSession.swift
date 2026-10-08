@@ -49,33 +49,58 @@ protocol VortxCheckpointStore: Sendable {
 /// The host supplies a key from its existing account secure store. This class never stores that key,
 /// tokens or plaintext snapshots. The encrypted file is separate from all legacy/account documents.
 final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Sendable {
+    private struct Envelope: Codable {
+        let format: String
+        let state: String
+        let bootstrap: Data?
+    }
     private let directory: URL
     private let key: SymmetricKey
     private let lock = NSLock()
-    init(directory: URL, key: SymmetricKey) throws {
+    private var bootstrap: Data?
+    init(directory: URL, key: SymmetricKey, bootstrap: Data? = nil) throws {
         guard key.bitCount == 256 else { throw VortxNativeError.invalidSnapshot }
-        self.directory = directory; self.key = key
+        if let bootstrap { try VortxNativeBootstrapArchive.validate(bootstrap) }
+        self.directory = directory; self.key = key; self.bootstrap = bootstrap
     }
     private func url(_ scope: VortxAccountScope) -> URL {
         let digest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
         return directory.appendingPathComponent("native-state-v1-\(digest).sealed")
     }
-    private func open(_ data: Data, scope: VortxAccountScope) throws -> String {
+    private func open(_ data: Data, scope: VortxAccountScope) throws -> Envelope {
         let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: data), using: key, authenticating: scope.authenticatedData)
         guard let snapshot = String(data: plain, encoding: .utf8) else { throw VortxNativeError.invalidSnapshot }
+        if let object = try JSONSerialization.jsonObject(with: plain) as? [String: Any], object["format"] != nil {
+            let envelope = try JSONDecoder().decode(Envelope.self, from: plain)
+            guard envelope.format == "vortx-native-checkpoint-v1" else { throw VortxNativeError.invalidSnapshot }
+            _ = try scope.validateSnapshot(envelope.state)
+            if let bootstrap = envelope.bootstrap { try VortxNativeBootstrapArchive.validate(bootstrap) }
+            return envelope
+        }
+        // Dual-read the prior raw runtime format without ever treating a failed decode as absence.
         _ = try scope.validateSnapshot(snapshot)
-        return snapshot
+        return Envelope(format: "vortx-native-checkpoint-v1", state: snapshot, bootstrap: nil)
     }
     func read(scope: VortxAccountScope) throws -> String? {
         lock.lock(); defer { lock.unlock() }
         try scope.validate()
-        do { return try open(Data(contentsOf: url(scope)), scope: scope) }
+        do {
+            let envelope = try open(Data(contentsOf: url(scope)), scope: scope)
+            if let retained = envelope.bootstrap { bootstrap = retained }
+            return envelope.state
+        }
         catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
     }
     func commit(_ snapshot: String, scope: VortxAccountScope) throws {
         lock.lock(); defer { lock.unlock() }
         try scope.validate(); _ = try scope.validateSnapshot(snapshot)
-        let sealed = try AES.GCM.seal(Data(snapshot.utf8), using: key, authenticating: scope.authenticatedData)
+        do {
+            // The first migration source is immutable, even for a fresh store instance making a
+            // later commit. A decode/read failure must not replace it with a newer/empty carrier.
+            if let retained = try open(Data(contentsOf: url(scope)), scope: scope).bootstrap { bootstrap = retained }
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {}
+        let envelope = Envelope(format: "vortx-native-checkpoint-v1", state: snapshot, bootstrap: bootstrap)
+        let sealed = try AES.GCM.seal(JSONEncoder().encode(envelope), using: key, authenticating: scope.authenticatedData)
         guard let combined = sealed.combined else { throw VortxNativeError.invalidSnapshot }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let staged = directory.appendingPathComponent(".native-checkpoint-\(UUID().uuidString).sealed")
@@ -83,13 +108,15 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         try combined.write(to: staged, options: [.withoutOverwriting, .completeFileProtection])
         let file = try FileHandle(forWritingTo: staged); defer { try? file.close() }
         try file.synchronize()
-        guard try open(Data(contentsOf: staged), scope: scope) == snapshot else { throw VortxNativeError.invalidSnapshot }
+        let stagedRead = try open(Data(contentsOf: staged), scope: scope)
+        guard stagedRead.state == snapshot, stagedRead.bootstrap == bootstrap else { throw VortxNativeError.invalidSnapshot }
         guard Darwin.rename(staged.path, url(scope).path) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         let directoryFD = Darwin.open(directory.path, O_RDONLY)
         guard directoryFD >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         defer { Darwin.close(directoryFD) }
         guard Darwin.fsync(directoryFD) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
-        guard try open(Data(contentsOf: url(scope)), scope: scope) == snapshot else { throw VortxNativeError.invalidSnapshot }
+        let installed = try open(Data(contentsOf: url(scope)), scope: scope)
+        guard installed.state == snapshot, installed.bootstrap == bootstrap else { throw VortxNativeError.invalidSnapshot }
     }
 }
 
