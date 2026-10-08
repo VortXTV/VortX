@@ -229,8 +229,9 @@ final class MPVMetalViewController: PlatformViewController {
                     return
                 }
                 let snapshot = self.nativeSeekSnapshot(handle: handle)
+                let transport = MPVSeekTransportDiagnostic.read(from: handle)
                 self.loadTokenLock.unlock()
-                DiagnosticsLog.log("playback", "seek-native pending=\(Int(delay))s load=\(owner.hashValue) seek=\(evidence.generation) \(snapshot.receipt)")
+                DiagnosticsLog.log("playback", "seek-native pending=\(Int(delay))s load=\(owner.hashValue) seek=\(evidence.generation) \(snapshot.receipt) \(transport.receipt)")
             }
         }
     }
@@ -3204,6 +3205,7 @@ final class MPVMetalViewController: PlatformViewController {
             return nil
         }
         let snapshot = nativeSeekSnapshot(handle: handle)
+        let transport = MPVSeekTransportDiagnostic.read(from: handle)
         guard let evidence = seekSettlement.evidenceForLatestCommand(
             owner: ticket.owner, generation: ticket.generation,
             seeking: snapshot.seeking, eofReached: snapshot.eof
@@ -3216,7 +3218,7 @@ final class MPVMetalViewController: PlatformViewController {
             nativePaused: snapshot.paused, nativeSeeking: snapshot.seeking, nativeEOF: snapshot.eof,
             confirmedPosition: confirmedPosition, landingTolerance: landingTolerance)
         loadTokenLock.unlock()
-        DiagnosticsLog.log("playback", "seek-native deadline load=\(ticket.owner.hashValue) seek=\(ticket.generation) target=\(ticket.target) recover=\(target != nil) \(snapshot.receipt)")
+        DiagnosticsLog.log("playback", "seek-native deadline load=\(ticket.owner.hashValue) seek=\(ticket.generation) target=\(ticket.target) recover=\(target != nil) \(snapshot.receipt) \(transport.receipt)")
         return target
     }
 
@@ -3943,9 +3945,12 @@ final class MPVMetalViewController: PlatformViewController {
         return "recommended"
     }
 
-    private func recordHardwareDecoderNegotiation(active: String?) {
+    private func recordHardwareDecoderNegotiation() {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
         guard !loggedHardwareDecoderNegotiation,
-              let active,
+              let handle = mpv,
+              let owner = loadProvenance.callbackToken(requiresLoadedFile: true),
+              let active = getString("hwdec-current"),
               getInt("video-params/w") > 0,
               getInt("video-params/h") > 0 else { return }
         loggedHardwareDecoderNegotiation = true
@@ -3954,11 +3959,12 @@ final class MPVMetalViewController: PlatformViewController {
         let codec = getString("video-format") ?? getString("video-codec") ?? "unknown"
         let pixelFormat = getString("video-params/pixelformat") ?? "unknown"
         let hardwarePixelFormat = getString("video-params/hw-pixelformat") ?? "none"
+        let codecProfile = MPVSeekTransportDiagnostic.codecProfile(from: handle)
         let fallback = MPVHardwareDecodePolicy.isSoftwareFallback(
             requested: requestedHardwareDecoder, active: active)
         DiagnosticsLog.log(
             "player",
-            "hwdec negotiation requested=\(requestedHardwareDecoder) active=\(active) fallback=\(fallback) codec=\(codec) video=\(width)x\(height) pixelFormat=\(pixelFormat) hardwarePixelFormat=\(hardwarePixelFormat)"
+            "hwdec negotiation load=\(owner.hashValue) requested=\(requestedHardwareDecoder) active=\(active) fallback=\(fallback) codec=\(codec) codecProfile=\(codecProfile.receipt) video=\(width)x\(height) pixelFormat=\(pixelFormat) hardwarePixelFormat=\(hardwarePixelFormat)"
         )
     }
 
@@ -4084,7 +4090,7 @@ final class MPVMetalViewController: PlatformViewController {
         framePresentation = nil
         #endif
         let hardwareDecoder = diagnosticString("hwdec-current")
-        recordHardwareDecoderNegotiation(active: hardwareDecoder)
+        recordHardwareDecoderNegotiation()
         return PlaybackDiagnostics(
             frameDropCount: diagnosticInt(MPVProperty.frameDropCount),
             decoderFrameDropCount: diagnosticInt(MPVProperty.decoderFrameDropCount),
@@ -4503,6 +4509,7 @@ final class MPVMetalViewController: PlatformViewController {
                     ? self.diagnosticDouble(MPVProperty.timePos, handle: handle) : nil
                 let nativeSeekSnapshot = (eventID == MPV_EVENT_SEEK || eventID == MPV_EVENT_PLAYBACK_RESTART)
                     && self.seekSettlement.current != nil ? self.nativeSeekSnapshot(handle: handle) : nil
+                let nativeSeekTransport = nativeSeekSnapshot != nil ? MPVSeekTransportDiagnostic.read(from: handle) : nil
                 var drainedRestart: (PlayerLoadToken, Double, MPVSeekSettlementEvidence)?
                 if eventID == MPV_EVENT_NONE,
                    self.seekSettlement.needsDrainedRestartConfirmation,
@@ -4519,9 +4526,10 @@ final class MPVMetalViewController: PlatformViewController {
                     }
                 }
                 self.loadTokenLock.unlock()
-                if let snapshot = nativeSeekSnapshot, let owner = rawSeekOwner, let evidence = rawSeekEvidence {
+                if let snapshot = nativeSeekSnapshot, let transport = nativeSeekTransport,
+                   let owner = rawSeekOwner, let evidence = rawSeekEvidence {
                     let kind = eventID == MPV_EVENT_SEEK ? "seek" : "restart"
-                    DiagnosticsLog.log("playback", "seek-native event=\(kind) load=\(owner.hashValue) seek=\(evidence.generation) settled=\(evidence.settled) attributed=\(evidence.attributed) \(snapshot.receipt)")
+                    DiagnosticsLog.log("playback", "seek-native event=\(kind) load=\(owner.hashValue) seek=\(evidence.generation) settled=\(evidence.settled) attributed=\(evidence.attributed) \(snapshot.receipt) \(transport.receipt)")
                 }
                 if event?.pointee.event_id == MPV_EVENT_NONE {
                     if let (owner, position, evidence) = drainedRestart {
@@ -4907,7 +4915,7 @@ final class MPVMetalViewController: PlatformViewController {
                               ) else { return }
                         self.reapplyDynamicRange()
                         self.updateCapturePipeline()
-                        self.recordHardwareDecoderNegotiation(active: self.getString("hwdec-current"))
+                        self.recordHardwareDecoderNegotiation()
                     }
                 case MPV_EVENT_END_FILE:
                     // A file finished, if it ENDED IN ERROR (couldn't open: dead/uncached link,
