@@ -36,6 +36,18 @@ enum VortxLegacyBootstrapMaterialTests {
         ["id": id, "type": "movie", "name": "Movie", "poster": "https://example.com/movie.jpg", "t": position,
          "d": 100, "lastWatched": "2026-01-01T00:00:00.123456Z"]
     }
+    /// Models the producer boundary exactly: independently authenticated Stremio response bodies
+    /// are retained byte-for-byte and put behind a small, token-free carrier. The bootstrapper
+    /// never accepts a flattened host reconstruction as account proof.
+    static func ownSourceEnvelope(libraryRows: [Object], addons: [Object], extraEnvelope: Object = [:]) throws -> Data {
+        let libraryResponse = try JSONSerialization.data(withJSONObject: ["result": libraryRows], options: [.sortedKeys])
+        let addonsResponse = try JSONSerialization.data(withJSONObject: ["result": ["addons": addons]], options: [.sortedKeys])
+        var envelope: Object = ["schemaVersion": 1,
+                                "libraryResponseBase64": libraryResponse.base64EncodedString(),
+                                "addonsResponseBase64": addonsResponse.base64EncodedString()]
+        for (key, value) in extraEnvelope { envelope[key] = value }
+        return try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
+    }
     static func watches(_ material: Object, profile: UserProfile = owner) -> [Object] {
         (material["watches"] as! [String: [Object]])[profile.id.uuidString]!
     }
@@ -80,9 +92,13 @@ enum VortxLegacyBootstrapMaterialTests {
         let ownURL = "https://own.example.invalid/manifest.json"
         let ownAddon: Object = ["transportUrl": ownURL,
                                 "manifest": ["id": "own", "name": "Own", "version": "1.0.0"]]
-        var ownMovie = movie("tt-own", position: 3.5); ownMovie["v"] = "tt-own"
-        let source: Object = ["vortx": ["addons": [ownAddon], "library": [ownMovie]]]
-        let sourceBytes = try JSONSerialization.data(withJSONObject: source, options: [.sortedKeys])
+        let ownMovie: Object = ["_id": "tt-own", "type": "movie", "name": "Own Movie",
+                                "poster": "https://own.example.invalid/poster.jpg", "removed": false, "temp": false,
+                                "_mtime": "2026-01-01T00:00:00.000Z", "_ctime": "2025-12-31T00:00:00.000Z",
+                                "state": ["timeOffset": 3500, "duration": 100000,
+                                          "lastWatched": "2026-01-01T00:00:00.123456Z", "video_id": "tt-own",
+                                          "timesWatched": 1, "flaggedWatched": 0]]
+        let sourceBytes = try ownSourceEnvelope(libraryRows: [ownMovie], addons: [ownAddon])
         let receipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
             verifiedStreamingUID: "verified-own-uid", sourceDocument: sourceBytes)
         let root = doc(["library": [movie("tt-root", position: 1)]])
@@ -118,7 +134,7 @@ enum VortxLegacyBootstrapMaterialTests {
         var sameUID = UserProfile(id: UUID(uuidString: "10000000-0000-0000-0000-000000000002")!, name: "Second", avatar: "S")
         sameUID.usesOwnAccount = true
         let second = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: sameUID.id,
-            verifiedStreamingUID: "verified-own-uid", sourceDocument: try JSONSerialization.data(withJSONObject: ["vortx": Object()]))
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [], addons: []))
         let sameUIDResult = try material(root, roster: [owner, own, sameUID], ownAccountSources: [receipt, second])
         check((sameUIDResult["ownAccountSources"] as! [String: Object]).count == 2,
               "Distinct profiles may independently prove the same streaming UID")
@@ -138,21 +154,28 @@ enum VortxLegacyBootstrapMaterialTests {
             verifiedStreamingUID: "verified-own-uid", sourceDocument: bytesBefore)
         do { _ = try material(root, roster: [owner, own], ownAccountSources: [malformed]); preconditionFailure("array source imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
-            check(error.reason.contains("source document"), "Malformed own source is refused")
+            check(error.reason.contains("source envelope"), "Malformed own source is refused")
         }
         check(malformed.sourceDocument == bytesBefore, "Failed own source import preserves caller bytes")
-        var credentialSource = source; credentialSource["authKey"] = "must-reject"
+        var credentialRow = ownMovie; credentialRow["authKey"] = "must-reject"
         let credentialReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
-            verifiedStreamingUID: "verified-own-uid", sourceDocument: try JSONSerialization.data(withJSONObject: credentialSource))
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [credentialRow], addons: [ownAddon]))
         do { _ = try material(root, roster: [owner, own], ownAccountSources: [credentialReceipt]); preconditionFailure("credential source imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
             check(error.reason.contains("Credential-bearing"), "Credential-bearing own source cannot be reduced into a proof")
         }
         let overlaySource = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
-            verifiedStreamingUID: "verified-own-uid", sourceDocument: try JSONSerialization.data(withJSONObject: ["vortx": ["byProfile": [own.id.uuidString: ["watched": Object()]]]]))
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [], addons: [], extraEnvelope: ["byProfile": [own.id.uuidString: ["watched": Object()]]]))
         do { _ = try material(root, roster: [owner, own], ownAccountSources: [overlaySource]); preconditionFailure("overlay source imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
-            check(error.reason.contains("overlay carrier"), "Profile overlay cannot masquerade as an independent source")
+            check(error.reason.contains("exact library and add-on responses"), "Profile overlay cannot masquerade as an independent source")
+        }
+        let incompleteEnvelope = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try JSONSerialization.data(withJSONObject: ["schemaVersion": 1,
+                                                                                                        "libraryResponseBase64": "e30=", "addonsResponseBase64": "e30="]))
+        do { _ = try material(root, roster: [owner, own], ownAccountSources: [incompleteEnvelope]); preconditionFailure("incomplete source imported") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("exact library and add-on responses"), "Missing authenticated response cannot become an empty account")
         }
     }
     static func savedVersusPlayed() throws {

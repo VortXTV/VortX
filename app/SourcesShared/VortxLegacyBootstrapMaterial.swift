@@ -215,6 +215,97 @@ enum VortxLegacyBootstrapMaterial {
             }
         }
 
+        /// The authenticated producer retains the exact datastore and add-on response bodies inside
+        /// this small envelope.  The source digest covers the envelope bytes, not a host-reserialized
+        /// projection; parsing below creates a private compatibility view only after that proof.
+        private static func decodeOwnAccountEnvelope(_ source: Data) throws -> Object {
+            guard let envelope = try JSONSerialization.jsonObject(with: source) as? Object,
+                  Set(envelope.keys) == ["schemaVersion", "libraryResponseBase64", "addonsResponseBase64"],
+                  let version = envelope["schemaVersion"] as? NSNumber,
+                  CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 1,
+                  Double(version.intValue) == version.doubleValue,
+                  let libraryBase64 = envelope["libraryResponseBase64"] as? String,
+                  let addonsBase64 = envelope["addonsResponseBase64"] as? String,
+                  let libraryBytes = Data(base64Encoded: libraryBase64),
+                  let addonBytes = Data(base64Encoded: addonsBase64),
+                  libraryBytes.base64EncodedString() == libraryBase64,
+                  addonBytes.base64EncodedString() == addonsBase64,
+                  let libraryEnvelope = try JSONSerialization.jsonObject(with: libraryBytes) as? Object,
+                  let addonEnvelope = try JSONSerialization.jsonObject(with: addonBytes) as? Object,
+                  Set(libraryEnvelope.keys) == ["result"],
+                  Set(addonEnvelope.keys) == ["result"],
+                  let libraryRows = libraryEnvelope["result"] as? [Any],
+                  let addonResult = addonEnvelope["result"] as? Object,
+                  Set(addonResult.keys) == ["addons"],
+                  let addons = addonResult["addons"] as? [Any] else {
+                throw fail("Own-account source envelope requires exact library and add-on responses")
+            }
+            try VortxLegacyBootstrapMaterial.rejectCredentials(envelope)
+            try VortxLegacyBootstrapMaterial.rejectCredentials(libraryEnvelope)
+            try VortxLegacyBootstrapMaterial.rejectCredentials(addonEnvelope)
+            let rows = try libraryRows.map(projectOwnLibraryRow)
+            let descriptors = try addons.map { raw -> Object in
+                guard let descriptor = raw as? Object else { throw fail("Malformed own-account add-on descriptor") }
+                _ = try string(descriptor, "transportUrl")
+                guard let manifest = try object(descriptor, "manifest") else { throw fail("Own-account add-on requires a manifest") }
+                _ = try string(manifest, "id"); _ = try string(manifest, "name"); _ = try string(manifest, "version")
+                return descriptor
+            }
+            return ["vortx": ["library": rows, "addons": descriptors],
+                    "addonOrder": try descriptors.map { try string($0, "transportUrl") }]
+        }
+
+        private static func projectOwnLibraryRow(_ raw: Any) throws -> Object {
+            guard let row = raw as? Object else { throw fail("Malformed own-account library row") }
+            let id = try string(row, "_id")
+            let type = try contentType(row)
+            var projected: Object = ["id": id, "type": type]
+            if let name = try optionalString(row, "name") { projected["name"] = name }
+            if let poster = try optionalString(row, "poster") { projected["poster"] = poster }
+            if let removed = try boolean(row, "removed") { projected["removed"] = removed }
+            if let temporary = try boolean(row, "temp") { projected["temp"] = temporary }
+            guard let state = try object(row, "state") else { return projected }
+            if let offset = try ownMilliseconds(state, "timeOffset") { projected["t"] = Double(offset) / 1000 }
+            if let duration = try ownMilliseconds(state, "duration") { projected["d"] = Double(duration) / 1000 }
+            if let watchedAt = try optionalString(state, "lastWatched") { projected["lastWatched"] = watchedAt }
+            if let video = try optionalString(state, "video_id") { projected["v"] = video }
+            if let count = try ownCount(state, "timesWatched") { projected["timesWatched"] = count }
+            if let flagged = try ownFlag(state, "flaggedWatched") { projected["currentVideoWatched"] = flagged }
+            if let opaque = try optionalString(state, "watched") { projected["watched"] = opaque }
+            return projected
+        }
+
+        private static func ownMilliseconds(_ root: Object, _ key: String) throws -> Int64? {
+            guard let raw = root[key], !(raw is NSNull) else { return nil }
+            guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue >= 0,
+                  number.doubleValue <= 9_007_199_254_740_990,
+                  number.doubleValue.rounded(.towardZero) == number.doubleValue else {
+                throw fail("Malformed own-account millisecond state " + key)
+            }
+            return number.int64Value
+        }
+
+        private static func ownCount(_ root: Object, _ key: String) throws -> Int64? {
+            guard let raw = root[key], !(raw is NSNull) else { return nil }
+            guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue >= 0,
+                  number.doubleValue <= 0xffff_ffff,
+                  number.doubleValue.rounded(.towardZero) == number.doubleValue else {
+                throw fail("Malformed own-account count " + key)
+            }
+            return number.int64Value
+        }
+
+        private static func ownFlag(_ root: Object, _ key: String) throws -> Bool? {
+            guard let raw = root[key], !(raw is NSNull) else { return nil }
+            guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue == 0 || number.doubleValue == 1 else {
+                throw fail("Malformed own-account watched flag")
+            }
+            return number.doubleValue == 1
+        }
+
         private convenience init(independentSource document: Object, profile: UserProfile) throws {
             try self.init(document: document, roster: [profile], ownerID: profile.id, modified: nil,
                           deferProfileEdits: false, allowIndependentSource: true)
@@ -233,10 +324,7 @@ enum VortxLegacyBootstrapMaterial {
                             "Own-account source lacks a verified streaming identity")
                 try require(source.sourceDocumentSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
                             "Own-account source has an invalid document digest")
-                guard let document = try JSONSerialization.jsonObject(with: source.sourceDocument) as? Object else {
-                    throw fail("Own-account source document must be an object")
-                }
-                try VortxLegacyBootstrapMaterial.rejectCredentials(document)
+                let document = try Self.decodeOwnAccountEnvelope(source.sourceDocument)
                 sources[profileID] = ResolvedOwnAccountSource(profileID: profileID,
                     verifiedStreamingUID: source.verifiedStreamingUID,
                     sourceDocumentSHA256: source.sourceDocumentSHA256, sourceDocument: document)
