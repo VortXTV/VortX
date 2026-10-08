@@ -9,7 +9,7 @@ import org.junit.Test
 class NativeLegacyMaterialTest {
     private val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Owner", avatar = "🍿", isOwner = true)
     private val child = UserProfile(id = "10000000-0000-0000-0000-000000000001", name = "Child", avatar = "🎬")
-    private fun material(document: JSONObject, roster: List<UserProfile> = listOf(owner, child)) = nativeLegacyMaterial(document, roster, 1720000000.1234)
+    private fun material(document: JSONObject, roster: List<UserProfile> = listOf(owner, child)) = nativeLegacyMaterial(document, roster, 1720000000.1234, watchedMigration = null)
     private fun document(vortx: JSONObject = JSONObject()) = JSONObject().put("vortx", vortx)
     private fun movie(id: String = "tt123", time: Double = 0.0) = JSONObject().put("id", id).put("type", "movie").put("name", "Film")
         .put("t", time).put("d", 100.0).put("lastWatched", "2026-01-01T00:00:00.123456Z")

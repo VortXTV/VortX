@@ -9,6 +9,7 @@ import java.net.URI
 import java.time.Instant
 import java.util.UUID
 import kotlin.math.roundToLong
+import com.vortx.android.engine.LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator as WatchedLocator
 
 /**
  * Pure adapter for the kernel's one-time, authenticated `import_legacy_sync` action. The caller must
@@ -26,24 +27,29 @@ internal fun nativeLegacyMaterial(
     retainedOwnAccounts: NativeOwnAccountBaseline? = null,
     accountScope: VortxAccountScope? = null,
     pendingOwnOverlays: Set<String> = emptySet(),
+    watchedMigration: NativeWatchedMigrationBatch? = null,
 ): JSONObject = withNativeOwnAccountSources(ownAccountSources) {
+    watchedMigration?.requireInputs(document, roster, accountScope, ownAccountSources)
     if (ownAccountSources.isNotEmpty() || retainedOwnAccounts != null) {
         val scope = requireNotNull(accountScope) { "Authenticated own-account scope required" }
         require(roster.single { it.isOwner }.id == scope.ownerProfileID && ownAccountSources.all { it.accountID == scope.accountID })
         require(retainedOwnAccounts == null || retainedOwnAccounts.scope == scope) { "Own-account baseline scope changed" }
     }
     LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts,
-        pendingOwnOverlays = pendingOwnOverlays).build()
+        pendingOwnOverlays = pendingOwnOverlays, watchedMigration = watchedMigration).build()
 }
 
 /** A rebind source is independent of the owner/global import. Reuse the same typed reducer, with
  * the exact authenticated UUID overlay and raw source only; never project the owner's library. */
 internal fun nativeOwnAccountCarrier(source: NativeOwnAccountSource, profile: UserProfile,
-                                     currentDocument: JSONObject): JSONObject = source.withActive {
+                                     currentDocument: JSONObject,
+                                     watchedMigration: NativeWatchedMigrationBatch? = null): JSONObject = source.withActive {
     require(source.profileID == profile.id && !profile.isOwner)
     source.requireOverlayUnchanged(currentDocument)
+    watchedMigration?.requireOwnSource(source)
     val isolated = profile.copy(isOwner = true, usesOwnAccount = false)
-    val material = LegacyMaterialAdapter(source.legacyDocument(), listOf(isolated), null, independentSource = true).build()
+    val material = LegacyMaterialAdapter(source.legacyDocument(), listOf(isolated), null, independentSource = true,
+        watchedMigration = watchedMigration).build()
     JSONObject().put("source", source.proof()).put("addons", material.getJSONObject("addons").getJSONObject(profile.id))
         .put("library", material.getJSONObject("libraries").getJSONObject(profile.id))
         .put("watches", material.getJSONObject("watches").getJSONArray(profile.id))
@@ -58,6 +64,7 @@ private class LegacyMaterialAdapter(
     private val retainedOwn: NativeOwnAccountBaseline? = null,
     private val independentSource: Boolean = false,
     private val pendingOwnOverlays: Set<String> = emptySet(),
+    private val watchedMigration: NativeWatchedMigrationBatch? = null,
 ) {
     private val vortx = objectField(document, "vortx") ?: JSONObject()
     private val owner = roster.singleOrNull { it.isOwner }
@@ -111,7 +118,8 @@ private class LegacyMaterialAdapter(
             val source = fresh[id]
             val material = source?.let {
                 val isolated = profiles.getValue(id).copy(isOwner = true, usesOwnAccount = false)
-                LegacyMaterialAdapter(it.legacyDocument(), listOf(isolated), null, independentSource = true).build()
+                LegacyMaterialAdapter(it.legacyDocument(), listOf(isolated), null, independentSource = true,
+                    watchedMigration = watchedMigration).build()
             }
             fun bucket(kind: String): Any = material?.getJSONObject(kind)?.get(id) ?: requireNotNull(retainedOwn).bucket(kind, id)
             addons.put(id, bucket("addons")); libraries.put(id, bucket("libraries"))
@@ -197,7 +205,7 @@ private class LegacyMaterialAdapter(
         val intents = linkedMapOf<String, JSONObject>()
         val seen = hashSetOf<String>()
         val declaredRemoved = hashSetOf<String>()
-        for (row in rows) {
+        for ((index, row) in rows.withIndex()) {
             val id = string(row, "id"); val type = contentType(row)
             known(owner.id, id, type)
             val key = "$type:$id"
@@ -216,12 +224,24 @@ private class LegacyMaterialAdapter(
                 items[key] = item
                 if (removed) declaredRemoved += key
             }
-            importWatch(owner.id, id, row, ownerRow = true)
+            val locator = if (independentSource) WatchedLocator.OwnAccountLibraryResponse(index)
+                else if (arrayField(vortx, "library") != null) WatchedLocator.AuthenticatedOwnerLibrary(index)
+                else WatchedLocator.AuthenticatedLegacyRootLibrary(index)
+            importWatch(owner.id, id, row, ownerRow = true, locator = locator)
         }
-        val historyBucket = objectField(vortx, "byProfile")?.let { objectField(it, if (independentSource) owner.id else UserProfile.OWNER_ID) }
-        for (row in objects(historyBucket?.let { arrayField(it, "ownerHistory") }, "owner history")) {
-            val id = string(row, "id"); known(owner.id, id, contentType(row))
-            importWatch(owner.id, id, row, ownerRow = true, historyOnly = true)
+        val historyProfiles = objectField(vortx, "byProfile")
+        val historyKeys = historyProfiles?.keys()?.asSequence().orEmpty().filter {
+            it.equals(owner.id, true) || !independentSource && it.equals(UserProfile.OWNER_ID, true)
+        }.toList()
+        requireMaterial(historyKeys.groupBy { it.uppercase() }.values.all { it.size == 1 }, "Ambiguous owner history profile identity")
+        for (sourceProfileID in historyKeys) {
+            val historyBucket = objectField(requireNotNull(historyProfiles), sourceProfileID)
+            for ((index, row) in objects(historyBucket?.let { arrayField(it, "ownerHistory") }, "owner history").withIndex()) {
+                val id = string(row, "id"); known(owner.id, id, contentType(row))
+                importWatch(owner.id, id, row, ownerRow = true, historyOnly = true,
+                    locator = if (independentSource) WatchedLocator.OwnAccountOwnerHistory(index)
+                        else WatchedLocator.AuthenticatedOwnerHistory(index, sourceProfileID))
+            }
         }
         fun keyFor(raw: String): String {
             val known = knownTitles.getValue(owner.id)
@@ -259,10 +279,11 @@ private class LegacyMaterialAdapter(
             val id = profiles.keys.singleOrNull { it.equals(rawID, true) } ?: fail("Watch carrier references an unknown profile")
             val rows = objects(arrayField(bucket, "library"), "overlay library")
             val railTitles = rows.map { string(it, "id") }.toSet()
-            for (row in rows) {
+            for ((index, row) in rows.withIndex()) {
                 val metaId = string(row, "id"); known(id, metaId, contentType(row))
-                importWatch(id, metaId, row, ownerRow = false)
-                importMarks(id, metaId, row)
+                importWatch(id, metaId, row, ownerRow = false,
+                    locator = if (independentSource) WatchedLocator.OwnAccountProfileLibrary(index)
+                        else WatchedLocator.AuthenticatedProfileLibrary(index))
             }
             objectField(bucket, "watched")?.let { map -> for (metaId in map.keys()) {
                 requireMaterial(metaId.isNotBlank(), "Empty durable watch identity")
@@ -282,18 +303,23 @@ private class LegacyMaterialAdapter(
         }
     }
 
-    private fun importWatch(profile: String, metaId: String, raw: JSONObject, ownerRow: Boolean, historyOnly: Boolean = false) {
+    private fun importWatch(profile: String, metaId: String, raw: JSONObject, ownerRow: Boolean, historyOnly: Boolean = false,
+                            locator: WatchedLocator) {
         val position = secondsToMillis(raw, "t"); val duration = secondsToMillis(raw, "d")
         val played = lastWatched(raw)
         val video = optionalString(raw, "v")?.takeIf(String::isNotBlank)
         val bits = optionalString(raw, "watched")
-        requireMaterial(bits.isNullOrEmpty(), "Opaque owner watched bitfield requires episode reconciliation")
+        val decoded = if (bits.isNullOrEmpty()) emptyList() else watchedMigration?.videoIDs(profile, locator, raw)
+            ?: fail("Opaque owner watched bitfield requires source-bound episode reconciliation")
+        // Bitmap IDs are bare source facts. Clocked ma/ua and owner intents are merged below;
+        // they remain authoritative and no lastWatched/metadata date becomes a mark timestamp.
+        importMarks(profile, metaId, raw, decoded)
         val watched = optionalBoolean(raw, "currentVideoWatched")
         val whole = optionalBoolean(raw, "wholeTitleWatched")
         val timesWatched = optionalUnsigned(raw, "timesWatched", 0xffff_ffffL)
         val type = contentType(raw)
         requireMaterial(type != "series" || whole != true, "Whole-series watch intent requires episode reconciliation")
-        val hasMarks = strings(arrayField(raw, "w"), "watched IDs").isNotEmpty() || (objectField(raw, "ma")?.length() ?: 0) > 0 || (objectField(raw, "ua")?.length() ?: 0) > 0
+        val hasMarks = decoded.isNotEmpty() || strings(arrayField(raw, "w"), "watched IDs").isNotEmpty() || (objectField(raw, "ma")?.length() ?: 0) > 0 || (objectField(raw, "ua")?.length() ?: 0) > 0
         if (!ownerRow && position == 0L && !hasMarks && watched != true && whole != true && (timesWatched ?: 0) == 0L) {
             fail("Saved-only overlay membership requires explicit reconciliation")
         }
@@ -354,8 +380,8 @@ private class LegacyMaterialAdapter(
         return units.values.toList()
     }
 
-    private fun importMarks(profile: String, metaId: String, raw: JSONObject) {
-        val watched = strings(arrayField(raw, "w"), "watched IDs").toSet()
+    private fun importMarks(profile: String, metaId: String, raw: JSONObject, decoded: List<String> = emptyList()) {
+        val watched = strings(arrayField(raw, "w"), "watched IDs").toSet() + decoded
         fun positiveClocks(key: String): Map<String, Double> {
             val values = objectField(raw, key) ?: return emptyMap()
             return values.keys().asSequence().mapNotNull { video -> clockField(values, video)?.takeIf { it > 0 }?.let { video to it } }.toMap()

@@ -7,15 +7,18 @@ import org.junit.Assert.fail
 import org.junit.Test
 import java.security.MessageDigest
 import java.util.Base64
+import org.json.JSONArray
+import org.json.JSONObject
 
 class LegacyWatchedBitfieldMigrationEvidenceTest {
     private val profile = "00000000-0000-0000-0000-00000000A11C"
+    private val ownProfile = "10000000-0000-0000-0000-000000000001"
     private val manifest = """{"id":"catalog","name":"Original catalog","version":"1.0.0"}""".toByteArray()
     private val addon = LegacyWatchedBitfieldMigrationEvidence.AuthorizedAddon("https://catalog.example/manifest.json", manifest)
 
     @Test fun `captures source bound raw metadata evidence and bare watched IDs`() = runBlocking {
         val source = sharedSource(); val metadata = metadata()
-        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile)
+        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, null, profile)
         var requests = 0
         val evidence = LegacyWatchedBitfieldMigrationEvidence.capture(scope, source,
             LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.AuthenticatedOwnerLibrary(0), addon, { true }) { request ->
@@ -32,7 +35,7 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
     }
 
     @Test fun `rejects descriptor mismatch metadata mismatch and duplicate raw keys`() = runBlocking {
-        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile)
+        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, null, profile)
         expectFailure {
             LegacyWatchedBitfieldMigrationEvidence.capture(scope,
                 """{"vortx":{"library":[{"id":"tt2934286","type":"series","watched":"tt2934286:1:5:5:eJyTZwAAAEAAIA=="}],"addons":[]}}""".toByteArray(),
@@ -73,7 +76,7 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
     }
 
     @Test fun `post fetch account admission is required`() = runBlocking {
-        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile)
+        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, null, profile)
         var current = true
         expectFailure {
             LegacyWatchedBitfieldMigrationEvidence.capture(scope, sharedSource(),
@@ -86,7 +89,7 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
 
     /** Invalid scalars each alter a complete bitmap-addressable inventory, never just its anchor. */
     @Test fun `rejects strict scalar and utf8 identity mismatches after a valid inventory reaches them`() = runBlocking {
-        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile)
+        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, null, profile)
         val seasonField = "\"season\":1,\"episode\":1,\"released\":\"2005-01-01T01:00:00+01:00\""
         expectFailure {
             capture(scope, sharedSource(), mutatedMetadata(seasonField, "\"season\":1.0000000000000001,\"episode\":1,\"released\":\"2005-01-01T01:00:00+01:00\""))
@@ -126,7 +129,7 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
 
     @Test fun `accepts authenticated legacy root source with its exact root registry`() = runBlocking {
         val source = """{"library":[{"id":"tt2934286","type":"series","watched":"tt2934286:1:5:5:eJyTZwAAAEAAIA=="}],"addons":[{"transportUrl":"https://catalog.example/manifest.json","manifest":{"id":"catalog","name":"Original catalog","version":"1.0.0"}}]}""".toByteArray()
-        val evidence = LegacyWatchedBitfieldMigrationEvidence.capture(LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile), source,
+        val evidence = LegacyWatchedBitfieldMigrationEvidence.capture(LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, null, profile), source,
             LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.AuthenticatedLegacyRootLibrary(0), addon, { true }) { request ->
                 LegacyWatchedBitfieldMigrationEvidence.MetadataResponse(request, metadata())
             }
@@ -135,8 +138,8 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
     }
 
     @Test fun `canonicalizes only complete profile UUIDs`() {
-        assertEquals(profile, LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile.lowercase()).profileID)
-        try { LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", "00000000-0000-0000-0000-1") ; fail("Expected complete UUID rejection")
+        assertEquals(profile, LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile.lowercase(), null, profile).profileID)
+        try { LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", "00000000-0000-0000-0000-1", null, profile) ; fail("Expected complete UUID rejection")
         } catch (_: IllegalArgumentException) { }
     }
 
@@ -145,12 +148,12 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
         val addons = Base64.getEncoder().encodeToString("""{"result":{"addons":[{"transportUrl":"https://catalog.example/manifest.json","manifest":{"id":"catalog","name":"Original catalog","version":"1.0.0"}}]}}""".toByteArray())
         val source = """{"schemaVersion":1,"libraryResponseBase64":"$library","addonsResponseBase64":"$addons","profileOverlayBase64":"e30="}""".toByteArray()
         expectFailure {
-            LegacyWatchedBitfieldMigrationEvidence.capture(LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile), source,
+            LegacyWatchedBitfieldMigrationEvidence.capture(LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", ownProfile, null, profile), source,
                 LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.OwnAccountLibraryResponse(0), addon, { true }) { request ->
                     LegacyWatchedBitfieldMigrationEvidence.MetadataResponse(request, metadata())
                 }
         }
-        val evidence = LegacyWatchedBitfieldMigrationEvidence.capture(LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, "uid-a"), source,
+        val evidence = LegacyWatchedBitfieldMigrationEvidence.capture(LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", ownProfile, "uid-a", profile), source,
             LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.OwnAccountLibraryResponse(0), addon, { true }) { request ->
                 LegacyWatchedBitfieldMigrationEvidence.MetadataResponse(request, metadata())
             }
@@ -162,7 +165,7 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
         val manifestInput = manifest.copyOf()
         val mutableAddon = LegacyWatchedBitfieldMigrationEvidence.AuthorizedAddon("https://catalog.example/manifest.json", manifestInput)
         val metadata = metadata(); val metadataBefore = metadata.copyOf()
-        val evidence = LegacyWatchedBitfieldMigrationEvidence.capture(LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile), source,
+        val evidence = LegacyWatchedBitfieldMigrationEvidence.capture(LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, null, profile), source,
             LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.AuthenticatedOwnerLibrary(0), mutableAddon, { true }) { request ->
                 source[0] = 'x'.code.toByte(); manifestInput[0] = 'x'.code.toByte(); metadata[0] = 'x'.code.toByte()
                 LegacyWatchedBitfieldMigrationEvidence.MetadataResponse(request, metadataBefore)
@@ -174,6 +177,61 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
         assertArrayEquals(sourceBefore, evidence.source); assertArrayEquals(metadataBefore, evidence.metadata)
         assertEquals(digest(sourceBefore), evidence.sourceSHA256); assertEquals(digest(metadataBefore), evidence.metadataSHA256)
         assertArrayEquals(manifest, evidence.addon.manifest)
+    }
+
+    @Test fun `replays exact current and historical owner rows with explicit resolved owner`() {
+        val owner = "00000000-0000-0000-0000-00000000BEEF"
+        val source = JSONObject(sharedSource().toString(Charsets.UTF_8))
+        val vortx = source.getJSONObject("vortx")
+        val row = vortx.getJSONArray("library").getJSONObject(0)
+        vortx.put("byProfile", JSONObject().put(owner, JSONObject().put("ownerHistory", JSONArray().put(row)))
+            .put(profile, JSONObject().put("ownerHistory", JSONArray().put(row))))
+        val bytes = source.toString().toByteArray()
+        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", owner, null, owner)
+        for (sourceID in listOf(owner, profile)) {
+            val locator = LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.AuthenticatedOwnerHistory(0, sourceID)
+            LegacyWatchedBitfieldMigrationEvidence.validateSource(scope, bytes, locator)
+            val evidence = LegacyWatchedBitfieldMigrationEvidence.replay(scope, bytes, locator, addon, metadata()) { true }
+            assertEquals(5, evidence.watchedVideoIDs.size)
+            assertArrayEquals(bytes, evidence.source)
+        }
+        try {
+            LegacyWatchedBitfieldMigrationEvidence.validateSource(scope, bytes,
+                LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.AuthenticatedOwnerHistory(0, ownProfile))
+            fail("Foreign history must not be attributed to owner")
+        } catch (_: IllegalArgumentException) { }
+    }
+
+    @Test fun `own overlay history requires exact authenticated scope and original own descriptor`() {
+        val shared = JSONObject(sharedSource().toString(Charsets.UTF_8)).getJSONObject("vortx")
+        val rows = shared.getJSONArray("library")
+        val overlay = JSONObject().put("vortx", JSONObject().put("byProfile", JSONObject().put(ownProfile,
+            JSONObject().put("library", rows).put("ownerHistory", rows))))
+        fun encoded(value: JSONObject) = Base64.getEncoder().encodeToString(value.toString().toByteArray())
+        val source = JSONObject().put("schemaVersion", 2)
+            .put("libraryResponseBase64", encoded(JSONObject().put("result", JSONArray())))
+            .put("addonsResponseBase64", encoded(JSONObject().put("result", JSONObject().put("addons", shared.getJSONArray("addons")))))
+            .put("profileOverlayBase64", encoded(overlay)).toString().toByteArray()
+        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", ownProfile, "uid-a", profile)
+        for (locator in listOf(LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.OwnAccountProfileLibrary(0),
+                              LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.OwnAccountOwnerHistory(0))) {
+            val evidence = LegacyWatchedBitfieldMigrationEvidence.replay(scope, source, locator, addon, metadata()) { true }
+            assertEquals(5, evidence.watchedVideoIDs.size)
+        }
+        val wrongScope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", "20000000-0000-0000-0000-000000000002", "uid-a", profile)
+        try { LegacyWatchedBitfieldMigrationEvidence.validateSource(wrongScope, source,
+            LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.OwnAccountProfileLibrary(0)); fail("Foreign own overlay must fail")
+        } catch (_: IllegalArgumentException) { }
+    }
+
+    @Test fun `original manifest extraction retains exact number lexemes`() {
+        val source = sharedSource().toString(Charsets.UTF_8).replace("\"version\":\"1.0.0\"", "\"version\":\"1.0.0\",\"rank\":1.0000000000000001")
+            .toByteArray()
+        val locator = LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.AuthenticatedOwnerLibrary(0)
+        val original = LegacyWatchedBitfieldMigrationEvidence.originalAddons(source, locator).single()
+        org.junit.Assert.assertTrue(original.manifest.toString(Charsets.UTF_8).contains("1.0000000000000001"))
+        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, null, profile)
+        assertEquals(5, LegacyWatchedBitfieldMigrationEvidence.replay(scope, source, locator, original, metadata()) { true }.watchedVideoIDs.size)
     }
 
     private fun sharedSource() = """{"vortx":{"library":[{"id":"tt2934286","type":"series","watched":"tt2934286:1:5:5:eJyTZwAAAEAAIA=="}],"addons":[{"transportUrl":"https://catalog.example/manifest.json","manifest":{"id":"catalog","name":"Original catalog","version":"1.0.0"}}]}}""".toByteArray()

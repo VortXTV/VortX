@@ -18,14 +18,17 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
     private const val OWNER_PROFILE_ID = "00000000-0000-0000-0000-00000000A11C"
     class Failure(message: String) : IllegalArgumentException(message)
 
-    data class Scope(val accountID: String, private val suppliedProfileID: String, val verifiedStreamingUID: String? = null) {
+    data class Scope(val accountID: String, private val suppliedProfileID: String, val verifiedStreamingUID: String?, private val suppliedOwnerProfileID: String) {
         /** A validated full UUID normalized to the same canonical form used by source buckets. */
         val profileID: String
+        val ownerProfileID: String
         init {
             require(accountID.isNotBlank()) { "Missing account scope" }
             require(FULL_UUID.matches(suppliedProfileID)) { "Invalid profile scope" }
             profileID = runCatching { UUID.fromString(suppliedProfileID).toString().uppercase() }
                 .getOrElse { throw Failure("Invalid profile scope") }
+            require(FULL_UUID.matches(suppliedOwnerProfileID)) { "Invalid owner profile scope" }
+            ownerProfileID = UUID.fromString(suppliedOwnerProfileID).toString().uppercase()
             if (verifiedStreamingUID != null) require(verifiedStreamingUID.isNotBlank()) { "Invalid streaming identity" }
         }
     }
@@ -35,7 +38,10 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
         data class AuthenticatedOwnerLibrary(val index: Int) : SourceRowLocator() { override val pointer = "/vortx/library/$index" }
         data class AuthenticatedLegacyRootLibrary(val index: Int) : SourceRowLocator() { override val pointer = "/library/$index" }
         data class AuthenticatedProfileLibrary(val index: Int) : SourceRowLocator() { override val pointer = "/vortx/byProfile/<captured-profile>/library/$index" }
+        data class AuthenticatedOwnerHistory(val index: Int, val sourceProfileID: String) : SourceRowLocator() { override val pointer = "/vortx/byProfile/$sourceProfileID/ownerHistory/$index" }
         data class OwnAccountLibraryResponse(val index: Int) : SourceRowLocator() { override val pointer = "/libraryResponseBase64/result/$index" }
+        data class OwnAccountProfileLibrary(val index: Int) : SourceRowLocator() { override val pointer = "/profileOverlayBase64/vortx/byProfile/<captured-profile>/library/$index" }
+        data class OwnAccountOwnerHistory(val index: Int) : SourceRowLocator() { override val pointer = "/profileOverlayBase64/vortx/byProfile/<captured-profile>/ownerHistory/$index" }
     }
 
     /** Raw original manifest identity; the authenticated source must contain this exact descriptor. */
@@ -80,37 +86,77 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
         val sourceSnapshot = source.copyOf()
         val addonSnapshot = AuthorizedAddon(addon.transportURL, addon.manifest)
         val sourceTree = StrictJson.value(sourceSnapshot)
-        if (rowLocator is SourceRowLocator.OwnAccountLibraryResponse) requireOwnEnvelope(sourceTree)
-        val row = sourceRow(sourceTree, scope, rowLocator)
-        require(row.type == "series" && row.metaID.isNotBlank() && row.watchedBitfield.isNotEmpty()) { "Source row is not a watched series" }
+        val row = validatedSourceRow(sourceTree, scope, rowLocator)
         requireOriginalAddon(sourceTree, rowLocator, addonSnapshot)
         val request = MetadataRequest(scope, addonSnapshot, "series", row.metaID)
         val response = fetch(request)
         require(isCurrent()) { "Migration account admission revoked" }
         require(response.request == request) { "Metadata response belongs to another request" }
-        val metadataSnapshot = response.raw.copyOf()
+        return replay(scope, sourceSnapshot, rowLocator, addonSnapshot, response.raw, isCurrent)
+    }
+
+    /** Cold replay re-runs the same strict source/descriptor/inventory/bitmap validation without
+     * trusting archived decoded IDs or performing a metadata request. */
+    fun replay(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator, addon: AuthorizedAddon,
+               metadata: ByteArray, isCurrent: () -> Boolean): Evidence {
+        require(isCurrent()) { "Migration account admission revoked" }
+        val sourceSnapshot = source.copyOf()
+        val addonSnapshot = AuthorizedAddon(addon.transportURL, addon.manifest)
+        val sourceTree = StrictJson.value(sourceSnapshot)
+        val row = validatedSourceRow(sourceTree, scope, rowLocator)
+        requireOriginalAddon(sourceTree, rowLocator, addonSnapshot)
+        val metadataSnapshot = metadata.copyOf()
         val inventory = inventory(metadataSnapshot, row.metaID)
+        val watched = LegacyWatchedBitfieldDecoder.decode(row.watchedBitfield, inventory)
+        require(isCurrent()) { "Migration account admission revoked" }
         return Evidence(scope, rowLocator, row.metaID, row.watchedBitfield, addonSnapshot, sourceSnapshot, sha256(sourceSnapshot),
-            metadataSnapshot, sha256(metadataSnapshot), inventory, LegacyWatchedBitfieldDecoder.decode(row.watchedBitfield, inventory))
+            metadataSnapshot, sha256(metadataSnapshot), inventory, watched)
+    }
+
+    fun validateSource(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator) {
+        validatedSourceRow(StrictJson.value(source.copyOf()), scope, rowLocator)
+    }
+
+    /** Preserve original manifest number lexemes while extracting source-authorized candidates.
+     * A platform JSONObject reserialization can otherwise change the descriptor being attested. */
+    fun originalAddons(source: ByteArray, rowLocator: SourceRowLocator): List<AuthorizedAddon> {
+        val tree = StrictJson.value(source.copyOf())
+        if (isOwn(rowLocator)) requireOwnEnvelope(tree)
+        return descriptorValues(tree, rowLocator).map { value ->
+            val row = strictObject(value)
+            AuthorizedAddon(strictString(row["transportUrl"]), StrictJson.encode(row.getValue("manifest")))
+        }
+    }
+
+    private fun validatedSourceRow(root: StrictJson.Value, scope: Scope, locator: SourceRowLocator): SourceRow {
+        if (isOwn(locator)) {
+            require(scope.verifiedStreamingUID != null && scope.profileID != scope.ownerProfileID) { "Own source requires an independent verified streaming identity" }
+            requireOwnEnvelope(root)
+            requireScopedOwnOverlay(root, scope)
+        } else require(scope.verifiedStreamingUID == null) { "Shared source cannot claim an independent streaming identity" }
+        return sourceRow(root, scope, locator).also { row ->
+            require(row.type == "series" && row.metaID.isNotBlank() && row.watchedBitfield.isNotEmpty()) { "Source row is not a watched series" }
+        }
     }
 
     private data class SourceRow(val metaID: String, val type: String, val watchedBitfield: String)
 
     private fun sourceRow(root: StrictJson.Value, scope: Scope, locator: SourceRowLocator): SourceRow = when (locator) {
         is SourceRowLocator.AuthenticatedOwnerLibrary -> {
-            require(locator.index >= 0 && scope.profileID == OWNER_PROFILE_ID) { "Owner source requires owner scope" }
+            require(locator.index >= 0 && scope.profileID == scope.ownerProfileID) { "Owner source requires owner scope" }
             val vortx = strictObject(strictObject(root).getValue("vortx"))
             val rows = strictArray(vortx.getValue("library"))
             sharedRow(rows, locator.index)
         }
         is SourceRowLocator.AuthenticatedLegacyRootLibrary -> {
-            require(locator.index >= 0 && scope.profileID == OWNER_PROFILE_ID) { "Owner source requires owner scope" }
+            require(locator.index >= 0 && scope.profileID == scope.ownerProfileID) { "Owner source requires owner scope" }
             sharedRow(strictArray(strictObject(root).getValue("library")), locator.index)
         }
         is SourceRowLocator.AuthenticatedProfileLibrary -> {
             require(locator.index >= 0) { "Invalid source row index" }
             val vortx = strictObject(strictObject(root).getValue("vortx"))
             val profiles = strictObject(vortx.getValue("byProfile"))
+            require(profiles.keys.count { it.equals(scope.profileID, true) } == 1) { "Ambiguous profile source carrier" }
             val bucket = strictObject(profiles.getValue(scope.profileID))
             sharedRow(strictArray(bucket.getValue("library")), locator.index)
         }
@@ -121,7 +167,41 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
             val fields = strictObject(row); val state = strictObject(fields.getValue("state"))
             SourceRow(strictString(fields["_id"]), strictString(fields["type"]), strictString(state["watched"]))
         }
+        is SourceRowLocator.AuthenticatedOwnerHistory -> {
+            require(locator.index >= 0 && scope.profileID == scope.ownerProfileID && FULL_UUID.matches(locator.sourceProfileID) &&
+                locator.sourceProfileID.uppercase() in setOf(scope.ownerProfileID, OWNER_PROFILE_ID)) { "Owner history requires exact owner carrier" }
+            val profiles = strictObject(strictObject(strictObject(root).getValue("vortx")).getValue("byProfile"))
+            require(profiles.keys.count { it.equals(locator.sourceProfileID, true) } == 1) { "Ambiguous owner history carrier" }
+            val bucket = strictObject(profiles.getValue(locator.sourceProfileID))
+            sharedRow(strictArray(bucket.getValue("ownerHistory")), locator.index)
+        }
+        is SourceRowLocator.OwnAccountProfileLibrary -> ownOverlayRow(root, scope, locator.index, "library")
+        is SourceRowLocator.OwnAccountOwnerHistory -> ownOverlayRow(root, scope, locator.index, "ownerHistory")
     }
+
+    private fun ownOverlayRow(root: StrictJson.Value, scope: Scope, index: Int, key: String): SourceRow {
+        require(index >= 0) { "Invalid source row index" }
+        val overlay = strictObject(StrictJson.value(strictEnvelopeBytes(strictObject(root), "profileOverlayBase64")))
+        val profiles = strictObject(strictObject(overlay.getValue("vortx")).getValue("byProfile"))
+        require(profiles.keys == setOf(scope.profileID)) { "Foreign own-account profile overlay" }
+        val bucket = strictObject(profiles.getValue(scope.profileID))
+        return sharedRow(strictArray(bucket.getValue(key)), index)
+    }
+
+    private fun requireScopedOwnOverlay(root: StrictJson.Value, scope: Scope) {
+        val overlay = strictObject(StrictJson.value(strictEnvelopeBytes(strictObject(root), "profileOverlayBase64")))
+        overlay["vortx"]?.let { vortx -> strictObject(vortx)["byProfile"]?.let { profiles ->
+            require(strictObject(profiles).keys.all { it == scope.profileID }) { "Foreign own-account profile overlay" }
+        } }
+        overlay["webProgress"]?.let { web -> strictObject(web)["removed"]?.let { removed ->
+            strictObject(removed)["byProfile"]?.let { profiles ->
+                require(strictObject(profiles).keys.all { it == scope.profileID }) { "Foreign own-account removals" }
+            }
+        } }
+    }
+
+    private fun isOwn(locator: SourceRowLocator): Boolean = locator is SourceRowLocator.OwnAccountLibraryResponse ||
+        locator is SourceRowLocator.OwnAccountProfileLibrary || locator is SourceRowLocator.OwnAccountOwnerHistory
 
     private fun requireOwnEnvelope(source: StrictJson.Value) {
         val parsed = strictObject(source)
@@ -136,8 +216,18 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
     }
 
     private fun requireOriginalAddon(root: StrictJson.Value, locator: SourceRowLocator, expected: AuthorizedAddon) {
+        val descriptors = descriptorValues(root, locator)
+        val expectedManifest = StrictJson.value(expected.manifest)
+        val matches = descriptors.count { raw ->
+            val descriptor = strictObject(raw)
+            strictString(descriptor["transportUrl"]) == expected.transportURL && descriptor["manifest"] == expectedManifest
+        }
+        require(matches == 1) { "Original add-on descriptor is absent or ambiguous" }
+    }
+
+    private fun descriptorValues(root: StrictJson.Value, locator: SourceRowLocator): List<StrictJson.Value> {
         val rootObject = strictObject(root)
-        val descriptors = if (locator is SourceRowLocator.OwnAccountLibraryResponse) {
+        return if (isOwn(locator)) {
             val result = strictObject(StrictJson.value(strictEnvelopeBytes(rootObject, "addonsResponseBase64")))
             strictArray(strictObject(result.getValue("result")).getValue("addons"))
         } else {
@@ -146,12 +236,6 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
             val vortxDescriptors = rootObject["vortx"]?.let { optionalStrictArray(strictObject(it)["addons"]) } ?: emptyList()
             vortxDescriptors + optionalStrictArray(rootObject["addons"])
         }
-        val expectedManifest = StrictJson.value(expected.manifest)
-        val matches = descriptors.count { raw ->
-            val descriptor = strictObject(raw)
-            strictString(descriptor["transportUrl"]) == expected.transportURL && descriptor["manifest"] == expectedManifest
-        }
-        require(matches == 1) { "Original add-on descriptor is absent or ambiguous" }
     }
 
     private fun inventory(raw: ByteArray, requestedID: String): List<LegacyWatchedBitfieldEpisode> {
@@ -234,6 +318,26 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
             data class Number(val raw: String) : Value()
             data class Bool(val value: Boolean) : Value()
             object Null : Value()
+        }
+        fun encode(value: Value): ByteArray {
+            fun quote(text: String): String = buildString {
+                append('"')
+                text.forEach { ch -> when (ch) {
+                    '"' -> append("\\\""); '\\' -> append("\\\\")
+                    '\b' -> append("\\b"); '\u000C' -> append("\\f"); '\n' -> append("\\n"); '\r' -> append("\\r"); '\t' -> append("\\t")
+                    else -> if (ch.code < 32) append("\\u%04x".format(ch.code)) else append(ch)
+                } }
+                append('"')
+            }
+            fun render(node: Value): String = when (node) {
+                is Value.Object -> node.values.entries.joinToString(",", "{", "}") { quote(it.key) + ":" + render(it.value) }
+                is Value.Array -> node.values.joinToString(",", "[", "]", transform = ::render)
+                is Value.StringValue -> quote(node.value)
+                is Value.Number -> node.raw
+                is Value.Bool -> node.value.toString()
+                Value.Null -> "null"
+            }
+            return render(value).toByteArray(Charsets.UTF_8)
         }
         fun validate(bytes: ByteArray) { value(bytes) }
         fun value(bytes: ByteArray): Value {
