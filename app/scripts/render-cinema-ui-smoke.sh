@@ -13,12 +13,15 @@ command -v xcodegen >/dev/null || { print -u2 'xcodegen is required'; exit 1; }
 xcodegen generate --spec "$root/project.yml" --project "$project"
 
 xcodebuild \
+  -jobs 1 \
+  -arch arm64 \
   -project "$project" \
   -scheme CinemaUISmokeRenderer \
   -configuration Debug \
   -derivedDataPath "$derived" \
   CODE_SIGNING_ALLOWED=NO \
   CODE_SIGNING_REQUIRED=NO \
+  SWIFT_COMPILATION_MODE=singlefile \
   build
 
 renderer="$derived/Build/Products/Debug/CinemaUISmokeRenderer.app/Contents/MacOS/CinemaUISmokeRenderer"
