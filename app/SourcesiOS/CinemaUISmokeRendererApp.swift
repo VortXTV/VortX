@@ -83,6 +83,7 @@ enum CinemaUISmokeRendererApp {
             // renderer-only receipt of both layout and accessibility before interpreting a dark sheet
             // bitmap as a production presentation defect.
             logQuickViewDiagnostics(parent: window, sheet: sheet, content: sheetContent)
+            writeCompositedSheetSnapshot(sheet, named: viewport.name, into: output)
             capturedView = sheetContent
         } else {
             capturedView = host
@@ -134,6 +135,32 @@ enum CinemaUISmokeRendererApp {
             labels.append(contentsOf: collectAccessibility(from: child))
         }
         return labels
+    }
+
+    /// This is deliberately scoped to the renderer's own attached sheet window.  It lets the receipt compare
+    /// AppKit's `cacheDisplay` result with the WindowServer composition without sampling the desktop or the
+    /// installed VortX app.  Some host privacy policies may deny this API even for an accessory process; that
+    /// is reported as an unavailable compositor receipt, not treated as a visual pass.
+    private static func writeCompositedSheetSnapshot(_ sheet: NSWindow, named viewport: String, into output: URL) {
+        guard let image = CGWindowListCreateImage(.null,
+                                                  .optionIncludingWindow,
+                                                  CGWindowID(sheet.windowNumber),
+                                                  [.boundsIgnoreFraming, .bestResolution]) else {
+            print("quick-view compositor snapshot unavailable for sheet window \(sheet.windowNumber)")
+            return
+        }
+        let bitmap = NSBitmapImageRep(cgImage: image)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            print("quick-view compositor snapshot could not encode for sheet window \(sheet.windowNumber)")
+            return
+        }
+        let file = output.appendingPathComponent("cinema-quickView-\(viewport)-composited.png")
+        do {
+            try png.write(to: file, options: .atomic)
+            print("quick-view compositor snapshot \(file.path) \(bitmap.pixelsWide)x\(bitmap.pixelsHigh)")
+        } catch {
+            print("quick-view compositor snapshot could not write: \(error.localizedDescription)")
+        }
     }
 
     private enum RendererError: LocalizedError {
