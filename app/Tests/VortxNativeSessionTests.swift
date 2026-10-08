@@ -172,12 +172,82 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         let key = SymmetricKey(size: .bits256)
         let archive = try VortxNativeBootstrapArchive.encode(document: Data(#"{"futurePreference":{"keep":42},"apiKeys":{"provider":"fixture-excluded"}}"#.utf8),
                                                               material: Data(#"{"schemaVersion":1,"sourceClock":1000.125}"#.utf8))
+        // A separate installation proof authenticates the inventory without sharing account keys.
+        // Legacy/unindexed and corrupt history never establish absence for a different account.
+        let indexedDirectory = directory.deletingLastPathComponent().appendingPathComponent("indexed-accounts")
+        let installKey = SymmetricKey(size: .bits256), keyB = SymmetricKey(size: .bits256)
+        let scopeB = VortxAccountScope(account: "account-b", ownerProfileID: scope.ownerProfileID)
+        let scopeC = VortxAccountScope(account: "account-c", ownerProfileID: scope.ownerProfileID)
+        let legacyA = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: key, bootstrap: archive, bootstrapScope: scope)
+        try legacyA.commit(before, scope: scope); try legacyA.rememberAuthenticatedScope(scope)
+        let indexedB = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: keyB, installationKey: installKey, bootstrap: archive, bootstrapScope: scopeB)
+        do { _ = try indexedB.authenticatedCheckpoint(scope: scopeB); fatalError("legacy other-account history admitted new account") } catch {}
+        let indexedA = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: key, installationKey: installKey)
+        check(try indexedA.authenticatedCheckpoint(scope: scope) == before)
+        try indexedA.rememberAuthenticatedScope(scope)
+        check(try indexedB.authenticatedCheckpoint(scope: scopeB) == nil)
+        do { _ = try indexedB.recovery(account: scope.account); fatalError("inventory key decrypted another account") } catch {}
+        let stateB = before.replacingOccurrences(of: "account-a", with: "account-b")
+        try indexedB.commit(stateB, scope: scopeB)
+        let indexedC = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: SymmetricKey(size: .bits256), installationKey: installKey)
+        do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("crash between checkpoint and locator admitted new account") } catch {}
+        try indexedB.rememberAuthenticatedScope(scopeB)
+        check(try indexedC.authenticatedCheckpoint(scope: scopeC) == nil)
+        try indexedA.commit(before, scope: scope)
+        check(try indexedC.authenticatedCheckpoint(scope: scopeC) == nil)
+        let indexedFiles = try FileManager.default.contentsOfDirectory(at: indexedDirectory, includingPropertiesForKeys: nil)
+        let accountIndexes = indexedFiles.filter { $0.lastPathComponent.hasPrefix("native-account-v2-") }
+        check(accountIndexes.count == 2)
+        for file in indexedFiles {
+            let sealedBytes = try Data(contentsOf: file)
+            check(sealedBytes.range(of: Data("account-a".utf8)) == nil)
+            check(sealedBytes.range(of: Data("Retain context".utf8)) == nil)
+        }
+        let indexPath = accountIndexes[0], indexBytes = try Data(contentsOf: accountIndexes[0])
+        try Data("corrupt-index".utf8).write(to: indexPath)
+        do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("corrupt inventory admitted new account") } catch {}
+        try indexBytes.write(to: indexPath)
+        try FileManager.default.removeItem(at: indexPath)
+        do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("missing index admitted new account") } catch {}
+        try indexedA.rememberAuthenticatedScope(scope); try indexedB.rememberAuthenticatedScope(scopeB)
+        check(try indexedC.authenticatedCheckpoint(scope: scopeC) == nil)
+        let stateDigest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
+        let indexedStateA = indexedDirectory.appendingPathComponent("native-state-v1-\(stateDigest).sealed")
+        let validIndexedState = try Data(contentsOf: indexedStateA)
+        let prefix = Data("vortx-native-indexed-ciphertext-v2\n".utf8)
+        var corrupted = try JSONSerialization.jsonObject(with: validIndexedState.dropFirst(prefix.count)) as! [String: Any]
+        var ciphertext = Data(base64Encoded: corrupted["ciphertext"] as! String)!
+        ciphertext[ciphertext.startIndex] ^= 1
+        corrupted["ciphertext"] = ciphertext.base64EncodedString()
+        try (prefix + JSONSerialization.data(withJSONObject: corrupted)).write(to: indexedStateA)
+        do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("altered account ciphertext passed inventory proof") } catch {}
+        do { _ = try indexedA.recovery(account: scope.account); fatalError("altered account ciphertext passed account authentication") } catch {}
+        try validIndexedState.write(to: indexedStateA)
+        try FileManager.default.removeItem(at: indexedStateA)
+        do { _ = try indexedC.authenticatedCheckpoint(scope: scopeC); fatalError("dangling authenticated index admitted absence") } catch {}
+        try validIndexedState.write(to: indexedStateA)
+        let accountOnly = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: key)
+        check(try accountOnly.recovery(account: scope.account)?.state == before)
+        // Device-key loss invalidates absence proofs, never the independently encrypted account data.
+        let rotatedKey = SymmetricKey(size: .bits256)
+        let rotatedA = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: key, installationKey: rotatedKey)
+        let rotatedB = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: keyB, installationKey: rotatedKey)
+        let rotatedC = try VortxEncryptedCheckpointStore(directory: indexedDirectory, key: SymmetricKey(size: .bits256), installationKey: rotatedKey)
+        do { _ = try rotatedC.authenticatedCheckpoint(scope: scopeC); fatalError("lost installation key established absence") } catch {}
+        check(try rotatedA.recovery(account: scope.account)?.state == before)
+        try rotatedA.rememberAuthenticatedScope(scope)
+        do { _ = try rotatedC.authenticatedCheckpoint(scope: scopeC); fatalError("partially repaired inventory established absence") } catch {}
+        check(try rotatedB.recovery(account: scopeB.account)?.state == stateB)
+        try rotatedB.rememberAuthenticatedScope(scopeB)
+        check(try rotatedC.authenticatedCheckpoint(scope: scopeC) == nil)
+        print("Native installation inventory: independent second-account admission, legacy/crash/corrupt/missing-index rejection, account-key isolation and install-key-loss repair passed")
         let encrypted = try VortxEncryptedCheckpointStore(directory: directory, key: key, bootstrap: archive, bootstrapScope: scope)
         try encrypted.commit(before, scope: scope)
         check(try encrypted.read(scope: scope) == before)
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        precondition(files.count == 1)
-        let bytes = try Data(contentsOf: files[0])
+        let stateFiles = files.filter { $0.lastPathComponent.hasPrefix("native-state-v1-") }
+        precondition(stateFiles.count == 1)
+        let bytes = try Data(contentsOf: stateFiles[0])
         precondition(bytes.range(of: Data("Retain context".utf8)) == nil)
         func archived(_ bytes: Data) throws -> Data? {
             let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: bytes), using: key, authenticating: scope.authenticatedData)

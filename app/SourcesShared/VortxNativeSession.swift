@@ -1,6 +1,37 @@
 import Foundation
 import CryptoKit
 import Darwin
+import Security
+
+/// This key authenticates only the local checkpoint inventory. Account ciphertext remains readable
+/// with its independent account key after device-key loss; no installation identity is exported.
+enum VortxNativeInstallationKey {
+    private static let lock = NSLock()
+    static func loadOrCreate() throws -> SymmetricKey {
+        lock.lock(); defer { lock.unlock() }
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "tv.vortx.native-installation", kSecAttrAccount as String: "checkpoint-inventory-v2",
+            kSecAttrSynchronizable as String: false]
+        func read() throws -> Data? {
+            var request = query; request[kSecReturnData as String] = true; request[kSecMatchLimit as String] = kSecMatchLimitOne
+            var result: CFTypeRef?
+            let status = SecItemCopyMatching(request as CFDictionary, &result)
+            if status == errSecItemNotFound { return nil }
+            guard status == errSecSuccess, let bytes = result as? Data, bytes.count == 32 else { throw VortxNativeError.unavailable }
+            return bytes
+        }
+        if let existing = try read() { return SymmetricKey(data: existing) }
+        var bytes = Data(count: 32)
+        let randomStatus = bytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        guard randomStatus == errSecSuccess else { throw VortxNativeError.unavailable }
+        var item = query; item[kSecValueData as String] = bytes
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(item as CFDictionary, nil)
+        guard status == errSecSuccess || status == errSecDuplicateItem, let confirmed = try read(),
+              status == errSecDuplicateItem || confirmed == bytes else { throw VortxNativeError.unavailable }
+        return SymmetricKey(data: confirmed)
+    }
+}
 
 /// Native-only exports cannot acknowledge legacy host edits they deliberately do not serialize.
 enum VortxNativeSyncExportPolicy {
@@ -74,25 +105,29 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
     }
     private let directory: URL
     private let key: SymmetricKey
+    private let installationKey: SymmetricKey?
     private let lock = NSLock()
     private var bootstraps: [VortxAccountScope: Data] = [:]
     private struct AccountLocator: Codable {
         let format: String
         let scope: VortxAccountScope
     }
+    private struct InventoryProof: Codable { let scope: VortxAccountScope; let ciphertextDigest: Data }
+    private struct IndexedCiphertext: Codable { let format: String; let ciphertext: Data; let proof: Data }
+    private static let indexedPrefix = Data("vortx-native-indexed-ciphertext-v2\n".utf8)
     struct Recovery {
         let scope: VortxAccountScope
         let state: String
         let bootstrap: Data
     }
-    init(directory: URL, key: SymmetricKey, bootstrap: Data? = nil, bootstrapScope: VortxAccountScope? = nil) throws {
-        guard key.bitCount == 256 else { throw VortxNativeError.invalidSnapshot }
+    init(directory: URL, key: SymmetricKey, installationKey: SymmetricKey? = nil, bootstrap: Data? = nil, bootstrapScope: VortxAccountScope? = nil) throws {
+        guard key.bitCount == 256, installationKey == nil || installationKey?.bitCount == 256 else { throw VortxNativeError.invalidSnapshot }
         if let bootstrap {
             guard let bootstrapScope else { throw VortxNativeError.invalidSnapshot }
             try bootstrapScope.validate(); try VortxNativeBootstrapArchive.validate(bootstrap)
             bootstraps[bootstrapScope] = bootstrap
         }
-        self.directory = directory; self.key = key
+        self.directory = directory; self.key = key; self.installationKey = installationKey
     }
     private func url(_ scope: VortxAccountScope) -> URL {
         let digest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
@@ -103,11 +138,75 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         let digest = SHA256.hash(data: locatorAAD(account)).map { String(format: "%02x", $0) }.joined()
         return directory.appendingPathComponent("native-account-v1-\(digest).sealed")
     }
+    private func indexURL(_ account: String) -> URL {
+        directory.appendingPathComponent(locatorURL(account).lastPathComponent.replacingOccurrences(of: "native-account-v1-", with: "native-account-v2-"))
+    }
+    private func indexAAD(_ filename: String) -> Data { Data(("vortx-native-inventory-v2\u{0}" + filename).utf8) }
+    private func indexedCiphertext(_ ciphertext: Data, scope: VortxAccountScope) throws -> Data {
+        guard let installationKey else { return ciphertext }
+        let proof = InventoryProof(scope: scope, ciphertextDigest: Data(SHA256.hash(data: ciphertext)))
+        guard let sealed = try AES.GCM.seal(JSONEncoder().encode(proof), using: installationKey,
+            authenticating: indexAAD(url(scope).lastPathComponent)).combined else { throw VortxNativeError.invalidSnapshot }
+        return Self.indexedPrefix + (try JSONEncoder().encode(IndexedCiphertext(format: "vortx-native-indexed-ciphertext-v2", ciphertext: ciphertext, proof: sealed)))
+    }
+    private func accountCiphertext(_ data: Data) throws -> Data {
+        // The original account-key ciphertext is never discarded or made dependent on the install key.
+        guard data.starts(with: Self.indexedPrefix) else { return data }
+        let indexed = try JSONDecoder().decode(IndexedCiphertext.self, from: data.dropFirst(Self.indexedPrefix.count))
+        guard indexed.format == "vortx-native-indexed-ciphertext-v2" else { throw VortxNativeError.invalidSnapshot }
+        return indexed.ciphertext
+    }
+    private func authenticatedInventory(for requestedScope: VortxAccountScope) throws -> Set<String> {
+        guard let installationKey else { return [] }
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        var covered: Set<String> = []
+        var authenticatedIndexes: Set<String> = []
+        for file in files where file.lastPathComponent.hasPrefix("native-account-v2-") {
+            let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: file)), using: installationKey,
+                                         authenticating: indexAAD(file.lastPathComponent))
+            let locator = try JSONDecoder().decode(AccountLocator.self, from: plain)
+            try locator.scope.validate()
+            guard locator.format == "vortx-native-account-locator-v2", indexURL(locator.scope.account).path == file.path else { throw VortxNativeError.invalidSnapshot }
+            guard locator.scope.account != requestedScope.account || locator.scope == requestedScope else { throw VortxNativeError.invalidSnapshot }
+            let stateURL = url(locator.scope)
+            let bytes = try Data(contentsOf: stateURL)
+            guard bytes.starts(with: Self.indexedPrefix) else { throw VortxNativeError.invalidSnapshot }
+            let indexed = try JSONDecoder().decode(IndexedCiphertext.self, from: bytes.dropFirst(Self.indexedPrefix.count))
+            guard indexed.format == "vortx-native-indexed-ciphertext-v2" else { throw VortxNativeError.invalidSnapshot }
+            let proofBytes = try AES.GCM.open(AES.GCM.SealedBox(combined: indexed.proof), using: installationKey,
+                                             authenticating: indexAAD(stateURL.lastPathComponent))
+            let proof = try JSONDecoder().decode(InventoryProof.self, from: proofBytes)
+            guard proof.scope == locator.scope, proof.ciphertextDigest == Data(SHA256.hash(data: indexed.ciphertext)),
+                  covered.insert(stateURL.path).inserted else { throw VortxNativeError.invalidSnapshot }
+            authenticatedIndexes.insert(file.lastPathComponent)
+        }
+        guard files.filter({ $0.lastPathComponent.hasPrefix("native-account-v1-") }).allSatisfy({
+            authenticatedIndexes.contains($0.lastPathComponent.replacingOccurrences(of: "native-account-v1-", with: "native-account-v2-"))
+        }) else { throw VortxNativeError.invalidSnapshot }
+        return covered
+    }
+    private func durableInstall(_ bytes: Data, at destination: URL) throws {
+        let staged = directory.appendingPathComponent(".native-index-\(UUID().uuidString).sealed")
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try bytes.write(to: staged, options: [.withoutOverwriting, .completeFileProtection])
+        let file = try FileHandle(forWritingTo: staged); defer { try? file.close() }; try file.synchronize()
+        guard try Data(contentsOf: staged) == bytes else { throw VortxNativeError.invalidSnapshot }
+        guard Darwin.rename(staged.path, destination.path) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        let fd = Darwin.open(directory.path, O_RDONLY); guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { Darwin.close(fd) }; guard Darwin.fsync(fd) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        guard try Data(contentsOf: destination) == bytes else { throw VortxNativeError.invalidSnapshot }
+    }
     /// Publish only after a full authenticated account open. The account key and namespace
     /// authenticate this owner lookup; global profile preferences never establish ownership.
     func rememberAuthenticatedScope(_ scope: VortxAccountScope) throws {
         lock.lock(); defer { lock.unlock() }
         try scope.validate()
+        do {
+            let prior = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: locatorURL(scope.account))),
+                                         using: key, authenticating: locatorAAD(scope.account))
+            let pinned = try JSONDecoder().decode(AccountLocator.self, from: prior)
+            guard pinned.format == "vortx-native-account-locator-v1", pinned.scope == scope else { throw VortxNativeError.invalidSnapshot }
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError {}
         let existing = try open(Data(contentsOf: url(scope)), scope: scope)
         guard existing.bootstrap != nil else { throw VortxNativeError.invalidSnapshot }
         let payload = try JSONEncoder().encode(AccountLocator(format: "vortx-native-account-locator-v1", scope: scope))
@@ -128,6 +227,16 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         let installed = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: locatorURL(scope.account))),
                                         using: key, authenticating: locatorAAD(scope.account))
         guard installed == payload else { throw VortxNativeError.invalidSnapshot }
+        if let installationKey {
+            // Only account-key-authenticated state may acquire an installation index. A crash before
+            // either publication leaves the file unindexed and blocks new-account admission.
+            let ciphertext = try accountCiphertext(Data(contentsOf: url(scope)))
+            try durableInstall(indexedCiphertext(ciphertext, scope: scope), at: url(scope))
+            let indexPayload = try JSONEncoder().encode(AccountLocator(format: "vortx-native-account-locator-v2", scope: scope))
+            guard let indexBytes = try AES.GCM.seal(indexPayload, using: installationKey,
+                authenticating: indexAAD(indexURL(scope.account).lastPathComponent)).combined else { throw VortxNativeError.invalidSnapshot }
+            try durableInstall(indexBytes, at: indexURL(scope.account))
+        }
     }
     /// Offline recovery is read-only until the caller hydrates the proven checkpoint. Missing
     /// locator/checkpoint/archive is not permission to provision a new account.
@@ -155,12 +264,13 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
             let files: [URL]
             do { files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) }
             catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
-            guard !files.contains(where: { $0.lastPathComponent.hasPrefix("native-state-v1-") }) else { throw VortxNativeError.invalidSnapshot }
+            let covered = try authenticatedInventory(for: scope)
+            guard files.filter({ $0.lastPathComponent.hasPrefix("native-state-v1-") }).allSatisfy({ covered.contains($0.path) }) else { throw VortxNativeError.invalidSnapshot }
         }
         return checkpoint
     }
     private func open(_ data: Data, scope: VortxAccountScope) throws -> Envelope {
-        let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: data), using: key, authenticating: scope.authenticatedData)
+        let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: accountCiphertext(data)), using: key, authenticating: scope.authenticatedData)
         guard let snapshot = String(data: plain, encoding: .utf8) else { throw VortxNativeError.invalidSnapshot }
         if let object = try JSONSerialization.jsonObject(with: plain) as? [String: Any], object["format"] != nil {
             let envelope = try JSONDecoder().decode(Envelope.self, from: plain)
@@ -222,7 +332,7 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let staged = directory.appendingPathComponent(".native-checkpoint-\(UUID().uuidString).sealed")
         defer { try? FileManager.default.removeItem(at: staged) }
-        try combined.write(to: staged, options: [.withoutOverwriting, .completeFileProtection])
+        try indexedCiphertext(combined, scope: scope).write(to: staged, options: [.withoutOverwriting, .completeFileProtection])
         let file = try FileHandle(forWritingTo: staged); defer { try? file.close() }
         try file.synchronize()
         let stagedRead = try open(Data(contentsOf: staged), scope: scope)

@@ -477,7 +477,7 @@ final class VortXSyncManager: ObservableObject {
               let keyBytes = dataKey, keyBytes.count == 32 else { throw VortxNativeError.invalidSnapshot }
         let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
-        let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
         if let recovery = try store.recovery(account: capture.namespace) {
             guard let archive = try JSONSerialization.jsonObject(with: recovery.bootstrap) as? [String: Any],
                   let document = archive["hostDocument"] as? [String: Any],
@@ -500,7 +500,7 @@ final class VortXSyncManager: ObservableObject {
         let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owner.id.uuidString)
         let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
-        let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+        let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
         // Preserve historical, already-mounted provisional checkpoints and every edit in them.
         if try probe.authenticatedCheckpoint(scope: scope) != nil { return baseline }
         var candidate = baseline
@@ -524,7 +524,7 @@ final class VortXSyncManager: ObservableObject {
         do {
             let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
                 .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
-            let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+            let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
             guard let recovery = try store.recovery(account: capture.namespace) else { throw VortxNativeError.invalidSnapshot }
             let state = try recovery.scope.validateSnapshot(recovery.state)
             guard let profile = state["roster"]?["profiles"]?[selectedProfile.uuidString], profile["deleted"] != .bool(true),
@@ -547,6 +547,7 @@ final class VortXSyncManager: ObservableObject {
                 let acceptedHost = try await session.hostPreferencesDocument()
                 guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
                       ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                try store.rememberAuthenticatedScope(recovery.scope)
                 let sourceDocument = archive["hostDocument"] as? [String: Any] ?? [:]
                 let hostProfiles = Self.resolveRoster(from: sourceDocument, fullOnly: true)?.profiles ?? []
                 try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture, hostProfiles: hostProfiles)
@@ -617,7 +618,7 @@ final class VortXSyncManager: ObservableObject {
                 let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
                     .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
                 let documentBytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys, .withoutEscapingSlashes])
-                let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+                let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
                 let checkpoint = try probe.authenticatedCheckpoint(scope: scope)
                 let hadCheckpoint = checkpoint != nil
                 // Every open checks the complete legacy projection, including pending web edits.
@@ -647,6 +648,7 @@ final class VortXSyncManager: ObservableObject {
                 }
                 let archive = try VortxNativeBootstrapArchive.encode(document: documentBytes, material: material)
                 let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes),
+                                                               installationKey: VortxNativeInstallationKey.loadOrCreate(),
                                                                bootstrap: archive, bootstrapScope: scope)
                 let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
                                                     transport: VortxCResourceTransport(), allowNewAccount: !hadCheckpoint, initialActions: initialActions,
