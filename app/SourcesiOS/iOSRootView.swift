@@ -5023,7 +5023,7 @@ struct CachedPosterImage: View {
     }
 
     var body: some View {
-        let image = Group {
+        let renderedImage = Group {
             if let image = image ?? synchronousCache {
                 imageView(image).resizable().scaledToFill()
             } else if failed {
@@ -5034,9 +5034,9 @@ struct CachedPosterImage: View {
             }
         }
         if disablesArtworkLoading {
-            image
+            renderedImage
         } else {
-            image.task(id: url) { await load() }
+            renderedImage.task(id: url) { await load() }
         }
     }
 
