@@ -43,7 +43,7 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
         val sync = state.optJSONObject("nativeSync")
         require(!requireSync || sync != null) { "Native sync artifact required" }
         if (sync != null) {
-            require(sync.getInt("schemaVersion") in 1..2 && sync.getString("scope") == accountID &&
+            require(sync.getInt("schemaVersion") in 1..4 && sync.getString("scope") == accountID &&
                 sync.getString("ownerProfileId") == ownerProfileID) { "Native snapshot scope mismatch" }
             sync.getJSONObject("profiles"); sync.getJSONObject("addons"); sync.getJSONObject("libraries"); sync.getJSONObject("watches")
         }
@@ -64,7 +64,7 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
         if (state.has("nativeHostPreferenceState")) state.getJSONObject("nativeHostPreferenceState")
         if (state.has("legacyImportMaterial")) {
             val material = state.getJSONObject("legacyImportMaterial")
-            require(material.getInt("schemaVersion") == 1)
+            require(material.getInt("schemaVersion") in 1..2)
             material.getJSONArray("roster"); material.getJSONArray("deletedProfileIds")
             material.getJSONObject("addons"); material.getJSONObject("libraries")
             material.getJSONObject("watches"); material.getJSONObject("identityLinks")
@@ -244,6 +244,7 @@ internal class VortxNativeSession private constructor(
     private val slots = mutableMapOf<String, Slot>()
     private var revision = nextRevision.incrementAndGet()
     private var closed = false
+    private var checkpointUncertain = false
     private val changes = MutableStateFlow(0L)
     val updates: StateFlow<Long> get() = changes
 
@@ -355,7 +356,8 @@ internal class VortxNativeSession private constructor(
             .put("websiteProfileEditCertificates", websiteProfileEditCertificates).toString())
         return VortxNativeRead(VortxNativeOwner(scope, state.getString("activeProfileId"), revision), state)
     }
-    @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && isAccountCurrent() && read().owner == owner
+    @Synchronized fun requiresRecovery(): Boolean = checkpointUncertain
+    @Synchronized fun accepts(owner: VortxNativeOwner): Boolean = !closed && !checkpointUncertain && isAccountCurrent() && read().owner == owner
     @Synchronized fun resolve(request: JSONObject, owner: VortxNativeOwner = read().owner): JSONObject = owned(owner) {
         JSONObject(runtime.resolve(request.toString())).also { check(it.getString("kind") != "error") { "Native query rejected" } }
     }
@@ -417,7 +419,7 @@ internal class VortxNativeSession private constructor(
             val updated = checkpoint(candidate.stateJson(), preferences, hostProfileSyncPending, applied.host,
                 legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, pending, applied.certificates)
             val state = scope.validateSnapshot(updated)
-            store.commit(scope, updated); check(store.read(scope) == updated) { "Native checkpoint readback failed" }
+            commitCheckpoint(updated)
             check(isAccountCurrent()) { "Native account changed" }
             val prior = JSONObject(before)
             val profileChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString()
@@ -435,8 +437,8 @@ internal class VortxNativeSession private constructor(
         val pending = NativeWebsiteProfileEdits.retain(scope, websiteProfileEditPending, event)
         val updated = checkpoint(runtime.stateJson(), hostProfilePreferences, hostProfileSyncPending, nativeHostPreferenceState,
             legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, pending, websiteProfileEditCertificates)
-        scope.validateSnapshot(updated); store.commit(scope, updated)
-        check(store.read(scope) == updated) { "Native checkpoint readback failed" }; check(isAccountCurrent()) { "Native account changed" }
+        scope.validateSnapshot(updated); commitCheckpoint(updated)
+        check(isAccountCurrent()) { "Native account changed" }
         websiteProfileEditPending = pending; changes.value += 1
     }
     /**
@@ -498,12 +500,12 @@ internal class VortxNativeSession private constructor(
                 .put("legacyWebsiteBootstrap", legacyWebsiteBootstrap)
                 .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates).toString()
             val state = scope.validateSnapshot(updated)
-            store.commit(scope, updated)
-            check(store.read(scope) == updated) { "Native checkpoint readback failed" }
+            commitCheckpoint(updated)
             check(isAccountCurrent()) { "Native account changed" }
             val prior = JSONObject(before)
             val profileOrRegistryChanged = prior.getJSONObject("roster").toString() != state.getJSONObject("roster").toString() ||
-                prior.getJSONObject("nativeSync").getJSONObject("addons").toString() != state.getJSONObject("nativeSync").getJSONObject("addons").toString()
+                prior.getJSONObject("nativeSync").getJSONObject("addons").toString() != state.getJSONObject("nativeSync").getJSONObject("addons").toString() ||
+                !NativeHostPreferences.equal(bindingSelections(prior), bindingSelections(state))
             val hostChanged = preferences.toString() != hostProfilePreferences.toString()
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
@@ -520,9 +522,31 @@ internal class VortxNativeSession private constructor(
             results
         } finally { if (!installed) candidate.close() }
     }
+    /** Same-UID relinks still change credential authority. Dormant slot merges do not revoke
+     * playback, but every actual selection transaction does, including remote A→B→A. */
+    private fun bindingSelections(state: JSONObject): JSONObject = JSONObject().also { result ->
+        state.optJSONObject("nativeSync")?.optJSONObject("accountSlots")?.let { slots ->
+            slots.keys().forEach { result.put(it, slots.getJSONObject(it).getJSONObject("activeBinding")) }
+        }
+    }
     @Synchronized private fun invalidate() {
         revision = nextRevision.incrementAndGet()
         slots.values.forEach { it.bridge.close() }; slots.clear()
+    }
+    /** Rename may have succeeded before fsync/readback failed. Keep the previously published view
+     * readable, but revoke ALL transaction/resource/reclaim admission until authenticated reopen.
+     * In particular, old runtime A must never overwrite a possibly installed binding B. */
+    private fun commitCheckpoint(snapshot: String) {
+        check(!checkpointUncertain) { "Native checkpoint requires authenticated reopen" }
+        try {
+            store.commit(scope, snapshot)
+            check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
+        } catch (error: Throwable) {
+            checkpointUncertain = true
+            slots.values.forEach { it.bridge.close() }; slots.clear()
+            changes.value += 1
+            throw error
+        }
     }
     private fun checkpoint(core: String, profiles: JSONObject, pendingProfiles: Boolean, host: JSONObject, material: JSONObject?, archive: JSONObject?, bootstrap: JSONObject?, websitePending: JSONObject, certificates: JSONObject): String =
         JSONObject(core).put("hostProfilePreferences", profiles).put("hostProfileSyncPending", pendingProfiles)

@@ -6,6 +6,7 @@ import com.vortx.android.security.PersistentCredentialAvailability
 import com.vortx.android.security.PersistentCredentialSnapshot
 import com.vortx.android.sync.SessionOwnerSnapshot
 import org.json.JSONObject
+import java.security.MessageDigest
 import java.util.UUID
 
 /** Device-only, account AND profile qualified streaming credentials. No legacy/global adoption.
@@ -26,9 +27,11 @@ internal class NativeOwnAccountCredentials(
             return requireNotNull(result).getOrThrow()
         }
     }
-    internal class Attempt internal constructor(val profileID: String, internal val key: String, val authority: Authority)
+    internal class Attempt internal constructor(val accountID: String, val profileID: String, internal val key: String,
+                                               val transactionID: String?, val authority: Authority,
+                                               internal val admission: (() -> Boolean) -> Boolean)
     internal class Capture internal constructor(val accountID: String, val profileID: String, val verifiedUID: String,
-                                               private val token: String, val authority: Authority) {
+                                               val transactionID: String?, private val token: String, val authority: Authority) {
         fun request(fields: JSONObject): JSONObject = authority.withActive { JSONObject(fields.toString()).put("authKey", token) }
     }
 
@@ -38,49 +41,72 @@ internal class NativeOwnAccountCredentials(
         require(UUID.fromString(profileID).toString().uppercase() == profileID) { "Exact uppercase profile UUID required" }
         return "account.${UUID.fromString(account.id).toString().lowercase()}.profile.$profileID"
     }
+    private fun slot(accountID: String, profileID: String, uid: String, transactionID: String?): String {
+        requireNativeStreamingUID(uid)
+        transactionID?.let(NativeAccountBinding::requireTransactionID)
+        val domain = transactionID?.let { "transaction:$it" } ?: "verified-import"
+        val bytes = "$accountID\u0000$profileID\u0000$uid\u0000$domain".toByteArray(Charsets.UTF_8)
+        return "revision." + MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+    }
     private fun confirmed(key: String): String? {
         val snapshot = read(key)
         check(snapshot.availability == PersistentCredentialAvailability.AVAILABLE) { "Streaming credential store unavailable" }
         return snapshot.values[key]
     }
     private fun authority(key: String, accountAdmission: (() -> Boolean) -> Boolean, expected: String? = null,
-                          checkRecord: Boolean = false): Authority {
+                          recordKey: String? = null): Authority {
         val generation = generations.getOrPut(key, UUID::randomUUID); val capturedContext = context
         return Authority { action -> synchronized(lock) {
             generation == generations[key] && capturedContext == context && accountAdmission {
-                (!checkRecord || confirmed(key) == expected) && action()
+                (recordKey == null || confirmed(recordKey) == expected) && action()
             }
         } }
     }
     /** Login starts a new epoch even if the server later returns the same token bytes. */
-    fun begin(account: SessionOwnerSnapshot.Account, profileID: String, accountAdmission: (() -> Boolean) -> Boolean): Attempt = synchronized(lock) {
+    fun begin(account: SessionOwnerSnapshot.Account, profileID: String, accountAdmission: (() -> Boolean) -> Boolean,
+              transactionID: String? = null): Attempt = synchronized(lock) {
+        transactionID?.let(NativeAccountBinding::requireTransactionID)
         val key = key(account, profileID); generations[key] = UUID.randomUUID()
-        Attempt(profileID, key, authority(key, accountAdmission)).also { it.authority.withActive {} }
+        Attempt("account.${UUID.fromString(account.id).toString().lowercase()}", profileID, key, transactionID,
+            authority(key, accountAdmission), accountAdmission).also { it.authority.withActive {} }
     }
-    fun capture(account: SessionOwnerSnapshot.Account, profileID: String, accountAdmission: (() -> Boolean) -> Boolean): Capture? = synchronized(lock) {
+    /** Only an exact native selection (or a verified initial-import UID) may name a secure slot.
+     * No latest-UID/profile pointer exists; staged failed-CAS revisions are never selected. */
+    fun capture(account: SessionOwnerSnapshot.Account, profileID: String, verifiedUID: String, transactionID: String?,
+                accountAdmission: (() -> Boolean) -> Boolean): Capture? = synchronized(lock) {
         val key = key(account, profileID)
+        val accountID = "account.${UUID.fromString(account.id).toString().lowercase()}"
+        val recordKey = slot(accountID, profileID, verifiedUID, transactionID)
         authority(key, accountAdmission).withActive {
-            val raw = confirmed(key) ?: return@withActive null
+            val raw = confirmed(recordKey) ?: return@withActive null
             val record = JSONObject(raw)
-            require(record.keys().asSequence().toSet() == setOf("schemaVersion", "revision", "authKey", "verifiedUID"))
-            require(record.get("schemaVersion") is Number && record.getDouble("schemaVersion") == 1.0)
-            UUID.fromString(record.getString("revision"))
+            require(record.keys().asSequence().toSet() == setOf("schemaVersion", "accountID", "profileID", "transactionID", "authKey", "verifiedUID"))
+            require(record.get("schemaVersion") is Number && record.getDouble("schemaVersion") == 2.0)
+            require(record.getString("accountID") == accountID && record.getString("profileID") == profileID &&
+                record.get("transactionID") == (transactionID ?: JSONObject.NULL))
             val token = record.get("authKey") as? String ?: error("Invalid streaming credential")
             require(token.isNotBlank())
             val uid = record.get("verifiedUID") as? String ?: error("Invalid streaming identity")
-            requireNativeStreamingUID(uid)
-            Capture("account.${UUID.fromString(account.id).toString().lowercase()}", profileID, uid, token, authority(key, accountAdmission, raw, true))
+            requireNativeStreamingUID(uid); require(uid == verifiedUID)
+            Capture(accountID, profileID, uid, transactionID, token, authority(key, accountAdmission, raw, recordKey))
         }
     }
     /** Called only after getUser verified the exact token; confirmed readback is mandatory. */
-    fun storeVerified(attempt: Attempt, token: String, uid: String) = attempt.authority.withActive {
+    fun storeVerified(attempt: Attempt, token: String, uid: String): Capture = attempt.authority.withActive {
         require(token.isNotBlank()); requireNativeStreamingUID(uid)
-        val value = JSONObject().put("schemaVersion", 1).put("revision", UUID.randomUUID().toString())
+        val recordKey = slot(attempt.accountID, attempt.profileID, uid, attempt.transactionID)
+        val value = JSONObject().put("schemaVersion", 2).put("accountID", attempt.accountID).put("profileID", attempt.profileID)
+            .put("transactionID", attempt.transactionID ?: JSONObject.NULL)
             .put("authKey", token).put("verifiedUID", uid).toString()
-        check(write(attempt.key, value) && confirmed(attempt.key) == value) { "Streaming credential could not be stored securely" }
-    }
-    fun clear(attempt: Attempt) = attempt.authority.withActive {
-        check(write(attempt.key, null) && confirmed(attempt.key) == null) { "Streaming credential removal could not be confirmed" }
+        val old = confirmed(recordKey)
+        require(old == null || NativeHostPreferences.equal(JSONObject(old), JSONObject(value))) {
+            "An immutable streaming credential revision cannot be replaced"
+        }
+        check((old != null || write(recordKey, value)) && confirmed(recordKey) == (old ?: value)) {
+            "Streaming credential could not be stored securely"
+        }
+        Capture(attempt.accountID, attempt.profileID, uid, attempt.transactionID, token,
+            authority(attempt.key, attempt.admission, old ?: value, recordKey))
     }
 
     companion object {

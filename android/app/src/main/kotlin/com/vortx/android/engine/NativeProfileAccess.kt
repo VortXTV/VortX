@@ -17,10 +17,16 @@ internal class NativeProfileAccess(private val session: () -> VortxNativeSession
         val runtime = session(); val read = runtime.read()
         val previous = projection(read).profiles.find { it.id == profile.id }
         check(adding == (previous == null)) { "Native profile changed" }
-        check(!profile.usesOwnAccount || previous?.usesOwnAccount == true) { "Native external account binding requires authenticated setup" }
         check(profile.isOwner == (profile.id == read.owner.scope.ownerProfileID)) { "Native owner identity cannot change" }
+        check(!profile.isOwner || !profile.usesOwnAccount) { "Native owner cannot be rebound" }
         val actions = mutableListOf<JSONObject>()
         if (adding) actions += JSONObject().put("type", "add_profile").put("id", profile.id).put("name", profile.name)
+        if (!profile.isOwner && (profile.usesOwnAccount != (previous?.usesOwnAccount ?: false))) {
+            val expected = if (adding) NativeAccountBinding.parse(JSONObject().put("account", JSONObject().put("kind", "local_only"))
+                .put("revision", 0).put("transactionId", JSONObject.NULL)) else NativeAccountBinding.read(read.state, profile.id)
+            actions += NativeStreamingAccountLink.action(read.owner.scope, profile.id, expected, java.util.UUID.randomUUID().toString(),
+                JSONObject().put("kind", if (profile.usesOwnAccount) "pending_own" else "shared"))
+        }
         val edits = JSONArray()
         fun edit(field: String, value: Any?) { edits.put(JSONObject().put("field", field).put("value", value ?: JSONObject.NULL)) }
         if (previous?.name != profile.name) edit("name", profile.name)
@@ -62,7 +68,7 @@ internal class NativeProfileAccess(private val session: () -> VortxNativeSession
                 val id = value.getString("id"); val settings = value.getJSONObject("settings"); val parental = value.getJSONObject("parental")
                 val previous = host.optJSONObject(id)?.let(UserProfile::decodeProfile) ?: UserProfile(id = id, name = value.getString("name"), avatar = "person.fill")
                 previous.copy(id = id, name = value.getString("name"), isOwner = value.getBoolean("owner"),
-                    usesOwnAccount = value.getJSONObject("account").getString("kind") == "own",
+                    usesOwnAccount = value.getJSONObject("account").getString("kind") in setOf("own", "pending_own"),
                     pin = value.optString("pin").takeUnless { it.isEmpty() || it == "null" },
                     isKids = parental.getBoolean("kids"), familyEdit = parental.getBoolean("familyEdit"),
                     accentID = settings.optString("accent", previous.accentID), oled = settings.getBoolean("oled"),

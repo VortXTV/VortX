@@ -58,6 +58,7 @@ class NativeOwnAccountSourcesTest {
             .put(owner.id, JSONObject().put("private", "owner-only")))
         val source = producer(raw, addonRaw).fetch(capture, document)
         val bytes = Base64.getDecoder().decode(source.archiveBase64()); val envelope = JSONObject(String(bytes))
+        assertEquals(2, envelope.getInt("schemaVersion"))
         assertArrayEquals(raw, Base64.getDecoder().decode(envelope.getString("libraryResponseBase64")))
         assertArrayEquals(addonRaw, Base64.getDecoder().decode(envelope.getString("addonsResponseBase64")))
         val slice = String(Base64.getDecoder().decode(envelope.getString("profileOverlayBase64")))
@@ -100,11 +101,11 @@ class NativeOwnAccountSourcesTest {
         val failed = Journal().apply { writes = false }
         assertTrue(runCatching { capture(failed) }.isFailure); assertTrue(failed.values.isEmpty())
         val missing = Journal().apply { available = false }
-        assertTrue(runCatching { missing.credentials.capture(account, child.id) { it() } }.isFailure)
+        assertTrue(runCatching { missing.credentials.capture(account, child.id, "verified-stream-user", null) { it() } }.isFailure)
         val journal = Journal(); var current = true; val captured = capture(journal, admission = { current && it() })
         current = false
         assertTrue(runCatching { producer().fetch(captured, root()) }.isFailure)
-        assertNull(journal.credentials.capture(account.copy(id = "00000000-0000-0000-0000-000000000789"), child.id) { it() })
+        assertNull(journal.credentials.capture(account.copy(id = "00000000-0000-0000-0000-000000000789"), child.id, "verified-stream-user", null) { it() })
     }
 
     @Test fun `malformed partial and credential bearing response cannot become empty authenticated sources`() = runBlocking {
@@ -168,7 +169,8 @@ class NativeOwnAccountSourcesTest {
             assertEquals("own-addon", addons.getJSONArray("addons").getJSONObject(0).getJSONObject("manifest").getString("id"))
             journal.credentials.invalidateContext()
             val peer = NativeOwnAccountBaseline.validate(bindings, scope, sync)
-            assertTrue(runCatching { nativeLegacyMaterial(document, listOf(owner, child), 1.0, retainedOwnAccounts = peer, accountScope = scope) }.isFailure)
+            val peerMaterial = nativeLegacyMaterial(document, listOf(owner, child), 1.0, retainedOwnAccounts = peer, accountScope = scope)
+            assertTrue(NativeHostPreferences.equal(peer.proof(child.id), peerMaterial.getJSONObject("ownAccountSources").get(child.id)))
             assertEquals("verified-stream-user", peer.proof(child.id).getString("verifiedStreamingUid"))
             val retained = NativeOwnAccountBaseline.validate(bindings, scope, sync, mapOf(child.id to sourceBytes))
             val cold = nativeLegacyMaterial(document, listOf(owner, child), 1.0, retainedOwnAccounts = retained, accountScope = scope)
@@ -219,7 +221,9 @@ class NativeOwnAccountSourcesTest {
             val before = runtime.stateJson()
             assertTrue(runCatching { nativeLegacyMaterial(changed, listOf(owner, child), 1.0, retainedOwnAccounts = local, accountScope = scope) }.isFailure)
             val peer = NativeOwnAccountBaseline.validate(bindings, scope, sync)
-            assertTrue(runCatching { nativeLegacyMaterial(document, listOf(owner, child), 1.0, retainedOwnAccounts = peer, accountScope = scope) }.isFailure)
+            val peerMaterial = nativeLegacyMaterial(document, listOf(owner, child), 1.0, retainedOwnAccounts = peer, accountScope = scope)
+            assertTrue(NativeHostPreferences.equal(peer.bucket("watches", child.id), peerMaterial.getJSONObject("watches").get(child.id)))
+            assertTrue(runCatching { nativeLegacyMaterial(changed, listOf(owner, child), 1.0, retainedOwnAccounts = peer, accountScope = scope) }.isFailure)
             assertEquals(before, runtime.stateJson()) // Valid native account remains visible unchanged.
             assertEquals(30_000L, JSONObject(runtime.resolve(query)).getJSONArray("continueWatching").getJSONObject(0).getLong("offsetMs"))
             val bad = bytes.copyOf().also { it[it.lastIndex] = '!'.code.toByte() }

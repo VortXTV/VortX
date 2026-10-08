@@ -59,7 +59,7 @@ internal class NativeAccountCoordinator(
 
     override suspend fun reopenCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): Boolean = mutex.withLock {
         check(isCurrent() && accountCurrent(account)) { "Native account changed" }
-        mounted.get()?.takeIf { it.account == account }?.let { return@withLock true }
+        mounted.get()?.takeIf { it.account == account && !it.session.requiresRecovery() }?.let { return@withLock true }
         retire()
         while (true) { val prior = retired.poll() ?: break; prior.close() }
         val namespace = "account.${UUID.fromString(account.id).toString().lowercase()}"
@@ -170,7 +170,7 @@ internal class NativeAccountCoordinator(
         // is credential-free; sanitizing it would silently change the shared kernel's receipt input.
         NativeHostDocument.requireCredentialFree(material)
         val old = mounted.get()
-        val retained = old?.takeIf { it.account == account && it.session.scope == scope }?.session?.read()?.state
+        val retained = old?.takeIf { it.account == account && it.session.scope == scope && !it.session.requiresRecovery() }?.session?.read()?.state
             ?: checkpoints.read(scope)?.let(scope::validateSnapshot)
         val hasReceipt = remote?.optJSONObject("legacyImport") != null || retained?.optJSONObject("nativeSync")?.optJSONObject("legacyImport") != null
         val replay = JSONObject().put("type", if (hasReceipt) "reconcile_legacy_sync" else "import_legacy_sync").put("scope", namespace).put("ownerProfileId", owner.id)
@@ -179,7 +179,7 @@ internal class NativeAccountCoordinator(
         val syncActions = listOfNotNull(remote?.let { JSONObject().put("type", "merge_native_sync").put("document", it) }, replay)
         val archive = NativeHostDocument.archive(document)
         val baselineHost = NativeHostProfiles.fromDocument(archive.getJSONObject("document"), roster, resolved.modifiedSeconds)
-        if (old != null && old.account == account && old.session.scope == scope) {
+        if (old != null && old.account == account && old.session.scope == scope && !old.session.requiresRecovery()) {
             val read = old.session.read()
             val host = read.state.getJSONObject("hostProfilePreferences")
             val nextHost = if ((resolved.modifiedSeconds ?: 0.0) > host.optDouble("modifiedSeconds", 0.0)) {

@@ -75,9 +75,26 @@ internal object NativeHostDocument {
                 val childPath = pointer(path, key)
                 if (excluded(key, childPath)) continue
                 val child = value.get(key)
-                result.put(key, if (root && key == "settings" && child != JSONObject.NULL)
+                val profileName = key == "name" && child is String &&
+                    Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").matches(value.optString("id")) &&
+                    (value.opt("isOwner") is Boolean || value.opt("owner") is Boolean)
+                result.put(key, if (profileName && cannotBeEncodedText(child as String)) child
+                else if (key == "authenticatedOwnAccountSources")
+                    validateNativeOwnAccountArchive(child as? JSONObject ?: reject("Malformed authenticated source archive"))
+                else if (root && key == "settings" && child != JSONObject.NULL)
                     settings(child, childPath, depth + 1) else json(child, childPath, depth + 1))
             }
+        }
+
+        /** Names such as "Independent" accidentally decode to quote + invalid UTF-8. This is a
+         * schema-qualified literal name, not opaque backup Data. Real encoded JSON remains scanned. */
+        private fun cannotBeEncodedText(value: String): Boolean {
+            if (value.trimStart().firstOrNull() in setOf('{', '[', '"')) return false
+            val candidate = value.filterNot { it in " \t\r\n" }
+            val decoder = if (candidate.any { it == '-' || it == '_' }) Base64.getUrlDecoder() else Base64.getDecoder()
+            val decoded = runCatching { decoder.decode(candidate) }.getOrNull() ?: return false
+            val first = decoded.firstOrNull { (it.toInt() and 255).toChar() !in " \t\r\n" }?.let { (it.toInt() and 255).toChar() }
+            return first in setOf('{', '[', '"') && runCatching { strictUtf8(decoded) }.isFailure
         }
 
         private fun settings(value: Any, path: String, depth: Int): String {
@@ -166,7 +183,12 @@ internal object NativeHostDocument {
             if (Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").matches(value)) return null
             // Website protocol SHA-256 evidence is opaque identity material, not an encoded
             // document. Keep this narrow: arbitrary lookalike strings still receive inspection.
-            if ((path.endsWith("/valueHash") || path.endsWith("/fingerprint")) && Regex("[0-9a-f]{64}").matches(value)) return null
+            if (listOf("/valueHash", "/fingerprint", "/sourceDocumentSha256", "/profileOverlaySha256", "/typedCarrierFingerprint")
+                    .any(path::endsWith) && Regex("[0-9a-f]{64}").matches(value)) return null
+            if (Regex("[0-9a-f]{64}").matches(value) && (
+                Regex(".*/nativeSync/legacyImport/acceptedFingerprints/[0-9]+").matches(path) ||
+                Regex(".*/nativeSync/legacyImport/ownAccountSourceHistory/[^/]+/[0-9a-f]{64}").matches(path) ||
+                Regex(".*/nativeSync/accountSlots/[^/]+/slots/[^/]+/sourceHistory/[0-9a-f]{64}").matches(path))) return null
             val candidate = value.filterNot { it in " \t\r\n" }
             if (candidate.isEmpty()) return null
             requireArchive(candidate.length <= 44 * 1024 * 1024, "Encoded host document exceeds inspection limits")

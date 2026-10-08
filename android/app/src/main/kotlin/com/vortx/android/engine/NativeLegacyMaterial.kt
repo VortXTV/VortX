@@ -34,6 +34,20 @@ internal fun nativeLegacyMaterial(
     LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts).build()
 }
 
+/** A rebind source is independent of the owner/global import. Reuse the same typed reducer, with
+ * the exact authenticated UUID overlay and raw source only; never project the owner's library. */
+internal fun nativeOwnAccountCarrier(source: NativeOwnAccountSource, profile: UserProfile,
+                                     currentDocument: JSONObject): JSONObject = source.withActive {
+    require(source.profileID == profile.id && !profile.isOwner)
+    source.requireOverlayUnchanged(currentDocument)
+    val isolated = profile.copy(isOwner = true, usesOwnAccount = false)
+    val material = LegacyMaterialAdapter(source.legacyDocument(), listOf(isolated), null, independentSource = true).build()
+    JSONObject().put("source", source.proof()).put("addons", material.getJSONObject("addons").getJSONObject(profile.id))
+        .put("library", material.getJSONObject("libraries").getJSONObject(profile.id))
+        .put("watches", material.getJSONObject("watches").getJSONArray(profile.id))
+        .put("identityLinks", material.getJSONObject("identityLinks").getJSONArray(profile.id))
+}
+
 private class LegacyMaterialAdapter(
     private val document: JSONObject,
     private val roster: List<UserProfile>,
@@ -77,7 +91,7 @@ private class LegacyMaterialAdapter(
         for (id in ownIDs) {
             requireMaterial(UUID.fromString(id).toString().uppercase() == id, "Own-account profile UUID must be canonical uppercase")
             fresh[id]?.requireOverlayUnchanged(document) ?: requireNotNull(retainedOwn).requireOverlayUnchanged(document, id)
-            val proof = fresh[id]?.let { JSONObject().put("verifiedStreamingUid", it.verifiedUID).put("sourceDocumentSha256", it.digest) }
+            val proof = fresh[id]?.proof()
                 ?: requireNotNull(retainedOwn).proof(id)
             proofs.put(id, proof)
         }

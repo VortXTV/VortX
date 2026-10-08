@@ -26,10 +26,15 @@ internal class NativeOwnAccountSource private constructor(
 ) {
     private val bytes = bytes.copyOf()
     val digest: String = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+    val overlayDigest: String = NativeProfileOverlayWitness.digest(decodeOwnEnvelope(bytes).third)
+    fun proof(): JSONObject = withActive { JSONObject().put("verifiedStreamingUid", verifiedUID)
+        .put("sourceDocumentSha256", digest).also {
+            if (ownObject(bytes).getInt("schemaVersion") == 2) it.put("profileOverlaySha256", overlayDigest)
+        } }
     fun archiveBase64(): String = withActive { Base64.getEncoder().encodeToString(bytes) }
     fun <T> withActive(action: () -> T): T = authority.withActive(action)
     fun requireOverlayUnchanged(document: JSONObject) = withActive {
-        require(NativeHostPreferences.equal(nativeOwnAccountOverlay(document, profileID), decodeOwnEnvelope(bytes).third)) {
+        require(NativeProfileOverlayWitness.digest(nativeOwnAccountOverlay(document, profileID)) == overlayDigest) {
             "Own-account overlay changed during authenticated source capture"
         }
     }
@@ -82,13 +87,15 @@ internal class NativeOwnAccountSource private constructor(
         return row
     }
     companion object {
-        internal fun fromFetched(capture: NativeOwnAccountCredentials.Capture, uid: String, library: ByteArray, addons: ByteArray, overlay: ByteArray): NativeOwnAccountSource = capture.authority.withActive {
+        internal fun fromFetched(capture: NativeOwnAccountCredentials.Capture, uid: String, library: ByteArray, addons: ByteArray, overlay: ByteArray,
+                                 witnessedOverlay: Boolean = true): NativeOwnAccountSource = capture.authority.withActive {
             requireNativeStreamingUID(uid); require(uid == capture.verifiedUID) { "Streaming credential identity changed" }
             // Sorted keys and ordinary JSON strings match the shared Apple framing. The digest is
             // over THESE bytes; another platform must retain rather than reserialize this envelope.
             val encoded = "{\"addonsResponseBase64\":" + JSONObject.quote(Base64.getEncoder().encodeToString(addons)) +
                 ",\"libraryResponseBase64\":" + JSONObject.quote(Base64.getEncoder().encodeToString(library)) +
-                ",\"profileOverlayBase64\":" + JSONObject.quote(Base64.getEncoder().encodeToString(overlay)) + ",\"schemaVersion\":1}"
+                ",\"profileOverlayBase64\":" + JSONObject.quote(Base64.getEncoder().encodeToString(overlay)) +
+                ",\"schemaVersion\":" + (if (witnessedOverlay) 2 else 1) + "}"
             NativeOwnAccountSource(capture.accountID, capture.profileID, uid, encoded.toByteArray(Charsets.UTF_8), capture.authority).also { it.legacyDocument() }
         }
     }
@@ -96,18 +103,19 @@ internal class NativeOwnAccountSource private constructor(
 
 internal class NativeOwnAccountProducer(private val send: suspend (String, JSONObject) -> ByteArray = NativeOwnAccountHTTP()::post) {
     suspend fun signIn(credentials: NativeOwnAccountCredentials, account: SessionOwnerSnapshot.Account, profileID: String,
-                       email: String, password: String, accountAdmission: (() -> Boolean) -> Boolean): NativeOwnAccountCredentials.Capture {
-        val attempt = credentials.begin(account, profileID, accountAdmission)
+                       email: String, password: String, accountAdmission: (() -> Boolean) -> Boolean,
+                       transactionID: String? = null): NativeOwnAccountCredentials.Capture {
+        val attempt = credentials.begin(account, profileID, accountAdmission, transactionID)
         val login = ownObject(send("login", JSONObject().put("email", email).put("password", password)))
         attempt.authority.withActive {}
         val result = ownResult(login); val token = ownString(result, "authKey")
         val uid = identity(send("getUser", JSONObject().put("authKey", token)))
         return attempt.authority.withActive {
             credentials.storeVerified(attempt, token, uid)
-            requireNotNull(credentials.capture(account, profileID, accountAdmission))
         }
     }
-    suspend fun fetch(capture: NativeOwnAccountCredentials.Capture, authenticatedDocument: JSONObject): NativeOwnAccountSource {
+    suspend fun fetch(capture: NativeOwnAccountCredentials.Capture, authenticatedDocument: JSONObject,
+                      witnessedOverlay: Boolean = true): NativeOwnAccountSource {
         val overlay = capture.authority.withActive {
             nativeOwnAccountOverlay(authenticatedDocument, capture.profileID).toString().toByteArray(Charsets.UTF_8)
         }
@@ -116,7 +124,7 @@ internal class NativeOwnAccountProducer(private val send: suspend (String, JSONO
         val library = send("datastoreGet", capture.request(JSONObject().put("collection", "libraryItem").put("all", true)))
         capture.authority.withActive {}
         val addons = send("addonCollectionGet", capture.request(JSONObject().put("update", false)))
-        return NativeOwnAccountSource.fromFetched(capture, uid, library, addons, overlay)
+        return NativeOwnAccountSource.fromFetched(capture, uid, library, addons, overlay, witnessedOverlay)
     }
     private fun identity(bytes: ByteArray): String {
         val user = ownResult(ownObject(bytes))
@@ -138,11 +146,15 @@ internal fun nativeOwnAccountOverlay(document: JSONObject, profileID: String): J
     val result = JSONObject()
     own(member(member(document, "vortx"), "byProfile"))?.let {
         require(it is JSONObject) { "Malformed own-account watch overlay" }
-        result.put("vortx", JSONObject().put("byProfile", JSONObject().put(profileID, JSONObject(it.toString()))))
+        // Strict copies preserve original decimal values. Platform JSONObject(String) can round
+        // them before witness framing, changing provenance or blessing unsafe fractions.
+        result.put("vortx", JSONObject().put("byProfile", JSONObject().put(profileID,
+            NativeProfileOverlayWitness.parseDocument(it.toString().toByteArray(Charsets.UTF_8)))))
     }
     own(member(member(member(document, "webProgress"), "removed"), "byProfile"))?.let {
         require(it is JSONArray) { "Malformed own-account watch removals" }
-        result.put("webProgress", JSONObject().put("removed", JSONObject().put("byProfile", JSONObject().put(profileID, JSONArray(it.toString())))))
+        result.put("webProgress", JSONObject().put("removed", JSONObject().put("byProfile", JSONObject().put(profileID,
+            NativeProfileOverlayWitness.parse(it.toString().toByteArray(Charsets.UTF_8))))))
     }
     return result
 }
@@ -163,32 +175,59 @@ internal class NativeOwnAccountBaseline private constructor(val scope: VortxAcco
      * remain pending until a new authenticated fetch or a kernel-supported overlay witness. */
     fun requireOverlayUnchanged(document: JSONObject, id: String) {
         val current = nativeOwnAccountOverlay(document, id)
+        val witness = proof(id).optString("profileOverlaySha256").takeIf { it.isNotEmpty() }
         val acknowledged = sourceOverlays[id]
-        require(acknowledged != null && NativeHostPreferences.equal(current, acknowledged)) {
+        require(if (witness != null) NativeProfileOverlayWitness.digest(current) == witness
+            else acknowledged != null && NativeHostPreferences.equal(current, acknowledged)) {
             "Own-account overlay requires an authenticated source refresh"
         }
     }
     companion object {
         fun validate(bindings: VortxRuntimeBindings, scope: VortxAccountScope, document: JSONObject,
-                     retainedSourceEnvelopes: Map<String, ByteArray> = emptyMap()): NativeOwnAccountBaseline {
-            require(document.getInt("schemaVersion") == 3 && document.getString("scope") == scope.accountID &&
+                     retainedSourceEnvelopes: Map<String, ByteArray> = emptyMap(), activeBindings: Boolean = true): NativeOwnAccountBaseline {
+            require(document.getInt("schemaVersion") in 3..4 && document.getString("scope") == scope.accountID &&
                 document.getString("ownerProfileId") == scope.ownerProfileID)
             return VortxNativeRuntime.create(bindings, scope.ownerProfileID, "Owner").use { runtime ->
                 for (action in listOf(JSONObject().put("type", "bind_sync_scope").put("scope", scope.accountID),
                     JSONObject().put("type", "merge_native_sync").put("document", document))) {
                     check(JSONObject(runtime.dispatch(action.toString())).getBoolean("ok")) { "Native own-account document rejected" }
                 }
-                val receipt = JSONObject(runtime.stateJson()).getJSONObject("nativeSync").getJSONObject("legacyImport")
-                require(receipt.getInt("schemaVersion") == 2)
-                val baseline = receipt.getJSONObject("baseline")
-                require(baseline.getInt("schemaVersion") == 2)
+                val validated = JSONObject(runtime.stateJson()).getJSONObject("nativeSync")
+                val receipt = validated.getJSONObject("legacyImport")
+                require(receipt.getInt("schemaVersion") in 1..2)
+                val baseline = JSONObject(receipt.getJSONObject("baseline").toString())
+                require(baseline.getInt("schemaVersion") in 1..2)
+                if (!baseline.has("ownAccountSources")) baseline.put("ownAccountSources", JSONObject())
+                // Rebound profiles use their ACTIVE slot's canonical carrier. Original import
+                // material remains historical evidence, never authority for the newly selected UID.
+                validated.optJSONObject("accountSlots")?.takeIf { activeBindings }?.let { slots ->
+                    slots.keys().forEach { id ->
+                        val entry = slots.getJSONObject(id); val binding = entry.getJSONObject("activeBinding")
+                        val account = binding.getJSONObject("account")
+                        if (account.getString("kind") == "own") {
+                            val matches = entry.getJSONObject("slots").let { all -> all.keys().asSequence()
+                                .map { all.getJSONObject(it) }.filter { NativeHostPreferences.equal(it.getJSONObject("account"), account) }.toList() }
+                            val carrier = matches.single().optJSONObject("sourceBaseline")
+                            if (carrier == null) {
+                                baseline.getJSONObject("ownAccountSources").remove(id)
+                            } else {
+                                baseline.getJSONObject("ownAccountSources").put(id, carrier.getJSONObject("source"))
+                                for ((kind, field) in listOf("addons" to "addons", "libraries" to "library", "watches" to "watches", "identityLinks" to "identityLinks"))
+                                    baseline.getJSONObject(kind).put(id, carrier.get(field))
+                            }
+                        } else baseline.getJSONObject("ownAccountSources").remove(id)
+                    }
+                }
                 val proofs = baseline.getJSONObject("ownAccountSources")
-                val overlays = retainedSourceEnvelopes.mapValues { (id, bytes) ->
+                val overlays = retainedSourceEnvelopes.filterKeys { proofs.has(it) }.mapValues { (id, bytes) ->
                     val immutableBytes = bytes.copyOf()
                     val proof = proofs.getJSONObject(id)
                     val digest = MessageDigest.getInstance("SHA-256").digest(immutableBytes).joinToString("") { "%02x".format(it) }
                     require(digest == proof.getString("sourceDocumentSha256")) { "Retained own-account source changed" }
                     val (library, addons, overlay) = decodeOwnEnvelope(immutableBytes)
+                    val version = ownObject(immutableBytes).getInt("schemaVersion")
+                    if (proof.has("profileOverlaySha256")) require(version == 2 &&
+                        proof.getString("profileOverlaySha256") == NativeProfileOverlayWitness.digest(overlay)) { "Retained overlay witness changed" }
                     requireOwnAccountSourceCredentialFree(library); requireOwnAccountSourceCredentialFree(addons)
                     requireOwnAccountSourceCredentialFree(overlay)
                     require(NativeHostPreferences.equal(nativeOwnAccountOverlay(overlay, id), overlay)) { "Foreign retained own-account overlay" }
@@ -203,14 +242,34 @@ internal class NativeOwnAccountBaseline private constructor(val scope: VortxAcco
 private fun decodeOwnEnvelope(bytes: ByteArray): Triple<JSONObject, JSONObject, JSONObject> {
     val envelope = ownObject(bytes)
     require(envelope.keys().asSequence().toSet() == setOf("schemaVersion", "libraryResponseBase64", "addonsResponseBase64", "profileOverlayBase64"))
-    require(envelope.get("schemaVersion") is Number && envelope.getDouble("schemaVersion") == 1.0)
+    require(envelope.get("schemaVersion") is Number && envelope.getDouble("schemaVersion") in listOf(1.0, 2.0))
     fun decoded(key: String): JSONObject {
         val text = envelope.get(key) as? String ?: error("Malformed streaming response carrier")
         val decoded = Base64.getDecoder().decode(text)
         require(Base64.getEncoder().encodeToString(decoded) == text)
         return ownObject(decoded)
     }
-    return Triple(decoded("libraryResponseBase64"), decoded("addonsResponseBase64"), decoded("profileOverlayBase64"))
+    val overlay = decoded("profileOverlayBase64")
+    if (envelope.getInt("schemaVersion") == 2) NativeProfileOverlayWitness.digest(overlay)
+    return Triple(decoded("libraryResponseBase64"), decoded("addonsResponseBase64"), overlay)
+}
+
+/** Exact token-free source bytes are adjacent sealed host evidence, never native wire. The
+ * specialized validator preserves ordinary media text while rejecting encoded credentials. */
+internal fun validateNativeOwnAccountArchive(value: JSONObject): JSONObject {
+    value.keys().forEach { id ->
+        require(java.util.UUID.fromString(id).toString().uppercase() == id)
+        val record = value.getJSONObject(id)
+        require(record.keys().asSequence().toSet() == setOf("verifiedStreamingUid", "sourceDocumentBase64"))
+        requireNativeStreamingUID(record.getString("verifiedStreamingUid"))
+        val encoded = record.getString("sourceDocumentBase64")
+        val bytes = Base64.getDecoder().decode(encoded)
+        require(Base64.getEncoder().encodeToString(bytes) == encoded)
+        val (library, addons, overlay) = decodeOwnEnvelope(bytes)
+        listOf(library, addons, overlay).forEach(::requireOwnAccountSourceCredentialFree)
+        require(NativeHostPreferences.equal(nativeOwnAccountOverlay(overlay, id), overlay))
+    }
+    return JSONObject(value.toString())
 }
 
 /** Hold every exact credential generation across material construction AND native commit. */
