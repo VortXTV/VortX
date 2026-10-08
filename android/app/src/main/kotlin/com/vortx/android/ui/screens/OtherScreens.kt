@@ -896,7 +896,7 @@ private fun LoadMoreFooter(loading: Boolean, onClick: () -> Unit) {
 
 /// The shimmer loading state for a poster grid (DESIGN-SYSTEM.md §3 "skeleton shimmer for loading").
 @Composable
-private fun ShimmerGrid() {
+internal fun ShimmerGrid() {
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 112.dp),
         modifier = Modifier.fillMaxSize(),
