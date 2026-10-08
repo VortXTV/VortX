@@ -42,6 +42,9 @@ grep -Fq 'Utility.shell(command, isOutput: true, currentDirectoryURL: directoryU
   fail "SpikeGit output/success checks must request shell output explicitly"
 grep -Fq 'matchesExactPatchTree' "$PATCH" || fail "SpikeGit must compare the complete tree to the approved patch set"
 grep -Fq 'git status --porcelain --untracked-files=all' "$PATCH" || fail "SpikeGit must inspect dirty state"
+if grep -Fq 'test -z \\\"$(git status --porcelain --untracked-files=all)\\\"' "$PATCH"; then
+  fail "SpikeGit must not require an exact applied checkout to have an empty status"
+fi
 grep -Fq 'git diff --cached --quiet' "$PATCH" || fail "SpikeGit must reject staged changes"
 grep -Fq 'git rev-parse HEAD' "$PATCH" || fail "SpikeGit must validate an existing HEAD"
 grep -Fq 'expected exact pin' "$PATCH" || fail "SpikeGit must assert the fresh checkout pin"
@@ -152,4 +155,139 @@ rm -f "$SOURCE/untracked.txt"
 [ "$(git -C "$SOURCE" status --porcelain --untracked-files=all)" = ' M Package.swift' ] ||
   fail "fixture did not retain only the exact approved patch after dirty-state cases"
 
-echo "PASS: MPVKit-DVFEL pin/dirty-state fixtures, FFmpeg/Libmpv capability, exact slices, TLS, and post-fetch artifact contracts"
+# Compile the actual patched SpikeGit implementation extracted from the canonical MPVKit source.
+# The fixture provides only the surrounding Foundation types and a real Process-backed Utility.shell;
+# it does not reimplement or regex-test the production validation logic.
+CANONICAL_MPVKIT="${MPVKIT_DVFEL_CANONICAL:-/Users/daksh/VortXTV/MPVKit}"
+[ -d "$CANONICAL_MPVKIT/.git" ] || fail "canonical MPVKit checkout is unavailable: $CANONICAL_MPVKIT"
+CANONICAL_REF="$(git -C "$CANONICAL_MPVKIT" rev-parse HEAD)"
+[ "$CANONICAL_REF" = "2103893078c5e339073b11737b86f7f22b9c4491" ] ||
+  fail "canonical MPVKit fixture source is not pinned to 2103893: $CANONICAL_REF"
+
+PATCHED_SOURCE="$FIXTURE/mpvkit-patched-source"
+mkdir -p "$PATCHED_SOURCE"
+git -C "$CANONICAL_MPVKIT" archive HEAD | tar -x -C "$PATCHED_SOURCE"
+git -C "$CANONICAL_MPVKIT" apply --unsafe-paths --directory="$PATCHED_SOURCE" "$PATCH"
+swiftc -parse "$PATCHED_SOURCE/Sources/BuildScripts/XCFrameworkBuild/main.swift" ||
+  fail "actual patched MPVKit BuildScripts source did not parse"
+SPIKE_BLOCK="$FIXTURE/spikegit-production.swift"
+sed -n '/^enum SpikeGit {/,/^private class BuildOpenSSL: ZipBaseBuild {/p' \
+  "$PATCHED_SOURCE/Sources/BuildScripts/XCFrameworkBuild/main.swift" | sed '$d' >"$SPIKE_BLOCK"
+[ -s "$SPIKE_BLOCK" ] || fail "could not extract the patched production SpikeGit implementation"
+
+SWIFT_PATCH_DIR="$FIXTURE/Sources/BuildScripts/patch/fixture"
+mkdir -p "$SWIFT_PATCH_DIR"
+cp "$FIXTURE_PATCH" "$SWIFT_PATCH_DIR/0001-approved.patch"
+cp "$FIXTURE/base-package.swift" "$SOURCE/Package.swift"
+
+SWIFT_HELPER="$FIXTURE/spikegit-fixture.swift"
+{
+  printf '%s\n' \
+    'import Foundation' \
+    'import Darwin' \
+    '' \
+    'enum Library: String {' \
+    '    case fixture' \
+    '}' \
+    '' \
+    'extension URL {' \
+    '    static var currentDirectory: URL {' \
+    '        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)' \
+    '    }' \
+    '' \
+    '    static func + (left: URL, right: String) -> URL {' \
+    '        left.appendingPathComponent(right)' \
+    '    }' \
+    '}' \
+    '' \
+    'enum Utility {' \
+    '    @discardableResult' \
+    '    static func shell(_ command: String, isOutput: Bool = false, currentDirectoryURL: URL? = nil, environment: [String: String] = [:]) -> String? {' \
+    '        do {' \
+    '            return try launch(executableURL: URL(fileURLWithPath: "/bin/bash"), arguments: ["-c", command], isOutput: isOutput, currentDirectoryURL: currentDirectoryURL, environment: environment)' \
+    '        } catch {' \
+    '            return nil' \
+    '        }' \
+    '    }' \
+    '' \
+    '    @discardableResult' \
+    '    static func launch(path: String, arguments: [String], isOutput: Bool = false, isPrint: Bool = true, currentDirectoryURL: URL? = nil, environment: [String: String] = [:]) throws -> String {' \
+    '        try launch(executableURL: URL(fileURLWithPath: path), arguments: arguments, isOutput: isOutput, currentDirectoryURL: currentDirectoryURL, environment: environment)' \
+    '    }' \
+    '' \
+    '    @discardableResult' \
+    '    static func launch(executableURL: URL, arguments: [String], isOutput: Bool = false, isPrint: Bool = true, currentDirectoryURL: URL? = nil, environment: [String: String] = [:]) throws -> String {' \
+    '        let task = Process()' \
+    '        task.executableURL = executableURL' \
+    '        task.arguments = arguments' \
+    '        task.currentDirectoryURL = currentDirectoryURL' \
+    '        var mergedEnvironment = ProcessInfo.processInfo.environment' \
+    '        environment.forEach { mergedEnvironment[$0.key] = $0.value }' \
+    '        task.environment = mergedEnvironment' \
+    '        let outputPipe = Pipe()' \
+    '        task.standardOutput = outputPipe' \
+    '        let errorPipe = Pipe()' \
+    '        task.standardError = errorPipe' \
+    '        try task.run()' \
+    '        task.waitUntilExit()' \
+    '        guard task.terminationStatus == 0 else {' \
+    '            let diagnostic = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""' \
+    '            if !diagnostic.isEmpty { FileHandle.standardError.write(Data(diagnostic.utf8)) }' \
+    '            throw NSError(domain: "SpikeGitFixture", code: Int(task.terminationStatus))' \
+    '        }' \
+    '        guard isOutput else { return "" }' \
+    '        return String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .newlines) ?? ""' \
+    '    }' \
+    '}' \
+    ''
+  sed -n '1,$p' "$SPIKE_BLOCK"
+  printf '%s\n' \
+    '' \
+    'let expectedSHA = CommandLine.arguments[1]' \
+    'let checkout = URL(fileURLWithPath: CommandLine.arguments[2])' \
+    'do {' \
+    '    try SpikeGit.clonePinned(url: "unused", sha: expectedSHA, library: .fixture, into: checkout)' \
+    '    print("SPIKE FIXTURE PASS")' \
+    '    exit(0)' \
+    '} catch {' \
+    '    print("SPIKE FIXTURE FAILURE: \(error.localizedDescription)")' \
+    '    exit(1)' \
+    '}'
+} >"$SWIFT_HELPER"
+
+SWIFT_BINARY="$FIXTURE/spikegit-fixture"
+swiftc "$SWIFT_HELPER" -o "$SWIFT_BINARY" || fail "actual patched SpikeGit fixture did not compile"
+
+run_spike() {
+  local expected_sha="$1" log="$2"
+  (cd "$SOURCE" && "$SWIFT_BINARY" "$expected_sha" "$SOURCE") >"$log" 2>&1
+}
+
+run_spike "$FIXTURE_REF" "$FIXTURE/swift-clean.log" ||
+  fail "compiled SpikeGit rejected the initial clean checkout: $(cat "$FIXTURE/swift-clean.log")"
+git -C "$SOURCE" apply "$FIXTURE_PATCH"
+run_spike "$FIXTURE_REF" "$FIXTURE/swift-retry.log" ||
+  fail "compiled SpikeGit rejected the exact patched retry: $(cat "$FIXTURE/swift-retry.log")"
+
+BAD_REF="0000000000000000000000000000000000000000"
+if run_spike "$BAD_REF" "$FIXTURE/swift-wrong-sha.log"; then
+  fail "compiled SpikeGit accepted a wrong SHA"
+fi
+grep -Fq 'expected' "$FIXTURE/swift-wrong-sha.log" || fail "wrong SHA lacked the exact-pin diagnostic"
+
+printf '%s\n' 'let unrelated = true' >>"$SOURCE/Package.swift"
+if run_spike "$FIXTURE_REF" "$FIXTURE/swift-unrelated.log"; then
+  fail "compiled SpikeGit accepted an unrelated same-file edit"
+fi
+grep -Fq 'conflicting, partial, or unrelated' "$FIXTURE/swift-unrelated.log" ||
+  fail "compiled SpikeGit same-file rejection lacked the exact-tree diagnostic"
+cp "$FIXTURE/exact-package.swift" "$SOURCE/Package.swift"
+
+printf '%s\n' 'untracked Swift fixture data' >"$SOURCE/swift-untracked.txt"
+if run_spike "$FIXTURE_REF" "$FIXTURE/swift-untracked.log"; then
+  fail "compiled SpikeGit accepted an unknown untracked file"
+fi
+grep -Fq 'not owned by the approved patch set' "$FIXTURE/swift-untracked.log" ||
+  fail "compiled SpikeGit untracked rejection lacked the ownership diagnostic"
+
+echo "PASS: compiled production SpikeGit and MPVKit-DVFEL pin/dirty-state, FFmpeg/Libmpv capability, exact slices, TLS, and post-fetch artifact contracts"
