@@ -4,7 +4,7 @@ The app contains additive native state/resource bindings, an Apple account/sessi
 presentation adapters. Shipping `CoreBridge` and `EngineStremioRepository` remain the active data engine. There is no new user
 selector. A native streaming server is a separate capability from the native data engine.
 
-## Integration status — 8 October 2026
+## Integration status — 9 October 2026
 
 The public integration branch is `beta/native-engine-integration-20261008` (remote branch
 `beta-native-engine-integration-20261008`). Native defaults are still off; neither a passing
@@ -17,25 +17,33 @@ fixture nor this document authorizes the default flip. The installed/public rele
   Library viewing history uses authoritative watched history plus partial Continue Watching,
   not saved membership. CW cards use a typed, one-shot resume intent and fall back to details
   when the device has no matching saved stream.
-- Reviewed Apple website native/host transactions are integrated and passed the combined live
-  C-ABI suite plus focused checkpoint/conflict/replay tests. They use private source `286a26c`,
-  immutable library SHA-256 `a99af5d5d3148c0ca77299a18c43e11917a5f5d5e22f5b6553c70db509d8bea5`.
-  Earlier provider/API receipts use source `b6de6b86`, library
-  `34c900f1c64537f275e6eca835925a2e4e8328c4fd801a0986bfbc7e04d7a061`.
-  The reviewed own-account import kernel `cf693ddb` has a separate fresh fixture,
-  `7e9d73ce43987f4f690421d4d98305c904f66eaff53d68cbc0e7bb2299e3f719`;
-  authenticated host fetch, own-account rebinding and final packaging remain separate gates.
-  Do not run newer actions against older fixtures or infer package provenance from these tests.
-- Own-streaming-account profile migration and projection remain functional cutover blockers,
-  not permission to clear that preference or run those profiles under the owner's identity.
-- Android website transactions and durable downloaded-watch cleanup are separately reviewed
-  integration lanes; their acceptance must include the final account/lifecycle/download lock order.
-- Fresh native-flag Apple Mac/iOS/tvOS compilation succeeded using unsigned, unoptimized
-  diagnostic builds. Optimized signed packages, current full Android flavor/ABI packages,
-  physical playback and rendered UI verification remain distinct release gates.
-- A fresh MPVKit rebuild is staged separately. The previous package failed the intended
-  FFmpeg/TLS content contract; source and artifact validation now run before promotion.
-  The installed Mac application has not been restarted or replaced.
+- Private native source `ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4` is reviewed and full
+  CI run `37825134605` passed on Ubuntu and macOS. Public Apple/Android workflows now pin
+  that source, with source-content native-cache partitions and real-SDK DEX verifier fixtures.
+- Reviewed schema-4 own-account rebind and overlay classifier APIs are integrated. Historical
+  A data cannot be relabelled as a newly linked B account; unchanged retained fractional clocks
+  keep their exact values. The immutable C/JNI fixture uses library SHA-256
+  `8eaa51e9e3b5098a60019ef83b9840d2a70101a1d3dd1168ab9a4330ea470e65` and header
+  `f7e277e197c8c72d230be633db5395234a19ff73ec645f971b0d3e88da376672`.
+  Final production own-account UI/bootstrap wiring remains a separate gate.
+- Android website transactions, downloaded-watch receipts and reviewed account-binding service
+  are integrated. The latter's real-JNI suite passed 122 tests, including install-then-error
+  checkpoint recovery and immutable credential selection. Production DI/UI wiring remains WIP.
+- Strict Swift/Kotlin watched-bitfield decoders are integrated. Metadata-backed, same-source
+  inventory evidence and importer wiring remain WIP; do not remove migration guards or invent
+  viewing clocks merely because the pure decoder passes.
+- Website PR5 is merged and production assets were verified against the reviewed build. This
+  does not establish live multi-device convergence for every migration cohort.
+- Fresh five-slice Apple resource-host SDK generation from `ec96c6c` and the separate arm64
+  Mac server build passed. The earlier native-flag app builds were diagnostic snapshots, not
+  final optimized app builds from this source. Current signed Apple/Android packages, feeds,
+  installation and physical playback remain distinct gates.
+- Reviewed offline Cinema renderer/presentation seams are integrated. Mac Home/Search/Sources
+  and compositor-based Quick View captures exist. Phone/tablet-sized Mac windows are not native
+  iPhone/iPad proof; an isolated native simulator renderer is being prepared.
+- Fresh MPVKit artifacts passed the FFmpeg 9, platform/architecture and SecureTransport content
+  checks. Final app linking and physical decoder behavior remain separate. The installed Mac
+  application has not been restarted or replaced; no 0.5 release is established by these receipts.
 
 ## Implemented and independently exercisable
 
@@ -151,8 +159,8 @@ Same-account A→B→A and same-profile reopen invalidate old launch targets per
 launches never acquire a later session. The existing owner-gated external scrobble fanout remains
 after this target validation, independently of whether selected-player engine writes are allowed.
 
-The current local C-ABI facade/playback fixture passed against integrated private source `b6de6b86`, library
-SHA-256 `34c900f1c64537f275e6eca835925a2e4e8328c4fd801a0986bfbc7e04d7a061` and header
+The retained schema-4 C-ABI facade/playback fixture uses private source `5c93b9d`, library
+SHA-256 `8eaa51e9e3b5098a60019ef83b9840d2a70101a1d3dd1168ab9a4330ea470e65` and header
 `f7e277e197c8c72d230be633db5395234a19ff73ec645f971b0d3e88da376672`, with unchanged before/after
 hashes. That covers real kernel queries/mutations and localhost resources, not full app packaging.
 
@@ -207,7 +215,7 @@ app or media player. The fixture server requires Node 22+ lossless JSON source s
 | Owner lane | Required behavior before selecting native by default |
 | --- | --- |
 | Apple facade | Own-streaming-account profile identity, migration and projection; remaining reachable unsupported actions and full-app parity verification. Offline authenticated checkpoint recovery, native profile CRUD/preferences, authoritative playback/history/stat readers and reviewed Apple bulk watched/add-on actions are implemented behind the gate, not a default cutover. |
-| Android facade | Integrate and verify website edits, native downloaded-watch receipt and own-streaming-account profiles. Authoritative whole-series/season/individual watch inventory and add-on URL replacement are integrated. Verify remaining interface defaults at their real consumers; a deliberately unused legacy login method is not itself a native auth gap. |
+| Android facade | Complete own-streaming-account production DI/UI and metadata-backed watched migration. Website edits and downloaded-watch receipts are integrated. Optional Stremio authentication/import is a reachable UnifiedSignIn path and needs a separate native import/auth channel, not VortX login or a legacy-engine fallback. Verify remaining interface defaults at their real consumers. |
 | Native state integration | Website immutable sparse events, independent host causal bases, atomic receipt/state/host persistence, exact CAS acknowledgements, native-aware website projection, and own-account/ambiguous source cohorts. Shared clocked legacy reconciliation is implemented; that alone does not establish website convergence. |
 | Sources/playback | Integrate provider/debrid resolution, full subtitle options, current source preferences, source-preserving resume, episode/binge selection and download admission. |
 | Native server | Advertise/test NNTP/archive capabilities before changing Node routes; unsupported archives require the supported fallback. |
