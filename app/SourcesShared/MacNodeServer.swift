@@ -19,8 +19,8 @@ import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IP discovery
 /// NATIVE ENGINE (flag-gated, default OFF): behind `vortxNativeServer` (UserDefaults), the same
 /// lifecycle spawns the native Rust streaming server (`vortx-streaming-server`, bundled from
 /// app/Vendor by scripts/build-mac-server.sh) instead of node + server.js. Same port (11470),
-/// same HTTP contract, same LAN-bind toggle; see spawnNative(binPath:). With the flag OFF, or
-/// the binary absent, everything below runs the node path unchanged.
+/// same HTTP contract, same LAN-bind toggle; see spawnNative(binPath:). Native selection fails
+/// explicitly if its binary is missing. Legacy selection retains the Node path.
 enum NodeServer {
     private(set) static var started = false
     /// Set when the node process exits. A relaunch (or toggling Direct Links Only off) restarts it.
@@ -119,8 +119,10 @@ enum NodeServer {
     /// restarts the child so the engine swap takes effect without an app relaunch, the same
     /// restart pattern as the LAN-sharing toggle above.
     static var nativeServerEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: nativeServerKey) }
+        get { NativeTransportPolicy.selectsNative(required: NativeTransportPolicy.isRequired,
+                                                  preference: UserDefaults.standard.bool(forKey: nativeServerKey)) }
         set {
+            guard !NativeTransportPolicy.isRequired else { return }
             guard newValue != nativeServerEnabled else { return }
             UserDefaults.standard.set(newValue, forKey: nativeServerKey)
             restart()
@@ -135,12 +137,19 @@ enum NodeServer {
         Bundle.main.path(forResource: "vortx-streaming-server", ofType: nil)
     }
 
-    /// True when start/restart would spawn the native engine (flag ON and the binary bundled).
-    private static var usingNativeServer: Bool { nativeServerEnabled && nativeServerBinary != nil }
+    /// Native selection includes a missing native binary: that is unavailable, never a Node fallback.
+    private static var usingNativeServer: Bool { nativeServerEnabled }
 
-    /// Exposed only for protocol routing.  `/nzb/create` is implemented by bundled server.js, not the
-    /// native torrent server, so callers must fail locally rather than POST provider credentials to it.
+    /// Exposed for protocol routing; NNTP also requires an exact local capability check.
     static var isUsingNativeServer: Bool { usingNativeServer }
+
+    /// The child must actually be running before a native credential-control endpoint is offered.
+    static var nativeBaseURL: String? {
+        queue.sync {
+            guard usingNativeServer, started, exitCode == nil, process?.isRunning == true else { return nil }
+            return "http://127.0.0.1:11470"
+        }
+    }
 
     /// Locate an ffmpeg/ffprobe pair the server can use for VideoToolbox transcoding. server.js
     /// searches a fixed set of paths but NOT Homebrew's Apple-silicon prefix (/opt/homebrew/bin),
@@ -178,6 +187,7 @@ enum NodeServer {
     static var statusDescription: String {
         if PlaybackSettings.torrentsDisabled { return "Disabled by Direct Links Only" }
         if usingNativeServer {
+            if nativeServerBinary == nil { return "Native streaming server is missing from this build." }
             if !started { return "Not started (native server)" }
             if let code = exitCode { return "Native server exited with code \(code). Relaunch the app to restart it." }
             if sharedOnLAN, let url = lanURL { return "Sharing on this network at \(url) (native server)" }
@@ -206,9 +216,7 @@ enum NodeServer {
         ServerDiagnostics.register(status: { statusDescription }, logTail: { logTail($0) })
         queue.async {
             guard !started, !shutdownRequested else { return }
-            // Flag-gated native engine: same stale-port reclaim, then the native spawn instead of
-            // node. A missing binary (script never run) logs and falls through to the node path,
-            // so flipping the flag on a build without the binary can never kill streaming.
+            // Native selection is terminal here, including an unavailable bundle.
             if nativeServerEnabled {
                 if let nativeBin = nativeServerBinary {
                     reclaimStalePort()
@@ -216,7 +224,8 @@ enum NodeServer {
                     spawnNative(binPath: nativeBin)
                     return
                 }
-                NSLog("StremioX: vortxNativeServer is ON but vortx-streaming-server is not bundled; using node")
+                DiagnosticsLog.log("server", "native streaming selected but server binary is missing")
+                return
             }
             guard let nodeBin = Bundle.main.path(forResource: "node-darwin-arm64", ofType: nil) else {
                 NSLog("StremioX: node binary not found in bundle, streaming server disabled")
@@ -254,8 +263,13 @@ enum NodeServer {
                 process = nil
                 exitCode = nil
             }
-            if nativeServerEnabled, let nativeBin = nativeServerBinary {
+            if nativeServerEnabled {
                 reapCurrent()
+                started = false
+                guard let nativeBin = nativeServerBinary else {
+                    DiagnosticsLog.log("server", "native streaming selected but server binary is missing")
+                    return
+                }
                 started = true
                 spawnNative(binPath: nativeBin)
                 return

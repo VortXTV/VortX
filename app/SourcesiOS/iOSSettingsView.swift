@@ -1386,27 +1386,14 @@ struct iOSSettingsView: View {
                     Button(role: .destructive) { exit(0) } label: {
                         Label("Restart server (quits VortX, then reopen it)", systemImage: "arrow.clockwise")
                     }
-                    // Phase 8: flag-gated in-process ENGINE streaming server (vortx-core). Rendered only
-                    // in builds whose linked VortxEngine slice carries the server symbols, so the toggle
-                    // can never dangle. ON starts it immediately and the player follows its port
-                    // (StremioServer.embeddedPort); OFF stops it and nodejs-mobile serves again. The
-                    // node path itself is never touched either way.
-                    if VortxNativeServerFlag.isSupported {
+                    // Mobile runtimes cannot be swapped in-process: persist the next-launch choice.
+                    if VortxNativeServerFlag.isSupported && !NativeTransportPolicy.isRequired {
                         Toggle(isOn: $engineServerOn) {
                             Label("Engine streaming server (experimental)", systemImage: "gearshape.2")
                         }
-                        .onChange(of: engineServerOn) { on in
-                            if on {
-                                VortxNativeServer.startIfNeeded()
-                            } else {
-                                Task.detached(priority: .utility) { VortxNativeServer.stop() }
-                            }
-                        }
-                        if engineServerOn {
-                            Text(VortxNativeServer.statusDescription)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
+                        Text("Restart VortX after changing the streaming engine.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 #endif

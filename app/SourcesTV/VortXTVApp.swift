@@ -79,12 +79,7 @@ struct VortXTVApp: App {
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
-            // Phase 8 (flag `vortxNativeServer`, default OFF): also bring up the in-process engine
-            // streaming server (vortx-core over the C server ABI); the player follows its port via
-            // StremioServer.embeddedPort. One boolean read and a no-op while the flag is off (and an
-            // inert stub while VortXTV links no server-inclusive VortxEngine slice), so the default
-            // launch path is unchanged and nodejs-mobile keeps serving.
-            VortxNativeServer.startIfNeeded()
+            // The lifecycle entry point starts exactly the selected transport.
             // Once the server is up, cap its torrent cache to a TV-safe size (the 2 GB default
             // can get the whole app jetsam-killed mid-torrent). Detached so it never blocks launch.
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }

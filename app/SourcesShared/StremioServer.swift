@@ -10,13 +10,13 @@ enum StremioServer {
     /// torrent request refused. On the Lite build (no embedded server) and on macOS (MacNodeServer reclaims
     /// and rebinds 11470 reliably via its own port handling), this stays the fixed 11470.
     static var embeddedPort: Int {
+        // Port zero is deliberately unusable while native starts/fails. Never route native mode
+        // to a stale Node listener merely because its conventional port is still answering.
+        if nativeTransportSelected {
+            return nativeTransportBase.flatMap { URL(string: $0)?.port } ?? 0
+        }
         #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)
-        // Phase 8 in-process engine server (flag `vortxNativeServer`, default OFF): while it is
-        // running, the player streams from ITS bound port. publishedPort is nil unless the flag is
-        // ON and the server is up, so the default path costs one nil read and then follows the
-        // nodejs-mobile port exactly as before. Re-read per use: the engine server binds a fresh
-        // ephemeral port on every foreground start, and computing keeps followers current.
-        if let p = VortxNativeServer.publishedPort { return p }
+        // Legacy selection follows Node's discovered port, including its bounded port drift.
         if let p = NodeServer.discoveredPort { return p }
         #endif
         return 11470
@@ -24,23 +24,45 @@ enum StremioServer {
     /// The on-device server base. Used unless the user points at a remote/dedicated server.
     static var embedded: String { "http://127.0.0.1:\(embeddedPort)" }
 
-    /// The Node-only loopback endpoint that implements the NZB control contract.  This is deliberately
-    /// separate from `embedded`: the optional native torrent server can publish an embedded port too, but
-    /// it does not implement `/nzb/create`.  NZB credentials must consequently never be posted through the
-    /// generic embedded endpoint.  The returned port follows nodejs-mobile's discovered port on iOS/tvOS.
+    static var nativeTransportSelected: Bool {
+        #if VORTX_NO_EMBEDDED_SERVER
+        return NativeTransportPolicy.isRequired
+        #elseif os(macOS)
+        return NodeServer.nativeServerEnabled
+        #else
+        return VortxNativeServerFlag.isOn
+        #endif
+    }
+
+    private static var nativeTransportBase: String? {
+        #if VORTX_NO_EMBEDDED_SERVER
+        return nil
+        #elseif os(macOS)
+        return NodeServer.nativeBaseURL
+        #else
+        return VortxNativeServer.publishedBaseURL
+        #endif
+    }
+
+    /// Credential control follows the explicitly selected local runtime, never the user's LAN
+    /// server setting. Native creates additionally validate /nzb/capabilities before each POST.
+    static var usenetEndpoint: UsenetNodeClient.Endpoint? {
+        if nativeTransportSelected {
+            return nativeTransportBase.map { UsenetNodeClient.Endpoint(base: $0, requiresNativeCapabilities: true) }
+        }
+        return usenetNodeBase.map { UsenetNodeClient.Endpoint(base: $0, requiresNativeCapabilities: false) }
+    }
+
+    /// Legacy Node-only endpoint. A native selection never guesses the legacy port.
     static var usenetNodeBase: String? {
+        guard !nativeTransportSelected else { return nil }
         #if VORTX_NO_EMBEDDED_SERVER
         return nil
         #elseif os(macOS)
         guard !NodeServer.isUsingNativeServer else { return nil }
         return "http://127.0.0.1:11470"
         #else
-        // Native and Node can run together on Apple mobile targets.  A discovered Node port is proof of
-        // the Node listener and must win even while native has published its own port.  If Node has not
-        // announced a port, never guess 11470 while native is active: that could post NZB credentials to
-        // the native torrent server.
         if let port = NodeServer.discoveredPort { return "http://127.0.0.1:\(port)" }
-        guard VortxNativeServer.publishedPort == nil else { return nil }
         return "http://127.0.0.1:11470"
         #endif
     }
@@ -143,6 +165,10 @@ enum StremioServer {
     /// reading Offline forever. Validates the /settings body shape so a foreign local listener on one of
     /// these ports can never be latched as ours.
     static func isOnline() async -> Bool {
+        if !isCustom, nativeTransportSelected {
+            guard let nativeBase = nativeTransportBase else { return false }
+            return await respondsAsServer("\(nativeBase)/settings")
+        }
         if await respondsAsServer("\(base)/settings") { return true }
         guard !isCustom else { return false }
         #if !VORTX_NO_EMBEDDED_SERVER && !os(macOS)

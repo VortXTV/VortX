@@ -72,13 +72,7 @@ struct VortXiOSApp: App {
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
-            #if !os(macOS)
-            // Phase 8 (flag `vortxNativeServer`, default OFF): also bring up the in-process engine
-            // streaming server (vortx-core over the C server ABI); the player follows its port via
-            // StremioServer.embeddedPort. One boolean read and a no-op while the flag is off, so
-            // the default launch path is unchanged and nodejs-mobile keeps serving.
-            VortxNativeServer.startIfNeeded()
-            #endif
+            // The lifecycle entry point starts exactly the selected transport.
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
         }
         #endif

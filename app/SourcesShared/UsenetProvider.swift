@@ -156,13 +156,13 @@ enum UsenetLocalResolver {
     }
 
     /// Resolve `nzbUrl` to a loopback stream URL, or throw. The nntp URL (carrying the user's provider
-    /// password) is POSTed ONLY to `StremioServer.usenetNodeBase` (the local Node server) - deliberately
-    /// never `StremioServer.base` or the generic embedded/native endpoint - and is never logged.
+    /// password) is POSTed ONLY to `StremioServer.usenetEndpoint` (the selected local runtime),
+    /// never `StremioServer.base`. Native capabilities are validated first. Secrets are never logged.
     static func resolve(nzbUrl: String, credentials: UsenetProviderCredentials) async throws -> URL {
         try await resolve(nzbURLs: [nzbUrl], servers: [], credentials: credentials)
     }
 
-    /// Submit validated add-on mirrors and NNTP hints to Node's NZB control endpoint.  A saved VortX
+    /// Submit validated add-on mirrors and NNTP hints to the local NZB control endpoint. A saved VortX
     /// provider is appended when present; add-on credentials are never copied into preferences or logs.
     static func resolve(nzbURLs: [String], servers: [String],
                         credentials: UsenetProviderCredentials? = nil,
@@ -199,8 +199,8 @@ enum UsenetLocalResolver {
                                                          savedServers: savedServerURLs,
                                                          excluding: excluding)
         guard !validNZBs.isEmpty, !attempts.isEmpty else { throw ResolveError.unavailable }
-        let base = if waitForNode { try await waitForNodeBase() } else { StremioServer.usenetNodeBase }
-        guard let base else { throw ResolveError.unavailable }
+        let endpoint = if waitForNode { try await waitForLocalEndpoint() } else { StremioServer.usenetEndpoint }
+        guard let endpoint else { throw ResolveError.unavailable }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = requestTimeout
         configuration.timeoutIntervalForResource = requestTimeout
@@ -210,7 +210,7 @@ enum UsenetLocalResolver {
         // This is the same serial/cancellation policy exercised by the injected transport regression test.
         guard let (route, url) = try await UsenetRoutingPolicy.firstSuccessful(attempts, create: { attempt in
             try await UsenetNodeClient.createStream(
-                base: base, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout
+                endpoint: endpoint, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout
             )
         }) else {
             throw ResolveError.badResponse
@@ -219,16 +219,16 @@ enum UsenetLocalResolver {
         #endif
     }
 
-    /// Node and native can boot concurrently on mobile.  An explicit tap waits briefly for Node to publish
-    /// its actual port instead of guessing the native port; auto selection never calls this waiting path.
-    private static func waitForNodeBase() async throws -> String? {
+    /// An explicit tap waits briefly for the selected local engine to publish its endpoint.
+    /// It never starts a different runtime or forwards credentials to the custom remote server.
+    private static func waitForLocalEndpoint() async throws -> UsenetNodeClient.Endpoint? {
         for _ in 0..<15 {
-            if let base = StremioServer.usenetNodeBase { return base }
+            if let endpoint = StremioServer.usenetEndpoint { return endpoint }
             try Task.checkCancellation()
             try await Task.sleep(for: .milliseconds(100))
         }
         try Task.checkCancellation()
-        return StremioServer.usenetNodeBase
+        return StremioServer.usenetEndpoint
     }
 }
 

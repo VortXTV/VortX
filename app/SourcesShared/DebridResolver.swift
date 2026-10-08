@@ -1464,11 +1464,19 @@ extension DebridCoordinator {
             return .unsupported("This source is not an NZB stream.")
         }
         let remoteAvailable = DebridPlaybackAvailability.shared.canResolveUsenetRemotely
-        // Do not reject a just-published native server while its paired Node listener is still starting.
-        // `resolvedPlaybackRef` performs the bounded readiness wait before trying the cloud route.
+        // The selected local transport may still be starting. Resolution performs a bounded wait
+        // before trying the user's configured cloud route. Lite has no local transport.
+        #if VORTX_NO_EMBEDDED_SERVER
+        let localAvailable = false
+        #else
         let localAvailable = UsenetProviderStore.isConfigured || !stream.usenetServers.isEmpty
+        #endif
         guard remoteAvailable || localAvailable else {
-            return .unsupported("NZB playback needs a Usenet provider, a supported add-on server, or a TorBox account. Native streaming and Lite builds cannot play NZB streams locally.")
+            #if VORTX_NO_EMBEDDED_SERVER
+            return .unsupported("This build cannot play NZB streams locally. Configure a TorBox account or use another source.")
+            #else
+            return .unsupported("NZB playback needs a Usenet provider, a supported add-on server, or a TorBox account.")
+            #endif
         }
         if let ref = await resolvedPlaybackRef(for: stream, episode: episode,
                                                confirmedCachedHashes: nil,
@@ -1476,6 +1484,9 @@ extension DebridCoordinator {
                                                waitForLocalUsenetNode: true,
                                                usenetResolveTimeout: .seconds(35)) {
             return .ready(ref)
+        }
+        if StremioServer.nativeTransportSelected {
+            return .failed("This NZB could not be started with the configured providers. Native playback supports raw video, stored RAR and COPY 7z archives. Compressed, encrypted or repair-required sources need a supported TorBox route or another source.")
         }
         return .failed("This NZB source could not be started. Check that the provider is available and try another source.")
     }

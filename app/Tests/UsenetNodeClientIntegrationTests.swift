@@ -1,7 +1,8 @@
 // Credential-free integration test for Node's NZB POST/key contract using an injected URLSession protocol.
 // Run from repository root:
 // swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors -o /tmp/usenet-node-client \
-//   app/SourcesShared/UsenetNodeClient.swift app/Tests/UsenetNodeClientIntegrationTests.swift && /tmp/usenet-node-client
+//   app/SourcesShared/NativeTransportPolicy.swift app/SourcesShared/UsenetNodeClient.swift \
+//   app/Tests/UsenetNodeClientIntegrationTests.swift && /tmp/usenet-node-client
 
 import Foundation
 

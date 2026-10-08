@@ -59,10 +59,10 @@ private enum UsenetNodeRoutingContractTests {
               && models.contains("var usenetServers: [String]"))
         check("CoreBridge round-trips plural NZBs and servers", bridge.contains("raw[\"nzbUrls\"] = nzbs")
               && bridge.contains("raw[\"servers\"] = servers"))
-        check("NZB control route is Node-only and follows the discovered port", server.contains("static var usenetNodeBase: String?")
+        check("NZB control route follows the selected runtime and preserves legacy port discovery", server.contains("static var usenetEndpoint: UsenetNodeClient.Endpoint?")
               && server.contains("if let port = NodeServer.discoveredPort")
-              && server.contains("never guess 11470 while native is active"))
-        check("resolver posts the Node NZB contract and never generic embedded", resolver.contains("StremioServer.usenetNodeBase")
+              && server.contains("guard !nativeTransportSelected else { return nil }"))
+        check("resolver posts the selected local NZB contract and never generic embedded", resolver.contains("StremioServer.usenetEndpoint")
               && resolver.contains("UsenetNodeClient.createStream") && nodeClient.contains("\"nzbUrls\": nzbURLs")
               && !resolver.contains("let base = StremioServer.embedded"))
         check("add-on server order is tried before a sequential saved-provider fallback",

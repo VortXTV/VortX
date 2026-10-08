@@ -140,6 +140,9 @@ enum NodeServer {
 
     /// One-line state for the Settings diagnostics.
     static var statusDescription: String {
+        #if !VORTX_WEB_HOST
+        if VortxNativeServerFlag.isOn { return VortxNativeServer.statusDescription }
+        #endif
         if PlaybackSettings.torrentsDisabled { return "Disabled by Direct Links Only" }
         if !started { return "Not started (server.js missing from the bundle)" }
         if let code = exitCode { return "Server exited with code \(code). Relaunch the app to restart it." }
@@ -207,6 +210,13 @@ enum NodeServer {
     }
 
     static func startIfNeeded() {
+        #if !VORTX_WEB_HOST
+        if VortxNativeServerFlag.isOn {
+            ServerDiagnostics.register(status: { VortxNativeServer.statusDescription }, logTail: { _ in [] })
+            VortxNativeServer.startIfNeeded()
+            return
+        }
+        #endif
         guard !started else { return }
         // Wire the shared diagnostics indirection so the VXProbe heartbeat and the diagnostics export can
         // surface this server's state without SourcesShared referencing NodeServer directly. Idempotent.
@@ -714,6 +724,9 @@ enum NodeServer {
     /// is left strictly untouched (never risk a mid-stream close). Cheap and fail-soft; safe to call on every
     /// foreground.
     static func recoverIfSuspended() async {
+        #if !VORTX_WEB_HOST
+        guard !VortxNativeServerFlag.isOn else { return }
+        #endif
         // Custom/remote servers self-manage; a dead in-process runtime cannot be rebound in-process.
         guard !StremioServer.isCustom, exitCode == nil else { return }
         // The ordinary scan latches a drifted fallback port and returns true if any port answers -> healthy.
