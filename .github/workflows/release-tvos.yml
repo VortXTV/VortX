@@ -422,6 +422,7 @@ jobs:
           unzip -q /tmp/mpvkit.zip -d "$DEST"
           test -d "$DEST/artifacts/Libmpv-GPL.xcframework/tvos-arm64_x86_64-simulator" \
             || { echo "::error::tvOS simulator slice missing after unpack"; exit 1; }
+          bash scripts/verify-mpvkit-dvfel-artifacts.sh "$DEST"
           echo "MPVKit-DVFEL artifacts in place: $(ls "$DEST/artifacts" | wc -l | tr -d ' ') xcframeworks"
 
       - name: Generate the Xcode project

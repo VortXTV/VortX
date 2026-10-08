@@ -80,7 +80,7 @@ index e5f872c..dcaca5b 100644
          case .libdav1d:
              return "https://github.com/mpvkit/libdav1d-build/releases/download/\(self.version)/libdav1d-all.zip"
          case .libdovi:
-@@ -372,6 +404,16 @@ private class BuildMPV: BaseBuild {
+@@ -372,6 +404,17 @@ private class BuildMPV: BaseBuild {
          super.init(library: .libmpv)
      }
  
@@ -90,6 +90,7 @@ index e5f872c..dcaca5b 100644
 +    override func beforeBuild() throws {
 +        try SpikeGit.clonePinned(url: library.url,
 +                                 sha: Library.mpvPinnedSHA,
++                                 library: .libmpv,
 +                                 into: directoryURL)
 +        try SpikeGit.applyPatches(for: library, in: directoryURL)
 +    }
@@ -97,7 +98,7 @@ index e5f872c..dcaca5b 100644
      override func flagsDependencelibrarys() -> [Library] {
          if BaseBuild.options.enableGPL {
              return [.gmp, .libsmbclient]
-@@ -396,6 +438,14 @@ private class BuildMPV: BaseBuild {
+@@ -396,6 +439,14 @@ private class BuildMPV: BaseBuild {
              "-Djpeg=disabled",
              "-Dvapoursynth=disabled",
              "-Drubberband=disabled",
@@ -112,7 +113,7 @@ index e5f872c..dcaca5b 100644
          ]
          if BaseBuild.options.enableGPL {
              array.append("-Dgpl=true")
-@@ -450,7 +500,15 @@ private class BuildFFMPEG: BaseBuild {
+@@ -450,7 +501,16 @@ private class BuildFFMPEG: BaseBuild {
      }
  
      override func beforeBuild() throws {
@@ -124,12 +125,13 @@ index e5f872c..dcaca5b 100644
 +        try SpikeGit.clonePinned(url: library.url,
 +                                 sha: Library.ffmpegPinnedSHA,
 +                                 branch: Library.ffmpegPinnedBranch,
++                                 library: .FFmpeg,
 +                                 into: directoryURL)
 +        try SpikeGit.applyPatches(for: library, in: directoryURL)
  
          if Utility.shell("which nasm") == nil {
              Utility.shell("brew install nasm")
-@@ -609,7 +667,18 @@ private class BuildFFMPEG: BaseBuild {
+@@ -609,7 +669,18 @@ private class BuildFFMPEG: BaseBuild {
          //        if platform == .isimulator || platform == .tvsimulator {
          //            arguments.append("--assert-level=1")
          //        }
@@ -149,7 +151,7 @@ index e5f872c..dcaca5b 100644
          if BaseBuild.options.enableGPL {
              dependencyLibrary += [.libsmbclient]
          }
-@@ -681,6 +750,22 @@ private class BuildFFMPEG: BaseBuild {
+@@ -681,6 +752,22 @@ private class BuildFFMPEG: BaseBuild {
          "--enable-encoder=aac", "--enable-encoder=alac", "--enable-encoder=flac", "--enable-encoder=pcm*",
          "--enable-encoder=movtext", "--enable-encoder=mpeg4", "--enable-encoder=h264_videotoolbox",
          "--enable-encoder=hevc_videotoolbox", "--enable-encoder=prores", "--enable-encoder=prores_videotoolbox",
@@ -172,7 +174,7 @@ index e5f872c..dcaca5b 100644
          // ./configure --list-protocols
          "--enable-protocols",
          // ./configure --list-demuxers
-@@ -778,10 +863,92 @@ private class BuildLuaJIT: ZipBaseBuild {
+@@ -778,10 +865,164 @@ private class BuildLuaJIT: ZipBaseBuild {
  }
  
  
@@ -189,6 +191,7 @@ index e5f872c..dcaca5b 100644
 +    override func beforeBuild() throws {
 +        try SpikeGit.clonePinned(url: library.url,
 +                                 sha: Library.placeboPinnedSHA,
++                                 library: .libplacebo,
 +                                 into: directoryURL)
 +        try SpikeGit.applyPatches(for: library, in: directoryURL)
 +    }
@@ -228,39 +231,110 @@ index e5f872c..dcaca5b 100644
 +// SPIKE: shared helpers for cloning a dependency at an exact commit. BaseBuild.beforeBuild
 +// can only clone a tag/branch via `--branch`, which cannot express a SHA.
 +enum SpikeGit {
-+    static func clonePinned(url: String, sha: String, branch: String? = nil, into directoryURL: URL) throws {
++    private static func failure(_ message: String) -> NSError {
++        NSError(domain: "VortX.MPVKit.Pin", code: 1,
++                userInfo: [NSLocalizedDescriptionKey: message])
++    }
++
++    private static func output(_ command: String, in directoryURL: URL) throws -> String {
++        guard let value = Utility.shell(command, currentDirectoryURL: directoryURL) else {
++            throw failure("git command failed in \(directoryURL.path): \(command)")
++        }
++        return value.trimmingCharacters(in: .whitespacesAndNewlines)
++    }
++
++    private static func succeeds(_ command: String, in directoryURL: URL) -> Bool {
++        Utility.shell(command, currentDirectoryURL: directoryURL) != nil
++    }
++
++    private static func patchFiles(for library: Library) throws -> [String] {
++        let patchDirectory = URL.currentDirectory + "../Sources/BuildScripts/patch/\(library.rawValue)"
++        guard FileManager.default.fileExists(atPath: patchDirectory.path) else { return [] }
++        return try FileManager.default.contentsOfDirectory(atPath: patchDirectory.path)
++            .filter { $0.hasSuffix(".patch") }
++            .sorted()
++            .map { (patchDirectory + $0).path }
++    }
++
++    private static func validateExisting(url directoryURL: URL, sha: String, library: Library) throws {
++        let head = try output("git rev-parse HEAD", in: directoryURL)
++        guard head == sha else {
++            throw failure("pinned checkout at \(directoryURL.path) is \(head), expected \(sha); refusing to switch it")
++        }
++        guard succeeds("git diff --cached --quiet", in: directoryURL) else {
++            throw failure("pinned checkout at \(directoryURL.path) has staged changes; refusing to reuse it")
++        }
++        let status = try output("git status --porcelain --untracked-files=all", in: directoryURL)
++        guard !status.isEmpty else { return }
++
++        // A prior build may have applied MPVKit's exact library patch set before an interrupted
++        // compile. Permit only that explicit state; arbitrary tracked edits and partial/conflicting
++        // patch applications must stop rather than being repaired by a reset or checkout.
++        let patchPaths = try patchFiles(for: library)
++        guard !patchPaths.isEmpty else {
++            throw failure("pinned checkout at \(directoryURL.path) is dirty and has no known patch set to validate")
++        }
++        let changedPaths = try output("git diff --name-only", in: directoryURL)
++            .split(separator: "\n", omittingEmptySubsequences: true)
++            .map(String.init)
++        for patchPath in patchPaths {
++            let forward = succeeds("git apply --check \"\(patchPath)\"", in: directoryURL)
++            let reverse = succeeds("git apply --reverse --check \"\(patchPath)\"", in: directoryURL)
++            guard forward || reverse else {
++                throw failure("pinned checkout at \(directoryURL.path) has a conflicting or unrelated change; inspect before retrying")
++            }
++        }
++        guard !changedPaths.isEmpty else {
++            throw failure("pinned checkout at \(directoryURL.path) has unexpected untracked files; inspect before retrying")
++        }
++    }
++
++    static func clonePinned(url: String, sha: String, branch: String? = nil, library: Library, into directoryURL: URL) throws {
 +        if FileManager.default.fileExists(atPath: directoryURL.path) {
++            guard FileManager.default.fileExists(atPath: directoryURL.appendingPathComponent(".git").path) else {
++                throw failure("pinned source path exists but is not a Git checkout: \(directoryURL.path)")
++            }
++            try validateExisting(url: directoryURL, sha: sha, library: library)
 +            return
 +        }
-+        // Shallow-clone deep enough to contain the pin, then detach onto it. `branch` is
-+        // required when the pin lives on a maintenance branch (FFmpeg release/9.0), because
-+        // the default-branch clone would not contain that commit at any depth.
-+        var cloneArgs = ["-c", "advice.detachedHead=false", "clone", "--depth", "150"]
++        // Fetch the exact commit explicitly. `branch` is required when the pin lives on a
++        // maintenance branch (FFmpeg release/9.0), because a default-branch clone need not contain
++        // that commit at any depth.
++        var cloneArgs = ["-c", "advice.detachedHead=false", "clone", "--no-checkout", "--depth", "150"]
 +        if let branch {
 +            cloneArgs += ["--branch", branch]
 +        }
 +        cloneArgs += [url, directoryURL.path]
-+        try! Utility.launch(path: "/usr/bin/git", arguments: cloneArgs)
-+        try! Utility.launch(path: "/usr/bin/git",
-+                            arguments: ["-c", "advice.detachedHead=false", "checkout", sha],
-+                            currentDirectoryURL: directoryURL)
-+        try! Utility.launch(path: "/usr/bin/git",
-+                            arguments: ["submodule", "update", "--init", "--recursive", "--depth", "1"],
-+                            currentDirectoryURL: directoryURL)
++        try Utility.launch(path: "/usr/bin/git", arguments: cloneArgs)
++        try Utility.launch(path: "/usr/bin/git",
++                           arguments: ["fetch", "--quiet", "--depth", "1", "origin", sha],
++                           currentDirectoryURL: directoryURL)
++        try Utility.launch(path: "/usr/bin/git",
++                           arguments: ["-c", "advice.detachedHead=false", "checkout", "--detach", sha],
++                           currentDirectoryURL: directoryURL)
++        try Utility.launch(path: "/usr/bin/git",
++                           arguments: ["submodule", "update", "--init", "--recursive", "--depth", "1"],
++                           currentDirectoryURL: directoryURL)
++        let head = try output("git rev-parse HEAD", in: directoryURL)
++        guard head == sha else {
++            throw failure("fresh clone at \(directoryURL.path) resolved to \(head), expected exact pin \(sha)")
++        }
 +    }
 +
 +    static func applyPatches(for library: Library, in directoryURL: URL) throws {
-+        let patch = URL.currentDirectory + "../Sources/BuildScripts/patch/\(library.rawValue)"
-+        guard FileManager.default.fileExists(atPath: patch.path) else { return }
-+        let fileNames = try! FileManager.default.contentsOfDirectory(atPath: patch.path).sorted()
-+        for fileName in fileNames where fileName.hasSuffix(".patch") {
-+            // Idempotent: skip anything already in the tree (re-runs reuse the clone).
-+            let check = Utility.shell("git apply --reverse --check \"\((patch + fileName).path)\"",
-+                                      currentDirectoryURL: directoryURL)
-+            if check != nil { continue }
-+            try! Utility.launch(path: "/usr/bin/git",
-+                                arguments: ["apply", (patch + fileName).path],
-+                                currentDirectoryURL: directoryURL)
++        let patchPaths = try patchFiles(for: library)
++        for patchPath in patchPaths {
++            // Idempotent only for an exact patch: apply forward when clean, skip when reverse-check
++            // proves it is already applied, and fail with context for a partial/conflicting state.
++            if succeeds("git apply --check \"\(patchPath)\"", in: directoryURL) {
++                try Utility.launch(path: "/usr/bin/git",
++                                   arguments: ["apply", patchPath],
++                                   currentDirectoryURL: directoryURL)
++            } else if succeeds("git apply --reverse --check \"\(patchPath)\"", in: directoryURL) {
++                continue
++            } else {
++                throw failure("patch neither applies cleanly nor is already applied: \(patchPath) in \(directoryURL.path)")
++            }
 +        }
 +    }
  }
