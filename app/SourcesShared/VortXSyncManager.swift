@@ -404,16 +404,24 @@ final class VortXSyncManager: ObservableObject {
     /// A genuine LOCAL settings write landed (the global didChange observer, already gated on !isApplyingRemote,
     /// so a remote-apply / housekeeping write never reaches here). Diff the live domain against the shadow, mark
     /// any changed syncable key dirty, and re-baseline the shadow. No-op when signed out (nothing to protect).
-    private func noteLocalSettingsChange() {
-        guard isSignedIn else { return }
+    @discardableResult
+    private func noteLocalSettingsChange() -> Bool {
+        guard isSignedIn else { return false }
         let current = currentSyncableDomain()
         let changed = SettingsDirtyKeys.changedSyncableKeys(from: settingsShadow, to: current,
                                                             isSyncable: SettingsBackup.isSyncable)
         settingsShadow = current
-        guard !changed.isEmpty else { return }
+        guard !changed.isEmpty else { return false }
         var dirty = dirtySettings
         SettingsDirtyKeys.mark(changed, at: Date().timeIntervalSince1970, into: &dirty)
         dirtySettings = dirty
+        return true
+    }
+
+    private func observeDefaultsChange() {
+        guard !isApplyingRemote else { return }
+        // Only a real syncable delta may defer receiving peer profile edits.
+        if noteLocalSettingsChange() { requestSyncSoon() }
     }
     /// Clear the keys a CONFIRMED push carried up, guarded by the stamp `snapshot` taken when that push began so a
     /// key re-edited mid-push stays protected (see `SettingsDirtyKeys.clearPushed`). Under the suppression window:
@@ -656,13 +664,9 @@ final class VortXSyncManager: ObservableObject {
         // key dirty). Refreshed after every remote-apply / housekeeping window (see withRemoteApplySuppressed).
         refreshSettingsShadow()
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, !self.isApplyingRemote else { return }
-                // Record which syncable key(s) the user just changed (durable, per-key, survives a relaunch) so a
-                // later pull cannot clobber an unpushed local edit; THEN arm the debounced push. Both are gated on
-                // !isApplyingRemote, so a remote apply's writes never mark dirty or arm a push.
-                self.noteLocalSettingsChange()
-                self.requestSyncSoon()
+            MainActor.assumeIsolated {
+                // Stay in this main-queue delivery turn: a second Task could outlive suppression.
+                self?.observeDefaultsChange()
             }
         }
         // T-2: give TraktAuth a cross-device lookup for the refresh-401 recovery path. When a refresh 401s
@@ -1912,6 +1916,11 @@ final class VortXSyncManager: ObservableObject {
         }
 
         var v: [String: Any] = ["profiles": profiles, "updatedAt": Int(Date().timeIntervalSince1970 * 1000)]
+        // Match Android's lossless carrier; the dashboard summary above deliberately omits bindings.
+        if let roster = ProfileRosterSnapshot.wire(store.profiles) {
+            v["roster"] = roster
+            v["rosterModified"] = store.rosterModified.timeIntervalSince1970
+        }
         if !ownerWatched.isEmpty { v["ownerWatched"] = ownerWatched }
         if !byProfile.isEmpty { v["byProfile"] = byProfile }
         if !ownerLibrary.isEmpty { v["library"] = ownerLibrary }
@@ -1988,6 +1997,25 @@ final class VortXSyncManager: ObservableObject {
               let rosterData = domain["stremiox.profiles"] as? Data,
               let roster = try? JSONDecoder().decode([UserProfile].self, from: rosterData) else { return nil }
         return roster
+    }
+
+    static func resolveRoster(from doc: [String: Any]) -> ProfileRosterSnapshot? {
+        let domain = (doc["settings"] as? String).flatMap { Data(base64Encoded: $0) }
+            .flatMap { try? SettingsBackup.decodeDomain(from: $0) }
+        return ProfileRosterSnapshot.resolve(settingsDomain: domain, vortx: doc["vortx"] as? [String: Any])
+    }
+
+    /// Web patches are independent of the native carrier and must be consumed before we acknowledge
+    /// them by publishing a fresh native mirror. The store protects newer native fields separately.
+    @discardableResult
+    private func applyPendingProfileEdits(_ doc: [String: Any]) -> Bool {
+        guard let edits = doc["profileEdits"] as? [String: Any],
+              let editedAt = ProfileRosterSyncPolicy.validClock(edits["editedAt"]),
+              editedAt > lastAppliedProfileEditsAt else { return false }
+        ProfileStore.shared.applyProfileEdits(edits,
+            mirrorUpdatedAt: (doc["vortx"] as? [String: Any])?["updatedAt"])
+        lastAppliedProfileEditsAt = editedAt
+        return true
     }
 
     // MARK: - Profiles + settings sync (reuses the SettingsBackup serialization as the doc payload)
@@ -2095,9 +2123,11 @@ final class VortXSyncManager: ObservableObject {
         // profiles never shrinks the cloud's profile set: the pushed blob already contains both sides.
         // Any cloud-only profile that gets merged back keeps its own watch overlay (mergeInRoster does
         // not clear watchCacheKey), so its Continue Watching is not lost when it returns to this device.
-        if let cloudRoster = Self.decodeRoster(fromSettingsBlob: doc["settings"]) {
-            ProfileStore.shared.mergeInRoster(cloudRoster)
+        if let cloud = Self.resolveRoster(from: doc) {
+            ProfileStore.shared.mergeInRoster(cloud.profiles,
+                incomingModified: cloud.modified.map(Date.init(timeIntervalSince1970:)))
         }
+        withRemoteApplySuppressed { applyPendingProfileEdits(doc) }
         // READ-MERGE the settings blob onto the PULLED one, exactly like the tombstones/roster/apiKeys/vortx
         // fields above and below (#145 M2). This used to be `makeBackup()`, a snapshot of THIS DEVICE'S
         // UserDefaults domain, assigned straight over the pulled doc's settings. On a reinstalled device that
@@ -2357,6 +2387,7 @@ final class VortXSyncManager: ObservableObject {
         }
         let doc = pulled.doc
         var restored = false
+        var restoredSettings = false
         var pendingDebridValues = pendingDebridApply?.values ?? [:]
         var pendingDebridServices: Set<DebridService> = []
         var providerPlan: PendingProviderApply?
@@ -2369,16 +2400,14 @@ final class VortXSyncManager: ObservableObject {
         // guard and the peer's settings are never applied. The body is fully synchronous (no awaits), so the
         // coalesced notifications drain on the next main-queue turn while the flag is still set.
         withRemoteApplySuppressed {
+        foldDocTombstones(doc) // deletions precede every roster fold, including a fallback-only carrier
         providerPlan = providerApplyIntent(
             keys: doc["apiKeys"] as? [String: String],
             capture: capture,
             version: pulled.version)
         if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64) {
-            // Capture the LIVE roster BEFORE restore: SettingsBackup.restore overwrites the roster key
-            // with the cloud blob wholesale, and a cloud blob with FEWER profiles would otherwise delete
-            // a richer local profile (the data-loss bug). Restore, re-read the cloud roster, then UNION
-            // the captured local roster back in so no local-only profile is ever dropped by this pull.
-            let localRosterBefore = ProfileStore.shared.profiles
+            // Roster records are merged separately by their own clocks, never wholesale-restored.
+            // This also protects a still-dirty local edit while admitting cloud-only profile ids.
             // These dictionaries are CRDT state, not replaceable scalar preferences. An older client's
             // settings blob may contain older/empty maps even when this device has newer removals.
             // LOCAL-WINS: skip any syncable key the user changed on THIS device and has not pushed yet, so the
@@ -2391,9 +2420,11 @@ final class VortXSyncManager: ObservableObject {
                 try SettingsBackup.restore(
                     from: data,
                     skipping: Set(dirtySettings.keys),
-                    excluding: ProfileDiscoveryPreferencesStore.activeProjectionKeys)
+                    excluding: ProfileDiscoveryPreferencesStore.activeProjectionKeys.union([
+                        "stremiox.profiles", "stremiox.profiles.modified", "stremiox.profiles.active"]))
             }) ?? 0) > 0 {
                 restored = true
+                restoredSettings = true
                 // Stamp the applied-blob BASELINE (#145 resurrection fix): the syncable keys this pulled doc just
                 // wrote, in the SAME migrated form restore used. mergedSyncBlob reads it on the next push so a
                 // setting the user later clears on THIS device (absent locally AND in this baseline) is deleted
@@ -2404,9 +2435,6 @@ final class VortXSyncManager: ObservableObject {
                 appliedSettingsBaseline = SettingsBackup.appliedKeys(
                     from: data,
                     excluding: ProfileDiscoveryPreferencesStore.activeProjectionKeys)
-                ProfileStore.shared.reloadFromDefaults()              // apply the cloud roster to the LIVE store, no relaunch
-                ProfileStore.shared.mergeInRoster(localRosterBefore)  // cloud UNION local: keep every local-only profile
-                ProfileStore.shared.applyLocalTombstones()           // a profile deleted this session stays gone even if the pulled doc predates its tombstone (the resurrect window)
                 LastStreamStore.invalidateCache()                    // the restore wrote new lastStream behind the cache; re-read it
                 // Every OTHER store that reads UserDefaults once at init is just as blind to the restore:
                 // UserDefaults KVO does not fire for our dotted keys, so nothing above re-reads them. Worse,
@@ -2415,8 +2443,21 @@ final class VortXSyncManager: ObservableObject {
                 // back over the pulled one and making the loss permanent. Re-read them here, synchronously and
                 // inside the suppression window, so those writes cannot arm a self-echo push. Runs AFTER the
                 // roster settles: the per-profile stores key off ProfileStore.activeID.
-                SettingsBackup.reloadLiveStores()
             }
+        }
+        // A valid lossless roster can exist without a settings blob (Android/partial document).
+        if let cloud = Self.resolveRoster(from: doc) {
+            ProfileStore.shared.mergeInRoster(cloud.profiles,
+                incomingModified: cloud.modified.map(Date.init(timeIntervalSince1970:)))
+            ProfileStore.shared.applyLocalTombstones()
+            restored = true
+        }
+        ProfileStore.shared.applyLocalTombstones()
+        if restoredSettings {
+            // The roster itself was excluded from restore. Reapply this device's active viewer
+            // even on an equal-roster pull, before singletons read a peer's flat preference projection.
+            ProfileStore.shared.reloadFromDefaults()
+            SettingsBackup.reloadLiveStores()
         }
         if let keys = doc["apiKeys"] as? [String: String] {
             guard isCurrent(capture) else { return }
@@ -2720,14 +2761,7 @@ final class VortXSyncManager: ObservableObject {
         // name/familyEdit/pin + per-profile library adds, LWW by editedAt, once per stamp.
         // Guarded by the per-stamp editedAt LWW below (once per stamp), which is the correct conflict rule here;
         // no extra version gate (that was reverted with the tombstone gates, since it blocked legitimate edits).
-        if let edits = doc["profileEdits"] as? [String: Any] {
-            let editedAt = (edits["editedAt"] as? Double) ?? Double((edits["editedAt"] as? Int) ?? 0)
-            if editedAt > lastAppliedProfileEditsAt {
-                ProfileStore.shared.applyProfileEdits(edits)
-                lastAppliedProfileEditsAt = editedAt
-                restored = true
-            }
-        }
+        if applyPendingProfileEdits(doc) { restored = true }
         if !pendingDebridServices.isEmpty {
             pendingDebridApply = PendingDebridApply(
                 capture: capture,
