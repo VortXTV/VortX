@@ -87,6 +87,11 @@ fun PosterCard(
     onQuickView: (() -> Unit)? = null,
     /** Touch presentation opts into the direct-accent cinema frame; TV retains its focus/elevation style. */
     cinema: Boolean = false,
+    /** Cinema result/CW frames are wide even when the general poster preset remains portrait. */
+    landscape: Boolean? = null,
+    showLabels: Boolean? = null,
+    description: String? = null,
+    reserveLabelSpace: Boolean = false,
     art: @Composable BoxScope.() -> Unit = { DefaultPosterArt(title) },
 ) {
     val colors = VortXTheme.colors
@@ -95,7 +100,7 @@ fun PosterCard(
     // moment a preset changes in the Poster Style screen.
     val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
     val cardShape = RoundedCornerShape(posterStyle.radius.radius)
-    val aspect = if (posterStyle.landscape) 16f / 9f else 2f / 3f
+    val aspect = if (landscape ?: posterStyle.landscape) 16f / 9f else 2f / 3f
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val reduced = VortXTheme.reducedMotion
@@ -186,11 +191,12 @@ fun PosterCard(
         }
         // Hide-labels preset (item 5): the poster art carries the identity, so the title/subtitle rows are
         // dropped when the user opts in. Labels shown is the default, today's look.
-        if (!posterStyle.hideLabels) {
+        if (showLabels ?: !posterStyle.hideLabels) {
             Text(
                 text = title,
                 style = VortXTheme.type.cardTitle.copy(color = if (active) colors.textPrimary else colors.textPrimary.copy(alpha = 0.92f)),
                 maxLines = 2,
+                minLines = if (reserveLabelSpace) 2 else 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 6.dp),
             )
@@ -198,8 +204,18 @@ fun PosterCard(
                 Text(
                     text = subtitle,
                     style = VortXTheme.type.label.copy(color = colors.textTertiary, fontSize = 12.sp),
-                    maxLines = 1,
+                    maxLines = if (description != null || reserveLabelSpace) 2 else 1,
+                    minLines = if (reserveLabelSpace) 2 else 1,
                     overflow = TextOverflow.Ellipsis,
+                )
+            }
+            description?.takeIf(String::isNotBlank)?.let {
+                Text(
+                    text = it,
+                    style = VortXTheme.type.body.copy(color = colors.textSecondary),
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 6.dp),
                 )
             }
         }

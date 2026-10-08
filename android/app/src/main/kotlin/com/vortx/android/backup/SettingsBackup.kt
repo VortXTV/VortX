@@ -415,6 +415,8 @@ object SettingsBackup {
         "vortx.home.showCollectionsHub" to SettingType.BOOL,
         "vortx.discover.showCollectionsHub" to SettingType.BOOL,
         "vortx.mergeDiscoverSearch" to SettingType.BOOL,
+        "vortx.mergeHomeDiscover" to SettingType.BOOL,
+        "vortx.cinema.quickView" to SettingType.BOOL,
         "vortx.detail.showFinancials" to SettingType.BOOL,
         "vortx.detail.spoilerSafe" to SettingType.BOOL,
         "vortx.spoilerBlur" to SettingType.BOOL,

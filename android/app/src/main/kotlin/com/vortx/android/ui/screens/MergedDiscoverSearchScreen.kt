@@ -76,6 +76,7 @@ fun MergedDiscoverSearchScreen(
                     },
                     sectioned = true,
                     showMenu = true,
+                    cinemaSearch = true,
                 )
             }
         } else {

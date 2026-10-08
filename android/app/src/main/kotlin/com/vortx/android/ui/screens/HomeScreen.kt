@@ -235,12 +235,9 @@ private fun HomeContent(
                         } else {
                             null
                         },
-                        // Only engine-board rows have a repository-backed grid/pagination route. Client-side
-                        // editorial rails deliberately keep their current tap-to-detail behavior instead of
-                        // exposing a See all button that could lead to an empty, duplicate fetch.
-                        onSeeAll = onBrowseCatalog
-                            ?.takeIf { catalog.engineIndex != null || catalog.id == "continue" }
-                            ?.let { browse -> { browse(catalog) } },
+                        // Engine/CW rows retain repository paging; client rails open their published Home
+                        // projection. Every shelf therefore has a complete grid without a duplicate fetch.
+                        onSeeAll = onBrowseCatalog?.let { browse -> { browse(catalog) } },
                         onQuickView = onQuickView,
                     )
                 }

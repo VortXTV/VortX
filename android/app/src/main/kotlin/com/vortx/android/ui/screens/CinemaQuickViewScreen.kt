@@ -9,6 +9,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -26,6 +31,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.vortx.android.library.WatchlistStore
 import com.vortx.android.model.MetaItem
@@ -37,6 +43,7 @@ import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 
 /**
  * Lightweight, presentation-only title view. Actions delegate to the shell's existing detail/watchlist
@@ -54,14 +61,19 @@ fun CinemaQuickViewScreen(
 ) {
     val scope = rememberCoroutineScope()
     var watchlistMessage by remember(item.id) { mutableStateOf<String?>(null) }
-    val inWatchlist = watchlistStore.isWatchlisted(item.id)
-    Column(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
+    val watchlist by watchlistStore.items.collectAsStateWithLifecycle()
+    val inWatchlist = watchlist.any { it.id == item.id }
+    var togglingWatchlist by remember(item.id) { mutableStateOf(false) }
+    Column(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas).safeDrawingPadding()) {
         TopAppBar(
             title = { Text("Quick view", style = VortXTheme.type.screenTitle) },
             navigationIcon = { IconButton(onClick = onClose) { Icon(VortXIcons.back, "Back") } },
+            windowInsets = WindowInsets(0, 0, 0, 0),
         )
         Column(
-            modifier = Modifier.padding(VortXTheme.spacing.edge),
+            modifier = Modifier.weight(1f).verticalScroll(rememberScrollState())
+                .widthIn(max = 840.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
+                .padding(VortXTheme.spacing.edge),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
             Box(
@@ -98,11 +110,20 @@ fun CinemaQuickViewScreen(
             Chip(
                 label = if (inWatchlist) "Remove from Watchlist" else "Watchlist",
                 selected = inWatchlist,
+                enabled = !togglingWatchlist,
                 leadingIcon = VortXIcons.bookmark,
                 onClick = {
+                    togglingWatchlist = true
                     scope.launch {
-                        val nowWatchlisted = watchlistStore.toggle(item)
-                        watchlistMessage = if (nowWatchlisted) "Added to Watchlist" else "Removed from Watchlist"
+                        try {
+                            val nowWatchlisted = watchlistStore.toggle(item)
+                            watchlistMessage = if (nowWatchlisted) "Added to Watchlist" else "Removed from Watchlist"
+                        } catch (error: Exception) {
+                            if (error is CancellationException) throw error
+                            watchlistMessage = "Could not update Watchlist. Try again."
+                        } finally {
+                            togglingWatchlist = false
+                        }
                     }
                 },
             )

@@ -5,10 +5,12 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -20,6 +22,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -78,6 +82,26 @@ fun BoxScope.PosterArt(
             active = !PosterArtwork.bakesRatings(forId = id),
             modifier = Modifier.align(Alignment.TopStart).padding(6.dp),
         )
+    }
+}
+
+/** Wide Cinema art with a readable poster inset when the provider supplied only portrait artwork. */
+@Composable
+fun BoxScope.CinemaLandscapeArt(item: MetaItem) {
+    val artwork = cinemaLandscapeArtwork(item)
+    if (artwork == null) {
+        DefaultPosterArt(item.name)
+    } else {
+        AsyncImage(model = artwork, contentDescription = null, contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize())
+    }
+    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.45f)))))
+    if (item.background.isNullOrBlank() && !item.poster.isNullOrBlank()) {
+        AsyncImage(model = item.poster, contentDescription = null, contentScale = ContentScale.Fit,
+            modifier = Modifier.align(Alignment.Center).fillMaxHeight().aspectRatio(2f / 3f))
+    }
+    item.resumeLabel?.let { label ->
+        Badge(label, modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp))
     }
 }
 
@@ -150,6 +174,7 @@ fun PosterRail(
                     }
                 }
                 val menu = posterMenuFor(catalog)
+                val continueWatching = catalog.id == CONTINUE_WATCHING_ROW_ID
                 PosterCard(
                     title = item.name,
                     subtitle = cinemaCardFacts(item),
@@ -165,9 +190,15 @@ fun PosterRail(
                         menu == PosterCardMenu.CONTINUE_WATCHING && onRemoveFromContinueWatching != null
                     ) ({ onRemoveFromContinueWatching(item) }) else null,
                     onQuickView = onQuickView?.let { quickView -> { quickView(item) } },
-                    art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
+                    art = {
+                        if (continueWatching) CinemaLandscapeArt(item)
+                        else PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
+                    },
                     cinema = true,
-                    modifier = Modifier.width(posterStyle.width.compactWidth).padding(end = VortXTheme.spacing.sm),
+                    landscape = true.takeIf { continueWatching },
+                    reserveLabelSpace = continueWatching,
+                    modifier = Modifier.width(if (continueWatching) maxOf(240.dp, posterStyle.width.compactWidth) else posterStyle.width.compactWidth)
+                        .padding(end = VortXTheme.spacing.sm),
                 )
             }
         }

@@ -23,7 +23,8 @@ import java.util.Locale
  *   - `vortx.home.showCuratedRails`        -> Home view model.
  *   - `vortx.discover.showCollectionsHub`  -> phone and TV Discover hub, independent of Home.
  *   - `vortx.mergeDiscoverSearch`          -> application navigation.
- *   - `vortx.cinema.quickView`              -> catalog tap presentation on Home.
+ *   - `vortx.mergeHomeDiscover`            -> Featured/Browse under Home, reversible.
+ *   - `vortx.cinema.quickView`              -> title catalog tap presentation.
  *   - `vortx.detail.showFinancials`        -> phone and TV detail.
  *   - `vortx.detail.spoilerSafe` / `vortx.spoilerBlur` -> episode spoiler veils.
  *   - `stremiox.catalog.hidePosterLabels`  -> poster presentation preferences.
@@ -68,8 +69,13 @@ class HomeDiscoverPreferences(context: Context) {
         get() = prefs.getBoolean(KEY_MERGE_DISCOVER_SEARCH, false)
         set(value) { prefs.edit().putBoolean(KEY_MERGE_DISCOVER_SEARCH, value).apply() }
 
+    /** New Cinema shells combine the two owners; an explicit false retains the previous tab layout. */
+    var mergeHomeDiscover: Boolean
+        get() = prefs.getBoolean(KEY_MERGE_HOME_DISCOVER, true)
+        set(value) { prefs.edit().putBoolean(KEY_MERGE_HOME_DISCOVER, value).apply() }
+
     /**
-     * When enabled, a regular Home catalog tap opens the functional Quick View surface before Detail.
+     * When enabled, a title catalog tap opens the functional Quick View surface before Detail.
      * Continue Watching is deliberately excluded at the caller: it must keep its direct-resume route.
      */
     var cinemaQuickView: Boolean
@@ -139,6 +145,7 @@ class HomeDiscoverPreferences(context: Context) {
         // MUST equal com.vortx.android.home.COLLECTIONS_REFRESH_CADENCE_KEY.
         const val KEY_REFRESH_CADENCE = "vortx.collections.refreshCadence"
         const val KEY_MERGE_DISCOVER_SEARCH = "vortx.mergeDiscoverSearch"
+        const val KEY_MERGE_HOME_DISCOVER = "vortx.mergeHomeDiscover"
         const val KEY_CINEMA_QUICK_VIEW = "vortx.cinema.quickView"
         const val KEY_SHOW_FINANCIALS = "vortx.detail.showFinancials"
         const val KEY_SPOILER_SAFE = "vortx.detail.spoilerSafe"

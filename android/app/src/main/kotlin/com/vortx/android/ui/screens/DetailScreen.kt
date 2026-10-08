@@ -6,6 +6,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -109,7 +111,7 @@ import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.cinemaCardFacts
 import com.vortx.android.ui.components.DefaultEpisodeThumb
 import com.vortx.android.ui.components.ErrorState
-import com.vortx.android.ui.components.EpisodeRow
+import com.vortx.android.ui.components.CinemaEpisodeCard
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
 import com.vortx.android.ui.components.PrimaryButton
@@ -628,7 +630,7 @@ fun DetailScreen(
                                 // A veiled row's first tap reveals only; it never writes watched state or
                                 // enters the source path before the viewer has chosen to see the spoiler.
                                 val veiled = spoilerVeiled(spoilerSafe, watched, episode.id in revealedEpisodeIds)
-                                EpisodeRow(
+                                CinemaEpisodeCard(
                                     code = if (episode.season > 0) "S${episode.season} · E${episode.episode}" else "Episode ${episode.episode}",
                                     title = episode.title,
                                     overview = if (veiled) "Tap to reveal" else episode.overview,
@@ -644,7 +646,12 @@ fun DetailScreen(
                                             viewModel.selectEpisode(episode.id)
                                         }
                                     },
-                                    onLongClick = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
+                                    onToggleWatched = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
+                                    runtime = m.data.runtime,
+                                    quality = if (currentForSources) {
+                                        (streamsState as? UiState.Success<List<StreamGroup>>)?.data
+                                            ?.let(StreamRanking::tiers)?.filter { it != "Others" }?.joinToString(" / ")
+                                    } else null,
                                     focusRequester = episodeFocus,
                                     thumb = { EpisodeThumb(episode, veiled = veiled, fallbackUrls = listOf(m.data.background, m.data.poster)) },
                                     modifier = Modifier
@@ -1727,6 +1734,7 @@ private fun SourcesSection(
     // DET-2 grouped/collapsible source list state: the per-add-on filter ("All" = null), the remembered
     // collapsed add-on set, the render window (grown by "Show more"), and the two-level Quality menu.
     var sourceFilter by remember { mutableStateOf<String?>(null) }
+    var sourceJumpRevision by remember { mutableStateOf(0) }
     var collapsed by remember { mutableStateOf(emptySet<String>()) }
     var renderLimit by remember { mutableStateOf(SOURCE_WINDOW_INITIAL) }
     var qualityOpen by remember { mutableStateOf(false) }
@@ -1749,6 +1757,14 @@ private fun SourcesSection(
                 val total = groups.sumOf { it.streams.size }
                 val effectiveSourceFilter = sourceFilter?.takeIf { addon -> groups.any { it.addon == addon } }
                 val filteredGroups = groups.filter { effectiveSourceFilter == null || it.addon == effectiveSourceFilter }
+                val sourceAnchors = remember(groups.map { it.addon }) {
+                    groups.associate { it.addon to BringIntoViewRequester() }
+                }
+                // A selected add-on is an actual jump into its source section as well as the established
+                // filter. The parent LazyColumn owns the scroll, and the incoming/user order is retained.
+                LaunchedEffect(effectiveSourceFilter, sourceJumpRevision) {
+                    effectiveSourceFilter?.let { sourceAnchors[it]?.bringIntoView() }
+                }
                 val availableAudioLanguages = detailAudioLanguageOptions(filteredGroups)
                 // Header + the "Re-find" escape hatch: re-query the add-ons fresh so an expired/dead source
                 // (or an empty result) is replaced. All the work lives in [DetailViewModel.refreshSources];
@@ -1784,7 +1800,11 @@ private fun SourcesSection(
                                 Chip(
                                     label = "${group.addon} (${group.streams.size})",
                                     selected = effectiveSourceFilter == group.addon,
-                                    onClick = { sourceFilter = group.addon },
+                                    onClick = {
+                                        collapsed = collapsed - group.addon
+                                        sourceFilter = group.addon
+                                        sourceJumpRevision += 1
+                                    },
                                 )
                             }
                         }
@@ -1915,8 +1935,12 @@ private fun SourcesSection(
                 val filtered = filteredGroups
                 var budget = renderLimit
                 var shownRows = 0
+                val anchoredAddons = HashSet<String>()
                 filtered.forEach { group ->
                     val isCollapsed = group.addon in collapsed
+                    // Labels can repeat across transports. Jump to the first matching section, whose
+                    // sources get the render budget first, rather than scrolling through every duplicate.
+                    val sourceAnchor = sourceAnchors[group.addon]?.takeIf { anchoredAddons.add(group.addon) }
                     SourceGroupHeader(
                         addon = group.addon,
                         count = group.streams.size,
@@ -1924,6 +1948,7 @@ private fun SourcesSection(
                         onToggle = {
                             collapsed = if (isCollapsed) collapsed - group.addon else collapsed + group.addon
                         },
+                        modifier = sourceAnchor?.let { Modifier.bringIntoViewRequester(it) } ?: Modifier,
                     )
                     if (!isCollapsed && budget > 0) {
                         val sorted = sortedStreamsInGroup(group.streams, sort)
@@ -1993,9 +2018,9 @@ private fun copyableSourceLinks(groups: List<StreamGroup>): List<String> =
 /// section head of the DET-2 grouped list (Apple's `sectionHeader`). Styled as a glass row so the grouping
 /// reads as a deliberate raised card.
 @Composable
-private fun SourceGroupHeader(addon: String, count: Int, collapsed: Boolean, onToggle: () -> Unit) {
+private fun SourceGroupHeader(addon: String, count: Int, collapsed: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onToggle)
             .vortxGlass(VortXShapes.chip, fillAlpha = VortXGlass.badgeFillAlpha, shadow = VortXGlass.Shadow.flat)

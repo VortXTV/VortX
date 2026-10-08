@@ -2259,18 +2259,7 @@ class DetailViewModel(
         return primaryEpisodeOf(detail)
     }
 
-    private fun primaryEpisodeOf(detail: MetaDetail): Pair<Episode, Boolean>? {
-        if (detail.videos.isEmpty()) return null
-        val sorted = detailEpisodeTargetOrder(detail.videos)
-        val lib = detail.libraryItem
-        if (lib != null && lib.timeOffsetMs > 0 && lib.videoId != null) {
-            val resumeVideo = sorted.firstOrNull { it.id == lib.videoId }
-            if (resumeVideo != null && resumeVideo.id !in detail.watchedVideoIds) return resumeVideo to true
-        }
-        val next = sorted.firstOrNull { it.id !in detail.watchedVideoIds }
-        if (next != null) return next to false
-        return sorted.first() to false
-    }
+    private fun primaryEpisodeOf(detail: MetaDetail): Pair<Episode, Boolean>? = detailPrimaryEpisode(detail)
 
     // ---- S05: watched-state + library mutations ----
     //
@@ -2482,13 +2471,27 @@ internal suspend fun resolveRelatedDetailTitle(item: MetaItem): MetaItem {
 
 /**
  * Detail's target policy intentionally ignores season-zero specials whenever a title has actual episodes.
- * Specials remain available in the episode browser; they simply cannot hijack Continue Watching's primary
- * resume/next target ahead of the first real episode.
+ * Specials remain available in the episode browser and explicit saved resumes; they cannot hijack a fresh
+ * or next target ahead of the first real episode.
  */
 internal fun detailEpisodeTargetOrder(videos: List<Episode>): List<Episode> {
     val ordered = videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
     val actualEpisodes = ordered.filter { it.season > 0 }
     return actualEpisodes.ifEmpty { ordered }
+}
+
+/** Explicit saved progress can resume a special; only fresh/next selection skips season zero. */
+internal fun detailPrimaryEpisode(detail: MetaDetail): Pair<Episode, Boolean>? {
+    if (detail.videos.isEmpty()) return null
+    val sorted = detailEpisodeTargetOrder(detail.videos)
+    val lib = detail.libraryItem
+    if (lib != null && lib.timeOffsetMs > 0 && lib.videoId != null) {
+        val resumeVideo = detail.videos.firstOrNull { it.id == lib.videoId }
+        if (resumeVideo != null && resumeVideo.id !in detail.watchedVideoIds) return resumeVideo to true
+    }
+    val next = sorted.firstOrNull { it.id !in detail.watchedVideoIds }
+    if (next != null) return next to false
+    return sorted.first() to false
 }
 
 /**

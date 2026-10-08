@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -21,6 +22,39 @@ import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.HomeCatalogBrowseViewModel
+import com.vortx.android.ui.viewmodel.HomeViewModel
+import com.vortx.android.ui.viewmodel.HomeCatalogTarget
+
+/** Client editorial rails already belong to HomeViewModel; observe that projection without a new request. */
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+fun HomeCatalogSnapshotBrowseScreen(
+    viewModel: HomeViewModel,
+    target: HomeCatalogTarget,
+    onBack: () -> Unit,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    Column(modifier.fillMaxSize().navigationBarsPadding()) {
+        TopAppBar(
+            title = { Text(target.title, style = VortXTheme.type.screenTitle) },
+            navigationIcon = { IconButton(onClick = onBack) { Icon(VortXIcons.back, "Back") } },
+        )
+        when (val current = state) {
+            is UiState.Loading -> ShimmerGrid()
+            is UiState.Error -> ErrorState(current.message, onRetry = viewModel::load)
+            is UiState.Success -> {
+                val catalog = current.data.firstOrNull { it.id == target.id }
+                if (catalog == null) {
+                    ErrorState("${target.title} is no longer available.")
+                } else {
+                    PosterGrid(catalog.items, onItem, emptyHint = "This catalog has no titles right now.", showMenu = !catalog.readOnly)
+                }
+            }
+        }
+    }
+}
 
 /** Full-grid counterpart of a Home rail. Pagination stays on the row's established repository action. */
 @Composable
@@ -33,7 +67,7 @@ fun HomeCatalogBrowseScreen(
     modifier: Modifier = Modifier,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    Column(modifier = modifier.fillMaxSize()) {
+    Column(modifier = modifier.fillMaxSize().navigationBarsPadding()) {
         TopAppBar(
             title = { Text(title, style = VortXTheme.type.screenTitle) },
             navigationIcon = {

@@ -3,6 +3,8 @@ package com.vortx.android.ui.viewmodel
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
+import com.vortx.android.model.MetaDetail
+import com.vortx.android.model.LibraryItemInfo
 import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
@@ -140,6 +142,21 @@ class DetailEpisodeTargetPolicyTest {
         )
 
         assertEquals(listOf("s1e1", "s1e2"), ordered.map { it.id })
+    }
+
+    @Test
+    fun `saved special resumes but fresh or watched special chooses season one`() {
+        val detail = MetaDetail("show", MediaType.SERIES, "Show", videos = listOf(
+            Episode("special", "Special", season = 0, episode = 1),
+            Episode("s1e2", "Second", season = 1, episode = 2),
+            Episode("s1e1", "First", season = 1, episode = 1),
+        ))
+        assertEquals("s1e1" to false, detailPrimaryEpisode(detail)?.let { it.first.id to it.second })
+        val saved = detail.copy(libraryItem = LibraryItemInfo("show", false, false, "special", 30_000L, 60_000L, 0))
+        assertEquals("special" to true, detailPrimaryEpisode(saved)?.let { it.first.id to it.second })
+        assertEquals("s1e1" to false, detailPrimaryEpisode(saved.copy(watchedVideoIds = setOf("special")))?.let { it.first.id to it.second })
+        assertEquals("s1e1" to false, detailPrimaryEpisode(saved.copy(libraryItem = saved.libraryItem!!.copy(timeOffsetMs = 0)))?.let { it.first.id to it.second })
+        assertEquals("special", detailEpisodeTargetForRoute(detail.videos, PreferredEpisode(0, 1), null)?.id)
     }
 
     @Test

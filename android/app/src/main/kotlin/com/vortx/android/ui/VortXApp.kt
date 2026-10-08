@@ -4,6 +4,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -99,7 +100,6 @@ import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.prefs.TabSlot
 import com.vortx.android.ui.prefs.isVisible
-import com.vortx.android.ui.prefs.resolveSelected
 import com.vortx.android.ui.screens.AccountScreen
 import com.vortx.android.ui.screens.AddonPairingScreen
 import com.vortx.android.ui.screens.AddonStoreScreen
@@ -108,6 +108,7 @@ import com.vortx.android.ui.screens.AppearanceScreen
 import com.vortx.android.stats.WatchStatsScreen
 import com.vortx.android.ui.screens.BackupRestoreScreen
 import com.vortx.android.ui.screens.CustomizeHomeScreen
+import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.screens.CinemaQuickViewScreen
 import com.vortx.android.ui.screens.DebridKeysScreen
 import com.vortx.android.ui.screens.DebridLibraryScreen
@@ -117,6 +118,7 @@ import com.vortx.android.ui.screens.DownloadQueueScreen
 import com.vortx.android.ui.screens.DownloadsScreen
 import com.vortx.android.ui.screens.HomeDiscoverSettingsScreen
 import com.vortx.android.ui.screens.HomeCatalogBrowseScreen
+import com.vortx.android.ui.screens.HomeCatalogSnapshotBrowseScreen
 import com.vortx.android.ui.screens.HomeScreen
 import com.vortx.android.ui.screens.IntegrationsScreen
 import com.vortx.android.ui.screens.LiveScreen
@@ -272,17 +274,43 @@ fun VortXApp(
         ) {
             // WHY audit R02: save enum identity, not ordinal, so shell selection survives process death safely.
             var savedTabName by rememberSaveable { mutableStateOf(Tab.HOME.name) }
-            val tab = Tab.entries.firstOrNull { it.name == savedTabName } ?: Tab.HOME
+            var savedHomeModeName by rememberSaveable { mutableStateOf(CinemaHomeMode.FEATURED.name) }
+            val requestedTab = Tab.entries.firstOrNull { it.name == savedTabName } ?: Tab.HOME
+            val requestedHomeMode = CinemaHomeMode.entries.firstOrNull { it.name == savedHomeModeName } ?: CinemaHomeMode.FEATURED
             // SD-2: the combined Discover+Search surface folds Search into Discover, so the standalone
             // Search tab is dropped from the bar while the pref is on (Apple `visibleTabs`).
             val homeDiscoverPrefs = remember(appContext) { HomeDiscoverPreferences(appContext) }
             var mergeDiscoverSearch by remember { mutableStateOf(homeDiscoverPrefs.mergeDiscoverSearch) }
+            var mergeHomeDiscover by remember { mutableStateOf(homeDiscoverPrefs.mergeHomeDiscover) }
             var cinemaQuickView by remember { mutableStateOf(homeDiscoverPrefs.cinemaQuickView) }
-            val visibleTabs = Tab.entries.filter {
-                hiddenTabs.isVisible(it.slot) && !(mergeDiscoverSearch && it == Tab.SEARCH)
+            val route = cinemaTabRoute(requestedTab.slot, requestedHomeMode, hiddenTabs, mergeHomeDiscover, mergeDiscoverSearch)
+            val tab = Tab.entries.first { it.slot == route.tab }
+            val homeMode = route.homeMode
+            val visibleSlots = cinemaVisibleTabs(hiddenTabs, mergeHomeDiscover, mergeDiscoverSearch)
+            val visibleTabs = Tab.entries.filter { it.slot in visibleSlots }
+            DisposableEffect(homeDiscoverPrefs) {
+                val stop = homeDiscoverPrefs.observeChanges {
+                    val nextHomeMerge = homeDiscoverPrefs.mergeHomeDiscover
+                    if (nextHomeMerge != mergeHomeDiscover) {
+                        val currentRoute = cinemaTabRoute(
+                            Tab.entries.firstOrNull { it.name == savedTabName }?.slot ?: TabSlot.HOME,
+                            CinemaHomeMode.entries.firstOrNull { it.name == savedHomeModeName } ?: CinemaHomeMode.FEATURED,
+                            tabBarPrefs.state.value, mergeHomeDiscover, mergeDiscoverSearch,
+                        )
+                        val nextRoute = cinemaRouteAfterHomeMergeChange(currentRoute, nextHomeMerge,
+                            homeDiscoverPrefs.mergeDiscoverSearch, tabBarPrefs.state.value)
+                        savedTabName = Tab.entries.first { it.slot == nextRoute.tab }.name
+                        savedHomeModeName = nextRoute.homeMode.name
+                    }
+                    mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+                    mergeHomeDiscover = nextHomeMerge
+                    cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
+                }
+                onDispose { stop() }
             }
-            LaunchedEffect(tab, hiddenTabs) {
-                if (hiddenTabs.resolveSelected(tab.slot) != tab.slot) savedTabName = Tab.HOME.name
+            LaunchedEffect(route) {
+                savedTabName = tab.name
+                savedHomeModeName = homeMode.name
             }
         // WHY audit R02: save only the stable route strings, then rehydrate through the deep-link target hook.
         var savedDetailId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -373,6 +401,7 @@ fun VortXApp(
         var showWatchlist by remember { mutableStateOf(false) }
         var showPreviouslyWatched by remember { mutableStateOf(false) }
         var catalogBrowseTarget by remember { mutableStateOf<HomeCatalogTarget?>(null) }
+        var catalogBrowseIsClientRail by remember { mutableStateOf(false) }
         var quickViewItem by remember { mutableStateOf<MetaItem?>(null) }
         var quickWatchIdentity by remember { mutableStateOf<String?>(null) }
         // Nested under Downloads: the queue manager (reorder / concurrency / storage). Checked BEFORE the
@@ -413,12 +442,8 @@ fun VortXApp(
         LaunchedEffect(showHomeDiscover) {
             if (!showHomeDiscover) {
                 mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+                mergeHomeDiscover = homeDiscoverPrefs.mergeHomeDiscover
                 cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
-            }
-        }
-        LaunchedEffect(mergeDiscoverSearch, tab) {
-            if (mergeDiscoverSearch && tab == Tab.SEARCH) {
-                savedTabName = if (hiddenTabs.isVisible(TabSlot.DISCOVER)) Tab.DISCOVER.name else Tab.HOME.name
             }
         }
         // SD-6: per-tab re-tap tokens. The shell bumps one when the ALREADY-active tab is re-tapped, and the
@@ -471,6 +496,13 @@ fun VortXApp(
         val onItem: (MetaItem) -> Unit = {
             detailGeneration += 1
             openDetail(it)
+        }
+        val onCinemaItem: (MetaItem) -> Unit = { item ->
+            if (com.vortx.android.ui.components.cinemaCardOpensQuickView(item, cinemaQuickView)) {
+                quickViewItem = item
+            } else {
+                onItem(item)
+            }
         }
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
@@ -555,6 +587,7 @@ fun VortXApp(
             TabBarScreen(
                 prefs = tabBarPrefs,
                 onBack = { showTabBar = false },
+                mergeHomeDiscover = mergeHomeDiscover,
             )
             return@VortXTheme
         }
@@ -1284,10 +1317,12 @@ fun VortXApp(
                 onWatch = {
                     quickWatchIdentity = "${item.type.id}:${item.id}"
                     quickViewItem = null
+                    catalogBrowseTarget = null
                     onItem(item)
                 },
                 onDetails = {
                     quickViewItem = null
+                    catalogBrowseTarget = null
                     onItem(item)
                 },
             )
@@ -1299,6 +1334,23 @@ fun VortXApp(
         // transfer cleanly into the established detail route.
         catalogBrowseTarget?.let { target ->
             BackHandler { catalogBrowseTarget = null }
+            val onBrowseItem: (MetaItem) -> Unit = { item ->
+                if (com.vortx.android.ui.components.cinemaCardOpensQuickView(item, cinemaQuickView)) {
+                    quickViewItem = item
+                } else {
+                    catalogBrowseTarget = null
+                    onItem(item)
+                }
+            }
+            if (catalogBrowseIsClientRail) {
+                HomeCatalogSnapshotBrowseScreen(
+                    viewModel = viewModel<HomeViewModel>(factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext)),
+                    target = target,
+                    onBack = { catalogBrowseTarget = null },
+                    onItem = onBrowseItem,
+                )
+                return@VortXTheme
+            }
             val catalogVm: HomeCatalogBrowseViewModel = viewModel(
                 key = "home-catalog-${target.id}",
                 factory = HomeCatalogBrowseViewModel.Factory(repo, target),
@@ -1307,10 +1359,7 @@ fun VortXApp(
                 viewModel = catalogVm,
                 title = target.title,
                 onBack = { catalogBrowseTarget = null },
-                onItem = { item ->
-                    catalogBrowseTarget = null
-                    onItem(item)
-                },
+                onItem = onBrowseItem,
             )
             return@VortXTheme
         }
@@ -1387,6 +1436,9 @@ fun VortXApp(
 
         val factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext)
         val authState by accountVm.authState.collectAsStateWithLifecycle()
+        BackHandler(enabled = mergeHomeDiscover && tab == Tab.HOME && homeMode == CinemaHomeMode.BROWSE) {
+            savedHomeModeName = CinemaHomeMode.FEATURED.name
+        }
         Scaffold(
             topBar = {
                 // The top bar reads as VortX glass: the stock opaque Material3 container is made transparent
@@ -1421,6 +1473,7 @@ fun VortXApp(
                                     when (t) {
                                         Tab.SEARCH -> searchReselect++
                                         Tab.DISCOVER -> discoverReselect++
+                                        Tab.HOME -> if (homeMode == CinemaHomeMode.BROWSE) discoverReselect++
                                         else -> Unit
                                     }
                                 } else {
@@ -1443,55 +1496,76 @@ fun VortXApp(
             // `account.isSignedIn || vortxSync.isSignedIn` gate. Signed out, both show a sign-in prompt.
             val accountSignedIn = authState is AuthState.SignedIn ||
                 vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn
-            when (tab) {
-                Tab.HOME -> HomeScreen(
-                    viewModel = viewModel<HomeViewModel>(factory = factory),
-                    onItem = onItem,
-                    modifier = content,
-                    onDirectResume = { item ->
-                        openDetail(item)
-                        pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
-                        detailGeneration += 1
-                    },
-                    onDiscover = { savedTabName = Tab.DISCOVER.name },
-                    onBrowseCatalog = { catalog ->
-                        catalogBrowseTarget = HomeCatalogTarget(catalog.id, catalog.title)
-                    },
-                    onCatalogItem = if (cinemaQuickView) ({ item -> quickViewItem = item }) else null,
-                    onQuickView = { item -> quickViewItem = item },
-                )
-                Tab.DISCOVER -> if (mergeDiscoverSearch) {
-                    // SD-2: the combined surface hosts both the Discover browse and the folded-in Search.
+            val browseContent: @Composable (Modifier) -> Unit = { browseModifier ->
+                if (mergeDiscoverSearch) {
                     MergedDiscoverSearchScreen(
                         discoverViewModel = viewModel<DiscoverViewModel>(factory = factory),
                         searchViewModel = viewModel<SearchViewModel>(factory = factory),
-                        onItem = onItem,
-                        modifier = content,
+                        onItem = onCinemaItem,
+                        modifier = browseModifier,
                         signedIn = accountSignedIn,
                         hideLive = hiddenTabs.hideLive,
                         reselectSignal = discoverReselect,
                         quickActions = {
-                            PlayLinkEntry(
-                                onClick = { showPlayLink = true },
-                                onDebridLibraryClick = { showDebridLibrary = true },
-                            )
+                            PlayLinkEntry(onClick = { showPlayLink = true }, onDebridLibraryClick = { showDebridLibrary = true })
                         },
                     )
                 } else {
                     DiscoverScreen(
-                        viewModel<DiscoverViewModel>(factory = factory),
-                        onItem,
-                        content,
+                        viewModel = viewModel<DiscoverViewModel>(factory = factory),
+                        onItem = onCinemaItem,
+                        modifier = browseModifier,
                         signedIn = accountSignedIn,
                         hideLive = hiddenTabs.hideLive,
                         reselectSignal = discoverReselect,
                     )
                 }
+            }
+            when (tab) {
+                Tab.HOME -> Column(content.fillMaxSize()) {
+                    if (mergeHomeDiscover && !hiddenTabs.hideDiscover) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                                .padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
+                            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                        ) {
+                            Chip("Featured", homeMode == CinemaHomeMode.FEATURED, onClick = { savedHomeModeName = CinemaHomeMode.FEATURED.name })
+                            Chip("Browse", homeMode == CinemaHomeMode.BROWSE, onClick = { savedHomeModeName = CinemaHomeMode.BROWSE.name })
+                        }
+                    }
+                    if (mergeHomeDiscover && homeMode == CinemaHomeMode.BROWSE) {
+                        browseContent(Modifier.weight(1f))
+                    } else {
+                        HomeScreen(
+                            viewModel = viewModel<HomeViewModel>(factory = factory),
+                            onItem = onItem,
+                            modifier = Modifier.weight(1f),
+                            onDirectResume = { item ->
+                                openDetail(item)
+                                pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
+                                detailGeneration += 1
+                            },
+                            onDiscover = if (hiddenTabs.hideDiscover) null else {
+                                {
+                                    if (mergeHomeDiscover) savedHomeModeName = CinemaHomeMode.BROWSE.name
+                                    else savedTabName = Tab.DISCOVER.name
+                                }
+                            },
+                            onBrowseCatalog = { catalog ->
+                                catalogBrowseIsClientRail = catalog.engineIndex == null && catalog.id != "continue"
+                                catalogBrowseTarget = HomeCatalogTarget(catalog.id, catalog.title)
+                            },
+                            onCatalogItem = onCinemaItem,
+                            onQuickView = { item -> quickViewItem = item },
+                        )
+                    }
+                }
+                Tab.DISCOVER -> browseContent(content)
                 Tab.LIVE -> LiveScreen(viewModel<LiveViewModel>(factory = factory), onItem, content)
                 Tab.LIBRARY -> LibraryScreen(
                     viewModel = viewModel<LibraryViewModel>(factory = factory),
                     landingViewModel = viewModel<LibraryLandingViewModel>(key = "library-history", factory = factory),
-                    onItem = onItem,
+                    onItem = onCinemaItem,
                     modifier = content,
                     onDirectResume = { item ->
                         openDetail(item)
@@ -1504,7 +1578,7 @@ fun VortXApp(
                 )
                 Tab.SEARCH -> SearchScreen(
                     viewModel<SearchViewModel>(factory = factory),
-                    onItem,
+                    onCinemaItem,
                     content,
                     signedIn = accountSignedIn,
                     reselectSignal = searchReselect,

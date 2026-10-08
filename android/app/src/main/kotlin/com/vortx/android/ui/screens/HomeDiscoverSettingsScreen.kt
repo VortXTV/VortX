@@ -42,6 +42,7 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
     var refreshCadence by remember { mutableStateOf(prefs.refreshCadence) }
     var mergeDiscoverSearch by remember { mutableStateOf(prefs.mergeDiscoverSearch) }
     var cinemaQuickView by remember { mutableStateOf(prefs.cinemaQuickView) }
+    var mergeHomeDiscover by remember { mutableStateOf(prefs.mergeHomeDiscover) }
     var regionPreference by remember { mutableStateOf(prefs.regionPreference) }
     var hiddenCategories by remember { mutableStateOf(prefs.hiddenCategories) }
     var showFinancials by remember { mutableStateOf(prefs.showFinancials) }
@@ -56,6 +57,7 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
             refreshCadence = prefs.refreshCadence
             mergeDiscoverSearch = prefs.mergeDiscoverSearch
             cinemaQuickView = prefs.cinemaQuickView
+            mergeHomeDiscover = prefs.mergeHomeDiscover
             regionPreference = prefs.regionPreference
             hiddenCategories = prefs.hiddenCategories
             showFinancials = prefs.showFinancials
@@ -108,12 +110,21 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
                     },
                 )
                 ToggleRow(
-                    label = "Open Quick View from Home",
-                    detail = "Preview catalog titles before opening their details. Continue Watching still resumes directly.",
+                    label = "Open Quick View from catalog cards",
+                    detail = "Home, Discover, Search and Library title taps open Watch, Watchlist and Details. Turn off to open Details directly. Continue Watching resumes directly.",
                     checked = cinemaQuickView,
                     onCheckedChange = {
                         cinemaQuickView = it
                         prefs.cinemaQuickView = it
+                    },
+                )
+                ToggleRow(
+                    label = "Combine Home & Discover",
+                    detail = "Featured rows and Browse filters share Home. Turn off to restore a separate Discover tab.",
+                    checked = mergeHomeDiscover,
+                    onCheckedChange = {
+                        mergeHomeDiscover = it
+                        prefs.mergeHomeDiscover = it
                     },
                 )
             }
