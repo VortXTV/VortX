@@ -3455,7 +3455,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             return
         }
         subtitleOverlay?.applyStyle()
-        updateSubtitleOverlay(atClock: player.currentTime().seconds)
+        updateSubtitleOverlay(atClock: RemuxResumePolicy.presented(
+            playerSeconds: player.currentTime().seconds, origin: remuxTimelineOrigin))
     }
 
     /// Select option `id` (its index in the group) on the current item, or deselect for mpv's -1 = off.
@@ -3617,7 +3618,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// as the renderer's offset, so the change is live: the next overlay update uses the new offset immediately.
     func setSubDelay(_ seconds: Double) {
         subtitleRenderer.offset = seconds
-        if externalSubActive { updateSubtitleOverlay(atClock: player.currentTime().seconds) }
+        if externalSubActive {
+            updateSubtitleOverlay(atClock: RemuxResumePolicy.presented(
+                playerSeconds: player.currentTime().seconds, origin: remuxTimelineOrigin))
+        }
     }
     /// No-op: AVFoundation exposes no audio-track time offset (unlike libmpv `audio-delay`). The chrome hides
     /// the audio-sync rows when this engine is active, so this is never reached from the UI on the AVPlayer path.
