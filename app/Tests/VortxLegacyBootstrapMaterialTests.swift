@@ -280,6 +280,31 @@ enum VortxLegacyBootstrapMaterialTests {
         check(((slottedCold["ownAccountSources"] as! [String: Object])[own.id.uuidString]!)["sourceDocumentSha256"] as? String == witnessedOverlayReceipt.sourceDocumentSHA256,
               "Witness-admitted cold material copies the active slot tuple verbatim")
 
+        // Material 1 predates a profile that later became independently authenticated. Its
+        // complete schema-4 active slot is sufficient; historical absence is not a malformed
+        // partial material-2 tuple.
+        let oldNoOwnBaseline = Data("{\"schemaVersion\":1}".utf8)
+        let lateOwnDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: rootWithOwnOverlayBytes,
+            roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: oldNoOwnBaseline,
+            retainedOwnAccountSlotBaselines: [activeSlot])
+        check(lateOwnDisposition.count == 1 && lateOwnDisposition[0].status == .matchedWitness,
+              "A new own persona may use a complete active slot when historical material predates it")
+        let lateOwnMaterial = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes,
+                                           retainedOwnAccountBaseline: oldNoOwnBaseline,
+                                           retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: lateOwnDisposition)
+        check(((lateOwnMaterial["ownAccountSources"] as! [String: Object])[own.id.uuidString]!)["sourceDocumentSha256"] as? String == witnessedOverlayReceipt.sourceDocumentSHA256,
+              "Late own persona retains the active slot's exact source proof")
+        var partialAbsentBaseline = witnessedOverlayMaterial
+        partialAbsentBaseline["ownAccountSources"] = Object()
+        do {
+            _ = try material(rootWithOwnOverlay, roster: [owner, own], documentData: rootWithOwnOverlayBytes,
+                             retainedOwnAccountBaseline: JSONSerialization.data(withJSONObject: partialAbsentBaseline),
+                             retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: witnessedDisposition)
+            preconditionFailure("Partial absent historical tuple admitted through active slot")
+        } catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("partial absent profile tuple"), "Claimed-but-partial historical own tuple remains closed")
+        }
+
         let changedRootOverlayBytes = try JSONSerialization.data(withJSONObject: changedRootOverlay, options: [.sortedKeys, .withoutEscapingSlashes])
         let changedDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: changedRootOverlayBytes,
             roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: retainedOverlayBaseline,

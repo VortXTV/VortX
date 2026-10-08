@@ -650,9 +650,15 @@ enum VortxLegacyBootstrapMaterial {
             guard let bytes else { return [:] }
             guard let baseline = try JSONSerialization.jsonObject(with: bytes) as? Object,
                   let version = baseline["schemaVersion"] as? NSNumber,
-                  CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 2,
-                  Double(version.intValue) == version.doubleValue,
-                  let roster = try array(baseline, "roster"),
+                  CFGetTypeID(version) != CFBooleanGetTypeID(), Double(version.intValue) == version.doubleValue,
+                  version.intValue == 1 || version.intValue == 2 else {
+                throw fail("Retained own-account baseline has an unsupported material schema")
+            }
+            // Material 1 predates own-account sources. It says nothing about a profile that was
+            // made own-account later, so a complete active schema-4 slot may supply that profile's
+            // current tuple. It must not be mistaken for a malformed partial material-2 tuple.
+            guard version.intValue == 2 else { return [:] }
+            guard let roster = try array(baseline, "roster"),
                   let sourceRows = try object(baseline, "ownAccountSources"),
                   let addons = try object(baseline, "addons"),
                   let libraries = try object(baseline, "libraries"),
@@ -670,7 +676,15 @@ enum VortxLegacyBootstrapMaterial {
             var retained: [String: ResolvedOwnAccountSource] = [:]
             for profile in requiredProfiles {
                 let id = profile.id.uuidString
-                guard let source = try object(sourceRows, id),
+                guard let source = try object(sourceRows, id) else {
+                    // The profile did not have an own source at the time this immutable baseline
+                    // was written. Buckets alongside an absent source would be a partial claim,
+                    // not an unknown historical state, so keep that closed.
+                    try require(addons[id] == nil && libraries[id] == nil && watches[id] == nil && links[id] == nil,
+                                "Retained own-account baseline has a partial absent profile tuple")
+                    continue
+                }
+                guard
                       Set(source.keys).isSubset(of: ["verifiedStreamingUid", "sourceDocumentSha256", "profileOverlaySha256"]),
                       let uid = try optionalString(source, "verifiedStreamingUid"),
                       uid == uid.trimmingCharacters(in: .whitespacesAndNewlines), !uid.isEmpty,

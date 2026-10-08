@@ -392,6 +392,18 @@ import CryptoKit
         let activeSlotColdTarget = try VortxNativeProfiles.ownTarget(material: try JSONDecoder().decode(VortxJSON.self, from: activeSlotColdMaterial), profileID: child.id)
         check(activeSlotColdTarget.sourceDocumentSHA256 == freshOwnTarget.sourceDocumentSHA256
               && activeSlotColdTarget.profileOverlaySHA256 == freshWitness)
+        let preOwnBaseline = Data("{\"schemaVersion\":1}".utf8)
+        let lateSlotDisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: freshRootDocument,
+            roster: [owner, ownAccount], ownerProfileID: owner.id, retainedOwnAccountBaseline: preOwnBaseline,
+            retainedOwnAccountSlotBaselines: activeSlotBaselines)
+        check(lateSlotDisposition.count == 1 && lateSlotDisposition[0].status == .matchedWitness)
+        let lateSlotMaterial = try VortxLegacyBootstrapMaterial.encode(document: freshRootDocument,
+            roster: [owner, ownAccount], ownerProfileID: owner.id, rosterModifiedSeconds: nil,
+            retainedOwnAccountBaseline: preOwnBaseline, retainedOwnAccountSlotBaselines: activeSlotBaselines,
+            deferredOwnAccountOverlays: lateSlotDisposition)
+        let lateSlotTarget = try VortxNativeProfiles.ownTarget(material: try JSONDecoder().decode(VortxJSON.self, from: lateSlotMaterial), profileID: child.id)
+        check(lateSlotTarget.sourceDocumentSHA256 == freshOwnTarget.sourceDocumentSHA256
+              && lateSlotTarget.profileOverlaySHA256 == freshWitness)
         let coldRebindRuntime = try VortxNativeRuntime(abi: VortxCABI(), snapshot: rebindExport)
         defer { coldRebindRuntime.close() }
         let coldRebindExport = try coldRebindRuntime.stateJSON()
