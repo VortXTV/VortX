@@ -1,13 +1,122 @@
 import Foundation
 
 /// Buffering only: this does not authorize a URL, forward credentials, or select a player engine.
-/// Recognize the embedded NZB endpoint before its redirect, not every loopback/torrent/proxy URL.
+/// Recognize the embedded NZB endpoint and its filename redirect, not every loopback/torrent/proxy URL.
 enum LocalNNTPBufferPolicy {
-    static func waitSeconds(url: URL, live: Bool, preview: Bool) -> Double {
-        guard !live, !preview, url.scheme?.lowercased() == "http",
+    static func isLocalNNTP(_ url: URL) -> Bool {
+        guard url.scheme?.lowercased() == "http",
               ["127.0.0.1", "localhost", "[::1]", "::1"].contains(url.host?.lowercased() ?? ""),
-              url.path == "/nzb/stream" else { return 1 }
-        return 6
+              url.user == nil, url.password == nil, url.fragment == nil else { return false }
+        if url.path == "/nzb/stream" {
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+            return query?.count == 1 && query?.first?.name == "key"
+                && query?.first?.value?.isEmpty == false
+        }
+        let parts = url.path.split(separator: "/", omittingEmptySubsequences: false)
+        return url.query == nil && parts.count == 5 && parts[0].isEmpty
+            && parts[1] == "nzb" && parts[2] == "stream"
+            && parts[3...4].allSatisfy { !$0.isEmpty && $0 != "." && $0 != ".." }
+    }
+
+    static func waitSeconds(url: URL, live: Bool, preview: Bool) -> Double {
+        !live && !preview && isLocalNNTP(url) ? 6 : 1
+    }
+}
+
+/// Raw, exact-load libmpv evidence. UI time can include a deferred-resume floor and must not be
+/// used to prove playback progress or starvation. Unsupported properties remain unknown.
+struct LocalNNTPPlaybackSample {
+    let position: Double?
+    let cachedAhead: Double?
+    let pausedForCache: Bool?
+    let playbackRequested: Bool
+    let seekSettled: Bool
+    let seekGeneration: UInt64
+}
+
+/// One same-source retry for sustained local article starvation; a repeated empty-cache freeze
+/// uses the existing source failover. Reloading a route that only repeats its opening frames
+/// cannot replenish this budget. Viewer input suspends observation without pretending it healed.
+struct LocalNNTPStallRecovery<Owner: Equatable> {
+    enum Action: Equatable {
+        case generalWatchdog
+        case wait
+        case reload
+        case failover
+    }
+
+    static var starvationSeconds: TimeInterval { 30 }
+    static var healthyProgressSeconds: TimeInterval { 60 }
+    private(set) var reloadUsed = false
+    private var owner: Owner?
+    private var seekGeneration: UInt64?
+    private var lastPosition: Double?
+    private var lastSampleAt: TimeInterval?
+    private var starvingSince: TimeInterval?
+    private var starvationPosition: Double?
+    private var healthySince: TimeInterval?
+
+    mutating func suspend() {
+        lastPosition = nil
+        lastSampleAt = nil
+        starvingSince = nil
+        starvationPosition = nil
+        healthySince = nil
+    }
+
+    mutating func observe(owner: Owner, sample: LocalNNTPPlaybackSample?, now: TimeInterval) -> Action {
+        guard let sample else { suspend(); return .generalWatchdog }
+        if self.owner != owner || seekGeneration != sample.seekGeneration {
+            suspend()
+            self.owner = owner
+            seekGeneration = sample.seekGeneration
+        }
+        guard sample.playbackRequested, sample.seekSettled else { suspend(); return .wait }
+        guard now.isFinite, let position = sample.position, position.isFinite, position >= 0,
+              let cachedAhead = sample.cachedAhead, cachedAhead.isFinite, cachedAhead >= 0 else {
+            suspend()
+            return .generalWatchdog
+        }
+        // A suspended app or backwards clock must earn a fresh observation window, not jump
+        // directly to failure on its first foreground poll (the production cadence is six seconds).
+        if let lastSampleAt, now <= lastSampleAt || now - lastSampleAt > 12 { suspend() }
+        defer { lastPosition = position; lastSampleAt = now }
+        let previousTime = lastSampleAt
+        let delta = lastPosition.map { position - $0 }
+        let progressing = delta.map { $0 >= 0.25 } ?? false
+        let backwards = delta.map { $0 < -0.25 } ?? false
+        // A large forward jump is a seek/discontinuity even if its event has not arrived yet.
+        let plausibleProgress = progressing
+            && delta.map { $0 <= max(1, (now - (previousTime ?? now)) * 4) } == true
+        if plausibleProgress, sample.pausedForCache == false {
+            if healthySince == nil { healthySince = previousTime ?? now }
+            if let healthySince, now - healthySince >= Self.healthyProgressSeconds {
+                reloadUsed = false
+            }
+        } else {
+            healthySince = nil
+        }
+        if backwards || (progressing && !plausibleProgress) {
+            starvingSince = nil
+            starvationPosition = nil
+            return .wait
+        }
+        guard !backwards, !progressing, cachedAhead <= 0.25, sample.pausedForCache == true else {
+            starvingSince = nil
+            starvationPosition = nil
+            return .generalWatchdog
+        }
+        // Compare with the entire window's origin, not only the last sample: small advancing
+        // increments must not masquerade as thirty seconds at the same playhead.
+        if starvingSince == nil || abs(position - (starvationPosition ?? position)) >= 0.25 {
+            starvingSince = now
+            starvationPosition = position
+        }
+        guard let starvingSince, now - starvingSince >= Self.starvationSeconds else { return .wait }
+        suspend()
+        if reloadUsed { return .failover }
+        reloadUsed = true
+        return .reload
     }
 }
 

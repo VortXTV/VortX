@@ -471,7 +471,7 @@ enum RemuxItemEndPolicyTests {
         check(
             "wiring: both Apple stall surfaces pass the active AVPlayer recovery token explicitly",
             containsInOrder(iosSurface, [
-                "private func recoverFromStall()",
+                "private func recoverFromStall(",
                 "let recoveryToken = coordinator.player is AVPlayerEngineController",
                 "reusing: recoveryToken, resumeOrigin: resume",
             ])

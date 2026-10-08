@@ -2954,10 +2954,10 @@ enum PlayerLiveContractTests {
         let midPlaybackWatchdog = sourceSection(
             playerScreen,
             from: "private func startStallWatchdog()",
-            to: "private func recoverFromStall()")
+            to: "private func recoverFromStall(")
         let midPlaybackRecovery = sourceSection(
             playerScreen,
-            from: "private func recoverFromStall()",
+            from: "private func recoverFromStall(",
             to: "/// Show a small transient notice over the video")
         let firstFrameCommit = sourceSection(
             playerScreen,

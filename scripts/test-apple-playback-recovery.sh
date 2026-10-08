@@ -24,3 +24,5 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   "${shared_sources[@]}" "$recovery_test_dir/node-listener.swift" \
   app/Tests/NodeListenerRebindAndTVAudioRecoveryTests.swift -o "$recovery_test_dir/tracks"
 "$recovery_test_dir/tracks"
+# Local article-stream buffering and repeated-starvation recovery use the same Apple source gate.
+bash scripts/test-local-nntp-playback.sh

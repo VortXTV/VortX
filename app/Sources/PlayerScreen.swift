@@ -1813,6 +1813,7 @@ struct PlayerScreen: View {
     @State private var stalledTicks = 0
     @State private var stallRecoveries = 0
     @State private var stallStableProgressTicks = 0
+    @State private var localNNTPStallRecovery = LocalNNTPStallRecovery<PlayerLoadToken>()
 
     // Skip intro / outro (chapter-derived + crowd-sourced timings), shown as a pill while controls hide.
     @State private var skipSegments: [SkipSegment] = []
@@ -3193,6 +3194,7 @@ struct PlayerScreen: View {
             // idempotent, so running it only on a real change is correct.
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
+                if b { localNNTPStallRecovery.suspend() }
                 #if os(iOS) || os(macOS)
                 if b {
                     suspendAVReplacementFirstFrameDeadline()
@@ -4607,6 +4609,7 @@ struct PlayerScreen: View {
 
     private func viewerPause() {
         guard coordinator.player != nil else { return }
+        localNNTPStallRecovery.suspend()
         recoveryPauseIntent = true
         playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
         coordinator.player?.pause()
@@ -4630,6 +4633,7 @@ struct PlayerScreen: View {
             }
             return
         }
+        localNNTPStallRecovery = .init()
         retryLoad()
     }
 
@@ -5271,15 +5275,17 @@ struct PlayerScreen: View {
     private func startStallWatchdog() {
         stallWatchdog?.cancel()
         lastObservedTime = -1; stalledTicks = 0; stallStableProgressTicks = 0
+        localNNTPStallRecovery.suspend()   // a fresh frame is not a fresh same-route retry budget
         stallWatchdog = Task { @MainActor in
             while !Task.isCancelled {
                 try? await Task.sleep(
                     for: .seconds(PlayerMidPlaybackStallPolicy.pollIntervalSeconds)
                 )
                 guard !Task.isCancelled else { return }
-                guard PlayerMidPlaybackStallPolicy.shouldObserve(
+                guard !playbackExited, !scrubbing, pendingAdvance == nil,
+                      PlayerMidPlaybackStallPolicy.shouldObserve(
                     hasStartedPlaying: hasStartedPlaying,
-                    isPaused: isPaused,
+                    isPaused: isPaused || playbackDeadlineClock.isPaused,
                     loadFailed: loadFailed,
                     isLive: isLive,
                     duration: duration,
@@ -5290,7 +5296,30 @@ struct PlayerScreen: View {
                     lastObservedTime = -1
                     stalledTicks = 0
                     stallStableProgressTicks = 0
+                    localNNTPStallRecovery.suspend()
                     continue
+                }
+                if LocalNNTPBufferPolicy.isLocalNNTP(curURL ?? url),
+                   let mpv = coordinator.player as? MPVMetalViewController,
+                   let owner = mpv.activeLoadToken {
+                    let action = localNNTPStallRecovery.observe(
+                        owner: owner, sample: mpv.localNNTPPlaybackSample(owner: owner),
+                        now: ProcessInfo.processInfo.systemUptime)
+                    if action != .generalWatchdog {
+                        lastObservedTime = -1; stalledTicks = 0; stallStableProgressTicks = 0
+                        switch action {
+                        case .reload:
+                            DiagnosticsLog.log("player", "local NNTP: sustained empty-cache freeze; one same-source retry")
+                            recoverFromStall(localNNTPStarvation: true)
+                        case .failover:
+                            recoverFromLocalNNTPStarvation(owner: owner)
+                        case .wait, .generalWatchdog:
+                            break
+                        }
+                        continue
+                    }
+                } else {
+                    localNNTPStallRecovery.suspend()
                 }
                 if lastObservedTime < 0 {
                     stalledTicks = 0
@@ -5401,7 +5430,28 @@ struct PlayerScreen: View {
         armAVReplacementFirstFrameDeadline(activeAVPlayer)
     }
 
-    private func recoverFromStall() {
+    /// A second proven empty-cache freeze after the one local retry goes directly to the existing
+    /// bounded source-hop path. Keep the current episode and exact resume calculation owned there.
+    private func recoverFromLocalNNTPStarvation(owner: PlayerLoadToken) {
+        guard !playbackExited, !isPaused, !playbackDeadlineClock.isPaused, !scrubbing,
+              pendingAdvance == nil, hasStartedPlaying, !loadFailed,
+              coordinator.player?.activeLoadToken == owner,
+              LocalNNTPBufferPolicy.isLocalNNTP(curURL ?? url) else { return }
+        let resume = retryResumeTarget()
+        DiagnosticsLog.log("player", "local NNTP: empty-cache freeze repeated after retry; failing over")
+        if hopToNextSource(reason: "local NNTP repeated starvation", resumeOverride: resume) {
+            // The shared source-switch path normally ignores the first five seconds. This recovery
+            // must not replay even that short opening when it is the exact frozen position.
+            if resume > 0, resume <= 5 { nudgeResume(to: resume) }
+            return
+        }
+        loadErrorMsg = "Playback kept buffering on this source."
+        presentTerminalLoadFailure()
+    }
+
+    private func recoverFromStall(localNNTPStarvation: Bool = false) {
+        guard !playbackExited, !isPaused, !playbackDeadlineClock.isPaused, !scrubbing,
+              pendingAdvance == nil, hasStartedPlaying, !loadFailed else { return }
         #if os(iOS) || os(macOS)
         if let avPlayer = coordinator.player as? AVPlayerEngineController {
             let expectedGeneration = avStallWatchdogItemGeneration ?? avPlayer.currentItemGeneration
@@ -5465,8 +5515,18 @@ struct PlayerScreen: View {
             curURL ?? url, headers: curHeaders, live: isLive,
             reusing: recoveryToken, resumeOrigin: resume, preservingAbandonedResume: true
         )
+        if issuedToken == nil, localNNTPStarvation {
+            // A refused local retry must not leave a cleared first-frame flag and an ownerless spinner.
+            if !hopToNextSource(reason: "local NNTP retry rejected", resumeOverride: resume) {
+                loadErrorMsg = "Playback could not recover this source."
+                presentTerminalLoadFailure()
+            } else if resume > 0, resume <= 5 {
+                nudgeResume(to: resume)
+            }
+            return
+        }
         if issuedToken != nil { startLoadTimeout() }
-        if issuedToken != nil, resume > 5 {
+        if issuedToken != nil, resume > 5 || (localNNTPStarvation && resume > 0) {
             nudgeResume(to: resume)
         }
     }
@@ -6222,6 +6282,7 @@ struct PlayerScreen: View {
         bufferedTime = 0
         stallRecoveries = 0
         stallStableProgressTicks = 0
+        localNNTPStallRecovery = .init()
         if userInitiated {
             sourceHops = 0; exhaustedURLs = []
             recoveryDeadline?.cancel(); recoveryDeadline = nil
@@ -6263,6 +6324,7 @@ struct PlayerScreen: View {
         lastReported = -1
         stallRecoveries = 0
         stallStableProgressTicks = 0
+        localNNTPStallRecovery = .init()
     }
 
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current

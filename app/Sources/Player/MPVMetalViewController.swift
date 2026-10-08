@@ -1697,7 +1697,6 @@ final class MPVMetalViewController: PlatformViewController {
         // userinfo and query string, which must not land in the device's persistent unified log.
         let redactedURL = "\(playURL.scheme ?? "?")://\(playURL.host ?? "?")\(playURL.path)"
         mpvLog.log("loadFile → \(redactedURL, privacy: .public)\(sidecar != nil ? " (+audio sidecar)" : "", privacy: .public)")
-        #if os(tvOS)
         // Apply before load admission so the first frame cannot outrun the NNTP cushion. A rejected
         // replacement restores the prior profile, including an outstanding manual-seek hold.
         let priorCachePauseInitial = getString("cache-pause-initial") ?? "no"
@@ -1705,7 +1704,6 @@ final class MPVMetalViewController: PlatformViewController {
         let nextCachePauseWait = LocalNNTPBufferPolicy.waitSeconds(url: playURL, live: live, preview: startMuted)
         setString("cache-pause-initial", nextCachePauseWait > 1 ? "yes" : "no")
         setString("cache-pause-wait", String(nextCachePauseWait))
-        #endif
         // `loadfile replace` mutates the playlist synchronously, while actual loading begins later. Hold the
         // same lock START_FILE takes and consume the immutable entry id returned by this exact command before
         // a racing event can bind. Reading playlist/0 afterward is racy because redirects and START_FILE may
@@ -1783,21 +1781,21 @@ final class MPVMetalViewController: PlatformViewController {
             // Restore the back-buffer for the accepted new file. A prior memory shed may have reduced it to
             // 8MiB; live keeps configureLiveMode's own tight value.
             if !live { setString("demuxer-max-back-bytes", defaultBackBufferCap) }
+            // The startup/rebuffer profile applies on macOS and iOS too. Memory caps above remain
+            // device-specific; this changes only when mpv releases its automatic cache pause.
+            cachePauseWaitSeconds = nextCachePauseWait
             #if os(tvOS)
             // A seek cache hold with no pausedForCache release edge must not hold THIS accepted file's start.
-            cachePauseWaitSeconds = nextCachePauseWait
             releaseSeekCacheHoldIfArmed()
+            #endif
             if nextCachePauseWait > 1 {
                 DiagnosticsLog.log("player", "local NNTP startup/rebuffer cushion=\(Int(nextCachePauseWait))s; memory cap unchanged")
             }
-            #endif
         } else {
             // Rejected replace: preserve the previous source's cache budget. The request already
             // canceled maintenance and restored its temporary option before attempting replacement.
-            #if os(tvOS)
             setString("cache-pause-initial", priorCachePauseInitial)
             setString("cache-pause-wait", priorCachePauseWait)
-            #endif
         }
         return issuedToken
     }
@@ -3157,18 +3155,36 @@ final class MPVMetalViewController: PlatformViewController {
         })
     }
 
+    /// A local NNTP load assembles articles on this device, unlike an already-served HTTP file.
+    /// Let mpv prebuffer/rebuffer a cushion automatically without changing the viewer's pause property.
+    /// mpv releases early at EOF or its byte cap, so short/high-bitrate inputs cannot wait for an
+    /// impossible duration. Every accepted source replacement resets this profile.
+    private var cachePauseWaitSeconds = 1.0
+
+    /// The local-starvation watchdog samples raw decoder state, never the chrome's resume floor.
+    /// Seek generation also catches a complete backward/forward seek between watchdog polls.
+    func localNNTPPlaybackSample(owner: PlayerLoadToken) -> LocalNNTPPlaybackSample? {
+        guard let handle = mpv else { return nil }
+        loadTokenLock.lock()
+        defer { loadTokenLock.unlock() }
+        guard loadProvenance.callbackToken(requiresLoadedFile: true) == owner else { return nil }
+        let settled = seekSettlement.evidence(
+            owner: owner, seeking: diagnosticFlag("seeking", handle: handle),
+            eofReached: diagnosticFlag("eof-reached", handle: handle))
+        return LocalNNTPPlaybackSample(
+            position: diagnosticDouble(MPVProperty.timePos, handle: handle),
+            cachedAhead: diagnosticDouble("demuxer-cache-duration", handle: handle),
+            pausedForCache: diagnosticFlag("paused-for-cache", handle: handle),
+            playbackRequested: !requestedPauseIntent,
+            seekSettled: settled.settled, seekGeneration: settled.generation)
+    }
+
     #if os(tvOS)
     /// True while the one-shot post-seek cache hold is armed for an in-flight cache-emptying seek
     /// (a scrub commit, or the demuxer refresh-seek an audio/subtitle track change triggers).
     /// Main-thread only: armed from the UI's seek/track calls, released via a main hop from the
     /// event drain (mirroring pausedStateChanged).
     private var seekCacheHoldArmed = false
-
-    /// A local NNTP load assembles articles on this device, unlike an already-served HTTP file.
-    /// Let mpv prebuffer/rebuffer a cushion automatically without changing the viewer's pause property.
-    /// mpv releases early at EOF or its byte cap, so short/high-bitrate inputs cannot wait for an
-    /// impossible duration. Every accepted source replacement resets this profile.
-    private var cachePauseWaitSeconds = 1.0
 
     /// Bounded, progress-aware watchdog for the OUT-OF-WINDOW scrub refill. An out-of-window jump empties the
     /// forward cache and then refills from a cold mid-file range read; on some sources (slow debrid CDN edges)
