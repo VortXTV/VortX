@@ -56,10 +56,20 @@ internal class NativeAccountCoordinator(
         val scope = VortxAccountScope(namespace, owner.id)
         val remote = document.optJSONObject("nativeSync")
         if (document.has("nativeSync")) requireNotNull(remote) { "Invalid native sync document" }
-        if (remote != null) require(remote.getString("scope") == namespace && remote.getString("ownerProfileId") == owner.id)
-        val syncAction = if (remote != null) JSONObject().put("type", "merge_native_sync").put("document", remote)
-            else JSONObject().put("type", "import_legacy_sync").put("scope", namespace).put("ownerProfileId", owner.id)
-                .put("material", nativeLegacyMaterial(document, roster, resolved.modifiedSeconds))
+        if (remote != null) {
+            require(remote.getString("scope") == namespace && remote.getString("ownerProfileId") == owner.id)
+            requireNotNull(remote.optJSONObject("legacyImport")) { "Native account requires a verified legacy baseline receipt" }
+        }
+        // Always project the CURRENT authenticated legacy carrier, even when nativeSync/checkpoint
+        // exists. Receipt replay is a no-op after native edits, but differing old-client/website
+        // material is rejected by the kernel before this transaction commits or publishes anything.
+        val material = nativeLegacyMaterial(document, roster, resolved.modifiedSeconds)
+        // Full descriptors may contain encoded custom strings. Retain exact typed input only if it
+        // is credential-free; sanitizing it would silently change the shared kernel's receipt input.
+        NativeHostDocument.requireCredentialFree(material)
+        val replay = JSONObject().put("type", "import_legacy_sync").put("scope", namespace).put("ownerProfileId", owner.id)
+            .put("material", material)
+        val syncActions = listOfNotNull(remote?.let { JSONObject().put("type", "merge_native_sync").put("document", it) }, replay)
         val archive = NativeHostDocument.archive(document)
         val old = mounted.get()
         if (old != null && old.account == account && old.session.scope == scope) {
@@ -68,9 +78,10 @@ internal class NativeAccountCoordinator(
             val nextHost = if ((resolved.modifiedSeconds ?: 0.0) > host.optDouble("modifiedSeconds", 0.0)) {
                 NativeHostProfiles.fromDocument(archive.getJSONObject("document"), roster, resolved.modifiedSeconds)
             } else host
-            old.session.dispatch(listOf(syncAction), read.owner, nextHost, notifyMutation = false, hostArchive = archive)
+            old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive)
             check(isCurrent()) { "Native account changed" }
             project(old.session)
+            check(isCurrent() && accountCurrent(account) && mounted.get() === old) { "Native account changed" }
             return@withLock true
         }
         retire()
@@ -79,15 +90,18 @@ internal class NativeAccountCoordinator(
         while (true) { val prior = retired.poll() ?: break; prior.close() }
         val resources = transport()
         val hostProfiles = NativeHostProfiles.fromDocument(archive.getJSONObject("document"), roster, resolved.modifiedSeconds)
-        val bootstrap = listOf(syncAction)
         val candidate = try { VortxNativeSession.open(scope, owner.name, bindings, checkpoints, resources,
-            bootstrapActions = bootstrap, initialHostProfiles = hostProfiles, initialHostArchive = archive, onMutation = onMutation) { accountCurrent(account) } }
+            bootstrapActions = syncActions, initialHostProfiles = hostProfiles, initialHostArchive = archive, onMutation = onMutation) { accountCurrent(account) } }
             catch (error: Throwable) { (resources as? AutoCloseable)?.close(); throw error }
         val next = Mounted(account, candidate)
         if (!isCurrent() || !accountCurrent(account) || !mounted.compareAndSet(null, next)) {
             candidate.close(); error("Native account changed")
         }
-        try { project(candidate); changes.value += 1; true }
+        try {
+            project(candidate)
+            check(isCurrent() && accountCurrent(account) && mounted.get() === next) { "Native account changed" }
+            changes.value += 1; true
+        }
         catch (error: Throwable) { if (mounted.compareAndSet(next, null)) candidate.close(); throw error }
     }
 
@@ -98,7 +112,8 @@ internal class NativeAccountCoordinator(
             // Active selection is device-local and intentionally absent from this carrier.
             val profiles = NativeProfileAccess.projection(read).profiles
             val host = read.state.getJSONObject("hostProfilePreferences")
-            NativeAccountExport(read.state.getJSONObject("nativeSync"), profiles, host.optDouble("modifiedSeconds", 0.0), NativeHostProfiles.roster(host, profiles))
+            NativeAccountExport(read.state.getJSONObject("nativeSync"), profiles, host.optDouble("modifiedSeconds", 0.0), NativeHostProfiles.roster(host, profiles),
+                read.state.getBoolean("hostProfileSyncPending"))
         }
     }
 }

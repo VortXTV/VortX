@@ -12,6 +12,12 @@ from the authenticated full roster (not the lossy dashboard summary or global
 ProfileStore). Existing checkpoints reopen; a first import uses the shared
 `import_legacy_sync` reducer and its durable, idempotent receipt. A changed legacy
 carrier after import requires explicit reconciliation, not an automatic overwrite.
+Every authenticated route, including existing checkpoints and native carriers,
+reprojects the current legacy material and replays its receipt in the same atomic
+transaction as native merge. Pending/malformed website `profileEdits` and missing
+native-carrier import receipts fail closed before checkpoint publication. Unchanged
+legacy material remains a no-op after native edits; differing material never silently
+mounts an older native state. The exact account/mount is checked again after UI projection.
 404, malformed success, network/key/decrypt failure and missing full rosters never
 create a blank account. New-account/no-backup provisioning remains a separate gate.
 Logout/account replacement retires the writer and clears native profile/UI state;
@@ -36,10 +42,27 @@ into the kernel or exported as `nativeSync`. Credential-shaped unknown fields an
 uninspectable settings fail closed. The original credential-bearing account
 document remains encrypted in the existing cloud carrier and is only held
 transiently for authenticated merge; keys stay in their existing secure stores.
-Native sync derives from a freshly authenticated full cloud document, merges only
-the native carrier and full roster/settings fields it owns, preserves unknown and
-credential-store fields, and uses the existing encrypted optimistic-concurrency
-push. Active profile selection is never exported in `nativeSync`.
+Recognizable encoded and quoted JSON/plist/backup carriers are inspected recursively.
+Older checkpoints' adjacent host fields are checked before hydration; detected
+credentials or malformed encoded carriers reject the original file without rewriting
+it. Fresh typed import material is checked without sanitizing or changing its receipt.
+Native sync derives from a freshly authenticated full cloud document and replaces
+only `nativeSync`, preserving the original legacy roster/settings/library/watch
+baseline and all unknown/credential fields. Rewriting that baseline from native
+projections would invalidate the import receipt on the next pull. Outbound host-only
+profile preferences, global settings and credential changes need a versioned
+reconciliation contract; pending dirty global settings or changed host credentials
+block push rather than reporting an upload or clearing unapplied intent. Existing
+host credential/global-settings restoration on pull is retained. Native profile,
+library and watch changes still synchronize through the native carrier using the
+existing encrypted optimistic-concurrency push. Active profile selection is never
+exported in `nativeSync`.
+Host-only profile preferences (including avatar, playback and discovery settings)
+are accepted locally and retained in the encrypted checkpoint. Such edits set durable
+`hostProfileSyncPending` intent and block native push until explicit outbound
+reconciliation exists; sync cannot report those changes uploaded or clear that intent.
+The flag survives cold reopen/remote merge and is never sent to the kernel or cloud.
+Native-owned name/PIN/parental/theme fields remain pushable through `nativeSync`.
 
 Checkpoints live in Android's `noBackupFilesDir/native-state`. Android Keystore
 holds a non-exportable AES-256 key per scope. The sealed payload is
@@ -87,6 +110,7 @@ cannot overwrite the kernel's exact resume offset or explicit reset-to-zero.
 Still unsupported, exposed as errors rather than success/no-op: Stremio login,
 unresolved own-Stremio-account migration, ambiguous or incomplete legacy carriers,
 new-account/no-backup provisioning, continuous old-client reconciliation,
+outbound global-settings/credential reconciliation,
 whole-series/season bulk watched mutation, add-on URL replacement and parental
 resource filtering. The existing profile UI verifies projected salted PINs before
 selection; stale projected profiles are rejected. Direct repository PIN switching
@@ -109,6 +133,9 @@ reopen, reject a foreign account document and render repository resource fixture
 The additional JNI lifecycle fixture imports an authenticated historical-owner
 backup, performs profile CRUD, preserves full adjacent preferences, reopens the
 encrypted checkpoint and rejects changed legacy material and stale account epochs.
+Native-carrier regressions cover pending website edits, changed legacy roster/library
+input and missing receipts across warm, cold and first adoption; unchanged native-native
+updates pass. Delayed projection tests reject retirement before install reports success.
 Resource bytes in that test are local fixtures; the test does not prove live
 provider behavior. The host ABI test creates/frees a resource host without loading
 network resources.

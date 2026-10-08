@@ -54,6 +54,7 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
                 else host.getJSONObject(key)
             }
         }
+        if (state.has("hostProfileSyncPending")) require(state.get("hostProfileSyncPending") is Boolean)
         if (state.has("legacyImportMaterial")) {
             val material = state.getJSONObject("legacyImportMaterial")
             require(material.getInt("schemaVersion") == 1)
@@ -167,6 +168,7 @@ internal class VortxNativeSession private constructor(
     private var runtime: VortxNativeRuntime,
     private val isAccountCurrent: () -> Boolean,
     private var hostProfilePreferences: JSONObject,
+    private var hostProfileSyncPending: Boolean,
     private var legacyImportMaterial: JSONObject?,
     private var hostDocumentArchive: JSONObject?,
     private val onMutation: () -> Unit,
@@ -192,9 +194,16 @@ internal class VortxNativeSession private constructor(
             bootstrapActions.forEach(scope::rejectCredentials)
             val stored = store.read(scope)
             val runtime = if (stored != null) {
-                scope.validateSnapshot(stored)
+                val retained = scope.validateSnapshot(stored)
+                // Earlier experimental checkpoints may contain encoded credentials in adjacent
+                // carriers. Inspect BEFORE hydrate; rejection leaves the original encrypted file
+                // untouched. Newer stored prefs must not bypass sanitized incoming preferences.
+                for (field in listOf("hostProfilePreferences", "legacyImportMaterial", "hostDocument")) {
+                    retained.optJSONObject(field)?.let(NativeHostDocument::requireCredentialFree)
+                }
                 val core = JSONObject(stored).also {
                     it.remove("hostProfilePreferences"); it.remove("legacyImportMaterial")
+                    it.remove("hostProfileSyncPending")
                     it.remove("hostDocument"); it.remove("excludedCredentialPaths")
                 }
                 VortxNativeRuntime.hydrate(bindings, core.toString())
@@ -210,23 +219,26 @@ internal class VortxNativeSession private constructor(
                 for (action in bootstrapActions) {
                     check(JSONObject(runtime.dispatch(action.toString())).getBoolean("ok")) { "Native account bootstrap rejected" }
                 }
-                val storedProfiles = stored?.let(::JSONObject)?.optJSONObject("hostProfilePreferences")
+                val old = stored?.let(::JSONObject)
+                val storedProfiles = old?.optJSONObject("hostProfilePreferences")
                 val hostProfiles = if (storedProfiles == null || initialHostProfiles.optDouble("modifiedSeconds", 0.0) > storedProfiles.optDouble("modifiedSeconds", 0.0))
                     initialHostProfiles else storedProfiles
+                val hostPending = old?.optBoolean("hostProfileSyncPending", false) == true ||
+                    (old != null && !old.has("hostProfileSyncPending") && storedProfiles != null && hostProfiles === storedProfiles &&
+                        initialHostProfiles.length() > 0 && NativeHostProfiles.hasUnexportedChanges(initialHostProfiles, storedProfiles))
                 // Preserve exact typed source clocks beside the receipt, never the credential-bearing cloud document.
-                val legacyMaterial = stored?.let(::JSONObject)?.optJSONObject("legacyImportMaterial")
+                val legacyMaterial = old?.optJSONObject("legacyImportMaterial")
                     ?: bootstrapActions.firstOrNull { it.getString("type") == "import_legacy_sync" }?.getJSONObject("material")
-                val old = stored?.let(::JSONObject)
                 val archive = initialHostArchive ?: old?.optJSONObject("hostDocument")?.let {
                     JSONObject().put("document", it).put("excludedCredentialPaths", old.getJSONArray("excludedCredentialPaths"))
                 }
-                val snapshot = JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfiles).put("legacyImportMaterial", legacyMaterial)
+                val snapshot = JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfiles).put("hostProfileSyncPending", hostPending).put("legacyImportMaterial", legacyMaterial)
                     .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths")).toString()
                 scope.validateSnapshot(snapshot)
                 store.commit(scope, snapshot)
                 check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
                 check(isAccountCurrent()) { "Native account changed" }
-                return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent, JSONObject(hostProfiles.toString()),
+                return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent, JSONObject(hostProfiles.toString()), hostPending,
                     legacyMaterial?.let { JSONObject(it.toString()) }, archive?.let { JSONObject(it.toString()) }, onMutation)
             } catch (error: Throwable) { runtime.close(); throw error }
         }
@@ -236,6 +248,7 @@ internal class VortxNativeSession private constructor(
         check(!closed) { "Native session closed" }
         check(isAccountCurrent()) { "Native account changed" }
         val state = scope.validateSnapshot(JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfilePreferences)
+            .put("hostProfileSyncPending", hostProfileSyncPending)
             .put("legacyImportMaterial", legacyImportMaterial).put("hostDocument", hostDocumentArchive?.getJSONObject("document"))
             .put("excludedCredentialPaths", hostDocumentArchive?.getJSONArray("excludedCredentialPaths")).toString())
         return VortxNativeRead(VortxNativeOwner(scope, state.getString("activeProfileId"), revision), state)
@@ -261,9 +274,11 @@ internal class VortxNativeSession private constructor(
                 candidate.dispatch(action.toString()).also { check(JSONObject(it).getBoolean("ok")) { "Native action rejected" } }
             }
             val preferences = hostProfiles ?: hostProfilePreferences
+            val pendingPreferences = hostProfileSyncPending ||
+                (notifyMutation && hostProfiles != null && NativeHostProfiles.hasUnexportedChanges(hostProfilePreferences, hostProfiles))
             val retained = legacyImportMaterial ?: actions.firstOrNull { it.getString("type") == "import_legacy_sync" }?.getJSONObject("material")
             val archive = hostArchive ?: hostDocumentArchive
-            val updated = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("legacyImportMaterial", retained)
+            val updated = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("hostProfileSyncPending", pendingPreferences).put("legacyImportMaterial", retained)
                 .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths")).toString()
             val state = scope.validateSnapshot(updated)
             store.commit(scope, updated)
@@ -275,6 +290,7 @@ internal class VortxNativeSession private constructor(
             val hostChanged = preferences.toString() != hostProfilePreferences.toString()
             val previous = runtime; runtime = candidate; installed = true; previous.close()
             hostProfilePreferences = JSONObject(preferences.toString())
+            hostProfileSyncPending = pendingPreferences
             legacyImportMaterial = retained?.let { JSONObject(it.toString()) }
             hostDocumentArchive = archive?.let { JSONObject(it.toString()) }
             // Any profile/registry mutation invalidates in-flight resources. Progress does not.

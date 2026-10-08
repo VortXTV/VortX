@@ -1882,30 +1882,29 @@ class VortXSyncManager(context: Context) {
 
     private suspend fun nativeSyncUp(lease: SyncSessionLease): Boolean {
         val gateway = nativeGateway ?: return false
-        val pushedStamps = readDirtySettings()
+        // Host-only outbound changes need a versioned reconciliation contract. Never report their
+        // dirty settings as uploaded while preserving the legacy receipt baseline unchanged.
+        if (readDirtySettings().isNotEmpty()) return false
         suspend fun derived(): JSONObject? {
             // A missing or failed cloud document is not authority to seed an account.
             val pull = pullSyncDocResult(lease) as? SyncDocPull.Doc ?: return null
             val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
             if (!gateway.applyDocument(account, pull.doc) { isSyncLeaseCurrent(lease) }) return null
             val exported = gateway.exportDocument(account) ?: return null
+            if (exported.hostProfileSyncPending) return null
             if (!isSyncLeaseCurrent(lease)) return null
-            // Preserve every adjacent encrypted legacy/settings field, including unknown keys.
+            // Preserve the exact legacy baseline. Rewriting the projected roster/settings here
+            // changes the one-time import fingerprint and poisons our own next pull. Native profile,
+            // library and watch edits travel only in nativeSync until explicit legacy reconciliation.
             val merged = JSONObject(pull.doc.toString())
             merged.put("nativeSync", exported.nativeSync)
-            val vortx = merged.optJSONObject("vortx") ?: JSONObject().also { merged.put("vortx", it) }
-            vortx.put("roster", exported.rawRoster)
-                .put("rosterModified", exported.rosterModifiedSeconds)
-            val settings = SettingsBackup.settingsBlobFor(merged.opt("settings"), exported.roster,
-                exported.rosterModifiedSeconds, settingsBundleId, deviceSettings = SettingsBackup.plistSettingsFrom(settingsPrefs.all),
-                rawRosterJson = exported.rawRoster.toString()) ?: return null
-            merged.put("settings", settings)
-            if (!publishIfSyncLeaseCurrent(lease) { mergeDebridKeysIntoDoc(merged); mergeMetadataKeysIntoDoc(merged) }) return null
+            val hostCandidate = JSONObject(pull.doc.toString())
+            if (!publishIfSyncLeaseCurrent(lease) { mergeDebridKeysIntoDoc(hostCandidate); mergeMetadataKeysIntoDoc(hostCandidate) }) return null
+            if (hostCandidate.opt("apiKeys")?.toString() != pull.doc.opt("apiKeys")?.toString()) return null
             return merged
         }
         val first = derived() ?: return false
         val pushed = pushDerivedDoc(lease, first) { derived() } && isSyncLeaseCurrent(lease)
-        if (pushed) publishIfSyncLeaseCurrent(lease) { clearPushedDirtySettings(pushedStamps) }
         return pushed
     }
 

@@ -5,7 +5,7 @@ import com.vortx.android.profile.UserProfile
 import org.json.JSONArray
 
 internal data class NativeAccountExport(val nativeSync: JSONObject, val roster: List<UserProfile>, val rosterModifiedSeconds: Double,
-    val rawRoster: JSONArray = JSONArray(roster.map { it.encode() }))
+    val rawRoster: JSONArray = JSONArray(roster.map { it.encode() }), val hostProfileSyncPending: Boolean = false)
 
 /** Only called with a successfully authenticated/decrypted document under a captured session lease.
  * Credentials and the account data key never cross this boundary. */

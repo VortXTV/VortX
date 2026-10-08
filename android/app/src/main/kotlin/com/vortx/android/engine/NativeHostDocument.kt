@@ -19,9 +19,16 @@ import java.util.Date
 internal object NativeHostDocument {
     fun archive(document: JSONObject): JSONObject = Sanitizer().archive(document)
 
+    /** Validation only: never silently sanitize retained import input or rewrite an old checkpoint. */
+    fun requireCredentialFree(document: JSONObject) {
+        requireArchive(archive(document).getJSONArray("excludedCredentialPaths").length() == 0,
+            "Credential-bearing retained native host material requires reconciliation")
+    }
+
     private class Sanitizer {
         private val excluded = sortedSetOf<String>()
         private var nodes = 0
+        private var inspectedBytes = 0L
 
         fun archive(document: JSONObject): JSONObject = JSONObject()
             .put("document", json(document, "", 0, root = true))
@@ -50,15 +57,8 @@ internal object NativeHostDocument {
             budget(depth)
             return when (value) {
                 null, JSONObject.NULL -> JSONObject.NULL
-                is JSONObject -> JSONObject().also { result ->
-                    for (key in value.keys().asSequence().toList().sorted()) {
-                        val childPath = pointer(path, key)
-                        if (excluded(key, childPath)) continue
-                        val child = value.get(key)
-                        result.put(key, if (root && key == "settings" && child != JSONObject.NULL)
-                            settings(child, childPath, depth + 1) else json(child, childPath, depth + 1))
-                    }
-                }
+                is JSONObject -> if (recognizableBackup(value)) backupEnvelope(value, path, depth + 1)
+                    else jsonObject(value, path, depth, root)
                 is JSONArray -> JSONArray().also { result ->
                     for (index in 0 until value.length()) result.put(json(value.get(index), pointer(path, index.toString()), depth + 1))
                 }
@@ -69,6 +69,17 @@ internal object NativeHostDocument {
             }
         }
 
+        private fun jsonObject(value: JSONObject, path: String, depth: Int, root: Boolean = false, skip: Set<String> = emptySet()): JSONObject = JSONObject().also { result ->
+            for (key in value.keys().asSequence().toList().sorted()) {
+                if (key in skip) continue
+                val childPath = pointer(path, key)
+                if (excluded(key, childPath)) continue
+                val child = value.get(key)
+                result.put(key, if (root && key == "settings" && child != JSONObject.NULL)
+                    settings(child, childPath, depth + 1) else json(child, childPath, depth + 1))
+            }
+        }
+
         private fun settings(value: Any, path: String, depth: Int): String {
             budget(depth)
             val priorExclusions = excluded.size
@@ -76,11 +87,19 @@ internal object NativeHostDocument {
             val envelopeBytes = decodeBase64(encoded)
             val envelope = parseJson(strictUtf8(envelopeBytes)) as? JSONObject
                 ?: reject("Settings envelope is not an object")
+            val clean = backupEnvelope(envelope, path, depth + 1)
+            if (excluded.size == priorExclusions) return encoded
+            return Base64.getEncoder().encodeToString(clean.toString().toByteArray(Charsets.UTF_8))
+        }
+
+        private fun backupEnvelope(envelope: JSONObject, path: String, depth: Int): JSONObject {
+            budget(depth)
+            val priorExclusions = excluded.size
             requireArchive(envelope.opt("schema") is Number && envelope.getDouble("schema") == 1.0,
                 "Unsupported settings schema")
             // This validates the shipping envelope. Its RETURN VALUE is deliberately not used:
             // decodeDomain filters device-local NONsecret settings, which this archive must preserve.
-            requireArchive(SettingsBackup.decodeDomain(envelopeBytes) != null, "Settings backup cannot be inspected losslessly")
+            requireArchive(SettingsBackup.decodeDomain(envelope.toString().toByteArray(Charsets.UTF_8)) != null, "Settings backup cannot be inspected losslessly")
             val payload = envelope.opt("payloadBase64") as? String ?: reject("Missing settings payload")
             val rawDomain = BinaryPlist.decode(decodeBase64(payload)) as? Map<*, *>
                 ?: reject("Settings payload is not a representable property-list dictionary")
@@ -92,11 +111,13 @@ internal object NativeHostDocument {
             val generatedEnvelope = parseJson(strictUtf8(generated)) as JSONObject
             // Preserve every original noncredential envelope header, including unknown headers and the
             // exact createdAt spelling. Only the redacted payload and its truthful keyCount change.
-            val cleanEnvelope = json(envelope, path, depth + 1) as JSONObject
+            // Inspect the payload exactly once. Feeding this recognized envelope back through json()
+            // would recurse into itself; ordinary headers still receive the full recursive inspection.
+            val cleanEnvelope = jsonObject(envelope, path, depth + 1, skip = setOf("payloadBase64"))
+            if (excluded.size == priorExclusions) return JSONObject(envelope.toString())
             cleanEnvelope.put("payloadBase64", generatedEnvelope.getString("payloadBase64"))
             cleanEnvelope.put("keyCount", stringDomain.size)
-            if (excluded.size == priorExclusions) return encoded
-            return Base64.getEncoder().encodeToString(cleanEnvelope.toString().toByteArray(Charsets.UTF_8))
+            return cleanEnvelope
         }
 
         private fun plist(value: Any, path: String, depth: Int): Any {
@@ -128,24 +149,66 @@ internal object NativeHostDocument {
             // Both settings and unknown document fields may carry nested JSON as STRING, including
             // strings inside JSON Data. Recurse while preserving the carrier, not just the first level.
             val trimmed = value.trimStart()
-            if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return value
+            if (trimmed.startsWith('{') || trimmed.startsWith('[') || trimmed.startsWith('"')) {
+                val priorExclusions = excluded.size
+                val sanitized = json(parseJson(value), path, depth + 1)
+                val clean = if (sanitized is String) JSONObject.quote(sanitized) else sanitized.toString()
+                return if (excluded.size == priorExclusions) value else clean
+            }
+            return encodedStructure(value, path, depth + 1) ?: value
+        }
+
+        /** Only recognizable structured base64 is a carrier; opaque ordinary strings remain exact. */
+        private fun encodedStructure(value: String, path: String, depth: Int): String? {
+            budget(depth)
+            val candidate = value.filterNot { it in " \t\r\n" }
+            if (candidate.isEmpty()) return null
+            requireArchive(candidate.length <= 44 * 1024 * 1024, "Encoded host document exceeds inspection limits")
+            val urlSafe = candidate.any { it == '-' || it == '_' }
+            val decoder = if (urlSafe) Base64.getUrlDecoder() else Base64.getDecoder()
+            val decoded = runCatching { decoder.decode(candidate) }.getOrElse {
+                // An invalid suffix must not turn a recognizable encoded JSON/plist into an opaque
+                // pass-through. Inspect the valid complete-quantum prefix before deciding it is plain.
+                val prefix = candidate.takeWhile { it.isLetterOrDigit() && it.code < 128 || it in "+/-_" }
+                val decodable = if (prefix.length % 4 == 1) prefix.dropLast(1) else prefix
+                val prefixBytes = runCatching { decoder.decode(decodable) }.getOrNull()
+                requireArchive(prefixBytes == null || !recognizableBytes(prefixBytes), "Malformed recognizable base64 structure")
+                return null
+            }
+            inspectedBytes += decoded.size
+            requireArchive(inspectedBytes <= 32L * 1024 * 1024, "Encoded host document exceeds inspection limits")
             val priorExclusions = excluded.size
-            val clean = json(parseJson(value), path, depth + 1).toString()
-            return if (excluded.size == priorExclusions) value else clean
+            val clean = if (recognizableBytes(decoded)) inspectData(decoded, path, depth + 1) else {
+                // A base64 layer can itself wrap another base64 string. Only accept that inference if
+                // recursive inspection actually recognizes a structured payload within the limits.
+                val nested = runCatching { strictUtf8(decoded) }.getOrNull() ?: return null
+                val inspected = encodedStructure(nested, path, depth + 1) ?: return null
+                inspected.toByteArray(Charsets.UTF_8)
+            }
+            if (excluded.size == priorExclusions) return value
+            var encoder = if (urlSafe) Base64.getUrlEncoder() else Base64.getEncoder()
+            if (!candidate.endsWith('=')) encoder = encoder.withoutPadding()
+            return encoder.encodeToString(clean)
         }
 
         private fun inspectData(bytes: ByteArray, path: String, depth: Int): ByteArray {
             budget(depth)
             val priorExclusions = excluded.size
             if (bytes.isEmpty()) return bytes.copyOf()
-            if (bytes.size >= 8 && bytes.copyOfRange(0, 8).contentEquals("bplist00".toByteArray(Charsets.US_ASCII))) {
+            if (bytes.size >= 6 && bytes.copyOfRange(0, 6).contentEquals("bplist".toByteArray(Charsets.US_ASCII))) {
                 val decoded = BinaryPlist.decode(bytes) ?: reject("Nested property-list data cannot be inspected")
                 val clean = BinaryPlist.encode(plist(decoded, path, depth + 1)) ?: reject("Nested property-list data cannot be preserved")
                 return if (excluded.size == priorExclusions) bytes.copyOf() else clean
             }
-            val decoded = parseJson(strictUtf8(bytes))
-            requireArchive(decoded is JSONObject || decoded is JSONArray, "Opaque settings data requires reconciliation")
-            val clean = json(decoded, path, depth + 1).toString().toByteArray(Charsets.UTF_8)
+            val text = strictUtf8(bytes)
+            if (!text.trimStart().startsWith('{') && !text.trimStart().startsWith('[') && !text.trimStart().startsWith('"')) {
+                val clean = encodedStructure(text, path, depth + 1) ?: reject("Opaque settings data requires reconciliation")
+                return if (excluded.size == priorExclusions) bytes.copyOf() else clean.toByteArray(Charsets.UTF_8)
+            }
+            val decoded = parseJson(text)
+            requireArchive(decoded is JSONObject || decoded is JSONArray || decoded is String, "Opaque settings data requires reconciliation")
+            val sanitized = json(decoded, path, depth + 1)
+            val clean = (if (sanitized is String) JSONObject.quote(sanitized) else sanitized.toString()).toByteArray(Charsets.UTF_8)
             return if (excluded.size == priorExclusions) bytes.copyOf() else clean
         }
     }
@@ -153,6 +216,14 @@ internal object NativeHostDocument {
     private val credentialKeys = setOf("auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
         "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials")
     private val suspiciousSuffixes = listOf("token", "password", "authkey", "apikey")
+
+    private fun recognizableBackup(value: JSONObject): Boolean = value.opt("format") == SettingsBackup.FORMAT_TAG ||
+        value.has("payloadBase64") && (value.has("bundleID") || value.has("keyCount"))
+    private fun recognizableBytes(bytes: ByteArray): Boolean {
+        if (bytes.size >= 6 && bytes.copyOfRange(0, 6).contentEquals("bplist".toByteArray(Charsets.US_ASCII))) return true
+        val first = bytes.firstOrNull { it.toInt() !in listOf(9, 10, 13, 32) }?.toInt()
+        return first == '{'.code || first == '['.code || first == '"'.code
+    }
 
     private fun pointer(path: String, key: String): String = path + "/" + key.replace("~", "~0").replace("/", "~1")
     private fun decodeBase64(value: String): ByteArray = runCatching { Base64.getDecoder().decode(value) }

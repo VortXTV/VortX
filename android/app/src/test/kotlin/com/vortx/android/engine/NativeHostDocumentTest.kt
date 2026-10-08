@@ -94,7 +94,7 @@ class NativeHostDocumentTest {
     @Test fun `opaque corrupt and unsupported settings are explicit failures`() {
         failure(JSONObject().put("settings", "not base64!"), "base64")
         failure(JSONObject().put("settings", JSONObject()), "inspectable")
-        failure(JSONObject().put("settings", blob(mapOf("opaque" to byteArrayOf(1, 2, 3)))), "structured settings")
+        failure(JSONObject().put("settings", blob(mapOf("opaque" to byteArrayOf(1, 2, 3)))), "Opaque settings data")
         failure(JSONObject().put("settings", blob(mapOf("invalidUtf8" to byteArrayOf(0xc3.toByte(), 0x28)))), "UTF-8")
         failure(JSONObject().put("settings", blob(mapOf("safe" to "yes")) { it.put("schema", 99) }), "Unsupported settings schema")
     }
@@ -153,5 +153,105 @@ class NativeHostDocumentTest {
             "futureString" to structured, "kcfallback.account" to "hidden"))))
         val domain = rawDomain(redacted.getJSONObject("document").getString("settings"))
         assertArrayEquals(data, domain["futureData"] as ByteArray); assertEquals(structured, domain["futureString"])
+    }
+
+    @Test fun `base64 JSON and plist strings outside settings scrub known credentials recursively`() {
+        fun encoded(text: String) = Base64.getEncoder().encodeToString(text.toByteArray(Charsets.UTF_8))
+        val json = encoded(JSONObject().put("authKey", "hidden-json").put("safe", true).toString())
+        val plist = Base64.getEncoder().encodeToString(requireNotNull(BinaryPlist.encode(mapOf("password" to "hidden-plist", "when" to Date(0), "count" to 8L))))
+        val array = encoded(JSONArray().put(JSONObject().put("refreshToken", "hidden-array").put("key", "movie:tt123")).toString())
+        val result = NativeHostDocument.archive(JSONObject().put("futureJson", json).put("futurePlist", plist).put("futureArray", array))
+        val clean = result.getJSONObject("document")
+        assertTrue(envelope(clean.getString("futureJson")).getBoolean("safe")); assertFalse(envelope(clean.getString("futureJson")).has("authKey"))
+        val decodedPlist = BinaryPlist.decode(Base64.getDecoder().decode(clean.getString("futurePlist"))) as Map<*, *>
+        assertFalse(decodedPlist.containsKey("password")); assertEquals(Date(0), decodedPlist["when"]); assertEquals(8L, decodedPlist["count"])
+        val decodedArray = JSONArray(String(Base64.getDecoder().decode(clean.getString("futureArray")), Charsets.UTF_8))
+        assertFalse(decodedArray.getJSONObject(0).has("refreshToken")); assertEquals("movie:tt123", decodedArray.getJSONObject(0).getString("key"))
+        assertEquals(listOf("/futureArray/0/refreshToken", "/futureJson/authKey", "/futurePlist/password"), paths(result))
+    }
+
+    @Test fun `nested backup envelopes inspect plist payloads and preserve unknown headers in every carrier`() {
+        val backup = blob(mapOf("kcfallback.account" to "hidden", "stremiox.serverURL" to "http://127.0.0.1:11470", "future" to 9L)) {
+            it.put("futureHeader", JSONObject().put("stable", "yes"))
+        }
+        val source = JSONObject().put("objectCarrier", envelope(backup)).put("textCarrier", envelope(backup).toString())
+            .put("base64Carrier", backup)
+        val result = NativeHostDocument.archive(source).getJSONObject("document")
+        val carriers = listOf(result.getJSONObject("objectCarrier"), JSONObject(result.getString("textCarrier")), envelope(result.getString("base64Carrier")))
+        for (carrier in carriers) {
+            val domain = BinaryPlist.decode(Base64.getDecoder().decode(carrier.getString("payloadBase64"))) as Map<*, *>
+            assertFalse(domain.containsKey("kcfallback.account")); assertEquals(9L, domain["future"])
+            assertEquals("http://127.0.0.1:11470", domain["stremiox.serverURL"])
+            assertEquals("yes", carrier.getJSONObject("futureHeader").getString("stable")); assertEquals(2, carrier.getInt("keyCount"))
+        }
+        val archived = NativeHostDocument.archive(source)
+        assertEquals(listOf("/base64Carrier/payloadBase64/kcfallback.account", "/objectCarrier/payloadBase64/kcfallback.account",
+            "/textCarrier/payloadBase64/kcfallback.account"), paths(archived))
+    }
+
+    @Test fun `base64 structures recurse inside settings strings Data and encoded JSON string wrappers`() {
+        fun encoded(text: String) = Base64.getEncoder().encodeToString(text.toByteArray(Charsets.UTF_8))
+        val nested = JSONObject().put("accessToken", "hidden").put("value", "keep").toString()
+        val encodedJsonString = encoded(JSONObject.quote(nested))
+        val doubleEncoded = encoded(encoded(nested))
+        val source = JSONObject().put("quoted", encodedJsonString).put("double", doubleEncoded)
+            .put("settings", blob(mapOf("futureString" to encoded(nested), "futureData" to encoded(nested).toByteArray(Charsets.UTF_8))))
+        val result = NativeHostDocument.archive(source)
+        val clean = result.getJSONObject("document")
+        val decodedQuoted = org.json.JSONTokener(String(Base64.getDecoder().decode(clean.getString("quoted")), Charsets.UTF_8)).nextValue() as String
+        assertEquals("keep", JSONObject(decodedQuoted).getString("value")); assertFalse(JSONObject(decodedQuoted).has("accessToken"))
+        val decodedDouble = JSONObject(String(Base64.getDecoder().decode(Base64.getDecoder().decode(clean.getString("double"))), Charsets.UTF_8))
+        assertEquals("keep", decodedDouble.getString("value")); assertFalse(decodedDouble.has("accessToken"))
+        val domain = rawDomain(clean.getString("settings"))
+        assertFalse(envelope(domain["futureString"] as String).has("accessToken"))
+        assertFalse(envelope(String(domain["futureData"] as ByteArray, Charsets.UTF_8)).has("accessToken"))
+        assertEquals(listOf("/double/accessToken", "/quoted/accessToken", "/settings/payloadBase64/futureData/accessToken",
+            "/settings/payloadBase64/futureString/accessToken"), paths(result))
+    }
+
+    @Test fun `opaque ordinary strings URLs and unchanged base64 retain exact original bytes`() {
+        val safeJson = " { \"future\" : [1, 2, 3] } "
+        val encoded = Base64.getEncoder().withoutPadding().encodeToString(safeJson.toByteArray(Charsets.UTF_8))
+        val opaque = Base64.getEncoder().encodeToString(byteArrayOf(0xff.toByte(), 1, 2, 3))
+        val url = "https://example.com/Config%2FAbC/manifest.json?opaque=$encoded"
+        val source = JSONObject().put("safe", " \n$encoded\n ").put("opaque", opaque).put("text", "Ordinary viewing preference")
+            .put("url", url).put("futureBackup", blob(mapOf("safe" to safeJson)))
+        val result = NativeHostDocument.archive(source)
+        for (key in source.keys()) assertEquals(source.getString(key), result.getJSONObject("document").getString(key))
+        assertTrue(paths(result).isEmpty())
+        val direct = envelope(source.getString("futureBackup"))
+        val archivedDirect = NativeHostDocument.archive(JSONObject().put("direct", direct)).getJSONObject("document").getJSONObject("direct")
+        assertEquals(direct.getString("payloadBase64"), archivedDirect.getString("payloadBase64"))
+    }
+
+    @Test fun `malformed recognizable base64 JSON plist and nested backups fail closed`() {
+        fun encoded(text: String) = Base64.getEncoder().encodeToString(text.toByteArray(Charsets.UTF_8))
+        failure(JSONObject().put("future", encoded("{uninspectable")), "structured settings data")
+        failure(JSONObject().put("future", encoded("{\"safe\":true}") + "!"), "Malformed recognizable base64")
+        failure(JSONObject().put("future", "ey!"), "Malformed recognizable base64")
+        failure(JSONObject().put("future", encoded("bplist00malformed")), "property-list data cannot be inspected")
+        failure(JSONObject().put("future", blob(mapOf("safe" to true)) { it.put("schema", 999) }), "Unsupported settings schema")
+        failure(JSONObject().put("future", envelope(blob(mapOf("safe" to true))).put("payloadBase64", "invalid!")), "cannot be inspected losslessly")
+        failure(JSONObject().put("future", encoded("[\"unterminated")), "structured settings data")
+    }
+
+    @Test fun `recursive encoded and object carriers retain bounded inspection`() {
+        var nested = JSONObject().put("safe", "yes")
+        repeat(70) { nested = JSONObject().put("nested", nested) }
+        val encoded = Base64.getEncoder().encodeToString(nested.toString().toByteArray(Charsets.UTF_8))
+        failure(JSONObject().put("future", encoded), "inspection limits")
+    }
+
+    @Test fun `direct and double quoted JSON strings inspect recursively and retain string layers`() {
+        val payload = "{\"authKey\":\"quoted-secret\",\"safe\":true}"
+        val quoted = JSONObject.quote(payload)
+        val result = NativeHostDocument.archive(JSONObject().put("single", quoted).put("double", JSONObject.quote(quoted)))
+        val clean = result.getJSONObject("document")
+        fun unquote(value: String) = org.json.JSONTokener(value).nextValue() as String
+        assertTrue(JSONObject(unquote(clean.getString("single"))).getBoolean("safe"))
+        assertFalse(JSONObject(unquote(clean.getString("single"))).has("authKey"))
+        assertFalse(JSONObject(unquote(unquote(clean.getString("double")))).has("authKey"))
+        assertEquals(listOf("/double/authKey", "/single/authKey"), paths(result))
+        failure(JSONObject().put("future", "\"unterminated"), "structured settings data")
     }
 }

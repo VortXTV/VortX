@@ -38,6 +38,12 @@ private class LegacyMaterialAdapter(
     private val links = linkedMapOf<String, MutableList<List<String>>>()
 
     fun build(): JSONObject {
+        // Website patches have not been reconciled into the full legacy carrier. This check must
+        // run on every authenticated pull, including native-carrier and existing-checkpoint paths.
+        if (document.has("profileEdits") && !document.isNull("profileEdits")) {
+            val edits = document.optJSONObject("profileEdits")
+            requireMaterial(edits != null && edits.length() == 0, "Pending profile edits require reconciliation")
+        }
         requireMaterial(roster.isNotEmpty() && profiles.size == roster.size, "Duplicate or empty profile roster")
         roster.forEach {
             requireMaterial(runCatching { UUID.fromString(it.id).toString().equals(it.id, true) }.getOrDefault(false), "Invalid profile identity")

@@ -4,6 +4,9 @@ import java.io.File
 import java.nio.file.Files
 import javax.crypto.KeyGenerator
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineStart
 import com.vortx.android.model.MediaType
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.sync.SessionOwnerSnapshot
@@ -15,6 +18,10 @@ import org.junit.Test
 
 /** Explicit local host artifact only. Never launches an app, player, provider or network request. */
 class VortxNativeLiveJniTest {
+    private fun noNetwork() = object : VortxResourceTransport {
+        override fun makeCancellation(): VortxResourceCancellation = error("No resource request permitted")
+        override fun load(requestJson: String, cancellation: VortxResourceCancellation): String = error("No network permitted")
+    }
     private fun bindings() = object : VortxRuntimeBindings {
         override fun create(ownerId: String, ownerName: String) = VortxCore.nativeInitRuntime(JSONObject().put("ownerId", ownerId).put("ownerName", ownerName).toString())
         override fun hydrate(snapshot: String) = VortxCore.nativeInitFromStateJson(snapshot)
@@ -189,5 +196,116 @@ class VortxNativeLiveJniTest {
             assertTrue(runCatching { runtime.session() }.isFailure)
             assertNull(runtime.exportDocument(account))
         } finally { runtime.retire(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+
+    @Test fun `native carrier always validates current legacy material before warm cold or first adoption`() = runBlocking {
+        assumeTrue("Requires reviewed importer JNI", System.getenv("VORTX_JNI_SYNC") == "1")
+        load()
+        val directory = Files.createTempDirectory(File("build").toPath(), "native-receipt-jni-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val checkpoints = VortxEncryptedCheckpointStore(directory) { key }
+        val account = SessionOwnerSnapshot.Account("00000000-0000-0000-0000-000000000123", 4)
+        val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Baseline owner", avatar = "star", isOwner = true)
+        val doc = JSONObject().put("vortx", JSONObject().put("roster", JSONArray().put(owner.encode()))
+            .put("rosterModified", 123.5).put("library", JSONArray()).put("addons", JSONArray()))
+        val scope = VortxAccountScope("account.${account.id}", owner.id)
+        fun coordinator() = NativeAccountCoordinator(bindings(), checkpoints, { noNetwork() }, { it == account }, { it() }, {})
+        var runtime = coordinator()
+        try {
+            assertTrue(runtime.applyDocument(account, doc) { true })
+            val originalMaterial = runtime.session().read().state.getJSONObject("legacyImportMaterial").toString()
+            NativeProfileAccess { runtime.session() }.save(owner.copy(name = "Native name"), adding = false)
+            val remote = VortxNativeRuntime.hydrate(bindings(), runtime.session().read().state.toString())
+            val carrier = remote.use {
+                assertTrue(JSONObject(it.dispatch("""{"type":"add_library_item","profileId":"${owner.id}","item":{"kind":"standard","id":"native-only","type":"movie","name":"Native film"}}""")).getBoolean("ok"))
+                JSONObject(doc.toString()).put("nativeSync", JSONObject(it.stateJson()).getJSONObject("nativeSync"))
+            }
+            assertTrue(runtime.applyDocument(account, carrier) { true })
+            assertEquals("Native name", NativeProfileAccess { runtime.session() }.read().profiles.single().name)
+            assertEquals("native-only", NativeCatalogRepository { runtime.session() }.library().getOrThrow().items.single().id)
+            assertEquals(originalMaterial, runtime.session().read().state.getJSONObject("legacyImportMaterial").toString())
+            val rejected = listOf(
+                JSONObject(carrier.toString()).put("profileEdits", JSONObject().put(owner.id, JSONObject().put("name", "Pending web edit"))),
+                JSONObject(carrier.toString()).put("profileEdits", JSONArray()),
+                JSONObject(carrier.toString()).also { it.getJSONObject("vortx").getJSONArray("roster").getJSONObject(0).put("name", "Old client name") },
+                JSONObject(carrier.toString()).also { it.getJSONObject("vortx").getJSONArray("library").put(JSONObject().put("id", "legacy-only").put("type", "movie").put("name", "Old client film")) },
+                JSONObject(carrier.toString()).also { it.getJSONObject("nativeSync").remove("legacyImport") },
+            )
+            val before = runtime.session().read().state.toString()
+            for (bad in rejected) {
+                assertTrue(runCatching { runtime.applyDocument(account, bad) { true } }.isFailure)
+                assertEquals(before, runtime.session().read().state.toString())
+                assertEquals(before, checkpoints.read(scope))
+            }
+            runtime.retire()
+            for (bad in rejected) {
+                runtime = coordinator()
+                assertTrue(runCatching { runtime.applyDocument(account, bad) { true } }.isFailure)
+                assertTrue(runCatching { runtime.session() }.isFailure)
+                assertEquals(before, checkpoints.read(scope))
+            }
+            // A valid native-native update with unchanged old material remains usable on cold reopen.
+            assertTrue(runtime.applyDocument(account, carrier) { true })
+            assertEquals("Native name", NativeProfileAccess { runtime.session() }.read().profiles.single().name)
+            val absent = object : VortxCheckpointStore {
+                var committed: String? = null
+                override fun read(scope: VortxAccountScope) = committed
+                override fun commit(scope: VortxAccountScope, snapshot: String) { committed = snapshot }
+            }
+            val fresh = NativeAccountCoordinator(bindings(), absent, { noNetwork() }, { true }, { it() }, {})
+            try {
+                for (bad in rejected) {
+                    assertTrue(runCatching { fresh.applyDocument(account, bad) { true } }.isFailure)
+                    assertNull(absent.committed)
+                }
+                val unsafeImport = JSONObject(doc.toString())
+                unsafeImport.getJSONObject("vortx").getJSONArray("addons").put(JSONObject()
+                    .put("transportUrl", "https://fixture.invalid/manifest.json").put("manifest", JSONObject()
+                        .put("id", "encoded-fixture").put("name", "Fixture").put("version", "1.0.0")
+                        .put("description", java.util.Base64.getEncoder().encodeToString("{\"authKey\":\"fixture-only-secret\"}".toByteArray()))))
+                assertTrue(runCatching { fresh.applyDocument(account, unsafeImport) { true } }.isFailure)
+                assertNull(absent.committed)
+                assertTrue(fresh.applyDocument(account, carrier) { true })
+                assertEquals("Native name", NativeProfileAccess { fresh.session() }.read().profiles.single().name)
+            } finally { fresh.retire() }
+        } finally { runtime.retire(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+
+    @Test fun `account retirement during suspended projection never reports a successful native install`() = runBlocking {
+        assumeTrue("Requires reviewed importer JNI", System.getenv("VORTX_JNI_SYNC") == "1")
+        load()
+        val account = SessionOwnerSnapshot.Account("00000000-0000-0000-0000-000000000123", 4)
+        val owner = UserProfile(id = UserProfile.OWNER_ID, name = "Owner", avatar = "star", isOwner = true)
+        val doc = JSONObject().put("vortx", JSONObject().put("roster", JSONArray().put(owner.encode()))
+            .put("rosterModified", 123.5).put("library", JSONArray()).put("addons", JSONArray()))
+        for (warm in listOf(false, true)) {
+            var current = account
+            var suspendProjection = false
+            val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+            val store = object : VortxCheckpointStore {
+                var checkpoint: String? = null
+                override fun read(scope: VortxAccountScope) = checkpoint
+                override fun commit(scope: VortxAccountScope, snapshot: String) { checkpoint = snapshot }
+            }
+            val runtime = NativeAccountCoordinator(bindings(), store, { noNetwork() }, { it == current }, { it() }, {
+                if (suspendProjection) { entered.complete(Unit); release.await() }
+            })
+            try {
+                assertTrue(runtime.applyDocument(account, doc) { account == current })
+                val carrier = JSONObject(doc.toString()).put("nativeSync", runtime.exportDocument(account)!!.nativeSync)
+                if (!warm) runtime.retire()
+                suspendProjection = true
+                val applying = async(start = CoroutineStart.UNDISPATCHED) {
+                    runCatching { runtime.applyDocument(account, carrier) { account == current } }
+                }
+                entered.await()
+                current = account.copy(generation = 5)
+                runtime.retire()
+                release.complete(Unit)
+                assertTrue(applying.await().isFailure)
+                assertNull(runtime.exportDocument(account))
+                assertTrue(runCatching { runtime.session() }.isFailure)
+            } finally { release.complete(Unit); runtime.retire() }
+        }
     }
 }

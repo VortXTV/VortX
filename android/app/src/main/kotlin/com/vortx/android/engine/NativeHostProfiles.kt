@@ -7,6 +7,27 @@ import org.json.JSONObject
 
 /** Full authenticated host-owned preference records. Unknown fields survive native projection/edit. */
 internal object NativeHostProfiles {
+    /** Native fields travel in nativeSync. Every other changed host field still needs outbound
+     * reconciliation; a native-carrier upload must not acknowledge that unexported local intent. */
+    fun hasUnexportedChanges(before: JSONObject, after: JSONObject): Boolean {
+        fun hostOnly(record: JSONObject) = JSONObject(record.toString()).also { value ->
+            for (field in listOf("id", "name", "isOwner", "pin", "isKids", "familyEdit", "accentID", "oled", "textScale", "disabledAddons")) value.remove(field)
+        }
+        return after.keys().asSequence().filter { it != "modifiedSeconds" }.any { id ->
+            !sameValue(hostOnly(before.optJSONObject(id) ?: JSONObject()), hostOnly(after.getJSONObject(id)))
+        }
+    }
+
+    private fun sameValue(left: Any?, right: Any?): Boolean = when {
+        left is JSONObject && right is JSONObject -> {
+            val keys = left.keys().asSequence().toSet()
+            keys == right.keys().asSequence().toSet() && keys.all { sameValue(left.get(it), right.get(it)) }
+        }
+        left is JSONArray && right is JSONArray -> left.length() == right.length() && (0 until left.length()).all { sameValue(left.get(it), right.get(it)) }
+        left is Number && right is Number -> java.math.BigDecimal(left.toString()).compareTo(java.math.BigDecimal(right.toString())) == 0
+        else -> left == right
+    }
+
     fun fromDocument(document: JSONObject, roster: List<UserProfile>, modified: Double?): JSONObject {
         val vortx = document.optJSONObject("vortx")
         val native = vortx?.optJSONArray("roster")

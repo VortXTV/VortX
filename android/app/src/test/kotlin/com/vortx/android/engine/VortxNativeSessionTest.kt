@@ -112,6 +112,22 @@ class VortxNativeSessionTest {
         VortxNativeSession.open(scope, "Owner", runtime, store, transport, true)
     private fun request(id: String) = VortxResourceRequest(VortxResourceRequest.Resource.CATALOG, "series", id) to listOf(VortxResourceAddon("a", "https://fixture.invalid/manifest.json", "{}"))
 
+    @Test fun `host-only intent comparison excludes native fields but preserves every unsupported preference`() {
+        val profile = JSONObject().put("id", "owner").put("name", "Original").put("avatar", "star")
+            .put("playback", JSONObject().put("audioLang", "eng")).put("future", JSONObject().put("value", 1))
+        val before = JSONObject().put("owner", profile).put("modifiedSeconds", 1.0)
+        val native = JSONObject(before.toString()).put("modifiedSeconds", 2.0)
+        native.getJSONObject("owner").put("name", "New").put("pin", "sha256:fixture").put("isKids", true)
+            .put("familyEdit", true).put("accentID", "blue").put("oled", true).put("textScale", 1.1).put("disabledAddons", JSONArray())
+        assertFalse(NativeHostProfiles.hasUnexportedChanges(before, native))
+        for ((field, value) in listOf("avatar" to "moon", "playback" to JSONObject().put("audioLang", "fra"),
+            "discovery" to JSONObject().put("hideLiveTab", true), "future" to JSONObject().put("value", 2),
+            "addonPreferences" to JSONObject().put("disabledAddonURLsOverride", JSONArray()))) {
+            val changed = JSONObject(native.toString()); changed.getJSONObject("owner").put(field, value)
+            assertTrue(NativeHostProfiles.hasUnexportedChanges(before, changed))
+        }
+    }
+
     @Test fun `failed durable writes dispatches and readback never publish candidate`() {
         val runtime = Runtime(); val store = Store()
         open(runtime, store).use { session ->
@@ -159,6 +175,42 @@ class VortxNativeSessionTest {
             assertTrue(runCatching { store.read(other) }.isFailure)
             val bytes = target.readBytes(); bytes[bytes.lastIndex] = (bytes.last().toInt() xor 1).toByte(); target.writeBytes(bytes)
             assertTrue(runCatching { VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), true) }.isFailure)
+        } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+    @Test fun `old encrypted adjacent encoded credentials fail before hydration without rewriting checkpoint`() {
+        val directory = Files.createTempDirectory(File("build").toPath(), "native-retained-guard-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val store = VortxEncryptedCheckpointStore(directory) { key }
+        try {
+            val baseline = VortxNativeSession.open(scope, "Owner", Runtime(), store, Transport(), true).use { it.read().state.toString() }
+            val encodedCases = listOf("{\"authKey\":\"fixture-only-secret\"}", "{malformed")
+                .map { java.util.Base64.getEncoder().encodeToString(it.toByteArray()) }
+            for (encoded in encodedCases) for (field in listOf("hostProfilePreferences", "legacyImportMaterial", "hostDocument")) {
+                val state = JSONObject(baseline)
+                val payload = JSONObject().put("future", encoded)
+                when (field) {
+                    "hostProfilePreferences" -> state.put(field, JSONObject().put("modifiedSeconds", 999.0).put("owner", payload))
+                    "hostDocument" -> state.put(field, payload).put("excludedCredentialPaths", JSONArray())
+                    else -> state.put(field, payload.put("schemaVersion", 1).put("roster", JSONArray()).put("deletedProfileIds", JSONArray())
+                        .put("addons", JSONObject()).put("libraries", JSONObject()).put("watches", JSONObject()).put("identityLinks", JSONObject()))
+                }
+                // Simulate the prior experimental writer: valid AES-GCM and raw credential-key
+                // validation, but a previously opaque encoded string in an adjacent host carrier.
+                store.commit(scope, state.toString())
+                val file = directory.listFiles()!!.single(); val sealed = file.readBytes()
+                val runtime = Runtime()
+                assertTrue(runCatching { VortxNativeSession.open(scope, "Owner", runtime, store, Transport(),
+                    initialHostProfiles = JSONObject().put("modifiedSeconds", 1.0)) }.isFailure)
+                assertEquals(0L, runtime.next); assertEquals(0, runtime.created)
+                assertArrayEquals(sealed, file.readBytes()); assertEquals(state.toString(), store.read(scope))
+            }
+            val clean = JSONObject(baseline).put("hostDocument", JSONObject().put("future",
+                java.util.Base64.getEncoder().encodeToString("{\"safe\":true}".toByteArray())))
+                .put("excludedCredentialPaths", JSONArray())
+            store.commit(scope, clean.toString())
+            VortxNativeSession.open(scope, "Owner", Runtime(), store, Transport()).use {
+                assertEquals(clean.getJSONObject("hostDocument").toString(), it.read().state.getJSONObject("hostDocument").toString())
+            }
         } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
     @Test fun `independent consumers load concurrently while a profile switch fences late results`() = runBlocking {
@@ -323,9 +375,26 @@ class VortxNativeSessionTest {
         val newer = JSONObject().put("modifiedSeconds", 20).put("owner", JSONObject().put("avatar", "newer"))
         VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), initialHostProfiles = newer).use {
             assertEquals("newer", it.read().state.getJSONObject("hostProfilePreferences").getJSONObject("owner").getString("avatar"))
+            assertTrue(it.read().state.getBoolean("hostProfileSyncPending"))
         }
         VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), initialHostProfiles = JSONObject().put("modifiedSeconds", 10)).use {
             assertEquals("newer", it.read().state.getJSONObject("hostProfilePreferences").getJSONObject("owner").getString("avatar"))
+            assertTrue(it.read().state.getBoolean("hostProfileSyncPending"))
+        }
+        store.value = JSONObject(store.value!!).also { it.remove("hostProfileSyncPending") }.toString()
+        VortxNativeSession.open(scope, "Owner", runtime, store, Transport(), initialHostProfiles =
+            JSONObject().put("modifiedSeconds", 10).put("owner", JSONObject().put("avatar", "older"))).use {
+            assertTrue(it.read().state.getBoolean("hostProfileSyncPending"))
+        }
+        val cleanStore = Store()
+        VortxNativeSession.open(scope, "Owner", Runtime(), cleanStore, Transport(), allowNewAccount = true,
+            initialHostProfiles = preferences).close()
+        VortxNativeSession.open(scope, "Owner", Runtime(), cleanStore, Transport(), initialHostProfiles = newer).use {
+            assertFalse(it.read().state.getBoolean("hostProfileSyncPending"))
+        }
+        VortxNativeSession.open(scope, "Owner", Runtime(), cleanStore, Transport(), initialHostProfiles =
+            JSONObject().put("modifiedSeconds", 10)).use {
+            assertFalse(it.read().state.getBoolean("hostProfileSyncPending"))
         }
     }
 

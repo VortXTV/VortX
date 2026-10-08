@@ -21,6 +21,14 @@ class NativeLegacyMaterialTest {
         assertTrue("Expected '$phrase', got $error", error is IllegalArgumentException && error.message.orEmpty().contains(phrase))
     }
 
+    @Test fun `pending or malformed website profile edits never bypass complete material validation`() {
+        for (edits in listOf<Any>(JSONObject().put(owner.id, JSONObject().put("name", "Website name")), JSONArray(), "opaque")) {
+            failure(document().put("profileEdits", edits), "Pending profile edits")
+        }
+        material(document().put("profileEdits", JSONObject()))
+        material(document().put("profileEdits", JSONObject.NULL))
+    }
+
     @Test fun `preserves exact profile ids salted PIN and fractional roster clock without credentials`() {
         val pin = UserProfile.pinHash("1234", child.id)
         val original = document().put("authKey", "must-not-copy").put("settings", "opaque encrypted-account-adjacent backup")
