@@ -857,6 +857,14 @@ private struct iOSCWDetailTarget: Hashable {
     let traktSessionID: TraktSessionID?
 }
 
+/// A quick-view Watch intent. Detail owns authoritative metadata/source settlement; this value only says
+/// that the viewer explicitly chose Watch, keeping it distinct from a plain Details navigation. It remains
+/// module-visible so the paginated category browser can preserve that distinction after resolving a `tmdb:` id.
+struct CinemaDetailTarget: Hashable {
+    let item: FeaturedHeroItem
+    let autoPlay: Bool
+}
+
 private struct iOSCWProducerProvenance: Sendable {
     let source: TraktPlaybackShadow.ContinueWatchingSource
     let traktSessionID: TraktSessionID?
@@ -1252,8 +1260,16 @@ struct iOSHomeView: View {
                     )
                 }
             }
+            .navigationDestination(for: CinemaDetailTarget.self) { target in
+                iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                              seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                              autoPlayOnAppear: target.autoPlay)
+            }
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
+            }
+            .navigationDestination(for: CinemaBoardCatalogTarget.self) { target in
+                CinemaBoardCatalogBrowse(target: target, path: $path)
             }
             .iOSPlayerCover($player, account: account, core: core)
         }
@@ -1554,6 +1570,10 @@ struct iOSHomeView: View {
                                                  genres: $0.genres)
                                     },
                                     onTap: handleTap, showWatchedBadges: true,
+                                    onSeeAll: {
+                                        path.append(CinemaBoardCatalogTarget(rowID: row.id, title: row.title,
+                                                                             engineIndex: row.engineIndex))
+                                    },
                                     onReachEnd: { core.loadBoardRowNextPage(engineIndex: row.engineIndex) }))
                     .onAppear {
                         if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {
@@ -1601,13 +1621,17 @@ struct iOSHomeView: View {
     /// rails are byte-for-byte unchanged. Returns the (possibly reconfigured) `PosterRail` directly so
     /// the `@ViewBuilder` parents see a plain View, not a `()` from a mutating statement.
     private func homeRail(_ rail: PosterRail) -> PosterRail {
-        #if os(macOS)
         var configured = rail
+        configured.onWatch = watchFromQuickView
+        #if os(macOS)
         configured.macFocus = $macFocus
-        return configured
-        #else
-        return rail
         #endif
+        return configured
+    }
+
+    private func watchFromQuickView(_ item: RailItem) {
+        hero.noteInteraction()
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
 
     /// Tapping a poster opens that title's detail through normal navigation; it does NOT "feature" it
@@ -2117,7 +2141,7 @@ struct iOSLibraryView: View {
                             // RailItem grid is then narrowed to the matching ids.
                             smartFilterBar(segmentedSource())
                             PosterGrid(items: smartFiltered(segmented(libraryItems), pass: smartPassIDs(segmentedSource())),
-                                       onTap: handleTap, menu: .library)
+                                       onTap: handleTap, onWatch: watchFromQuickView, menu: .library)
                         }
                     }
                     .padding(.bottom, Theme.Space.md)
@@ -2142,6 +2166,11 @@ struct iOSLibraryView: View {
                 // Cinemeta meta is nil for a new/unreleased title.
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
+            }
+            .navigationDestination(for: CinemaDetailTarget.self) { target in
+                iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                              seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                              autoPlayOnAppear: target.autoPlay)
             }
             #if !os(tvOS)
             // Value-routed Downloads push (#25): the pill appends `LibraryRoute.downloads`.
@@ -2199,6 +2228,11 @@ struct iOSLibraryView: View {
     private func handleTap(_ item: RailItem) {
         hero.noteInteraction()
         path.append(FeaturedHeroItem.from(rail: item))
+    }
+
+    private func watchFromQuickView(_ item: RailItem) {
+        hero.noteInteraction()
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
 
     private func resumeLibraryContinueWatching(_ item: RailItem) {
@@ -2738,7 +2772,7 @@ struct iOSSearchView: View {
     #endif
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
-    @State private var path: [FeaturedHeroItem] = []
+    @State private var path = NavigationPath()
     @State private var showOpenLink = false
     @State private var pastedPlayer: iOSPlayerLaunch?   // paste-a-link player, presented from here (not the sheet)
     @State private var pendingLaunch: iOSPlayerLaunch?  // staged while the link sheet dismisses, presented in onDismiss
@@ -2784,6 +2818,11 @@ struct iOSSearchView: View {
                 // Cinemeta meta is nil for a new/unreleased title.
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
+            }
+            .navigationDestination(for: CinemaDetailTarget.self) { target in
+                iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                              seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                              autoPlayOnAppear: target.autoPlay)
             }
             .onAppear {
                 core.loadSearchSuggestions()
@@ -3000,7 +3039,7 @@ struct iOSSearchView: View {
                         }, onOpen: { item in
                             saveToHistory(query)
                             path.append(FeaturedHeroItem.from(rail: item))
-                        })
+                        }, onWatch: watchFromQuickView)
                     }
                 }
             }
@@ -3056,6 +3095,11 @@ struct iOSSearchView: View {
         guard trimmed.count >= 2 else { return }
         SearchHistoryStore.add(trimmed, profileID: profiles.activeID)
         history = SearchHistoryStore.load(profileID: profiles.activeID)
+    }
+
+    private func watchFromQuickView(_ item: RailItem) {
+        saveToHistory(query)
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
 
     private var hasSearchQuery: Bool {
@@ -3203,6 +3247,11 @@ struct iOSDiscoverView: View {
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
+            .navigationDestination(for: CinemaDetailTarget.self) { target in
+                iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                              seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                              autoPlayOnAppear: target.autoPlay)
+            }
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
             }
@@ -3330,6 +3379,7 @@ struct iOSDiscoverView: View {
                                             releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
                                },
                                onTap: { path.append(FeaturedHeroItem.from(rail: $0)) },
+                               onWatch: watchFromQuickView,
                                menu: .catalog, showWatchedBadges: true)
                 }
             }
@@ -3355,6 +3405,11 @@ struct iOSDiscoverView: View {
     private func handleTap(_ item: RailItem) {
         hero.noteInteraction()
         path.append(FeaturedHeroItem.from(rail: item))
+    }
+
+    private func watchFromQuickView(_ item: RailItem) {
+        hero.noteInteraction()
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
 
     private func chipScroll<C: View>(@ViewBuilder _ content: () -> C) -> some View {
@@ -3419,7 +3474,7 @@ struct iOSDiscoverView: View {
                 RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
                          background: $0.background, description: $0.description,
                          releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-            }, onTap: handleTap, showWatchedBadges: true, onReachEnd: { core.loadDiscoverNextPage() })
+            }, onTap: handleTap, onWatch: watchFromQuickView, showWatchedBadges: true, onReachEnd: { core.loadDiscoverNextPage() })
         }
     }
 
@@ -4464,6 +4519,9 @@ private enum OpenLinkMagnet {
 struct PosterGrid: View {
     let items: [RailItem]
     let onTap: (RailItem) -> Void
+    /// Explicit Watch is distinct from Details: callers can route it through the detail owner's
+    /// authoritative autoplay/source-selection contract.
+    var onWatch: ((RailItem) -> Void)? = nil
     /// Which long-press context menu each card shows on this surface (#14). `.none` for surfaces
     /// where no engine action applies.
     var menu: iOSPosterMenu = .none
@@ -4527,7 +4585,9 @@ struct PosterGrid: View {
         .frame(maxWidth: .infinity)
         .padding(.horizontal, Theme.Space.md)
         .sheet(item: $quickViewItem) { item in
-            CinemaQuickView(item: item, onWatch: { onTap(item) }, onDetails: { onTap(item) })
+            CinemaQuickView(item: item, onWatch: {
+                if let onWatch { onWatch(item) } else { onTap(item) }
+            }, onDetails: { onTap(item) })
         }
     }
 
@@ -4574,6 +4634,10 @@ private struct PosterRail: View {
     var eyebrow: String? = nil
     let items: [RailItem]
     let onTap: (RailItem) -> Void
+    var onWatch: ((RailItem) -> Void)? = nil
+    /// A catalog shelf can expose the same live row as a full, paginated grid. Nil keeps personal and
+    /// editorial rails compact (and avoids presenting an action that cannot represent their source).
+    var onSeeAll: (() -> Void)? = nil
     /// Which long-press context menu each card shows on this surface (#14).
     var menu: iOSPosterMenu = .none
     /// Opens a card's detail page (used by the Continue Watching menu's Details item, since a CW tap resumes).
@@ -4617,9 +4681,22 @@ private struct PosterRail: View {
             // uppercase eyebrow above the title matches the redesign mockup's shelf headers (and tvOS
             // RailHeader), so a shelf like Continue Watching reads "Pick up where you left off / Continue
             // Watching" exactly as the mockup and the tvOS home do.
-            VStack(alignment: .leading, spacing: 4) {
-                if let eyebrow { Text(eyebrow).eyebrowStyle() }
-                Text(title).sectionTitleStyle()
+            HStack(alignment: .lastTextBaseline, spacing: Theme.Space.sm) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let eyebrow { Text(eyebrow).eyebrowStyle() }
+                    Text(title).sectionTitleStyle()
+                }
+                Spacer(minLength: Theme.Space.sm)
+                if let onSeeAll {
+                    Button(action: onSeeAll) {
+                        Label("See all", systemImage: "chevron.right")
+                            .font(Theme.Typography.label.weight(.semibold))
+                            .foregroundStyle(Theme.Palette.accent)
+                            .frame(minHeight: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Opens the full \(title) catalog")
+                }
             }
             .padding(.horizontal, Theme.Space.md)
             ScrollViewReader { proxy in
@@ -4648,7 +4725,9 @@ private struct PosterRail: View {
         }
         .onHover { hovering = $0 }
         .sheet(item: $quickViewItem) { item in
-            CinemaQuickView(item: item, onWatch: { onTap(item) }, onDetails: { onTap(item) })
+            CinemaQuickView(item: item, onWatch: {
+                if let onWatch { onWatch(item) } else { onTap(item) }
+            }, onDetails: { onTap(item) })
         }
     }
 

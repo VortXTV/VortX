@@ -201,11 +201,72 @@ struct CinemaBrowseEntry: View {
     }
 }
 
+/// A value route for an installed add-on catalog. It intentionally stores only stable board identity;
+/// `CinemaBoardCatalogBrowse` observes the current bridge row so a horizontal shelf and its full grid share
+/// the same live page stream instead of making a second provider-wide catalog request.
+struct CinemaBoardCatalogTarget: Hashable {
+    let rowID: String
+    let title: String
+    let engineIndex: Int
+}
+
+/// The full-grid counterpart to a Home add-on shelf. Paging delegates to the existing per-row engine action,
+/// preserving source selection and avoiding duplicate/fan-out catalog fetches.
+struct CinemaBoardCatalogBrowse: View {
+    let target: CinemaBoardCatalogTarget
+    @Binding var path: NavigationPath
+    @EnvironmentObject private var core: CoreBridge
+
+    private var row: CoreBoardRow? {
+        core.boardRows.first(where: { $0.id == target.rowID })
+    }
+
+    private var items: [RailItem] {
+        (row?.items ?? []).map {
+            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
+                     background: $0.background, description: $0.description,
+                     releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
+                if items.isEmpty {
+                    ContentUnavailableViewCompat(title: target.title, systemImage: "film.stack",
+                                                 message: "This catalog has no available titles right now.")
+                        .frame(minHeight: 360)
+                } else {
+                    PosterGrid(items: items, onTap: openDetails, onWatch: watch,
+                               menu: .catalog, showWatchedBadges: true,
+                               onReachEnd: { core.loadBoardRowNextPage(engineIndex: target.engineIndex) })
+                }
+            }
+            .padding(.vertical, Theme.Space.md)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #if os(iOS)
+        .navigationTitle(target.title)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .macBackAffordance()
+    }
+
+    private func openDetails(_ item: RailItem) {
+        path.append(FeaturedHeroItem.from(rail: item))
+    }
+
+    private func watch(_ item: RailItem) {
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
+    }
+}
+
 /// Search is deliberately a result surface rather than another poster rail: its cards keep the actual
 /// wide artwork, title, available facts, and synopsis together under the image at a readable scale.
 struct CinemaSearchResults: View {
     let items: [RailItem]
     let onOpen: (RailItem) -> Void
+    var onWatch: ((RailItem) -> Void)? = nil
     @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
     @State private var quickViewItem: RailItem?
 
@@ -224,7 +285,9 @@ struct CinemaSearchResults: View {
         }
         .padding(.horizontal, Theme.Space.md)
         .sheet(item: $quickViewItem) { item in
-            CinemaQuickView(item: item, onWatch: { onOpen(item) }, onDetails: { onOpen(item) })
+            CinemaQuickView(item: item, onWatch: {
+                if let onWatch { onWatch(item) } else { onOpen(item) }
+            }, onDetails: { onOpen(item) })
         }
     }
 }
