@@ -64,17 +64,28 @@ struct ProfilePickerView: View {
     @State private var editorProfile: UserProfile?
     @State private var signInNeeded = false
     #if !os(tvOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     /// Measured width of the picker's horizontal scroll viewport (iOS + macOS), used to pin the card row's
     /// minWidth so a short row centers instead of sitting hard-left (see the picker body below).
     @State private var pickerRowWidth: CGFloat = 0
     #endif
 
+    private var usesWideProfileLayout: Bool {
+        #if os(tvOS)
+        return true
+        #elseif os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
+
     var body: some View {
         ZStack {
             Theme.Palette.canvas.ignoresSafeArea()
-            VStack(spacing: Theme.Space.xxl) {
+            VStack(spacing: usesWideProfileLayout ? Theme.Space.xxl : Theme.Space.md) {
                 Text("Who's watching?")
-                    .font(Theme.Typography.hero)
+                    .font(usesWideProfileLayout ? Theme.Typography.hero : Theme.Typography.screenTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
                 // Touch: scroll horizontally so 3+ cards (230pt each) don't overflow + clip both edges
                 // on a phone (systemic fix S1b). tvOS keeps the centered HStack for remote focus nav.
@@ -85,7 +96,8 @@ struct ProfilePickerView: View {
                 // horizontal ScrollView still scrolls when N avatars exceed it.
                 #if os(tvOS)
                 profileCards
-                #elseif os(macOS)
+                #else
+                if usesWideProfileLayout {
                 // Center the row when it is narrower than the viewport so a couple of avatars sit balanced
                 // rather than pinned hard-left with trailing dead space. A flexible `maxWidth: .infinity`
                 // frame is a NO-OP along a horizontal ScrollView's unbounded scroll axis (it collapses to the
@@ -103,24 +115,18 @@ struct ProfilePickerView: View {
                 })
                 // Belt-and-braces: let an active card's ember glow render past the scroll rectangle instead
                 // of being clipped to bounds (FINDING 8). macOS 14+ (VortXMac target), so no availability gate.
+                #if os(macOS)
                 .scrollClipDisabled()
-                #else
-                // iOS: the horizontal scroll is the systemic S1b fix so 3+ cards do not clip both phone
-                // edges. S12: use the SAME measured-minWidth centering as macOS so a short row (1-2 profiles)
-                // sits balanced instead of hard-left with trailing dead space; it still scrolls identically
-                // once the cards exceed the measured viewport width (the intrinsic row width then wins).
-                ScrollView(.horizontal, showsIndicators: false) {
-                    profileCards
-                        .frame(minWidth: pickerRowWidth, alignment: .center)
+                #endif
+                } else {
+                    ScrollView(.vertical, showsIndicators: false) {
+                        compactProfileCards
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
-                .background(GeometryReader { proxy in
-                    Color.clear
-                        .onAppear { pickerRowWidth = proxy.size.width }
-                        .onChange(of: proxy.size.width) { newWidth in pickerRowWidth = newWidth }
-                })
                 #endif
             }
-            .padding(Theme.Space.screenInset)
+            .padding(usesWideProfileLayout ? Theme.Space.screenInset : Theme.Space.sm)
             // macOS no longer presents this as a content-sized `.sheet` (which clipped the trailing Add
             // Profile card at the window's right edge): it is hosted WINDOW-FILLING at the scene root by
             // MacRootProfileCoverOverlay, so the canvas + measured-minWidth centering below fill the whole
@@ -168,6 +174,21 @@ struct ProfilePickerView: View {
         .padding(.vertical, Theme.Space.xl)
         #endif
     }
+
+    #if !os(tvOS)
+    @ViewBuilder private var compactProfileCards: some View {
+        LazyVStack(spacing: Theme.Space.sm) {
+            ForEach(store.profiles) { profile in
+                CompactProfileRow(profile: profile, isCurrent: profile.id == store.activeID) {
+                    pick(profile)
+                }
+            }
+            CompactAddProfileRow {
+                editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
+            }
+        }
+    }
+    #endif
 
     private func pick(_ profile: UserProfile) {
         if profile.hasPin {
@@ -249,7 +270,11 @@ private struct ProfileCard: View {
         Button(action: action) {
             ProfileCardContent(profile: profile, isCurrent: isCurrent)
         }
+        #if os(tvOS)
         .buttonStyle(CardFocusStyle())
+        #else
+        .buttonStyle(.plain)
+        #endif
     }
 }
 
@@ -264,6 +289,7 @@ private struct ProfileCardContent: View {
     }
 
     var body: some View {
+        #if os(tvOS)
         VStack(spacing: Theme.Space.md) {
             ZStack {
                 Circle().fill(accent.opacity(focused ? 0.5 : 0.24))
@@ -303,6 +329,44 @@ private struct ProfileCardContent: View {
         }
         .frame(width: 230)
         .animation(Theme.Motion.focus, value: focused)
+        #else
+        HStack(spacing: Theme.Space.md) {
+            ZStack {
+                Circle().fill(accent.opacity(0.22))
+                Text(profile.avatar)
+                    .font(.system(size: 44, weight: .bold))
+            }
+            .frame(width: 76, height: 76)
+
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                Text(profile.name)
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1)
+                Text(profile.isOwner ? "Owner profile" : (profile.isKids ? "Kids profile" : "Profile"))
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            Spacer(minLength: Theme.Space.sm)
+            HStack(spacing: Theme.Space.xs) {
+                if profile.hasPin {
+                    Image(systemName: "lock.fill")
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                if isCurrent {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(accent)
+                        .accessibilityLabel("Current profile")
+                }
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+        }
+        .padding(Theme.Space.md)
+        .frame(width: 320, minHeight: 100, alignment: .leading)
+        .vortxCinemaCard()
+        #endif
     }
 }
 
@@ -312,6 +376,7 @@ private struct AddProfileCard: View {
 
     var body: some View {
         Button(action: action) {
+            #if os(tvOS)
             VStack(spacing: Theme.Space.md) {
                 ZStack {
                     Circle().fill(Theme.Palette.surface1)
@@ -325,10 +390,111 @@ private struct AddProfileCard: View {
                     .foregroundStyle(Theme.Palette.textSecondary)
             }
             .frame(width: 230)
+            #else
+            HStack(spacing: Theme.Space.md) {
+                Image(systemName: "plus.circle.fill")
+                    .font(.system(size: 34, weight: .medium))
+                    .foregroundStyle(Theme.Palette.accent)
+                Text("Add Profile")
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+            .padding(Theme.Space.md)
+            .frame(width: 320, minHeight: 76, alignment: .leading)
+            .vortxCinemaCard()
+            #endif
         }
+        #if os(tvOS)
         .buttonStyle(CardFocusStyle())
+        #else
+        .buttonStyle(.plain)
+        #endif
     }
 }
+
+#if !os(tvOS)
+/// Phone profile picker rows keep the same switch/PIN action as the wide card, but use the viewport width
+/// instead of a fixed 230pt card so names and the current-profile marker never clip on a narrow device.
+private struct CompactProfileRow: View {
+    let profile: UserProfile
+    let isCurrent: Bool
+    let action: () -> Void
+    @EnvironmentObject private var theme: ThemeManager
+
+    private var accent: Color {
+        ThemeManager.accents.first { $0.id == profile.accentID }?.base ?? Theme.Palette.accent
+    }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: Theme.Space.sm) {
+                ZStack {
+                    Circle().fill(accent.opacity(0.22))
+                    Text(profile.avatar).font(.system(size: 30, weight: .bold))
+                }
+                .frame(width: 52, height: 52)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(profile.name)
+                        .font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .lineLimit(1)
+                    Text(profile.isOwner ? "Owner profile" : (profile.isKids ? "Kids profile" : "Profile"))
+                        .font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                Spacer(minLength: Theme.Space.xs)
+                if profile.hasPin {
+                    Image(systemName: "lock.fill")
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                }
+                if isCurrent {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(accent)
+                        .accessibilityLabel("Current profile")
+                }
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.vertical, Theme.Space.sm)
+            .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
+            .vortxSettingsCard()
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct CompactAddProfileRow: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: Theme.Space.sm) {
+                Image(systemName: "plus.circle.fill")
+                    .font(.system(size: 28, weight: .medium))
+                    .foregroundStyle(Theme.Palette.accent)
+                Text("Add Profile")
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.vertical, Theme.Space.sm)
+            .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
+            .vortxSettingsCard()
+        }
+        .buttonStyle(.plain)
+    }
+}
+#endif
 
 /// Create or edit a profile: name, avatar, theme, an optional own Stremio account, and an optional
 /// 4-digit PIN. Works on a draft; nothing persists until Save.
@@ -339,6 +505,9 @@ struct ProfileEditorView: View {
     @EnvironmentObject private var account: StremioAccount   // for the locked-panel "Switch profile" reload
     @EnvironmentObject private var core: CoreBridge          // (mirrors ProfilePickerView's switch path)
     @Environment(\.dismiss) private var dismiss
+    #if !os(tvOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
 
     @State private var draft: UserProfile
     @State private var pinText: String
@@ -348,6 +517,16 @@ struct ProfileEditorView: View {
     @State private var signInNeeded = false      // an own-account profile with no stored token
 
     private var isNew: Bool { !store.profiles.contains { $0.id == original.id } }
+
+    private var usesWideEditorLayout: Bool {
+        #if os(tvOS)
+        return true
+        #elseif os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
 
     /// The guardrail: a profile can ONLY be edited while it is the one in use. You cannot change
     /// another profile from yours, with or without a PIN (the PIN bypass was the hole in the
@@ -372,7 +551,7 @@ struct ProfileEditorView: View {
                 // widest child, so the fixed-width fields + chip rows below pushed the whole editor
                 // wider than the phone and it clipped on BOTH edges ("ile", "ED Black"). LazyVStack is
                 // greedy on width and pins the column to the viewport. (Systemic fix S1.)
-                LazyVStack(alignment: .leading, spacing: Theme.Space.xl) {
+                LazyVStack(alignment: .leading, spacing: usesWideEditorLayout ? Theme.Space.xl : Theme.Space.md) {
                     Text(isNew ? "New Profile" : "Edit \(original.name)")
                         .font(Theme.Typography.screenTitle)
                         .foregroundStyle(Theme.Palette.textPrimary)
@@ -488,7 +667,8 @@ struct ProfileEditorView: View {
                     .padding(.top, Theme.Space.md)
                     .profileFocusSection()
                 }
-                .padding(Theme.Space.screenInset)
+                .frame(maxWidth: usesWideEditorLayout ? 900 : .infinity, alignment: .leading)
+                .padding(usesWideEditorLayout ? Theme.Space.screenInset : Theme.Space.sm)
             }
             // Unfocusable while the lock is up, so the remote lands in the lock panel (tvOS focus
             // won't enter an overlay while anything beneath stays focusable).
@@ -594,8 +774,8 @@ struct ProfileEditorView: View {
         dismiss()
     }
 
-    private func row<Content: View>(_ label: String, @ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+    @ViewBuilder private func row<Content: View>(_ label: String, @ViewBuilder _ content: () -> Content) -> some View {
+        let rowBody = VStack(alignment: .leading, spacing: Theme.Space.sm) {
             Text(label.uppercased())
                 .font(Theme.Typography.eyebrow)
                 .foregroundStyle(Theme.Palette.textTertiary)
@@ -607,7 +787,16 @@ struct ProfileEditorView: View {
         // Treat each row as a focus section so Down always drops to the next row, even when
         // the focused chip sits far to the right of the item below it. Without this, tvOS does
         // a strict geometric down-search and refuses to move unless you first level horizontally.
-        .profileFocusSection()
+        if usesWideEditorLayout {
+            rowBody
+                .padding(Theme.Space.md)
+                .vortxCinemaCard()
+                .profileFocusSection()
+        } else {
+            rowBody
+                .padding(.vertical, Theme.Space.xs)
+                .profileFocusSection()
+        }
     }
 }
 
@@ -634,7 +823,9 @@ private struct ProfileAccentPicker: View {
                                     selection == opt.id ? Theme.Palette.textPrimary : .clear,
                                     lineWidth: 3))
                         }
-                        .buttonStyle(CardFocusStyle())
+                        // Selection is carried by the direct circle stroke; the touch/Mac picker should
+                        // not add a second rectangular focus platter around the color control.
+                        .buttonStyle(.plain)
                     }
                 }
                 .padding(.horizontal, Theme.Space.sm)

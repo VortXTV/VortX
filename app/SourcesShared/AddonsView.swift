@@ -103,6 +103,27 @@ final class AddonHealthStore: ObservableObject {
     }
 }
 
+/// Add-ons use the compact settings-card treatment on a phone and the wider Cinema Glass card preset on
+/// iPad/Mac. Keeping this switch in one modifier changes only presentation; all action rows remain live.
+private struct AddonSurfaceModifier: ViewModifier {
+    let wide: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if wide {
+            content.vortxCinemaCard()
+        } else {
+            content.vortxSettingsCard()
+        }
+    }
+}
+
+private extension View {
+    func addonSurface(wide: Bool) -> some View {
+        modifier(AddonSurfaceModifier(wide: wide))
+    }
+}
+
 /// Add-ons installed on your account, read live from the engine. Install one by its manifest URL,
 /// or remove a non-default add-on here. Changes sync to your account and to the official apps when mirroring
 /// is enabled; a Change URL is an atomic engine replacement that retains its priority slot.
@@ -112,6 +133,9 @@ struct AddonsView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore
+    #if !os(tvOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
     @ObservedObject private var health = AddonHealthStore.shared
     @State private var newAddonURL = ""
     @State private var installing = false
@@ -125,10 +149,28 @@ struct AddonsView: View {
     // signal to re-run orderedByApplied; without it the new order showed only on the next cold launch.
     @ObservedObject private var orderObserver = AddonOrderObserver.shared
 
+    private var usesWideAddonLayout: Bool {
+        #if os(tvOS)
+        return false
+        #elseif os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
+
+    private var usesCompactAddonLayout: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return !usesWideAddonLayout
+        #endif
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                VStack(alignment: .leading, spacing: usesCompactAddonLayout ? Theme.Space.md : Theme.Space.lg) {
                     // Read the shared order revision so a reorder (in-app drag or remote pull) re-runs body and
                     // re-sorts the ForEach below via orderedByApplied. Must be READ in body to be tracked.
                     let _ = orderObserver.revision
@@ -154,13 +196,13 @@ struct AddonsView: View {
                                     Spacer()
                                     Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
                                 }
-                                .padding(Theme.Space.md)
+                                .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 // glass-Browse: this nav row is bespoke chrome, not routed through a shared
                                 // row style, so it flips straight to the settings-card glass preset in place
                                 // of the flat surface1 fill (same throughout this file: install/discover/
                                 // reorder rows, the add-on card).
-                                .vortxSettingsCard()
+                                .addonSurface(wide: usesWideAddonLayout)
                             }
                             // tvOS: `.plain` left the system focus platter on over this settings-card row. See ChipButtonStyle.
                             .vortxCardButton()
@@ -181,9 +223,9 @@ struct AddonsView: View {
                                         Spacer()
                                         Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
                                     }
-                                    .padding(Theme.Space.md)
+                                    .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .vortxSettingsCard()
+                                    .addonSurface(wide: usesWideAddonLayout)
                                 }
                                 // tvOS: `.plain` leaves the system focus platter on over a settings-card row
                                 // (see ChipButtonStyle); use the shared card-button treatment like the Discover
@@ -217,13 +259,16 @@ struct AddonsView: View {
                                 Spacer()
                                 #endif
                             }
-                            ForEach(VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })) { addon in addonRow(addon) }
+                            ForEach(Array(VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl }).enumerated()), id: \.element.id) { index, addon in
+                                addonRow(addon, position: index + 1)
+                            }
                         }
                     }
                 }
-                .padding(.horizontal, Theme.Space.screenInset)
-                .padding(.vertical, Theme.Space.xl)
+                .padding(.horizontal, usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.screenInset)
+                .padding(.vertical, usesCompactAddonLayout ? Theme.Space.md : Theme.Space.xl)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: usesWideAddonLayout ? 1120 : .infinity, alignment: .center)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
@@ -277,7 +322,7 @@ struct AddonsView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .vortxSettingsCard()
+        .addonSurface(wide: usesWideAddonLayout)
     }
 
     private var discoverLink: some View {
@@ -291,7 +336,7 @@ struct AddonsView: View {
             }
             .padding(Theme.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .vortxSettingsCard()
+            .addonSurface(wide: usesWideAddonLayout)
         }
         // tvOS: `.plain` left the system focus platter on over this settings-card row. See ChipButtonStyle.
         .vortxCardButton()
@@ -340,7 +385,8 @@ struct AddonsView: View {
         let symbol = addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill"
         let tint = isOff ? Theme.Palette.textTertiary
                          : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary)
-        AddonLogoIcon(logo: addon.manifest.logo, symbol: symbol, tint: tint, isOff: isOff)
+        AddonLogoIcon(logo: addon.manifest.logo, symbol: symbol, tint: tint, isOff: isOff,
+                      size: usesCompactAddonLayout ? 44 : 56)
     }
 
     /// Add-on logo, DOWNSAMPLED via PosterImageLoader (maxPixel 168 = the 56pt @3x on-screen size) instead of
@@ -354,6 +400,7 @@ struct AddonsView: View {
         let symbol: String
         let tint: Color
         let isOff: Bool
+        let size: CGFloat
         @State private var image: VXPosterImage?
 
         private var warmCache: VXPosterImage? {
@@ -368,10 +415,10 @@ struct AddonsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card / 2, style: .continuous))
                         .opacity(isOff ? 0.5 : 1)
                 } else {
-                    Image(systemName: symbol).font(.system(size: 36)).foregroundStyle(tint)
+                    Image(systemName: symbol).font(.system(size: size * 0.6)).foregroundStyle(tint)
                 }
             }
-            .frame(width: 56, height: 56)
+            .frame(width: size, height: size)
             .task(id: logo) {
                 guard image == nil, let logo, !logo.isEmpty else { return }
                 // 168px = 56pt @3x: only the on-screen size ever sits in memory, never a 1000px+ full-res logo.
@@ -388,16 +435,25 @@ struct AddonsView: View {
         }
     }
 
-    private func addonRow(_ addon: CoreDescriptor) -> some View {
+    private func addonRow(_ addon: CoreDescriptor, position: Int? = nil) -> some View {
         let isOff = profiles.isAddonDisabledForActive(base: addon.transportUrl)
         // Layout regression fix: previously icon + text + up-to-4 action chips all shared ONE HStack, so on a
         // narrow phone the fixed-width chips squeezed the text column toward zero width, forcing the name /
         // detail to wrap one glyph per line and clipping at the edges. Split into a top INFO row (icon + text
         // that always claims the full width) and a separate action row below that flows horizontally.
         return VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            HStack(alignment: .top, spacing: Theme.Space.md) {
+            HStack(alignment: .top, spacing: usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md) {
+                #if !os(tvOS)
+                if let position {
+                    Text("\(position)")
+                        .font(Theme.Typography.eyebrow)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                        .frame(width: usesCompactAddonLayout ? 20 : 28, alignment: .leading)
+                        .accessibilityLabel("Add-on position \(position)")
+                }
+                #endif
                 addonIcon(addon, isOff: isOff)
-                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                VStack(alignment: .leading, spacing: usesCompactAddonLayout ? 3 : Theme.Space.xs) {
                     Text(addon.manifest.name).font(Theme.Typography.cardTitle)
                         .foregroundStyle(isOff ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
                         .fixedSize(horizontal: false, vertical: true)   // wrap by word, never by glyph
@@ -416,9 +472,9 @@ struct AddonsView: View {
             }
             addonActions(addon, isOff: isOff)
         }
-        .padding(Theme.Space.md)
+        .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .vortxSettingsCard()
+        .addonSurface(wide: usesWideAddonLayout)
     }
 
     /// The add-on's action chips, in their own row beneath the info so they never steal width from the name /
@@ -480,7 +536,28 @@ struct AddonsView: View {
 /// The same explicit inheritance controls are available with touch, pointer and the TV remote.
 private struct ProfileAddonInheritanceControls: View {
     @EnvironmentObject private var profiles: ProfileStore
+    #if !os(tvOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
     var showsVisibility = true
+
+    private var usesWideAddonLayout: Bool {
+        #if os(tvOS)
+        return false
+        #elseif os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
+
+    private var usesCompactAddonLayout: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return !usesWideAddonLayout
+        #endif
+    }
 
     var body: some View {
         if profiles.activeSharesMainAddons {
@@ -494,9 +571,9 @@ private struct ProfileAddonInheritanceControls: View {
                               customize: profiles.customizeAddonRanking,
                               reset: profiles.resetAddonRankingToMain)
             }
-            .padding(Theme.Space.md)
+            .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .vortxSettingsCard()
+            .addonSurface(wide: usesWideAddonLayout)
         }
     }
 
@@ -519,9 +596,18 @@ struct AddonReorderView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ObservedObject private var orderObserver = AddonOrderObserver.shared   // re-seed on a remote reorder
     @State private var ordered: [CoreDescriptor] = []
     @State private var editorProfileID: UUID?
+
+    private var usesWideAddonLayout: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
 
     var body: some View {
         List {
@@ -541,14 +627,20 @@ struct AddonReorderView: View {
                     Spacer()
                     Image(systemName: "line.3.horizontal").foregroundStyle(Theme.Palette.textTertiary)
                 }
-                .padding(.vertical, 4)
-                .listRowBackground(Color.clear.vortxGlassListRow(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)))
+                .padding(.vertical, usesWideAddonLayout ? Theme.Space.sm : 4)
+                .listRowBackground(Color.clear.vortxGlassListRow(
+                    in: RoundedRectangle(cornerRadius: usesWideAddonLayout ? Theme.Radius.card + 4 : Theme.Radius.control,
+                                         style: .continuous)))
                 .listRowSeparator(.hidden)
             }
             .onMove(perform: move)
         }
         .scrollContentBackground(.hidden)
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .listRowInsets(EdgeInsets(top: usesWideAddonLayout ? Theme.Space.sm : Theme.Space.xs,
+                                  leading: usesWideAddonLayout ? Theme.Space.md : Theme.Space.sm,
+                                  bottom: usesWideAddonLayout ? Theme.Space.sm : Theme.Space.xs,
+                                  trailing: usesWideAddonLayout ? Theme.Space.md : Theme.Space.sm))
         #if os(iOS)
         .navigationTitle("Reorder Add-ons")
         .navigationBarTitleDisplayMode(.inline)
