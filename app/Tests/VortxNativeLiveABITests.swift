@@ -310,6 +310,23 @@ import CryptoKit
                                       sourceDocument: freshSourceEnvelope, profileOverlaySHA256: freshWitness)])
         let freshMaterial = try JSONDecoder().decode(VortxJSON.self, from: freshMaterialData)
         let freshOwnTarget = try VortxNativeProfiles.ownTarget(material: freshMaterial, profileID: child.id)
+        // B is a separately authenticated source with no overlay context. In particular, the
+        // historical raw A overlay above is not copied into this fresh B envelope or its witness.
+        let reboundLibraryResponse = try JSONSerialization.data(withJSONObject: ["result": [["_id": "tt-rebind-b", "type": "movie", "name": "Rebind B"]]])
+        let reboundOverlayResponse = Data("{}".utf8)
+        let reboundSourceEnvelope = try JSONSerialization.data(withJSONObject: [
+            "schemaVersion": 2,
+            "libraryResponseBase64": reboundLibraryResponse.base64EncodedString(),
+            "addonsResponseBase64": emptyAddonsResponse.base64EncodedString(),
+            "profileOverlayBase64": reboundOverlayResponse.base64EncodedString()
+        ], options: [.sortedKeys])
+        let reboundWitness = try VortxProfileOverlayWitness.digest(json: reboundOverlayResponse)
+        let reboundMaterialData = try VortxLegacyBootstrapMaterial.encode(
+            document: try JSONSerialization.data(withJSONObject: ["vortx": [:]]), roster: [owner, ownAccount], ownerProfileID: owner.id,
+            rosterModifiedSeconds: nil,
+            ownAccountSources: [.init(profileID: child.id, verifiedStreamingUID: "verified-own-uid-b",
+                                      sourceDocument: reboundSourceEnvelope, profileOverlaySHA256: reboundWitness)])
+        let reboundOwnTarget = try VortxNativeProfiles.ownTarget(material: try JSONDecoder().decode(VortxJSON.self, from: reboundMaterialData), profileID: child.id)
         // Exercise the reviewed schema-4 transaction against the actual C artifact: material-2
         // establishes the proven own account, a CAS visits shared, then the exact witnessed
         // carrier restores own. The exported cold state and cold nativeSync import must retain the
@@ -370,6 +387,28 @@ import CryptoKit
               && activeOwnSource(coldRebindState)?["profileOverlaySha256"] == .string(freshWitness))
         try VortxNativeSession.validateLegacyCompatibility(scope: rebindScope, ownerName: owner.name, snapshot: nil,
                                                            nativeSync: rebindState["nativeSync"], material: freshMaterialData, abi: VortxCABI())
+        let switchToB = try VortxNativeProfiles.rebindAction(profileID: child.id,
+            request: .init(scope: rebindScope.account, ownerProfileID: owner.id.uuidString,
+                           transactionID: "schema4-own-b", expected: try VortxNativeProfiles.expectedBinding(state: rebindState, profileID: child.id),
+                           target: .own(reboundOwnTarget)))
+        _ = try applyRebind(switchToB, now: 5)
+        let reboundState = try JSONDecoder().decode(VortxJSON.self, from: Data(rebindRuntime.stateJSON().utf8))
+        check(reboundState["roster"]?["profiles"]?[child.id.uuidString]?["account"]?["value"] == .string("verified-own-uid-b")
+              && reboundState["nativeSync"]?["legacyImport"]?["baseline"]?["ownAccountSources"]?[child.id.uuidString]?["verifiedStreamingUid"] == .string("verified-own-uid"))
+        let reboundSlotBaselines = try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: reboundState["nativeSync"]!)
+        let historicalADisposition = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: freshRootDocument,
+            roster: [owner, ownAccount], ownerProfileID: owner.id, retainedOwnAccountBaseline: freshMaterialData,
+            retainedOwnAccountSlotBaselines: reboundSlotBaselines)
+        check(historicalADisposition.count == 1 && historicalADisposition[0].status == .matchedWitness
+              && historicalADisposition[0].sourceDocumentSHA256 == freshOwnTarget.sourceDocumentSHA256)
+        let historicalAMaterial = try VortxLegacyBootstrapMaterial.encode(document: freshRootDocument,
+            roster: [owner, ownAccount], ownerProfileID: owner.id, rosterModifiedSeconds: nil,
+            retainedOwnAccountBaseline: freshMaterialData, retainedOwnAccountSlotBaselines: reboundSlotBaselines,
+            deferredOwnAccountOverlays: historicalADisposition)
+        let historicalATarget = try VortxNativeProfiles.ownTarget(material: try JSONDecoder().decode(VortxJSON.self, from: historicalAMaterial), profileID: child.id)
+        check(historicalATarget.verifiedStreamingUID == "verified-own-uid"
+              && historicalATarget.sourceDocumentSHA256 == freshOwnTarget.sourceDocumentSHA256
+              && historicalATarget.profileOverlaySHA256 == freshWitness)
         let pendingRequest = try VortxNativeProfiles.AccountRebindRequest(scope: "fixture-account", ownerProfileID: owner.id.uuidString,
                                                                             transactionID: "pending-own-transaction", expected: expectedBinding,
                                                                             target: .pendingOwn)
