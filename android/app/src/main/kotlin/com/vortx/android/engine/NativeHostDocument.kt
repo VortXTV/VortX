@@ -75,6 +75,8 @@ internal object NativeHostDocument {
                 val childPath = pointer(path, key)
                 if (excluded(key, childPath)) continue
                 val child = value.get(key)
+                val watchlistName = key == "name" && child is String && value.opt("id") is String && value.optString("type") in setOf("movie", "series") &&
+                    value.opt("addedAt") is Number && path.split('/').any { it.startsWith("watchlist.") || it.startsWith("vortx.watchlist.") }
                 val profileName = key == "name" && child is String &&
                     Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").matches(value.optString("id")) &&
                     (value.opt("isOwner") is Boolean || value.opt("owner") is Boolean)
@@ -82,9 +84,15 @@ internal object NativeHostDocument {
                 // Other values (including recognizable encoded secrets) still receive inspection.
                 val streamingUID = child is String && Regex("[0-9a-f]{24}").matches(child) &&
                     (key == "verifiedStreamingUid" || key == "value" && value.optString("kind") == "own")
-                result.put(key, if (streamingUID || profileName && cannotBeEncodedText(child as String)) child
+                result.put(key, if (streamingUID || (profileName || watchlistName) && cannotBeEncodedText(child as String)) child
                 else if (key == "authenticatedOwnAccountSources")
                     validateNativeOwnAccountArchive(child as? JSONObject ?: reject("Malformed authenticated source archive"))
+                else if (key == "nativeWatchedMigrationEvidence")
+                    validateNativeWatchedMigrationArchive(child as? JSONArray ?: reject("Malformed watched evidence archive"))
+                else if (key == "nativeWatchedMigrationPending")
+                    validateNativeWatchedMigrationPending(child as? JSONArray ?: reject("Malformed pending watched archive"))
+                else if (key == "nativeOwnAccountCandidates")
+                    validateNativeOwnAccountCandidates(child as? JSONObject ?: reject("Malformed pending account candidates"))
                 else if (root && key == "settings" && child != JSONObject.NULL)
                     settings(child, childPath, depth + 1) else json(child, childPath, depth + 1))
             }

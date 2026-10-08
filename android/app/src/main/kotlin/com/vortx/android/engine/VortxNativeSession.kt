@@ -111,6 +111,11 @@ internal interface VortxCheckpointStore {
     fun remember(scope: VortxAccountScope) {}
     /** Reject ambiguous older unindexed checkpoints before creating any blank account. */
     fun verifyFreshAccount(scope: VortxAccountScope) {}
+    /** Setup-only evidence; a missing runtime is never replaced with an empty one. */
+    fun readPreflight(accountID: String): NativeMigrationPreflight? = null
+    fun commitPreflight(next: NativeMigrationPreflight, expected: NativeMigrationPreflight?) {
+        error("Encrypted native migration preflight storage unavailable")
+    }
 }
 
 /** Same sealed format as Apple: nonce(12) + AES-GCM ciphertext + tag(16), account+NUL+owner AAD. */
@@ -128,6 +133,41 @@ internal class VortxEncryptedCheckpointStore(
         val text = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
             .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(plain)).toString()
         return text
+    }
+    private fun seal(scope: VortxAccountScope, snapshot: String): ByteArray {
+        val plain = snapshot.toByteArray(Charsets.UTF_8)
+        require(plain.size <= MAX_BYTES - 28)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, key(scope))
+        require(cipher.iv.size == 12)
+        cipher.updateAAD(scope.authenticatedData)
+        return cipher.iv + cipher.doFinal(plain)
+    }
+    private fun preflightScope(accountID: String) = VortxAccountScope(accountDigest(accountID), "native-migration-preflight-v1")
+    private fun preflightFile(accountID: String) = File(directory, "native-preflight-v1-${accountDigest(accountID)}.sealed")
+    @Synchronized override fun readPreflight(accountID: String): NativeMigrationPreflight? {
+        val target = preflightFile(accountID)
+        val outer = try {
+            require(Files.size(target.toPath()) <= MAX_BYTES)
+            JSONObject(open(preflightScope(accountID), Files.readAllBytes(target.toPath())))
+        } catch (_: java.nio.file.NoSuchFileException) { return null }
+        require(outer.keys().asSequence().toSet() == setOf("schemaVersion", "accountID", "ownerProfileID", "sealedPayload") &&
+            outer.getInt("schemaVersion") == 1 && outer.getString("accountID") == accountID)
+        val scope = VortxAccountScope(accountID, outer.getString("ownerProfileID"))
+        val encoded = outer.getString("sealedPayload")
+        val sealed = java.util.Base64.getDecoder().decode(encoded)
+        require(java.util.Base64.getEncoder().encodeToString(sealed) == encoded)
+        return NativeMigrationPreflight.parse(scope, open(scope, sealed))
+    }
+    @Synchronized override fun commitPreflight(next: NativeMigrationPreflight, expected: NativeMigrationPreflight?) {
+        val prior = readPreflight(next.scope.accountID)
+        require(prior?.raw == expected?.raw && (prior == null || prior.scope == next.scope)) { "Native migration setup changed" }
+        NativeMigrationPreflight.parse(next.scope, next.raw)
+        val outer = JSONObject().put("schemaVersion", 1).put("accountID", next.scope.accountID)
+            .put("ownerProfileID", next.scope.ownerProfileID)
+            .put("sealedPayload", java.util.Base64.getEncoder().encodeToString(seal(next.scope, next.raw)))
+        replace(preflightScope(next.scope.accountID), preflightFile(next.scope.accountID), outer.toString())
+        check(readPreflight(next.scope.accountID)?.raw == next.raw) { "Native migration preflight readback failed" }
     }
     @Synchronized override fun read(scope: VortxAccountScope): String? {
         val target = file(scope)
@@ -164,6 +204,7 @@ internal class VortxEncryptedCheckpointStore(
         return scope
     }
     @Synchronized override fun verifyFreshAccount(scope: VortxAccountScope) {
+        require(readPreflight(scope.accountID) == null) { "Authenticated native migration is still pending" }
         discover(scope.accountID)?.let { require(it == scope); return }
         val files = try { Files.list(directory.toPath()).use { paths -> paths.iterator().asSequence().map { it.toFile() }.toList() } }
             catch (_: java.nio.file.NoSuchFileException) { return }
@@ -184,13 +225,7 @@ internal class VortxEncryptedCheckpointStore(
         check(discover(scope.accountID) == scope) { "Native account locator readback failed" }
     }
     private fun replace(scope: VortxAccountScope, target: File, snapshot: String) {
-        val plain = snapshot.toByteArray(Charsets.UTF_8)
-        require(plain.size <= MAX_BYTES - 28)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key(scope))
-        require(cipher.iv.size == 12)
-        cipher.updateAAD(scope.authenticatedData)
-        val sealed = cipher.iv + cipher.doFinal(plain)
+        val sealed = seal(scope, snapshot)
         Files.createDirectories(directory.toPath())
         val pending = Files.createTempFile(directory.toPath(), "native-checkpoint-", ".pending")
         try {
@@ -238,6 +273,7 @@ internal class VortxNativeSession private constructor(
     private var websiteProfileEditPending: JSONObject,
     private var websiteProfileEditCertificates: JSONObject,
     private val onMutation: () -> Unit,
+    private val beforeOwnerChange: () -> Unit,
 ) : AutoCloseable {
     private data class Slot(val ticket: UUID, val owner: VortxNativeOwner, val bridge: VortxResourceBridge,
                             var completed: List<Pair<String, Long>>? = null)
@@ -255,8 +291,9 @@ internal class VortxNativeSession private constructor(
                  allowNewAccount: Boolean = false, bootstrapActions: List<JSONObject> = emptyList(),
                  initialHostProfiles: JSONObject = JSONObject(), initialHostArchive: JSONObject? = null,
                  initialHostPreferences: JSONObject? = null,
+                 initialLegacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap(),
                  verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
-                 onMutation: () -> Unit = {}, isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
+                 onMutation: () -> Unit = {}, beforeOwnerChange: () -> Unit = {}, isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
             check(isAccountCurrent()) { "Native account changed" }
             scope.rejectCredentials(initialHostProfiles)
             scope.rejectCredentials(initialHostArchive)
@@ -306,6 +343,10 @@ internal class VortxNativeSession private constructor(
                     hostPending = false
                 }
                 hostState = NativeHostPreferences.merge(scope, hostState, initialHostPreferences)
+                val liveRoster = JSONObject(runtime.stateJson()).getJSONObject("roster").getJSONObject("profiles")
+                hostState = NativeHostPreferences.seedWatchlists(scope, hostState, initialLegacyWatchlists.filterKeys {
+                    liveRoster.optJSONObject(it)?.optBoolean("deleted") == false
+                })
                 hostProfiles = NativeHostPreferences.projectProfiles(hostState, hostProfiles,
                     JSONObject(runtime.stateJson()).getJSONObject("roster").getJSONObject("profiles"))
                 NativeHostPreferences.validateProjectedProfiles(hostProfiles)
@@ -340,7 +381,7 @@ internal class VortxNativeSession private constructor(
                 return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent, JSONObject(hostProfiles.toString()), hostPending, hostState,
                     legacyMaterial?.let { JSONObject(it.toString()) }, archive?.let { JSONObject(it.toString()) },
                     legacyBootstrap?.let { JSONObject(it.toString()) },
-                    JSONObject(pendingWebsiteEdits.toString()), JSONObject(websiteCertificates.toString()), onMutation)
+                    JSONObject(pendingWebsiteEdits.toString()), JSONObject(websiteCertificates.toString()), onMutation, beforeOwnerChange)
             } catch (error: Throwable) { runtime.close(); throw error }
         }
     }
@@ -465,7 +506,9 @@ internal class VortxNativeSession private constructor(
                               hostArchive: JSONObject? = null, remoteHostPreferences: JSONObject? = null,
                               globalChanges: JSONObject? = null, acknowledgeHostPreferences: JSONObject? = null,
                               baselineHostProfiles: JSONObject? = null,
-                              verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null): List<String> = owned(owner) {
+                              verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
+                              beforeCommit: () -> Unit = {}, profileFieldChanges: JSONObject? = null,
+                              legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap()): List<String> = owned(owner) {
         actions.forEach(scope::rejectCredentials)
         scope.rejectCredentials(hostProfiles)
         scope.rejectCredentials(hostArchive)
@@ -488,6 +531,11 @@ internal class VortxNativeSession private constructor(
                 pendingPreferences = false
             }
             hostState = NativeHostPreferences.merge(scope, hostState, remoteHostPreferences)
+            val liveRoster = JSONObject(candidate.stateJson()).getJSONObject("roster").getJSONObject("profiles")
+            hostState = NativeHostPreferences.seedWatchlists(scope, hostState, legacyWatchlists.filterKeys {
+                liveRoster.optJSONObject(it)?.optBoolean("deleted") == false
+            })
+            if (profileFieldChanges != null) hostState = NativeHostPreferences.recordProfileFields(scope, hostState, owner.profileID, profileFieldChanges)
             if (globalChanges != null) hostState = NativeHostPreferences.recordGlobals(scope, hostState, globalChanges)
             if (acknowledgeHostPreferences != null && NativeHostPreferences.equal(hostState.getJSONObject("document"), acknowledgeHostPreferences))
                 hostState.put("pending", false)
@@ -502,6 +550,7 @@ internal class VortxNativeSession private constructor(
                 .put("legacyWebsiteBootstrap", legacyWebsiteBootstrap)
                 .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates).toString()
             val state = scope.validateSnapshot(updated)
+            beforeCommit()
             commitCheckpoint(updated)
             check(isAccountCurrent()) { "Native account changed" }
             val prior = JSONObject(before)
@@ -532,6 +581,7 @@ internal class VortxNativeSession private constructor(
         }
     }
     @Synchronized private fun invalidate() {
+        beforeOwnerChange()
         revision = nextRevision.incrementAndGet()
         slots.values.forEach { it.bridge.close() }; slots.clear()
     }

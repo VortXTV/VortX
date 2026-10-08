@@ -25,11 +25,13 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
     private val profiles = NativeProfileAccess { accounts.session() }
     data class State(val mounted: Boolean = false, val profiles: List<UserProfile> = emptyList(), val activeID: String? = null,
                      val streaming: List<NativeAccountCoordinator.StreamingProfile> = emptyList(),
+                     val migration: NativeAccountCoordinator.MigrationStatus? = null,
                      val formProfile: UserProfile? = null, val busy: Boolean = false, val message: String? = null)
     private val mutable = MutableStateFlow(State())
     val state = mutable.asStateFlow()
     private var target: NativeAccountCoordinator.StreamingTarget? = null
     private var request: Job? = null
+    private var retryTarget: NativeAccountCoordinator.MigrationTarget? = null
 
     init {
         refresh()
@@ -45,7 +47,8 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
         val projection = runCatching { NativeProfileAccess.projection(accounts.session().read()) }.getOrNull()
         val streaming = runCatching { accounts.streamingProfiles() }.getOrDefault(emptyList())
         mutable.value = mutable.value.copy(mounted = projection != null,
-            profiles = projection?.profiles ?: streaming.map { it.profile }, activeID = projection?.activeID, streaming = streaming)
+            profiles = projection?.profiles ?: streaming.map { it.profile }, activeID = projection?.activeID, streaming = streaming,
+            migration = runCatching { accounts.migrationStatus() }.getOrNull())
     }
     fun prepare(profileID: String): Prepared? = runCatching { Prepared(accounts.captureStreamingTarget(profileID)) }.getOrElse {
         mutable.value = mutable.value.copy(message = "The profile changed. Open it again before signing in."); null
@@ -72,9 +75,35 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
         }; refresh(); true
     }.getOrElse { mutable.value = mutable.value.copy(message = "The profile changed. Reopen its editor before saving."); false }
     fun close() {
-        request?.cancel(); request = null; target = null
+        request?.cancel(); request = null; target = null; retryTarget = null
         mutable.value = mutable.value.copy(formProfile = null, busy = false, message = null)
         refresh()
+    }
+    fun retryMigration() {
+        if (mutable.value.busy) return
+        val captured = runCatching { accounts.captureMigrationTarget() }.getOrElse {
+            mutable.value = mutable.value.copy(message = "The account changed. Reopen migration setup."); return
+        }
+        retryTarget = captured
+        mutable.value = mutable.value.copy(busy = true, message = null)
+        request = viewModelScope.launch {
+            try {
+                val complete = withContext(Dispatchers.IO) { accounts.retryMigration(captured) }
+                if (retryTarget === captured) {
+                    retryTarget = null
+                    mutable.value = mutable.value.copy(busy = false, message = if (complete) "Preserved account data is ready."
+                        else "Original data is preserved. Episode inventories, profile sign-ins, or Watchlist attribution still need attention.")
+                    refresh()
+                }
+            } catch (cancel: CancellationException) { throw cancel }
+            catch (_: Exception) {
+                if (retryTarget === captured) {
+                    retryTarget = null
+                    mutable.value = mutable.value.copy(busy = false, message = "Migration could not be confirmed. Original history is preserved; reopen setup before retrying.")
+                    refresh()
+                }
+            }
+        }
     }
     fun submit(email: String, password: String) {
         val captured = target ?: return
@@ -87,7 +116,7 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
                     target = null
                     mutable.value = mutable.value.copy(formProfile = null, busy = false,
                         message = if (mounted) "This profile's verified streaming account is ready. Any historical data needing attribution remains pending."
-                            else "Account verified. Complete the remaining profile sign-ins to open the native account.")
+                            else "Account verified. Original history is preserved while episode inventories or remaining profile sign-ins are pending.")
                     refresh()
                 }
             } catch (cancel: CancellationException) { throw cancel }

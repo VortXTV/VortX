@@ -1,6 +1,8 @@
 package com.vortx.android.engine
 
 import com.vortx.android.backup.SettingsBackup
+import com.vortx.android.library.NativeWatchlistCodec
+import com.vortx.android.library.WatchlistEntry
 import java.math.BigDecimal
 import java.util.UUID
 import org.json.JSONArray
@@ -48,12 +50,15 @@ internal object NativeHostPreferences {
     }
     private fun validateFields(fields: JSONObject, profile: Boolean) {
         for (field in fields.keys()) {
-            require(field.isNotBlank() && field.length <= 512)
+            val watchlist = field.startsWith(NativeWatchlistCodec.PREFIX)
+            require(field.isNotBlank() && field.length <= (if (watchlist) NativeWatchlistCodec.MAX_FIELD_LENGTH else 512))
+            require(!watchlist || profile) { "Watchlist is profile-scoped" }
             require(!authority(field)) { "Host field conflicts with native authority" }
             val entry = fields.getJSONObject(field)
             require(entry.keys().asSequence().toSet() == setOf("clock", "actor", "value"))
             clock(entry.get("clock")); actor(entry.getString("actor"))
             val value = entry.get("value")
+            if (watchlist) NativeWatchlistCodec.validate(field, value)
             if (value == JSONObject.NULL) continue
             if (profile) when (field) {
                 "avatar", "email" -> require(value is String) { "Invalid host string preference" }
@@ -70,6 +75,7 @@ internal object NativeHostPreferences {
     private fun integer(value: Any) { require(value is Number); BigDecimal(value.toString()).intValueExact() }
     private fun decimal(value: Any) { require(value is Number && value.toDouble().isFinite()) }
     private fun validateGlobal(field: String, value: Any) {
+        if (field == "vortx.quickViewEnabled") require(value is Boolean)
         when (SettingsBackup.SYNCABLE_SETTING_TYPES[field]) {
             SettingsBackup.SettingType.BOOL -> require(value is Boolean)
             SettingsBackup.SettingType.STRING -> require(value is String)
@@ -161,7 +167,7 @@ internal object NativeHostPreferences {
         for (id in after.keys().asSequence().filter { it != "modifiedSeconds" }.sorted()) {
             val old = before.optJSONObject(id) ?: JSONObject(); val next = after.getJSONObject(id)
             for (field in (old.keys().asSequence().toSet() + next.keys().asSequence().toSet()).sorted()) {
-                if (field in nativeFields || equal(old.opt(field), next.opt(field))) continue
+                if (field in nativeFields || field.startsWith(NativeWatchlistCodec.PREFIX) || equal(old.opt(field), next.opt(field))) continue
                 val bucket = profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }
                 record(result, bucket.getJSONObject("fields"), field, next.opt(field))
             }
@@ -175,6 +181,34 @@ internal object NativeHostPreferences {
         for (field in changes.keys().asSequence().sorted()) {
             if (fields.has(field) && equal(fields.getJSONObject(field).get("value"), changes.get(field))) continue
             record(result, fields, field, changes.get(field))
+        }
+        validate(scope, result.getJSONObject("document"))
+        return result
+    }
+    fun recordProfileFields(scope: VortxAccountScope, local: JSONObject, profileID: String, changes: JSONObject): JSONObject {
+        val result = local(scope, local)
+        val profiles = result.getJSONObject("document").getJSONObject("profiles")
+        val bucket = profiles.optJSONObject(profileID) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(profileID, it) }
+        val fields = bucket.getJSONObject("fields")
+        for (field in changes.keys().asSequence().sorted()) {
+            if (fields.has(field) && equal(fields.getJSONObject(field).get("value"), changes.get(field))) continue
+            record(result, fields, field, changes.get(field))
+        }
+        validate(scope, result.getJSONObject("document"))
+        return result
+    }
+    fun seedWatchlists(scope: VortxAccountScope, local: JSONObject, baseline: Map<String, List<WatchlistEntry>>): JSONObject {
+        val result = local(scope, local)
+        val profiles = result.getJSONObject("document").getJSONObject("profiles")
+        for ((id, items) in baseline) {
+            val fields = (profiles.optJSONObject(id) ?: JSONObject().put("fields", JSONObject()).also { profiles.put(id, it) }).getJSONObject("fields")
+            for (item in items) {
+                val field = NativeWatchlistCodec.field(item.id, item.type)
+                if (fields.has(field)) continue // A remote tombstone or a native edit always wins admission.
+                fields.put(field, JSONObject().put("clock", 0).put("actor", NativeWatchlistCodec.baselineActor(id, item))
+                    .put("value", NativeWatchlistCodec.value(item)))
+                result.put("pending", true)
+            }
         }
         validate(scope, result.getJSONObject("document"))
         return result
@@ -194,6 +228,7 @@ internal object NativeHostPreferences {
             val target = result.optJSONObject(id) ?: JSONObject().put("id", id).put("name", roster.getJSONObject(id).getString("name"))
             val fields = profiles.getJSONObject(id).getJSONObject("fields")
             for (field in fields.keys()) {
+                if (field.startsWith(NativeWatchlistCodec.PREFIX)) continue // Separate per-item ledger, not profile DTO attributes.
                 val value = fields.getJSONObject(field).get("value")
                 if (value == JSONObject.NULL) target.remove(field) else target.put(field, value)
             }

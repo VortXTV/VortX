@@ -129,12 +129,13 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 syncManager === manager && manager.sessionOwnerSnapshot() == captured && action()
             } }
             gate
-        } }) }
+        } }, onAuthorityChanged = { com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority() }) }
     internal fun nativeStreamingAccounts(): NativeAccountCoordinator {
         check(BuildConfig.NATIVE_ENGINE_ENABLED) { "Native streaming accounts are not enabled" }
         return nativeAccounts
     }
     private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess { nativeAccounts.session() } }
+    private val nativeWatchlist by lazy { com.vortx.android.engine.NativeWatchlistAccess(nativeAccounts) }
     private val nativeStreamingAuth by lazy { com.vortx.android.engine.NativeStreamingAuthRepository(nativeAccounts, applicationScope) }
     private val nativeRepository: NativeCatalogRepository by lazy { NativeCatalogRepository(AndroidNativePlaybackResolver(this), nativeAccounts.changes.map { Unit },
         { check(syncManager?.signOut() == true) { "Account sign-out could not be stored securely" } },
@@ -168,6 +169,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // per-profile key and the switch-listener reload hook wired in EngineStremioRepository.
         runCatching { ProfileStore.init(this) }
             .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) {
+            com.vortx.android.library.WatchlistStore.shared(this).installNativeGateway(nativeWatchlist) { BuildConfig.NATIVE_ENGINE_ENABLED }
+        }
         // Bootstrap the RemoteConfig snapshot (baked defaults, signed config.vortx.tv fetch with ETag/304).
         // Loads the last-good cached config synchronously, then refreshes once in the background. Fail-soft:
         // every feature flag + typed value reads its baked (== shipping) default until a remote value lands.

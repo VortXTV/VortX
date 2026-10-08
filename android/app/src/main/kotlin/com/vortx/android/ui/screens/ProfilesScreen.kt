@@ -97,7 +97,7 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
             return
         }
         if (!nativeState.mounted) {
-            NativeStreamingSetup(nativeState, nativeModel::prepare, nativeModel::openPrepared, onBack, modifier)
+            NativeStreamingSetup(nativeState, nativeModel::prepare, nativeModel::openPrepared, nativeModel::retryMigration, nativeModel::close, onBack, modifier)
             return
         }
     }
@@ -219,6 +219,15 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     })
                 }
 
+                nativeState?.migration?.let {
+                    SettingsSection(title = "Preserved account data", footer = if (it.watchlistPending > 0)
+                        "Some Watchlist data has an unknown profile or invalid format and remains preserved without being assigned to Main. Correct the original backup before retrying. Your current native library remains usable."
+                        else "Original history is preserved while exact episode inventories are unavailable. Your current native library remains usable.") {
+                        EditorButton(if (nativeState.busy) "Retrying original sources…" else "Retry preserved data", !nativeState.busy, false,
+                            onClick = { nativeModel?.retryMigration() })
+                        if (nativeState.busy) EditorButton("Cancel retry", true, false, onClick = { nativeModel?.close() })
+                    }
+                }
                 nativeState?.streaming?.filter { it.profile.id == activeId }?.forEach { entry ->
                     SettingsSection(title = "This profile's streaming account", footer =
                         "Sign-in verifies this profile's Stremio identity and imports its independent library and add-ons. The VortX owner account is unchanged.") {
@@ -254,6 +263,7 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 @Composable
 private fun NativeStreamingSetup(state: NativeStreamingAccountViewModel.State, prepare: (String) -> NativeStreamingAccountViewModel.Prepared?,
                                  open: (NativeStreamingAccountViewModel.Prepared) -> Unit,
+                                 retry: () -> Unit, cancel: () -> Unit,
                                  onBack: () -> Unit, modifier: Modifier) {
     var pinTarget by remember { mutableStateOf<NativeStreamingAccountViewModel.Prepared?>(null) }
     Box(modifier.fillMaxSize()) {
@@ -261,9 +271,14 @@ private fun NativeStreamingSetup(state: NativeStreamingAccountViewModel.State, p
             navigationIcon = { IconButton(onClick = onBack) { Icon(VortXIcons.back, "Back") } }) }) { padding ->
             Column(Modifier.fillMaxSize().padding(padding).padding(VortXTheme.spacing.edge).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
-                Text(if (state.streaming.isEmpty()) "Sign into your VortX account to load its authenticated profiles. No device-local roster will be imported automatically."
+                Text(if (state.migration != null) "Authenticated setup is preserved securely. Episode metadata, profile sign-ins, or Watchlist attribution may need attention; no blank replacement is created."
+                    else if (state.streaming.isEmpty()) "Sign into your VortX account to load its authenticated profiles. No device-local roster will be imported automatically."
                     else "These profiles use independent streaming accounts. Verify each account before opening the native library; no blank replacement is created.",
                     style = VortXTheme.type.body)
+                state.migration?.let {
+                    EditorButton(if (state.busy) "Retrying original sources…" else "Retry preserved data", !state.busy, false, onClick = retry)
+                    if (state.busy) EditorButton("Cancel retry", true, false, onClick = cancel)
+                }
                 state.streaming.filter { it.pendingImport }.forEach { entry ->
                     SettingsSection(title = entry.profile.name, footer = "Historical data stays preserved and pending until its original source can be verified.") {
                         EditorButton("Sign in to this profile", true, false, onClick = {

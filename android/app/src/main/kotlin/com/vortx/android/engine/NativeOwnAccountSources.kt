@@ -88,6 +88,13 @@ internal class NativeOwnAccountSource private constructor(
         return row
     }
     companion object {
+        /** Only a previously authenticated sealed host candidate may call this seam. The exact
+         * immutable credential revision must still be available; never borrow a latest-UID slot. */
+        internal fun fromRetained(capture: NativeOwnAccountCredentials.Capture, bytes: ByteArray): NativeOwnAccountSource =
+            capture.authority.withActive {
+                NativeOwnAccountSource(capture.accountID, capture.profileID, capture.verifiedUID, capture.transactionID,
+                    bytes, capture.authority).also { it.legacyDocument() }
+            }
         internal fun fromFetched(capture: NativeOwnAccountCredentials.Capture, uid: String, library: ByteArray, addons: ByteArray, overlay: ByteArray,
                                  witnessedOverlay: Boolean = true): NativeOwnAccountSource = capture.authority.withActive {
             requireNativeStreamingUID(uid); require(uid == capture.verifiedUID) { "Streaming credential identity changed" }

@@ -31,10 +31,15 @@ class NativeOwnAccountCoordinatorTest {
     private val uid = "e9" + "0".repeat(22)
     private class Store : VortxCheckpointStore {
         var value: String? = null; var locator: VortxAccountScope? = null
+        var preflight: NativeMigrationPreflight? = null
         override fun read(scope: VortxAccountScope) = value
         override fun commit(scope: VortxAccountScope, snapshot: String) { scope.validateSnapshot(snapshot); value = snapshot }
         override fun discover(accountID: String) = locator?.takeIf { it.accountID == accountID }
         override fun remember(scope: VortxAccountScope) { locator = scope }
+        override fun readPreflight(accountID: String) = preflight?.takeIf { it.scope.accountID == accountID }
+        override fun commitPreflight(next: NativeMigrationPreflight, expected: NativeMigrationPreflight?) {
+            check(preflight?.raw == expected?.raw); preflight = next
+        }
     }
     private class Journal {
         val values = mutableMapOf<String, String?>()
