@@ -38,7 +38,11 @@ internal class NativeAccountCoordinator(
     internal fun accountFor(session: VortxNativeSession): SessionOwnerSnapshot.Account? = synchronized(lifecycleLock) {
         mounted.get()?.takeIf { it.session === session }?.account
     }
-    /** The caller already owns Session -> auth. This lock never acquires either in reverse order. */
+    /**
+     * Final reclaim fence. Deliberately contains no auth or session calls: writers enter in the
+     * established Session -> authenticated-admission -> lifecycle order and retire never waits
+     * for a session while it owns this lock.
+     */
     internal fun withMountedSession(session: VortxNativeSession, account: SessionOwnerSnapshot.Account, action: () -> Boolean): Boolean = synchronized(lifecycleLock) {
         if (mounted.get()?.let { it.session === session && it.account == account } == true) action() else false
     }
@@ -150,6 +154,9 @@ internal class NativeAccountCoordinator(
             require(remote.getString("scope") == namespace && remote.getString("ownerProfileId") == owner.id)
             requireNotNull(remote.optJSONObject("legacyImport")) { "Native account requires a verified legacy baseline receipt" }
         }
+        // This carrier is immutable source evidence. It is deliberately not folded into the
+        // historical aggregate before native reconciliation; each entry owns its own receipt.
+        val websiteEvents = NativeWebsiteProfileEdits.events(document)
         // Current authenticated legacy material is reconciled against the kernel's acknowledged
         // baseline. Unsupported/missing causal evidence rejects the complete candidate transaction.
         val material = nativeLegacyMaterial(document, roster, resolved.modifiedSeconds)
@@ -174,6 +181,7 @@ internal class NativeAccountCoordinator(
             } else host
             old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive,
                 remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost)
+            websiteEvents.forEach { event -> old.session.applyWebsiteProfileEdit(event) }
             check(isCurrent()) { "Native account changed" }
             project(old.session)
             check(isCurrent() && accountCurrent(account) && mounted.get() === old) { "Native account changed" }
@@ -189,6 +197,8 @@ internal class NativeAccountCoordinator(
             bootstrapActions = syncActions, initialHostProfiles = hostProfiles, initialHostArchive = archive,
             initialHostPreferences = remoteHost, onMutation = onMutation) { accountCurrent(account) } }
             catch (error: Throwable) { (resources as? AutoCloseable)?.close(); throw error }
+        try { websiteEvents.forEach { event -> candidate.applyWebsiteProfileEdit(event) } }
+        catch (error: Throwable) { candidate.close(); throw error }
         try { checkpoints.remember(scope) }
         catch (error: Throwable) { candidate.close(); throw error }
         publish(account, candidate, isCurrent)
