@@ -20,6 +20,8 @@ xcrun swiftc -parse-as-library -warnings-as-errors app/SourcesShared/SourceSettl
 "$continuity_test_dir/episode-candidates"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors app/SourcesShared/SourceSettlementPolicy.swift app/SourcesShared/EpisodeResolutionBudget.swift app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift app/Tests/EpisodeResolutionBudgetTests.swift -o "$continuity_test_dir/episode-budget"
 "$continuity_test_dir/episode-budget"
+xcrun swiftc -parse-as-library -warnings-as-errors app/Tests/AppleCWNextEpisodePreparationContractTests.swift -o "$continuity_test_dir/cw-preparation"
+"$continuity_test_dir/cw-preparation"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift app/Tests/ResumeSeekIntentContractTests.swift -o "$continuity_test_dir/seek-intent"
 "$continuity_test_dir/seek-intent"
 xcrun swiftc -parse-as-library -warnings-as-errors app/SourcesShared/LibraryTombstones.swift app/SourcesShared/AddonTombstones.swift app/Tests/AddonOwnerStorageTests.swift -o "$continuity_test_dir/addon-owner"
