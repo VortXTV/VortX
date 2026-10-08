@@ -48,6 +48,10 @@ targets:
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: Cinema UI Smoke
+        # MPVKit is a static archive with several foreign unwind personalities. Xcode's Debug-dylib
+        # indirection exceeds compact-unwind's per-image personality table before this fixture executable
+        # can link; keeping this diagnostic target as one normal executable avoids that linker-only limit.
+        ENABLE_DEBUG_DYLIB: "NO"
         CODE_SIGNING_ALLOWED: "NO"
         CODE_SIGNING_REQUIRED: "NO"
 schemes:

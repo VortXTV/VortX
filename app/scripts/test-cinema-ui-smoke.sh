@@ -45,8 +45,9 @@ for renderer_contract in \
   'xcodebuild' \
   'cinema-phone.png' \
   'cinema-tablet.png' \
-  'cinema-mac.png'; do
-  rg -Fq "$renderer_contract" SourcesiOS/CinemaUISmokeRendererApp.swift project.yml scripts/render-cinema-ui-smoke.sh SourcesiOS/VortXiOSApp.swift SourcesShared/WatchedIndex.swift
+  'cinema-mac.png' \
+  'ENABLE_DEBUG_DYLIB: "NO"'; do
+  rg -Fq "$renderer_contract" SourcesiOS/CinemaUISmokeRendererApp.swift CinemaUISmokeRenderer.yml project.yml scripts/render-cinema-ui-smoke.sh SourcesiOS/VortXiOSApp.swift SourcesShared/WatchedIndex.swift
 done
 
 fixture_rail="$(sed -n '/struct CinemaFixturePosterRail/,/#endif/p' SourcesiOS/iOSRootView.swift)"
