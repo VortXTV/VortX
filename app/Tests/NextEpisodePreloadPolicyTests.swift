@@ -562,8 +562,9 @@ struct NextEpisodePreloadPolicyTests {
         )
         expect(
             player?.contains("let request = attempt.preparationRequest") == true
-                && player?.contains("let result = await warm(request)") == true,
-            "PlayerScreen passes the admitted attempt request into production warming"
+                && player?.contains("let result = await SeriesSourceSticky.$resolvingChoice.withValue(choice)") == true
+                && player?.contains("await warm(request)") == true,
+            "PlayerScreen warms the admitted request under its captured source/language choice"
         )
         expect(
             detail?.contains("request: request,\n        stride: NextEpisodePreparationBudget.providerRotationStride") == true,
