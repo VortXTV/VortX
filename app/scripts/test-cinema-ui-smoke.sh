@@ -10,6 +10,7 @@ for source in \
   SourcesiOS/iOSDetailView.swift \
   SourcesiOS/CinemaUISmokeHarness.swift \
   SourcesiOS/CinemaUISmokeRendererApp.swift \
+  SourcesiOS/CinemaUISmokeIOSRendererApp.swift \
   SourcesiOS/CinemaJSProviderSourceStub.swift \
   SourcesiOS/CinemaPinnedHTTPClientStub.swift \
   SourcesiOS/CinemaCommunityStreamGatewayStub.swift \
@@ -53,6 +54,22 @@ for renderer_contract in \
   'DEAD_CODE_STRIPPING: "YES"'; do
   rg -Fq "$renderer_contract" SourcesiOS/CinemaUISmokeRendererApp.swift CinemaUISmokeRenderer.yml project.yml scripts/render-cinema-ui-smoke.sh SourcesiOS/VortXiOSApp.swift SourcesShared/WatchedIndex.swift
 done
+for native_renderer_contract in \
+  'platform: iOS' \
+  'PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.cinema-ui-smoke.ios' \
+  'VORTX_NO_EMBEDDED_SERVER' \
+  'CinemaUISmokeIOSRendererApp' \
+  'CINEMA_UI_SMOKE_SURFACE' \
+  'simctl create' \
+  'simctl delete' \
+  'Cinema UI Smoke iPhone 16 Pro' \
+  'Cinema UI Smoke iPad Pro 13 M5'; do
+  rg -Fq "$native_renderer_contract" SourcesiOS/CinemaUISmokeHarness.swift SourcesiOS/CinemaUISmokeIOSRendererApp.swift CinemaUISmokeIOSRenderer.yml scripts/render-cinema-ui-smoke-native.sh
+done
+if rg -n 'CoreBridge\.shared|StremioAccount\(|PlayerScreen\(' SourcesiOS/CinemaUISmokeIOSRendererApp.swift >/dev/null; then
+  print -u2 'native Cinema renderer must not boot production lifecycle owners'
+  exit 1
+fi
 if rg -n -- '-force_load' CinemaUISmokeRenderer.yml >/dev/null; then
   print -u2 'Cinema renderer must not force-load full native archives'
   exit 1

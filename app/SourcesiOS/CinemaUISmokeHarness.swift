@@ -71,6 +71,16 @@ enum CinemaUISmokeSurface: String, CaseIterable {
         default: "\(rawValue)-"
         }
     }
+
+    /// The native simulator renderer selects one static production-component surface per launch. This
+    /// reads only its diagnostic process environment; it has no UserDefaults, account, or provider state.
+    static var requestedFromEnvironment: Self {
+        guard let raw = ProcessInfo.processInfo.environment["CINEMA_UI_SMOKE_SURFACE"],
+              let surface = Self(rawValue: raw) else {
+            return .home
+        }
+        return surface
+    }
 }
 
 private struct CinemaUISmokeSurfaceContent: View {
