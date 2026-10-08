@@ -1,13 +1,5 @@
 import SwiftUI
 
-#if DEBUG
-/// Process-local switch used only while the deterministic Cinema smoke host is mounted.  It prevents
-/// shared artwork cells from scheduling their normal image-loader task; no release build contains it.
-enum CinemaUISmokeRuntime {
-    static var disablesArtworkLoading = false
-}
-#endif
-
 /// The compact, data-honest title preview used by catalog cards. It deliberately renders only fields
 /// already present on `RailItem`; the sheet is a navigation affordance, never a metadata fetcher.
 struct CinemaQuickView: View {

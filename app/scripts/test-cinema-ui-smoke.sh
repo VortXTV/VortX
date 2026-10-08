@@ -17,10 +17,11 @@ for needle in \
   'CinemaSearchResults' \
   'CinemaEpisodeRailCard' \
   'iOSStreamLabel' \
-  'disablesArtworkLoading = true' \
-  'disablesArtworkLoading = false' \
+  'cinemaFixtureDisablesArtworkLoading, true' \
+  'CinemaTabBarChrome' \
+  '.safeAreaInset(edge: .bottom' \
   '#Preview("Cinema UI Smoke · offline")' \
-  'Color.clear.frame(height: 72)'; do
+  'CinemaCompactTabLabel'; do
   rg -Fq "$needle" SourcesiOS/CinemaUISmokeHarness.swift SourcesiOS/iOSRootView.swift SourcesiOS/iOSDetailView.swift SourcesiOS/CinemaPresentation.swift
 done
 

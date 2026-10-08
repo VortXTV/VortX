@@ -617,24 +617,14 @@ struct iOSRootView: View {
     }
 
     private var customTabBar: some View {
-        HStack(spacing: 0) {
-            ForEach(compactTabLayout.primary, id: \.rawValue) { item in
-                tabButton(item)
+        CinemaTabBarChrome {
+            HStack(spacing: 0) {
+                ForEach(compactTabLayout.primary, id: \.rawValue) { item in
+                    tabButton(item)
+                }
+                if !compactTabLayout.overflow.isEmpty { overflowTabMenu }
             }
-            if !compactTabLayout.overflow.isEmpty { overflowTabMenu }
         }
-        #if os(macOS)
-        .focusSection()
-        #endif
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Tabs")
-        // The same floating capsule as TV, with at most five touch targets instead of squeezing
-        // all seven labels into a phone. The shell reserves its real height below scrolling content.
-        .padding(.horizontal, Theme.Space.sm)
-        .padding(.vertical, Theme.Space.xs)
-        .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .padding(.horizontal, Theme.Space.md)
-        .padding(.vertical, Theme.Space.xs)
     }
 
     private var compactTabLayout: (primary: [Tab], overflow: [Tab]) {
@@ -681,30 +671,9 @@ struct iOSRootView: View {
 
     private func compactTabLabel(title: String, icon: String, selected: Bool,
                                  downloadBadge: Bool = false) -> some View {
-        VStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 20, weight: .semibold))
-                .frame(height: 22)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-                .background {
-                    if selected { Capsule().fill(Theme.Palette.accent) }
-                }
-                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
-                .overlay(alignment: .topTrailing) {
-                    if downloadBadge, activeDownloadCount > 0 {
-                        downloadCountBadge(activeDownloadCount)
-                    }
-                }
-            Text(title)
-                .font(.system(size: compactLabelSize, weight: selected ? .semibold : .medium))
-                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-        }
-        .frame(maxWidth: .infinity, minHeight: 44)
-        .padding(.bottom, 2)
-        .contentShape(Rectangle())
+        CinemaCompactTabLabel(title: title, icon: icon, selected: selected,
+                              downloadBadge: downloadBadge ? activeDownloadCount : nil,
+                              fontSize: compactLabelSize)
     }
 
     /// Quiet, persistent "You're offline" strip (#120), shown across every tab while the device has no
@@ -829,6 +798,79 @@ struct iOSRootView: View {
         #else
         return base
         #endif
+    }
+}
+
+/// Shared compact navigation chrome. RootTabView supplies the real destination buttons; the offline
+/// Cinema fixture supplies inert buttons, which lets it render the actual safe-area treatment without
+/// constructing the root's account/session state.
+struct CinemaTabBarChrome<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            #if os(macOS)
+            .focusSection()
+            #endif
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Tabs")
+            .padding(.horizontal, Theme.Space.sm)
+            .padding(.vertical, Theme.Space.xs)
+            .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.vertical, Theme.Space.xs)
+    }
+}
+
+/// Shared compact tab glyph/label treatment. The root continues to own tab selection and download state.
+struct CinemaCompactTabLabel: View {
+    let title: String
+    let icon: String
+    let selected: Bool
+    var downloadBadge: Int? = nil
+    var fontSize: CGFloat = 12
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 20, weight: .semibold))
+                .frame(height: 22)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background { if selected { Capsule().fill(Theme.Palette.accent) } }
+                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+                .overlay(alignment: .topTrailing) {
+                    if let downloadBadge, downloadBadge > 0 {
+                        Text(downloadBadge > 9 ? "9+" : "\(downloadBadge)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(Theme.Palette.onAccent)
+                            .padding(.horizontal, 5)
+                            .frame(minWidth: 16, minHeight: 16)
+                            .background(Theme.Palette.accent, in: Capsule())
+                            .offset(x: 6, y: -6)
+                            .accessibilityLabel("\(downloadBadge) active downloads")
+                    }
+                }
+            Text(title)
+                .font(.system(size: fontSize, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .padding(.bottom, 2)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct CinemaFixtureDisablesArtworkLoadingKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var cinemaFixtureDisablesArtworkLoading: Bool {
+        get { self[CinemaFixtureDisablesArtworkLoadingKey.self] }
+        set { self[CinemaFixtureDisablesArtworkLoadingKey.self] = newValue }
     }
 }
 
@@ -4917,6 +4959,7 @@ struct CachedPosterImage: View {
     let url: String?
     @State private var image: VXPosterImage?
     @State private var failed = false
+    @Environment(\.cinemaFixtureDisablesArtworkLoading) private var disablesArtworkLoading
 
     /// Paint instantly (no task hop, no blank frame) when the decoded image is already in memory. The
     /// `.task` still runs to load a cold poster; on a warm one it returns immediately.
@@ -4936,15 +4979,11 @@ struct CachedPosterImage: View {
                 Theme.Palette.surface1
             }
         }
-        #if DEBUG
-        if CinemaUISmokeRuntime.disablesArtworkLoading {
+        if disablesArtworkLoading {
             image
         } else {
             image.task(id: url) { await load() }
         }
-        #else
-        image.task(id: url) { await load() }
-        #endif
     }
 
     private func imageView(_ img: VXPosterImage) -> Image {

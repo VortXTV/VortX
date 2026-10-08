@@ -7,10 +7,6 @@ import SwiftUI
 /// same shelf, search card, episode card, and source label geometry at representative window widths.
 @MainActor
 struct CinemaUISmokeHarness: View {
-    init() {
-        CinemaUISmokeRuntime.disablesArtworkLoading = true
-    }
-
     var body: some View {
         ScrollView(.horizontal, showsIndicators: true) {
             HStack(alignment: .top, spacing: Theme.Space.lg) {
@@ -22,8 +18,8 @@ struct CinemaUISmokeHarness: View {
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .environmentObject(ThemeManager.shared)
+        .environment(\.cinemaFixtureDisablesArtworkLoading, true)
         .accessibilityLabel("Cinema UI smoke harness")
-        .onDisappear { CinemaUISmokeRuntime.disablesArtworkLoading = false }
     }
 }
 
@@ -59,16 +55,37 @@ private struct CinemaUISmokeViewport: View {
                 }
                 .padding(.vertical, Theme.Space.md)
             }
-            // This real safe-area reservation catches content that would disappear under phone chrome;
-            // navigation itself belongs to RootTabView and is intentionally not booted by this offline host.
-            Color.clear.frame(height: 72).accessibilityHidden(true)
         }
         .frame(width: width, height: height)
         .background(Theme.Palette.canvas)
         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
             .stroke(Theme.Palette.hairline, lineWidth: 1))
+        .safeAreaInset(edge: .bottom, spacing: 0) { CinemaUISmokeTabBar() }
         .accessibilityLabel("\(name) Cinema viewport")
+    }
+}
+
+private struct CinemaUISmokeTabBar: View {
+    @State private var selected = "Home"
+    private let tabs = [
+        ("Home", "house.fill"), ("Discover", "safari"), ("Library", "books.vertical"), ("Search", "magnifyingglass")
+    ]
+
+    var body: some View {
+        CinemaTabBarChrome {
+            HStack(spacing: 0) {
+                ForEach(tabs, id: \.0) { tab in
+                    Button { selected = tab.0 } label: {
+                        CinemaCompactTabLabel(title: tab.0, icon: tab.1, selected: selected == tab.0,
+                                              downloadBadge: tab.0 == "Library" ? 2 : nil)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(tab.0)
+                    .accessibilityHint("Switches the fixture to \(tab.0)")
+                }
+            }
+        }
     }
 }
 
