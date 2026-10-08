@@ -23,6 +23,9 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.vortx.android.ui.theme.VortXIcons
@@ -57,6 +60,14 @@ fun EpisodeRow(
         modifier = modifier
             .fillMaxWidth()
             .vortxGlassRow()
+            .semantics {
+                contentDescription = "$code, $title"
+                stateDescription = when {
+                    watched -> "Watched"
+                    progress != null -> "In progress"
+                    else -> "Unwatched"
+                }
+            }
             .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier)
             .then(
                 if (onLongClick != null) {
@@ -70,7 +81,7 @@ fun EpisodeRow(
     ) {
         Box(
             modifier = Modifier
-                .width(140.dp)
+                .width(168.dp)
                 .aspectRatio(16f / 9f)
                 .clip(VortXShapes.chip)
                 .alpha(if (watched) 0.55f else 1f),
@@ -101,7 +112,7 @@ fun EpisodeRow(
             Text(
                 text = title,
                 style = VortXTheme.type.cardTitle,
-                maxLines = 1,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
             )
             airDate?.let {

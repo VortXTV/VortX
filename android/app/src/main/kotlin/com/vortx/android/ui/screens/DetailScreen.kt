@@ -106,6 +106,7 @@ import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.components.cinemaCardFacts
 import com.vortx.android.ui.components.DefaultEpisodeThumb
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.EpisodeRow
@@ -1423,9 +1424,10 @@ private fun SimilarRail(type: MediaType, titles: List<MetaItem>, onOpen: (MetaIt
             items(titles) { item ->
                 PosterCard(
                     title = item.name,
-                    subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · ").ifBlank { null },
+                    subtitle = cinemaCardFacts(item),
                     onClick = { onOpen(item) },
                     modifier = Modifier.width(120.dp),
+                    cinema = true,
                     art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                 )
             }
@@ -1456,9 +1458,10 @@ private fun CollectionRail(collection: CollectionClient.MovieCollection, onOpen:
             items(collection.parts) { item ->
                 PosterCard(
                     title = item.name,
-                    subtitle = item.year,
+                    subtitle = cinemaCardFacts(item),
                     onClick = { onOpen(item) },
                     modifier = Modifier.width(120.dp),
+                    cinema = true,
                     art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                 )
             }

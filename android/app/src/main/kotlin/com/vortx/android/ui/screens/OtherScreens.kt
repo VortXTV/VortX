@@ -70,6 +70,7 @@ import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.CollectionsHub
 import com.vortx.android.ui.components.CollectionsBrowseScreen
+import com.vortx.android.ui.components.cinemaCardFacts
 import com.vortx.android.ui.components.rememberDiscoverHub
 import kotlinx.coroutines.launch
 import com.vortx.android.ui.components.EmptyState
@@ -89,8 +90,10 @@ import com.vortx.android.ui.search.searchResultSectionHeaderKey
 import com.vortx.android.ui.search.searchResultSections
 import com.vortx.android.ui.search.titleResourceId
 import com.vortx.android.ui.theme.VortXIcons
+import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.LibraryViewModel
 import com.vortx.android.ui.viewmodel.SearchViewModel
@@ -685,7 +688,14 @@ private fun SettingRow(
         modifier = modifier
             .fillMaxWidth()
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-            .padding(vertical = VortXTheme.spacing.sm),
+            // Settings is the compact touch control surface: a direct, high-contrast card edge makes
+            // entries easy to scan without turning the page into a stack of floating shadows.
+            .vortxGlass(
+                shape = VortXShapes.card,
+                fillAlpha = VortXGlass.cardFillAlpha,
+                shadow = VortXGlass.Shadow.flat,
+            )
+            .padding(horizontal = VortXTheme.spacing.md, vertical = VortXTheme.spacing.sm),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
         Icon(icon, contentDescription = null, tint = colors.accent)
@@ -769,11 +779,12 @@ internal fun PosterGrid(
                 Box {
                     PosterCard(
                         title = item.name,
-                        subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
+                        subtitle = cinemaCardFacts(item),
                         onClick = { onItem(item) },
                         progress = item.progress,
                         watched = item.watched,
                         menuItem = if (showMenu) item else null,
+                        cinema = true,
                         art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                     )
                     if (onRemove != null) {

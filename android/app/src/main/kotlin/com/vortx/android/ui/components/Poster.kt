@@ -141,7 +141,7 @@ fun PosterRail(
                 val menu = posterMenuFor(catalog)
                 PosterCard(
                     title = item.name,
-                    subtitle = item.caption ?: listOfNotNull(item.year, item.type.label).joinToString(" · "),
+                    subtitle = cinemaCardFacts(item),
                     onClick = { onItem(item) },
                     // Continue Watching items carry a watched fraction; the card draws its accent
                     // progress track for them (null on plain catalog items = no track).
@@ -154,6 +154,7 @@ fun PosterRail(
                         menu == PosterCardMenu.CONTINUE_WATCHING && onRemoveFromContinueWatching != null
                     ) ({ onRemoveFromContinueWatching(item) }) else null,
                     art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
+                    cinema = true,
                     modifier = Modifier.width(posterStyle.width.compactWidth).padding(end = VortXTheme.spacing.sm),
                 )
             }

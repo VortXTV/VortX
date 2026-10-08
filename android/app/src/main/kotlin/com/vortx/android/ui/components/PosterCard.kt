@@ -3,6 +3,7 @@ package com.vortx.android.ui.components
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -83,6 +84,8 @@ fun PosterCard(
     menu: PosterCardMenu = if (menuItem == null) PosterCardMenu.NONE else PosterCardMenu.CATALOG,
     onDetails: (() -> Unit)? = null,
     onRemoveFromContinueWatching: (() -> Unit)? = null,
+    /** Touch presentation opts into the direct-accent cinema frame; TV retains its focus/elevation style. */
+    cinema: Boolean = false,
     art: @Composable BoxScope.() -> Unit = { DefaultPosterArt(title) },
 ) {
     val colors = VortXTheme.colors
@@ -139,8 +142,15 @@ fun PosterCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(aspect)
-                .vortxShadow(elevationSpec, cardShape)
-                .clip(cardShape),
+                .then(if (cinema) Modifier else Modifier.vortxShadow(elevationSpec, cardShape))
+                .clip(cardShape)
+                .then(
+                    if (cinema) Modifier.border(
+                        width = if (active) 2.dp else 1.dp,
+                        color = if (active) colors.accent else colors.hairline.copy(alpha = 0.82f),
+                        shape = cardShape,
+                    ) else Modifier,
+                ),
         ) {
             art()
             if (watched) {
