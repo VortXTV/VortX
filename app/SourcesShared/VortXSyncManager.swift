@@ -545,6 +545,38 @@ final class VortXSyncManager: ObservableObject {
         // Only a real syncable delta may defer receiving peer profile edits.
         if noteLocalSettingsChange() { requestSyncSoon() }
     }
+    private var pendingLocalRosterPush: CredentialScopeRegistry.Capture?
+
+    /// Explicit local persistence is stronger evidence than a queued defaults notification.
+    /// The caller excludes housekeeping and remote profile-edit application.
+    private func noteLocalRosterMutation() {
+        guard isSignedIn else { return }
+        let capture = credentialAuthority.capture()
+        guard isCurrent(capture) else { return }
+        let keys: Set<String> = ["stremiox.profiles", "stremiox.profiles.modified"]
+        var dirty = dirtySettings
+        SettingsDirtyKeys.mark(keys, at: Date().timeIntervalSince1970, into: &dirty)
+        dirtySettings = dirty
+        let current = currentSyncableDomain()
+        for key in keys { settingsShadow[key] = current[key] }
+        if isApplyingRemote { pendingLocalRosterPush = capture }
+        else { requestSyncSoon() }
+    }
+
+    private func drainLocalRosterPush() {
+        guard !isApplyingRemote, let capture = pendingLocalRosterPush else { return }
+        pendingLocalRosterPush = nil
+        guard isSignedIn, isCurrent(capture) else { return }
+        requestSyncSoon()
+    }
+
+    nonisolated static func localRosterDidPersist() {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { shared.noteLocalRosterMutation() }
+        } else {
+            DispatchQueue.main.sync { shared.noteLocalRosterMutation() }
+        }
+    }
     /// Clear the keys a CONFIRMED push carried up, guarded by the stamp `snapshot` taken when that push began so a
     /// key re-edited mid-push stays protected (see `SettingsDirtyKeys.clearPushed`). Under the suppression window:
     /// it is a `vortx.sync.` UserDefaults write and must not arm a self-echo push.
@@ -3771,6 +3803,7 @@ final class VortXSyncManager: ObservableObject {
             // the snapshot captures the user's value for it and it stays dirty until its own push confirms.
             self?.refreshSettingsShadow()
             self?.isApplyingRemote = false
+            self?.drainLocalRosterPush()
         }
     }
 

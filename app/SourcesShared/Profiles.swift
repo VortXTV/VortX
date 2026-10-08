@@ -1216,10 +1216,9 @@ final class ProfileStore: ObservableObject {
     }
 
     private func persist(touch: Bool = true) {
+        guard let data = try? JSONEncoder().encode(profiles) else { return }
         let writeRosterAndActive = {
-            if let data = try? JSONEncoder().encode(self.profiles) {
-                UserDefaults.standard.set(data, forKey: Self.listKey)
-            }
+            UserDefaults.standard.set(data, forKey: Self.listKey)
             UserDefaults.standard.set(self.activeID?.uuidString, forKey: Self.activeKey)
         }
         if touch && !applyingProfileEdits {
@@ -1228,6 +1227,9 @@ final class ProfileStore: ObservableObject {
             writeRosterAndActive()
             UserDefaults.standard.set(ProfileRosterSyncPolicy.nextLocalClock(
                 now: Date().timeIntervalSince1970, prior: rosterModified.timeIntervalSince1970), forKey: Self.modifiedKey)
+            // Selection can immediately perform suppressed housekeeping before defaults notifications
+            // drain. Protect this real edit synchronously rather than losing its dirty mark on rebaseline.
+            VortXSyncManager.localRosterDidPersist()
             schedulePushRoster()
         } else {
             // Routine housekeeping (normalizeOwner re-key, legacy migrations, per-device selection, tombstone
