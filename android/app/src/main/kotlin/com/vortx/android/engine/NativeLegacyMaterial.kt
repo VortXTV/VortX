@@ -16,7 +16,7 @@ import com.vortx.android.engine.LegacyWatchedBitfieldMigrationEvidence.SourceRow
  * resolve the FULL account roster first and retain the encrypted original document and full profile
  * preferences beside the native projection. This is not a decoder for an unscoped device cache.
  *
- * Unsupported/ambiguous evidence fails closed: no wall-clock reads, guessed account bindings, guessed
+ * Unsupported/ambiguous evidence fails closed: no wall-clock mutation stamps, guessed account bindings, guessed
  * library types, opaque-bitfield decoding, or treating a saved-only overlay row as a viewing event.
  */
 internal fun nativeLegacyMaterial(
@@ -181,22 +181,60 @@ private class LegacyMaterialAdapter(
         val intents = linkedMapOf<String, JSONObject>()
         objectField(vortx, "deletedAddonsTs")?.let { stamps -> for (raw in stamps.keys()) {
             val entry = stamps.optJSONObject(raw) ?: fail("Malformed add-on intent")
+            requireMaterial(entry.keys().asSequence().toSet().all { it in setOf("addedAt", "removedAt", "intentV3") }, "Unsupported add-on intent fields")
+            for (field in listOf("addedAt", "removedAt")) if (entry.has(field) && !entry.isNull(field)) validateAddonTime(entry.get(field))
             val url = resolve(raw)
             val target = intents.getOrPut(url) { JSONObject().put("transportUrl", url) }
             mergeClock(entry, target, "addedAt", "addedAtMs"); mergeClock(entry, target, "removedAt", "removedAtMs")
+            if (entry.has("intentV3")) {
+                val v3 = entry.getJSONObject("intentV3")
+                validateAddonV3(v3)
+                val prior = target.optJSONObject("intentV3")
+                // Preserve all causal metadata for the shared kernel's bootstrap reducer. The V3
+                // winner can legitimately disagree with scalar maxima; never fabricate a clock.
+                target.put("intentV3", if (prior == null) NativeWebsiteAddonEdits.detached(v3) else mergeAddonV3(prior, v3))
+            }
         } }
         for (raw in strings(arrayField(vortx, "deletedAddons"), "deletedAddons")) {
             val url = resolve(raw)
             // Exact shipping AddonTombstones.MIGRATION_EPOCH_MS, not a fabricated viewing/now clock.
-            if (!hasPositiveIntent(intents[url])) intents.getOrPut(url) { JSONObject().put("transportUrl", url) }.put("removedAtMs", 1.0)
+            if (!hasPositiveIntent(intents[url]) && intents[url]?.has("intentV3") != true)
+                intents.getOrPut(url) { JSONObject().put("transportUrl", url) }.put("removedAtMs", 1.0)
         }
         for (raw in strings(arrayField(document, "webAddonRemovals"), "webAddonRemovals")) {
             // Shipping code mints a local clock for an unseen web removal. Migration is pure: a real
             // timestamp must be reconciled by the account layer rather than fabricated here.
-            requireMaterial(hasPositiveIntent(intents[resolve(raw)]), "Unclocked web add-on removal requires reconciliation")
+            requireMaterial(hasPositiveIntent(intents[resolve(raw)]) || intents[resolve(raw)]?.has("intentV3") == true,
+                "Unclocked web add-on removal requires reconciliation")
         }
         val order = strings(arrayField(document, "addonOrder"), "addonOrder").map(::resolve).distinct()
         return JSONObject().put("items", JSONArray(descriptors.values)).put("order", JSONArray(order)).put("intents", JSONArray(intents.values))
+    }
+
+    private fun validateAddonV3(value: JSONObject) {
+        requireMaterial(value.keys().asSequence().toSet() == setOf("version", "counter", "eventId", "state", "wallTime", "legacyRemovedSeen", "legacyAddedSeen"), "Unsupported V3 add-on intent")
+        requireMaterial(value.get("version") is Number && BigDecimal(value.get("version").toString()).compareTo(BigDecimal(3)) == 0, "Unsupported add-on intent version")
+        NativeWebsiteAddonEdits.requireCounter(value.get("counter"))
+        requireMaterial(value.get("eventId") is String && Regex("[0-9a-f]{32}").matches(value.getString("eventId")), "Malformed add-on event ID")
+        requireMaterial(value.get("state") in setOf("present", "removed"), "Malformed add-on intent state")
+        for (field in listOf("wallTime", "legacyRemovedSeen", "legacyAddedSeen")) validateAddonTime(value.get(field))
+    }
+    private fun mergeAddonV3(left: JSONObject, right: JSONObject): JSONObject {
+        val counter = java.math.BigInteger(left.getString("counter")).compareTo(java.math.BigInteger(right.getString("counter")))
+        val order = if (counter == 0) left.getString("eventId").compareTo(right.getString("eventId")) else counter
+        if (order == 0) requireMaterial(left.get("state") == right.get("state") &&
+            NativeHostPreferences.equal(left.get("wallTime"), right.get("wallTime")), "Conflicting aliased V3 event")
+        return NativeWebsiteAddonEdits.detached(if (order >= 0) left else right).also { winner ->
+            // Exact shipping writer alias merge: keep winning event, merge seen maxima separately.
+            for (field in listOf("legacyRemovedSeen", "legacyAddedSeen")) winner.put(field,
+                if (BigDecimal(left.get(field).toString()) >= BigDecimal(right.get(field).toString())) left.get(field) else right.get(field))
+        }
+    }
+    private fun validateAddonTime(value: Any) {
+        requireMaterial(value is Number, "Malformed add-on intent time")
+        val time = runCatching { BigDecimal(value.toString()) }.getOrElse { fail("Malformed add-on intent time") }
+        requireMaterial(time.signum() >= 0 && time <= BigDecimal.valueOf(NativeWebsiteAddonEdits.MAX_CLOCK) &&
+            time <= BigDecimal.valueOf(System.currentTimeMillis() + 48L * 60 * 60 * 1000), "Invalid or future add-on intent time")
     }
 
     private fun ownerLibrary(): JSONObject {

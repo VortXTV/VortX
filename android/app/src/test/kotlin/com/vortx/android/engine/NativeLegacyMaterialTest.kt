@@ -21,6 +21,43 @@ class NativeLegacyMaterialTest {
         assertTrue("Expected '$phrase', got $error", error is IllegalArgumentException && error.message.orEmpty().contains(phrase))
     }
 
+    private fun addonV3(counter: String = "2", state: String = "removed") = JSONObject().put("version", 3).put("counter", counter)
+        .put("eventId", "e9" + "0".repeat(30)).put("state", state).put("wallTime", 1000.125).put("legacyRemovedSeen", 300).put("legacyAddedSeen", 200)
+
+    @Test fun `known addon V3 is forwarded intact despite scalar intent disagreement`() {
+        val url = "https://fixture.invalid/manifest.json"
+        val intent = addonV3()
+        val doc = document(JSONObject().put("deletedAddonsTs", JSONObject().put(url, JSONObject().put("addedAt", 200).put("removedAt", 100).put("intentV3", intent)))
+            .put("deletedAddons", JSONArray().put(url)))
+        val actual = material(doc).getJSONObject("addons").getJSONObject(owner.id).getJSONArray("intents").getJSONObject(0)
+        assertTrue(NativeHostPreferences.equal(intent, actual.getJSONObject("intentV3")))
+        assertEquals(200.0, actual.getDouble("addedAtMs"), 0.0)
+        assertEquals(100.0, actual.getDouble("removedAtMs"), 0.0)
+        NativeHostDocument.requireCredentialFree(actual)
+    }
+
+    @Test fun `addon V3 alias merge keeps winner and component seen maxima without flattening`() {
+        val url = "https://fixture.invalid/Config/manifest.json"
+        val descriptor = JSONObject().put("transportUrl", url).put("manifest", JSONObject().put("id", "fixture").put("name", "Fixture"))
+        val older = addonV3("1", "present").put("legacyRemovedSeen", 500)
+        val newer = addonV3("2", "removed").put("legacyAddedSeen", 600)
+        val doc = document(JSONObject().put("addons", JSONArray().put(descriptor)).put("deletedAddonsTs", JSONObject()
+            .put(url, JSONObject().put("addedAt", 200).put("intentV3", older))
+            .put(url.lowercase(), JSONObject().put("removedAt", 100).put("intentV3", newer))))
+        val v3 = material(doc).getJSONObject("addons").getJSONObject(owner.id).getJSONArray("intents").getJSONObject(0).getJSONObject("intentV3")
+        assertEquals("2", v3.getString("counter")); assertEquals("removed", v3.getString("state"))
+        assertEquals(500, v3.getInt("legacyRemovedSeen")); assertEquals(600, v3.getInt("legacyAddedSeen"))
+    }
+
+    @Test fun `unknown malformed or future addon intents fail rather than dropping causal metadata`() {
+        val url = "https://fixture.invalid/manifest.json"
+        fun intent(value: JSONObject) = document(JSONObject().put("deletedAddonsTs", JSONObject().put(url, value)))
+        failure(intent(JSONObject().put("future", true)), "Unsupported add-on intent fields")
+        failure(intent(JSONObject().put("intentV3", addonV3().put("future", true))), "Unsupported V3")
+        assertTrue(runCatching { material(intent(JSONObject().put("intentV3", addonV3("01")))) }.isFailure)
+        failure(intent(JSONObject().put("intentV3", addonV3().put("wallTime", System.currentTimeMillis() + 49L * 60 * 60 * 1000))), "future")
+    }
+
     @Test fun `pending or malformed website profile edits never bypass complete material validation`() {
         for (edits in listOf<Any>(JSONObject().put(owner.id, JSONObject().put("name", "Website name")), JSONArray(), "opaque")) {
             failure(document().put("profileEdits", edits), "Pending profile edits")

@@ -84,7 +84,12 @@ internal object NativeHostDocument {
                 // Other values (including recognizable encoded secrets) still receive inspection.
                 val streamingUID = child is String && Regex("[0-9a-f]{24}").matches(child) &&
                     (key == "verifiedStreamingUid" || key == "value" && value.optString("kind") == "own")
-                result.put(key, if (streamingUID || (profileName || watchlistName) && cannotBeEncodedText(child as String)) child
+                // Website event IDs are literal 128-bit identities, not base64 payloads. Admit
+                // only the exact typed event/receipt/provenance/V3 shapes; unknown strings and
+                // every other field still pass through recursive credential inspection.
+                val websiteAddonID = key == "eventId" && child is String && Regex("[0-9a-f]{32}").matches(child) &&
+                    websiteAddonIdentity(value)
+                result.put(key, if (streamingUID || websiteAddonID || (profileName || watchlistName) && cannotBeEncodedText(child as String)) child
                 else if (key == "authenticatedOwnAccountSources")
                     validateNativeOwnAccountArchive(child as? JSONObject ?: reject("Malformed authenticated source archive"))
                 else if (key == "nativeWatchedMigrationEvidence")
@@ -96,6 +101,18 @@ internal object NativeHostDocument {
                 else if (root && key == "settings" && child != JSONObject.NULL)
                     settings(child, childPath, depth + 1) else json(child, childPath, depth + 1))
             }
+        }
+
+        private fun websiteAddonIdentity(value: JSONObject): Boolean {
+            val keys = value.keys().asSequence().toSet()
+            val schemaOne = value.opt("schemaVersion") is Number && value.optDouble("schemaVersion") == 1.0
+            val fields = setOf("schemaVersion", "eventId", "counter", "wallTime", "scope", "ownerProfileId", "profileId", "expectedBinding", "observed", "mutations")
+            return value.opt("counter") is String && Regex("0|[1-9][0-9]{0,19}").matches(value.getString("counter")) && (
+                schemaOne && (keys - "order" == fields ||
+                    keys == setOf("schemaVersion", "eventId", "counter", "fingerprint", "scope", "ownerProfileId", "profileId", "expectedBinding") ||
+                    keys == setOf("schemaVersion", "counter", "eventId", "fingerprint", "observedClock")) ||
+                value.opt("version") is Number && value.optDouble("version") == 3.0 &&
+                    keys == setOf("version", "counter", "eventId", "state", "wallTime", "legacyRemovedSeen", "legacyAddedSeen"))
         }
 
         /** Names such as "Independent" accidentally decode to quote + invalid UTF-8. This is a

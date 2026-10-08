@@ -352,7 +352,7 @@ internal class NativeAccountCoordinator(
     }
 
     override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean = mutex.withLock {
-        require(nativeMigrationSidecars.none(document::has)) { "Device-local migration evidence is not an authenticated cloud source" }
+        require(nativeMigrationSidecars.none(document::has) && !document.has("websiteAddonEditPending")) { "Device-local migration evidence is not an authenticated cloud source" }
         applyDocumentLocked(account, document, isCurrent)
     }
     private suspend fun applyDocumentLocked(account: SessionOwnerSnapshot.Account, incomingDocument: JSONObject, isCurrent: () -> Boolean,
@@ -383,6 +383,7 @@ internal class NativeAccountCoordinator(
         // This carrier is immutable source evidence. It is deliberately not folded into the
         // historical aggregate before native reconciliation; each entry owns its own receipt.
         val websiteEvents = NativeWebsiteProfileEdits.events(document)
+        val websiteAddonEvents = NativeWebsiteAddonEdits.events(document, scope)
         val legacyAggregate = document.opt("profileEdits").takeIf { value -> value != null && value != JSONObject.NULL &&
             (value !is JSONObject || value.length() > 0) }
         // The historical aggregate must never be folded by the broad legacy importer. Its narrow
@@ -391,7 +392,7 @@ internal class NativeAccountCoordinator(
         // library/add-on/watch source values may not: stripping a nested encoded secret there
         // would bless a different descriptor or migration receipt than the authenticated input.
         val sourceFields = JSONObject()
-        for (key in listOf("addons", "library", "addonOrder", "webAddonRemovals", "webProgress"))
+        for (key in listOf("addons", "library", "addonOrder", "webAddonRemovals", "webProgress", "webAddonEdits"))
             if (document.has(key)) sourceFields.put(key, document.get(key))
         document.optJSONObject("vortx")?.let { original ->
             val fields = JSONObject()
@@ -410,6 +411,9 @@ internal class NativeAccountCoordinator(
         val capturedUpdate = capturedRead?.let { old!!.session.updates.value }
         val retained = capturedRead?.state
             ?: checkpoints.read(scope)?.let(scope::validateSnapshot)
+        // Bound the complete immutable source union before installing even the base merge. A
+        // pruned cloud queue never discards a local unacknowledged historical source.
+        NativeWebsiteAddonEdits.union(scope, retained?.optJSONObject("websiteAddonEditPending") ?: NativeWebsiteAddonEdits.emptyPending(), websiteAddonEvents)
         val native = remote ?: retained?.optJSONObject("nativeSync")
         val hasNative = native != null
         val preflight = checkpoints.readPreflight(namespace)?.also { require(it.scope == scope) { "Native setup owner changed" } }
@@ -535,6 +539,14 @@ internal class NativeAccountCoordinator(
                 }) { "Native account changed" } }
             } }
             websiteEvents.forEach { event -> old.session.applyWebsiteProfileEdit(event) }
+            old.session.owned(old.session.read().owner) {
+                withAccountAdmission(account, isCurrent) { check(withMountedSession(old.session, account) {
+                    old.session.applyWebsiteAddonEdits(websiteAddonEvents, beforeCommit = {
+                        operationJob?.ensureActive(); check(isCurrent() && operationCurrent() && accountCurrent(account)) { "Native website add-on account changed" }
+                    })
+                    true
+                }) { "Native account changed" } }
+            }
             legacyAggregate?.let { aggregate -> old.session.applyLegacyWebsiteAggregate(aggregate) }
             check(isCurrent()) { "Native account changed" }
             project(old.session)
@@ -567,6 +579,12 @@ internal class NativeAccountCoordinator(
                 throw error
             }
         try { websiteEvents.forEach { event -> candidate.applyWebsiteProfileEdit(event) } }
+        catch (error: Throwable) { candidate.close(); throw error }
+        try { candidate.owned(candidate.read().owner) {
+            withAccountAdmission(account, isCurrent) { candidate.applyWebsiteAddonEdits(websiteAddonEvents, beforeCommit = {
+                operationJob?.ensureActive(); check(isCurrent() && accountCurrent(account)) { "Native website add-on account changed" }
+            }) }
+        } }
         catch (error: Throwable) { candidate.close(); throw error }
         try { legacyAggregate?.let { aggregate -> candidate.applyLegacyWebsiteAggregate(aggregate) } }
         catch (error: Throwable) { candidate.close(); throw error }

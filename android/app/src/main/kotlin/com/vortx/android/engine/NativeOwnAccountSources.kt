@@ -195,7 +195,7 @@ internal class NativeOwnAccountBaseline private constructor(val scope: VortxAcco
         fun validate(bindings: VortxRuntimeBindings, scope: VortxAccountScope, document: JSONObject,
                      retainedSourceEnvelopes: Map<String, ByteArray> = emptyMap(), activeBindings: Boolean = true,
                      priorDocument: JSONObject? = null, retainedSourceUIDs: Map<String, String> = emptyMap()): NativeOwnAccountBaseline {
-            require(document.getInt("schemaVersion") in 1..4 && document.getString("scope") == scope.accountID &&
+            require(document.getInt("schemaVersion") in 1..5 && document.getString("scope") == scope.accountID &&
                 document.getString("ownerProfileId") == scope.ownerProfileID)
             return VortxNativeRuntime.create(bindings, scope.ownerProfileID, "Owner").use { runtime ->
                 for (action in listOfNotNull(JSONObject().put("type", "bind_sync_scope").put("scope", scope.accountID),
@@ -204,7 +204,7 @@ internal class NativeOwnAccountBaseline private constructor(val scope: VortxAcco
                     check(JSONObject(runtime.dispatch(action.toString())).getBoolean("ok")) { "Native own-account document rejected" }
                 }
                 val validated = JSONObject(runtime.stateJson()).getJSONObject("nativeSync")
-                require(validated.getInt("schemaVersion") in 3..4)
+                require(validated.getInt("schemaVersion") in 3..5)
                 val receipt = validated.getJSONObject("legacyImport")
                 require(receipt.getInt("schemaVersion") in 1..2)
                 val baseline = JSONObject(receipt.getJSONObject("baseline").toString())
