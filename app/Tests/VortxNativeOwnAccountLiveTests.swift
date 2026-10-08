@@ -1,6 +1,19 @@
 import Foundation
 import CryptoKit
 
+private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Sendable {
+    private let condition = NSCondition()
+    private var started = false
+    private var released = false
+    var isStarted: Bool { condition.lock(); defer { condition.unlock() }; return started }
+    func release() { condition.lock(); released = true; condition.broadcast(); condition.unlock() }
+    func withActive(_ operation: () throws -> Void) throws {
+        condition.lock(); started = true; condition.broadcast()
+        while !released { condition.wait() }
+        condition.unlock(); try operation()
+    }
+}
+
 @main struct VortxNativeOwnAccountLiveTests {
     static func check(_ value: Bool, line: UInt = #line) { precondition(value, "own account live fixture line \(line)") }
     static func raw(_ value: VortxJSON) throws -> String { String(decoding: try JSONEncoder().encode(value), as: UTF8.self) }
@@ -139,6 +152,7 @@ import CryptoKit
                                  source: source, directory: directory.appendingPathComponent("rebind"))
         try await coldPendingRepair(scope: scope, owner: owner, own: own, native: state["nativeSync"]!,
                                     source: source, directory: directory.appendingPathComponent("pending-repair"))
+        try await unattributedColdPeer(scope: scope, owner: owner, own: own, directory: directory.appendingPathComponent("unknown-overlay"))
         print("Own-account actual C: authenticated raw producer→material2/schema3, isolated buckets, original/latest sealed source, retired-source checkpoint fence and token-free native cold peer passed")
     }
 
@@ -184,8 +198,26 @@ import CryptoKit
         let target = try VortxNativeProfiles.ownTarget(material: JSONDecoder().decode(VortxJSON.self, from: repairMaterial), profileID: own.id)
         let request = try VortxNativeProfiles.AccountRebindRequest(scope: scope.account, ownerProfileID: scope.ownerProfileID,
             transactionID: "fixture-pending-repair", expected: VortxNativeProfiles.expectedBinding(state: before, profileID: own.id), target: .own(target))
-        _ = try await session.dispatch([raw(VortxNativeProfiles.rebindAction(profileID: own.id, request: request))], now: 1800000002,
-            sourceAuthority: authority, authenticatedSourceArchive: VortxNativeOwnAccountProducer.archive([repair], pendingOverlays: [:]))
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], changed: { _ in })
+        let staleAuthority = VortxNativeOwnAccountProducer.Authority(generations: [], validate: facade.captureSourceFence())
+        let gate = OwnSourceCommitGate()
+        let rebindTask = Task {
+            try await facade.mutateProfiles([VortxNativeProfiles.rebindAction(profileID: own.id, request: request)], hostEdits: [],
+                expectedProfileID: owner.id.uuidString, expectedAccountGeneration: facade.accountGeneration, sourceAuthority: gate,
+                authenticatedSourceArchive: VortxNativeOwnAccountProducer.archive([repair], pendingOverlays: [:]))
+        }
+        while !gate.isStarted { await Task.yield() }
+        let staleMerge = Task {
+            try await facade.mergeAccountDocument(nil, hostRemote: nil, legacyMaterial: retained, sourceAuthority: staleAuthority,
+                authenticatedSourceArchive: VortxNativeOwnAccountProducer.archive([], pendingOverlays: [own.id.uuidString: pending]))
+        }
+        for _ in 0..<10 { await Task.yield() }
+        gate.release()
+        try await rebindTask.value
+        do { _ = try await staleMerge.value; fatalError("stale credentialless preparation restored cleared pending") }
+        catch VortxNativeError.superseded {}
+        // No MainActor context invalidation is performed here: accepted FIFO publication itself
+        // must retire the old source/pending fence before its queued successor can commit.
         check(try await session.pendingOwnAccountOverlays() == .object([:]))
         let repaired = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
         let slots = try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: repaired["nativeSync"]!)
@@ -198,8 +230,57 @@ import CryptoKit
             retainedOwnAccountSlotBaselines: slots, deferredOwnAccountOverlays: matched)
         _ = try await session.dispatch([#"{"type":"get_state"}"#], now: 1800000003, legacyMaterial: next)
         check(try await session.pendingOwnAccountOverlays() == .object([:]))
-        await session.close()
+        await facade.shutdown()
         print("Own-account actual C: changed cold overlay stays pending beside visible data; verified same-UID repair checkpoints source/witness and clears exactly its pending record")
+    }
+
+    static func unattributedColdPeer(scope: VortxAccountScope, owner: UserProfile, own: UserProfile, directory: URL) async throws {
+        let authority = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
+        let source = try await VortxNativeOwnAccountProducer.fetch(profileID: own.id, authKey: "fixture-B", authority: authority,
+            framing: .independentNetworkOnly, verify: { _ in "network-only-B" }, send: { request in
+                .init(data: Data((request.url!.lastPathComponent == "datastoreGet"
+                    ? #"{"result":[{"_id":"B-only","name":"B","type":"movie","state":{}}]}"# : #"{"result":{"addons":[]}}"#).utf8), statusCode: 200)
+            })
+        let material = try VortxLegacyBootstrapMaterial.encode(document: Data("{}".utf8), roster: [owner, own], ownerProfileID: owner.id,
+            rosterModifiedSeconds: nil, ownAccountSources: [source])
+        let typed = try JSONDecoder().decode(VortxJSON.self, from: material)
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(size: .bits256))
+        let session = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: store,
+            transport: VortxCResourceTransport(), allowNewAccount: true, initialActions: [raw(.object([
+                "type": .string("import_legacy_sync"), "scope": .string(scope.account), "ownerProfileId": .string(scope.ownerProfileID), "material": typed]))])
+        let overlay = try JSONEncoder().encode(VortxJSON.object(["vortx": .object(["byProfile": .object([
+            own.id.uuidString: .object(["watched": .object(["unknown-A-only": .object(["ma": .integer(42)])])])])])]))
+        let deferred = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: overlay,
+            roster: [owner, own], ownerProfileID: owner.id, retainedOwnAccountBaseline: material)
+        check(deferred.first?.status == .missingWitness)
+        let proof = typed["ownAccountSources"]?[own.id.uuidString]
+        check(try !VortxNativeOwnAccountProducer.hasOverlayAttribution(proof: proof, sealedEnvelope: nil))
+        check(try !VortxNativeOwnAccountProducer.hasOverlayAttribution(proof: proof, sealedEnvelope: source.sourceDocument))
+        let pending = try VortxNativeOwnAccountProducer.pendingRecord(disposition: deferred[0], verifiedUID: source.verifiedStreamingUID,
+            overlay: overlay, attributed: false, previous: nil)
+        check(pending["verifiedStreamingUid"] == nil && pending["sourceDocumentSha256"] == nil)
+        let cannotPromote = try VortxNativeOwnAccountProducer.pendingRecord(disposition: deferred[0], verifiedUID: source.verifiedStreamingUID,
+            overlay: overlay, attributed: true, previous: pending)
+        check(cannotPromote["verifiedStreamingUid"] == nil) // A later source never retroactively attributes an unknown old intent.
+        let retained = try VortxLegacyBootstrapMaterial.encode(document: overlay, roster: [owner, own], ownerProfileID: owner.id,
+            rosterModifiedSeconds: nil, retainedOwnAccountBaseline: material, deferredOwnAccountOverlays: deferred)
+        _ = try await session.dispatch([#"{"type":"get_state"}"#], now: 1800000000, legacyMaterial: retained,
+            authenticatedSourceArchive: VortxNativeOwnAccountProducer.archive([], pendingOverlays: [own.id.uuidString: pending]))
+        let before = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        let currentPending = try await session.pendingOwnAccountOverlays()
+        check(try VortxNativeOwnAccountProducer.pendingOverlay(profileID: own.id, verifiedUID: source.verifiedStreamingUID,
+            state: before, pending: currentPending) == nil)
+        let reconnect = try VortxNativeProfiles.AccountRebindRequest(scope: scope.account, ownerProfileID: scope.ownerProfileID,
+            transactionID: "unattributed-B-reconnect", expected: VortxNativeProfiles.expectedBinding(state: before, profileID: own.id),
+            target: .own(VortxNativeProfiles.ownTarget(material: typed, profileID: own.id)))
+        _ = try await session.dispatch([raw(VortxNativeProfiles.rebindAction(profileID: own.id, request: reconnect))], now: 1800000001,
+            sourceAuthority: authority, authenticatedSourceArchive: VortxNativeOwnAccountProducer.archive([source]))
+        check(try await session.pendingOwnAccountOverlays() == .object([own.id.uuidString: pending]))
+        let after = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        check(after["libraries"]?[own.id.uuidString]?["items"]?.array?.first?["id"] == .string("B-only"))
+        check(try !raw(after["nativeSync"]!).contains("unknown-A-only"))
+        await session.close()
+        print("Own-account actual C: cold network-only B never attributes or consumes unknown historical A overlay; reconnect keeps raw pending and B data separate")
     }
 
     static func rebindFixtures(scope: VortxAccountScope, owner: UserProfile, own: UserProfile, native: VortxJSON,

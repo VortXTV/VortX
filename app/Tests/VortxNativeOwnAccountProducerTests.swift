@@ -133,6 +133,7 @@ private actor OwnSourceRequests {
         // Secure candidates are immutable and inactive until the durable native binding names
         // their transaction. No mutable current-token pointer can race a failed native CAS.
         let journalAuthority = VortxNativeOwnAccountProducer.Authority(generations: [.initCapture(slot)], validate: { true })
+        let credentiallessAuthority = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
         var secure: [String: String] = [:]
         func stage(_ token: String, _ scope: String, _ id: UUID, _ uid: String, _ transaction: String?) throws -> String {
             try VortxNativeAccountCredentials.stage(token: token, scope: scope, profileID: id, uid: uid,
@@ -165,6 +166,8 @@ private actor OwnSourceRequests {
         check(try VortxNativeAccountCredentials.selectedSlot(scope: "account-A", profileID: profileID,
             binding: .object(["account": .object(["kind": .string("pending_own")])])) == nil)
         VortxNativeOwnAccountProducer.invalidateContext()
+        do { try credentiallessAuthority.withActive {}; fatalError("empty credential list ignored context retirement") }
+        catch VortxNativeError.superseded {}
         let beforeRetired = secure
         do { _ = try stage("retired", "account-A", profileID, "uid-A", "retired"); fatalError("retired credential candidate staged") }
         catch VortxNativeError.superseded {}

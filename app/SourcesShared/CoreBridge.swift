@@ -206,6 +206,13 @@ final class CoreBridge: ObservableObject {
     }
     @MainActor func refreshNativeProfileEditBinding(_ profileID: UUID) { nativeAccountEditRequests.removeValue(forKey: profileID) }
 
+    /// The facade publishes a rebind epoch and pending sidecar before the next FIFO intent starts.
+    /// A source preparation must not depend on a later MainActor callback to retire its authority.
+    func captureNativeSourceFence() -> @Sendable () -> Bool {
+        guard let facade = nativeFacade else { return { true } }
+        return facade.captureSourceFence()
+    }
+
     /// Never fall back to an unrelated legacy profile token once a native binding exists.
     func nativeCredentialSlot(profileID: UUID) -> String? {
         nativeFacadeLock.withLock {

@@ -124,7 +124,7 @@ check(appearsBefore("facade.addCatalogItem", "let binding = settledActiveAccount
                 && nativeAutoAdd.contains("allowInsert: stampIntent"),
               "native auto-add uses captured native metadata and durable membership without a Stremio receipt")
 let nativeBootstrap = section(syncSource, from: "func restoreNativeCheckpoint", until: "/// Shared account-owner epoch")
-check(appearsBefore("await self.prepareNativeLegacyMaterial(document, capture: capture)", "await CoreBridge.shared.closeNativeSession()", in: nativeBootstrap)
+check(appearsBefore("await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)", "await CoreBridge.shared.closeNativeSession()", in: nativeBootstrap)
       && appearsBefore("validateLegacyCompatibility", "await CoreBridge.shared.closeNativeSession()", in: nativeBootstrap)
       && nativeBootstrap.contains("let finalCheckpoint = try probe.authenticatedCheckpoint(scope: scope)"),
       "source preflight keeps current native data visible and replacement revalidates the final checkpoint")
@@ -132,19 +132,21 @@ let ownPreparation = section(syncSource, from: "private func prepareNativeLegacy
 check(ownPreparation.contains("classifyDeferredOwnAccountOverlays(document: documentBytes")
       && ownPreparation.contains("deferredOwnAccountOverlays: deferred")
       && ownPreparation.contains("archive(sources, pendingOverlays: pendingOverlays)")
-      && ownPreparation.contains("disposition.currentProfileOverlaySHA256")
+      && ownPreparation.contains("VortxNativeOwnAccountProducer.pendingRecord(disposition: disposition")
+      && ownPreparation.contains("(!enforceMountedFence || mountedSourceFence())")
+      && ownPreparation.contains("if validatedSync != nil && !attributed")
       && ownPreparation.contains("if historical == nil || historical?[\"verifiedStreamingUid\"] == source[\"verifiedStreamingUid\"]"),
       "cold own overlay evidence remains UID-bound and pending is sealed alongside the native candidate")
 check(nativeBootstrap.contains("resolveRoster(from: document, fullOnly: true)")
                 && nativeBootstrap.contains("let checkpoint = try probe.authenticatedCheckpoint(scope: scope)")
                 && nativeBootstrap.contains("let hadCheckpoint = checkpoint != nil")
                 && nativeBootstrap.contains("if !hadCheckpoint")
-                && nativeBootstrap.contains("await self.prepareNativeLegacyMaterial(document, capture: capture)")
+                && nativeBootstrap.contains("await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)")
                 && nativeBootstrap.contains("VortxNativeBootstrapArchive.encode(document: documentBytes, material: material, authenticatedSourceArchive: prepared.sourceArchive)")
                 && nativeBootstrap.contains("allowNewAccount: !hadCheckpoint, initialActions: initialActions")
                 && nativeBootstrap.contains("if didImportLegacy || !websiteEvents.isEmpty { self.requestSyncSoon() }")
                 && appearsBefore("validateLegacyCompatibility", "let session = try VortxNativeSession", in: nativeBootstrap)
-                && appearsBefore("await self.prepareNativeLegacyMaterial(document, capture: capture)", "if !hadCheckpoint", in: nativeBootstrap)
+                && appearsBefore("await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)", "if !hadCheckpoint", in: nativeBootstrap)
                 && autoAddSource.contains("case .native(let binding): return binding?.profileID")
                 && autoAddSource.contains("keyPrefix).native.\\(namespace)")
                 && autoAddSource.contains("only the acknowledged native save"),

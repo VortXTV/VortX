@@ -101,7 +101,9 @@ struct ProfilePickerView: View {
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 }
                 if !nativeSync.nativeOwnAccountOverlayPending.isEmpty {
-                    Text("Some older profile updates are waiting for account verification. Your current library remains available; reconnect the original independent account to review and refresh those updates.")
+                    Text(nativeSync.nativeOwnAccountOverlayUnattributed.isEmpty
+                         ? "Some older profile updates are waiting for account verification. Your current library remains available; reconnect the original independent account to review and refresh those updates."
+                         : "Some older profile updates have no verified account link and remain pending. They will not be assigned to a different account. Your current library remains available.")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                 }
 #endif
@@ -653,7 +655,9 @@ struct ProfileEditorView: View {
                             if !isNew && draft.usesOwnAccount == original.usesOwnAccount {
                                 let pending = core.nativeAccountMode(profileID: draft.id) == "pending_own"
                                 if nativeSync.nativeOwnAccountOverlayPending.contains(draft.id) {
-                                    Text("Older updates for this profile are still pending verification. Reconnect the original account; current library and history have not been replaced.")
+                                    Text(nativeSync.nativeOwnAccountOverlayUnattributed.contains(draft.id)
+                                         ? "These older updates have no verified account link and remain pending. Connecting another account will not import them. Current library and history remain available."
+                                         : "Older updates for this profile are still pending verification. Reconnect the original account; current library and history have not been replaced.")
                                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                                 }
                                 if pending || nativeSync.nativeOwnAccountResyncUnavailable.contains(draft.id)

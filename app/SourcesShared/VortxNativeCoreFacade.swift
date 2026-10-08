@@ -24,6 +24,13 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var pendingProfileTransitions = 0
     private var accountEpoch = UUID()
     var accountGeneration: UUID { lock.withLock { accountEpoch } }
+    func captureSourceFence() -> @Sendable () -> Bool {
+        guard let captured = profileSnapshot() else { return { false } }
+        return { [weak self] in
+            guard let current = self?.profileSnapshot() else { return false }
+            return current.generation == captured.generation && current.pending == captured.pending
+        }
+    }
     private func accountIdentity(_ state: VortxJSON?) -> VortxJSON {
         var bindings: [String: VortxJSON] = [:]
         if case .object(let profiles) = state?["roster"]?["profiles"] {

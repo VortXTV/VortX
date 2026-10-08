@@ -554,10 +554,8 @@ actor VortxNativeSession {
             guard case .object(let profiles) = pending else { throw VortxNativeError.invalidSnapshot }
             for (id, entry) in profiles {
                 guard UUID(uuidString: id)?.uuidString == id, case .object(let fields) = entry,
-                      Set(fields.keys) == ["verifiedStreamingUid", "sourceDocumentSha256", "profileOverlayBase64", "reason"],
-                      case .string(let uid) = fields["verifiedStreamingUid"], !uid.isEmpty,
-                      case .string(let digest) = fields["sourceDocumentSha256"],
-                      digest.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                      Set(fields.keys) == ["verifiedStreamingUid", "sourceDocumentSha256", "profileOverlayBase64", "reason"]
+                        || Set(fields.keys) == ["profileOverlayBase64", "reason"],
                       case .string(let reason) = fields["reason"], ["missing_witness", "changed_witness"].contains(reason),
                       case .string(let raw) = fields["profileOverlayBase64"], let bytes = Data(base64Encoded: raw), bytes.base64EncodedString() == raw,
                       (try? VortxProfileOverlayWitness.decodeObject(json: bytes)) != nil,
@@ -574,6 +572,13 @@ actor VortxNativeSession {
                 }
                 // Pending is not an import receipt. It may only refer to an already validated
                 // source for this exact profile, including a dormant historical account slot.
+                if fields["verifiedStreamingUid"] == nil {
+                    guard reason == "missing_witness", state["roster"]?["profiles"]?[id] != nil else { throw VortxNativeError.invalidSnapshot }
+                    continue // No attribution: no reconnect may consume this raw intent.
+                }
+                guard case .string(let uid) = fields["verifiedStreamingUid"], !uid.isEmpty,
+                      case .string(let digest) = fields["sourceDocumentSha256"],
+                      digest.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else { throw VortxNativeError.invalidSnapshot }
                 let receipt = state["nativeSync"]?["legacyImport"]
                 let legacy = receipt?["baseline"]?["ownAccountSources"]?[id]
                 var proven = legacy?["verifiedStreamingUid"] == .string(uid)

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// External authentication/fetch boundary only. Typed addon/library/watch conversion belongs to
 /// VortxLegacyBootstrapMaterial; source ownership and merge semantics belong to the native kernel.
@@ -24,10 +25,15 @@ enum VortxNativeOwnAccountProducer {
     struct Authority: VortxMutationAuthority {
         let generations: [Generation]
         let validate: @Sendable () -> Bool
+        private let context: UUID
+        init(generations: [Generation], validate: @escaping @Sendable () -> Bool) {
+            self.generations = generations; self.validate = validate
+            context = epochs.lock.withLock { epochs.context }
+        }
         func withActive(_ operation: () throws -> Void) throws {
             try epochs.lock.withLock {
                 try Task.checkCancellation()
-                guard generations.allSatisfy({ epochs.values[$0.slot] == $0.value && epochs.context == $0.context }), validate() else { throw VortxNativeError.superseded }
+                guard epochs.context == context, generations.allSatisfy({ epochs.values[$0.slot] == $0.value && epochs.context == $0.context }), validate() else { throw VortxNativeError.superseded }
                 try operation()
             }
         }
@@ -61,6 +67,31 @@ enum VortxNativeOwnAccountProducer {
     typealias Verify = @Sendable (String) async throws -> String
     typealias Send = @Sendable (URLRequest) async throws -> AuthenticatedHTTPResponse
     enum SourceFraming: Sendable, Equatable { case authenticatedOverlay, independentNetworkOnly }
+    /// A network-only v1 source with an empty consumed slice says nothing about a later legacy
+    /// UUID overlay. Neither its UID nor its hash may retroactively attribute that raw intent.
+    static func hasOverlayAttribution(proof: VortxJSON?, sealedEnvelope: Data?) throws -> Bool {
+        if case .string = proof?["profileOverlaySha256"] { return true }
+        guard let sealedEnvelope,
+              proof?["sourceDocumentSha256"] == .string(SHA256.hash(data: sealedEnvelope).map { String(format: "%02x", $0) }.joined()) else { return false }
+        let envelope = try VortxProfileOverlayWitness.decodeObject(json: sealedEnvelope)
+        guard let raw = envelope["profileOverlayBase64"] as? String, let bytes = Data(base64Encoded: raw) else { throw VortxNativeError.invalidSnapshot }
+        return !(try VortxProfileOverlayWitness.decodeObject(json: bytes)).isEmpty
+    }
+    static func pendingRecord(disposition: VortxLegacyBootstrapMaterial.RetainedOwnAccountOverlayDisposition,
+                              verifiedUID: String, overlay: Data, attributed: Bool, previous: VortxJSON?) throws -> VortxJSON {
+        guard try VortxProfileOverlayWitness.digest(json: overlay) == disposition.currentProfileOverlaySHA256,
+              let digest = disposition.sourceDocumentSHA256 else { throw VortxNativeError.invalidSnapshot }
+        if previous?["verifiedStreamingUid"] == .string(verifiedUID),
+           case .string(let raw) = previous?["profileOverlayBase64"], let bytes = Data(base64Encoded: raw),
+           try VortxProfileOverlayWitness.digest(json: bytes) == disposition.currentProfileOverlaySHA256 {
+            return previous! // Preserve exact previously sealed attribution; do not re-label its source.
+        }
+        let mayAttribute = attributed && !(previous != nil && previous?["verifiedStreamingUid"] == nil)
+        var fields: [String: VortxJSON] = ["profileOverlayBase64": .string(overlay.base64EncodedString()),
+            "reason": .string(mayAttribute ? disposition.status.rawValue : "missing_witness")]
+        if mayAttribute { fields["verifiedStreamingUid"] = .string(verifiedUID); fields["sourceDocumentSha256"] = .string(digest) }
+        return .object(fields)
+    }
     /// A profile UUID alone never attributes an old cloud overlay to a newly connected account.
     /// Only the kernel-bound source named by the pending record may authorize its consumption.
     static func pendingOverlay(profileID: UUID, verifiedUID: String, state: VortxJSON, pending: VortxJSON) throws -> Data? {
