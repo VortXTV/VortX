@@ -22,7 +22,9 @@ targets:
     sources:
       - SourcesiOS
       - path: SourcesShared
-        excludes: [".claude/**"]
+        # The renderer mounts no JS-provider surface; excluding this legacy C runtime keeps the
+        # diagnostic target out of its unrelated current-toolchain compilation failure.
+        excludes: [".claude/**", "JSProviders/**"]
       - path: Sources/Player
         excludes: [".claude/**"]
       - Sources/PlayerScreen.swift
