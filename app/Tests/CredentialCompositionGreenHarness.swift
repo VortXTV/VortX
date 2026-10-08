@@ -97,6 +97,16 @@ struct CredentialCompositionGreenHarness {
         )
     ]
 
+    // These Foundation-only policy carriers are real production dependencies of the sync
+    // manager. Keep one relative-path list for composition and every generated fixture so the
+    // standalone credential stubs see the same dependency closure in each evaluation mode.
+    private static let compilerDependencyRelativePaths = [
+        "app/SourcesShared/AddonReorderMove.swift",
+        "app/SourcesShared/ProfileRosterSyncPolicy.swift",
+        "app/SourcesShared/ContinueWatchingDedupe.swift",
+        "app/SourcesShared/OwnerLibraryPositionPolicy.swift"
+    ]
+
     private static let fixedGateIDs = [
         "GREEN-01-SOURCE-MANIFEST",
         "GREEN-02-SINGLE-RESULT-DEFINITIONS",
@@ -607,27 +617,55 @@ struct CredentialCompositionGreenHarness {
             let type: String
             let poster: String?
             var watchedVideoIds: [String] = []
+            var markedAt: [String: Double]?
+            var unmarkedAt: [String: Double]?
+        }
+
+        enum ProfileDiscoveryPreferencesStore {
+            static let activeProjectionKeys: Set<String> = []
+        }
+
+        enum AddonOwnerStorage {
+            static func currentKey(_ legacy: String) -> String { legacy }
+            static func migrateLegacy(
+                namespace: String,
+                authenticated: Bool,
+                defaults: UserDefaults = .standard
+            ) -> Bool { false }
         }
 
         final class ProfileStore {
             static let shared = ProfileStore()
             var profiles: [UserProfile] = []
             var activeID: UUID?
+            var rosterModified: Date { Date(timeIntervalSince1970: 0) }
             var deletedProfileIDs: Set<String> = []
-            func mergeInRoster(_ roster: [UserProfile]) {}
+            func mergeInRoster(_ roster: [UserProfile], incomingModified: Date? = nil) {}
             func reloadFromDefaults() {}
             func applyLocalTombstones() {}
             func mergeDeletedTombstones(_ ids: [String]) -> Bool { false }
             func watchEntries(for profileID: UUID) -> [String: WatchEntry] { [:] }
-            func applyRemoteOverlay(profileID: UUID, entries: [String: WatchEntry]) {}
-            func applyProfileEdits(_ edits: [String: Any]) {}
+            func applyRemoteOverlay(
+                profileID: UUID,
+                entries: [String: WatchEntry],
+                removals: [OverlayWatchRemoval] = []
+            ) {}
+            func watchOverlayForSync(
+                for profileID: UUID,
+                merging remoteRemovals: [OverlayWatchRemoval]
+            ) -> (entries: [String: WatchEntry], removals: [OverlayWatchRemoval]) { ([:], []) }
+            func applyProfileEdits(_ edits: [String: Any], mirrorUpdatedAt: Any? = nil) {}
             func rosterDiffers(from roster: [UserProfile]) -> Bool { false }
+            static func watchIdentityForSync(metaId: String, entry: WatchEntry) -> ContinueWatchingDedupe.Identity {
+                .init(id: metaId, type: entry.type)
+            }
         }
 
         struct CorePlaybackState {
             var timeOffset: Double = 0
             var duration: Double = 0
             var videoId: String?
+            var lastWatched: String?
         }
 
         struct CoreCatalogItem {
@@ -638,6 +676,36 @@ struct CredentialCompositionGreenHarness {
             var removed: Bool?
             var temp: Bool?
             var state = CorePlaybackState()
+        }
+
+        struct CoreLibState {
+            var timeOffset: Double = 0
+            var duration: Double = 0
+            var videoId: String?
+            var lastWatched: String?
+            var flaggedWatched = 0
+            var timesWatched = 0
+        }
+
+        struct CoreCWItem {
+            let id: String
+            let type: String
+            let name: String
+            let poster: String?
+            let state: CoreLibState
+            var removed: Bool?
+            var temp: Bool?
+        }
+
+        enum BecauseYouWatchedDocumentHistory {
+            struct Snapshot {
+                let library: [CoreCWItem]
+                let continueWatching: [CoreCWItem]
+            }
+
+            static func snapshot(from document: [String: Any], removedIDs: Set<String> = []) -> Snapshot {
+                Snapshot(library: [], continueWatching: [])
+            }
         }
 
         struct CoreLibrary {
@@ -652,6 +720,7 @@ struct CredentialCompositionGreenHarness {
 
         final class CoreBridge {
             static let shared = CoreBridge()
+            static func excludeAccountHistoryFromGuestRecommendations() {}
             var library: CoreLibrary?
             var addons: [CoreAddon] = []
             func isLoggedIn() -> Bool { false }
@@ -659,8 +728,19 @@ struct CredentialCompositionGreenHarness {
             func uninstallAddon(_ addon: CoreAddon, tombstone: Bool) {}
             func hydrateAddonsFromAccount(_ owned: [VortXOwnedAddon]) {}
             func rebuildContinueWatching() {}
+            func addonOrderDidChange() {}
             func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool) async {}
             func loadLibraryAndAwait() async {}
+            func recordOwnedHistoryHydration(
+                credentialCapture: CredentialScopeRegistry.Capture,
+                library: [CoreCWItem],
+                continueWatching: [CoreCWItem]
+            ) {}
+            func addCatalogItemLocalOnly(
+                id: String,
+                type: String,
+                credentialCapture: CredentialScopeRegistry.Capture
+            ) async -> Bool { false }
         }
 
         enum MirrorSettings {
@@ -696,14 +776,17 @@ struct CredentialCompositionGreenHarness {
         enum LibraryTombstones {
             static func all() -> Set<String> { [] }
             static func normalize(_ value: String) -> String { value }
-            static func timestampsForSync() -> [String: Any] { [:] }
+            static func timestampsForSync() -> [String: [String: Double]] { [:] }
             static func merge(legacyIDs: [String], stampsRaw: [String: Any]) -> Bool { false }
         }
 
         enum AddonTombstones {
             static func normalize(_ value: String) -> String { value }
             static func all() -> Set<String> { [] }
-            static func timestampsForSync() -> [String: Any] { [:] }
+            static func preservingLocalSyncStamps<T>(_ restore: () throws -> T) rethrows -> T {
+                try restore()
+            }
+            static func timestampsForSync() -> [String: [String: Double]] { [:] }
             static func merge(
                 legacyIDs: [String],
                 stampsRaw: [String: Any],
@@ -714,10 +797,19 @@ struct CredentialCompositionGreenHarness {
 
         enum SettingsBackup {
             static func isSyncable(_ key: String) -> Bool { true }
+            static func migratedKey(_ key: String) -> String { key }
             static func decodeDomain(from data: Data) throws -> [String: Any] { [:] }
-            static func mergedSyncBlob(onto value: Any?, appliedBaseline: Set<String>) -> Data? { nil }
-            static func restore(from data: Data, skipping: Set<String>) throws -> Int { 0 }
-            static func appliedKeys(from data: Data) -> Set<String> { [] }
+            static func mergedSyncBlob(
+                onto value: Any?,
+                appliedBaseline: Set<String>,
+                excluding: Set<String> = []
+            ) -> Data? { nil }
+            static func restore(
+                from data: Data,
+                skipping: Set<String>,
+                excluding: Set<String> = []
+            ) throws -> Int { 0 }
+            static func appliedKeys(from data: Data, excluding: Set<String> = []) -> Set<String> { [] }
             static func reloadLiveStores() {}
         }
 
@@ -849,7 +941,35 @@ struct CredentialCompositionGreenHarness {
         }
 
         enum OwnerResumeStore {
-            static func merge(_ entries: [(id: String, t: Double, d: Double, v: String?)]) {}
+            static func bind(ownerID: String?) {}
+            static func merge(_ entries: [(id: String, t: Double, d: Double, v: String?, lastWatched: String?)]) {}
+            static func evict(libraryIDs: Set<String>, clearingFence: Bool = false) {}
+            static func recordReadds(_ addedAtByID: [String: Double]) {}
+        }
+
+        enum OwnerHistoryStore {
+            static func bind(ownerID: String?) {}
+            static func wire(merging raw: Any?) -> [[String: Any]]? { nil }
+            static func mergeWire(
+                _ raw: Any?,
+                capture: CredentialScopeRegistry.Capture
+            ) -> Bool { false }
+            static func validRows() -> [[String: Any]] { [] }
+        }
+
+        enum OwnerWatchedIntentStore {
+            static func bind(ownerID: String?) {}
+            static func wire(merging raw: Any?) -> [String: [String: Any]] { [:] }
+            static func mergeWire(_ raw: Any?) -> Bool { false }
+        }
+
+        enum OverlayWatchMergePolicy {
+            static let durableWatchedEntryLimit = 1_800
+        }
+
+        final class WatchedIndex {
+            static let shared = WatchedIndex()
+            func ownerIntentsDidChange() {}
         }
 
         enum Theme {
@@ -919,6 +1039,9 @@ struct CredentialCompositionGreenHarness {
             "app/SourcesShared/AuthenticatedHTTPTransport.swift"
         )
         let syncManager = root.appendingPathComponent("app/SourcesShared/VortXSyncManager.swift")
+        let policySources = Self.compilerDependencyRelativePaths.map {
+            root.appendingPathComponent($0).path
+        }
         let typecheck = try runCompiler(arguments: [
             "-parse-as-library",
             "-swift-version",
@@ -927,7 +1050,8 @@ struct CredentialCompositionGreenHarness {
             "-strict-concurrency=minimal",
             "-suppress-warnings",
             "-typecheck",
-            stubs.path,
+            stubs.path
+        ] + policySources + [
             scope.path,
             keychain.path,
             apiKeys.path,
@@ -5411,6 +5535,10 @@ struct CredentialCompositionGreenHarness {
                 encoding: .utf8
             )
         }
+        try copyCompilerDependencySources(
+            from: URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true),
+            to: root
+        )
         return root
     }
 
@@ -5432,7 +5560,23 @@ struct CredentialCompositionGreenHarness {
             )
             try FileManager.default.copyItem(at: source, to: destination)
         }
+        try copyCompilerDependencySources(from: currentRoot, to: root)
         return root
+    }
+
+    private static func copyCompilerDependencySources(from currentRoot: URL, to root: URL) throws {
+        for relativePath in compilerDependencyRelativePaths {
+            let source = currentRoot.appendingPathComponent(relativePath)
+            guard FileManager.default.fileExists(atPath: source.path) else {
+                throw HarnessError.fixture("compiler dependency source is absent at \(source.path)")
+            }
+            let destination = root.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.copyItem(at: source, to: destination)
+        }
     }
 
     private static func append(_ text: String, to url: URL) throws {
