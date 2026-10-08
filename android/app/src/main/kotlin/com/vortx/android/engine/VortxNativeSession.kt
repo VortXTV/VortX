@@ -69,6 +69,11 @@ internal data class VortxAccountScope(val accountID: String, val ownerProfileID:
             material.getJSONObject("addons"); material.getJSONObject("libraries")
             material.getJSONObject("watches"); material.getJSONObject("identityLinks")
         }
+        state.optJSONObject("legacyWebsiteBootstrap")?.let { bootstrap ->
+            require(bootstrap.keys().asSequence().toSet() == setOf("aggregate", "legacyImportFingerprint") &&
+                bootstrap.get("aggregate") != JSONObject.NULL && bootstrap.getString("legacyImportFingerprint").matches(Regex("[0-9a-f]{64}")))
+            NativeHostDocument.requireCredentialFree(bootstrap)
+        }
         if (state.has("hostDocument")) {
             state.getJSONObject("hostDocument")
             val excluded = state.getJSONArray("excludedCredentialPaths")
@@ -229,6 +234,7 @@ internal class VortxNativeSession private constructor(
     private var nativeHostPreferenceState: JSONObject,
     private var legacyImportMaterial: JSONObject?,
     private var hostDocumentArchive: JSONObject?,
+    private var legacyWebsiteBootstrap: JSONObject?,
     private var websiteProfileEditPending: JSONObject,
     private var websiteProfileEditCertificates: JSONObject,
     private val onMutation: () -> Unit,
@@ -259,7 +265,7 @@ internal class VortxNativeSession private constructor(
                 // Earlier experimental checkpoints may contain encoded credentials in adjacent
                 // carriers. Inspect BEFORE hydrate; rejection leaves the original encrypted file
                 // untouched. Newer stored prefs must not bypass sanitized incoming preferences.
-                for (field in listOf("hostProfilePreferences", "legacyImportMaterial", "hostDocument", "nativeHostPreferenceState", "websiteProfileEditPending")) {
+                for (field in listOf("hostProfilePreferences", "legacyImportMaterial", "hostDocument", "nativeHostPreferenceState", "legacyWebsiteBootstrap", "websiteProfileEditPending")) {
                     retained.optJSONObject(field)?.let(NativeHostDocument::requireCredentialFree)
                 }
                 val core = JSONObject(stored).also {
@@ -267,6 +273,7 @@ internal class VortxNativeSession private constructor(
                     it.remove("hostProfileSyncPending")
                     it.remove("nativeHostPreferenceState")
                     it.remove("hostDocument"); it.remove("excludedCredentialPaths")
+                    it.remove("legacyWebsiteBootstrap")
                     it.remove("websiteProfileEditPending"); it.remove("websiteProfileEditCertificates")
                 }
                 VortxNativeRuntime.hydrate(bindings, core.toString())
@@ -306,12 +313,18 @@ internal class VortxNativeSession private constructor(
                 val archive = initialHostArchive ?: old?.optJSONObject("hostDocument")?.let {
                     JSONObject().put("document", it).put("excludedCredentialPaths", old.getJSONArray("excludedCredentialPaths"))
                 }
+                val legacyBootstrap = old?.optJSONObject("legacyWebsiteBootstrap") ?: if (stored == null) initialHostArchive
+                    ?.getJSONObject("document")?.opt("profileEdits")?.takeIf { it != JSONObject.NULL && (it !is JSONObject || it.length() > 0) }
+                    ?.let { raw -> JSONObject().put("aggregate", raw).put("legacyImportFingerprint", JSONObject(runtime.stateJson()).getJSONObject("nativeSync")
+                        .getJSONObject("legacyImport").getString("fingerprint")) } else null
+                legacyBootstrap?.let { NativeHostDocument.requireCredentialFree(it) }
                 val pendingWebsiteEdits = old?.optJSONObject("websiteProfileEditPending") ?: JSONObject().put("events", JSONArray())
                 val websiteCertificates = old?.optJSONObject("websiteProfileEditCertificates") ?: JSONObject()
                 NativeWebsiteProfileEdits.validateRetained(scope, pendingWebsiteEdits, websiteCertificates)
                 val snapshot = JSONObject(runtime.stateJson()).put("hostProfilePreferences", hostProfiles).put("hostProfileSyncPending", hostPending).put("legacyImportMaterial", legacyMaterial)
                     .put("nativeHostPreferenceState", hostState)
                     .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
+                    .put("legacyWebsiteBootstrap", legacyBootstrap)
                     .put("websiteProfileEditPending", pendingWebsiteEdits).put("websiteProfileEditCertificates", websiteCertificates).toString()
                 scope.validateSnapshot(snapshot)
                 store.commit(scope, snapshot)
@@ -319,6 +332,7 @@ internal class VortxNativeSession private constructor(
                 check(isAccountCurrent()) { "Native account changed" }
                 return VortxNativeSession(scope, bindings, store, transport, runtime, isAccountCurrent, JSONObject(hostProfiles.toString()), hostPending, hostState,
                     legacyMaterial?.let { JSONObject(it.toString()) }, archive?.let { JSONObject(it.toString()) },
+                    legacyBootstrap?.let { JSONObject(it.toString()) },
                     JSONObject(pendingWebsiteEdits.toString()), JSONObject(websiteCertificates.toString()), onMutation)
             } catch (error: Throwable) { runtime.close(); throw error }
         }
@@ -332,6 +346,7 @@ internal class VortxNativeSession private constructor(
             .put("nativeHostPreferenceState", nativeHostPreferenceState)
             .put("legacyImportMaterial", legacyImportMaterial).put("hostDocument", hostDocumentArchive?.getJSONObject("document"))
             .put("excludedCredentialPaths", hostDocumentArchive?.getJSONArray("excludedCredentialPaths"))
+            .put("legacyWebsiteBootstrap", legacyWebsiteBootstrap)
             .put("websiteProfileEditPending", websiteProfileEditPending)
             .put("websiteProfileEditCertificates", websiteProfileEditCertificates).toString())
         return VortxNativeRead(VortxNativeOwner(scope, state.getString("activeProfileId"), revision), state)
@@ -372,8 +387,12 @@ internal class VortxNativeSession private constructor(
                 val action = JSONObject().put("type", "apply_legacy_profile_edits").put("scope", scope.accountID)
                     .put("ownerProfileId", scope.ownerProfileID).put("event", JSONObject(event.toString()).also { it.remove("legacyBootstrapFingerprint") })
                 if (event.has("legacyBootstrapFingerprint")) action.put("legacyBootstrapFingerprint", event.get("legacyBootstrapFingerprint"))
-                NativeWebsiteProfileEdits.admit(scope, event, JSONObject(candidate.dispatch(action.toString())), nativeHostPreferenceState,
-                    hostProfilePreferences, websiteProfileEditCertificates)
+                val response = JSONObject(candidate.dispatch(action.toString()))
+                val receiptFingerprint = response.optJSONArray("events")?.optJSONObject(0)?.optJSONObject("receipt")?.optJSONObject("source")?.optString("fingerprint")
+                val priorReceipt = receiptFingerprint?.let { fingerprint -> JSONObject(before).getJSONObject("nativeSync")
+                    .optJSONObject("legacyProfileEditReceipts")?.optJSONObject(fingerprint) }
+                NativeWebsiteProfileEdits.admit(scope, event, response, nativeHostPreferenceState,
+                    hostProfilePreferences, websiteProfileEditCertificates, priorReceipt)
             } catch (error: NativeWebsiteProfileEdits.Conflict) {
                 retainWebsiteProfileEdit(retainedSource, owner); return@owned false
             } catch (error: IllegalArgumentException) {
@@ -391,7 +410,7 @@ internal class VortxNativeSession private constructor(
             NativeHostPreferences.validateProjectedProfiles(preferences)
             val pending = NativeWebsiteProfileEdits.remove(websiteProfileEditPending, event.getString("eventId"))
             val updated = checkpoint(candidate.stateJson(), preferences, hostProfileSyncPending, applied.host,
-                legacyImportMaterial, hostDocumentArchive, pending, applied.certificates)
+                legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, pending, applied.certificates)
             val state = scope.validateSnapshot(updated)
             store.commit(scope, updated); check(store.read(scope) == updated) { "Native checkpoint readback failed" }
             check(isAccountCurrent()) { "Native account changed" }
@@ -410,7 +429,7 @@ internal class VortxNativeSession private constructor(
     @Synchronized private fun retainWebsiteProfileEdit(event: JSONObject, owner: VortxNativeOwner) = owned(owner) {
         val pending = NativeWebsiteProfileEdits.retain(scope, websiteProfileEditPending, event)
         val updated = checkpoint(runtime.stateJson(), hostProfilePreferences, hostProfileSyncPending, nativeHostPreferenceState,
-            legacyImportMaterial, hostDocumentArchive, pending, websiteProfileEditCertificates)
+            legacyImportMaterial, hostDocumentArchive, legacyWebsiteBootstrap, pending, websiteProfileEditCertificates)
         scope.validateSnapshot(updated); store.commit(scope, updated)
         check(store.read(scope) == updated) { "Native checkpoint readback failed" }; check(isAccountCurrent()) { "Native account changed" }
         websiteProfileEditPending = pending; changes.value += 1
@@ -422,10 +441,10 @@ internal class VortxNativeSession private constructor(
     @Synchronized fun applyLegacyWebsiteAggregate(raw: Any?, owner: VortxNativeOwner = read().owner): Boolean = owned(owner) {
         val retained = NativeWebsiteProfileEdits.legacyPending(raw)
         val aggregate = raw as? JSONObject ?: run { retainWebsiteProfileEdit(retained, owner); return@owned false }
-        val archived = hostDocumentArchive?.optJSONObject("document")?.opt("profileEdits")
-        if (!NativeHostPreferences.equal(archived, aggregate)) { retainWebsiteProfileEdit(retained, owner); return@owned false }
+        val bootstrap = legacyWebsiteBootstrap
+        if (bootstrap == null || !NativeHostPreferences.equal(bootstrap.get("aggregate"), aggregate)) { retainWebsiteProfileEdit(retained, owner); return@owned false }
         val import = JSONObject(runtime.stateJson()).getJSONObject("nativeSync").optJSONObject("legacyImport")
-        val fingerprint = import?.optString("fingerprint")?.takeIf { it.matches(Regex("[0-9a-f]{64}")) }
+        val fingerprint = import?.optString("fingerprint")?.takeIf { it.matches(Regex("[0-9a-f]{64}")) && it == bootstrap.optString("legacyImportFingerprint") }
             ?: run { retainWebsiteProfileEdit(retained, owner); return@owned false }
         applyWebsiteProfileEdit(NativeWebsiteProfileEdits.legacyMigrationEvent(aggregate, fingerprint), retained, owner)
     }
@@ -471,6 +490,7 @@ internal class VortxNativeSession private constructor(
             val updated = JSONObject(candidate.stateJson()).put("hostProfilePreferences", preferences).put("hostProfileSyncPending", pendingPreferences).put("legacyImportMaterial", retained)
                 .put("nativeHostPreferenceState", hostState)
                 .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
+                .put("legacyWebsiteBootstrap", legacyWebsiteBootstrap)
                 .put("websiteProfileEditPending", websiteProfileEditPending).put("websiteProfileEditCertificates", websiteProfileEditCertificates).toString()
             val state = scope.validateSnapshot(updated)
             store.commit(scope, updated)
@@ -499,10 +519,11 @@ internal class VortxNativeSession private constructor(
         revision = nextRevision.incrementAndGet()
         slots.values.forEach { it.bridge.close() }; slots.clear()
     }
-    private fun checkpoint(core: String, profiles: JSONObject, pendingProfiles: Boolean, host: JSONObject, material: JSONObject?, archive: JSONObject?, websitePending: JSONObject, certificates: JSONObject): String =
+    private fun checkpoint(core: String, profiles: JSONObject, pendingProfiles: Boolean, host: JSONObject, material: JSONObject?, archive: JSONObject?, bootstrap: JSONObject?, websitePending: JSONObject, certificates: JSONObject): String =
         JSONObject(core).put("hostProfilePreferences", profiles).put("hostProfileSyncPending", pendingProfiles)
             .put("nativeHostPreferenceState", host).put("legacyImportMaterial", material)
             .put("hostDocument", archive?.getJSONObject("document")).put("excludedCredentialPaths", archive?.getJSONArray("excludedCredentialPaths"))
+            .put("legacyWebsiteBootstrap", bootstrap)
             .put("websiteProfileEditPending", websitePending).put("websiteProfileEditCertificates", certificates).toString()
     @Synchronized override fun close() {
         if (closed) return

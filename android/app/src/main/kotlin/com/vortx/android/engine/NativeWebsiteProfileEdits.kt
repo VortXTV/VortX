@@ -69,7 +69,7 @@ internal object NativeWebsiteProfileEdits {
         for (index in 0 until events.length()) {
             val old = events.getJSONObject(index)
             if (old.getString("eventId") == id) {
-                if (!NativeHostPreferences.equal(old, event)) throw Conflict("Website event identity conflict")
+                if (!NativeHostPreferences.equal(old, event)) events.put(JSONObject().put("eventId", "conflict-${hash(event)}").put("conflictingEvent", copy(event)))
                 return result
             }
         }
@@ -86,7 +86,7 @@ internal object NativeWebsiteProfileEdits {
     })
 
     fun admit(scope: VortxAccountScope, event: JSONObject, response: JSONObject, local: JSONObject,
-              fallbackProfiles: JSONObject, certificates: JSONObject): Applied {
+              fallbackProfiles: JSONObject, certificates: JSONObject, priorNativeReceipt: JSONObject?): Applied {
         validateSource(scope, event)
         if (!response.optBoolean("ok")) throw Conflict("Website event rejected by native kernel")
         val returned = response.optJSONArray("events") ?: throw Conflict("Website receipt missing")
@@ -107,8 +107,12 @@ internal object NativeWebsiteProfileEdits {
         val prior = if (certificates.has(id)) certificates.getString(id) else null
         if (prior != null && prior != fingerprint) throw Conflict("Website certificate conflicts with immutable receipt")
         val updated = NativeHostPreferences.local(scope, local)
-        if (prior == null) compareBases(event, patch, updated, fallbackProfiles)
-        applyPatch(event, patch, updated, fallbackProfiles, replay = prior != null)
+        if (patch.length() > 0) when {
+            prior != null -> applyPatch(event, patch, updated, fallbackProfiles, replay = true)
+            priorNativeReceipt != null -> require(NativeHostPreferences.equal(priorNativeReceipt, receipt)) { "Website native receipt mismatch" }
+                .also { verifyRemotePairedHost(event, patch, updated) }
+            else -> { compareBases(event, patch, updated, fallbackProfiles); applyPatch(event, patch, updated, fallbackProfiles, replay = false) }
+        }
         val nextCertificates = JSONObject(certificates.toString()).put(id, fingerprint)
         return Applied(JSONObject(receipt.toString()), updated, nextCertificates)
     }
@@ -208,7 +212,11 @@ internal object NativeWebsiteProfileEdits {
                 if (replay && current != null && compare(current, clock, event.getString("eventId")) >= 0) continue
                 val value = if (topLevel == "avatar") values.get("settings.avatar") else {
                     val base = fallbackProfiles.optJSONObject(profileId)?.optJSONObject("playback") ?: JSONObject()
-                    val playback = if (current?.optJSONObject("value") != null) JSONObject(current.getJSONObject("value").toString()) else JSONObject(base.toString())
+                    val playback = when {
+                        current == null -> JSONObject(base.toString())
+                        current.isNull("value") -> JSONObject()
+                        else -> JSONObject(current.getJSONObject("value").toString())
+                    }
                     values.keys().asSequence().filter { it.startsWith("settings.playback.") }.forEach { key -> playback.put(key.removePrefix("settings.playback."), values.get(key)) }
                     playback
                 }
@@ -219,17 +227,53 @@ internal object NativeWebsiteProfileEdits {
         NativeHostPreferences.validate(scope = VortxAccountScope(document.getString("scope"), document.getString("ownerProfileId")), document = document)
     }
 
+    /** A peer receipt is useful only with a matching host result; it never authorizes a host write. */
+    private fun verifyRemotePairedHost(event: JSONObject, patch: JSONObject, local: JSONObject) {
+        val expectedClock = event.getLong("observedHostClock") + 1
+        require(expectedClock <= NativeHostPreferences.MAX_CLOCK)
+        val actor = event.getString("eventId")
+        val profiles = local.getJSONObject("document").getJSONObject("profiles")
+        for (profileId in patch.keys()) {
+            val values = patch.getJSONObject(profileId)
+            val fields = profiles.optJSONObject(profileId)?.getJSONObject("fields")
+            for (topLevel in values.keys().asSequence().map { if (it == "settings.avatar") "avatar" else "playback" }.toSet()) {
+                val entry = fields?.optJSONObject(topLevel) ?: throw Conflict("Website peer receipt lacks paired host result")
+                val ordering = compare(entry, expectedClock, actor)
+                if (ordering > 0) continue // A later host LWW value, including explicit null, must not rewind.
+                if (ordering != 0 || entry.getString("actor") != actor) throw Conflict("Website peer host result is stale or foreign")
+                if (topLevel == "avatar") {
+                    if (!NativeHostPreferences.equal(entry.get("value"), values.get("settings.avatar"))) throw Conflict("Website peer avatar result mismatch")
+                } else {
+                    val playback = entry.optJSONObject("value") ?: throw Conflict("Website peer playback result mismatch")
+                    for (path in values.keys().asSequence().filter { it.startsWith("settings.playback.") }) {
+                        val key = path.removePrefix("settings.playback.")
+                        if (!playback.has(key) || !NativeHostPreferences.equal(playback.get(key), values.get(path))) throw Conflict("Website peer playback result mismatch")
+                    }
+                }
+            }
+        }
+    }
+
     private fun compare(entry: JSONObject, clock: Long, actor: String): Int = compareValuesBy(entry, JSONObject().put("clock", clock).put("actor", actor), { it.getLong("clock") }, { it.getString("actor") })
     private fun exactClock(value: Any): Boolean = runCatching { BigDecimal(value.toString()).longValueExact() in 0..NativeHostPreferences.MAX_CLOCK }.getOrDefault(false)
     private fun hash(value: Any?): String = MessageDigest.getInstance("SHA-256").digest(canonical(value).toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
-    private fun canonical(value: Any?): String = when (value) {
+    internal fun canonical(value: Any?): String = when (value) {
         null, JSONObject.NULL -> "null"
-        is JSONObject -> value.keys().asSequence().sorted().joinToString(prefix = "{", postfix = "}") { key -> JSONObject.quote(key) + ":" + canonical(value.get(key)) }
-        is JSONArray -> (0 until value.length()).joinToString(prefix = "[", postfix = "]") { canonical(value.get(it)) }
+        is JSONObject -> value.keys().asSequence().sorted().joinToString(separator = ",", prefix = "{", postfix = "}") { key -> JSONObject.quote(key) + ":" + canonical(value.get(key)) }
+        is JSONArray -> (0 until value.length()).joinToString(separator = ",", prefix = "[", postfix = "]") { canonical(value.get(it)) }
         is String -> JSONObject.quote(value)
         is Boolean -> value.toString()
-        is Number -> BigDecimal(value.toString()).stripTrailingZeros().toPlainString()
+        is Number -> canonicalNumber(value)
         else -> throw IllegalArgumentException("Unsupported canonical JSON value")
+    }
+    private fun canonicalNumber(value: Number): String {
+        val number = value.toDouble()
+        require(number.isFinite()) { "Canonical JSON cannot encode non-finite number" }
+        if (number == 0.0) return "0"
+        val decimal = BigDecimal(value.toString()).stripTrailingZeros()
+        val magnitude = kotlin.math.abs(number)
+        return if (magnitude >= 1e21 || magnitude < 1e-6) decimal.toString().replace('E', 'e').replace(Regex("e([+-])0+(\\d+)"), "e\$1\$2")
+        else decimal.toPlainString()
     }
     private fun copy(value: Any?): Any = when (value) {
         null, JSONObject.NULL -> JSONObject.NULL

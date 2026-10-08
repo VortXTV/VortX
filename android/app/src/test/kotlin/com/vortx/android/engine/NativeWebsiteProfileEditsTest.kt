@@ -21,7 +21,7 @@ class NativeWebsiteProfileEditsTest {
 
     @Test fun `exact absent host base admits immutable patch and records event actor`() {
         val result = NativeWebsiteProfileEdits.admit(scope, event(), response(), NativeHostPreferences.local(scope),
-            JSONObject().put("owner", JSONObject().put("avatar", "moon")), JSONObject())
+            JSONObject().put("owner", JSONObject().put("avatar", "moon")), JSONObject(), null)
         val avatar = result.host.getJSONObject("document").getJSONObject("profiles").getJSONObject("owner").getJSONObject("fields").getJSONObject("avatar")
         assertEquals(8L, avatar.getLong("clock")); assertEquals(id, avatar.getString("actor")); assertEquals("🍿", avatar.getString("value"))
         assertEquals("a".repeat(64), result.certificates.getString(id))
@@ -31,7 +31,7 @@ class NativeWebsiteProfileEditsTest {
         val local = NativeHostPreferences.recordProfiles(scope, NativeHostPreferences.local(scope), JSONObject(),
             JSONObject().put("owner", JSONObject().put("avatar", "later")))
         assertTrue(runCatching { NativeWebsiteProfileEdits.admit(scope, event(), response(), local,
-            JSONObject().put("owner", JSONObject().put("avatar", "moon")), JSONObject()) }.exceptionOrNull() is NativeWebsiteProfileEdits.Conflict)
+            JSONObject().put("owner", JSONObject().put("avatar", "moon")), JSONObject(), null) }.exceptionOrNull() is NativeWebsiteProfileEdits.Conflict)
         val unsupportedButCredentialFree = JSONObject().put("eventId", "legacy-pending").put("unknownFuture", true)
         val retained = NativeWebsiteProfileEdits.retain(scope, JSONObject().put("events", JSONArray()), unsupportedButCredentialFree)
         assertEquals(1, retained.getJSONArray("events").length())
@@ -60,5 +60,29 @@ class NativeWebsiteProfileEditsTest {
         val archived = NativeHostDocument.archive(source).getJSONObject("document")
         assertEquals(hash("\"moon\""), archived.getJSONObject("profileEditEvents").getJSONArray("events").getJSONObject(0)
             .getJSONObject("hostBases").getJSONObject("owner").getJSONObject("avatar").getString("valueHash"))
+    }
+
+    @Test fun `canonical JSON matches website commas numbers and unicode vectors`() {
+        val vector = JSONObject().put("emoji", "🎬").put("exponent", 1e-7).put("integral", 100000000000000000000.0)
+            .put("negativeZero", -0.0).put("nested", JSONObject().put("b", 1).put("a", 2))
+            .put("array", JSONArray().put("x").put(1e-7)).put("slash", "https://vortx.tv/a/b")
+        assertEquals("{\"array\":[\"x\",1e-7],\"emoji\":\"🎬\",\"exponent\":1e-7,\"integral\":100000000000000000000,\"negativeZero\":0,\"nested\":{\"a\":2,\"b\":1},\"slash\":\"https://vortx.tv/a/b\"}",
+            NativeWebsiteProfileEdits.canonical(vector))
+    }
+
+    @Test fun `peer receipt needs exact paired host result or a newer host tuple`() {
+        val fallback = JSONObject().put("owner", JSONObject().put("avatar", "moon"))
+        val applied = NativeWebsiteProfileEdits.admit(scope, event(), response(), NativeHostPreferences.local(scope), fallback, JSONObject(), null)
+        val receipt = response().getJSONArray("events").getJSONObject(0).getJSONObject("receipt")
+        val replay = NativeWebsiteProfileEdits.admit(scope, event(), response(), applied.host, fallback, JSONObject(), receipt)
+        assertEquals("a".repeat(64), replay.certificates.getString(id))
+        assertTrue(runCatching { NativeWebsiteProfileEdits.admit(scope, event(), response(), NativeHostPreferences.local(scope), fallback, JSONObject(), receipt) }
+            .exceptionOrNull() is NativeWebsiteProfileEdits.Conflict)
+        val newer = JSONObject(applied.host.toString())
+        newer.getJSONObject("document").getJSONObject("profiles").getJSONObject("owner").getJSONObject("fields").put("avatar",
+            JSONObject().put("clock", 9).put("actor", "00000000-0000-4000-8000-000000000009").put("value", JSONObject.NULL))
+        newer.put("counter", 9)
+        val retainedNewer = NativeWebsiteProfileEdits.admit(scope, event(), response(), newer, fallback, JSONObject(), receipt)
+        assertTrue(retainedNewer.host.getJSONObject("document").getJSONObject("profiles").getJSONObject("owner").getJSONObject("fields").getJSONObject("avatar").isNull("value"))
     }
 }
