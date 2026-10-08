@@ -91,6 +91,14 @@ final class CoreBridge: ObservableObject {
         _ = facade.setWatchedVideos(metaID: id, videoIDs: videoIDs, name: name, type: type, poster: poster,
                                     watched: watched, profileID: profile.uuidString)
     }
+    private func resolveNativeWatchedInventory(id: String, name: String, type: String, poster: String?, watched: Bool,
+                                               season: Int? = nil, target: PlaybackMutationTarget? = nil) {
+        guard let (facade, profile) = nativePlaybackBinding(target ?? .capture(core: self)) else { return }
+        Task { [weak facade] in
+            _ = await facade?.resolveAndSetWatchedVideos(metaID: id, type: type, name: name, poster: poster,
+                                                          watched: watched, profileID: profile.uuidString, season: season)
+        }
+    }
     private func nativeDismissContinueWatching(id: String, target: PlaybackMutationTarget? = nil) {
         guard let (facade, profile) = nativePlaybackBinding(target ?? .capture(core: self)) else { return }
         _ = facade.dispatchForProfile(.object(["type": .string("remove_from_continue_watching"), "metaId": .string(id)]), profileID: profile.uuidString)
@@ -3064,7 +3072,10 @@ final class CoreBridge: ObservableObject {
     func setLibraryItemWatched(id: String, _ isWatched: Bool) {
 #if VORTX_NATIVE_DATA_ENGINE
         if usesNativeProfileState {
-            guard let item = library?.catalog.first(where: { $0.id == id }), !EpisodePlaybackIdentity.usesSeriesLifecycle(type: item.type) else { return }
+            guard let item = library?.catalog.first(where: { $0.id == id }) else { return }
+            if EpisodePlaybackIdentity.usesSeriesLifecycle(type: item.type) {
+                resolveNativeWatchedInventory(id: id, name: item.name, type: item.type, poster: item.poster, watched: isWatched); return
+            }
             nativeWatchedIntent(id: id, name: item.name, type: item.type, poster: item.poster, watched: isWatched); return
         }
 #endif
@@ -3620,7 +3631,10 @@ final class CoreBridge: ObservableObject {
         if usesNativeProfileState {
             let preview = rawMetaPreview(forId: metaId) ?? fallbackPreview?.dictionary
             guard let preview, preview["id"] as? String == metaId, let type = preview["type"] as? String,
-                  let name = preview["name"] as? String, !EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) else { return }
+                  let name = preview["name"] as? String else { return }
+            if EpisodePlaybackIdentity.usesSeriesLifecycle(type: type) {
+                resolveNativeWatchedInventory(id: metaId, name: name, type: type, poster: preview["poster"] as? String, watched: isWatched); return
+            }
             nativeWatchedIntent(id: metaId, name: name, type: type, poster: preview["poster"] as? String, watched: isWatched); return
         }
 #endif

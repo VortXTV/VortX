@@ -293,6 +293,36 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return enqueueMutation(type: watched ? "mark_watched" : "reset_watched", raw: "", actions: actions)
         } catch { return fail("invalid_watched_inventory") }
     }
+    /// Card actions may not have a resident detail page. Resolve their exact metadata through the
+    /// native resource host without publishing into the navigation slot, then recheck the captured
+    /// profile and registry generation before one atomic episode transaction is admitted.
+    func resolveAndSetWatchedVideos(metaID: String, type: String, name: String, poster: String?, watched: Bool,
+                                    profileID: String, season: Int? = nil) async -> Bool {
+        let captured: (UUID, [VortxResourceAddon])? = lock.withLock {
+            guard !closed, pendingProfileTransitions == 0, resourceRegistryValid,
+                  values["native_state"]?["activeProfileId"] == .string(profileID) else { return nil }
+            return (registryGeneration, registry)
+        }
+        guard let captured else { return fail("stale_watched_resolution") }
+        let request = VortxResourceRequest(resource: .meta, type: type, id: metaID)
+        guard let projection = try? await session.loadMeta(request: request, stream: nil, addons: captured.1),
+              let meta = projection["metaItems"]?.array?.compactMap({ $0["content"]?["content"] }).first(where: { $0["id"] == .string(metaID) && $0["type"] == .string(type) }) else {
+            return fail("watched_metadata_unavailable")
+        }
+        let ids = (meta["videos"]?.array ?? []).filter { season == nil || (try? $0["season"]?.decode(Int.self)) == season }.compactMap { string($0["id"]) }
+        guard !ids.isEmpty else { return fail("watched_metadata_unavailable") }
+        return lock.withLock {
+            guard !closed, pendingProfileTransitions == 0, registryGeneration == captured.0,
+                  values["native_state"]?["activeProfileId"] == .string(profileID) else { return fail("stale_watched_resolution") }
+            do {
+                let actions = try Array(Set(ids)).sorted().map { videoID in
+                    let action: VortxJSON = .object(["type": .string(watched ? "mark_watched" : "reset_watched"), "metaId": .string(metaID), "videoId": .string(videoID), "name": .string(name), "metadata": .object(["type": .string(type), "poster": poster.map(VortxJSON.string) ?? .null])])
+                    return String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
+                }
+                return enqueueMutation(type: watched ? "mark_watched" : "reset_watched", raw: "", actions: actions)
+            } catch { return fail("invalid_watched_inventory") }
+        }
+    }
     /// Metadata comes only from the accepted native registry. The return value acknowledges the
     /// durable FIFO add, not merely HTTP success or UI dispatch. Legacy recovery may only confirm
     /// existing native membership; it cannot manufacture a new save over a native removal.
