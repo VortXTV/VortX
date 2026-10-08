@@ -7288,6 +7288,8 @@ struct TVPlayerView: View {
             // bounded attach grace above, after which a never-attached route still demotes. The .failed
             // instant-demote path is untouched. A working stream cancels this via the timePos handler.
             let armed = playbackDeadlineNow
+            var nativeDecodeClock = AppleAVStartWatchdogPolicy.NativeDecodeClock(
+                uptime: ProcessInfo.processInfo.systemUptime, activeTime: armed)
             let surfaceRemuxExpected = activeAVPlayerWouldRemux || activeAVPlayerWouldPlainRemux
             var watchedController = coordinator.player as? AVPlayerEngineController
             var watchedLoadToken = watchedController?.activeLoadToken
@@ -7327,13 +7329,18 @@ struct TVPlayerView: View {
                 let remuxExpectedNow = surfaceRemuxExpected
                     || (remuxSignal?.pendingOrMounted == true)
                 let elapsed = (now - armed)
+                let nativePhase = controller?.nativeStartupPhase ?? .notRequired
+                let nativeDecodeElapsed = nativeDecodeClock.elapsed(
+                    phase: nativePhase, uptime: ProcessInfo.processInfo.systemUptime, activeTime: now)
                 let awaitingDecision = AppleAVStartWatchdogPolicy.awaitingMountDecision(
                     elapsed: elapsed,
                     ownerCurrent: ownerCurrent,
                     remuxMounted: mountedNow,
                     remuxExpected: remuxExpectedNow,
                     directTimeout: avStartWatchdogSeconds,
-                    remuxAttachTimeout: avRemuxAttachWatchdogSeconds
+                    remuxAttachTimeout: avRemuxAttachWatchdogSeconds,
+                    nativePhase: nativePhase,
+                    nativeDecodeElapsed: nativeDecodeElapsed
                 )
                 if awaitingDecision == .cancel { return }
                 if !monitoringRemux {

@@ -24,6 +24,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   "${shared_sources[@]}" "$recovery_test_dir/remux-signal.swift" \
   app/Tests/TVAVStartWatchdogPolicyTests.swift -o "$recovery_test_dir/startup"
 "$recovery_test_dir/startup"
+bash scripts/test-native-dv-preflight.sh
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   "${shared_sources[@]}" "$recovery_test_dir/node-listener.swift" \
   app/Tests/NodeListenerRebindAndTVAudioRecoveryTests.swift -o "$recovery_test_dir/tracks"

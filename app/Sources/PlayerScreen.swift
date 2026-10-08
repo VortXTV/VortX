@@ -5916,6 +5916,8 @@ struct PlayerScreen: View {
             // A hosted remux mounts asynchronously. Poll until it attaches, then monitor input/output
             // progress. A one-shot pre-mount sample must not send a healthy DV source to the direct timer.
             let armed = playbackDeadlineNow
+            var nativeDecodeClock = AppleAVStartWatchdogPolicy.NativeDecodeClock(
+                uptime: ProcessInfo.processInfo.systemUptime, activeTime: armed)
             let surfaceRemuxExpected = activeAVPlayerWouldRemux || activeAVPlayerWouldPlainRemux
             var watchedController = coordinator.player as? AVPlayerEngineController
             var watchedLoadToken = watchedController?.activeLoadToken
@@ -5949,12 +5951,17 @@ struct PlayerScreen: View {
                 let remuxSignal = current?.remuxStartupSignal
                 let remuxExpectedNow = surfaceRemuxExpected || remuxSignal?.pendingOrMounted == true
                 let elapsed = now - armed
+                let nativePhase = current?.nativeStartupPhase ?? .notRequired
+                let nativeDecodeElapsed = nativeDecodeClock.elapsed(
+                    phase: nativePhase, uptime: ProcessInfo.processInfo.systemUptime, activeTime: now)
                 let awaitingDecision = AppleAVStartWatchdogPolicy.awaitingMountDecision(
                     elapsed: elapsed, ownerCurrent: ownerCurrent,
                     remuxMounted: remuxSignal?.mounted == true,
                     remuxExpected: remuxExpectedNow,
                     directTimeout: avStartWatchdogSeconds,
-                    remuxAttachTimeout: avRemuxAttachWatchdogSeconds)
+                    remuxAttachTimeout: avRemuxAttachWatchdogSeconds,
+                    nativePhase: nativePhase,
+                    nativeDecodeElapsed: nativeDecodeElapsed)
                 if awaitingDecision == .cancel { return }
                 if !monitoringRemux {
                     switch awaitingDecision {

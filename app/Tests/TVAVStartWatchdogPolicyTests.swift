@@ -62,6 +62,56 @@ private enum TVAVStartWatchdogPolicyTests {
             pendingGeneration: nil,
             mounted: false)
 
+        var native = Policy.NativePreflightState()
+        native.begin(generation: 9)
+        var nativeClock = Policy.NativeDecodeClock(uptime: 100, activeTime: 100)
+        let preparing = native.currentPhase(generation: 9, terminal: false)
+        check("native preflight: metadata is not charged as decoding", Policy.awaitingMountDecision(
+            elapsed: 10.25, ownerCurrent: true, remuxMounted: false, remuxExpected: false,
+            directTimeout: 10, remuxAttachTimeout: 30, nativePhase: preparing,
+            nativeDecodeElapsed: nativeClock.elapsed(phase: preparing, uptime: 110, activeTime: 110)) == .keepWaiting)
+        native.didAttach(generation: 8, uptime: 110)
+        check("native preflight: stale generation cannot publish attach", native.phase == preparing)
+        native.didAttach(generation: 9, uptime: 110.25)
+        let attached = native.phase
+        check("native decode: first sample excludes real pre-attach time",
+              nativeClock.elapsed(phase: attached, uptime: 110.5, activeTime: 110.5) == 0.25)
+        native.didAttach(generation: 9, uptime: 115)
+        check("native decode: repeated completion cannot restart attachment epoch", native.phase == attached)
+        check("native decode: unchanged active clock pauses deadline",
+              nativeClock.elapsed(phase: attached, uptime: 410.5, activeTime: 110.5) == 0.25)
+        let justBefore = nativeClock.elapsed(phase: attached, uptime: 420.249, activeTime: 120.249)
+        check("native decode: original ten-second boundary waits just before", Policy.awaitingMountDecision(
+            elapsed: 320.249, ownerCurrent: true, remuxMounted: false, remuxExpected: false,
+            directTimeout: 10, remuxAttachTimeout: 30, nativePhase: attached,
+            nativeDecodeElapsed: justBefore) == .keepWaiting)
+        let atBoundary = nativeClock.elapsed(phase: attached, uptime: 420.25, activeTime: 120.25)
+        check("native decode: original ten-second boundary still demotes", Policy.awaitingMountDecision(
+            elapsed: 320.25, ownerCurrent: true, remuxMounted: false, remuxExpected: false,
+            directTimeout: 10, remuxAttachTimeout: 30, nativePhase: attached,
+            nativeDecodeElapsed: atBoundary) == .demote)
+        check("native decode: source retirement overrides healthy phase", Policy.awaitingMountDecision(
+            elapsed: 0, ownerCurrent: false, remuxMounted: false, remuxExpected: false,
+            directTimeout: 10, remuxAttachTimeout: 30, nativePhase: attached,
+            nativeDecodeElapsed: 0) == .cancel)
+        check("native decode: current item generation must still match",
+              native.currentPhase(generation: 10, terminal: false) == .retired)
+        check("native decode: terminal receipt retires phase",
+              native.currentPhase(generation: 9, terminal: true) == .retired)
+        native.retire()
+        native.didAttach(generation: 9, uptime: 999)
+        check("native decode: stop cannot be revived by late attachment", native.phase == .retired)
+        check("native decode: retired watchdog cancels", Policy.awaitingMountDecision(
+            elapsed: 1000, ownerCurrent: true, remuxMounted: false, remuxExpected: false,
+            directTimeout: 10, remuxAttachTimeout: 30, nativePhase: native.phase) == .cancel)
+        var pausedAttachClock = Policy.NativeDecodeClock(uptime: 0, activeTime: 0)
+        check("native decode: attach during pause cannot bill earlier active time",
+              pausedAttachClock.elapsed(phase: .attached(generation: 1, uptime: 5),
+                                        uptime: 100, activeTime: 3) == 0)
+        check("native decode: play after paused attach receives the full decode opportunity",
+              pausedAttachClock.elapsed(phase: .attached(generation: 1, uptime: 5),
+                                        uptime: 109.999, activeTime: 12.999)! < 10)
+
         // Direct/native AVPlayer retains the old short deadline exactly.
         check("direct: initial signal is not pending", !directSignal.pendingOrMounted)
         check(
@@ -312,6 +362,12 @@ private enum TVAVStartWatchdogPolicyTests {
                 currentLoadToken: 7)
         )
 
+        let engineSource = (try? String(contentsOfFile: "app/Sources/Player/AVPlayerEngine.swift", encoding: .utf8)) ?? ""
+        check("native DV: metadata has an independent bounded task", engineSource.contains("nativePreAttachDeadlineTask = Task")
+            && engineSource.contains("nativePreflightTimeoutSeconds"))
+        check("native DV: actual item attachment publishes the decode boundary", engineSource.contains("nativePreflightState.didAttach(")
+            && engineSource.contains("uptime: ProcessInfo.processInfo.systemUptime"))
+
         for (label, path) in [
             ("iOS/macOS", "app/Sources/PlayerScreen.swift"),
             ("tvOS", "app/SourcesTV/TVPlayerView.swift")
@@ -325,6 +381,8 @@ private enum TVAVStartWatchdogPolicyTests {
                 check("\(label): current source owns HLS exemption", watchdog.contains("PlayerEngineRouter.isHLS(curURL ?? url)"))
                 check("\(label): startup phase polls current remux intent", watchdog.contains("AppleAVStartWatchdogPolicy.awaitingMountDecision(")
                     && watchdog.contains("remuxStartupSignal") && watchdog.contains("while true"))
+                check("\(label): startup distinguishes native preflight from decoding", watchdog.contains("nativeStartupPhase")
+                    && watchdog.contains("nativeDecodeClock.elapsed("))
                 check("\(label): watchdog fences all three generations and token", watchdog.contains("ApplePlaybackStartPolicy.loadTimeoutOwnerIsCurrent(")
                     && watchdog.contains("capturedEpisodeGeneration") && watchdog.contains("capturedSourceGeneration")
                     && watchdog.contains("capturedResumeGeneration") && watchdog.contains("watchedLoadToken"))

@@ -286,10 +286,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var recoverySeekSettlement = AVPlayerRecoverySettlementPolicy.RecoverySeekSettlement()
     private weak var registeredSeekServer: VortXRemuxHLSServer?
     private var registeredSeekRequestID: UInt64?
+    private var nativePreflightState = AppleAVStartWatchdogPolicy.NativePreflightState()
+    var nativeStartupPhase: AppleAVStartWatchdogPolicy.NativePreflightState.Phase {
+        nativePreflightState.currentPhase(
+            generation: itemGeneration,
+            terminal: fatalErrorEmitted || terminalLatch.hasEmitted)
+    }
     #if os(tvOS)
     /// Current native-DV preflight. A new load/stop cancels it, and its completion must also match both the
     /// logical load token and exact item generation before it may switch the display or attach anything.
     private var nativePreAttachTask: Task<Void, Never>?
+    private var nativePreAttachDeadlineTask: Task<Void, Never>?
     /// The exact object loaded from `AVAsset.preferredDisplayCriteria`. Ready-to-play may reapply this same
     /// Apple-owned object if the window's display manager was replaced; it never constructs a second criterion.
     private var nativeDisplayCriteria: AVDisplayCriteria?
@@ -881,6 +888,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     // MARK: Loading + transport
 
     func invalidateLoadToken() {
+        nativePreflightState.retire()
+        #if os(tvOS)
+        nativePreAttachTask?.cancel()
+        nativePreAttachTask = nil
+        nativePreAttachDeadlineTask?.cancel()
+        nativePreAttachDeadlineTask = nil
+        #endif
         activeLoadToken = nil
     }
 
@@ -1148,6 +1162,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // The new logical request becomes active before any mount failure or observer can emit.
         invalidateLoadToken()
         activeLoadToken = issuedToken
+        nativePreflightState = AppleAVStartWatchdogPolicy.NativePreflightState()
         externalMountTask?.cancel()
         externalMountTask = nil
         hdrFallbackCapabilityRefreshTask?.cancel()
@@ -1473,6 +1488,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         player.replaceCurrentItem(with: newItem)
         guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
               player.currentItem === newItem else { return }
+        nativePreflightState.didAttach(
+            generation: generation, uptime: ProcessInfo.processInfo.systemUptime)
         observe(newItem, loadToken: loadToken)
         // KVO uses [.initial, .new], but an already-ready item still gets an explicit kick.
         if newItem.status != .unknown { handleStatus(newItem, loadToken: loadToken) }
@@ -1485,59 +1502,71 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                                         loadToken: PlayerLoadToken,
                                         generation: UInt64) {
         nativePreAttachTask?.cancel()
+        nativePreAttachDeadlineTask?.cancel()
+        nativePreflightState.begin(generation: generation)
+        // Do not use a structured task group here: AVAsset loading can ignore cancellation, and waiting
+        // for that child on scope exit would defeat the deadline. Both independent tasks share a one-shot
+        // generation/phase fence. Late metadata can neither switch the display nor attach another item.
+        nativePreAttachDeadlineTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(AppleAVStartWatchdogPolicy.nativePreflightTimeoutSeconds))
+            } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.completeNativeDVPreAttach(
+                criteria: nil, item: newItem, output: output,
+                loadToken: loadToken, generation: generation, reason: "metadata-deadline-criteria-unavailable")
+        }
         nativePreAttachTask = Task { @MainActor [weak self] in
-            guard let self else { return }
             do {
                 let criteria = try await asset.load(.preferredDisplayCriteria)
-                guard !Task.isCancelled else { return }
-                let outcome = DVPlaybackPolicy.completeNativePreAttach(
-                    loadedCriteria: criteria,
-                    isCurrent: {
-                        self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation)
-                            && !Task.isCancelled
-                    },
-                    apply: { loadedCriteria in
-                        self.nativeDisplayCriteria = loadedCriteria
-                        let applied = HDRDisplayMode.applyNativePreferredCriteria(loadedCriteria, in: nil)
-                        DiagnosticsLog.log(
-                            "dv", "native asset-owned criteria pre-attach apply=\(applied ? "accepted" : "fail-soft") generation=\(generation)")
-                    },
-                    attach: {
-                        self.attachPreparedItem(
-                            newItem,
-                            output: output,
-                            loadToken: loadToken,
-                            generation: generation)
-                    })
-                if self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) {
-                    self.nativePreAttachTask = nil
-                }
-                DiagnosticsLog.log("dv", "native display preflight completed outcome=\(String(describing: outcome)) generation=\(generation)")
+                guard let self, !Task.isCancelled else { return }
+                self.completeNativeDVPreAttach(
+                    criteria: criteria, item: newItem, output: output,
+                    loadToken: loadToken, generation: generation, reason: "metadata-loaded")
             } catch {
-                guard !Task.isCancelled else { return }
-                let outcome = DVPlaybackPolicy.completeNativePreAttach(
-                    loadedCriteria: Optional<AVDisplayCriteria>.none,
-                    isCurrent: {
-                        self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation)
-                            && !Task.isCancelled
-                    },
-                    apply: { _ in },
-                    attach: {
-                        self.attachPreparedItem(
-                            newItem,
-                            output: output,
-                            loadToken: loadToken,
-                            generation: generation)
-                    })
-                if self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) {
-                    self.nativePreAttachTask = nil
-                }
+                guard let self, !Task.isCancelled else { return }
+                self.completeNativeDVPreAttach(
+                    criteria: nil, item: newItem, output: output,
+                    loadToken: loadToken, generation: generation, reason: "metadata-failed")
                 DiagnosticsLog.log(
-                    "dv", "native preferredDisplayCriteria load failed; attach fail-soft outcome=\(String(describing: outcome)) error=\(error.localizedDescription)")
+                    "dv", "native preferredDisplayCriteria load failed; attach fail-soft error=\(error.localizedDescription)")
             }
         }
         DiagnosticsLog.log(
-            "dv", "native display preflight started; retired item detached, existing chrome start watchdogs remain the outer slow-load bound generation=\(generation)")
+            "dv", "native display preflight started; metadata bounded to \(Int(AppleAVStartWatchdogPolicy.nativePreflightTimeoutSeconds))s, decode budget begins at exact-item attach generation=\(generation)")
+    }
+
+    private func completeNativeDVPreAttach(criteria: AVDisplayCriteria?,
+                                          item newItem: AVPlayerItem,
+                                          output: AVPlayerItemVideoOutput,
+                                          loadToken: PlayerLoadToken,
+                                          generation: UInt64,
+                                          reason: String) {
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
+              nativePreflightState.isPreparing(generation: generation),
+              !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }
+        nativePreAttachTask?.cancel()
+        nativePreAttachTask = nil
+        nativePreAttachDeadlineTask?.cancel()
+        nativePreAttachDeadlineTask = nil
+        let outcome = DVPlaybackPolicy.completeNativePreAttach(
+            loadedCriteria: criteria,
+            isCurrent: {
+                self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation)
+                    && self.nativePreflightState.isPreparing(generation: generation)
+                    && !self.fatalErrorEmitted && !self.terminalLatch.hasEmitted
+            },
+            apply: { loadedCriteria in
+                self.nativeDisplayCriteria = loadedCriteria
+                let applied = HDRDisplayMode.applyNativePreferredCriteria(loadedCriteria, in: nil)
+                DiagnosticsLog.log(
+                    "dv", "native asset-owned criteria pre-attach apply=\(applied ? "accepted" : "fail-soft") generation=\(generation)")
+            },
+            attach: {
+                self.attachPreparedItem(newItem, output: output, loadToken: loadToken, generation: generation)
+            })
+        DiagnosticsLog.log(
+            "dv", "native display preflight completed outcome=\(String(describing: outcome)) reason=\(reason) generation=\(generation)")
     }
     #endif
 
