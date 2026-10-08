@@ -33,16 +33,16 @@ targets:
     dependencies:
       - package: MPVKit
         product: MPVKit-GPL
-      - framework: Vendor/StremioXCore.xcframework
-        embed: false
-      - framework: Vendor/VortxEngine.xcframework
-        embed: false
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.cinema-ui-smoke
         PRODUCT_NAME: CinemaUISmokeRenderer
         SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
-        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        # Xcode 26 rejects locally linked static XCFramework roots in an ad-hoc project even when
+        # their macOS slices validate.  Expose the same checked native module maps and archives
+        # directly; no native runtime is constructed by the renderer entry point.
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64/Headers $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64/Headers/vortx"
+        OTHER_LDFLAGS: "$(inherited) -force_load $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64/libstremiox_core.a -force_load $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64/libvortx_ffi.a"
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: Cinema UI Smoke
