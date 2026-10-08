@@ -5,12 +5,13 @@ set -euo pipefail
 # which still links the same private MPV/Core frameworks as the native app. Run only after the active MPV
 # rebuild window is clear; it does not launch the installed VortX application or any account/player flow.
 root="${0:A:h:h}"
-project="$root/VortX.xcodeproj"
+spec="$root/CinemaUISmokeRenderer.yml"
+project="$root/CinemaUISmokeRenderer.xcodeproj"
 derived="${CINEMA_UI_SMOKE_DERIVED_DATA:-$root/build/cinema-ui-smoke-derived}"
 output="${CINEMA_UI_SMOKE_OUTPUT:-$root/build/cinema-ui-smoke-png}"
 
 command -v xcodegen >/dev/null || { print -u2 'xcodegen is required'; exit 1; }
-xcodegen generate --spec "$root/project.yml" --project "$project"
+xcodegen generate --spec "$spec" --project "$root"
 
 xcodebuild \
   -jobs 1 \
