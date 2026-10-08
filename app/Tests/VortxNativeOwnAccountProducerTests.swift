@@ -63,14 +63,36 @@ private actor OwnSourceRequests {
         check(Data(base64Encoded: envelope["libraryResponseBase64"] as! String) == library)
         check(Data(base64Encoded: envelope["addonsResponseBase64"] as! String) == addons)
         check(Data(base64Encoded: envelope["profileOverlayBase64"] as! String) == Data("{}".utf8))
+        check(envelope["schemaVersion"] as? Int == 2)
+        check(source.profileOverlaySHA256 == (try VortxProfileOverlayWitness.digest(json: Data("{}".utf8))))
         let scopedDocument: VortxJSON = .object(["vortx": .object(["library": .array([.string("must-not-borrow")]), "byProfile": .object([
             profileID.uuidString: .object(["watched": .object(["own-only": .object(["ma": .integer(10)])])]),
             UserProfile.ownerID.uuidString: .object(["watched": .object(["owner-only": .object(["ma": .integer(20)])])])])])])
         let overlay = try JSONDecoder().decode(VortxJSON.self, from: VortxNativeOwnAccountProducer.overlay(document: scopedDocument, profileID: profileID))
         check(overlay["vortx"]?["library"] == nil && overlay["vortx"]?["byProfile"]?[UserProfile.ownerID.uuidString] == nil)
         check(overlay["vortx"]?["byProfile"]?[profileID.uuidString]?["watched"]?["own-only"]?["ma"] == .integer(10))
+        let hardRaw = Data(("{\"vortx\":{\"byProfile\":{\"" + profileID.uuidString + "\":{\"progress\":{\"own-only\":{\"t\":0.039304369631583587}}}}}}").utf8)
+        let ingress = try VortxProfileOverlayWitness.decodeObject(json: hardRaw)
+        let projected = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: ingress))
+        let rawSlice = try VortxNativeOwnAccountProducer.overlay(document: projected, profileID: profileID)
+        check(try VortxProfileOverlayWitness.digest(json: rawSlice) == VortxProfileOverlayWitness.digest(json: hardRaw))
         check(source.profileID == profileID && source.verifiedStreamingUID == "verified-fixture-uid")
         check(await requests.paths == ["datastoreGet", "addonCollectionGet"])
+        // A new UID's independently fetched rows do not certify a historical UUID-only
+        // cloud overlay. Version 1 deliberately carries no current-overlay witness.
+        let independent = try await VortxNativeOwnAccountProducer.fetch(profileID: profileID, authKey: "fixture-only", authority: authority,
+            framing: .independentNetworkOnly, verify: { _ in "independent-uid" }, send: { request in
+                .init(data: request.url!.lastPathComponent == "datastoreGet" ? library : addons, statusCode: 200)
+            })
+        let independentEnvelope = try JSONSerialization.jsonObject(with: independent.sourceDocument) as! [String: Any]
+        check(independentEnvelope["schemaVersion"] as? Int == 1 && independent.profileOverlaySHA256 == nil)
+        do {
+            _ = try await VortxNativeOwnAccountProducer.fetch(profileID: profileID, authKey: "fixture-only", authority: authority,
+                profileOverlay: VortxNativeOwnAccountProducer.overlay(document: scopedDocument, profileID: profileID),
+                framing: .independentNetworkOnly, verify: { _ in "independent-uid" }, send: send)
+            fatalError("historical overlay attributed to new UID")
+        } catch VortxNativeError.invalidSnapshot {}
+        check(await requests.paths.count == 2)
         // Same-slot replacement A→B→A still retires the original capture even if the final token
         // bytes equal the first token. A source never becomes valid again by value equality alone.
         let old = VortxNativeOwnAccountProducer.Authority(generations: [.initCapture(slot)], validate: { true })
@@ -108,6 +130,45 @@ private actor OwnSourceRequests {
         VortxNativeOwnAccountProducer.withCredentialMutation(slot: slot) { /* Same-value token replacement still retires the capture. */ }
         do { try betweenStartAndWrite.withActive {}; fatalError("same-value credential replacement revived source") }
         catch VortxNativeError.superseded {}
+        // Secure candidates are immutable and inactive until the durable native binding names
+        // their transaction. No mutable current-token pointer can race a failed native CAS.
+        let journalAuthority = VortxNativeOwnAccountProducer.Authority(generations: [.initCapture(slot)], validate: { true })
+        var secure: [String: String] = [:]
+        func stage(_ token: String, _ scope: String, _ id: UUID, _ uid: String, _ transaction: String?) throws -> String {
+            try VortxNativeAccountCredentials.stage(token: token, scope: scope, profileID: id, uid: uid,
+                transactionID: transaction, authority: journalAuthority, read: { secure[$0] }, write: { secure[$0] = $1; return true })
+        }
+        func binding(_ uid: String, _ revision: Int64, _ transaction: String?) -> VortxJSON {
+            .object(["account": .object(["kind": .string("own"), "value": .string(uid)]),
+                     "revision": .integer(revision), "transactionId": transaction.map(VortxJSON.string) ?? .null])
+        }
+        let initial = try stage("token-A0", "account-A", profileID, "uid-A", nil)
+        let stagedB = try stage("token-B", "account-A", profileID, "uid-B", "transaction-B")
+        var active = binding("uid-A", 0, nil)
+        check(try VortxNativeAccountCredentials.selectedSlot(scope: "account-A", profileID: profileID, binding: active) == initial)
+        // A failed/unknown CAS does not select the newly staged candidate.
+        check(secure[initial] == "token-A0" && stagedB != initial)
+        active = binding("uid-B", 1, "transaction-B")
+        check(try VortxNativeAccountCredentials.selectedSlot(scope: "account-A", profileID: profileID, binding: active) == stagedB)
+        let relinkA = try stage("token-A2", "account-A", profileID, "uid-A", "transaction-A2")
+        active = binding("uid-A", 2, "transaction-A2")
+        check(try VortxNativeAccountCredentials.selectedSlot(scope: "account-A", profileID: profileID, binding: active) == relinkA)
+        check(relinkA != initial && secure[initial] == "token-A0" && secure[stagedB] == "token-B")
+        let foreignAccount = try stage("token-foreign-account", "account-B", profileID, "uid-A", "transaction-A2")
+        let foreignProfile = try stage("token-foreign-profile", "account-A", UUID(), "uid-A", "transaction-A2")
+        check(foreignAccount != relinkA && foreignProfile != relinkA)
+        do { _ = try stage("replacement", "account-A", profileID, "uid-A", "transaction-A2"); fatalError("immutable credential revision overwritten") }
+        catch VortxNativeError.invalidSnapshot {}
+        check(secure[relinkA] == "token-A2")
+        let missing = try VortxNativeAccountCredentials.selectedSlot(scope: "account-A", profileID: profileID, binding: binding("uid-A", 3, "missing"))!
+        check(secure[missing] == nil) // Never borrow an earlier same-UID token.
+        check(try VortxNativeAccountCredentials.selectedSlot(scope: "account-A", profileID: profileID,
+            binding: .object(["account": .object(["kind": .string("pending_own")])])) == nil)
+        VortxNativeOwnAccountProducer.invalidateContext()
+        let beforeRetired = secure
+        do { _ = try stage("retired", "account-A", profileID, "uid-A", "retired"); fatalError("retired credential candidate staged") }
+        catch VortxNativeError.superseded {}
+        check(secure == beforeRetired)
         print("Own-account authenticated producer: hardened identity redirect rejection, exact raw source bytes, independent read-only requests, token ABA/profile retirement and failed-source nonempty semantics passed")
     }
 }

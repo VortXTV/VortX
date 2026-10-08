@@ -22,6 +22,18 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var failure: String?
     private var resourceRegistryValid = true
     private var pendingProfileTransitions = 0
+    private var accountEpoch = UUID()
+    var accountGeneration: UUID { lock.withLock { accountEpoch } }
+    private func accountIdentity(_ state: VortxJSON?) -> VortxJSON {
+        var bindings: [String: VortxJSON] = [:]
+        if case .object(let profiles) = state?["roster"]?["profiles"] {
+            for (id, profile) in profiles {
+                bindings[id] = state?["nativeSync"]?["accountSlots"]?[id]?["activeBinding"]
+                    ?? .object(["account": profile["account"] ?? .null, "revision": .integer(0), "transactionId": .null])
+            }
+        }
+        return .object(bindings)
+    }
     private var playback: VortxJSON?
     private var libraryRequest: VortxJSON?
     var lastFailure: String? { lock.withLock { failure } }
@@ -34,19 +46,25 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return Double(offset) / 1000
         }
     }
-    func resumeSeconds(id: String, profileID: String) async throws -> Double {
-        let accepted = lock.withLock { !closed && pendingProfileTransitions == 0 && values["native_state"]?["activeProfileId"] == .string(profileID) }
+    func resumeSeconds(id: String, profileID: String, expectedAccountGeneration: UUID) async throws -> Double {
+        let accepted = lock.withLock { !closed && accountEpoch == expectedAccountGeneration && pendingProfileTransitions == 0 && values["native_state"]?["activeProfileId"] == .string(profileID) }
         guard accepted else { throw VortxNativeError.superseded }
         let seconds = try await session.resumeSeconds(id: id, profileID: profileID)
-        guard lock.withLock({ !closed && pendingProfileTransitions == 0 && values["native_state"]?["activeProfileId"] == .string(profileID) }) else { throw VortxNativeError.superseded }
+        guard lock.withLock({ !closed && accountEpoch == expectedAccountGeneration && pendingProfileTransitions == 0 && values["native_state"]?["activeProfileId"] == .string(profileID) }) else { throw VortxNativeError.superseded }
         return seconds
     }
-    func dispatchForProfile(_ action: VortxJSON, profileID: String) -> Bool {
+    func dispatchForProfile(_ action: VortxJSON, profileID: String, expectedAccountGeneration: UUID) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !closed, pendingProfileTransitions == 0, values["native_state"]?["activeProfileId"] == .string(profileID),
+        guard !closed, accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0, values["native_state"]?["activeProfileId"] == .string(profileID),
               let type = string(action["type"]), ["report_progress", "mark_watched", "reset_watched", "remove_from_continue_watching"].contains(type),
               let bytes = try? JSONEncoder().encode(action) else { return fail("stale_profile_intent") }
         return enqueueMutation(type: type, raw: String(decoding: bytes, as: UTF8.self))
+    }
+    func dispatchCaptured(data: Data, field: String?, expectedAccountGeneration: UUID) -> Bool {
+        lock.withLock {
+            guard !closed, accountEpoch == expectedAccountGeneration else { return false }
+            return dispatch(data: data, field: field)
+        }
     }
 
     static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
@@ -58,6 +76,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         facade.playback = try await session.playbackProjection()
         facade.values = try facade.stateFields(state)
         facade.values["native_host_preferences"] = try await session.hostPreferencesDocument()
+        facade.values["native_own_overlay_pending"] = try await session.pendingOwnAccountOverlays()
         return facade
     }
     private init(session: VortxNativeSession, registry: [VortxResourceAddon], mutationAccepted: @escaping @Sendable () -> Void, changed: @escaping @Sendable ([String]) -> Void) {
@@ -66,6 +85,12 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     func stateData(_ field: String) -> Data? {
         lock.lock(); defer { lock.unlock() }; guard !closed, let value = values[field] else { return nil }
         return try? JSONEncoder().encode(value)
+    }
+    func profileSnapshot() -> (state: VortxJSON, host: VortxJSON, pending: VortxJSON, generation: UUID)? {
+        lock.withLock {
+            guard !closed, let state = values["native_state"], let host = values["native_host_preferences"] else { return nil }
+            return (state, host, values["native_own_overlay_pending"] ?? .object([:]), accountEpoch)
+        }
     }
     func close() {
         lock.lock(); closed = true; let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); lock.unlock()
@@ -114,6 +139,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let active = string(state?["activeProfileId"]) ?? ""
         let profile = state?["roster"]?["profiles"]?[active]
         return .object(["active": .string(active), "binding": profile?["addons"] ?? .null,
+                        "account": accountIdentity(state),
                         "settings": profile?["settings"] ?? .null, "parental": profile?["parental"] ?? .null,
                         "addons": state?["nativeSync"]?["addons"] ?? .null])
     }
@@ -160,7 +186,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
         let predecessor = tasks["native_state"]
         let ticket = UUID(); generations["native_state"] = ticket
-        let profileTransition = ["switch_profile", "delete_profile", "merge_native_sync", "patch_profile"].contains(type)
+        let profileTransition = ["switch_profile", "delete_profile", "merge_native_sync", "patch_profile", "rebind_profile_account"].contains(type)
         if profileTransition { pendingProfileTransitions += 1 }
         // State intents are FIFO, never latest-wins: dropping one would lose progress/profile edits.
         tasks["native_state"] = Task { [weak self] in
@@ -187,6 +213,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 let playback = try await session.playbackProjection()
                 let host = try await session.hostPreferencesDocument()
                 let website = try await session.websiteEditOutcome()
+                let ownPending = try await session.pendingOwnAccountOverlays()
                 let websiteChanged = !websiteEvents.isEmpty && self.lock.withLock {
                     self.values["native_state"]?["nativeSync"] != state["nativeSync"] ||
                         self.values["native_host_preferences"] != host || self.values["native_website_edits"] != website
@@ -198,6 +225,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 if resourceChanged { await session.invalidateResources() }
                 let publishedFields = try self.lock.withLock { () -> [String: VortxJSON]? in
                     guard !self.closed else { return nil }
+                    if self.accountIdentity(self.values["native_state"]) != self.accountIdentity(state) { self.accountEpoch = UUID() }
                     self.failure = nil
                     self.playback = playback
                     if self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) {
@@ -208,6 +236,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     var fields = try self.stateFields(state)
                     fields["native_host_preferences"] = host
                     fields["native_website_edits"] = website
+                    fields["native_own_overlay_pending"] = ownPending
                     fields.forEach { self.values[$0.key] = $0.value }; return fields
                 }
                 // FIFO intents each publish their acknowledged state before the next task executes.
@@ -281,14 +310,16 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             }) { continuation.resume(throwing: VortxNativeError.closed) }
         }
     }
-    func mutateProfiles(_ actions: [VortxJSON], hostEdits: [VortxNativeHostPreferences.Edit], expectedProfileID: String) async throws {
+    func mutateProfiles(_ actions: [VortxJSON], hostEdits: [VortxNativeHostPreferences.Edit], expectedProfileID: String, expectedAccountGeneration: UUID,
+                        sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             lock.lock(); defer { lock.unlock() }
-            guard !closed, pendingProfileTransitions == 0, values["native_state"]?["activeProfileId"] == .string(expectedProfileID),
-                  actions.allSatisfy({ ["add_profile", "patch_profile", "delete_profile", "switch_profile"].contains(string($0["type"]) ?? "") }) else { continuation.resume(throwing: VortxNativeError.superseded); return }
+            guard !closed, accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0, values["native_state"]?["activeProfileId"] == .string(expectedProfileID),
+                  actions.allSatisfy({ ["add_profile", "patch_profile", "delete_profile", "switch_profile", "rebind_profile_account"].contains(string($0["type"]) ?? "") }) else { continuation.resume(throwing: VortxNativeError.superseded); return }
             do {
                 let raw = try actions.map { String(decoding: try JSONEncoder().encode($0), as: UTF8.self) }
                 if !enqueueMutation(type: "patch_profile", raw: "", actions: raw, hostEdits: hostEdits,
+                                    sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive,
                                     completion: { result in continuation.resume(with: result.map { _ in () }) }) {
                     continuation.resume(throwing: VortxNativeError.closed)
                 }
@@ -389,9 +420,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// Metadata comes only from the accepted native registry. The return value acknowledges the
     /// durable FIFO add, not merely HTTP success or UI dispatch. Legacy recovery may only confirm
     /// existing native membership; it cannot manufacture a new save over a native removal.
-    func addCatalogItem(id: String, type: String, profileID: String, allowInsert: Bool) async throws -> Bool {
+    func addCatalogItem(id: String, type: String, profileID: String, allowInsert: Bool, expectedAccountGeneration: UUID) async throws -> Bool {
         let captured = try lock.withLock { () -> (UUID, [VortxResourceAddon], Bool) in
-            guard !closed, pendingProfileTransitions == 0, resourceRegistryValid,
+            guard !closed, accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0, resourceRegistryValid,
                   values["native_state"]?["activeProfileId"] == .string(profileID) else { throw VortxNativeError.superseded }
             let saved = values["native_state"]?["libraries"]?[profileID]?["items"]?.array?.contains {
                 $0["kind"] == .string("standard") && $0["id"] == .string(id) && $0["type"] == .string(type)
@@ -403,7 +434,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let meta = try await session.libraryMetadata(id: id, type: type, profileID: profileID, addons: captured.1)
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock(); defer { lock.unlock() }
-            guard !closed, pendingProfileTransitions == 0, resourceRegistryValid, registryGeneration == captured.0,
+            guard !closed, accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0, resourceRegistryValid, registryGeneration == captured.0,
                   values["native_state"]?["activeProfileId"] == .string(profileID) else {
                 continuation.resume(throwing: VortxNativeError.superseded); return
             }
@@ -613,7 +644,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
         return fail("unsupported_action")
     }
-    private static let nativeActions: Set<String> = ["add_profile", "switch_profile", "delete_profile", "set_parental", "set_ranking_prefs", "report_progress", "mark_watched", "reset_watched", "remove_from_continue_watching", "merge_watch_state", "merge_watch_document", "link_resume_identity", "get_state", "bind_sync_scope", "merge_native_sync", "patch_profile", "install_addon", "remove_addon", "reorder_addons", "add_library_item", "remove_library_item"]
+    private static let nativeActions: Set<String> = ["add_profile", "switch_profile", "delete_profile", "set_parental", "set_ranking_prefs", "report_progress", "mark_watched", "reset_watched", "remove_from_continue_watching", "merge_watch_state", "merge_watch_document", "link_resume_identity", "get_state", "bind_sync_scope", "merge_native_sync", "patch_profile", "rebind_profile_account", "install_addon", "remove_addon", "reorder_addons", "add_library_item", "remove_library_item"]
     private func addonOwner(for state: VortxJSON) -> String? {
         guard let active = string(state["activeProfileId"]),
               let binding = state["roster"]?["profiles"]?[active]?["addons"],

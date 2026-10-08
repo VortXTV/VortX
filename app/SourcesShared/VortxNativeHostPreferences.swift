@@ -58,13 +58,21 @@ struct VortxNativeHostPreferences: Sendable {
         let incoming = try JSONDecoder().decode(VortxJSON.self, from: archive)
         guard case .object(let sources) = incoming["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
         var retained: [String: VortxJSON] = [:]
+        var pending: VortxJSON?
         if let prior = local.authenticatedSourceArchive {
             let old = try JSONDecoder().decode(VortxJSON.self, from: prior)
             guard case .object(let values) = old["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
             retained = values
+            pending = old["hostDocument"]?["ownAccountOverlayPending"]
         }
         for (id, source) in sources { retained[id] = source }
-        let document = try JSONEncoder().encode(VortxJSON.object(["ownAccountSources": .object(retained)]))
+        if let incomingPending = incoming["hostDocument"]?["ownAccountOverlayPending"] {
+            guard case .object = incomingPending else { throw VortxNativeError.invalidSnapshot }
+            pending = incomingPending
+        }
+        var documentFields: [String: VortxJSON] = ["ownAccountSources": .object(retained)]
+        if let pending { documentFields["ownAccountOverlayPending"] = pending }
+        let document = try JSONEncoder().encode(VortxJSON.object(documentFields))
         local.authenticatedSourceArchive = try VortxNativeBootstrapArchive.encode(document: document)
     }
     mutating func merge(_ remote: VortxJSON?, scope: VortxAccountScope) throws {

@@ -24,7 +24,7 @@ xcrun swiftc -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=c
     app/SourcesShared/CredentialScope.swift app/SourcesShared/AuthenticatedHTTPTransport.swift app/SourcesShared/SIMKLAuth.swift \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift \
     app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/ProfileAddonPreferences.swift \
+    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
     "$native_oauth_dir/UserProfile.swift" "$native_oauth_dir/Discovery.swift" "$native_oauth_dir/SIMKLSeams.swift" "$native_oauth_dir/Journal.swift" \
     app/SourcesShared/VortxNativeProfileEditHost.swift app/Tests/VortxNativeOAuthIntentTests.swift -o "$native_oauth_dir/oauth-intents"
 "$native_oauth_dir/oauth-intents"
@@ -34,7 +34,7 @@ xcrun swiftc -parse-as-library -D DEBUG -D VORTX_NATIVE_DATA_ENGINE -strict-conc
     app/SourcesShared/TraktScrobbleProgressPolicy.swift app/SourcesShared/VortXEdgeAuth.swift \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift \
     app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/ProfileAddonPreferences.swift \
+    app/SourcesShared/VortxNativeSession.swift app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
     "$native_oauth_dir/UserProfile.swift" "$native_oauth_dir/Discovery.swift" "$native_oauth_dir/TraktSeams.swift" "$native_oauth_dir/Journal.swift" \
     app/SourcesShared/VortxNativeProfileEditHost.swift app/Tests/VortxNativeTraktIntentTests.swift -o "$native_oauth_dir/trakt-intents"
 "$native_oauth_dir/trakt-intents"

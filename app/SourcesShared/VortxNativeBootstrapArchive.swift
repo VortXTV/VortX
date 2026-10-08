@@ -56,7 +56,7 @@ enum VortxNativeBootstrapArchive {
         guard depth <= 64 else { throw Failure.opaquePreference }
         // Typed SHA-256 evidence is hexadecimal, not a base64 JSON carrier. Some valid hashes
         // (for example e9...) decode to a leading brace plus arbitrary bytes under base64 probing.
-        let typedDigest = ["/valueHash", "/fingerprint", "/sourceDocumentSha256", "/typedCarrierFingerprint"].contains(where: path.hasSuffix)
+        let typedDigest = ["/valueHash", "/fingerprint", "/sourceDocumentSha256", "/profileOverlaySha256", "/typedCarrierFingerprint"].contains(where: path.hasSuffix)
             || path.range(of: #"/nativeSync/legacyImport/acceptedFingerprints/[0-9]+$"#, options: .regularExpression) != nil
             || path.range(of: #"/nativeSync/legacyImport/ownAccountSourceHistory/[0-9A-F-]{36}/[0-9a-f]{64}$"#, options: .regularExpression) != nil
         if let text = value as? String, typedDigest,

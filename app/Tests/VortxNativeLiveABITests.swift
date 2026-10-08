@@ -74,9 +74,9 @@ import CryptoKit
         check(try field("library")["selectable"]?["types"]?.array?.first?["request"]?["sort"] == .string("lastwatched"))
         try dispatch(["action": "Load", "args": ["model": "LocalSearch"]], field: "local_search")
         check(try field("local_search")["searchResults"] == .array([]))
-        check(try await !facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: scope.ownerProfileID, allowInsert: false))
+        check(try await !facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: scope.ownerProfileID, allowInsert: false, expectedAccountGeneration: facade.accountGeneration))
         let detailBeforeAutoAdd = try field("meta_details")
-        check(try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: scope.ownerProfileID, allowInsert: true))
+        check(try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: scope.ownerProfileID, allowInsert: true, expectedAccountGeneration: facade.accountGeneration))
         check(try field("library")["catalog"]?.array?.count == 1)
         try dispatch(["action": "Load", "args": ["model": "LibraryWithFilters", "args": ["request": ["type": "series", "sort": "name", "page": 1]]]], field: "library")
         check(try field("library")["catalog"]?.array?.count == 1)
@@ -146,7 +146,7 @@ import CryptoKit
         // A native mutation republishes library, but must retain the selected type/sort even when
         // the matching type later has no rows.
         check(try field("library")["selectable"]?["sorts"]?.array?.contains { $0["sort"] == .string("name") && $0["selected"] == .bool(true) } == true)
-        do { _ = try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: "kid", allowInsert: true); fatalError("stale profile auto-add admitted") }
+        do { _ = try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: "kid", allowInsert: true, expectedAccountGeneration: facade.accountGeneration); fatalError("stale profile auto-add admitted") }
         catch VortxNativeError.superseded {}
         try dispatch(["action": "Ctx", "args": ["action": "AddToLibrary", "args": ["id": "tt-fixture", "type": "series", "name": "Fixture"]]], field: "ctx")
         await facade.settled(); check(try field("library")["catalog"]?.array?.count == 1)
@@ -184,15 +184,15 @@ import CryptoKit
         let kidProgress: VortxJSON = .object(["type": .string("report_progress"), "metaId": .string("unsaved-kid"), "videoId": .string("opaque-kid-episode"),
                                              "name": .string("Kid episode"), "positionMs": .integer(3001), "durationMs": .integer(100001),
                                              "metadata": .object(["type": .string("series")])])
-        check(!facade.dispatchForProfile(kidProgress, profileID: scope.ownerProfileID))
-        check(facade.dispatchForProfile(kidProgress, profileID: "kid")); await facade.settled()
+        check(!facade.dispatchForProfile(kidProgress, profileID: scope.ownerProfileID, expectedAccountGeneration: facade.accountGeneration))
+        check(facade.dispatchForProfile(kidProgress, profileID: "kid", expectedAccountGeneration: facade.accountGeneration)); await facade.settled()
         check(try field("library")["catalog"] == .array([]))
         check(try field("continue_watching_preview")["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-kid-episode"))
         check(facade.cachedResumeSeconds(id: "opaque-kid-episode") == 3.001)
-        check(try await facade.resumeSeconds(id: "opaque-kid-episode", profileID: "kid") == 3.001)
+        check(try await facade.resumeSeconds(id: "opaque-kid-episode", profileID: "kid", expectedAccountGeneration: facade.accountGeneration) == 3.001)
         let watchedMovie: VortxJSON = .object(["type": .string("mark_watched"), "metaId": .string("unsaved-movie"), "name": .string("Watched without saving"),
                                               "metadata": .object(["type": .string("movie")])])
-        check(facade.dispatchForProfile(watchedMovie, profileID: "kid")); await facade.settled()
+        check(facade.dispatchForProfile(watchedMovie, profileID: "kid", expectedAccountGeneration: facade.accountGeneration)); await facade.settled()
         check(try field("native_history")["items"]?.array?.contains { $0["_id"] == .string("unsaved-movie") && $0["state"]?["timesWatched"] == .integer(1) } == true)
         check(try field("library")["catalog"] == .array([]))
         // Ctx add-on mutations use the exact kernel actions. Invalid new descriptors are rejected before
@@ -630,7 +630,7 @@ import CryptoKit
         let profilesFacade = try await VortxNativeCoreFacade.create(session: migratedCold, registry: [], changed: { _ in })
         var editedChild = child; editedChild.name = "Updated Child"; editedChild.avatar = "moon"; editedChild.textScale = 1.25
         let profileMutation = try VortxNativeProfiles.mutation(editedChild, previous: child, ownerID: owner.id.uuidString)
-        try await profilesFacade.mutateProfiles(profileMutation.0, hostEdits: [profileMutation.1], expectedProfileID: child.id.uuidString)
+        try await profilesFacade.mutateProfiles(profileMutation.0, hostEdits: [profileMutation.1], expectedProfileID: child.id.uuidString, expectedAccountGeneration: profilesFacade.accountGeneration)
         await profilesFacade.settled()
         let profileState = try JSONDecoder().decode(VortxJSON.self, from: profilesFacade.stateData("native_state")!)
         let hostState = try JSONDecoder().decode(VortxJSON.self, from: profilesFacade.stateData("native_host_preferences")!)
@@ -641,11 +641,11 @@ import CryptoKit
         check(try migrationStore.readHostPreferences(scope: legacyScope) != nil)
         let newProfile = UserProfile(id: UUID(uuidString: "30000000-0000-0000-0000-000000000001")!, name: "New viewer", avatar: "star")
         let create = try VortxNativeProfiles.mutation(newProfile, previous: nil, ownerID: owner.id.uuidString)
-        try await profilesFacade.mutateProfiles(create.0, hostEdits: [create.1], expectedProfileID: child.id.uuidString)
+        try await profilesFacade.mutateProfiles(create.0, hostEdits: [create.1], expectedProfileID: child.id.uuidString, expectedAccountGeneration: profilesFacade.accountGeneration)
         await profilesFacade.settled()
         let addedState = try JSONDecoder().decode(VortxJSON.self, from: profilesFacade.stateData("native_state")!)
         check(addedState["roster"]?["profiles"]?[newProfile.id.uuidString]?["name"] == .string("New viewer"))
-        try await profilesFacade.mutateProfiles([.object(["type": .string("delete_profile"), "id": .string(newProfile.id.uuidString)])], hostEdits: [], expectedProfileID: child.id.uuidString)
+        try await profilesFacade.mutateProfiles([.object(["type": .string("delete_profile"), "id": .string(newProfile.id.uuidString)])], hostEdits: [], expectedProfileID: child.id.uuidString, expectedAccountGeneration: profilesFacade.accountGeneration)
         await profilesFacade.settled()
         let deletedState = try JSONDecoder().decode(VortxJSON.self, from: profilesFacade.stateData("native_state")!)
         check(deletedState["roster"]?["profiles"]?[newProfile.id.uuidString]?["deleted"] == .bool(true))

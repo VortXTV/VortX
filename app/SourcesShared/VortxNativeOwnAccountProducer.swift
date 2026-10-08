@@ -33,7 +33,7 @@ enum VortxNativeOwnAccountProducer {
         }
     }
     private struct RawSource: Encodable {
-        let schemaVersion = 1
+        let schemaVersion: Int
         let libraryResponseBase64: String
         let addonsResponseBase64: String
         let profileOverlayBase64: String
@@ -60,13 +60,54 @@ enum VortxNativeOwnAccountProducer {
     }
     typealias Verify = @Sendable (String) async throws -> String
     typealias Send = @Sendable (URLRequest) async throws -> AuthenticatedHTTPResponse
+    enum SourceFraming: Sendable, Equatable { case authenticatedOverlay, independentNetworkOnly }
+    /// A profile UUID alone never attributes an old cloud overlay to a newly connected account.
+    /// Only the kernel-bound source named by the pending record may authorize its consumption.
+    static func pendingOverlay(profileID: UUID, verifiedUID: String, state: VortxJSON, pending: VortxJSON) throws -> Data? {
+        let id = profileID.uuidString
+        guard let record = pending[id], record["verifiedStreamingUid"] == .string(verifiedUID),
+              case .string(let digest) = record["sourceDocumentSha256"] else { return nil }
+        let receipt = state["nativeSync"]?["legacyImport"]
+        let legacy = receipt?["baseline"]?["ownAccountSources"]?[id]
+        var belongs = legacy?["verifiedStreamingUid"] == .string(verifiedUID)
+            && (legacy?["sourceDocumentSha256"] == .string(digest) || receipt?["ownAccountSourceHistory"]?[id]?[digest] != nil)
+        if case .object(let slots) = state["nativeSync"]?["accountSlots"]?[id]?["slots"] {
+            belongs = belongs || slots.values.contains {
+                $0["sourceBaseline"]?["source"]?["verifiedStreamingUid"] == .string(verifiedUID)
+                    && ($0["sourceBaseline"]?["source"]?["sourceDocumentSha256"] == .string(digest) || $0["sourceHistory"]?[digest] != nil)
+            }
+        }
+        guard belongs else { return nil }
+        guard case .string(let raw) = record["profileOverlayBase64"], let bytes = Data(base64Encoded: raw), bytes.base64EncodedString() == raw else {
+            throw VortxNativeError.invalidSnapshot
+        }
+        _ = try VortxProfileOverlayWitness.decodeObject(json: bytes)
+        return bytes
+    }
+    static func archive(_ sources: [VortxLegacyBootstrapMaterial.OwnAccountSource], pendingOverlays: [String: VortxJSON]? = nil) throws -> Data {
+        guard Set(sources.map(\.profileID)).count == sources.count else { throw VortxNativeError.invalidSnapshot }
+        var fields: [String: VortxJSON] = ["ownAccountSources": .object(Dictionary(uniqueKeysWithValues: sources.map { source in
+            (source.profileID.uuidString, .object(["verifiedStreamingUid": .string(source.verifiedStreamingUID),
+                "sourceDocumentBase64": .string(source.sourceDocument.base64EncodedString())]))
+        }))]
+        if let pendingOverlays { fields["ownAccountOverlayPending"] = .object(pendingOverlays) }
+        let raw = VortxJSON.object(fields)
+        let archive = try VortxNativeBootstrapArchive.encode(document: JSONEncoder().encode(raw))
+        let retained = try JSONDecoder().decode(VortxJSON.self, from: archive)
+        guard retained["hostDocument"] == raw, retained["excludedCredentialPaths"] == .array([]) else { throw VortxNativeError.invalidSnapshot }
+        return archive
+    }
 
     static func fetch(profileID: UUID, authKey: String, authority: any VortxMutationAuthority,
                       profileOverlay: Data = Data("{}".utf8),
+                      framing: SourceFraming = .authenticatedOverlay,
                       verify: Verify = { try await LinkAuthService.authenticatedIdentity(authKey: $0).uid },
                       send: Send = { try await AuthenticatedHTTPTransport.shared.send($0, allowedHosts: ["api.strem.io"],
                           maxResponseBytes: AuthenticatedHTTPTransport.snapshotResponseLimit) }) async throws -> VortxLegacyBootstrapMaterial.OwnAccountSource {
         guard !authKey.isEmpty else { throw VortxNativeError.invalidSnapshot }
+        if framing == .independentNetworkOnly {
+            guard try VortxProfileOverlayWitness.decodeObject(json: profileOverlay).isEmpty else { throw VortxNativeError.invalidSnapshot }
+        }
         try authority.withActive {}
         let uid = try await verify(authKey)
         try authority.withActive {}
@@ -93,9 +134,11 @@ enum VortxNativeOwnAccountProducer {
               addonsObject["error"] == nil || addonsObject["error"] is NSNull,
               let result = addonsObject["result"] as? [String: Any], result["addons"] is [[String: Any]] else { throw VortxNativeError.invalidResponse }
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let source = try encoder.encode(RawSource(libraryResponseBase64: library.data.base64EncodedString(), addonsResponseBase64: addons.data.base64EncodedString(),
+        let source = try encoder.encode(RawSource(schemaVersion: framing == .authenticatedOverlay ? 2 : 1,
+                                                libraryResponseBase64: library.data.base64EncodedString(), addonsResponseBase64: addons.data.base64EncodedString(),
                                                 profileOverlayBase64: profileOverlay.base64EncodedString()))
         try authority.withActive {}
-        return .init(profileID: profileID, verifiedStreamingUID: uid, sourceDocument: source)
+        return .init(profileID: profileID, verifiedStreamingUID: uid, sourceDocument: source,
+                     profileOverlaySHA256: framing == .authenticatedOverlay ? try VortxProfileOverlayWitness.digest(json: profileOverlay) : nil)
     }
 }

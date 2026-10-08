@@ -351,7 +351,12 @@ final class StremioAccount: ObservableObject {
         }
         struct ErrObj: Decodable { let message: String? }
         guard !email.isEmpty, !password.isEmpty else { signInError = "Enter your email and password."; return }
-        let context = beginAuthOperation()
+        var context = beginAuthOperation()
+#if VORTX_NATIVE_DATA_ENGINE
+        let nativeTarget: CoreBridge.NativeAccountLoginTarget?
+        do { nativeTarget = try CoreBridge.shared.captureNativeAccountLogin() }
+        catch { signInError = "Open this profile before connecting its account."; return }
+#endif
         do {
             let res: Res = try await post("login", body: Req(email: email, password: password))
             guard authOperationStillCurrent(context) else { return }
@@ -366,7 +371,15 @@ final class StremioAccount: ObservableObject {
             // destination dynamically from the profile selected after the response returned.
             // Never use a dynamically selected credential destination after this await: the selected
             // profile may have changed. Write only to the slot captured before the request started.
+#if VORTX_NATIVE_DATA_ENGINE
+            if let nativeTarget {
+                try await CoreBridge.shared.authenticateNativeOwnAccount(token: key, target: nativeTarget)
+                guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
+                context = captureAuthOperationContext()
+            } else { Self.storeAuthKey(key, account: context.keychainAccount) }
+#else
             Self.storeAuthKey(key, account: context.keychainAccount)
+#endif
             guard authOperationStillCurrent(context) else { return }
             publishCredentialBoundary(wasSignedIn: wasSignedIn)
             // Publish the credential boundary before the email publisher so CoreBridge can rotate its
@@ -377,6 +390,12 @@ final class StremioAccount: ObservableObject {
             await loadAddons(for: context)
         } catch {
             guard authOperationStillCurrent(context) else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+            if nativeTarget != nil {
+                signInError = "Account could not be connected. Existing library and history are unchanged. Refresh the profile and retry."
+                return
+            }
+#endif
             signInError = "Couldn't reach Stremio. Check your connection."
             log.error("signIn network error: \(error.localizedDescription, privacy: .public)")
         }
@@ -386,9 +405,23 @@ final class StremioAccount: ObservableObject {
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else { signInError = "Sign-in failed."; return }
         signInError = nil
-        let context = beginAuthOperation()
+        var context = beginAuthOperation()
         let wasSignedIn = isSignedIn
+#if VORTX_NATIVE_DATA_ENGINE
+        do {
+            if let target = try CoreBridge.shared.captureNativeAccountLogin() {
+                try await CoreBridge.shared.authenticateNativeOwnAccount(token: token, target: target)
+                guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
+                context = captureAuthOperationContext()
+            } else { Self.storeAuthKey(token, account: context.keychainAccount) }
+        } catch {
+            guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
+            signInError = "Account could not be connected. Your existing profile data is unchanged. Refresh the profile and retry."
+            return
+        }
+#else
         Self.storeAuthKey(token, account: context.keychainAccount)
+#endif
         guard authOperationStillCurrent(context) else { return }
         publishCredentialBoundary(wasSignedIn: wasSignedIn)
         await backfillEmail(for: context)

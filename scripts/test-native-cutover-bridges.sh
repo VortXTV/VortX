@@ -15,7 +15,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
 "$native_test_dir/native-bridges" test/fixtures/native-resource-contract.json
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
-  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
+  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
   "$native_test_dir/UserProfile.swift" "$native_test_dir/Discovery.swift" app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxNativeProfileEditHost.swift \
   app/Tests/VortxNativeSessionTests.swift -o "$native_test_dir/native-session"
 "$native_test_dir/native-session" "$native_test_dir"

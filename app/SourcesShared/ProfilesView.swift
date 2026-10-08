@@ -64,6 +64,9 @@ struct ProfilePickerView: View {
     @State private var editorProfile: UserProfile?
     @State private var signInNeeded = false
     @StateObject private var profileAction = ProfileMutationPresentation()
+#if VORTX_NATIVE_DATA_ENGINE
+    @ObservedObject private var nativeSync = VortXSyncManager.shared
+#endif
     #if !os(tvOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     /// Measured width of the picker's horizontal scroll viewport (iOS + macOS), used to pin the card row's
@@ -92,6 +95,16 @@ struct ProfilePickerView: View {
                 if let error = profileAction.errorMessage {
                     Text(error).font(Theme.Typography.label).foregroundStyle(.red)
                 }
+#if VORTX_NATIVE_DATA_ENGINE
+                if !nativeSync.nativeOwnAccountResyncUnavailable.isEmpty {
+                    Text("Some profiles need to reconnect for external refresh. Their saved library and watch history remain available.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                }
+                if !nativeSync.nativeOwnAccountOverlayPending.isEmpty {
+                    Text("Some older profile updates are waiting for account verification. Your current library remains available; reconnect the original independent account to review and refresh those updates.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                }
+#endif
                 // Touch: scroll horizontally so 3+ cards (230pt each) don't overflow + clip both edges
                 // on a phone (systemic fix S1b). tvOS keeps the centered HStack for remote focus nav.
                 // macOS: the picker presents as a `.sheet`, which sizes to content; a horizontal ScrollView
@@ -210,7 +223,11 @@ struct ProfilePickerView: View {
         #if VORTX_NATIVE_DATA_ENGINE
         let target = core.captureNativePlaybackTarget()
         profileAction.start(operation: { await store.selectNative(profile, target: target) },
-                            failureMessage: { store.nativeProfileError ?? "Profile could not be opened. Please retry." })
+                            failureMessage: { store.nativeProfileError ?? "Profile could not be opened. Please retry." },
+                            onSuccess: {
+                                account.reloadForActiveProfile()
+                                if core.nativeAccountMode(profileID: profile.id) == "pending_own" { signInNeeded = true }
+                            })
         #else
         switch store.select(profile) {
         case .sameAccount:
@@ -523,6 +540,9 @@ struct ProfileEditorView: View {
     #if !os(tvOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
+#if VORTX_NATIVE_DATA_ENGINE
+    @ObservedObject private var nativeSync = VortXSyncManager.shared
+#endif
 
     @State private var draft: UserProfile
     @State private var pinText: String
@@ -629,10 +649,38 @@ struct ProfileEditorView: View {
                                 .buttonStyle(ChipButtonStyle(selected: draft.usesOwnAccount))
                         }
                         if draft.usesOwnAccount {
+#if VORTX_NATIVE_DATA_ENGINE
+                            if !isNew && draft.usesOwnAccount == original.usesOwnAccount {
+                                let pending = core.nativeAccountMode(profileID: draft.id) == "pending_own"
+                                if nativeSync.nativeOwnAccountOverlayPending.contains(draft.id) {
+                                    Text("Older updates for this profile are still pending verification. Reconnect the original account; current library and history have not been replaced.")
+                                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                                }
+                                if pending || nativeSync.nativeOwnAccountResyncUnavailable.contains(draft.id)
+                                    || (store.activeID == draft.id && !account.isSignedIn) {
+                                    Text(pending ? "Connect an account to start this independent profile."
+                                         : "Saved library and history are available. Reconnect to refresh from the external account.")
+                                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                                }
+                                Button(pending ? "Connect account" : "Connect or change account") {
+                                    let target = core.captureNativePlaybackTarget()
+                                    profileAction.start(operation: {
+                                        if store.activeID == draft.id { return true }
+                                        return await store.selectNative(original, target: target)
+                                    }, failureMessage: { store.nativeProfileError ?? "Profile could not be opened." }, onSuccess: {
+                                        account.reloadForActiveProfile(); signInNeeded = true
+                                    })
+                                }.buttonStyle(ChipButtonStyle(selected: false))
+                            } else {
+                                Text("Save this account choice, then open the profile to connect. Existing account libraries remain separate.")
+                                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                            }
+#else
                             Text(draft.email.map { "Signed in as \($0)" }
                                  ?? "You'll be asked to sign in when this profile is first opened.")
                                 .font(Theme.Typography.label)
                                 .foregroundStyle(Theme.Palette.textTertiary)
+#endif
                         } else {
                             Text("Keeps its own watch history, synced through your Stremio account to your other devices.")
                                 .font(Theme.Typography.label)
@@ -684,6 +732,12 @@ struct ProfileEditorView: View {
                     .profileFocusSection()
                     if let error = profileAction.errorMessage {
                         Text(error).font(Theme.Typography.label).foregroundStyle(.red)
+#if VORTX_NATIVE_DATA_ENGINE
+                        Button("Refresh account binding and retry") {
+                            core.refreshNativeProfileEditBinding(draft.id)
+                            save()
+                        }.buttonStyle(ChipButtonStyle(selected: false))
+#endif
                     }
                 }
                 .frame(maxWidth: usesWideEditorLayout ? 900 : .infinity, alignment: .leading)
@@ -782,7 +836,11 @@ struct ProfileEditorView: View {
         let target = core.captureNativePlaybackTarget()
         profileAction.start(operation: { await store.selectNative(original, target: target) },
                             failureMessage: { store.nativeProfileError ?? "Profile could not be opened. Please retry." },
-                            onSuccess: { dismiss() })
+                            onSuccess: {
+                                account.reloadForActiveProfile()
+                                if core.nativeAccountMode(profileID: original.id) == "pending_own" { signInNeeded = true }
+                                else { dismiss() }
+                            })
         #else
         switch store.select(original) {
         case .sameAccount:

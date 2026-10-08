@@ -231,9 +231,9 @@ final class ProfileStore: ObservableObject {
     }
     /// Called only after the native transaction's checkpoint acknowledgement. The old global
     /// roster is replaced as a presentation mirror, never unioned into native account authority.
-    func applyNativeProfiles(_ incoming: [UserProfile], activeID selected: UUID) {
+    func applyNativeProfiles(_ incoming: [UserProfile], activeID selected: UUID, projectionTarget: PlaybackMutationTarget? = nil) {
         guard incoming.contains(where: { $0.id == selected }) else { return }
-        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        let target = projectionTarget ?? CoreBridge.shared.captureNativePlaybackTarget()
         let sameInstallation = nativeProjectionTarget == target && activeID == selected
         // A same-session sync publication may run before a queued UI preference save. Preserve
         // its captured flat values until that transaction acknowledges; real switches still reset.
@@ -259,7 +259,7 @@ final class ProfileStore: ObservableObject {
     func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget? = nil) async -> Bool {
         let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
         do { try await CoreBridge.shared.saveNativeProfile(profile, creating: creating, target: captured); nativeProfileError = nil; return true }
-        catch { nativeProfileError = "Profile could not be saved. Please retry."; return false }
+        catch { nativeProfileError = "Profile could not be saved. Your edits are still here. Refresh the account binding and retry if it changed on another device."; return false }
     }
     @MainActor
     func removeNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil) async -> Bool {
@@ -431,12 +431,20 @@ final class ProfileStore: ObservableObject {
     }
 
     func keychainAccount(for profile: UserProfile) -> String {
+#if VORTX_NATIVE_DATA_ENGINE
+        if !profile.isOwner && profile.usesOwnAccount {
+            return CoreBridge.shared.nativeCredentialSlot(profileID: profile.id)
+                ?? "vortx.native.streaming.unavailable." + profile.id.uuidString
+        }
+#endif
+        return Self.legacyKeychainAccount(for: profile)
+    }
+    static func legacyKeychainAccount(for profile: UserProfile) -> String {
         // The owner IS the primary account: it always reads the primary slot, no matter what the
         // usesOwnAccount flag says. (A synced roster once arrived with the flag flipped on the
         // owner, which pointed sign-in at an empty per-profile slot and "signed out" every device.)
-        if profile.isOwner { return Self.primaryTokenAccount }
-        return profile.usesOwnAccount ? Self.primaryTokenAccount + "." + profile.id.uuidString
-                                      : Self.primaryTokenAccount
+        if profile.isOwner { return primaryTokenAccount }
+        return profile.usesOwnAccount ? primaryTokenAccount + "." + profile.id.uuidString : primaryTokenAccount
     }
 
     private static func accountFingerprint(_ account: String) -> String? {

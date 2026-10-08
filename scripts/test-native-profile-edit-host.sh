@@ -21,7 +21,7 @@ writeFileSync(process.argv[2],JSON.stringify(values.map(value=>({value,canonical
 NODE
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-    app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift \
+    app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
     app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift \
     "$website_host_dir/UserProfile.swift" "$website_host_dir/Discovery.swift" app/Tests/VortxNativeProfileEditHostTests.swift \
     -o "$website_host_dir/website-host"
@@ -34,7 +34,7 @@ if [[ -n "${VORTX_FFI_LIBRARY:-}" ]]; then
     xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
         -D VORTX_ENGINE_STATE_BRIDGE -D VORTX_ENGINE_RESOURCE_HOST -I "$website_host_dir" \
         app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
-        app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift \
+        app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxProfileOverlayWitness.swift \
         app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \
         "$website_host_dir/UserProfile.swift" "$website_host_dir/Discovery.swift" app/Tests/VortxNativeWebsiteTransactionTests.swift \
         "$VORTX_FFI_LIBRARY" -o "$website_host_dir/website-transaction"

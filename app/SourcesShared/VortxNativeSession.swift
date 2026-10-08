@@ -533,11 +533,58 @@ actor VortxNativeSession {
         guard case .object(let sources) = decoded["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
         for (id, value) in sources {
             guard case .object(let fields) = value, Set(fields.keys) == ["verifiedStreamingUid", "sourceDocumentBase64"],
-                  case .string(let raw) = fields["sourceDocumentBase64"], let bytes = Data(base64Encoded: raw), bytes.base64EncodedString() == raw,
-                  let proof = state["nativeSync"]?["legacyImport"]?["baseline"]?["ownAccountSources"]?[id],
-                  proof["verifiedStreamingUid"] == fields["verifiedStreamingUid"],
-                  proof["sourceDocumentSha256"] == .string(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()) else {
-                throw VortxNativeError.invalidSnapshot
+                  case .string(let raw) = fields["sourceDocumentBase64"], let bytes = Data(base64Encoded: raw), bytes.base64EncodedString() == raw else { throw VortxNativeError.invalidSnapshot }
+            let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+            let legacy = state["nativeSync"]?["legacyImport"]
+            let proof = legacy?["baseline"]?["ownAccountSources"]?[id]
+            var paired = proof?["verifiedStreamingUid"] == fields["verifiedStreamingUid"] &&
+                (proof?["sourceDocumentSha256"] == .string(digest) || legacy?["ownAccountSourceHistory"]?[id]?[digest] != nil)
+            if let slots = state["nativeSync"]?["accountSlots"]?[id],
+               case .object(let retained) = slots["slots"] {
+                let matches = retained.values.filter { $0["account"] == slots["activeBinding"]?["account"] }
+                guard matches.count == 1 else { throw VortxNativeError.invalidSnapshot }
+                if matches[0]["sourceBaseline"]?["source"]?["verifiedStreamingUid"] == value["verifiedStreamingUid"] {
+                    paired = paired || matches[0]["sourceBaseline"]?["source"]?["sourceDocumentSha256"] == .string(digest)
+                        || matches[0]["sourceHistory"]?[digest] != nil
+                }
+            }
+            guard paired else { throw VortxNativeError.invalidSnapshot }
+        }
+        if let pending = decoded["hostDocument"]?["ownAccountOverlayPending"] {
+            guard case .object(let profiles) = pending else { throw VortxNativeError.invalidSnapshot }
+            for (id, entry) in profiles {
+                guard UUID(uuidString: id)?.uuidString == id, case .object(let fields) = entry,
+                      Set(fields.keys) == ["verifiedStreamingUid", "sourceDocumentSha256", "profileOverlayBase64", "reason"],
+                      case .string(let uid) = fields["verifiedStreamingUid"], !uid.isEmpty,
+                      case .string(let digest) = fields["sourceDocumentSha256"],
+                      digest.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                      case .string(let reason) = fields["reason"], ["missing_witness", "changed_witness"].contains(reason),
+                      case .string(let raw) = fields["profileOverlayBase64"], let bytes = Data(base64Encoded: raw), bytes.base64EncodedString() == raw,
+                      (try? VortxProfileOverlayWitness.decodeObject(json: bytes)) != nil,
+                      let overlay = try? JSONDecoder().decode(VortxJSON.self, from: bytes),
+                      case .object(let root) = overlay, Set(root.keys).isSubset(of: ["vortx", "webProgress"]) else { throw VortxNativeError.invalidSnapshot }
+                if let vortx = root["vortx"] {
+                    guard case .object(let fields) = vortx, Set(fields.keys) == ["byProfile"],
+                          case .object(let profiles) = fields["byProfile"], Set(profiles.keys) == [id] else { throw VortxNativeError.invalidSnapshot }
+                }
+                if let web = root["webProgress"] {
+                    guard case .object(let fields) = web, Set(fields.keys) == ["removed"],
+                          case .object(let removed) = fields["removed"], Set(removed.keys) == ["byProfile"],
+                          case .object(let profiles) = removed["byProfile"], Set(profiles.keys) == [id] else { throw VortxNativeError.invalidSnapshot }
+                }
+                // Pending is not an import receipt. It may only refer to an already validated
+                // source for this exact profile, including a dormant historical account slot.
+                let receipt = state["nativeSync"]?["legacyImport"]
+                let legacy = receipt?["baseline"]?["ownAccountSources"]?[id]
+                var proven = legacy?["verifiedStreamingUid"] == .string(uid)
+                    && (legacy?["sourceDocumentSha256"] == .string(digest) || receipt?["ownAccountSourceHistory"]?[id]?[digest] != nil)
+                if case .object(let slots) = state["nativeSync"]?["accountSlots"]?[id]?["slots"] {
+                    proven = proven || slots.values.contains {
+                        $0["sourceBaseline"]?["source"]?["verifiedStreamingUid"] == .string(uid)
+                            && ($0["sourceBaseline"]?["source"]?["sourceDocumentSha256"] == .string(digest) || $0["sourceHistory"]?[digest] != nil)
+                    }
+                }
+                guard proven else { throw VortxNativeError.invalidSnapshot }
             }
         }
     }
@@ -565,6 +612,15 @@ actor VortxNativeSession {
     nonisolated static func authenticatedOwnAccountBaseline(scope: VortxAccountScope, ownerName: String,
                                                             snapshot: String?, nativeSync: VortxJSON?,
                                                             abi: any VortxRuntimeABI) throws -> Data? {
+        let sync = try authenticatedAccountSync(scope: scope, ownerName: ownerName, snapshot: snapshot, nativeSync: nativeSync, abi: abi)
+        guard [.integer(3), .integer(4)].contains(sync?["schemaVersion"] ?? .null),
+              sync?["legacyImport"]?["schemaVersion"] == .integer(2) else { return nil }
+        guard let baseline = sync?["legacyImport"]?["baseline"], baseline["schemaVersion"] == .integer(2),
+              case .object(let proofs) = baseline["ownAccountSources"], !proofs.isEmpty else { throw VortxNativeError.invalidSnapshot }
+        return try JSONEncoder().encode(baseline)
+    }
+    nonisolated static func authenticatedAccountSync(scope: VortxAccountScope, ownerName: String,
+                                                     snapshot: String?, nativeSync: VortxJSON?, abi: any VortxRuntimeABI) throws -> VortxJSON? {
         guard snapshot != nil || nativeSync != nil else { return nil }
         try scope.validate()
         let candidate: VortxNativeRuntime
@@ -579,12 +635,7 @@ actor VortxNativeSession {
             let action = VortxJSON.object(["type": .string("merge_native_sync"), "document": nativeSync])
             try apply(candidate, action: String(decoding: JSONEncoder().encode(action), as: UTF8.self))
         }
-        let sync = try scope.validateSnapshot(candidate.stateJSON())["nativeSync"]
-        guard sync?["schemaVersion"] == .integer(3) else { return nil }
-        guard sync?["legacyImport"]?["schemaVersion"] == .integer(2),
-              let baseline = sync?["legacyImport"]?["baseline"], baseline["schemaVersion"] == .integer(2),
-              case .object(let proofs) = baseline["ownAccountSources"], !proofs.isEmpty else { throw VortxNativeError.invalidSnapshot }
-        return try JSONEncoder().encode(baseline)
+        return try scope.validateSnapshot(candidate.stateJSON())["nativeSync"]
     }
     nonisolated static func validateLegacyCompatibility(scope: VortxAccountScope, ownerName: String,
                                                         snapshot: String?, nativeSync: VortxJSON?, material: Data,
@@ -701,6 +752,12 @@ actor VortxNativeSession {
     }
     func websiteEditOutcome() throws -> VortxJSON {
         try lease.withActive { try VortxNativeProfileEditHost.outcome(hostPreferences.local) }
+    }
+    func pendingOwnAccountOverlays() throws -> VortxJSON {
+        try lease.withActive {
+            guard let archive = hostPreferences.local.authenticatedSourceArchive else { return .object([:]) }
+            return try JSONDecoder().decode(VortxJSON.self, from: archive)["hostDocument"]?["ownAccountOverlayPending"] ?? .object([:])
+        }
     }
     @discardableResult func dispatch(_ actions: [String], now: UInt64, legacyMaterial: Data? = nil,
                                     hostRemote: VortxJSON? = nil, hostEdits: [VortxNativeHostPreferences.Edit] = [],

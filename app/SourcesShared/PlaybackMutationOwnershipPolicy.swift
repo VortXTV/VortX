@@ -19,10 +19,12 @@ enum PlaybackMutationOwnershipPolicy {
         let profileID: UUID
         let credential: CredentialScopeRegistry.Capture
         let sessionGeneration: UUID
+        var accountGeneration: UUID? = nil
     }
 
     static func allowsNative(_ target: Target, binding: NativeBinding?) -> Bool {
-        guard case .native(let captured?) = target, let binding else { return false }
+        guard case .native(let captured?) = target, let binding,
+              captured.accountGeneration != nil, binding.accountGeneration != nil else { return false }
         return captured == binding
     }
 
