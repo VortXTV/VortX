@@ -281,6 +281,7 @@ fun LibraryScreen(
     landingViewModel: LibraryLandingViewModel,
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
+    onDirectResume: (MetaItem) -> Unit = onItem,
     onDownloads: (() -> Unit)? = null,
     onWatchlist: (() -> Unit)? = null,
     onPreviouslyWatched: (() -> Unit)? = null,
@@ -310,7 +311,8 @@ fun LibraryScreen(
             is UiState.Success -> if (landing.data.continueWatching.isNotEmpty()) {
                 PosterRail(
                     catalog = Catalog("continue", "Continue Watching", landing.data.continueWatching),
-                    onItem = onItem,
+                    onItem = onDirectResume,
+                    onRemoveFromContinueWatching = landingViewModel::removeFromContinueWatching,
                     eyebrow = "Pick up where you left off",
                 )
             }

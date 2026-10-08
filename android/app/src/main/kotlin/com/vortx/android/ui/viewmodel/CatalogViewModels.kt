@@ -1080,6 +1080,15 @@ class LibraryLandingViewModel(private val repo: CatalogRepository) : ViewModel()
 
     fun retry() = load(showLoading = true)
 
+    /** Keep the Library-local Continue Watching rail's long-press removal functional without creating Home. */
+    fun removeFromContinueWatching(item: MetaItem) {
+        val owner = repo.continueWatchingOwner()
+        viewModelScope.launch {
+            repo.removeFromContinueWatching(ContinueWatchingDismissal(owner, item.type, item.id))
+                .onSuccess { load(showLoading = false) }
+        }
+    }
+
     private fun load(showLoading: Boolean) {
         loadJob?.cancel()
         if (showLoading) _state.value = UiState.Loading

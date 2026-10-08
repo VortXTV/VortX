@@ -222,7 +222,11 @@ private fun HomeContent(
                         // Only ordinary catalog taps are redirected to the optional Quick View. Continue
                         // Watching keeps its established direct-detail/resume behavior and long-press menu.
                         onItem = { item ->
-                            if (catalog.id != "continue" && onCatalogItem != null) onCatalogItem(item) else onItem(item)
+                            when {
+                                catalog.id == "continue" -> onDirectResume(item)
+                                onCatalogItem != null -> onCatalogItem(item)
+                                else -> onItem(item)
+                            }
                         },
                         onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
                         eyebrow = eyebrow,

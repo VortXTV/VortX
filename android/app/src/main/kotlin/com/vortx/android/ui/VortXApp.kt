@@ -1483,6 +1483,11 @@ fun VortXApp(
                     landingViewModel = viewModel<LibraryLandingViewModel>(key = "library-history", factory = factory),
                     onItem = onItem,
                     modifier = content,
+                    onDirectResume = { item ->
+                        pendingDirectResumeId = item.id
+                        detailGeneration += 1
+                        openDetail(item)
+                    },
                     onDownloads = { showDownloads = true },
                     onWatchlist = { showWatchlist = true },
                     onPreviouslyWatched = { showPreviouslyWatched = true },
