@@ -748,7 +748,8 @@ final class VortXSyncManager: ObservableObject {
                 let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
                                                     transport: VortxCResourceTransport(), allowNewAccount: !hadCheckpoint, initialActions: initialActions,
                                                     hostActor: self.nativeHostActor(capture: capture), sourceAuthority: prepared.authority,
-                                                    authenticatedSourceArchive: didImportLegacy ? prepared.sourceArchive : nil)
+                                                    authenticatedSourceArchive: !hadCheckpoint ? prepared.sourceArchive : nil,
+                                                    initialLegacyMaterial: !hadCheckpoint && remoteNative != nil ? material : nil)
                 do {
                     let hostRemote = try document["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                     let websiteEvents = try Self.nativeWebsiteEvents(document)

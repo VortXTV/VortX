@@ -88,6 +88,35 @@ import CryptoKit
         check(adopted["nativeSync"] == state["nativeSync"])
         check(adopted["libraries"]?[own.id.uuidString] == state["libraries"]?[own.id.uuidString])
         await peer.close()
+        // A cold peer's first durable checkpoint must pair a newly authenticated source with
+        // the reconciled native baseline, not seal it beside the older downloaded source proof.
+        let refreshed = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id, verifiedStreamingUID: source.verifiedStreamingUID,
+            sourceDocument: Data(" ".utf8) + source.sourceDocument)
+        let refreshedMaterial = try VortxLegacyBootstrapMaterial.encode(document: rootDocument, roster: [owner, own], ownerProfileID: owner.id,
+            rosterModifiedSeconds: 1720000000.1234, ownAccountSources: [refreshed])
+        let refreshedSources = VortxJSON.object(["ownAccountSources": .object([own.id.uuidString: .object([
+            "verifiedStreamingUid": .string(refreshed.verifiedStreamingUID), "sourceDocumentBase64": .string(refreshed.sourceDocument.base64EncodedString())])])])
+        let refreshedArchive = try VortxNativeBootstrapArchive.encode(document: JSONEncoder().encode(refreshedSources))
+        let refreshedBootstrap = try VortxNativeBootstrapArchive.encode(document: rootDocument, material: refreshedMaterial, authenticatedSourceArchive: refreshedArchive)
+        let refreshedStore = try VortxEncryptedCheckpointStore(directory: directory.appendingPathComponent("refreshed-peer"), key: SymmetricKey(size: .bits256),
+            bootstrap: refreshedBootstrap, bootstrapScope: scope)
+        let newAuthority = VortxNativeOwnAccountProducer.Authority(generations: [VortxNativeOwnAccountProducer.capture(slot: slot)], validate: { true })
+        let refreshedPeer = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: refreshedStore,
+            transport: VortxCResourceTransport(), allowNewAccount: true, initialActions: [raw(merge)], sourceAuthority: newAuthority,
+            authenticatedSourceArchive: refreshedArchive, initialLegacyMaterial: refreshedMaterial)
+        let firstCheckpoint = try JSONDecoder().decode(VortxJSON.self, from: Data(refreshedStore.read(scope: scope)!.utf8))
+        check(firstCheckpoint["nativeSync"]?["legacyImport"]?["baseline"]?["ownAccountSources"]?[own.id.uuidString]?["sourceDocumentSha256"] == .string(refreshed.sourceDocumentSHA256))
+        await refreshedPeer.close()
+        let failedStore = try VortxEncryptedCheckpointStore(directory: directory.appendingPathComponent("retired-first-peer"), key: SymmetricKey(size: .bits256),
+            bootstrap: refreshedBootstrap, bootstrapScope: scope)
+        VortxNativeOwnAccountProducer.invalidate(slot: slot)
+        do {
+            _ = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: failedStore,
+                transport: VortxCResourceTransport(), allowNewAccount: true, initialActions: [raw(merge)], sourceAuthority: newAuthority,
+                authenticatedSourceArchive: refreshedArchive, initialLegacyMaterial: refreshedMaterial)
+            fatalError("retired first peer committed bootstrap")
+        } catch VortxNativeError.superseded {}
+        check(try failedStore.read(scope: scope) == nil)
         print("Own-account actual C: authenticated raw producer→material2/schema3, isolated buckets, original/latest sealed source, retired-source checkpoint fence and token-free native cold peer passed")
     }
 }

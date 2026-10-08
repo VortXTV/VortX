@@ -63,6 +63,12 @@ import Foundation
         check(sanitizedObject["token"] == nil && sanitizedObject["unknown"] as? Bool == true)
         check((quotedArchive["excludedCredentialPaths"] as! [String]).contains("/future/token"))
         let unchanged = try data(["keep": true]).base64EncodedString()
+        let hashThatLooksStructured = "e9" + String(repeating: "0", count: 62)
+        let evidence = try data(["sourceDocumentSha256": hashThatLooksStructured, "typedCarrierFingerprint": hashThatLooksStructured,
+            "nativeSync": ["legacyImport": ["acceptedFingerprints": [hashThatLooksStructured], "ownAccountSourceHistory": [
+                "00000000-0000-0000-0000-00000000A11C": [hashThatLooksStructured: hashThatLooksStructured]]]]])
+        let hashArchive = try VortxNativeBootstrapArchive.encode(document: evidence)
+        try VortxNativeBootstrapArchive.validate(hashArchive)
         let unchangedArchive = try JSONSerialization.jsonObject(with: VortxNativeBootstrapArchive.encode(document: data(["future": unchanged]))) as! [String: Any]
         check((unchangedArchive["hostDocument"] as! [String: String])["future"] == unchanged)
         let malformedBackup = try data(["format": "vortx-backup", "schema": 1, "payloadBase64": "opaque"]).base64EncodedString()

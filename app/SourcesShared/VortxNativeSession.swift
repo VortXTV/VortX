@@ -466,7 +466,8 @@ actor VortxNativeSession {
          store: any VortxCheckpointStore, transport: any VortxResourceTransport,
          allowNewAccount: Bool = false, legacy: VortxLegacyImport? = nil,
          initialActions: [String] = [], hostActor: String = UUID().uuidString.lowercased(),
-         sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) throws {
+         sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil,
+         initialLegacyMaterial: Data? = nil) throws {
         try scope.validate()
         guard legacy == nil || legacy?.scope == scope else { throw VortxNativeError.invalidSnapshot }
         self.scope = scope; self.abi = abi; self.store = store; self.transport = transport
@@ -497,6 +498,9 @@ actor VortxNativeSession {
             runtime = try VortxNativeRuntime(abi: abi, ownerID: scope.ownerProfileID, ownerName: ownerName)
             try Self.bind(runtime, scope: scope)
             for action in initialActions { try Self.apply(runtime, action: action) }
+            if let initialLegacyMaterial {
+                try Self.validateLegacyReceipt(runtime, scope: scope, material: initialLegacyMaterial, baselineMaterial: legacyBaseline)
+            }
             let bound = try runtime.stateJSON()
             _ = try scope.validateSnapshot(bound)
             try Self.validateAuthenticatedSources(authenticatedSourceArchive, state: scope.validateSnapshot(bound))
