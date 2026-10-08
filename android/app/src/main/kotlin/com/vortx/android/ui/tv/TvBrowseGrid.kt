@@ -15,6 +15,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.Dp
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.search.searchResultItemKey
 import com.vortx.android.ui.prefs.PosterStylePreferences
@@ -35,6 +36,7 @@ internal fun TvBrowseGrid(
     gridState: LazyGridState = rememberLazyGridState(),
     header: (LazyGridScope.() -> Unit)? = null,
     footer: (@Composable () -> Unit)? = null,
+    minCardWidth: Dp? = null,
     card: @Composable (MetaItem) -> Unit,
 ) {
     // An empty grid with NO header is a calm hint; with a header (e.g. the Collections hub) the header still
@@ -48,7 +50,7 @@ internal fun TvBrowseGrid(
     val layout = TvPosterLayoutPolicy.layout(posterStyle)
     LazyVerticalGrid(
         state = gridState,
-        columns = GridCells.Adaptive(minSize = layout.width),
+        columns = GridCells.Adaptive(minSize = minCardWidth ?: layout.width),
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(TvDimens.edge),
         horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),

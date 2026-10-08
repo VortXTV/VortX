@@ -16,11 +16,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.onFocusChanged
@@ -46,6 +48,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.prefs.TabBarPrefs
+import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.screens.DebridLibraryScreen
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -55,6 +58,8 @@ import com.vortx.android.ui.viewmodel.AddonsViewModel
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.HomeViewModel
 import com.vortx.android.ui.viewmodel.LibraryViewModel
+import com.vortx.android.ui.viewmodel.LibraryLandingViewModel
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 
@@ -110,9 +115,30 @@ fun TvShell(
     var reselectSignal by remember { mutableStateOf(0) }
     var showPlayLinkSheet by remember { mutableStateOf(false) }
     var showDebridLibrary by remember { mutableStateOf(false) }
+    var libraryRoute by remember { mutableStateOf(TvLibraryRoute.LANDING) }
+    var libraryReturnRoute by remember { mutableStateOf(TvLibraryRoute.DOWNLOADS) }
+    var libraryRestoreFocusSignal by remember { mutableStateOf(0) }
+    val libraryEntryFocus = remember {
+        listOf(TvLibraryRoute.DOWNLOADS, TvLibraryRoute.WATCHLIST, TvLibraryRoute.HISTORY).associateWith { FocusRequester() }
+    }
+    var homeBrowseSelected by remember { mutableStateOf(false) }
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val debridLibraryFocus = remember { FocusRequester() }
     val modalVisible = showPlayLinkSheet || showDebridLibrary
+    fun openLibraryRoute(route: TvLibraryRoute) {
+        libraryReturnRoute = route
+        libraryRoute = route
+    }
+    fun closeLibraryRoute() {
+        libraryRoute = TvLibraryRoute.LANDING
+        libraryRestoreFocusSignal++
+    }
+    LaunchedEffect(libraryRestoreFocusSignal) {
+        if (libraryRestoreFocusSignal > 0 && destination == TvDestination.LIBRARY) {
+            withFrameNanos { }
+            runCatching { libraryEntryFocus[libraryReturnRoute]?.requestFocus() }
+        }
+    }
 
     fun dismissSearchOverlay() {
         showPlayLinkSheet = false
@@ -127,10 +153,16 @@ fun TvShell(
     // form factor moves the same value.
     val tabBarPrefs = remember(appContext) { TabBarPrefs(appContext) }
     val hiddenTabs by tabBarPrefs.state.collectAsStateWithLifecycle()
-    val destinations = remember(hiddenTabs) {
+    val homePreferences = remember(appContext) { HomeDiscoverPreferences(appContext) }
+    var mergeHomeDiscover by remember(homePreferences) { mutableStateOf(homePreferences.mergeHomeDiscover) }
+    DisposableEffect(homePreferences) {
+        val stop = homePreferences.observeChanges { mergeHomeDiscover = homePreferences.mergeHomeDiscover }
+        onDispose { stop() }
+    }
+    val destinations = remember(hiddenTabs, mergeHomeDiscover) {
         TvDestination.entries.filter { dest ->
             when (dest) {
-                TvDestination.DISCOVER -> !hiddenTabs.hideDiscover
+                TvDestination.DISCOVER -> !mergeHomeDiscover && !hiddenTabs.hideDiscover
                 TvDestination.LIVE -> !hiddenTabs.hideLive
                 TvDestination.LIBRARY -> !hiddenTabs.hideLibrary
                 TvDestination.SEARCH -> !hiddenTabs.hideSearch
@@ -138,7 +170,13 @@ fun TvShell(
             }
         }
     }
-    LaunchedEffect(destinations) {
+    LaunchedEffect(destinations, destination, mergeHomeDiscover, hiddenTabs.hideDiscover) {
+        // A legacy Discover route is translated to the visible Browse mode before the removed rail entry
+        // heals to Home. A hidden Discover preference also hides Browse and heals to Featured.
+        if (destination == TvDestination.DISCOVER && mergeHomeDiscover) {
+            homeBrowseSelected = !hiddenTabs.hideDiscover
+        }
+        if (!mergeHomeDiscover || hiddenTabs.hideDiscover) homeBrowseSelected = false
         if (destination !in destinations) onDestinationChange(TvDestination.HOME)
     }
 
@@ -154,6 +192,8 @@ fun TvShell(
     // ABOVE this shell with its own BackHandler, so this one is inert underneath it -- the existing
     // Home -> Detail -> Play back stack is unchanged.
     BackHandler(enabled = destination != TvDestination.HOME) { onDestinationChange(TvDestination.HOME) }
+    BackHandler(enabled = destination == TvDestination.HOME && homeBrowseSelected) { homeBrowseSelected = false }
+    BackHandler(enabled = destination == TvDestination.LIBRARY && libraryRoute != TvLibraryRoute.LANDING, onBack = ::closeLibraryRoute)
 
     // One factory for the shell, carrying the app Context so SearchViewModel's history store resolves --
     // the same construction the phone shell uses at VortXApp.kt. Home/Discover/Library ignore the Context.
@@ -174,15 +214,32 @@ fun TvShell(
             destinations = destinations,
             selected = destination,
             // Re-selecting the active tab pops that tab's own stack to root (Add-ons); switching tabs moves.
-            onSelect = { dest -> if (dest == destination) reselectSignal++ else onDestinationChange(dest) },
+            onSelect = { dest ->
+                if (dest == TvDestination.LIBRARY && libraryRoute != TvLibraryRoute.LANDING) closeLibraryRoute()
+                if (dest == destination) reselectSignal++ else onDestinationChange(dest)
+            },
             )
             Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
             // Only the selected destination's ViewModel is instantiated (lazily inside the branch); each is
             // retained in the Activity's ViewModelStore by its default class key, so switching tabs keeps a
             // surface's state (Home's live stream, a Search query) exactly as the phone shell does.
             when (destination) {
-                TvDestination.HOME ->
-                    TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, reselectSignal = reselectSignal)
+                TvDestination.HOME -> Column(modifier = Modifier.fillMaxSize()) {
+                    if (mergeHomeDiscover && !hiddenTabs.hideDiscover) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.sm),
+                            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                        ) {
+                            TvFilterChip("Featured", selected = !homeBrowseSelected, onClick = { homeBrowseSelected = false })
+                            TvFilterChip("Browse", selected = homeBrowseSelected, onClick = { homeBrowseSelected = true })
+                        }
+                    }
+                    if (mergeHomeDiscover && homeBrowseSelected && !hiddenTabs.hideDiscover) {
+                        TvDiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), signedIn = signedIn, reselectSignal = reselectSignal)
+                    } else {
+                        TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), reselectSignal = reselectSignal)
+                    }
+                }
                 TvDestination.DISCOVER ->
                     TvDiscoverScreen(
                         viewModel<DiscoverViewModel>(factory = factory),
@@ -192,8 +249,39 @@ fun TvShell(
                     )
                 TvDestination.LIVE ->
                     TvLiveScreen(viewModel<LiveViewModel>(factory = factory), onItem)
-                TvDestination.LIBRARY ->
-                    TvLibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem)
+                TvDestination.LIBRARY -> {
+                    val landingViewModel = viewModel<LibraryLandingViewModel>(factory = factory)
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        // Retain the landing grid, filters and its focused entry underneath depth routes.
+                        TvLibraryScreen(
+                            viewModel = viewModel<LibraryViewModel>(factory = factory),
+                            landingViewModel = landingViewModel,
+                            onItem = onItem,
+                            onDownloads = { openLibraryRoute(TvLibraryRoute.DOWNLOADS) },
+                            onWatchlist = { openLibraryRoute(TvLibraryRoute.WATCHLIST) },
+                            onPreviouslyWatched = { openLibraryRoute(TvLibraryRoute.HISTORY) },
+                            entryFocusRequesters = libraryEntryFocus,
+                            modifier = Modifier.focusProperties { canFocus = libraryRoute == TvLibraryRoute.LANDING },
+                        )
+                    when (libraryRoute) {
+                        TvLibraryRoute.LANDING -> Unit
+                        TvLibraryRoute.DOWNLOADS -> Column(modifier = Modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
+                            TvLibraryRouteHeader("Downloads", onBack = ::closeLibraryRoute)
+                            TvDownloadsScreen(onPlay = onPlayLocal, modifier = Modifier.weight(1f))
+                        }
+                        TvLibraryRoute.WATCHLIST -> TvWatchlistScreen(
+                            store = WatchlistStore.shared(appContext),
+                            onBack = ::closeLibraryRoute,
+                            onItem = onItem,
+                        )
+                        TvLibraryRoute.HISTORY -> TvPreviouslyWatchedScreen(
+                            viewModel = landingViewModel,
+                            onBack = ::closeLibraryRoute,
+                            onItem = onItem,
+                        )
+                    }
+                    }
+                }
                 TvDestination.DOWNLOADS ->
                     TvDownloadsScreen(onPlay = onPlayLocal)
                 TvDestination.SEARCH ->

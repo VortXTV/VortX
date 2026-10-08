@@ -109,7 +109,7 @@ fun TvSearchScreen(
             // No retry affordance: the flow re-runs on the next query change, so a bare message (not a Retry
             // card) is the honest state, matching the phone's ErrorState(message) here.
             is UiState.Error -> TvEmpty(s.message)
-            is UiState.Success -> TvPosterGrid(
+            is UiState.Success -> TvCinemaGrid(
                 items = s.data,
                 onItem = openItem,
                 emptyHint = when (val message = searchEmptyMessage(query, s)) {

@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -34,7 +35,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.home.HomeCatalogLayout
@@ -153,6 +158,24 @@ private fun TvHomeContent(
 ) {
     val colors = VortXTheme.colors
     val visibleCatalogs = remember(catalogs) { tvHomeCatalogs(catalogs) }
+    var browseCatalogId by remember(contentOwnerGeneration) { mutableStateOf<String?>(null) }
+    var browseReturnFocus by remember(contentOwnerGeneration) { mutableStateOf<FocusRequester?>(null) }
+    var restoreBrowseFocus by remember(contentOwnerGeneration) { mutableStateOf(false) }
+    fun openCatalog(catalog: Catalog, returnFocus: FocusRequester) {
+        browseReturnFocus = returnFocus
+        browseCatalogId = catalog.id
+    }
+    fun closeCatalog() {
+        browseCatalogId = null
+        restoreBrowseFocus = true
+    }
+    LaunchedEffect(browseCatalogId, restoreBrowseFocus) {
+        if (browseCatalogId == null && restoreBrowseFocus) {
+            withFrameNanos { }
+            runCatching { browseReturnFocus?.requestFocus() }
+            restoreBrowseFocus = false
+        }
+    }
     // The coordinator tracks the actual composed node, including its row. A title duplicated in another
     // rail therefore cannot masquerade as the tile whose focus node was removed. Owner generation and
     // layout are state keys, so neither an old owner's focused hero nor a rail-only recovery lease can
@@ -184,7 +207,10 @@ private fun TvHomeContent(
     // list is not attached (e.g. the poster-wall layout owns its own scroller).
     val initialReselect = remember { reselectSignal }
     LaunchedEffect(reselectSignal) {
-        if (reselectSignal != initialReselect) runCatching { columnState.animateScrollToItem(0) }
+        if (reselectSignal != initialReselect) {
+            browseCatalogId = null
+            runCatching { columnState.animateScrollToItem(0) }
+        }
     }
 
     val heroHeight = (LocalConfiguration.current.screenHeightDp * 0.5f).dp.coerceIn(280.dp, 460.dp)
@@ -198,7 +224,8 @@ private fun TvHomeContent(
     // Enrich the focused item post-focus (backdrop + clearlogo + synopsis/rating/genres + the trailer id
     // that lights the ambient trailer) through the existing engine meta route -- see TvHeroEnrichment.kt.
     val enrichedHeroItem = rememberEnrichedHeroItem(heroItem)
-    Column(modifier = modifier.fillMaxSize().background(colors.canvas)) {
+    Box(modifier = modifier.fillMaxSize().background(colors.canvas)) {
+    Column(modifier = Modifier.fillMaxSize().focusProperties { canFocus = browseCatalogId == null }) {
         // Hook site: the living-backdrop cinematic hero (backdrop crossfade + Ken Burns + ambient trailer +
         // metadata overlay) lives in TvAmbientHero.kt. It follows the enriched focus-driven hero item.
         TvAmbientHero(enrichedHeroItem, modifier = Modifier.fillMaxWidth().height(heroHeight))
@@ -210,6 +237,7 @@ private fun TvHomeContent(
                 onRemoveFromContinueWatching = onRemoveFromContinueWatching,
                 onLoadRowPage = onLoadRowPage,
                 onLoadMoreRows = onLoadMoreRows,
+                onBrowseCatalog = ::openCatalog,
                 firstCardFocus = firstCardFocus,
                 modifier = Modifier.fillMaxWidth().weight(1f),
             )
@@ -260,6 +288,7 @@ private fun TvHomeContent(
                                 onRowDisposed = { rowId, state ->
                                     if (rowStates[rowId] === state) rowStates.remove(rowId)
                                 },
+                                onBrowseCatalog = ::openCatalog,
                             )
                         }
                     }
@@ -267,10 +296,20 @@ private fun TvHomeContent(
             }
         }
     }
+    browseCatalogId?.let { id ->
+        TvHomeCatalogBrowse(
+            catalog = visibleCatalogs.firstOrNull { it.id == id },
+            onBack = ::closeCatalog,
+            onItem = onItem,
+            onLoadNextPage = onLoadRowPage,
+            onRemoveFromContinueWatching = onRemoveFromContinueWatching,
+        )
+    }
+    }
 
     LaunchedEffect(contentOwnerGeneration, catalogLayout) {
         delay(120)
-        if (!hasReceivedFocus) runCatching { firstCardFocus.requestFocus() }
+        if (!hasReceivedFocus && browseCatalogId == null) runCatching { firstCardFocus.requestFocus() }
     }
 
     LaunchedEffect(visibleCatalogs, contentOwnerGeneration, catalogLayout) {
@@ -285,7 +324,8 @@ private fun TvHomeContent(
         }
     }
 
-    LaunchedEffect(focusRecovery, focusGeneration) {
+    LaunchedEffect(focusRecovery, focusGeneration, browseCatalogId) {
+        if (browseCatalogId != null) return@LaunchedEffect
         val lease = focusRecovery ?: return@LaunchedEffect
         val target = lease.recovery
         // The focused row/item may be far outside both lazy viewports. Compose the row first, then the
@@ -317,9 +357,11 @@ private fun TvCatalogRow(
     recoveryFocus: FocusRequester?,
     onRowState: (String, LazyListState) -> Unit = { _, _ -> },
     onRowDisposed: (String, LazyListState) -> Unit = { _, _ -> },
+    onBrowseCatalog: (Catalog, FocusRequester) -> Unit,
 ) {
     val visibleItems = remember(catalog.items) { tvHomeItems(catalog.items) }
     val rowState = rememberLazyListState()
+    val seeAllFocus = remember(catalog.id) { FocusRequester() }
     DisposableEffect(catalog.id, rowState) {
         onRowState(catalog.id, rowState)
         onDispose { onRowDisposed(catalog.id, rowState) }
@@ -332,6 +374,7 @@ private fun TvCatalogRow(
     // debrid is enforced inside [SourceWarmer]. Fail-soft: a missed warm just falls back to the tap search.
     val warmContext = LocalContext.current
     val isContinueWatchingRow = remember(catalog) { posterMenuFor(catalog) == PosterCardMenu.CONTINUE_WATCHING }
+    val usesContinueWatchingCard = remember(catalog) { tvIsContinueWatchingCatalog(catalog) }
     var focusedCwItem by remember { mutableStateOf<MetaItem?>(null) }
     LaunchedEffect(focusedCwItem) {
         val item = focusedCwItem ?: return@LaunchedEffect
@@ -342,7 +385,7 @@ private fun TvCatalogRow(
     }
 
     Column(modifier = Modifier.focusGroup()) {
-        TvCatalogHeader(catalog)
+        TvCatalogHeader(catalog, onSeeAll = { onBrowseCatalog(catalog, seeAllFocus) }, seeAllFocus = seeAllFocus)
         if (onEndReached != null && showEmptyCatalogContinuation(catalog)) {
             androidx.compose.material3.Button(onClick = onEndReached, modifier = Modifier.padding(horizontal = TvDimens.edge)) {
                 Text("Continue catalog")
@@ -361,18 +404,29 @@ private fun TvCatalogRow(
                 }
                 val menu = posterMenuFor(catalog)
                 val focusKey = TvHomeFocusKey(catalog.id, item.type, item.id)
-                TvPosterCard(
+                val cardFocus = when {
+                    recovery?.key == focusKey -> recoveryFocus
+                    firstCardFocus != null && i == 0 -> firstCardFocus
+                    else -> null
+                }
+                if (usesContinueWatchingCard) {
+                    TvCinemaCard(
+                        item = item,
+                        onClick = { onItem(item) },
+                        onFocused = { onFocused(item); if (isContinueWatchingRow) focusedCwItem = item },
+                        focusRequester = cardFocus,
+                        width = 300.dp,
+                        continueWatching = true,
+                        onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onRemoveFromContinueWatching(item) }) else null,
+                    )
+                } else TvPosterCard(
                     item = item,
                     onClick = { onItem(item) },
                     onFocused = {
                         onFocused(item)
                         if (menu == PosterCardMenu.CONTINUE_WATCHING) focusedCwItem = item
                     },
-                    focusRequester = when {
-                        recovery?.key == focusKey -> recoveryFocus
-                        firstCardFocus != null && i == 0 -> firstCardFocus
-                        else -> null
-                    },
+                    focusRequester = cardFocus,
                     menu = menu,
                     onDetails = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onItem(item) }) else null,
                     onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) {
@@ -394,6 +448,7 @@ private fun TvCatalogWall(
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
     onLoadRowPage: (Catalog) -> Unit,
     onLoadMoreRows: () -> Unit,
+    onBrowseCatalog: (Catalog, FocusRequester) -> Unit,
     firstCardFocus: FocusRequester,
     modifier: Modifier,
 ) {
@@ -438,6 +493,7 @@ private fun TvCatalogWall(
                         firstCardFocus = if (firstAction?.first == catalog.id) firstCardFocus else null,
                         recovery = null,
                         recoveryFocus = null,
+                        onBrowseCatalog = onBrowseCatalog,
                     )
                 }
 
@@ -449,7 +505,8 @@ private fun TvCatalogWall(
                         if (catalogIndex == catalogs.lastIndex) {
                             LaunchedEffect(catalogs.size, catalog.id) { onLoadMoreRows() }
                         }
-                        TvCatalogHeader(catalog, edgePadding = false)
+                        val seeAllFocus = remember(catalog.id) { FocusRequester() }
+                        TvCatalogHeader(catalog, edgePadding = false, onSeeAll = { onBrowseCatalog(catalog, seeAllFocus) }, seeAllFocus = seeAllFocus)
                         if (showEmptyCatalogContinuation(catalog)) {
                             androidx.compose.material3.Button(onClick = { onLoadRowPage(catalog) }) { Text("Continue catalog") }
                         }
@@ -488,26 +545,46 @@ private fun TvCatalogWall(
 }
 
 @Composable
-private fun TvCatalogHeader(catalog: Catalog, edgePadding: Boolean = true) {
+private fun TvCatalogHeader(
+    catalog: Catalog,
+    edgePadding: Boolean = true,
+    onSeeAll: (() -> Unit)? = null,
+    seeAllFocus: FocusRequester? = null,
+) {
     val eyebrow = if (catalog.id == HomeRail.CONTINUE_CATALOG_ID) {
         "Pick up where you left off"
     } else when (HomeRail.forCatalog(catalog)) {
         HomeRail.TOP_PICKS -> "Based on what you watch"
         HomeRail.UPCOMING_EPISODES, HomeRail.UPCOMING_MOVIES -> "Coming soon"
         HomeRail.TRAKT_WATCHLIST -> "From Trakt"
+        HomeRail.TRAKT_CONTINUE_WATCHING -> "From Trakt"
         HomeRail.SIMKL_WATCHLIST -> "From SIMKL"
         else -> null
     }
-    Column(
+    Row(
         modifier = Modifier.padding(
             start = if (edgePadding) TvDimens.edge else 0.dp,
+            end = if (edgePadding) TvDimens.edge else 0.dp,
             bottom = VortXTheme.spacing.sm,
-        ),
+        ).fillMaxWidth(),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
     ) {
+        Column(modifier = Modifier.weight(1f)) {
         if (eyebrow != null) {
             Text(text = eyebrow.uppercase(), style = VortXTheme.type.eyebrow)
         }
         Text(text = catalog.title, style = VortXTheme.type.sectionTitle)
+        }
+        onSeeAll?.let {
+            TvFilterChip(
+                label = "See All",
+                selected = false,
+                onClick = it,
+                modifier = (if (seeAllFocus != null) Modifier.focusRequester(seeAllFocus) else Modifier)
+                    .semantics { contentDescription = "See all ${catalog.title}" },
+            )
+        }
     }
 }
 
@@ -518,6 +595,9 @@ private fun TvCatalogHeader(catalog: Catalog, edgePadding: Boolean = true) {
  */
 internal fun tvHomeCatalogs(catalogs: List<Catalog>): List<Catalog> =
     normalizeHomeCatalogs(catalogs)
+
+internal fun tvIsContinueWatchingCatalog(catalog: Catalog): Boolean =
+    catalog.id == HomeRail.CONTINUE_CATALOG_ID || HomeRail.forCatalog(catalog) == HomeRail.TRAKT_CONTINUE_WATCHING
 
 /**
  * A content identity is type plus id: a movie and series may legitimately share an external id, while

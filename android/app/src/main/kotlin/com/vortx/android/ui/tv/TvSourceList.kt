@@ -13,11 +13,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.withFrameNanos
 import com.vortx.android.ui.components.sourceAuthoredText
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -25,6 +29,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
@@ -113,13 +120,7 @@ fun TvSourceList(
     }
 }
 
-/// One rendered line of the grouped list: a per-add-on [Header] (name + count + fold chevron) or one source
-/// [Row]. Flattened so a single windowed [LazyColumn] renders the whole grouped list with a bounded row budget.
-private sealed interface TvSourceItem {
-    data class Header(val addon: String, val count: Int, val collapsed: Boolean) : TvSourceItem
-    data class Row(val source: StreamSource, val addon: String) : TvSourceItem
-}
-
+/// Fixed remote controls and add-on jump tabs above one ordered, bounded source list.
 @Composable
 private fun TvSourceListContent(
     groups: List<StreamGroup>,
@@ -140,15 +141,27 @@ private fun TvSourceListContent(
     onUnpin: (SourcePinScope) -> Unit,
 ) {
     val colors = VortXTheme.colors
-    // DET-2 grouped/collapsible source list state, mirroring the phone SourcesSection: the per-add-on filter
-    // ("All" = null), the remembered collapsed add-on set, the render window (grown by "Show more"), the row
-    // whose long-press opened the pin/download menu, and the two-level Quality menu.
-    var sourceFilter by remember { mutableStateOf<String?>(null) }
+    // Section jumps, folding and the render window belong only to this title's remote presentation.
+    // Sorting, quality, audio, pinning, download and playback keep their existing shared owners.
+    var jumpGroupKey by remember { mutableStateOf<String?>(null) }
+    var jumpRevision by remember { mutableStateOf(0) }
+    var focusRevision by remember { mutableStateOf(0L) }
+    var jumpLease by remember { mutableStateOf<TvSourceJumpLease?>(null) }
     var collapsed by remember { mutableStateOf(emptySet<String>()) }
     var renderLimit by remember { mutableStateOf(TV_SOURCE_WINDOW_INITIAL) }
     var pinMenuFor by remember { mutableStateOf<String?>(null) }
     var qualityOpen by remember { mutableStateOf(false) }
     var qualityTier by remember { mutableStateOf<String?>(null) }
+    val listState = rememberLazyListState()
+    val groupKeys = groups.mapIndexed { index, group -> tvSourceGroupKey(group, index) }
+    val groupFocus = remember(groupKeys) { groupKeys.associateWith { FocusRequester() } }
+    fun acceptFocus() { focusRevision++ }
+    fun requestJump(key: String?) {
+        if (key != null) collapsed = collapsed - key
+        jumpGroupKey = key
+        jumpRevision++
+        jumpLease = TvSourceJumpLease(key, jumpRevision, focusRevision)
+    }
 
     val total = groups.sumOf { it.streams.size }
 
@@ -165,29 +178,64 @@ private fun TvSourceListContent(
         return
     }
 
-    val filtered = groups.filter { sourceFilter == null || it.addon == sourceFilter }
-    // Build at most [renderLimit] rows across the (filtered, expanded) groups, stopping the moment the budget
-    // is hit -- bounded work no matter how many thousand sources land (the phone SourcesSection computes this
-    // inline every recomposition too). A collapsed group emits only its header.
-    val items = buildList {
-        var budget = renderLimit
-        for (group in filtered) {
-            val isCollapsed = group.addon in collapsed
-            add(TvSourceItem.Header(group.addon, group.streams.size, isCollapsed))
-            if (!isCollapsed && budget > 0) {
-                val sorted = tvSortedStreamsInGroup(group.streams, sort)
-                val take = minOf(sorted.size, budget)
-                budget -= take
-                for (i in 0 until take) add(TvSourceItem.Row(sorted[i], group.addon))
-            }
+    // A late section jump adds at most one 40-row window to the normal global render budget.
+    val items = tvSourceWindow(groups, collapsed, renderLimit, jumpGroupKey) { tvSortedStreamsInGroup(it, sort) }
+    val shownRows = items.count { it is TvSourceItem.Row }
+    val expandableTotal = groups.mapIndexed { index, group ->
+        if (tvSourceGroupKey(group, index) in collapsed) 0 else group.streams.size
+    }.sum()
+    val hasMore = shownRows < expandableTotal
+    val prefixCount = 1 + (if (best != null) 1 else 0) + (if (failure != null) 1 else 0) + (if (downloadNotice != null) 1 else 0)
+    LaunchedEffect(jumpRevision, groupKeys) {
+        val lease = jumpLease ?: return@LaunchedEffect
+        if (!lease.stillOwns(jumpRevision, focusRevision, groupKeys)) return@LaunchedEffect
+        val key = lease.groupKey
+        if (key == null) {
+            listState.scrollToItem(0)
+        } else {
+            val index = tvSourceSectionIndex(items, key) ?: return@LaunchedEffect
+            listState.scrollToItem(prefixCount + index)
+            withFrameNanos { }
+            if (!lease.stillOwns(jumpRevision, focusRevision, groupKeys)) return@LaunchedEffect
+            runCatching { groupFocus[key]?.requestFocus() }
         }
     }
-    val shownRows = items.count { it is TvSourceItem.Row }
-    val expandableTotal = filtered.filter { it.addon !in collapsed }.sumOf { it.streams.size }
-    val hasMore = shownRows < expandableTotal
 
+    Column(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+        TvSourceControlsRow(
+            groups = groups,
+            sort = sort,
+            onSortChange = onSortChange,
+            audioLanguageHint = audioLanguageHint,
+            onAudioLanguageHintChange = onAudioLanguageHintChange,
+            qualityOpen = qualityOpen,
+            onQualityOpenChange = { qualityOpen = it },
+            qualityTier = qualityTier,
+            onQualityTierChange = { qualityTier = it },
+            onPlay = onPlay,
+            onFocused = ::acceptFocus,
+        )
+        // These tabs scroll to a section in the complete ordered list; selecting an add-on never filters
+        // away its neighbors or changes the user's installed add-on order.
+        if (groups.size > 1) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
+                item(key = "sources-all") {
+                    TvFilterChip("All ($total)", jumpGroupKey == null, onClick = { requestJump(null) }, modifier = Modifier.onFocusChanged { if (it.isFocused) acceptFocus() })
+                }
+                itemsIndexed(groups, key = { index, group -> tvSourceGroupKey(group, index) }) { index, group ->
+                    val key = tvSourceGroupKey(group, index)
+                    TvFilterChip(
+                        label = "${group.addon} (${group.streams.size})",
+                        selected = jumpGroupKey == key,
+                        onClick = { requestJump(key) },
+                        modifier = Modifier.onFocusChanged { if (it.isFocused) acceptFocus() },
+                    )
+                }
+            }
+        }
     LazyColumn(
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.fillMaxWidth().weight(1f),
+        state = listState,
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
         contentPadding = PaddingValues(bottom = TvDimens.edge),
     ) {
@@ -204,46 +252,7 @@ private fun TvSourceListContent(
         // source straight away (the same [DetailViewModel.bestSource] the hero Watch button uses).
         best?.let { top ->
             item(key = "sources-best") {
-                TvBestSourceRow(source = top, enabled = !resolving, onPlay = { onPlay(top) })
-            }
-        }
-
-        // Sort (Best/Size/Seeders) + the two-level Quality picker, on one D-pad row.
-        item(key = "sources-controls") {
-            TvSourceControlsRow(
-                groups = groups,
-                sort = sort,
-                onSortChange = onSortChange,
-                audioLanguageHint = audioLanguageHint,
-                onAudioLanguageHintChange = onAudioLanguageHintChange,
-                qualityOpen = qualityOpen,
-                onQualityOpenChange = { qualityOpen = it },
-                qualityTier = qualityTier,
-                onQualityTierChange = { qualityTier = it },
-                onPlay = onPlay,
-            )
-        }
-
-        // Per-add-on filter chips ("All (N)" + one per group), only when there is more than one add-on to
-        // filter between (Apple's `filterBar`, shown for groups.count > 1).
-        if (groups.size > 1) {
-            item(key = "sources-filter") {
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
-                    item(key = "filter-all") {
-                        TvFilterChip(
-                            label = "All ($total)",
-                            selected = sourceFilter == null,
-                            onClick = { sourceFilter = null },
-                        )
-                    }
-                    items(groups, key = { "filter-${it.addon}" }) { group ->
-                        TvFilterChip(
-                            label = "${group.addon} (${group.streams.size})",
-                            selected = sourceFilter == group.addon,
-                            onClick = { sourceFilter = group.addon },
-                        )
-                    }
-                }
+                TvBestSourceRow(source = top, enabled = !resolving, onPlay = { onPlay(top) }, onFocused = ::acceptFocus)
             }
         }
 
@@ -268,11 +277,15 @@ private fun TvSourceListContent(
                     addon = entry.addon,
                     count = entry.count,
                     collapsed = entry.collapsed,
+                    modifier = Modifier
+                        .then(groupFocus[entry.key]?.let { Modifier.focusRequester(it) } ?: Modifier)
+                        .onFocusChanged { if (it.isFocused) acceptFocus() },
                     onToggle = {
-                        collapsed = if (entry.collapsed) collapsed - entry.addon else collapsed + entry.addon
+                        collapsed = if (entry.collapsed) collapsed - entry.key else collapsed + entry.key
                     },
                 )
                 is TvSourceItem.Row -> {
+                    val menuKey = "${entry.groupKey}|${entry.source.id}"
                     val pinned = pin.resolved
                         ?.let { SourcePinStore.matches(entry.source, entry.addon, it) } == true
                     TvSourceDepthRow(
@@ -281,14 +294,15 @@ private fun TvSourceListContent(
                         resolving = resolving,
                         pin = pin,
                         entryNoun = entryNoun,
-                        menuOpen = pinMenuFor == entry.source.id,
-                        onOpenMenu = { pinMenuFor = entry.source.id },
+                        menuOpen = pinMenuFor == menuKey,
+                        onOpenMenu = { pinMenuFor = menuKey },
                         onDismissMenu = { pinMenuFor = null },
                         onPlay = onPlay,
                         onPlayWithEngine = onPlayWithEngine,
                         onDownload = onDownload,
                         onPin = onPin,
                         onUnpin = onUnpin,
+                        onFocused = ::acceptFocus,
                     )
                 }
             }
@@ -300,9 +314,11 @@ private fun TvSourceListContent(
                     label = "Show more · ${expandableTotal - shownRows} more",
                     selected = false,
                     onClick = { renderLimit += TV_SOURCE_WINDOW_STEP },
+                    modifier = Modifier.onFocusChanged { if (it.isFocused) acceptFocus() },
                 )
             }
         }
+    }
     }
 }
 
@@ -311,13 +327,13 @@ private fun TvSourceListContent(
 /// [Surface]; a cached best also lights the "Instant" tag.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvBestSourceRow(source: StreamSource, enabled: Boolean, onPlay: () -> Unit) {
+private fun TvBestSourceRow(source: StreamSource, enabled: Boolean, onPlay: () -> Unit, onFocused: () -> Unit) {
     val colors = VortXTheme.colors
     val cached = StreamRanking.isCachedSource(source)
     Surface(
         onClick = onPlay,
         enabled = enabled,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) onFocused() },
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = colors.accent.copy(alpha = 0.22f),
@@ -378,6 +394,7 @@ private fun TvSourceControlsRow(
     qualityTier: String?,
     onQualityTierChange: (String?) -> Unit,
     onPlay: (StreamSource) -> Unit,
+    onFocused: () -> Unit,
 ) {
     var audioOpen by remember { mutableStateOf(false) }
     // The picker is a session filter over the sources currently assembled for this title.  Keep the
@@ -386,6 +403,7 @@ private fun TvSourceControlsRow(
     val audioLanguageOptions = detailAudioLanguageOptions(groups)
     LazyRow(
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+        modifier = Modifier.onFocusChanged { if (it.hasFocus) onFocused() },
     ) {
         items(TV_SOURCE_SORT_OPTIONS, key = { it.first }) { (key, label) ->
             TvFilterChip(label = label, selected = key == sort, onClick = { onSortChange(key) })
@@ -476,11 +494,11 @@ private fun TvSourceControlsRow(
 /// D-pad can collapse a noisy add-on from the couch.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvSourceGroupHeader(addon: String, count: Int, collapsed: Boolean, onToggle: () -> Unit) {
+private fun TvSourceGroupHeader(addon: String, count: Int, collapsed: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
     val colors = VortXTheme.colors
     Surface(
         onClick = onToggle,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.chip),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = colors.surface2,
@@ -534,6 +552,7 @@ private fun TvSourceDepthRow(
     onDownload: (StreamSource) -> Unit,
     onPin: (StreamSource, SourcePinScope) -> Unit,
     onUnpin: (SourcePinScope) -> Unit,
+    onFocused: () -> Unit,
 ) {
     val colors = VortXTheme.colors
     val cached = StreamRanking.isCachedSource(source)
@@ -548,7 +567,7 @@ private fun TvSourceDepthRow(
             onClick = { onPlay(source) },
             onLongClick = onOpenMenu,
             enabled = !resolving,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().onFocusChanged { if (it.isFocused) onFocused() },
             shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
             colors = ClickableSurfaceDefaults.colors(
                 containerColor = colors.surface1,
@@ -670,8 +689,8 @@ private fun tvSortedStreamsInGroup(streams: List<StreamSource>, sort: String): L
 /// A stable LazyColumn key for a rendered [TvSourceItem]: position-prefixed so a decorated / duplicate source
 /// id can never collide, header vs row disambiguated by kind.
 private fun tvSourceItemKey(index: Int, item: TvSourceItem): String = when (item) {
-    is TvSourceItem.Header -> "h-$index-${item.addon}"
-    is TvSourceItem.Row -> "r-$index-${item.source.id}"
+    is TvSourceItem.Header -> "h-${item.key}"
+    is TvSourceItem.Row -> "r-${item.groupKey}-$index-${item.source.id}"
 }
 
 /// The sort ids/labels, the SAME lowercase persistence keys the phone `defaultSourceSort` stores, so the TV
