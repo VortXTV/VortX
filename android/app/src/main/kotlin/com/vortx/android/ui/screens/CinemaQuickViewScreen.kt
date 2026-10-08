@@ -60,10 +60,10 @@ fun CinemaQuickViewScreen(
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
-    var watchlistMessage by remember(item.id) { mutableStateOf<String?>(null) }
+    var watchlistMessage by remember(item.id, item.type) { mutableStateOf<String?>(null) }
     val watchlist by watchlistStore.items.collectAsStateWithLifecycle()
-    val inWatchlist = watchlist.any { it.id == item.id }
-    var togglingWatchlist by remember(item.id) { mutableStateOf(false) }
+    val inWatchlist = watchlist.any { it.id == item.id && it.type == item.type }
+    var togglingWatchlist by remember(item.id, item.type) { mutableStateOf(false) }
     Column(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas).safeDrawingPadding()) {
         TopAppBar(
             title = { Text("Quick view", style = VortXTheme.type.screenTitle) },
@@ -113,10 +113,15 @@ fun CinemaQuickViewScreen(
                 enabled = !togglingWatchlist,
                 leadingIcon = VortXIcons.bookmark,
                 onClick = {
+                    // Capture immutable account/profile authority in the click, not in a delayed Task.
+                    val intent = try { watchlistStore.captureToggle(item) } catch (_: Exception) {
+                        watchlistMessage = "Could not update Watchlist. Try again."
+                        return@Chip
+                    }
                     togglingWatchlist = true
                     scope.launch {
                         try {
-                            val nowWatchlisted = watchlistStore.toggle(item)
+                            val nowWatchlisted = watchlistStore.toggle(intent)
                             watchlistMessage = if (nowWatchlisted) "Added to Watchlist" else "Removed from Watchlist"
                         } catch (error: Exception) {
                             if (error is CancellationException) throw error

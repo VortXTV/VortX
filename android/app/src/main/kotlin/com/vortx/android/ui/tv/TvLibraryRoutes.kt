@@ -43,14 +43,16 @@ internal fun TvLibraryRouteHeader(title: String, onBack: () -> Unit) {
     }
 }
 
-/** The same profile-local store used by Detail and touch Watchlist; no synthetic saved-title filter. */
+/** The same native/legacy Watchlist projection used by Detail and touch; no second saved-title list. */
 @Composable
 internal fun TvWatchlistScreen(store: WatchlistStore, onBack: () -> Unit, onItem: (MetaItem) -> Unit) {
     val items by store.items.collectAsStateWithLifecycle()
-    LaunchedEffect(store) { store.reload() }
+    val error by store.error.collectAsStateWithLifecycle()
+    LaunchedEffect(store) { store.requestReload() }
     Column(modifier = Modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
         TvLibraryRouteHeader("Watchlist", onBack)
-        TvCinemaGrid(items, onItem, "Titles you add to Watchlist appear here.", Modifier.weight(1f))
+        if (error != null) TvError(error!!, store::requestReload, Modifier.weight(1f))
+        else TvCinemaGrid(items, onItem, "Titles you add to Watchlist appear here.", Modifier.weight(1f))
     }
 }
 

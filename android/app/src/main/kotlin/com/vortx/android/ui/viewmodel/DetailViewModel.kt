@@ -419,8 +419,8 @@ class DetailViewModel(
     private var profileReloadJob: Job? = null
     private val watchlistStore = WatchlistStore.shared(app)
     val watchlisted: StateFlow<Boolean> = watchlistStore.items
-        .map { items -> items.any { it.id == id } }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, watchlistStore.isWatchlisted(id))
+        .map { items -> items.any { it.id == id && it.type == type } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, watchlistStore.isWatchlisted(id, type))
 
     /// Gate for the [sourceModel] -> [_streams] bridge: true only after the raw engine groups for the current
     /// target have loaded, so the coalescer's empty first-paint (and the empty state at each new load) never
@@ -2322,18 +2322,22 @@ class DetailViewModel(
         }
     }
 
-    /** Toggle the separate profile-local want-to-watch ledger without mutating the account library. */
+    /** Watchlist remains separate from engine library; capture authority before enqueueing work. */
     fun toggleWatchlist() {
         val current = (_meta.value as? UiState.Success)?.data ?: return
+        val intent = try {
+            watchlistStore.captureToggle(MetaItem(id = current.id, type = current.type, name = current.name, poster = current.poster))
+        } catch (_: Exception) {
+            _mutationError.value = "Could not update Watchlist. Try again."
+            return
+        }
         viewModelScope.launch {
-            watchlistStore.toggle(
-                MetaItem(
-                    id = current.id,
-                    type = current.type,
-                    name = current.name,
-                    poster = current.poster,
-                ),
-            )
+            try {
+                watchlistStore.toggle(intent)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _mutationError.value = "Could not update Watchlist. Try again."
+            }
         }
     }
 

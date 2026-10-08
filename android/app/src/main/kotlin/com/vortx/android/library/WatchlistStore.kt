@@ -8,10 +8,12 @@ import com.vortx.android.profile.ProfileStore
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -20,11 +22,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Profile-local want-to-watch ledger, separate from the account library and remote integrations.
+ * Want-to-watch projection, separate from engine-library membership and remote integrations.
  *
  * This module does not currently carry AndroidX DataStore. Keep the existing Apple-compatible
  * SharedPreferences keys, but follow the repository's serialized IO pattern (SkipTimestampStore): one
- * coroutine [Mutex] around read-modify-write and every JSON/persistence operation on [Dispatchers.IO].
+ * coroutine [Mutex] around read-modify-write and JSON/persistence operations on [Dispatchers.IO].
+ * Native mode instead uses the injected account/profile host-register authority, with no local
+ * ledger fallback or optimistic publication. Native clocks and checkpointing belong to its gateway.
  */
 class WatchlistStore internal constructor(
     private val persistence: WatchlistPersistence,
@@ -33,19 +37,63 @@ class WatchlistStore internal constructor(
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val nowEpochSeconds: () -> Double = { System.currentTimeMillis() / 1000.0 },
+    initialNativeEnabled: () -> Boolean = { false },
 ) {
     private val _items = MutableStateFlow<List<MetaItem>>(emptyList())
     val items: StateFlow<List<MetaItem>> = _items.asStateFlow()
+    private val _error = MutableStateFlow<String?>(null)
+    val error: StateFlow<String?> = _error.asStateFlow()
     private val mutex = Mutex()
     private val publishLock = Any()
 
     private var publishedProfileId: String? = null
+    private var publishedNativeOwner: NativeWatchlistGateway.Owner? = null
     private var profileGeneration = 0L
+    private var reloadSequence = 0L
+    private var nativeGateway: NativeWatchlistGateway? = null
+    private var nativeEnabled: () -> Boolean = initialNativeEnabled
+    private var nativeChangesJob: Job? = null
 
     init {
-        scheduleReload()
-        registerProfileSwitch(::scheduleReload)
+        scheduleReload(advanceGeneration = true)
+        registerProfileSwitch { scheduleReload(advanceGeneration = true) }
     }
+
+    /** Application wiring owns this choice. Native enabled with no gateway always fails closed. */
+    internal fun installNativeGateway(gateway: NativeWatchlistGateway?, enabled: () -> Boolean) {
+        val previous = synchronized(publishLock) {
+            profileGeneration += 1
+            nativeGateway = gateway
+            nativeEnabled = enabled
+            publishedNativeOwner = null
+            publishedProfileId = null
+            _items.value = emptyList()
+            _error.value = null
+            nativeChangesJob.also { nativeChangesJob = null }
+        }
+        previous?.cancel()
+        val job = gateway?.let {
+            scope.launch { it.changes.collect { scheduleReload() } }
+        }
+        synchronized(publishLock) {
+            if (nativeGateway === gateway && nativeEnabled === enabled) nativeChangesJob = job else job?.cancel()
+        }
+        scheduleReload()
+    }
+
+    /**
+     * Called synchronously before native account retire/rebind/mount. May run while Session is held:
+     * never call a gateway, profile provider or other external code under this publication monitor.
+     */
+    internal fun invalidateNativeAuthority() = synchronized(publishLock) {
+        profileGeneration += 1
+        publishedNativeOwner = null
+        publishedProfileId = null
+        _items.value = emptyList()
+        _error.value = null
+    }
+
+    fun requestReload() = scheduleReload()
 
     suspend fun reload() {
         reload(currentProfileOperation())
@@ -54,40 +102,64 @@ class WatchlistStore internal constructor(
     private suspend fun reload(operation: ProfileOperation) {
         mutex.withLock {
             val loaded = withContext(ioDispatcher) {
-                WatchlistCodec.decode(persistence.read(storageKey(operation.profileId)))
-                    .take(MAX_ENTRIES)
-                    .map(WatchlistEntry::toMetaItem)
+                operation.native?.let { NativeWatchlistCodec.entries(it.snapshot.registers) }
+                    ?: WatchlistCodec.decode(persistence.read(storageKey(operation.profileId))).take(MAX_ENTRIES)
             }
-            publishIfCurrent(operation, loaded)
+            publishIfCurrent(operation, loaded.map(WatchlistEntry::toMetaItem))
         }
     }
 
     fun isWatchlisted(id: String): Boolean = _items.value.any { it.id == id }
+    fun isWatchlisted(id: String, type: MediaType): Boolean = _items.value.any { it.id == id && it.type == type }
+
+    /** Must run in the click/intent caller, before launch/withContext can capture a newer owner. */
+    internal fun captureToggle(item: MetaItem): ToggleIntent {
+        val operation = currentProfileOperation()
+        val entry = WatchlistEntry(item.id, item.type.id, item.name.takeIf(String::isNotBlank),
+            item.poster?.takeIf(String::isNotBlank), nowEpochSeconds())
+        if (operation.native != null) NativeWatchlistCodec.field(entry.id, entry.type)
+        return ToggleIntent(operation, entry)
+    }
 
     /** Returns the new membership state. Unsafe synthetic ids are rejected. */
-    suspend fun toggle(item: MetaItem): Boolean {
-        if (!isSafeId(item.id)) return false
-        val operation = currentProfileOperation()
+    suspend fun toggle(item: MetaItem): Boolean = toggle(captureToggle(item))
+
+    internal suspend fun toggle(intent: ToggleIntent): Boolean {
+        val operation = intent.operation
+        if (operation.native == null && !isSafeId(intent.entry.id)) return false
         return mutex.withLock {
+            check(intentSourceCurrent(operation)) { "Watchlist account or profile changed. Try again." }
+            operation.native?.let { native ->
+                val current = withContext(ioDispatcher) { NativeWatchlistCodec.entries(native.snapshot.registers) }
+                val adding = current.none { it.id == intent.entry.id && it.type == intent.entry.type }
+                val changes = withContext(ioDispatcher) {
+                    if (adding) NativeWatchlistCodec.requireAdditionCapacity(current, intent.entry.id, intent.entry.type)
+                    NativeWatchlistCodec.change(intent.entry, adding)
+                }
+                val acknowledged = native.gateway.mutate(native.snapshot.owner, changes).getOrThrow()
+                val loaded = withContext(ioDispatcher) { NativeWatchlistCodec.entries(acknowledged.registers) }
+                check(loaded.any { it.id == intent.entry.id && it.type == intent.entry.type } == adding) {
+                    "Watchlist update was not acknowledged. Try again."
+                }
+                check(publishIfCurrent(operation.copy(native = native.copy(snapshot = acknowledged)),
+                    loaded.map(WatchlistEntry::toMetaItem))) { "Watchlist account or profile changed. Try again." }
+                return@withLock adding
+            }
             val result = withContext(ioDispatcher) {
                 val current = WatchlistCodec.decode(
                     persistence.read(storageKey(operation.profileId)),
                 ).toMutableList()
-                val existing = current.indexOfFirst { it.id == item.id }
+                val existing = current.indexOfFirst { it.id == intent.entry.id }
                 val nowWatchlisted = existing < 0
                 if (existing >= 0) {
                     current.removeAt(existing)
                 } else {
-                    current += WatchlistEntry(
-                        id = item.id,
-                        type = if (item.type == MediaType.SERIES) MediaType.SERIES.id else MediaType.MOVIE.id,
-                        name = item.name.takeIf(String::isNotBlank),
-                        poster = item.poster?.takeIf(String::isNotBlank),
-                        addedAt = nowEpochSeconds(),
-                    )
+                    current += intent.entry.copy(type = if (intent.entry.type == MediaType.SERIES.id) MediaType.SERIES.id else MediaType.MOVIE.id)
                 }
                 val bounded = current.sortedByDescending(WatchlistEntry::addedAt).take(MAX_ENTRIES)
-                persistence.write(storageKey(operation.profileId), WatchlistCodec.encode(bounded))
+                check(persistence.write(storageKey(operation.profileId), WatchlistCodec.encode(bounded))) {
+                    "Could not save Watchlist. Try again."
+                }
                 ToggleResult(nowWatchlisted, bounded.map(WatchlistEntry::toMetaItem))
             }
             // Publication is part of the same serialized operation as the read/write. A reload that
@@ -97,50 +169,124 @@ class WatchlistStore internal constructor(
         }
     }
 
-    private fun scheduleReload() {
-        val operation = beginProfileReload()
-        scope.launch { reload(operation) }
-    }
-
-    private fun beginProfileReload(): ProfileOperation = synchronized(publishLock) {
-        val profileId = activeProfileId()
-        profileGeneration += 1
-        if (publishedProfileId != profileId) {
-            publishedProfileId = profileId
-            _items.value = emptyList()
+    private fun scheduleReload(advanceGeneration: Boolean = false) {
+        val attempt = synchronized(publishLock) {
+            if (advanceGeneration) profileGeneration += 1
+            ReloadAttempt(profileGeneration, ++reloadSequence)
         }
-        ProfileOperation(profileId, profileGeneration)
+        val operation = try { currentProfileOperation().copy(loadTicket = attempt.ticket) } catch (error: Exception) {
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            synchronized(publishLock) {
+                if (profileGeneration == attempt.generation && reloadSequence == attempt.ticket) {
+                    _items.value = emptyList()
+                    _error.value = "Watchlist is unavailable for this account. Try again."
+                }
+            }
+            return
+        }
+        scope.launch {
+            try { reload(operation) } catch (error: Exception) {
+                if (error is kotlinx.coroutines.CancellationException) throw error
+                reportLoadFailure(operation)
+            }
+        }
     }
 
     private fun currentProfileOperation(): ProfileOperation {
-        val profileId = activeProfileId()
-        return synchronized(publishLock) {
+        val basis = synchronized(publishLock) { CaptureBasis(profileGeneration, nativeGateway, nativeEnabled) }
+        // Session -> publication is the integration lock order. Never invert it by capturing inside
+        // publishLock; the synchronous native invalidation hook fences this capture/publication gap.
+        val native = if (basis.enabled()) {
+            val gateway = checkNotNull(basis.gateway) { "Native Watchlist is unavailable" }
+            NativeOperation(gateway, gateway.capture().getOrThrow())
+        } else null
+        val profileId = native?.snapshot?.owner?.profileId ?: activeProfileId()
+        fun record(): ProfileOperation = synchronized(publishLock) {
+            check(profileGeneration == basis.generation && nativeGateway === basis.gateway && nativeEnabled === basis.enabled) {
+                "Watchlist account or profile changed. Try again."
+            }
             // Normally the profile listener has already advanced the generation. This branch also
             // makes a direct reload/toggle safe if the active-profile provider changes first.
-            if (publishedProfileId != profileId) {
-                profileGeneration += 1
+            if (publishedProfileId != profileId || publishedNativeOwner != native?.snapshot?.owner) {
+                if (native == null) profileGeneration += 1
                 publishedProfileId = profileId
+                publishedNativeOwner = native?.snapshot?.owner
                 _items.value = emptyList()
+                _error.value = null
             }
-            ProfileOperation(profileId, profileGeneration)
+            ProfileOperation(profileId, profileGeneration, native)
+        }
+        if (native == null) return record()
+        // Bookkeeping/clears are publications too: an older capture cannot clear a newer revision.
+        var operation: ProfileOperation? = null
+        check(native.gateway.publishIfCurrent(native.snapshot.owner) { operation = record() }) {
+            "Watchlist account or profile changed. Try again."
+        }
+        return checkNotNull(operation)
+    }
+
+    private fun publishIfCurrent(operation: ProfileOperation, items: List<MetaItem>): Boolean {
+        val basis = synchronized(publishLock) { CaptureBasis(profileGeneration, nativeGateway, nativeEnabled) }
+        if (basis.generation != operation.generation) return false
+        var published = false
+        val publication = {
+            synchronized(publishLock) {
+                if (
+                profileGeneration == operation.generation &&
+                nativeGateway === basis.gateway && nativeEnabled === basis.enabled &&
+                publishedProfileId == operation.profileId
+                ) {
+                    publishedNativeOwner = operation.native?.snapshot?.owner
+                    _items.value = items
+                    _error.value = null
+                    reloadSequence += 1
+                    published = true
+                }
+            }
+            Unit
+        }
+        operation.native?.let {
+            if (basis.gateway !== it.gateway || !basis.enabled()) return false
+            // Atomic publication admission only. Mutation used its original opaque Owner throughout.
+            return it.gateway.publishIfCurrent(it.snapshot.owner, publication) && published
+        }
+        if (basis.enabled() || activeProfileId() != operation.profileId) return false
+        publication()
+        return published
+    }
+
+    private fun intentSourceCurrent(operation: ProfileOperation): Boolean {
+        val basis = synchronized(publishLock) { CaptureBasis(profileGeneration, nativeGateway, nativeEnabled) }
+        if (basis.generation != operation.generation) return false
+        val modeMatches = operation.native?.let { basis.gateway === it.gateway && basis.enabled() }
+            ?: (!basis.enabled() && activeProfileId() == operation.profileId)
+        return synchronized(publishLock) {
+            modeMatches && profileGeneration == operation.generation && nativeGateway === basis.gateway && nativeEnabled === basis.enabled
         }
     }
 
-    private fun publishIfCurrent(operation: ProfileOperation, items: List<MetaItem>) {
-        synchronized(publishLock) {
-            if (
-                profileGeneration == operation.generation &&
-                publishedProfileId == operation.profileId &&
-                activeProfileId() == operation.profileId
-            ) {
-                _items.value = items
+    private fun reportLoadFailure(operation: ProfileOperation) {
+        val failure = {
+            synchronized(publishLock) {
+                if (profileGeneration == operation.generation && operation.loadTicket == reloadSequence) {
+                    _items.value = emptyList()
+                    _error.value = "Watchlist is unavailable for this account. Try again."
+                }
             }
+            Unit
         }
+        operation.native?.let { it.gateway.publishIfCurrent(it.snapshot.owner, failure) }
+            ?: if (intentSourceCurrent(operation)) failure() else Unit
     }
 
     private fun storageKey(profileId: String): String = "$KEY_PREFIX.$profileId"
 
-    private data class ProfileOperation(val profileId: String, val generation: Long)
+    internal class ToggleIntent internal constructor(internal val operation: ProfileOperation, internal val entry: WatchlistEntry)
+
+    internal data class ProfileOperation(val profileId: String, val generation: Long, val native: NativeOperation? = null, val loadTicket: Long? = null)
+    internal data class NativeOperation(val gateway: NativeWatchlistGateway, val snapshot: NativeWatchlistGateway.Snapshot)
+    private data class CaptureBasis(val generation: Long, val gateway: NativeWatchlistGateway?, val enabled: () -> Boolean)
+    private data class ReloadAttempt(val generation: Long, val ticket: Long)
 
     private data class ToggleResult(val nowWatchlisted: Boolean, val items: List<MetaItem>)
 
@@ -160,6 +306,7 @@ class WatchlistStore internal constructor(
                 ),
                 activeProfileId = { ProfileStore.shared.activeProfileId },
                 registerProfileSwitch = { ProfileStore.shared.addSwitchListener(it) },
+                initialNativeEnabled = { com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED },
             ).also { instance = it }
         }
     }
@@ -167,7 +314,7 @@ class WatchlistStore internal constructor(
 
 internal interface WatchlistPersistence {
     fun read(key: String): String?
-    fun write(key: String, value: String)
+    fun write(key: String, value: String): Boolean
 }
 
 private class SharedPreferencesWatchlistPersistence(
@@ -175,10 +322,10 @@ private class SharedPreferencesWatchlistPersistence(
 ) : WatchlistPersistence {
     override fun read(key: String): String? = prefs.getString(key, null)
 
-    override fun write(key: String, value: String) {
+    override fun write(key: String, value: String): Boolean {
         // commit() is intentionally blocking here because the caller is already on Dispatchers.IO and the
         // mutex must not admit another read-modify-write until this one has reached the backing store.
-        prefs.edit().putString(key, value).commit()
+        return prefs.edit().putString(key, value).commit()
     }
 }
 
