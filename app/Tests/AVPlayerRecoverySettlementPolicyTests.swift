@@ -32,6 +32,7 @@ enum AVPlayerRecoverySettlementPolicyTests {
         notificationBeforeTimerActivatesExactlyOnce()
         newerOffOrNativeSelectionAndReplacementCancelThePendingExternalIntent()
         recoveryCompletionFailureAndDeadlineRetireOnlyTheirOwnedTicket()
+        staleFailureCannotRetireTheNewestNormalizedRecoveryTarget()
         newerUserSeekSupersedesRecoveryAndPausedRestoreDoesNotRequestPlayback()
         recoveryAdmissionReconcilesLocalHLSAtTheActualLanding()
         readyContinuationRejectsSynchronousRecoveryRemount()
@@ -106,6 +107,30 @@ enum AVPlayerRecoverySettlementPolicyTests {
         check("a newer user seek fences the prior recovery completion", bound && !staleCompletion)
         check("a successful paused recovery preserves its actual target without requesting autoplay",
               paused.sourceSeconds == 222 && !paused.playbackRequested)
+    }
+
+    private static func staleFailureCannotRetireTheNewestNormalizedRecoveryTarget() {
+        var recovery = AVPlayerRecoverySettlementPolicy.RecoverySeekSettlement()
+        let oldTicket = recovery.issue(
+            sourceSeconds: 340, playbackRequested: true,
+            generation: generation, mountIdentity: mount, revision: 1)
+        let oldBound = recovery.bind(requestID: 101, ticket: oldTicket)
+        let normalizedTarget = AVPlayerRecoverySettlementPolicy.normalizedRecoverySourceSeconds(
+            requestedSourceSeconds: 1_200,
+            achievedOriginSeconds: 1_200.2,
+            acceptedForwardLandingTolerance: RemuxResumePolicy.forwardLandingToleranceSeconds)
+        let newTicket = recovery.issue(
+            sourceSeconds: normalizedTarget, playbackRequested: false,
+            generation: generation + 1, mountIdentity: mount + 1, revision: 2)
+        let newBound = recovery.bind(requestID: 102, ticket: newTicket)
+        let staleRepair = recovery.fail(requestID: 101)
+        check("a stale failure cannot retire the latest recovery ticket",
+              oldBound && newBound && staleRepair == nil && recovery.ticket == newTicket)
+        let currentRepair = recovery.fail(requestID: 102)
+        check("owned repair retains the normalized source target rather than the old mount clock",
+              currentRepair?.sourceSeconds == 1_200.2 && recovery.ticket == nil)
+        check("a repair target is consumed once, not reissued by a duplicate deadline",
+              recovery.fail(requestID: 102) == nil)
     }
 
     private static func recoveryAdmissionReconcilesLocalHLSAtTheActualLanding() {
