@@ -82,6 +82,28 @@ struct VortxNativeTraktIntentTests {
         let winner = try manager.testProviderState(capture: capture)
         check(!winner.hasPreparedMutation)
         check(winner.local.document.fields["traktAccess"]?.value == .string("fixture-login-winner"))
+        // Switch accounts after the exact prepare is durably saved, before the actor can mutate.
+        // Its receipt permits only local prepared cleanup in A; reopening A must not be stranded.
+        let sessionBeforeSwitch = await auth.sessionID
+        FixtureURLProtocol.fixture.set(status: 200, json: #"{"session":"fixture-switch","user_code":"fixture-switch-code","verification_url":"https://trakt.tv/activate","expires_in":600,"interval":1}"#)
+        let switchingLogin = try await auth.requestDeviceCode()
+        FixtureURLProtocol.fixture.set(status: 200, json: #"{"status":"authorized","token":{"access_token":"fixture-never-installed","refresh_token":"fixture-never-installed-refresh","expires_in":3600,"created_at":1800000000}}"#)
+        var retiredReceipt: [String: VortxNativeProviderCredentials.Register] = [:]
+        manager.testPreparedHook = {
+            retiredReceipt = try! manager.testProviderState(capture: capture).local.prepared!
+            _ = CredentialScopeRegistry.shared.bind(CredentialScope(canonicalRemoteAccountID: "00000000-0000-0000-0000-000000000456")!)
+        }
+        do { _ = try await auth.poll(session: switchingLogin.session); preconditionFailure("retired login installed") } catch {}
+        check(manager.testPreparedHook == nil && !retiredReceipt.isEmpty)
+        let rebound = CredentialScopeRegistry.shared.bind(scope)
+        _ = CredentialScopeRegistry.shared.establishAuthenticatedOwner(rebound)
+        let reopened = try manager.testProviderState(capture: rebound)
+        check(!reopened.hasPreparedMutation && reopened.local.document == winner.local.document)
+        check(await auth.sessionID == sessionBeforeSwitch)
+        let replacementReceipt = manager.prepareNativeProviderMutation(live, capture: rebound)!
+        check(!manager.abortNativeProviderMutation(retiredReceipt, capture: capture))
+        check(try manager.testProviderState(capture: rebound).local.prepared == replacementReceipt)
+        check(manager.abortNativeProviderMutation(replacementReceipt, capture: rebound))
         print("Native Trakt production integration: durable intent failures, exact stale apply fences, cancelled-prepare abort, and login-versus-refresh serialization passed")
     }
 }

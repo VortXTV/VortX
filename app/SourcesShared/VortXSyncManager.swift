@@ -279,12 +279,24 @@ final class VortXSyncManager: ObservableObject {
     }
     /// Only an auth actor that has not attempted its tuple mutation may abort this exact event.
     func abortNativeProviderMutation(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
-        if events.isEmpty { return isCurrent(capture) }
-        do {
-            var state = try nativeProviderState(capture: capture)
-            try state.abortPrepared(events); try saveNativeProviderState(state, capture: capture)
-            return true
-        } catch { return false }
+        if events.isEmpty { return true }
+        guard case .account = capture.scope else { return false }
+        // The receipt authorizes cleanup of this never-attempted local operation even after account
+        // retirement. It does NOT restore authority to mutate credentials, document, pending events,
+        // account settings or cloud state. Match the original namespace and every event exactly.
+        return VortxNativeProviderCredentials.withStoreLock {
+            let slot = "vortx.native.providerState." + capture.namespace
+            guard case .value(let encoded) = Keychain.confirmedString(slot) else { return false }
+            do {
+                var state = try VortxNativeProviderCredentials(scope: capture.namespace,
+                    actor: "00000000-0000-0000-0000-000000000001", sealed: Data(encoded.utf8))
+                try state.abortPrepared(events)
+                let repaired = String(decoding: try state.encoded(), as: UTF8.self)
+                guard Keychain.set(repaired, for: slot) == .success,
+                      case .value(let confirmed) = Keychain.confirmedString(slot), confirmed == repaired else { return false }
+                return true
+            } catch { return false }
+        }
     }
     /// Synchronous credential mutation linearization: the provider register cannot change between
     /// this exact-event check and the secure tuple mutation. Never hold this lock across an await.

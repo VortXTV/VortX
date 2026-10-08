@@ -14,8 +14,10 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
 {
     printf '%s\n' 'import Foundation' '@MainActor final class VortXSyncManager {' 'static let shared = VortXSyncManager()'
     printf '%s\n' 'func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { CredentialScopeRegistry.shared.isCurrent(capture) }'
-    printf '%s\n' 'var testActorLookupHook: (() -> Void)?' 'func nativeHostActor(capture: CredentialScopeRegistry.Capture) throws -> String { let hook = testActorLookupHook; testActorLookupHook = nil; hook?(); return "00000000-0000-0000-0000-000000000001" }' 'func requestSyncSoon() {}'
-    sed -n '/^    private func nativeProviderState(/,/^    \/\/\/ Called only after/{ /^    \/\/\/ Called only after/!p; }' app/SourcesShared/VortXSyncManager.swift
+    printf '%s\n' 'var testActorLookupHook: (() -> Void)?' 'var testPreparedHook: (() -> Void)?' 'func nativeHostActor(capture: CredentialScopeRegistry.Capture) throws -> String { let hook = testActorLookupHook; testActorLookupHook = nil; hook?(); return "00000000-0000-0000-0000-000000000001" }' 'func requestSyncSoon() {}'
+    sed -n '/^    private func nativeProviderState(/,/^    \/\/\/ Called only after/{ /^    \/\/\/ Called only after/!p; }' app/SourcesShared/VortXSyncManager.swift | sed '/^[[:space:]]*return events$/i\
+            let preparedHook = testPreparedHook; testPreparedHook = nil; preparedHook?()\
+'
     printf '%s\n' 'func testProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials { try nativeProviderState(capture: capture) }' '}'
 } > "$native_oauth_dir/Journal.swift"
 xcrun swiftc -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -strict-concurrency=complete -warnings-as-errors \
