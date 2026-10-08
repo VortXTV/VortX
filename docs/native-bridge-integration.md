@@ -1,7 +1,7 @@
 # Native bridge integration boundary
 
-The app contains additive native state/resource bindings and presentation adapters. Shipping
-`CoreBridge` and `EngineStremioRepository` remain the active data engine. There is no new user
+The app contains additive native state/resource bindings, an Apple account/session facade and
+presentation adapters. Shipping `CoreBridge` and `EngineStremioRepository` remain the active data engine. There is no new user
 selector. A native streaming server is a separate capability from the native data engine.
 
 ## Implemented and independently exercisable
@@ -18,6 +18,35 @@ selector. A native streaming server is a separate capability from the native dat
   hints and integer sizes are retained. Empty metadata is terminal, not `Ready(null)`.
 - Bridges do not persist credentials or configured addon URLs. Resource/projection snapshots are
   memory-only. Callers must check `accepts(snapshot)` again at their UI publication boundary.
+
+The Apple native session stores full state only in a separate AES-256-GCM encrypted checkpoint,
+using the host-supplied secure account key and account/owner identity as authenticated data. It seals,
+syncs and verifies a staged file, atomically renames it, syncs the directory and reads back before
+publication. An ambiguous post-rename failure is `checkpointUncertain`: no later mutation can
+overwrite it until the session is reopened and checked. Neither account tokens nor encryption keys
+enter kernel actions or checkpoint metadata. Same-scope sessions have one in-process writer;
+replacement must await shutdown before opening another session.
+
+State changes clone the runtime, apply a FIFO action transaction, verify owner/nativeSync/watch-context
+retention, checkpoint and then publish. Failed actions do not change the published runtime. Synchronous
+revocation waits for an in-flight commit and prevents later outgoing-account writes. Catalog, search,
+discover, metadata and subtitle slots are independent and generation-fenced. Legacy roster/watch
+documents have a read-only import carrier; nonempty legacy data blocks fresh-state fallback. This is
+not yet the lossless legacy importer.
+
+`VORTX_NATIVE_DATA_ENGINE` selects the actual Apple `CoreBridge.start/dispatch/stateData` branch:
+that branch does not initialize/call Stremio and rejects unsupported actions. It needs an explicitly
+installed, authenticated session. No target sets this compilation condition. At this checkpoint the
+production account/key bootstrap is still a separate gate; merely enabling the flag leaves the bridge
+unbound, not an empty native account. CoreBridge exposes awaited shutdown and generation-checked
+session installation plus addon-registry rebind after profile/configuration changes.
+
+Apple compatibility currently covers board/search Load + LoadRange, default/specific Discover loads,
+metadata/episode streams, subtitles, default library reads, standard AddToLibrary/RemoveFromLibrary,
+title/episode watched intents, Player selection/progress attribution and explicit native profile/state
+actions. Loading groups use the shipping read shape. Unsupported pagination/filter/sort/player actions
+return false; there is no silent Stremio fallback. The native library projection currently covers standard
+saved titles, not native magnet/playlist presentation or full Continue Watching/history parity.
 
 ## Artifact gate
 
@@ -45,16 +74,19 @@ fixtures plus canonical engine-source resolution checks. Android runs
 build tasks when testing the pure bridge. Both consume `test/fixtures/native-resource-contract.json`.
 
 `bash scripts/test-native-cutover-live-abi.sh` links the actual native library selected by
-`VORTX_FFI_HEADER` and `VORTX_FFI_LIBRARY`, proves cold hydration/deltas, and fetches deterministic
-catalog/meta/stream/subtitle fixtures over loopback. It launches no app or media player.
+`VORTX_FFI_HEADER` and `VORTX_FFI_LIBRARY`, hash-fences both artifacts, proves cold hydration/deltas,
+and fetches deterministic catalog/meta/stream/subtitle fixtures over loopback. It also runs the real
+Apple facade, bound nativeSync scope, standard library membership, FIFO profile/progress actions,
+registry rebind and encrypted exact-state cold reopen with episode watch contexts. It launches no
+app or media player. The fixture server requires Node 22+ lossless JSON source support.
 
 ## Remaining default-cutover gates
 
 | Owner lane | Required behavior before selecting native by default |
 | --- | --- |
-| Apple facade | Route existing CoreBridge actions/state events through native host; preserve loading, paging, search/discover, publication fences and all profile/account leases. |
+| Apple facade | Production authenticated bootstrap/import; horizontal and Discover pagination; genre/filter options; full library/CW/history and overlay profile integration; remaining player actions. Gated callsites and current supported actions are implemented, not a default cutover. |
 | Android facade | Implement all CatalogRepository/AuthRepository/history interfaces; remove direct Stremio calls from stats and other consumers only after equivalent behavior is tested. |
-| Native state integration | Copy/read back existing account/profile/addon/library/watch state, verify owner and sync schema, use acknowledged persistence, reject malformed snapshots without creating empty accounts. |
+| Native state integration | Lossless authenticated legacy account/profile/addon/library/watch import and nativeSync transport in the existing encrypted account envelope. Apple scoped acknowledged checkpointing is implemented; absence/decrypt failure never creates an empty account. |
 | Sources/playback | Integrate provider/debrid resolution, full subtitle options, current source preferences, source-preserving resume, episode/binge selection and download admission. |
 | Native server | Advertise/test NNTP/archive capabilities before changing Node routes; unsupported archives require the supported fallback. |
 | Packaging | Exact reviewed core pin, both Android flavors and all ABIs, Apple slice/header/export checks, universal Mac and Lite decisions, device verification. |

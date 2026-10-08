@@ -9,6 +9,62 @@ import StremioXCore
 /// worker thread) whenever model fields change, so the UI can re-pull exactly what changed.
 final class CoreBridge: ObservableObject {
     static let shared = CoreBridge()
+#if VORTX_NATIVE_DATA_ENGINE
+    private let nativeFacadeLock = NSLock()
+    private var nativeFacadeStorage: VortxNativeCoreFacade?
+    private var nativeCredentialCapture: CredentialScopeRegistry.Capture?
+    private var nativeInstallGeneration = UUID()
+    private var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
+    var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
+
+    @MainActor
+    func rebindNativeRegistry(_ registry: [VortxResourceAddon], expected: VortxNativeCoreFacade.RegistryBinding) async throws {
+        guard !enginePublicationBlocked, let facade = nativeFacade else { throw VortxNativeError.closed }
+        try await facade.rebindRegistry(registry, expected: expected)
+        guard !enginePublicationBlocked else { throw VortxNativeError.superseded }
+        loadBoard()
+    }
+
+    /// Called only after authenticated scope migration and secure-key acquisition succeed. There is
+    /// deliberately no empty-account fallback and no user-facing engine selector.
+    @MainActor
+    func installNativeSession(_ session: VortxNativeSession, registry: [VortxResourceAddon],
+                              capture: CredentialScopeRegistry.Capture) async throws {
+        let installGeneration = UUID()
+        nativeFacadeLock.withLock { nativeInstallGeneration = installGeneration }
+        guard CredentialScopeRegistry.shared.isCurrent(capture), session.scope.account == capture.namespace else {
+            session.revoke(); throw VortxNativeError.invalidSnapshot
+        }
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry) { [weak self] fields in
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  let data = try? JSONSerialization.data(withJSONObject: ["name": "NewState", "args": fields]) else { return }
+            self?.handleEvent(data)
+        }
+        let result = nativeFacadeLock.withLock { () -> (Bool, VortxNativeCoreFacade?) in
+            guard CredentialScopeRegistry.shared.isCurrent(capture), nativeInstallGeneration == installGeneration else { return (false, nil) }
+            let old = nativeFacadeStorage; nativeFacadeStorage = facade; nativeCredentialCapture = capture; return (true, old)
+        }
+        guard result.0 else { facade.close(); throw VortxNativeError.superseded }
+        result.1?.close()
+        // Native ctx is descriptor-only: never synthesize a Stremio login/token receipt.
+        refreshAddons(capturedPublicationToken: capturePublicationToken())
+        loadBoard(); loadLibrary()
+    }
+    @MainActor
+    func closeNativeSession() async {
+        let old = nativeFacadeLock.withLock { nativeFacadeStorage }
+        revokeNativeSession()
+        await old?.shutdown()
+    }
+    private func revokeNativeSession() {
+        let old = nativeFacadeLock.withLock {
+            nativeInstallGeneration = UUID()
+            let old = nativeFacadeStorage; nativeFacadeStorage = nil; nativeCredentialCapture = nil; return old
+        }
+        old?.close()
+        invalidatePublicationEpoch()
+    }
+#endif
 
     /// Bumped on every `RuntimeEvent::NewState`; SwiftUI observes this to refresh. `changedFields`
     /// holds the field names that changed since the last bump (e.g. ["board", "ctx"]).
@@ -335,6 +391,11 @@ final class CoreBridge: ObservableObject {
     }
 
     private init() {
+#if VORTX_NATIVE_DATA_ENGINE
+        credentialScopeObserver = NotificationCenter.default.addObserver(
+            forName: VortXSyncManager.credentialScopeDidChangeNote, object: nil, queue: .main
+        ) { [weak self] _ in self?.revokeNativeSession() }
+#else
         // Seed the observer's previous scope from the registry, rather than treating the first note seen
         // after CoreBridge construction as an unrelated initial bind.  This preserves the account -> guest
         // boundary even when the bridge is lazily created after the account session has already settled.
@@ -377,6 +438,7 @@ final class CoreBridge: ObservableObject {
             // deduplicated by the process-local generation and does not log or transport credentials.
             self.signedInWithLegacyAuthKey()
         }
+#endif
     }
 
     /// Hydrate the engine from persisted storage and start the event loop. Idempotent.
@@ -384,6 +446,11 @@ final class CoreBridge: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+#if VORTX_NATIVE_DATA_ENGINE
+        // A compiled native lane cannot initialize Stremio, even when migration is not yet bound.
+        Task { await RemoteConfig.shared.bootstrap() }
+        return
+#else
         let initialCapture = CredentialScopeRegistry.shared.capture()
         let isSignedOutDevice: Bool
         if case .signedOutDevice = initialCapture.scope { isSignedOutDevice = true }
@@ -419,6 +486,7 @@ final class CoreBridge: ObservableObject {
         bootstrapAuth()
         seedInitialState()
         scheduleSessionRepair()   // runs on EVERY launch path: covers the force-close add-on-loss desync
+#endif
     }
 
     /// Pull state the engine populated at construction (e.g. `continue_watching_preview` from the
@@ -971,7 +1039,13 @@ final class CoreBridge: ObservableObject {
     }
 
     /// stremio-core's storage schema version, a smoke check that the FFI is wired end-to-end.
-    var schemaVersion: UInt32 { stremiox_core_schema_version() }
+    var schemaVersion: UInt32 {
+#if VORTX_NATIVE_DATA_ENGINE
+        1 // Native host presentation schema, not the Stremio storage schema.
+#else
+        stremiox_core_schema_version()
+#endif
+    }
 
     // MARK: Auth bootstrap / migration
 
@@ -3965,10 +4039,17 @@ final class CoreBridge: ObservableObject {
     }
 
     private var enginePublicationBlocked: Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        return nativeFacadeLock.withLock {
+            guard nativeFacadeStorage != nil, let capture = nativeCredentialCapture else { return true }
+            return !CredentialScopeRegistry.shared.isCurrent(capture)
+        }
+#else
         PlaybackMutationOwnershipPolicy.blocksEnginePublication(
             hasPendingBinding: pendingAccountBinding != nil,
             credentialRejected: rejectedAccountBindingGeneration == authBindingGeneration,
             signedOutRepairPending: signedOutRepairRequest != nil)
+#endif
     }
 
     /// Unlike the broader publication gate, this applies specifically to engine writes.  Local
@@ -4047,6 +4128,10 @@ final class CoreBridge: ObservableObject {
     /// ProfileStore calls this in the same turn as selection. It invalidates any completion for
     /// the prior profile before a new account switch or a same-account revalidation can begin.
     func activeProfileDidChange() {
+#if VORTX_NATIVE_DATA_ENGINE
+        revokeNativeSession()
+        return
+#else
         invalidateAuthenticationGeneration()
         guard !importedAwayFromStremio,
               let token = Keychain.string(activeTokenAccount), !token.isEmpty else {
@@ -4056,6 +4141,7 @@ final class CoreBridge: ObservableObject {
             return
         }
         beginAccountBinding(for: token)
+#endif
     }
 
     private func verifyAccountBinding(pending: PendingAccountBinding, token: String, attempt: Int) async {
@@ -4214,8 +4300,17 @@ final class CoreBridge: ObservableObject {
         // [engine] narrate every dispatched action (its name + the field it targets) so the log shows
         // what we asked the engine to do. Gated + autoclosure: shipping builds build no string.
         VXProbe.log("engine", "dispatch \(Self.actionName(action))\(field.map { " -> \($0)" } ?? "")")
+#if VORTX_NATIVE_DATA_ENGINE
+        _ = json // The shared validation above remains identical on both build lanes.
+        guard let nativeFacade, !enginePublicationBlocked,
+              let nativeAction = try? JSONSerialization.data(withJSONObject: action) else { return false }
+        let accepted = nativeFacade.dispatch(data: nativeAction, field: field)
+        if !accepted { NSLog("[CoreBridge] native action rejected: %@", nativeFacade.lastFailure ?? "unbound") }
+        return accepted
+#else
         json.withCString { stremiox_core_dispatch($0) }
         return true
+#endif
     }
 
     /// Compact human name for a dispatched action, for the [engine] probe. Reports the top-level
@@ -4235,10 +4330,14 @@ final class CoreBridge: ObservableObject {
     /// Raw JSON bytes for a model field (e.g. "board", "continue_watching_preview"). Heavy fields
     /// (library, catalogs) serialize on the calling thread, prefer a background queue for those.
     func stateData(_ field: String) -> Data? {
+#if VORTX_NATIVE_DATA_ENGINE
+        guard !enginePublicationBlocked else { return nil }; return nativeFacade?.stateData(field)
+#else
         let quoted = "\"\(field)\"" // get_state expects a JSON field name
         guard let ptr = quoted.withCString({ stremiox_core_get_state($0) }) else { return nil }
         defer { stremiox_core_string_free(ptr) }
         return Data(bytes: ptr, count: strlen(ptr))
+#endif
     }
 
     /// Decode a model field into a Codable type.
@@ -4294,6 +4393,7 @@ final class CoreBridge: ObservableObject {
         // (bootstrapAuth / switchAccount + its 6s backstop), so read+write it on main here too rather than on
         // this Rust worker thread, matching the decode branches below. Otherwise switchInFlight could latch
         // stuck-true (the switched account never reloads) through an unsynchronized cross-thread write.
+#if !VORTX_NATIVE_DATA_ENGINE
         if fields.contains("ctx") {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -4327,6 +4427,7 @@ final class CoreBridge: ObservableObject {
                 ProfileStore.shared.replayPendingAccountLibraryAdds(core: self)
             }
         }
+#endif
 
         // Decode the changed screens off the main thread, then publish on main.
         if fields.contains("continue_watching_preview") {

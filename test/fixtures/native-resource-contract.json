@@ -6,5 +6,5 @@
     {"infoHash":"0123456789012345678901234567890123456789","fileIdx":3,"name":"Alternate episode","extension":{"retain":true}}
   ]},
   "subtitles": {"subtitles": [{"id":"en-1","lang":"eng","url":"https://media.example/en.vtt","forced":false},{"id":"hi-1","lang":"hin","url":"https://media.example/hi.srt","extension":{"hearingImpaired":true}}]},
-  "manifest": {"id":"fixture.addon","version":"1.0.0","name":"Fixture","resources":["catalog","meta","stream","subtitles"],"types":["series"],"catalogs":[{"type":"series","id":"popular"}]}
+  "manifest": {"id":"fixture.addon","version":"1.0.0","name":"Fixture","resources":["catalog","meta","stream","subtitles"],"types":["series"],"catalogs":[{"type":"series","id":"popular","extra":[{"name":"search"},{"name":"skip"}]}]}
 }

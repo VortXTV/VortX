@@ -1,0 +1,340 @@
+import Foundation
+
+/// Compatibility entry point for CoreBridge's existing Load/Unload wire. It never initializes or
+/// calls Stremio. Unsupported actions return false and record a non-sensitive diagnostic code.
+/// Account migration/key acquisition remain explicit prerequisites to constructing the session.
+final class VortxNativeCoreFacade: @unchecked Sendable {
+    struct RegistryBinding: Equatable, Sendable { let scope: VortxAccountScope; let profileID: String; let generation: UUID }
+    private let session: VortxNativeSession
+    private var registry: [VortxResourceAddon]
+    private var registryGeneration = UUID()
+    private var registrySnapshot: [VortxResourceAddon] { lock.withLock { registry } }
+    // Dispatch admission is one synchronous transaction, including nested begin/enqueue helpers.
+    // This prevents a profile change/rebind from slipping between a UI identity read and enqueue.
+    private let lock = NSRecursiveLock()
+    private var values: [String: VortxJSON] = [:]
+    private var selections: [String: VortxJSON] = [:]
+    private var generations: [String: UUID] = [:]
+    private var tasks: [String: Task<Void, Never>] = [:]
+    private var closed = false
+    private let changed: @Sendable ([String]) -> Void
+    private var failure: String?
+    private var resourceRegistryValid = true
+    private var pendingProfileTransitions = 0
+    var lastFailure: String? { lock.withLock { failure } }
+
+    static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
+                       changed: @escaping @Sendable ([String]) -> Void) async throws -> VortxNativeCoreFacade {
+        guard Set(registry.map(\.id)).count == registry.count else { throw VortxNativeError.invalidResponse }
+        let facade = VortxNativeCoreFacade(session: session, registry: registry, changed: changed)
+        let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        facade.values = try facade.stateFields(state)
+        return facade
+    }
+    private init(session: VortxNativeSession, registry: [VortxResourceAddon], changed: @escaping @Sendable ([String]) -> Void) {
+        self.session = session; self.registry = registry; self.changed = changed
+    }
+    func stateData(_ field: String) -> Data? {
+        lock.lock(); defer { lock.unlock() }; guard !closed, let value = values[field] else { return nil }
+        return try? JSONEncoder().encode(value)
+    }
+    func close() {
+        lock.lock(); closed = true; let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); lock.unlock()
+        session.revoke()
+        old.forEach { $0.cancel() }; Task { await session.close() }
+    }
+    func shutdown() async { close(); await session.close() }
+    var registryBinding: RegistryBinding? {
+        lock.withLock {
+            guard !closed, pendingProfileTransitions == 0, let profile = string(values["native_state"]?["activeProfileId"]) else { return nil }
+            return RegistryBinding(scope: session.scope, profileID: profile, generation: registryGeneration)
+        }
+    }
+    /// Caller-confirmed registry replacement is bound to the accepted account/profile generation.
+    /// New loads stay rejected during replacement; all previous resource publications are revoked.
+    func rebindRegistry(_ replacement: [VortxResourceAddon], expected: RegistryBinding) async throws {
+        let admitted = lock.withLock { () -> Bool in
+            guard Set(replacement.map(\.id)).count == replacement.count, registryBinding == expected else { return false }
+            invalidateResourcePublications(); return true
+        }
+        guard admitted else { throw VortxNativeError.superseded }
+        await session.invalidateResources()
+        let accepted = lock.withLock { () -> Bool in
+            guard !closed, expected.scope == session.scope, expected.generation == registryGeneration,
+                  values["native_state"]?["activeProfileId"] == .string(expected.profileID) else { return false }
+            registry = replacement; resourceRegistryValid = true; registryGeneration = UUID()
+            values["ctx"] = .object(["profile": .object(["addons": .array(replacement.map {
+                .object(["transportUrl": .string($0.transportUrl), "manifest": $0.manifest ?? .object([:])])
+            })])]); return true
+        }
+        guard accepted else { throw VortxNativeError.superseded }; changed(["ctx"])
+    }
+    /// Called under lock. Keep the durable-state publication, discard only prior resource ownership.
+    private func invalidateResourcePublications() {
+        resourceRegistryValid = false
+        for (field, task) in tasks where field != "native_state" { task.cancel() }
+        generations = generations.filter { $0.key == "native_state" }
+        values = values.filter { ["native_state", "library"].contains($0.key) }; selections = [:]
+    }
+    private func resourceIdentity(_ state: VortxJSON?) -> VortxJSON {
+        let active = string(state?["activeProfileId"]) ?? ""
+        let profile = state?["roster"]?["profiles"]?[active]
+        return .object(["active": .string(active), "binding": profile?["addons"] ?? .null,
+                        "settings": profile?["settings"] ?? .null, "parental": profile?["parental"] ?? .null,
+                        "addons": state?["nativeSync"]?["addons"] ?? .null])
+    }
+    private func fail(_ code: String) -> Bool { lock.lock(); failure = code; lock.unlock(); return false }
+    private func string(_ value: VortxJSON?) -> String? { if case .string(let text) = value { return text }; return nil }
+    private func path(_ value: VortxJSON?) throws -> VortxResourceRequest {
+        guard let value else { throw VortxNativeError.invalidResponse }; return try value.decode(VortxResourceRequest.self)
+    }
+    private func begin(_ field: String) -> UUID? {
+        lock.lock(); defer { lock.unlock() }; guard !closed else { return nil }
+        let ticket = UUID(); tasks[field]?.cancel(); generations[field] = ticket; failure = nil; return ticket
+    }
+    private func publish(_ fields: [String: VortxJSON], field: String, ticket: UUID) {
+        lock.lock()
+        guard !closed, generations[field] == ticket else { lock.unlock(); return }
+        fields.forEach { values[$0.key] = $0.value }; lock.unlock(); changed(Array(fields.keys))
+    }
+    private func enqueue(_ field: String, initial: VortxJSON? = nil, operation: @escaping @Sendable () async throws -> [String: VortxJSON]) -> Bool {
+        guard let ticket = begin(field) else { return false }
+        if let initial { publish([field: initial], field: field, ticket: ticket) }
+        let task = Task { [weak self] in
+            do { try Task.checkCancellation(); let result = try await operation(); try Task.checkCancellation(); self?.publish(result, field: field, ticket: ticket) }
+            catch {
+                guard let self else { return }
+                self.lock.withLock {
+                    if self.generations[field] == ticket && !self.closed { self.failure = "native_operation_failed" }
+                }
+                self.publish([field: .object(["nativeError": .string("native_operation_failed")])], field: field, ticket: ticket)
+            }
+        }
+        lock.lock()
+        if closed || generations[field] != ticket { task.cancel() } else { tasks[field] = task }
+        lock.unlock(); return true
+    }
+    private func enqueueMutation(type: String, raw: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
+        let predecessor = tasks["native_state"]
+        let ticket = UUID(); generations["native_state"] = ticket
+        let profileTransition = ["switch_profile", "delete_profile", "merge_native_sync", "patch_profile"].contains(type)
+        if profileTransition { pendingProfileTransitions += 1 }
+        // State intents are FIFO, never latest-wins: dropping one would lose progress/profile edits.
+        tasks["native_state"] = Task { [weak self] in
+            await predecessor?.value
+            guard let self else { return }
+            defer { if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 } } }
+            do {
+                try Task.checkCancellation()
+                _ = try await session.dispatch([raw], now: UInt64(Date().timeIntervalSince1970))
+                let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+                let publishedFields = try self.lock.withLock { () -> [String: VortxJSON]? in
+                    guard !self.closed else { return nil }
+                    if self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) {
+                        self.invalidateResourcePublications(); self.registryGeneration = UUID()
+                    }
+                    let fields = try self.stateFields(state)
+                    fields.forEach { self.values[$0.key] = $0.value }; return fields
+                }
+                // FIFO intents each publish their acknowledged state before the next task executes.
+                // A later get_state must not hide the profile transition's accepted state.
+                if let publishedFields { self.changed(Array(publishedFields.keys)) }
+            } catch VortxNativeError.checkpointUncertain { _ = self.fail("checkpoint_uncertain_reopen_required") }
+            catch { _ = self.fail("native_mutation_failed") }
+        }
+        return true
+    }
+    /// Testing/integration receipt: waits for currently admitted operations, never launches UI/media.
+    func settled() async {
+        let pending = lock.withLock { Array(tasks.values) }
+        for task in pending { await task.value }
+    }
+
+    func dispatch(data: Data, field: String?) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed else { return false }
+        guard let action = try? JSONDecoder().decode(VortxJSON.self, from: data),
+              let name = string(action["action"]) else { return fail("invalid_action") }
+        let field = field ?? "ctx"
+        if name == "Unload", ["board", "search", "discover", "meta_details", "subtitles", "player"].contains(field) {
+            guard let ticket = begin(field) else { return false }
+            _ = lock.withLock { selections.removeValue(forKey: field) }
+            publish([field: .object(["selected": .null, "catalogs": .array([]), "metaItems": .array([]), "streams": .array([]), "metaStreams": .array([])])], field: field, ticket: ticket)
+            return true
+        }
+        // Explicit native action admission. No authentication/session-token operation is translated.
+        if name == "Vortx", let native = action["args"], let type = string(native["type"]),
+           Self.nativeActions.contains(type), let encoded = try? JSONEncoder().encode(native) {
+            let raw = String(decoding: encoded, as: UTF8.self)
+            return enqueueMutation(type: type, raw: raw)
+        }
+        // UI translations below refer to the currently published profile/selection. While a queued
+        // transition is unsettled, do not infer whether a gesture belongs to the old or new profile.
+        if lock.withLock({ pendingProfileTransitions > 0 }) { return fail("profile_transition_pending") }
+        if name == "Ctx", string(action["args"]?["action"]) == "LibraryItemMarkAsWatched",
+           let id = string(action["args"]?["args"]?["id"]), case .bool(let watched) = action["args"]?["args"]?["is_watched"] {
+            var intent: [String: VortxJSON] = ["type": .string(watched ? "mark_watched" : "reset_watched"), "metaId": .string(id)]
+            if let video = action["args"]?["args"]?["videoId"] ?? action["args"]?["args"]?["video_id"] {
+                guard string(video) != nil else { return fail("invalid_episode_identity") }; intent["videoId"] = video
+            }
+            let native: VortxJSON = .object(["action": .string("Vortx"), "args": .object(intent)])
+            guard let bytes = try? JSONEncoder().encode(native) else { return false }; return dispatch(data: bytes, field: "native_state")
+        }
+        if name == "Ctx", let subaction = string(action["args"]?["action"]), ["AddToLibrary", "RemoveFromLibrary"].contains(subaction) {
+            let state = lock.withLock { values["native_state"] }
+            guard let profile = string(state?["activeProfileId"]) else { return fail("missing_profile") }
+            var native: [String: VortxJSON] = ["profileId": .string(profile)]
+            if subaction == "AddToLibrary" {
+                guard let meta = action["args"]?["args"], let id = string(meta["id"]), let type = string(meta["type"]), let title = string(meta["name"]) else { return fail("invalid_library_meta") }
+                native["type"] = .string("add_library_item")
+                native["item"] = .object(["kind": .string("standard"), "id": .string(id), "type": .string(type), "name": .string(title), "poster": meta["poster"] ?? .null])
+            } else {
+                guard let id = string(action["args"]?["args"]) else { return fail("invalid_library_id") }
+                let matches = state?["libraries"]?[profile]?["items"]?.array?.filter { $0["id"] == .string(id) && $0["kind"] == .string("standard") } ?? []
+                guard matches.count == 1, let type = string(matches[0]["type"]) else { return fail("ambiguous_library_id") }
+                native["type"] = .string("remove_library_item"); native["key"] = .string(type + ":" + id)
+            }
+            guard let bytes = try? JSONEncoder().encode(VortxJSON.object(["action": .string("Vortx"), "args": .object(native)])) else { return false }
+            return dispatch(data: bytes, field: "native_state")
+        }
+        if name == "MetaDetails", let subaction = string(action["args"]?["action"]), ["MarkAsWatched", "MarkVideoAsWatched"].contains(subaction) {
+            let detail = lock.withLock { values["meta_details"] }
+            guard let metaID = string(detail?["selected"]?["metaPath"]?["id"]) else { return fail("missing_meta_selection") }
+            let arguments = action["args"]?["args"]
+            let watched: VortxJSON? = subaction == "MarkAsWatched" ? arguments : arguments?.array?.last
+            guard case .bool(let marked) = watched else { return fail("invalid_watched_intent") }
+            var native: [String: VortxJSON] = ["type": .string(marked ? "mark_watched" : "reset_watched"), "metaId": .string(metaID)]
+            if subaction == "MarkVideoAsWatched" {
+                guard let video = string(arguments?.array?.first?["id"]) else { return fail("invalid_episode_identity") }; native["videoId"] = .string(video)
+            }
+            guard let bytes = try? JSONEncoder().encode(VortxJSON.object(native)) else { return false }
+            return enqueueMutation(type: marked ? "mark_watched" : "reset_watched", raw: String(decoding: bytes, as: UTF8.self))
+        }
+        let model = string(action["args"]?["model"])
+        if ["board", "search", "discover", "meta_details", "subtitles"].contains(field),
+           !lock.withLock({ resourceRegistryValid }) { return fail("registry_rebind_required") }
+        if name == "Load", model == "Player", field == "player", let selected = action["args"]?["args"],
+           let meta = try? path(selected["metaRequest"]?["path"]), let stream = try? path(selected["streamRequest"]?["path"]),
+           meta.resource == .meta, stream.resource == .stream, meta.type == stream.type,
+           selected["stream"] != nil, lock.withLock({ resourceRegistryValid }) {
+            guard let ticket = begin(field) else { return false }
+            lock.withLock { selections[field] = selected }
+            publish([field: .object(["selected": selected])], field: field, ticket: ticket)
+            return true
+        }
+        if name == "Player", string(action["args"]?["action"]) == "TimeChanged", field == "player" {
+            let selected = lock.withLock { selections["player"] }
+            guard let metaID = string(selected?["metaRequest"]?["path"]?["id"]),
+                  let videoID = string(selected?["streamRequest"]?["path"]?["id"]),
+                  let time = try? action["args"]?["args"]?["time"]?.decode(UInt64.self),
+                  let duration = try? action["args"]?["args"]?["duration"]?.decode(UInt64.self), duration > 0 else { return fail("invalid_player_progress") }
+            let native: VortxJSON = .object(["type": .string("report_progress"), "metaId": .string(metaID), "videoId": .string(videoID), "positionMs": .unsigned(time), "durationMs": .unsigned(duration)])
+            guard let bytes = try? JSONEncoder().encode(native) else { return false }
+            return enqueueMutation(type: "report_progress", raw: String(decoding: bytes, as: UTF8.self))
+        }
+        if name == "Load", model == "CatalogsWithExtra", ["board", "search"].contains(field) {
+            guard let ticket = begin(field) else { return false }
+            let selection = action["args"]?["args"] ?? .object([:])
+            lock.withLock { selections[field] = selection }
+            let extra = (try? selection["extra"]?.decode([[String]].self)) ?? []
+            let loading = catalogRequests(extra: extra, type: string(selection["type"])).compactMap { try? loadingEntry($0.0, $0.1) }
+            publish([field: .object(["selected": selection, "catalogs": .array(loading.map { .array([$0]) })])], field: field, ticket: ticket)
+            return true
+        }
+        if name == "CatalogsWithExtra", string(action["args"]?["action"]) == "LoadRange", ["board", "search"].contains(field) {
+            let selection = lock.withLock { selections[field] }
+            guard let selection, let screen = VortxNativeSession.CatalogScreen(rawValue: field) else { return fail("missing_selection") }
+            let extra = (try? selection["extra"]?.decode([[String]].self)) ?? []
+            let catalogs = catalogRequests(extra: extra, type: string(selection["type"]))
+            let end = (try? action["args"]?["args"]?["end"]?.decode(Int.self)) ?? catalogs.count
+            guard end >= 0 else { return fail("invalid_range") }
+            return enqueue(field) { [self] in
+                var board: VortxJSON = .object(["selected": selection, "catalogs": .array([])])
+                for (index, item) in catalogs.prefix(end).enumerated() {
+                    try Task.checkCancellation()
+                    board = try await session.loadCatalog(screen, request: item.1, addons: [item.0], append: index != 0)
+                }
+                return [field: board]
+            }
+        }
+        if name == "Load", model == "MetaDetails", field == "meta_details" {
+            guard let request = try? path(action["args"]?["args"]?["metaPath"]) else { return fail("invalid_meta_path") }
+            let streamValue = action["args"]?["args"]?["streamPath"]
+            let stream = streamValue == nil || streamValue == .null ? nil : try? path(streamValue)
+            if streamValue != nil && streamValue != .null && stream == nil { return fail("invalid_stream_path") }
+            let addons = registrySnapshot
+            let loading: VortxJSON = .object([
+                "selected": .object(["metaPath": (try? VortxResourceProjection.path(request)) ?? .null, "streamPath": (try? stream.map(VortxResourceProjection.path)) ?? .null]),
+                "metaItems": .array(addons.compactMap { try? loadingEntry($0, request) }),
+                "streams": .array(stream.map { path in addons.compactMap { try? loadingEntry($0, path) } } ?? []), "metaStreams": .array([])])
+            return enqueue(field, initial: loading) { [self] in [field: try await session.loadMeta(request: request, stream: stream, addons: addons)] }
+        }
+        if name == "Load", model == "CatalogWithFilters", field == "discover" {
+            let supplied = action["args"]?["args"]?["request"]
+            let requests = catalogRequests(extra: [], type: nil)
+            let chosen: (VortxResourceAddon, VortxResourceRequest)?
+            if let supplied, let request = try? path(supplied["path"]), let addon = registrySnapshot.first(where: { .string($0.transportUrl) == supplied["base"] }) { chosen = (addon, request) }
+            else if supplied == nil { chosen = requests.first } else { return fail("invalid_catalog_request") }
+            guard let chosen else { return fail("no_catalogs") }
+            guard let loading = try? loadingEntry(chosen.0, chosen.1) else { return fail("invalid_catalog_request") }
+            let initial: VortxJSON = .object(["catalog": .array([loading]), "selectable": .object(["types": .array([]), "catalogs": .array([]), "extra": .array([]), "next_page": .null])])
+            return enqueue(field, initial: initial) { [self] in
+                let board = try await session.loadCatalog(.discover, request: chosen.1, addons: [chosen.0])
+                let pages = board["catalogs"]?.array?.flatMap { $0.array ?? [] } ?? []
+                let options = try requests.map { item -> VortxJSON in
+                    .object(["catalog": .string(item.1.id), "type": .string(item.1.type), "selected": .bool(item.0.id == chosen.0.id && item.1 == chosen.1),
+                             "request": .object(["base": .string(item.0.transportUrl), "path": try VortxResourceProjection.path(item.1)])])
+                }
+                return [field: .object(["catalog": .array(pages), "selectable": .object(["types": .array(options), "catalogs": .array(options), "extra": .array([]), "next_page": .null])])]
+            }
+        }
+        if name == "Load", model == "LibraryWithFilters", field == "library" {
+            // Only the default library selection is supported; never silently ignore a filter/sort.
+            let request = action["args"]?["args"]?["request"]
+            guard request?["type"] == nil || request?["type"] == .null,
+                  request?["sort"] == nil || request?["sort"] == .string("lastwatched"),
+                  request?["page"] == nil || request?["page"] == .integer(1) else { return fail("unsupported_library_filter") }
+            guard let value = values["library"], let ticket = begin(field) else { return fail("missing_library_state") }
+            publish([field: value], field: field, ticket: ticket); return true
+        }
+        if name == "Load", model == "Subtitles", field == "subtitles", let request = try? path(action["args"]?["args"]) {
+            let addons = registrySnapshot
+            return enqueue(field) { [self] in [field: try await session.loadSubtitles(request: request, addons: addons)] }
+        }
+        return fail("unsupported_action")
+    }
+    private static let nativeActions: Set<String> = ["add_profile", "switch_profile", "delete_profile", "set_parental", "set_ranking_prefs", "report_progress", "mark_watched", "reset_watched", "remove_from_continue_watching", "merge_watch_state", "merge_watch_document", "link_resume_identity", "get_state", "bind_sync_scope", "merge_native_sync", "patch_profile", "install_addon", "remove_addon", "reorder_addons", "add_library_item", "remove_library_item"]
+    private func loadingEntry(_ addon: VortxResourceAddon, _ request: VortxResourceRequest) throws -> VortxJSON {
+        .object(["request": .object(["base": .string(addon.transportUrl), "path": try VortxResourceProjection.path(request)]), "content": .object(["type": .string("Loading")])])
+    }
+    private func catalogRequests(extra: [[String]], type: String?) -> [(VortxResourceAddon, VortxResourceRequest)] {
+        registrySnapshot.flatMap { addon in
+            (addon.manifest?["catalogs"]?.array ?? []).compactMap { catalog in
+                guard let id = string(catalog["id"]), let kind = string(catalog["type"]), type == nil || type == kind else { return nil }
+                let supported = Set((catalog["extra"]?.array ?? []).compactMap { string($0["name"]) } + (catalog["extraSupported"]?.array ?? []).compactMap { string($0) })
+                guard extra.allSatisfy({ $0.count == 2 && supported.contains($0[0]) }) else { return nil }
+                let required = (catalog["extra"]?.array ?? []).filter { $0["isRequired"] == .bool(true) }.compactMap { string($0["name"]) }
+                guard required.allSatisfy({ name in extra.contains { $0.first == name } }) else { return nil }
+                return (addon, VortxResourceRequest(resource: .catalog, type: kind, id: id, extra: extra))
+            }
+        }
+    }
+    private func stateFields(_ state: VortxJSON) throws -> [String: VortxJSON] {
+        guard let active = string(state["activeProfileId"]), let library = state["libraries"]?[active] else { throw VortxNativeError.invalidSnapshot }
+        let items = (library["items"]?.array ?? []).filter { $0["kind"] == .string("standard") }
+        let projected = items.compactMap { item -> VortxJSON? in
+            guard let id = string(item["id"]), let type = string(item["type"]) else { return nil }
+            let resume = library["resume"]?[id]
+            let offset = (try? resume?["offsetSecs"]?.decode(UInt64.self)) ?? 0
+            let duration = (try? resume?["durationSecs"]?.decode(UInt64.self)) ?? 0
+            return .object(["_id": .string(id), "type": .string(type), "name": item["name"] ?? .string(id), "poster": item["poster"] ?? .null,
+                            "state": .object(["timeOffset": .unsigned(offset.multipliedReportingOverflow(by: 1000).overflow ? UInt64.max : offset * 1000),
+                                              "duration": .unsigned(duration.multipliedReportingOverflow(by: 1000).overflow ? UInt64.max : duration * 1000),
+                                              "timesWatched": .integer(Int64(library["watched"]?[id]?["videoIds"]?.array?.count ?? 0))])])
+        }
+        let descriptors = (lock.withLock { resourceRegistryValid ? registry : [] }).map { addon in VortxJSON.object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest ?? .object([:])]) }
+        return ["native_state": state, "ctx": .object(["profile": .object(["addons": .array(descriptors)])]),
+                "library": .object(["catalog": .array(projected), "selectable": .object(["types": .array([]), "sorts": .array([])])])]
+    }
+}

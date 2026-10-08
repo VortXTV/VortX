@@ -8,4 +8,9 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   app/SourcesShared/VortxResourceProjection.swift app/Tests/VortxNativeBridgeTests.swift \
   -o "$native_test_dir/native-bridges"
 "$native_test_dir/native-bridges" test/fixtures/native-resource-contract.json
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
+  app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
+  app/Tests/VortxNativeSessionTests.swift -o "$native_test_dir/native-session"
+"$native_test_dir/native-session" "$native_test_dir"
 bash test/build-mac-server-resolver.sh

@@ -17,7 +17,7 @@ protocol VortxRuntimeABI: Sendable {
 }
 
 enum VortxNativeError: Error, Equatable {
-    case unavailable, closed, invalidSnapshot, invalidResponse, superseded
+    case unavailable, closed, invalidSnapshot, invalidResponse, superseded, checkpointUncertain
 }
 
 /// Every handle call, replacement and teardown uses the same lock. A failed cold load leaves
