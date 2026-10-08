@@ -11,6 +11,7 @@ on:
       - "scripts/test-issue240-playback-failures.sh"
       - "scripts/test-source-continuity-and-seek-intent.sh"
       - "scripts/test-hls-seek-producer-gate.sh"
+      - "scripts/test-mpv-seek-settlement.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "test/apple-player-timeline-boundaries.test.js"
@@ -36,6 +37,7 @@ on:
       - "scripts/test-issue240-playback-failures.sh"
       - "scripts/test-source-continuity-and-seek-intent.sh"
       - "scripts/test-hls-seek-producer-gate.sh"
+      - "scripts/test-mpv-seek-settlement.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
       - "scripts/test-profile-roster-propagation.sh"
       - "test/apple-player-timeline-boundaries.test.js"
@@ -75,6 +77,7 @@ jobs:
       - run: bash scripts/test-issue240-playback-failures.sh
       - run: bash scripts/test-source-continuity-and-seek-intent.sh
       - run: bash scripts/test-hls-seek-producer-gate.sh
+      - run: bash scripts/test-mpv-seek-settlement.sh
       - run: bash scripts/test-sync-derived-document-revisions.sh
       - run: bash scripts/test-profile-roster-propagation.sh
       - run: bash scripts/test-apple-parity-contracts.sh
