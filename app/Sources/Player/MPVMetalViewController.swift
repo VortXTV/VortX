@@ -1490,7 +1490,6 @@ final class MPVMetalViewController: PlatformViewController {
     ) -> PlayerLoadToken {
         // libmpv has no exact AVPlayerItem-style ownership fence. Every load therefore mints a fresh token,
         // including internal reloads, so a queued callback can never become valid again through token reuse.
-        finishCacheFlushFlight(cacheFlushFlight.reset())
         let issuedToken = PlayerLoadToken()
         loadTokenLock.lock()
         let requestedOrigin = requestedFreshOrigin
@@ -1521,6 +1520,40 @@ final class MPVMetalViewController: PlatformViewController {
             }
             return issuedToken
         }
+        // Header-admission transaction begins before mutating the still-owned source's state.
+        // Per-stream HTTP headers (behaviorHints.proxyHeaders): some add-ons front CDNs that
+        // require a specific Referer or a browser User-Agent; without them the server rejects
+        // the stream ("loading failed" on sources that play fine in clients that apply them).
+        // ALWAYS set all three so the previous file's headers never bleed into this one.
+        var fields: [String] = []
+        var userAgent = ""
+        var referrer = ""
+        for (name, value) in StreamRequestHeaderPolicy.sanitized(headers).sorted(by: { $0.key < $1.key }) {
+            switch name.lowercased() {
+            case "user-agent":         userAgent = value
+            case "referer", "referrer": referrer = value
+            default:                    fields.append("\(name): \(value)")
+            }
+        }
+        let isGoogleVideo = { (u: URL?) in u?.host?.contains("googlevideo") ?? false }
+        let usesGoogleVideo = isGoogleVideo(url) || isGoogleVideo(audioSidecar)
+        if usesGoogleVideo {
+            // Choose the final trailer headers now, not a second fallible clear after source mutation.
+            // Both adaptive legs share the minting client; the registry lookup starts no request.
+            fields = []
+            referrer = ""
+            userAgent = YouTubeDirectResolver.requiredUserAgent(for: (isGoogleVideo(url) ? url : audioSidecar) ?? url)
+        }
+        let headerStatus = MPVHTTPHeaderOptions.set(fields, on: mpv)
+        guard headerStatus >= 0 else {
+            // Refuse this replacement before loadfile: a rejected option must not admit a source
+            // with the previous source's headers. Preserve the existing load's provenance.
+            checkError(headerStatus)
+            return issuedToken
+        }
+        setString("user-agent", userAgent.isEmpty ? defaultUserAgent : userAgent)
+        setString("referrer", referrer)
+        finishCacheFlushFlight(cacheFlushFlight.reset())
         loggedHardwareDecoderNegotiation = false
         // Re-arm HDR detection for THIS file. appliedDynamicRange otherwise persists from the previous
         // file, so an in-place episode / source switch left it stale and the guard SKIPPED re-applying the
@@ -1547,30 +1580,6 @@ final class MPVMetalViewController: PlatformViewController {
 
         args.append("replace")
 
-        // Per-stream HTTP headers (behaviorHints.proxyHeaders): some add-ons front CDNs that
-        // require a specific Referer or a browser User-Agent; without them the server rejects
-        // the stream ("loading failed" on sources that play fine in clients that apply them).
-        // ALWAYS set all three so the previous file's headers never bleed into this one.
-        var fields: [String] = []
-        var userAgent = ""
-        var referrer = ""
-        for (name, value) in StreamRequestHeaderPolicy.sanitized(headers).sorted(by: { $0.key < $1.key }) {
-            switch name.lowercased() {
-            case "user-agent":         userAgent = value
-            case "referer", "referrer": referrer = value
-            default:                    fields.append("\(name): \(value)")
-            }
-        }
-        setString("user-agent", userAgent.isEmpty ? defaultUserAgent : userAgent)
-        setString("referrer", referrer)
-        let headerStatus = MPVHTTPHeaderOptions.set(fields, on: mpv)
-        guard headerStatus >= 0 else {
-            // Refuse this replacement before loadfile: a rejected option must not admit a source
-            // with the previous source's headers. Preserve the existing load's provenance.
-            checkError(headerStatus)
-            return issuedToken
-        }
-
         // yt-direct googlevideo streams no longer play when handed to mpv directly: googlevideo now 403s every
         // Range shape FFmpeg can send (open-ended `bytes=0-` and no-Range alike), so libmpv reports
         // `endFileError reason=loading failed` (the "Trailer unavailable" overlay) even with the correct UA.
@@ -1584,14 +1593,7 @@ final class MPVMetalViewController: PlatformViewController {
         // match 127.0.0.1 once proxied. mpv's `user-agent` option applies to EVERY stream this load opens,
         // including the `--audio-files` sidecar. Non-googlevideo streams are untouched, so debrid/direct/torrent
         // playback keeps its own UA.
-        let isGoogleVideo = { (u: URL?) in u?.host?.contains("googlevideo") ?? false }
-        if isGoogleVideo(url) || isGoogleVideo(audioSidecar) {
-            // UA lockstep (trailerClientResolverV2): googlevideo binds each issued URL to the InnerTube client
-            // that MINTED it, so ask the resolver for the UA recorded against this exact URL. mpv's
-            // `user-agent` option applies to every stream this load opens (video + the --audio-files sidecar),
-            // and both legs always come from the same minting client, so one lookup covers both. With the flag
-            // off the registry is empty and the lookup returns the IOS constant, byte-identical to before.
-            let requiredUA = YouTubeDirectResolver.requiredUserAgent(for: (isGoogleVideo(url) ? url : audioSidecar) ?? url)
+        if usesGoogleVideo {
             if isGoogleVideo(url) {
                 if YouTubeDirectResolver.isManifestURL(url) {
                     // V2 HLS-master fallback: mpv opens the manifest DIRECTLY. The range-proxy cannot serve it
@@ -1608,14 +1610,6 @@ final class MPVMetalViewController: PlatformViewController {
                 sidecar = VXTrailerProxy.shared.proxied(audioSidecar, mime: "audio/mp4") ?? audioSidecar
             }
             args[0] = playURL.absoluteString
-            setString("user-agent", requiredUA)
-            // Referer/extra headers from a browser context would only confuse googlevideo's UA binding.
-            setString("referrer", "")
-            let clearHeaderStatus = MPVHTTPHeaderOptions.set([], on: mpv)
-            guard clearHeaderStatus >= 0 else {
-                checkError(clearHeaderStatus)
-                return issuedToken
-            }
             // Trailer audio-language belt-and-suspenders: the resolver already selects the preferred-language
             // audio LEG (the load-bearing fix for multi-language trailers). This additionally tells mpv which
             // language to auto-select IF a single opened file itself exposes more than one embedded audio track
@@ -1628,7 +1622,7 @@ final class MPVMetalViewController: PlatformViewController {
             }
             NSLog("[trailer] loadFile googlevideo: proxying via 127.0.0.1 playHost=%@ sidecar=%@ alang=%@ ua=%@",
                   playURL.host ?? "?", sidecar == nil ? "none" : (sidecar!.host ?? "?"),
-                  trailerAlang.joined(separator: ","), requiredUA)
+                  trailerAlang.joined(separator: ","), userAgent)
         }
 
         // yt-direct adaptive pair: mount the external audio stream so mpv merges it with the video-only
