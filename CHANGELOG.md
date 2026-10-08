@@ -36,10 +36,16 @@ encrypted Swift/Kotlin carrier fixture uses real native sessions, but its manual
 recovery is not production-manager retry proof. Both watched/Watchlist hosts and native
 shipping selection and reviewed DV pre-attachment/mpv cache-map repairs are integrated.
 The website's final native projection/edit/optional-manifest source passed independent review,
-128 tests and the Astro/CSP build gate, but is not deployed. Fresh revised SDK/optimized
-whole-app rebuilding, actual package
-versions, signing, deployment and physical device/provider acceptance remain pending. Infuse
-watched-return, mpv PiP and broader parity/features are not claimed complete. No public release,
+128 tests and the Astro/CSP build gate, and is now production-deployed with the exact reviewed
+tree, nine byte-matched JavaScript bundles and verified 19-page/seven-hash CSP content. This is
+not authenticated multi-device or live Stremio/provider/device proof. Native Usenet still has
+implementation blockers: Apple's legacy-only eligibility, Android's dropped add-on providers/
+mirrors and old Kotlin route, missing direct indexer wiring, and native aggregate deadline,
+caller-operation cancellation and explicit-selection handling. A reviewed sixteen-saved-provider
+transport repair passed 21 targeted NNTP tests, but has no fresh SDK/package yet. Fresh final
+SDK/optimized whole-app rebuilding, actual package versions, signing, provenance/feeds and
+physical device/provider acceptance remain pending. Infuse watched-return, mpv PiP and broader
+parity/features are not claimed complete and remain part of the active overall goal. No public release,
 installation or universal issue/playback/parity closure is established by this entry.
 
 See [the draft 0.5 Beta 1 notes](docs/releases/0.5.0-beta.1.md) for the full behavior, retained
