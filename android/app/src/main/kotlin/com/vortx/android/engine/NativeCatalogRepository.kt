@@ -31,6 +31,8 @@ internal class NativeCatalogRepository(
     },
     private val sessionChanges: Flow<Unit> = flowOf(Unit),
     private val signOutAccount: (suspend () -> Unit)? = null,
+    private val captureReclaimAdmission: ((VortxNativeSession, VortxNativeOwner) -> ((() -> Boolean) -> Boolean)?)? = null,
+    private val withReclaimLifecycle: ((() -> Boolean) -> Boolean) = { action -> action() },
     private val sessionProvider: () -> VortxNativeSession,
 ) : CatalogRepository, AuthRepository {
     private data class CatalogSpec(val addon: VortxResourceAddon, val catalog: JSONObject) {
@@ -53,6 +55,9 @@ internal class NativeCatalogRepository(
     private val detailCache = mutableMapOf<Pair<MediaType, String>, Pair<VortxNativeOwner, MetaDetail>>()
     private var admittedResources: Pair<VortxNativeOwner, Set<Pair<String, String>>>? = null
     private var playing: Playing? = null
+    private data class DurableWatchProof(val owner: VortxNativeOwner, val token: PlaybackSessionToken, val watchedAt: Long,
+                                        val admit: (() -> Boolean) -> Boolean)
+    private val durableWatchReceipts = java.util.IdentityHashMap<DurableWatchedPlaybackReceipt, DurableWatchProof>()
     private data class SourceBinding(val owner: VortxNativeOwner, val context: PlaybackContext)
     private val sourceBindings = mutableMapOf<String, SourceBinding>()
     private val resolveSequence = AtomicLong()
@@ -687,7 +692,7 @@ internal class NativeCatalogRepository(
             PlaybackSessionToken(playbackSequence.incrementAndGet()).also { playing = Playing(it, read.owner, captured) }
         } }
     }
-    private fun progress(sessionToken: PlaybackSessionToken, positionMs: Long, durationMs: Long, end: Boolean) {
+    private fun progress(sessionToken: PlaybackSessionToken, positionMs: Long, durationMs: Long) {
         val session = session(); val current = synchronized(this) { playing } ?: return
         if (current.token != sessionToken) return
         require(positionMs >= 0 && durationMs >= 0)
@@ -697,12 +702,66 @@ internal class NativeCatalogRepository(
                 session.dispatch(listOf(action("report_progress").put("metaId", current.context.contentId).put("videoId", current.context.videoId)
                     .put("name", current.context.title).put("positionMs", positionMs).put("durationMs", durationMs)
                     .put("metadata", JSONObject().put("type", current.context.type).put("poster", current.context.poster))), current.owner)
-                if (end) playing = null
             }
         }
     }
-    override suspend fun reportProgress(session: PlaybackSessionToken, positionMs: Long, durationMs: Long) = attempt { progress(session, positionMs, durationMs, false) }
-    override suspend fun endPlaybackSession(session: PlaybackSessionToken, positionMs: Long, durationMs: Long) = attempt { progress(session, positionMs, durationMs, true) }
+    override suspend fun reportProgress(session: PlaybackSessionToken, positionMs: Long, durationMs: Long) = attempt { progress(session, positionMs, durationMs) }
+    override suspend fun endPlaybackSession(session: PlaybackSessionToken, positionMs: Long, durationMs: Long) =
+        endPlaybackSessionWithDurableWatchReceipt(session, positionMs, durationMs).map { Unit }
+    private fun watchedStamp(projection: JSONObject, context: PlaybackContext, requireType: Boolean): Long? =
+        projection.getJSONArray("history").objects().filter { row ->
+            row.getString("metaId") == context.contentId && row.getBoolean("watched") &&
+                (!requireType || row.optStringOrNull("type") == context.type) &&
+                (row.optStringOrNull("videoId") == context.videoId ||
+                    context.type == "movie" && context.videoId == context.contentId && row.optStringOrNull("videoId") == null)
+        }.maxOfOrNull { it.getLong("updatedAt") }
+
+    override suspend fun endPlaybackSessionWithDurableWatchReceipt(token: PlaybackSessionToken, positionMs: Long, durationMs: Long): Result<DurableWatchedPlaybackReceipt?> = attempt {
+        val session = session(); val current = synchronized(this) { playing } ?: return@attempt null
+        if (current.token != token) return@attempt null
+        require(positionMs >= 0 && durationMs >= 0)
+        session.owned(current.owner) { synchronized(this) {
+            if (playing !== current) return@owned null
+            val query = JSONObject().put("kind", "profile_playback").put("profileId", current.owner.profileID)
+            val prior = watchedStamp(session.resolve(query, current.owner), current.context, false) ?: 0L
+            try {
+                session.dispatch(listOf(action("report_progress").put("metaId", current.context.contentId).put("videoId", current.context.videoId)
+                    .put("name", current.context.title).put("positionMs", positionMs).put("durationMs", durationMs)
+                    .put("metadata", JSONObject().put("type", current.context.type).put("poster", current.context.poster))), current.owner)
+                val committed = session.resolveCommitted(query, current.owner)
+                check(committed.getString("kind") == "profile_playback" && committed.getString("profileId") == current.owner.profileID)
+                val stamp = watchedStamp(committed, current.context, true)
+                // The kernel alone decides completion. A prior watch plus a partial/zero terminal
+                // report is not a new durable finish from this playback session.
+                val admission = if (stamp != null && stamp > prior && durationMs > 0L) captureReclaimAdmission?.invoke(session, current.owner) else null
+                if (stamp == null || admission == null) null else {
+                    if (durableWatchReceipts.size >= 128) durableWatchReceipts.clear()
+                    DurableWatchedPlaybackReceipt(current.context, owner(current.owner)).also {
+                        durableWatchReceipts[it] = DurableWatchProof(current.owner, token, stamp, admission)
+                    }
+                }
+            } finally { if (playing === current) playing = null }
+        } }
+    }
+    override fun reclaimAfterDurableWatchedPlaybackReceipt(receipt: DurableWatchedPlaybackReceipt, action: () -> Boolean): Boolean = runCatching { withReclaimLifecycle {
+        val session = session()
+        val proof = synchronized(this) { durableWatchReceipts[receipt] } ?: return@withReclaimLifecycle false
+        session.owned(proof.owner) { synchronized(this) {
+            if (durableWatchReceipts[receipt] !== proof || receipt.owner != owner(proof.owner) ||
+                receipt.context.owner != PlaybackContext.Owner(proof.owner.profileID, true)) return@owned false
+            // Production enters the download lifecycle first, then Session -> auth -> mounted lifecycle.
+            // Point-in-time owner checks
+            // alone cannot serialize a destructive callback with logout/epoch retirement.
+            proof.admit {
+                val committed = session.resolveCommitted(JSONObject().put("kind", "profile_playback").put("profileId", proof.owner.profileID), proof.owner)
+                if (committed.getString("kind") != "profile_playback" || watchedStamp(committed, receipt.context, true) != proof.watchedAt) false else {
+                    // The UI coordinator independently waits for every decoder/lease to release.
+                    durableWatchReceipts.remove(receipt)
+                    action()
+                }
+            }
+        } }
+    } }.getOrDefault(false)
     override suspend fun resolve(source: StreamSource, episode: Episode?): Result<Playable> = attempt {
         val session = session(); val read = session.read()
         val binding = synchronized(this) { sourceBindings[source.nativePlaybackToken] }

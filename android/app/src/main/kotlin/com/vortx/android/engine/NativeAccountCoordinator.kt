@@ -34,6 +34,14 @@ internal class NativeAccountCoordinator(
     val changes = MutableStateFlow(0L)
     fun session(): VortxNativeSession = checkNotNull(mounted.get()) { "Native account has not completed authenticated bootstrap" }
         .also { check(accountCurrent(it.account)) { "Native account changed" } }.session
+    /** Captures only a still-mounted identity; callers perform account authentication outside this lock. */
+    internal fun accountFor(session: VortxNativeSession): SessionOwnerSnapshot.Account? = synchronized(lifecycleLock) {
+        mounted.get()?.takeIf { it.session === session }?.account
+    }
+    /** The caller already owns Session -> auth. This lock never acquires either in reverse order. */
+    internal fun withMountedSession(session: VortxNativeSession, account: SessionOwnerSnapshot.Account, action: () -> Boolean): Boolean = synchronized(lifecycleLock) {
+        if (mounted.get()?.let { it.session === session && it.account == account } == true) action() else false
+    }
     override fun retire() {
         val old = synchronized(lifecycleLock) {
             mounted.getAndSet(null).also { if (it != null) retired.add(it.session) }
@@ -105,7 +113,9 @@ internal class NativeAccountCoordinator(
 
     private suspend fun publish(account: SessionOwnerSnapshot.Account, candidate: VortxNativeSession, isCurrent: () -> Boolean): Boolean {
         val next = Mounted(account, candidate)
-        if (!isCurrent() || !accountCurrent(account) || !mounted.compareAndSet(null, next)) {
+        val current = isCurrent() && accountCurrent(account)
+        val installed = current && synchronized(lifecycleLock) { mounted.compareAndSet(null, next) }
+        if (!installed) {
             candidate.close(); error("Native account changed")
         }
         try {
@@ -113,7 +123,11 @@ internal class NativeAccountCoordinator(
             check(isCurrent() && accountCurrent(account) && mounted.get() === next) { "Native account changed" }
             changes.value += 1
             return true
-        } catch (error: Throwable) { if (mounted.compareAndSet(next, null)) candidate.close(); throw error }
+        } catch (error: Throwable) {
+            val removed = synchronized(lifecycleLock) { mounted.compareAndSet(next, null) }
+            if (removed) candidate.close()
+            throw error
+        }
     }
 
     override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean = mutex.withLock {

@@ -166,8 +166,14 @@ flat native-profile theme changes). The existing profile UI verifies projected s
 selection; stale projected profiles are rejected. Direct repository PIN switching
 remains blocked rather than bypassing that gate. Source
 ordering does not yet implement `rememberedQuality`/`wantedAddon` continuity.
-Native auth state reflects successfully mounted VortX accounts. No durable watched receipt authorizes
-download deletion. None of these gates is evidence of full product cutover.
+Native auth state reflects successfully mounted VortX accounts. Terminal playback can issue a
+one-use owner/session-bound watched receipt only when a fresh authenticated checkpoint query
+confirms a new exact-video completion. Cleanup rechecks that same persisted watch clock and owner;
+the existing download coordinator still separately requires decoder/lease release and the user's
+auto-delete setting. Final cleanup admission holds the download lifecycle, native session, captured
+account epoch and mounted-account fence in that order, so logout cannot race an admitted deletion
+and download bookkeeping cannot invert the authentication lock. Partial playback, failed persistence, unwatch, reopen and profile switches
+cannot authorize cleanup. None of these gates is evidence of full product cutover.
 
 Silent verification uses both `compilePlayDebugKotlin` and
 `compileFullDebugKotlin`, then the focused `VortxNative*Test` JVM suites with

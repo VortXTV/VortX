@@ -325,6 +325,21 @@ internal class VortxNativeSession private constructor(
     @Synchronized fun resolve(request: JSONObject, owner: VortxNativeOwner = read().owner): JSONObject = owned(owner) {
         JSONObject(runtime.resolve(request.toString())).also { check(it.getString("kind") != "error") { "Native query rejected" } }
     }
+    /** Destructive follow-through requires the exact current authenticated checkpoint, not an
+     * action ACK or an in-memory publication. Adjacent host carriers never enter the kernel. */
+    @Synchronized fun resolveCommitted(request: JSONObject, owner: VortxNativeOwner): JSONObject = owned(owner) {
+        val committed = scope.validateSnapshot(requireNotNull(store.read(scope)) { "Native checkpoint unavailable" })
+        check(NativeHostPreferences.equal(committed, read().state)) { "Native checkpoint no longer matches the mounted state" }
+        val core = JSONObject(committed.toString()).also { value ->
+            listOf("hostProfilePreferences", "legacyImportMaterial", "hostProfileSyncPending", "nativeHostPreferenceState",
+                "hostDocument", "excludedCredentialPaths", "websiteProfileEditPending", "websiteProfileEditCertificates").forEach(value::remove)
+        }
+        VortxNativeRuntime.hydrate(bindings, core.toString()).use { restored ->
+            JSONObject(restored.resolve(request.toString())).also {
+                check(it.getString("kind") != "error" && accepts(owner)) { "Native committed query rejected" }
+            }
+        }
+    }
     @Synchronized fun <T> owned(owner: VortxNativeOwner, action: () -> T): T {
         check(accepts(owner)) { "Native owner changed" }; return action()
     }

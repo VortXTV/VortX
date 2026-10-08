@@ -126,7 +126,13 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         }; Unit }) }
     private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess { nativeAccounts.session() } }
     private val nativeRepository: NativeCatalogRepository by lazy { NativeCatalogRepository(AndroidNativePlaybackResolver(this), nativeAccounts.changes.map { Unit },
-        { check(syncManager?.signOut() == true) { "Account sign-out could not be stored securely" } }) {
+        { check(syncManager?.signOut() == true) { "Account sign-out could not be stored securely" } },
+        captureReclaimAdmission = { session, owner ->
+            syncManager?.let { manager -> com.vortx.android.engine.captureNativeReclaimAdmission(nativeAccounts, session, owner,
+                { if (syncManager === manager) manager.sessionOwnerSnapshot() else com.vortx.android.sync.SessionOwnerSnapshot.UnknownOrUnavailable(0) },
+                manager::captureLocalLibraryMutationAdmission) }
+        },
+        withReclaimLifecycle = { action -> DownloadManager.withWatchedReclaimAdmission(this, action) }) {
         nativeAccounts.session().also { it.read() }
     } }
 
