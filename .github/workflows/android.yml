@@ -228,6 +228,10 @@ jobs:
       #   VORTX_REQUIRE_ENGINE=1 -> flips both tasks' dev-machine warn-and-skip into a HARD FAILURE
       #                             (missing manifest, missing cargo, or missing/empty .so output all
       #                             throw), so a CI APK can never silently ship without its engines.
+      # Native selection is explicit at the Gradle invocation boundary. Passing both properties is
+      # required: the app BuildConfig and the vortx-ffi resource-host feature are derived from the
+      # same fail-closed contract in app/build.gradle.kts. VORTX_NATIVE_RESOURCE_HOST remains in
+      # env for the private-engine fetch/build diagnostics and backwards-compatible local tooling.
       # Reproducibility: both engine cargo-ndk invocations pass --locked (build.gradle.kts) against
       # the Cargo.lock each pinned engine commit now tracks, so a drifted dependency resolution
       # FAILS the build instead of silently linking a different graph than the proven runs.
@@ -242,7 +246,8 @@ jobs:
           VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
           VORTX_REQUIRE_ENGINE: "1"
           VORTX_NATIVE_RESOURCE_HOST: "1"
-        run: ./gradlew assembleFullDebug assemblePlayDebug --no-daemon --stacktrace
+          VORTX_NATIVE_ENGINE: "1"
+        run: ./gradlew assembleFullDebug assemblePlayDebug -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true --no-daemon --stacktrace
 
       # Fail loud if either flavor did not produce an APK (a path drift or a silently-skipped variant
       # must fail the job, not pass with a missing artifact).
@@ -288,11 +293,11 @@ jobs:
       #        libvortx_ffi.so <- VortxCore.kt:38 + VortxServer.kt:65 loadLibrary("vortx_ffi"),
       #          external funs at VortxCore.kt:50/54/58/61/64 and VortxServer.kt:85/88/91/95;
       #          exported by the pinned vortx-core commit's crates/ffi/src/jni.rs:128-230 (feature
-      #          `jni`) and crates/ffi/src/jni_server.rs:82-146 (features `jni`+`server`) -- both
-      #          features are ON in this build (build.gradle.kts:403 passes `--features jni,server`),
-      #          so a .so built with a dropped feature (kernel bridge or server lane silently gone)
-      #          fails this gate instead of shipping.
-      - name: Verify engine .so in every APK (all ABIs, right ELF class/arch, JNI exports)
+      #          `jni`) and crates/ffi/src/jni_server.rs:82-146 (features `jni`+`server`). Native
+      #          builds additionally pass `resource-host` (build.gradle.kts), so a .so built with a
+      #          dropped kernel, server, or resource-host feature silently gone fails this gate
+      #          instead of shipping.
+      - name: Verify native BuildConfig and engine .so in every APK (all ABIs, right ELF class/arch, JNI exports)
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -302,6 +307,11 @@ jobs:
           READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
           if [ ! -x "$READELF" ]; then
             echo "::error::pinned NDK llvm-readelf not found/executable at $READELF; refusing to verify APKs with an unpinned readelf"
+            exit 1
+          fi
+          DEXDUMP="$ANDROID_HOME/build-tools/36.0.0/dexdump"
+          if [ ! -x "$DEXDUMP" ]; then
+            echo "::error::pinned Android build-tools dexdump not found/executable at $DEXDUMP; refusing to verify BuildConfig with an unpinned tool"
             exit 1
           fi
           full_apks=(android/app/build/outputs/apk/full/debug/*.apk)
@@ -316,7 +326,48 @@ jobs:
           syms_libvortx_ffi="Java_com_vortx_android_engine_VortxCore_nativeInitRuntime Java_com_vortx_android_engine_VortxCore_nativeDispatchJson Java_com_vortx_android_engine_VortxCore_nativeResolveJson Java_com_vortx_android_engine_VortxCore_nativeGetStateJson Java_com_vortx_android_engine_VortxCore_nativeEngineFree Java_com_vortx_android_engine_VortxServer_nativeStart Java_com_vortx_android_engine_VortxServer_nativePort Java_com_vortx_android_engine_VortxServer_nativeBaseUrl Java_com_vortx_android_engine_VortxServer_nativeStop"
           fail=0
           workdir="$(mktemp -d)"
+          verify_native_build_config() {
+            local artifact="$1" prefix entry dex dump
+            case "$artifact" in
+              *.apk) prefix="" ;;
+              *.aab) prefix="base/" ;;
+              *) echo "::error::unsupported artifact for BuildConfig verification: $artifact"; return 1 ;;
+            esac
+            while IFS= read -r entry; do
+              [ -n "$entry" ] || continue
+              dex="$workdir/$(basename "$artifact").${entry##*/}"
+              dump="$dex.dump"
+              unzip -p "$artifact" "$entry" > "$dex" || return 1
+              "$DEXDUMP" -d "$dex" > "$dump"
+              # dexdump versions differ in whether they print a field/value pair or an indexed
+              # static-values table. Accept both forms, but only inside BuildConfig and only for
+              # NATIVE_ENGINE_ENABLED; a generic "true" in another class is not evidence.
+              if awk '
+                /Class descriptor[[:space:]]*:[[:space:]]*\047Lcom\/vortx\/android\/BuildConfig;\047/ { in_build=1; next }
+                in_build && /^Class descriptor/ { exit }
+                in_build && /NATIVE_ENGINE_ENABLED/ && /(true|0x0*1([[:space:]]|$))/ { found=1 }
+                in_build && /Static fields/ { in_fields=1; in_values=0; next }
+                in_build && /Static values/ { in_fields=0; in_values=1; next }
+                in_build && in_fields && /name[[:space:]]*:/ {
+                  field_count++
+                  if ($0 ~ /name[[:space:]]*:[[:space:]]*\047NATIVE_ENGINE_ENABLED\047/) target=field_count
+                  next
+                }
+                in_build && in_values && /value[[:space:]]*:/ { value_count++; values[value_count]=$0 }
+                END {
+                  if (found) exit 0
+                  if (target && values[target] ~ /(true|0x0*1([[:space:]]|$))/) exit 0
+                  exit 1
+                }
+              ' "$dump"; then
+                return 0
+              fi
+            done < <(unzip -Z1 "$artifact" | awk -v prefix="$prefix" '$0 ~ ("^" prefix "classes[0-9]*\\.dex$")')
+            echo "::error::$artifact does not prove BuildConfig.NATIVE_ENGINE_ENABLED=true"
+            return 1
+          }
           for apk in "${apks[@]}"; do
+            if ! verify_native_build_config "$apk"; then fail=1; else echo "ok: $apk BuildConfig.NATIVE_ENGINE_ENABLED=true"; fi
             for abi in arm64-v8a armeabi-v7a x86_64; do
               case "$abi" in
                 arm64-v8a)   elf_class='ELF64'; machine='AArch64' ;;
@@ -462,11 +513,12 @@ jobs:
           VORTX_ENGINE_CORE_DIR: ${{ github.workspace }}/vortx-core
           VORTX_REQUIRE_ENGINE: "1"
           VORTX_NATIVE_RESOURCE_HOST: "1"
+          VORTX_NATIVE_ENGINE: "1"
           VORTX_KEYSTORE_PATH: ${{ runner.temp }}/signing/upload.jks
           VORTX_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           VORTX_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           VORTX_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: ./gradlew assembleFullRelease bundleFullRelease --no-daemon --stacktrace
+        run: ./gradlew assembleFullRelease bundleFullRelease -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true --no-daemon --stacktrace
 
       # Signing-variable mapping assertion (fail-closed): prove the release build exports exactly
       # the four signing variables Gradle reads (build.gradle.kts:38-43), and Gradle maps exactly
@@ -540,6 +592,56 @@ jobs:
           scripts/verify-android-release-signing.sh verify "${apks[@]}" "${bundles[@]}"
           READELF="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
             bash scripts/verify-native-android-artifacts.sh "${apks[@]}" "${bundles[@]}"
+
+      # The packaged .so gate above proves JNI/resource-host exports. This separate bytecode gate
+      # proves the signed APK/AAB selected the same native mode at compile time; a release with a
+      # resource-host library but BuildConfig=false would silently route the app through legacy
+      # repository seams and is not a native release.
+      - name: Verify native BuildConfig in signed release artifacts
+        if: steps.signing.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apks=(android/app/build/outputs/apk/full/release/*.apk)
+          bundles=(android/app/build/outputs/bundle/fullRelease/*.aab)
+          DEXDUMP="$ANDROID_HOME/build-tools/36.0.0/dexdump"
+          test -x "$DEXDUMP" || { echo "::error::pinned Android build-tools dexdump unavailable"; exit 1; }
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          for artifact in "${apks[@]}" "${bundles[@]}"; do
+            case "$artifact" in *.apk) prefix="" ;; *.aab) prefix="base/" ;; *) exit 1 ;; esac
+            found=0
+            while IFS= read -r entry; do
+              [ -n "$entry" ] || continue
+              dex="$scratch/$(basename "$artifact").${entry##*/}"
+              dump="$dex.dump"
+              unzip -p "$artifact" "$entry" > "$dex"
+              "$DEXDUMP" -d "$dex" > "$dump"
+              if awk '
+                /Class descriptor[[:space:]]*:[[:space:]]*\047Lcom\/vortx\/android\/BuildConfig;\047/ { in_build=1; next }
+                in_build && /^Class descriptor/ { exit }
+                in_build && /NATIVE_ENGINE_ENABLED/ && /(true|0x0*1([[:space:]]|$))/ { found=1 }
+                in_build && /Static fields/ { in_fields=1; in_values=0; next }
+                in_build && /Static values/ { in_fields=0; in_values=1; next }
+                in_build && in_fields && /name[[:space:]]*:/ {
+                  field_count++
+                  if ($0 ~ /name[[:space:]]*:[[:space:]]*\047NATIVE_ENGINE_ENABLED\047/) target=field_count
+                  next
+                }
+                in_build && in_values && /value[[:space:]]*:/ { value_count++; values[value_count]=$0 }
+                END {
+                  if (found) exit 0
+                  if (target && values[target] ~ /(true|0x0*1([[:space:]]|$))/) exit 0
+                  exit 1
+                }
+              ' "$dump"; then found=1; break; fi
+            done < <(unzip -Z1 "$artifact" | awk -v prefix="$prefix" '$0 ~ ("^" prefix "classes[0-9]*\\.dex$")')
+            if [ "$found" -ne 1 ]; then
+              echo "::error::$artifact does not prove BuildConfig.NATIVE_ENGINE_ENABLED=true"
+              exit 1
+            fi
+            echo "ok: $artifact BuildConfig.NATIVE_ENGINE_ENABLED=true"
+          done
 
       - name: Upload signed release APK
         if: steps.signing.outputs.ready == 'true'

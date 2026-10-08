@@ -5,6 +5,51 @@ sets `BuildConfig.NATIVE_ENGINE_ENABLED` and selects `NativeCatalogRepository` f
 both application repository seams. In that mode the application never falls back
 to Stremio or preview data, and direct construction of the legacy repository fails.
 
+## Android native 0.5 release-selection contract (staged)
+
+The 0.5 candidate selects native mode explicitly at the Gradle invocation boundary:
+
+```text
+./gradlew <release-or-debug-tasks> -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
+```
+
+`android/app/build.gradle.kts` resolves those properties (with the matching
+`VORTX_NATIVE_ENGINE` / `VORTX_NATIVE_RESOURCE_HOST` environment variables as a
+local-tooling fallback) before Android variants are configured. Gradle properties
+take precedence over environment values. `nativeEngine=true` without
+`nativeResourceHost=true` fails configuration; a native application must compile
+the `jni,server,resource-host` `vortx-ffi` feature set. `BuildConfig.NATIVE_ENGINE_ENABLED`
+comes from that same resolved native flag, so a server-only/resource-host artifact
+cannot be presented as a native application by accident. Non-native builds retain
+the existing explicit `jni,server` feature set.
+
+Both `.github/workflows/android.yml` and `.github/workflows/android-release.yml`
+pass both Gradle properties for their engine-required builds. Their APK/AAB gates
+inspect each shipped `arm64-v8a`, `armeabi-v7a`, and `x86_64` slice with the pinned
+NDK `llvm-readelf`, require callable JNI exports and the resource-host ABI, and
+inspect packaged DEX with Android build-tools `dexdump` for
+`BuildConfig.NATIVE_ENGINE_ENABLED=true`. The signed candidate lane also retains
+`scripts/verify-native-android-artifacts.sh` before upload. A release artifact that
+contains a resource-host library but advertises `BuildConfig.NATIVE_ENGINE_ENABLED=false` is rejected.
+
+The existing `stremiox-core` checkout remains built and verified in this staged
+lane. The Kotlin source still contains the complete legacy repository implementation
+and its JNI bindings, while the current release verifier requires its callable
+surface. Native mode cannot construct or select that repository, but removing its
+build/package dependency needs a separate link/readback review and an artifact-gate
+change; this selection lane does not claim that removal. The private engine pins
+are intentionally unchanged and are recorded here for the parent approval step:
+
+- `.github/workflows/android.yml`: `VortXTV/stremiox-core` and `VortXTV/vortx-core`
+- `.github/workflows/android-release.yml`: `VortXTV/stremiox-core` and `VortXTV/vortx-core`
+
+Each workflow currently names an immutable 40-character commit for both checkouts.
+The pending private CI replacement (including the currently discussed `ec96`
+candidate) must be approved and filled by the parent across all release lanes; this
+contract change does not repin or build either private repository. Host/device
+ABI, signing, and final release gates remain outstanding, so this is staged native
+selection rather than a claim that the product cutover is complete.
+
 `VortXSyncManager` now activates `NativeAccountCoordinator` after its captured
 account lease has authenticated/decrypted a successful backup response. Scope is
 `account.<canonical lowercase account UUID>`, with the exact historical owner UUID

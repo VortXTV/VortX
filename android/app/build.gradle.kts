@@ -31,6 +31,32 @@ val externalSyncProps = Properties().apply {
 fun externalSyncSecret(name: String): String =
     (externalSyncProps.getProperty(name) ?: System.getenv(name) ?: "").trim()
 
+// Native release selection is one fail-closed decision, not a collection of loosely related
+// environment toggles. Gradle properties are authoritative when present so a caller can explicitly
+// turn a locally-exported flag off; CI passes both properties on every native release invocation.
+// The resource-host feature is required whenever the application selects the native repository
+// (VortxResourceBridge and native sync/playback call these symbols during startup).
+fun nativeBooleanFlag(propertyName: String, environmentName: String): Boolean {
+    val property = project.findProperty(propertyName) as? String
+    val raw = property?.trim() ?: System.getenv(environmentName)?.trim()
+    return when (raw?.lowercase()) {
+        null, "", "false", "0" -> false
+        "true", "1" -> true
+        else -> throw GradleException(
+            "$propertyName / $environmentName must be true/false or 1/0 (got '$raw')",
+        )
+    }
+}
+
+val nativeEngineEnabled = nativeBooleanFlag("vortx.nativeEngine", "VORTX_NATIVE_ENGINE")
+val nativeResourceHostEnabled = nativeBooleanFlag("vortx.nativeResourceHost", "VORTX_NATIVE_RESOURCE_HOST")
+if (nativeEngineEnabled && !nativeResourceHostEnabled) {
+    throw GradleException(
+        "Native engine selection is fail-closed: vortx.nativeEngine=true requires " +
+            "vortx.nativeResourceHost=true at native compilation.",
+    )
+}
+
 // Release signing credentials stay outside the public repository. VORTX_KEYSTORE_PATH may be an
 // existing local path or the base64 keystore value used by CI. Base64 input is decoded into an OS
 // temporary file and removed when the Gradle process exits.
@@ -105,9 +131,11 @@ android {
         versionCode = 240
         versionName = "0.4.0"
 
-        // Explicit experimental selection only; release/device/auth/player/migration parity is pending.
-        // Missing native session/artifact fails closed; this never falls back to Stremio or previews.
-        buildConfigField("boolean", "NATIVE_ENGINE_ENABLED", (providers.gradleProperty("vortx.nativeEngine").orNull == "true").toString())
+        // Explicit selection only; missing native session/artifact fails closed and never falls back
+        // to Stremio or previews. This value is resolved from the same property/env contract that
+        // selects the resource-host Cargo feature below, so a release cannot compile one mode and
+        // advertise another through BuildConfig.
+        buildConfigField("boolean", "NATIVE_ENGINE_ENABLED", nativeEngineEnabled.toString())
 
         // External sync credentials -> BuildConfig (read by com.vortx.android.integrations.TraktAuth /
         // SIMKLAuth). Empty default keeps the feature dormant on a public/unprovisioned build; see the
@@ -510,7 +538,8 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders"
 }
 
 // =====================================================================================================
-// vortx-core JNI (the OWN engine): build libvortx_ffi.so (features jni + server) into
+// vortx-core JNI (the OWN engine): build libvortx_ffi.so (features jni + server, plus
+// resource-host for native selection) into
 // src/main/jniLibs and package it. Sibling of the cargoNdkBuild block above, same pattern,
 // different crate: the source is the ENGINE branch's vortx-core workspace (crates/ffi), which is
 // not vendored in this tree (the vortx-core/ dir here carries the kernel crates only, no ffi/
@@ -523,7 +552,8 @@ tasks.matching { it.name.startsWith("merge") && it.name.endsWith("JniLibFolders"
 // libvortx_ffi.so is already staged in src/main/jniLibs (the manual build documented in
 // src/main/jniLibs/README.md) -- the .so binaries stay gitignored either way. `--features
 // jni,server` carries BOTH JNI surfaces in the one .so: the VortxCore kernel bridge (shadow
-// ranking) and the VortxServer in-process streaming server (raw-torrent playback).
+// ranking) and the VortxServer in-process streaming server (raw-torrent playback). Native mode
+// adds `resource-host` to that exact feature set; it must never compile a server-only artifact.
 // CARGO_TARGET_DIR is pinned to a task-owned scratch dir (target-andx) inside the engine checkout
 // so this cross-build never dirties that checkout's own target/ build cache.
 // =====================================================================================================
@@ -544,14 +574,11 @@ val vortxEngineCoreDir: File? = (
 
 // Explicit integration build only. Release workflows keep their frozen private-core pins until the
 // parent updates pins, feature sets and required ABI symbols together after review.
-val nativeResourceHostEnabled = System.getenv("VORTX_NATIVE_RESOURCE_HOST") == "1" ||
-    (project.findProperty("vortx.nativeResourceHost") as? String)?.toBoolean() == true
-
 val vortxJniLibsDir = layout.projectDirectory.dir("src/main/jniLibs")
 
 val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
     group = "rust"
-    description = "Cross-compile the engine branch's vortx-ffi (features jni,server) to libvortx_ffi.so via cargo-ndk."
+    description = "Cross-compile the engine branch's vortx-ffi (jni,server plus resource-host when selected) to libvortx_ffi.so via cargo-ndk."
     workingDir = vortxEngineCoreDir ?: coreCrateDir // placeholder wd when unset; onlyIf gates the run
 
     val targetFlags = androidAbis.flatMap { listOf("-t", it) }
@@ -565,7 +592,9 @@ val cargoNdkBuildVortxFfi by tasks.registering(Exec::class) {
             add("-p"); add(nativeApiLevel.toString())
             add("-o"); add(vortxJniLibsDir.asFile.absolutePath)
             add("build"); add("-p"); add("vortx-ffi")
-            add("--no-default-features"); add("--features"); add(if (nativeResourceHostEnabled) "jni,server,resource-host" else "jni,server")
+            add("--no-default-features"); add("--features"); add(
+                if (nativeResourceHostEnabled) "jni,server,resource-host" else "jni,server",
+            )
             add("--release"); add("--locked")
         },
     )
