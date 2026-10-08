@@ -28,6 +28,13 @@ enum ProfileMutationPresentationTests {
     @MainActor static func main() async {
         let presentation = ProfileMutationPresentation()
         var dismissals = 0
+        var cancelledOperationStarted = false
+        presentation.start(operation: { cancelledOperationStarted = true; return true },
+                           failureMessage: { "Cancelled before admission" }, onSuccess: { dismissals += 100 })
+        // Still on the same MainActor turn: cancellation precedes the newly scheduled task.
+        presentation.cancel()
+        for _ in 0..<10 { await Task.yield() }
+        precondition(!cancelledOperationStarted && !presentation.isRunning && dismissals == 0)
         let first = PendingResult()
         presentation.start(operation: { await first.value() }, failureMessage: { "Save failed" },
                            onSuccess: { dismissals += 1 })
@@ -38,6 +45,8 @@ enum ProfileMutationPresentationTests {
         first.finish(false)
         await settle { !presentation.isRunning }
         precondition(!duplicateStarted && dismissals == 0 && presentation.errorMessage == "Save failed")
+        presentation.cancel()
+        precondition(presentation.errorMessage == nil)
 
         let stale = PendingResult(), replacement = PendingResult()
         presentation.start(operation: { await stale.value() }, failureMessage: { "Stale error" },
@@ -60,7 +69,8 @@ enum ProfileMutationPresentationTests {
         precondition(view.contains("await store.removeNative(original, target: target)"))
         precondition(view.contains("await store.selectNative(original, target: target)"))
         precondition(view.contains("await store.selectNative(profile, target: target)"))
-        precondition(view.components(separatedBy: "let target = core.captureNativePlaybackTarget()").count == 5)
+        // Five admission sites: picker, account editor, removal, selection, and profile save.
+        precondition(view.components(separatedBy: "let target = core.captureNativePlaybackTarget()").count == 6)
         precondition(view.contains(".interactiveDismissDisabled(profileAction.isRunning)"))
         print("PASS actual profile mutation presentation: acknowledgement, failure, retry, duplicate taps, cancelled late completion, captured native UI targets")
     }

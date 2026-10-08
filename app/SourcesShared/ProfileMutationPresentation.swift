@@ -21,6 +21,9 @@ final class ProfileMutationPresentation: ObservableObject {
         isRunning = true
         errorMessage = nil
         task = Task { @MainActor [weak self] in
+            // A dismissed view can cancel before this task ever starts. Only a write already
+            // admitted by operation() may finish; cancellation must not admit a new one later.
+            guard !Task.isCancelled, self?.generation == owner else { return }
             let accepted = await operation()
             guard let self, !Task.isCancelled, self.generation == owner else { return }
             self.task = nil
@@ -36,5 +39,6 @@ final class ProfileMutationPresentation: ObservableObject {
         task?.cancel()
         task = nil
         isRunning = false
+        errorMessage = nil
     }
 }
