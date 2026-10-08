@@ -9,8 +9,8 @@
     "byProfile": {
       "00000000-0000-0000-0000-00000000A11C": {"ownerHistory": [{"id": "tt123", "type": "movie", "name": "Fixture Movie", "t": 0, "v": "tt123", "lastWatched": "2026-01-01T00:00:00.123456Z", "eventEpochMs": 1767225600123.75}]},
       "10000000-0000-0000-0000-000000000001": {
-        "library": [{"id": "tt456", "type": "series", "name": "Fixture Series", "poster": "https://example.com/series.jpg", "t": 12.345, "d": 100, "lastWatched": "2026-01-01T00:00:00.123456Z", "v": "opaque-episode", "w": ["opaque-episode"], "ma": {"opaque-episode": 50.125}}],
-        "watched": {"tt456": {"w": ["opaque-episode"], "ua": {"opaque-episode": 50.875}}, "durable-only": {"w": ["opaque-durable-unit"]}}
+        "library": [{"id": "tt456", "type": "series", "name": "Fixture Series", "poster": "https://example.com/series.jpg", "t": 12.345, "d": 100, "lastWatched": "2026-01-01T00:00:00.123456Z", "v": "opaque-episode", "w": ["opaque-episode"], "ma": {"opaque-episode": 50.125}, "ua": {"opaque-episode": 50.875}}],
+        "watched": {"tt456": {"w": ["opaque-episode"], "ma": {"opaque-episode": 999.5}, "ua": {"opaque-episode": 999.25}}, "durable-only": {"w": ["opaque-durable-unit"]}}
       }
     }
   },

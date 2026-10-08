@@ -66,7 +66,7 @@ enum VortxLegacyBootstrapMaterialTests {
         check(overlay.count == 2, "All durable watched entries retained")
         let row = overlay.first { $0["videoId"] as? String == "opaque-episode" }!
         check(row["positionMs"] as? Int == 12345 && row["lastPlayedAtMs"] as? Double == 1767225600123.456, "Original Double precision")
-        check(row["markedAtMs"] as? Double == 50.125 && row["resetAtMs"] as? Double == 50.875 && row["watched"] == nil, "Independent mark/reset clocks")
+        check(row["markedAtMs"] as? Double == 50.125 && row["resetAtMs"] as? Double == 50.875 && row["watched"] == nil, "Complete rail mark/reset clocks override duplicate durable explicit clocks")
         check(row["name"] as? String == "Fixture Series" && row["poster"] != nil, "Watch context retained")
         check((result["libraries"] as! [String: Object])[child.id.uuidString] == nil, "Overlay cache is not saved membership")
     }
@@ -89,11 +89,12 @@ enum VortxLegacyBootstrapMaterialTests {
         durable["null"] = ["w": ["null-episode"], "ma": ["null-episode": NSNull()]]
         let result = try material(doc(["byProfile": [child.id.uuidString: ["watched": durable]]]))
         let rows = watches(result, profile: child)
-        check(rows.count == 127, "No 120-row trimming")
+        check(rows.count == 128, "No 120-row trimming")
         let tie = rows.first { $0["metaId"] as? String == "clocked" }!
         check(tie["markedAtMs"] as? Double == 50.25 && tie["resetAtMs"] as? Double == 50.25 && tie["watched"] == nil, "Overlay strict mark > reset sent to native")
-        check(!rows.contains { $0["metaId"] as? String == "zero" }, "Present zero map keys suppress stale bare w without invented reset")
-        check(rows.first { $0["metaId"] as? String == "null" }?["watched"] as? Bool == true, "Null operation is missing, unlike a published finite zero")
+        let zero = rows.first { $0["metaId"] as? String == "zero" }!
+        check(zero["watched"] as? Bool == true && zero["markedAtMs"] == nil, "Doc ingress filters zero sentinel clocks before bare watched membership")
+        check(rows.first { $0["metaId"] as? String == "null" }?["watched"] as? Bool == true, "Null operation is absent at doc ingress")
         var current = movie(position: 1); current["w"] = [String]()
         let stale = try material(doc(["byProfile": [child.id.uuidString: ["library": [current], "watched": ["tt123": ["w": ["stale-episode"]]]]]]))
         check(watches(stale, profile: child).count == 1, "Durable unclocked set cannot resurrect omitted rail marker")

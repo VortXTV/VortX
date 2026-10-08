@@ -209,7 +209,7 @@ enum VortxLegacyBootstrapMaterial {
                     removedRows.insert(key)
                 } else { items[key] = item }
                 try importWatch(ownerID, id, row, history: false, overlay: false)
-                try importMarks(ownerID, id, row, includeUnclocked: true)
+                try importMarks(ownerID, id, row)
             }
             let buckets = try object(vortx, "byProfile") ?? [:]
             for (rawID, value) in buckets where UUID(uuidString: rawID) == UserProfile.ownerID || UUID(uuidString: rawID) == owner.id {
@@ -218,7 +218,7 @@ enum VortxLegacyBootstrapMaterial {
                     let id = try string(row, "id")
                     try known(ownerID, id, row)
                     try importWatch(ownerID, id, row, history: true, overlay: false)
-                    try importMarks(ownerID, id, row, includeUnclocked: true)
+                    try importMarks(ownerID, id, row)
                 }
             }
             func keyFor(_ raw: String) throws -> String {
@@ -294,12 +294,15 @@ enum VortxLegacyBootstrapMaterial {
                     let meta = try string(row, "id")
                     try known(id, meta, row)
                     try importWatch(id, meta, row, history: false, overlay: true)
-                    try importMarks(id, meta, row, includeUnclocked: true)
+                    try importMarks(id, meta, row)
                 }
                 for (meta, value) in try object(bucket, "watched") ?? [:] {
                     guard let row = value as? Object else { throw fail("Malformed durable watched row") }
                     try require(!meta.isEmpty, "Empty durable watch identity")
-                    try importMarks(id, meta, row, includeUnclocked: !railTitles.contains(meta))
+                    // Apple account-doc ingress gives the complete rail snapshot precedence over
+                    // the ENTIRE duplicate durable row, including its explicit ma/ua clocks. The
+                    // durable map fills titles beyond the rail; it is not an independent operation log.
+                    if !railTitles.contains(meta) { try importMarks(id, meta, row) }
                 }
                 let removals = try objects(bucket, "removed") + objects(web, rawID)
                 for removal in removals {
@@ -362,14 +365,13 @@ enum VortxLegacyBootstrapMaterial {
             watches[profile, default: []].append(row)
         }
 
-        func importMarks(_ profile: String, _ meta: String, _ raw: Object, includeUnclocked: Bool) throws {
-            let legacy = Set(try strings(raw, "w"))
-            let watched = includeUnclocked ? legacy : []
+        func importMarks(_ profile: String, _ meta: String, _ raw: Object) throws {
+            let watched = Set(try strings(raw, "w"))
             let marked = try object(raw, "ma") ?? [:], reset = try object(raw, "ua") ?? [:]
             for video in watched.union(marked.keys).union(reset.keys).sorted() {
                 try require(!video.isEmpty, "Empty watched video identity")
                 let ma = try clock(marked, video), ua = try clock(reset, video)
-                let bareWatched = ma == nil && ua == nil && watched.contains(video)
+                let bareWatched = (ma ?? 0) == 0 && (ua ?? 0) == 0 && watched.contains(video)
                 if (ma ?? 0) == 0 && (ua ?? 0) == 0 && !bareWatched { continue }
                 if video == meta {
                     try require(titles[profile]?[meta]?["type"] as? String == "movie",
@@ -380,8 +382,8 @@ enum VortxLegacyBootstrapMaterial {
                    let duration = try milliseconds(raw, "d") { row["durationMs"] = duration }
                 if let ma, ma > 0 { row["markedAtMs"] = ma }
                 if let ua, ua > 0 { row["resetAtMs"] = ua }
-                // Shipping overlay policy distinguishes a present zero sentinel from a missing
-                // operation key: either map key suppresses the older bare w, without minting reset.
+                // The account-doc ingress filters nonpositive clocks before overlay merging. Zero
+                // and null therefore mean no operation here and do not suppress a bare watched bit.
                 if bareWatched { row["watched"] = true }
                 if row["markedAtMs"] != nil || row["resetAtMs"] != nil || row["watched"] != nil { watches[profile, default: []].append(row) }
             }
