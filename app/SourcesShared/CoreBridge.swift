@@ -1,6 +1,8 @@
 import Foundation
 import CryptoKit
+#if !VORTX_NATIVE_DATA_ENGINE
 import StremioXCore
+#endif
 
 #if VORTX_NATIVE_DATA_ENGINE && (!VORTX_ENGINE_STATE_BRIDGE || !VORTX_ENGINE_RESOURCE_HOST || !canImport(VortxEngine))
 #error("Native data engine requires the exact state/resource-host VortxEngine artifact and bridge conditions")
