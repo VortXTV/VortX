@@ -141,12 +141,13 @@ final class CoreBridge: ObservableObject {
     @MainActor
     func mergeNativeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
                                     legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [],
+                                    legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                                     sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws -> VortxJSON {
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
         let baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline)
         let document = try await facade.mergeAccountDocument(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
-            hostEdits: hostEdits, websiteEvents: websiteEvents, websiteBaseline: baseline,
+            hostEdits: hostEdits, websiteEvents: websiteEvents, legacyWatchlists: legacyWatchlists, websiteBaseline: baseline,
             sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive)
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
@@ -168,6 +169,7 @@ final class CoreBridge: ObservableObject {
             return .native(.init(profileID: activeID, credential: capture, sessionGeneration: nativeInstallGeneration, accountGeneration: snapshot.generation))
         }
         ProfileStore.shared.applyNativeProfiles(profiles, activeID: activeID, projectionTarget: projection)
+        NotificationCenter.default.post(name: LibraryAutoAdd.watchlistChangedNote, object: nil)
         let slot = ProfileStore.shared.activeKeychainAccount
         if nativePublishedCredentialSlot != slot {
             nativePublishedCredentialSlot = slot
@@ -221,6 +223,27 @@ final class CoreBridge: ObservableObject {
     func captureNativeSourceFence() -> @Sendable () -> Bool {
         guard let facade = nativeFacade else { return { true } }
         return facade.captureSourceFence()
+    }
+    @MainActor func nativeWatchlist() throws -> [VortxNativeWatchlist.Entry] {
+        guard let facade = nativeFacade, let snapshot = facade.profileSnapshot(),
+              case .string(let id) = snapshot.state["activeProfileId"], let profile = UUID(uuidString: id),
+              ProfileStore.shared.activeID == profile else { throw VortxNativeError.closed }
+        return try VortxNativeWatchlist.entries(host: snapshot.host, profileID: profile)
+    }
+    @MainActor func setNativeWatchlist(_ entry: VortxNativeWatchlist.Entry, present: Bool, target: PlaybackMutationTarget) async throws -> Bool {
+        guard let (facade, _) = nativePlaybackBinding(target), case .native(let binding?) = target,
+              let epoch = binding.accountGeneration, let snapshot = facade.profileSnapshot() else { throw VortxNativeError.superseded }
+        let existing = try VortxNativeWatchlist.entries(host: snapshot.host, profileID: binding.profileID)
+        if present, !existing.contains(where: { $0.id == entry.id && $0.type == entry.type }), existing.count >= VortxNativeWatchlist.displayCap {
+            throw VortxNativeWatchlist.Failure.capacity
+        }
+        let field = try VortxNativeWatchlist.field(id: entry.id, type: entry.type)
+        let value: VortxJSON = present ? try VortxNativeWatchlist.value(entry) : .null
+        try await facade.mutateProfiles([], hostEdits: [.init(profileID: binding.profileID.uuidString, fields: [field: value])],
+            expectedProfileID: binding.profileID.uuidString, expectedAccountGeneration: epoch)
+        guard nativePlaybackBinding(target)?.0 === facade else { throw VortxNativeError.superseded }
+        NotificationCenter.default.post(name: LibraryAutoAdd.watchlistChangedNote, object: nil)
+        return try nativeWatchlist().contains { $0.id == entry.id && $0.type == entry.type }
     }
 
     /// Never fall back to an unrelated legacy profile token once a native binding exists.

@@ -190,6 +190,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func enqueueMutation(type: String, raw: String, legacyMaterial: Data? = nil,
                                  actions: [String]? = nil, hostRemote: VortxJSON? = nil,
                                  hostEdits: [VortxNativeHostPreferences.Edit] = [],
+                                 legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                                  admission: (@Sendable () -> Bool)? = nil,
                                  websiteEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                                  sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil,
@@ -217,7 +218,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     return
                 }
                 _ = try await session.dispatch(actions ?? [raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial,
-                                               hostRemote: hostRemote, hostEdits: hostEdits, websiteEvents: websiteEvents, websiteBaseline: websiteBaseline,
+                                               hostRemote: hostRemote, hostEdits: hostEdits, legacyWatchlists: legacyWatchlists, websiteEvents: websiteEvents, websiteBaseline: websiteBaseline,
                                                sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive)
                 durableCommitted = true
                 let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
@@ -304,6 +305,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// Its returned carrier is read only after the same FIFO's merge/checkpoint acknowledgement.
     func mergeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, legacyMaterial: Data?,
                               hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [],
+                              legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                               websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                               sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws -> VortxJSON {
         let action = remote.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) }
@@ -311,7 +313,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
         return try await withCheckedThrowingContinuation { continuation in
             if !enqueueMutation(type: remote == nil ? "get_state" : "merge_native_sync", raw: raw, legacyMaterial: legacyMaterial,
-                                hostRemote: hostRemote, hostEdits: hostEdits, websiteEvents: websiteEvents, websiteBaseline: websiteBaseline,
+                                hostRemote: hostRemote, hostEdits: hostEdits, legacyWatchlists: legacyWatchlists, websiteEvents: websiteEvents, websiteBaseline: websiteBaseline,
                                 sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive, completion: { [weak self] result in
                 switch result {
                 case .success(let native):

@@ -101,6 +101,10 @@ struct ProfilePickerView: View {
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                     Button("Retry watched-history migration") { Task { await nativeSync.retryNativeWatchedMigration() } }
                 }
+                if !nativeSync.nativeUnsupportedSettings.isEmpty {
+                    Text("Some older device settings are preserved locally but have not been synchronized by the native engine. Other supported settings can still sync; these retained values have not been marked uploaded.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                }
                 if !account.isSignedIn, let active = store.active, active.isOwner || !active.usesOwnAccount {
                     Text("Reconnect the owner's Stremio account for external refresh. Credentials from another VortX account are not reused; saved library and watch history remain available.")
                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)

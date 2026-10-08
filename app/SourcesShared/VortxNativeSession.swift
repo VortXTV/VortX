@@ -35,6 +35,12 @@ enum VortxNativeInstallationKey {
 
 /// Native-only exports cannot acknowledge legacy host edits they deliberately do not serialize.
 enum VortxNativeSyncExportPolicy {
+    static func acknowledgesSetting(_ key: String, syncable: Bool, profileProjection: Bool, projectionAcknowledged: Bool) -> Bool {
+        if !syncable { return true } // Retire obsolete device-local stamps, never export their values.
+        if VortxNativeHostPreferences.knownGlobals.contains(key) { return true }
+        if profileProjection { return projectionAcknowledged }
+        return ["stremiox.profiles.active", "stremiox.activeProfileId"].contains(key)
+    }
     static func permitsStateOnlyExport(hasDirtySettings: Bool, hasLegacyAddonOrderIntent: Bool,
                                        overridingLegacySource: Bool = false) -> Bool {
         !hasDirtySettings && !hasLegacyAddonOrderIntent && !overridingLegacySource
@@ -810,6 +816,7 @@ actor VortxNativeSession {
     }
     @discardableResult func dispatch(_ actions: [String], now: UInt64, legacyMaterial: Data? = nil,
                                     hostRemote: VortxJSON? = nil, hostEdits: [VortxNativeHostPreferences.Edit] = [],
+                                    legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                                     websiteEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                                     sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) throws -> [String] {
         guard !closed else { throw VortxNativeError.closed }
@@ -832,6 +839,10 @@ actor VortxNativeSession {
         var candidateHost = hostPreferences
         try candidateHost.retainAuthenticatedSourceArchive(authenticatedSourceArchive)
         try candidateHost.merge(hostRemote, scope: scope)
+        for (profile, entries) in legacyWatchlists {
+            guard let record = state["roster"]?["profiles"]?[profile.uuidString], record["deleted"] != .bool(true) else { throw VortxNativeError.invalidSnapshot }
+            try VortxNativeWatchlist.seed(entries, profileID: profile, into: &candidateHost)
+        }
         for edit in hostEdits {
             if let profile = edit.profileID {
                 guard let record = state["roster"]?["profiles"]?[profile], record["deleted"] != .bool(true) else { throw VortxNativeError.invalidSnapshot }

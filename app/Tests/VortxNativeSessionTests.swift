@@ -111,6 +111,12 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: true, hasLegacyAddonOrderIntent: false))
         check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: true))
         check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: false, overridingLegacySource: true))
+        for key in ["vortx.watchlist", "vortx.watchlist.00000000-0000-0000-0000-00000000A11C", "future.unknown.setting"] {
+            check(!VortxNativeSyncExportPolicy.acknowledgesSetting(key, syncable: true, profileProjection: false, projectionAcknowledged: false))
+        }
+        check(VortxNativeSyncExportPolicy.acknowledgesSetting("vortx.quickViewEnabled", syncable: true, profileProjection: false, projectionAcknowledged: false))
+        check(!VortxNativeSyncExportPolicy.acknowledgesSetting("profile-field", syncable: true, profileProjection: true, projectionAcknowledged: false))
+        check(VortxNativeSyncExportPolicy.acknowledgesSetting("profile-field", syncable: true, profileProjection: true, projectionAcknowledged: true))
         let scope = VortxAccountScope(account: "account-a", ownerProfileID: "owner")
         let actorA = "00000000-0000-0000-0000-000000000001", actorB = "00000000-0000-0000-0000-000000000002"
         var hostA = try VortxNativeHostPreferences(scope: scope, actor: actorA)
@@ -138,6 +144,35 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         try homePreference.merge(homePeer.document, scope: scope)
         check(try homePreference.document["globals"]?["fields"]?["vortx.mergeHomeDiscover"]?["value"] == .null) // Clear restores UI default.
         do { try homePeer.edit(profileID: nil, fields: ["vortx.mergeHomeDiscover": .integer(1)], scope: scope); fatalError("home/discover accepted non-Bool") } catch VortxNativeError.invalidSnapshot {}
+        for key in ["vortx.quickViewEnabled", "vortx.cinema.quickView", "vortx.downloads.autoDeleteWatched"] {
+            check(try homePeer.document["globals"]?["fields"]?[key] == nil)
+            try homePeer.edit(profileID: nil, fields: [key: .bool(false)], scope: scope)
+            do { try homePeer.edit(profileID: nil, fields: [key: .integer(0)], scope: scope); check(false) } catch VortxNativeError.invalidSnapshot {}
+        }
+        let watchProfile = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
+        var watchA = try VortxNativeHostPreferences(scope: scope, actor: actorA)
+        var watchB = try VortxNativeHostPreferences(scope: scope, actor: actorB)
+        let movie = VortxNativeWatchlist.Entry(id: "tt123", type: "movie", name: "Saved", poster: nil, addedAt: 123.25)
+        let series = VortxNativeWatchlist.Entry(id: "tt123", type: "series", name: nil, poster: nil, addedAt: 124)
+        let movieKey = try VortxNativeWatchlist.field(id: movie.id, type: movie.type)
+        let seriesKey = try VortxNativeWatchlist.field(id: series.id, type: series.type)
+        check(movieKey == "watchlist.movie.dHQxMjM" && movieKey != seriesKey)
+        try watchA.edit(profileID: watchProfile.uuidString, fields: [movieKey: VortxNativeWatchlist.value(movie)], scope: scope)
+        try watchB.edit(profileID: watchProfile.uuidString, fields: [seriesKey: VortxNativeWatchlist.value(series)], scope: scope)
+        try watchA.merge(watchB.document, scope: scope)
+        check(try VortxNativeWatchlist.entries(host: watchA.document, profileID: watchProfile).count == 2)
+        try watchA.edit(profileID: watchProfile.uuidString, fields: [movieKey: .null], scope: scope)
+        try watchA.merge(watchB.document, scope: scope)
+        try VortxNativeWatchlist.seed([movie], profileID: watchProfile, into: &watchA)
+        check(try VortxNativeWatchlist.entries(host: watchA.document, profileID: watchProfile) == [series])
+        check(try watchA.document["profiles"]?[watchProfile.uuidString]?["fields"]?[movieKey]?["value"] == .null)
+        var baselineWatch = try VortxNativeHostPreferences(scope: scope, actor: actorA)
+        try VortxNativeWatchlist.seed([movie], profileID: watchProfile, into: &baselineWatch)
+        check(baselineWatch.local.counter == 0 && baselineWatch.local.document.profiles[watchProfile.uuidString]?.fields[movieKey]?.clock == 0)
+        let beforeBadWatch = try watchA.encoded()
+        do { try watchA.edit(profileID: watchProfile.uuidString, fields: [movieKey: .object(["id": .string("ttOther")])], scope: scope); check(false) } catch {}
+        check(try watchA.encoded() == beforeBadWatch)
+        check(try VortxNativeWatchlist.entries(host: watchA.document, profileID: UUID()).isEmpty)
         var credentials = try VortxNativeProviderCredentials(scope: scope.account, actor: actorA)
         try credentials.edit(["tmdb": .string("fixture-nonproduction")])
         let sentCredentials = credentials.local.pending

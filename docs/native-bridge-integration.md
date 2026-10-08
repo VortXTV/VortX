@@ -251,3 +251,25 @@ same state when they cannot yet reach the picker.
 `scripts/test-native-own-account-producer.sh` with the frozen actual ABI additionally tests draft
 crash/reopen, no fabricated checkpoint/locator, cancelled and stale draft writes, exact cold replay,
 foreign-account refusal, and FIFO source-sidecar retirement. No live provider requests are made.
+
+## Native Watchlist host registers
+
+Watchlist is a separate want-to-watch ledger, never an engine-library mutation. Host schema 1
+stores each item at `profiles[UUID].fields["watchlist.<type>.<id>"]`, where type is `movie` or
+`series` and id is canonical unpadded base64url of the UTF-8 catalog id. A live register value is
+`{id,type,name?,poster?,addedAt}` with finite nonnegative epoch **seconds**; null is an explicit
+retained removal. The normal host Lamport clock/actor comparison applies independently per item.
+Local additions at 1,000 live entries refuse without evicting older entries. Larger peer unions
+remain visible and removals remain possible; tombstones are not pruned to satisfy a display cap.
+
+Only an authenticated account's profile-qualified legacy settings array seeds missing registers,
+at clock 0 / all-zero UUID actor, inside the accepted candidate after merging remote host state.
+Existing live registers and tombstones always win over that old array. Unqualified local arrays,
+unknown-profile or malformed old arrays, and unknown dirty settings remain preserved and visibly
+unsynchronized. They neither acquire a fabricated account attribution nor block unrelated supported
+settings; successful uploads clear only dirty keys actually represented by the native export.
+
+The acknowledged Watchlist API requires `PlaybackMutationTarget` captured synchronously at the
+gesture, before any Task is scheduled. Legacy synchronous mutators cannot bypass native admission.
+The Apple `vortx.quickViewEnabled` and Android `vortx.cinema.quickView` Boolean preferences retain
+their separate names and defaults; accepting both does not synthesize an alias edit or clock.

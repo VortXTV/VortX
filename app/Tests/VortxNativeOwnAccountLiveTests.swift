@@ -520,6 +520,21 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
         check(try VortxNativeWatchedArchive.entries(persisted, key: VortxNativeWatchedArchive.evidenceKey) == complete.archives)
         check(try VortxNativeWatchedArchive.pendingProfileIDs(persisted).isEmpty)
         let facade = try await VortxNativeCoreFacade.create(session: session, registry: []) { _ in }
+        let watch = VortxNativeWatchlist.Entry(id: "tt987", type: "movie", name: "Watch later", poster: nil, addedAt: 10.125)
+        let watchKey = try VortxNativeWatchlist.field(id: watch.id, type: watch.type)
+        _ = try await facade.mergeAccountDocument(nil, hostRemote: nil, legacyMaterial: nil, legacyWatchlists: [owner.id: [watch]])
+        check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: owner.id) == [watch])
+        let libraryBeforeWatch = facade.profileSnapshot()!.state["libraries"]
+        try await facade.mutateProfiles([], hostEdits: [.init(profileID: owner.id.uuidString, fields: [watchKey: .null])],
+            expectedProfileID: owner.id.uuidString, expectedAccountGeneration: facade.accountGeneration)
+        _ = try await facade.mergeAccountDocument(nil, hostRemote: nil, legacyMaterial: nil, legacyWatchlists: [owner.id: [watch]])
+        check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: owner.id).isEmpty)
+        check(facade.profileSnapshot()!.state["libraries"] == libraryBeforeWatch)
+        let watchHostBeforeFailure = try store.readHostPreferences(scope: scope)
+        do { try await facade.mutateProfiles([], hostEdits: [.init(profileID: owner.id.uuidString, fields: [watchKey: VortxNativeWatchlist.value(watch)])],
+            expectedProfileID: owner.id.uuidString, expectedAccountGeneration: UUID()); check(false) } catch VortxNativeError.superseded {}
+        check(try store.readHostPreferences(scope: scope) == watchHostBeforeFailure)
+        print("Watchlist actual C: authenticated absent-register seed, durable per-item removal, stale legacy replay refusal, untouched engine library and stale-epoch checkpoint rejection passed")
         let fence = facade.captureSourceFence()
         let stale = VortxNativeOwnAccountProducer.Authority(generations: [], validate: fence)
         let otherDocument = try VortxNativeBootstrapArchive.credentialFreeDocument(["vortx": ["library": [["id": "tt2934286", "type": "series", "watched": "tt2934286:1:5:5:eJyTZwAAAEAAIA=="]], "addons": []]])

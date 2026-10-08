@@ -152,9 +152,15 @@ enum LibraryAutoAdd {
 
     /// The active profile's watchlist, newest-add first. Fail-soft: a missing / garbled value reads as empty.
     static func watchlist() -> [WatchlistEntry] {
+#if VORTX_NATIVE_DATA_ENGINE
+        return ((try? CoreBridge.shared.nativeWatchlist()) ?? []).map {
+            WatchlistEntry(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, addedAt: $0.addedAt)
+        }
+#else
         guard let data = UserDefaults.standard.data(forKey: watchlistKey()),
               let entries = try? JSONDecoder().decode([WatchlistEntry].self, from: data) else { return [] }
         return entries.sorted { $0.addedAt > $1.addedAt }
+#endif
     }
 
     private static func saveWatchlist(_ entries: [WatchlistEntry]) {
@@ -167,10 +173,34 @@ enum LibraryAutoAdd {
     }
 
     /// Whether a title is on the active profile's watchlist. Cheap enough for a button to read directly.
-    static func isWatchlisted(_ id: String) -> Bool {
+    static func isWatchlisted(_ id: String, type: String? = nil) -> Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        return watchlist().contains { $0.id == id && (type == nil || $0.type == type) }
+#else
         guard let data = UserDefaults.standard.data(forKey: watchlistKey()),
               let entries = try? JSONDecoder().decode([WatchlistEntry].self, from: data) else { return false }
-        return entries.contains { $0.id == id }
+        return entries.contains { $0.id == id && (type == nil || $0.type == type) }
+#endif
+    }
+    /// Target must be captured synchronously at the user gesture, before scheduling a Task.
+    static func toggleWatchlistAcknowledged(id: String, type: String, name: String? = nil, poster: String? = nil,
+                                            target: PlaybackMutationTarget) async throws -> Bool {
+        guard target.stillOwnsCurrentContext(core: CoreBridge.shared) else { throw VortxNativeError.superseded }
+        let capturedProfile: UUID?
+        switch target {
+        case .overlay(let id): capturedProfile = id
+        case .engine(let id, _, _, _): capturedProfile = id
+        case .native(let binding): capturedProfile = binding?.profileID
+        }
+        guard let capturedProfile, ProfileStore.shared.activeID == capturedProfile else { throw VortxNativeError.superseded }
+#if VORTX_NATIVE_DATA_ENGINE
+        let normalizedType = type == "series" ? "series" : "movie"
+        let present = !isWatchlisted(id, type: normalizedType)
+        let entry = VortxNativeWatchlist.Entry(id: id, type: normalizedType, name: name, poster: poster, addedAt: Date().timeIntervalSince1970)
+        return try await CoreBridge.shared.setNativeWatchlist(entry, present: present, target: target)
+#else
+        return toggleWatchlist(id: id, type: type, name: name, poster: poster)
+#endif
     }
 
     /// Add a title to the watchlist. Engine-safe ids ONLY (a synthetic magnet / paste-a-link id is rejected so
@@ -178,6 +208,9 @@ enum LibraryAutoAdd {
     /// is left untouched. Returns true only when it actually added a new entry.
     @discardableResult
     static func addToWatchlist(id: String, type: String, name: String? = nil, poster: String? = nil) -> Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        return false // Synchronous admission is not a durable native acknowledgement.
+#else
         guard id.hasPrefix("tt") || id.hasPrefix("tmdb") else { return false }
         var entries = watchlist()
         guard !entries.contains(where: { $0.id == id }) else { return false }
@@ -187,24 +220,33 @@ enum LibraryAutoAdd {
         saveWatchlist(entries)
         NSLog("[watchlist] added %@ (%@)", id, normalizedType)
         return true
+#endif
     }
 
     /// Remove a title from the watchlist (no-op if it was not on it).
     static func removeFromWatchlist(_ id: String) {
+#if VORTX_NATIVE_DATA_ENGINE
+        return // Native removals require the captured async transaction above.
+#else
         var entries = watchlist()
         let before = entries.count
         entries.removeAll { $0.id == id }
         guard entries.count != before else { return }
         saveWatchlist(entries)
         NSLog("[watchlist] removed %@", id)
+#endif
     }
 
     /// Flip a title's watchlist membership. Returns the NEW state (true = now on the watchlist), so a button can
     /// set its own filled / outline state straight from the return value without a second `isWatchlisted` read.
     @discardableResult
     static func toggleWatchlist(id: String, type: String, name: String? = nil, poster: String? = nil) -> Bool {
+#if VORTX_NATIVE_DATA_ENGINE
+        return isWatchlisted(id, type: type)
+#else
         if isWatchlisted(id) { removeFromWatchlist(id); return false }
         return addToWatchlist(id: id, type: type, name: name, poster: poster)
+#endif
     }
 
     /// The watchlisted ids of one type ("series" / "movie"), for the Upcoming calendar's per-type fan-out.

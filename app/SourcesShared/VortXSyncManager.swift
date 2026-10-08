@@ -234,6 +234,8 @@ final class VortXSyncManager: ObservableObject {
     @Published private(set) var nativeOwnAccountResyncUnavailable: [UUID] = []
     @Published private(set) var nativeOwnAccountOverlayPending: [UUID] = []
     @Published private(set) var nativeWatchedMigrationPending: [UUID] = []
+    @Published private(set) var nativeUnsupportedSettings: [String] = []
+    private var nativeLegacyWatchlistPending = Set<String>()
     @Published private(set) var nativeOwnAccountOverlayUnattributed: [UUID] = []
     private var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
     private func nativeProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
@@ -420,6 +422,7 @@ final class VortXSyncManager: ObservableObject {
     }
     private func nativeGlobalEdits() throws -> [VortxNativeHostPreferences.Edit] {
         var fields: [String: VortxJSON] = [:]
+        var unsupported = Array(nativeLegacyWatchlistPending)
         for key in dirtySettings.keys {
             // Old installations can retain dirty stamps for values now explicitly device-local.
             // They neither enter a shared carrier nor prevent unrelated native state from syncing.
@@ -429,13 +432,52 @@ final class VortXSyncManager: ObservableObject {
                 guard ProfileStore.shared.nativePreferenceIsAcknowledged(key) else { throw VortxNativeError.invalidSnapshot }
                 continue
             }
-            guard VortxNativeHostPreferences.knownGlobals.contains(key) else { throw VortxNativeError.invalidSnapshot }
+            guard VortxNativeHostPreferences.knownGlobals.contains(key) else {
+                unsupported.append(key); continue // Retain dirty data; never acknowledge an unexported value.
+            }
             let object = UserDefaults.standard.object(forKey: key)
             let value = try object.map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0, options: .fragmentsAllowed)) } ?? .null
             guard VortxNativeHostPreferences.validGlobal(key, value: value) else { throw VortxNativeError.invalidSnapshot }
             fields[key] = value
         }
+        nativeUnsupportedSettings = Array(Set(unsupported)).sorted()
         return fields.isEmpty ? [] : [.init(profileID: nil, fields: fields)]
+    }
+    private func nativeLegacyWatchlists(_ document: [String: Any]) throws -> [UUID: [VortxNativeWatchlist.Entry]] {
+        guard let raw = document["settings"] else { return [:] }
+        guard let encoded = raw as? String, let bytes = Data(base64Encoded: encoded),
+              let roster = Self.resolveRoster(from: document, fullOnly: true) else { throw VortxNativeError.invalidSnapshot }
+        let domain = try SettingsBackup.decodeDomain(from: bytes)
+        var result: [UUID: [VortxNativeWatchlist.Entry]] = [:]
+        var pending = Set<String>()
+        for (key, raw) in domain where key == "vortx.watchlist" || key.hasPrefix("vortx.watchlist.") {
+            do {
+                guard let profile = roster.profiles.first(where: { key == "vortx.watchlist." + $0.id.uuidString }),
+                      let data = raw as? Data else { throw VortxNativeError.invalidSnapshot }
+                let entries = try JSONDecoder().decode([VortxNativeWatchlist.Entry].self, from: data)
+                guard entries.count <= VortxNativeWatchlist.displayCap else { throw VortxNativeError.invalidSnapshot }
+                var identities = Set<String>()
+                for entry in entries {
+                    let field = try VortxNativeWatchlist.field(id: entry.id, type: entry.type)
+                    _ = try VortxNativeWatchlist.value(entry)
+                    guard identities.insert(field).inserted else { throw VortxNativeError.invalidSnapshot }
+                }
+                result[profile.id] = entries
+            } catch {
+                // Keep the original authenticated settings blob unchanged. An unqualified,
+                // malformed or unknown-profile ledger does not authorize an empty replacement.
+                pending.insert(key)
+            }
+        }
+        nativeLegacyWatchlistPending = pending
+        nativeUnsupportedSettings = Array(pending.union(dirtySettings.keys.filter { !nativeDirtySettingIsExported($0) })).sorted()
+        return result
+    }
+    private func nativeDirtySettingIsExported(_ key: String) -> Bool {
+        VortxNativeSyncExportPolicy.acknowledgesSetting(key, syncable: SettingsBackup.isSyncable(key),
+            profileProjection: ProfileStore.nativePlaybackProjectionKeys.contains(key) || ProfileStore.nativeThemeProjectionKeys.contains(key)
+                || ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key),
+            projectionAcknowledged: ProfileStore.shared.nativePreferenceIsAcknowledged(key))
     }
     private func applyNativeGlobals(_ host: VortxJSON) {
         guard case .object(let fields) = host["globals"]?["fields"] else { return }
@@ -808,6 +850,7 @@ final class VortXSyncManager: ObservableObject {
             return await pending.value
         }
         let generation = UUID(); nativeCheckpointGeneration = generation; nativeProfileEditConflicts = []; nativeOwnAccountResyncUnavailable = []; nativeOwnAccountOverlayPending = []; nativeOwnAccountOverlayUnattributed = []; nativeWatchedMigrationPending = []
+        nativeUnsupportedSettings = []; nativeLegacyWatchlistPending = []
         let previous = nativeCheckpointTask; previous?.cancel(); _ = await previous?.value
         guard isCurrent(capture), nativeCheckpointGeneration == generation else { return false }
         nativeCheckpointCapture = capture; nativeCheckpointProfile = selectedProfile
@@ -904,11 +947,12 @@ final class VortXSyncManager: ObservableObject {
                                                     initialLegacyMaterial: !hadCheckpoint && remoteNative != nil ? material : nil)
                 do {
                     let hostRemote = try document["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+                    let watchlists = try self.nativeLegacyWatchlists(document)
                     let websiteEvents = try Self.nativeWebsiteEvents(document)
-                    if hadCheckpoint || remoteNative != nil || hostRemote != nil || !websiteEvents.isEmpty {
+                    if hadCheckpoint || remoteNative != nil || hostRemote != nil || !websiteEvents.isEmpty || !watchlists.isEmpty {
                         let action = remoteNative.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) } ?? .object(["type": .string("get_state")])
                         _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: material, hostRemote: hostRemote,
-                            websiteEvents: websiteEvents, websiteBaseline: VortxNativeProfileEditHost.baselines(roster.profiles),
+                            legacyWatchlists: watchlists, websiteEvents: websiteEvents, websiteBaseline: VortxNativeProfileEditHost.baselines(roster.profiles),
                             sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
                     }
                     guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
@@ -1183,6 +1227,9 @@ final class VortXSyncManager: ObservableObject {
     /// it is a `vortx.sync.` UserDefaults write and must not arm a self-echo push.
     private func clearPushedDirtySettings(_ snapshot: [String: Double]) {
         guard !snapshot.isEmpty else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        let snapshot = snapshot.filter { nativeDirtySettingIsExported($0.key) }
+#endif
         withRemoteApplySuppressed {
             var dirty = dirtySettings
             SettingsDirtyKeys.clearPushed(snapshot, from: &dirty)
@@ -1581,6 +1628,7 @@ final class VortXSyncManager: ObservableObject {
         nativeOwnAccountResyncUnavailable = []
         nativeOwnAccountOverlayPending = []
         nativeWatchedMigrationPending = []
+        nativeUnsupportedSettings = []; nativeLegacyWatchlistPending = []
         nativeOwnAccountOverlayUnattributed = []
 #endif
         if case .account = scope { CoreBridge.excludeAccountHistoryFromGuestRecommendations() }
@@ -1610,6 +1658,7 @@ final class VortXSyncManager: ObservableObject {
         nativeOwnAccountResyncUnavailable = []
         nativeOwnAccountOverlayPending = []
         nativeWatchedMigrationPending = []
+        nativeUnsupportedSettings = []; nativeLegacyWatchlistPending = []
         nativeOwnAccountOverlayUnattributed = []
 #endif
         if case .account = scope { CoreBridge.excludeAccountHistoryFromGuestRecommendations() }
@@ -2969,7 +3018,7 @@ final class VortXSyncManager: ObservableObject {
             let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
             let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
             let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture,
-                                                                               legacyMaterial: prepared.material, hostEdits: nativeGlobalEdits(), websiteEvents: Self.nativeWebsiteEvents(doc),
+                                                                               legacyMaterial: prepared.material, hostEdits: nativeGlobalEdits(), websiteEvents: Self.nativeWebsiteEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc),
                                                                                sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
             guard isCurrent(capture) else { return nil }
             doc["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["nativeSync"]!))
@@ -3271,7 +3320,7 @@ final class VortXSyncManager: ObservableObject {
                 let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                 let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                 let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture, legacyMaterial: material,
-                    websiteEvents: Self.nativeWebsiteEvents(doc), sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
+                    websiteEvents: Self.nativeWebsiteEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc), sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
                 guard isCurrent(capture) else { return false }
                 applyNativeGlobals(merged["nativeHostPreferences"]!)
                 try publishNativeWebsiteOutcome(merged["profileEditResults"]!, capture: capture)
