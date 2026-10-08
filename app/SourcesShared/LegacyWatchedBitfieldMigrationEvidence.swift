@@ -8,7 +8,7 @@ import CryptoKit
 /// where the existing explicit clocked marks win. The caller supplies its already-captured,
 /// authenticated document and uses the injected fetcher for exactly one original-addon meta call.
 enum LegacyWatchedBitfieldMigrationEvidence {
-    private static let ownerProfileID = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
+    private static let legacyOwnerProfileID = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
     enum Failure: Error, Equatable {
         case malformed(String)
         case admissionRevoked
@@ -17,14 +17,21 @@ enum LegacyWatchedBitfieldMigrationEvidence {
     struct Scope: Equatable, Sendable {
         let accountID: String
         let profileID: UUID
+        /// Resolved from the captured authenticated roster, never an implicit fixed owner.
+        let ownerProfileID: UUID
         /// Required only for an independently authenticated own-account source.
         let verifiedStreamingUID: String?
 
-        init(accountID: String, profileID: UUID, verifiedStreamingUID: String? = nil) throws {
-            guard !accountID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw Failure.malformed("Missing account scope") }
+        init(accountID: String, profileID: UUID, verifiedStreamingUID: String? = nil, ownerProfileID: UUID) throws {
+            func validIdentity(_ value: String) -> Bool {
+                !value.isEmpty && value.utf8.count <= 256 && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    && !value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+            }
+            guard validIdentity(accountID), verifiedStreamingUID.map(validIdentity) ?? true else { throw Failure.malformed("Missing account scope") }
             self.accountID = accountID
             self.profileID = profileID
-            self.verifiedStreamingUID = verifiedStreamingUID?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            self.ownerProfileID = ownerProfileID
+            self.verifiedStreamingUID = verifiedStreamingUID
         }
     }
 
@@ -34,14 +41,27 @@ enum LegacyWatchedBitfieldMigrationEvidence {
         case authenticatedOwnerLibrary(index: Int)
         case authenticatedLegacyRootLibrary(index: Int)
         case authenticatedProfileLibrary(index: Int)
+        case authenticatedOwnerHistory(sourceProfileID: String, index: Int)
         case ownAccountLibraryResponse(index: Int)
+        case ownAccountProfileLibrary(index: Int)
+        case ownAccountOwnerHistory(index: Int)
 
         var pointer: String {
             switch self {
             case .authenticatedOwnerLibrary(let index): return "/vortx/library/\(index)"
             case .authenticatedLegacyRootLibrary(let index): return "/library/\(index)"
             case .authenticatedProfileLibrary(let index): return "/vortx/byProfile/<captured-profile>/library/\(index)"
+            case .authenticatedOwnerHistory(let sourceProfileID, let index): return "/vortx/byProfile/\(sourceProfileID)/ownerHistory/\(index)"
             case .ownAccountLibraryResponse(let index): return "/libraryResponseBase64/result/\(index)"
+            case .ownAccountProfileLibrary(let index): return "/profileOverlayBase64/vortx/byProfile/<captured-profile>/library/\(index)"
+            case .ownAccountOwnerHistory(let index): return "/profileOverlayBase64/vortx/byProfile/<captured-profile>/ownerHistory/\(index)"
+            }
+        }
+
+        var isOwnAccount: Bool {
+            switch self {
+            case .ownAccountLibraryResponse, .ownAccountProfileLibrary, .ownAccountOwnerHistory: return true
+            default: return false
             }
         }
     }
@@ -103,23 +123,48 @@ enum LegacyWatchedBitfieldMigrationEvidence {
                         addon: AuthorizedAddon, isCurrent: @escaping @Sendable () -> Bool,
                         fetch: MetadataFetcher) async throws -> Evidence {
         guard isCurrent() else { throw Failure.admissionRevoked }
-        let sourceTree = try StrictJSON.value(source)
-        if case .ownAccountLibraryResponse = rowLocator { try requireOwnEnvelope(sourceTree) }
-        let row = try sourceRow(sourceTree, scope: scope, locator: rowLocator)
-        guard row.type == "series", !row.metaID.isEmpty, !row.watchedBitfield.isEmpty else {
-            throw Failure.malformed("Source row is not a watched series")
-        }
+        let (sourceTree, row) = try checkedSource(scope: scope, source: source, rowLocator: rowLocator)
         try requireOriginalAddon(sourceTree, locator: rowLocator, expected: addon)
 
         let request = MetadataRequest(scope: scope, addon: addon, type: "series", metaID: row.metaID)
         let response = try await fetch(request)
         guard isCurrent() else { throw Failure.admissionRevoked }
         guard sameRequest(response.request, request) else { throw Failure.malformed("Metadata response belongs to another request") }
-        let inventory = try inventory(response.raw, requestedID: row.metaID)
+        return try replay(scope: scope, source: source, rowLocator: rowLocator, addon: addon, metadata: response.raw, isCurrent: isCurrent)
+    }
+
+    /// Replays the same strict validator over exact archived bytes. No stored decoded IDs, clocks,
+    /// projected inventory or caller-constructed Evidence can bypass source/descriptor validation.
+    static func replay(scope: Scope, source: Data, rowLocator: SourceRowLocator, addon: AuthorizedAddon,
+                       metadata: Data, isCurrent: @escaping @Sendable () -> Bool) throws -> Evidence {
+        guard isCurrent() else { throw Failure.admissionRevoked }
+        let (sourceTree, row) = try checkedSource(scope: scope, source: source, rowLocator: rowLocator)
+        try requireOriginalAddon(sourceTree, locator: rowLocator, expected: addon)
+        let inventory = try inventory(metadata, requestedID: row.metaID)
         let watched = try LegacyWatchedBitfieldDecoder.decode(serialized: row.watchedBitfield, inventory: inventory)
+        guard isCurrent() else { throw Failure.admissionRevoked }
         return Evidence(scope: scope, rowLocator: rowLocator, metaID: row.metaID, watchedBitfield: row.watchedBitfield,
-                        addon: addon, source: source, sourceSHA256: sha256(source), metadata: response.raw,
-                        metadataSHA256: sha256(response.raw), inventory: inventory, watchedVideoIDs: watched)
+                        addon: addon, source: source, sourceSHA256: sha256(source), metadata: metadata,
+                        metadataSHA256: sha256(metadata), inventory: inventory, watchedVideoIDs: watched)
+    }
+
+    /// Pending evidence still proves which original bitmap was left unresolved, even when no
+    /// original add-on can supply metadata. It grants no decoded watch facts.
+    static func validateSource(scope: Scope, source: Data, rowLocator: SourceRowLocator) throws {
+        _ = try checkedSource(scope: scope, source: source, rowLocator: rowLocator)
+    }
+
+    private static func checkedSource(scope: Scope, source: Data, rowLocator: SourceRowLocator) throws -> (StrictJSON.Value, SourceRow) {
+        let sourceTree = try StrictJSON.value(source)
+        if rowLocator.isOwnAccount {
+            guard scope.verifiedStreamingUID != nil, scope.profileID != scope.ownerProfileID else { throw Failure.malformed("Own source requires verified secondary streaming identity") }
+            try requireOwnEnvelope(sourceTree)
+        } else {
+            guard scope.verifiedStreamingUID == nil else { throw Failure.malformed("Shared source cannot claim an own identity") }
+        }
+        let row = try sourceRow(sourceTree, scope: scope, locator: rowLocator)
+        guard row.type == "series", !row.metaID.isEmpty, !row.watchedBitfield.isEmpty else { throw Failure.malformed("Source row is not a watched series") }
+        return (sourceTree, row)
     }
 
     private struct SourceRow { let metaID: String; let type: String; let watchedBitfield: String }
@@ -128,19 +173,26 @@ enum LegacyWatchedBitfieldMigrationEvidence {
         let rootObject = try strictObject(root)
         switch locator {
         case .authenticatedOwnerLibrary(let index):
-            guard index >= 0, scope.profileID == ownerProfileID else { throw Failure.malformed("Owner source requires owner scope") }
+            guard index >= 0, scope.profileID == scope.ownerProfileID else { throw Failure.malformed("Owner source requires owner scope") }
             let vortx = try strictObject(strictValue(rootObject, "vortx"))
             let rows = try strictArray(strictValue(vortx, "library"))
             return try sharedRow(rows, index: index)
         case .authenticatedLegacyRootLibrary(let index):
-            guard index >= 0, scope.profileID == ownerProfileID else { throw Failure.malformed("Owner source requires owner scope") }
+            guard index >= 0, scope.profileID == scope.ownerProfileID else { throw Failure.malformed("Owner source requires owner scope") }
             return try sharedRow(try strictArray(strictValue(rootObject, "library")), index: index)
         case .authenticatedProfileLibrary(let index):
             guard index >= 0 else { throw Failure.malformed("Invalid source row index") }
             let vortx = try strictObject(strictValue(rootObject, "vortx"))
             let profiles = try strictObject(strictValue(vortx, "byProfile"))
-            let bucket = try strictObject(strictValue(profiles, scope.profileID.uuidString))
+            let bucket = try profileBucket(profiles, id: scope.profileID)
             return try sharedRow(try strictArray(strictValue(bucket, "library")), index: index)
+        case .authenticatedOwnerHistory(let sourceProfileID, let index):
+            guard index >= 0, scope.profileID == scope.ownerProfileID, let id = UUID(uuidString: sourceProfileID),
+                  id == scope.ownerProfileID || id == legacyOwnerProfileID else { throw Failure.malformed("History source requires resolved owner scope") }
+            let vortx = try strictObject(strictValue(rootObject, "vortx"))
+            let profiles = try strictObject(strictValue(vortx, "byProfile"))
+            let bucket = try profileBucket(profiles, id: id, exactKey: sourceProfileID)
+            return try sharedRow(try strictArray(strictValue(bucket, "ownerHistory")), index: index)
         case .ownAccountLibraryResponse(let index):
             guard index >= 0, scope.verifiedStreamingUID != nil else { throw Failure.malformed("Own source requires verified streaming identity") }
             let envelope = try strictObject(try StrictJSON.value(try strictEnvelopeBytes(rootObject, "libraryResponseBase64")))
@@ -149,7 +201,30 @@ enum LegacyWatchedBitfieldMigrationEvidence {
             let rowObject = try strictObject(row)
             let state = try strictObject(strictValue(rowObject, "state"))
             return SourceRow(metaID: try strictString(rowObject.value("_id")), type: try strictString(rowObject.value("type")), watchedBitfield: try strictString(state.value("watched")))
+        case .ownAccountProfileLibrary(let index), .ownAccountOwnerHistory(let index):
+            guard index >= 0 else { throw Failure.malformed("Invalid source row index") }
+            let overlay = try strictObject(try StrictJSON.value(try strictEnvelopeBytes(rootObject, "profileOverlayBase64")))
+            let vortx = try strictObject(strictValue(overlay, "vortx"))
+            let profiles = try strictObject(strictValue(vortx, "byProfile"))
+            guard profiles.members.count == 1 else { throw Failure.malformed("Own overlay must contain exactly its profile") }
+            let bucket = try profileBucket(profiles, id: scope.profileID, exactKey: scope.profileID.uuidString)
+            let carrier: String
+            if case .ownAccountOwnerHistory = locator { carrier = "ownerHistory" } else { carrier = "library" }
+            return try sharedRow(try strictArray(strictValue(bucket, carrier)), index: index)
         }
+    }
+
+    private static func profileBucket(_ profiles: StrictJSON.Object, id: UUID, exactKey: String? = nil) throws -> StrictJSON.Object {
+        var seen = Set<UUID>()
+        var selected: StrictJSON.Value?
+        for member in profiles.members {
+            guard let profile = UUID(uuidString: member.key), seen.insert(profile).inserted else { throw Failure.malformed("Ambiguous profile source identity") }
+            if profile == id {
+                guard exactKey == nil || exactUTF8(member.key, exactKey!) else { throw Failure.malformed("Source profile locator mismatch") }
+                selected = member.value
+            }
+        }
+        return try strictObject(selected)
     }
 
     private static func requireOwnEnvelope(_ source: StrictJSON.Value) throws {
@@ -173,9 +248,31 @@ enum LegacyWatchedBitfieldMigrationEvidence {
 
     private static func requireOriginalAddon(_ root: StrictJSON.Value, locator: SourceRowLocator,
                                              expected: AuthorizedAddon) throws {
+        let expectedManifest = try StrictJSON.value(expected.manifest)
+        let matches = try sourceDescriptors(root, locator: locator).filter { raw in
+            let descriptor = try strictObject(raw)
+            guard exactUTF8(try strictString(descriptor.value("transportUrl")), expected.transportURL) else { return false }
+            return descriptor.value("manifest") == expectedManifest
+        }
+        guard matches.count == 1 else { throw Failure.malformed("Original add-on descriptor is absent or ambiguous") }
+    }
+
+    /// Preserve all scalar spelling from the strict tree, including manifest numeric lexemes.
+    /// Foundation's dictionary projection is never a replacement descriptor identity witness.
+    static func originalAddons(source: Data, rowLocator: SourceRowLocator) throws -> [AuthorizedAddon] {
+        let root = try StrictJSON.value(source)
+        if rowLocator.isOwnAccount { try requireOwnEnvelope(root) }
+        return try sourceDescriptors(root, locator: rowLocator).map { raw in
+            let descriptor = try strictObject(raw)
+            let manifest = try strictValue(descriptor, "manifest")
+            return try AuthorizedAddon(transportURL: strictString(descriptor.value("transportUrl")), manifest: StrictJSON.serialize(manifest))
+        }
+    }
+
+    private static func sourceDescriptors(_ root: StrictJSON.Value, locator: SourceRowLocator) throws -> [StrictJSON.Value] {
         let rootObject = try strictObject(root)
         let descriptors: [StrictJSON.Value]
-        if case .ownAccountLibraryResponse = locator {
+        if locator.isOwnAccount {
             let envelope = try StrictJSON.value(try strictEnvelopeBytes(rootObject, "addonsResponseBase64"))
             let result = try strictObject(strictValue(try strictObject(envelope), "result"))
             descriptors = try strictArray(strictValue(result, "addons"))
@@ -192,13 +289,7 @@ enum LegacyWatchedBitfieldMigrationEvidence {
             }
             descriptors = vortxDescriptors + (try optionalStrictArray(rootObject.value("addons")))
         }
-        let expectedManifest = try StrictJSON.value(expected.manifest)
-        let matches = try descriptors.filter { raw in
-            let descriptor = try strictObject(raw)
-            guard exactUTF8(try strictString(descriptor.value("transportUrl")), expected.transportURL) else { return false }
-            return descriptor.value("manifest") == expectedManifest
-        }
-        guard matches.count == 1 else { throw Failure.malformed("Original add-on descriptor is absent or ambiguous") }
+        return descriptors
     }
 
     private static func inventory(_ raw: Data, requestedID: String) throws -> [LegacyWatchedBitfieldEpisode] {
@@ -357,6 +448,7 @@ enum LegacyWatchedBitfieldMigrationEvidence {
     private static func exactUTF8(_ lhs: String, _ rhs: String) -> Bool { Data(lhs.utf8) == Data(rhs.utf8) }
     private static func sameRequest(_ lhs: MetadataRequest, _ rhs: MetadataRequest) -> Bool {
         lhs.scope.profileID == rhs.scope.profileID && exactUTF8(lhs.scope.accountID, rhs.scope.accountID) &&
+            lhs.scope.ownerProfileID == rhs.scope.ownerProfileID &&
             optionalUTF8(lhs.scope.verifiedStreamingUID, rhs.scope.verifiedStreamingUID) &&
             exactUTF8(lhs.addon.transportURL, rhs.addon.transportURL) && lhs.addon.manifest == rhs.addon.manifest &&
             exactUTF8(lhs.type, rhs.type) && exactUTF8(lhs.metaID, rhs.metaID)
@@ -402,6 +494,29 @@ private enum StrictJSON {
 
     static func validate(_ data: Data) throws {
         _ = try value(data)
+    }
+
+    static func serialize(_ value: Value) throws -> Data {
+        switch value {
+        case .object(let object):
+            var data = Data("{".utf8)
+            for (index, member) in object.members.enumerated() {
+                if index > 0 { data.append(44) }
+                data.append(try serialize(.string(member.key))); data.append(58)
+                data.append(try serialize(member.value))
+            }
+            data.append(125); return data
+        case .array(let values):
+            var data = Data("[".utf8)
+            for (index, value) in values.enumerated() {
+                if index > 0 { data.append(44) }; data.append(try serialize(value))
+            }
+            data.append(93); return data
+        case .string(let text): return try JSONSerialization.data(withJSONObject: text, options: [.fragmentsAllowed, .withoutEscapingSlashes])
+        case .number(let text): return Data(text.utf8)
+        case .bool(let value): return Data((value ? "true" : "false").utf8)
+        case .null: return Data("null".utf8)
+        }
     }
 
     static func value(_ data: Data) throws -> Value {

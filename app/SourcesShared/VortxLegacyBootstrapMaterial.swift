@@ -121,12 +121,20 @@ enum VortxLegacyBootstrapMaterial {
                        ownAccountSources: [OwnAccountSource] = [], retainedOwnAccountBaseline: Data? = nil,
                        retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope] = [],
                        retainedOwnAccountSlotBaselines: [RetainedOwnAccountSlotBaseline] = [],
-                       deferredOwnAccountOverlays: [RetainedOwnAccountOverlayDisposition] = []) throws -> Data {
+                       deferredOwnAccountOverlays: [RetainedOwnAccountOverlayDisposition] = [],
+                       accountID: String? = nil,
+                       watchedEvidence: [VortxLegacyWatchedMigration.ValidatedRow] = []) throws -> Data {
         guard let source = try? VortxProfileOverlayWitness.decodeObject(json: document) else {
             throw ReconciliationRequired(reason: "Account document must be an object")
         }
+        for row in watchedEvidence {
+            guard let accountID else { throw ReconciliationRequired(reason: "Watched evidence requires authenticated account scope") }
+            try row.validateSource(accountID: accountID, ownerProfileID: ownerProfileID, document: document,
+                                   roster: roster, ownAccountSources: ownAccountSources)
+        }
         let adapter = try Adapter(document: source, roster: roster, ownerID: ownerProfileID,
-                                  modified: rosterModifiedSeconds, deferProfileEdits: deferProfileEdits)
+                                  modified: rosterModifiedSeconds, deferProfileEdits: deferProfileEdits,
+                                  accountID: accountID, sourceSHA256: sha256(document), watchedEvidence: watchedEvidence)
         return try JSONSerialization.data(withJSONObject: adapter.build(ownAccountSources: ownAccountSources,
                                                                          retainedOwnAccountBaseline: retainedOwnAccountBaseline,
                                                                          retainedOwnAccountSourceEnvelopes: retainedOwnAccountSourceEnvelopes,
@@ -167,18 +175,28 @@ enum VortxLegacyBootstrapMaterial {
         let profiles: [String: UserProfile]
         let deferProfileEdits: Bool
         let independentSource: Bool
+        let accountID: String?
+        let sourceSHA256: String?
+        let verifiedStreamingUID: String?
+        let watchedEvidence: [VortxLegacyWatchedMigration.ValidatedRow]
         var deleted = Set<String>()
         var watches: [String: [Object]] = [:]
         var titles: [String: [String: Object]] = [:]
 
         init(document: Object, roster: [UserProfile], ownerID: UUID, modified: Double?,
-             deferProfileEdits: Bool, allowIndependentSource: Bool = false) throws {
+             deferProfileEdits: Bool, allowIndependentSource: Bool = false,
+             accountID: String? = nil, sourceSHA256: String? = nil, verifiedStreamingUID: String? = nil,
+             watchedEvidence: [VortxLegacyWatchedMigration.ValidatedRow] = []) throws {
             self.document = document
             self.vortx = try object(document, "vortx") ?? [:]
             self.roster = roster
             self.modified = modified
             self.deferProfileEdits = deferProfileEdits
             self.independentSource = allowIndependentSource
+            self.accountID = accountID
+            self.sourceSHA256 = sourceSHA256
+            self.verifiedStreamingUID = verifiedStreamingUID
+            self.watchedEvidence = watchedEvidence
             try require(!roster.isEmpty && Set(roster.map(\.id)).count == roster.count, "Duplicate or empty profile roster")
             let owners = roster.filter(\.isOwner)
             if allowIndependentSource {
@@ -232,7 +250,7 @@ enum VortxLegacyBootstrapMaterial {
             var identityLinks = Dictionary(uniqueKeysWithValues: roster.map { ($0.id.uuidString, [[String]]()) })
             var retainedWatchProfiles = Set<String>()
             for (profileID, source) in sources {
-                let buckets = try source.buckets()
+                let buckets = try source.buckets(accountID: accountID, watchedEvidence: watchedEvidence)
                 addonBuckets[profileID] = buckets.addons
                 libraryBuckets[profileID] = buckets.library
                 watches[profileID] = buckets.watches
@@ -328,7 +346,7 @@ enum VortxLegacyBootstrapMaterial {
             let retainedBuckets: OwnAccountBuckets?
             var isRetained: Bool { retainedBuckets != nil }
 
-            func buckets() throws -> OwnAccountBuckets {
+            func buckets(accountID: String?, watchedEvidence: [VortxLegacyWatchedMigration.ValidatedRow]) throws -> OwnAccountBuckets {
                 if let retainedBuckets { return retainedBuckets }
                 guard let sourceDocument else { throw fail("Missing own-account source material") }
                 // An independently authenticated account has the same root membership/history
@@ -336,7 +354,9 @@ enum VortxLegacyBootstrapMaterial {
                 // profile roster's account. Its envelope carries only the authenticated, exact
                 // UUID-scoped overlay slice when that profile has durable local intents.
                 let profile = UserProfile(id: UUID(uuidString: profileID)!, name: "Independent", avatar: "🍿")
-                let adapter = try Adapter(independentSource: sourceDocument, profile: profile)
+                let adapter = try Adapter(document: sourceDocument, roster: [profile], ownerID: profile.id, modified: nil,
+                    deferProfileEdits: false, allowIndependentSource: true, accountID: accountID,
+                    sourceSHA256: sourceDocumentSHA256, verifiedStreamingUID: verifiedStreamingUID, watchedEvidence: watchedEvidence)
                 adapter.watches[profileID] = []
                 adapter.titles[profileID] = [:]
                 let addons = try adapter.addonBucket()
@@ -905,7 +925,7 @@ enum VortxLegacyBootstrapMaterial {
             var items: [String: Object] = [:], intents: [String: Object] = [:]
             var removedRows = Set<String>(), publishedStamps = Set<String>()
             var seen = Set<String>()
-            for value in rows {
+            for (index, value) in rows.enumerated() {
                 guard let row = value as? Object else { throw fail("Malformed owner library row") }
                 let id = try string(row, "id"), type = try contentType(row)
                 try known(ownerID, id, row)
@@ -924,17 +944,23 @@ enum VortxLegacyBootstrapMaterial {
                     removedRows.insert(key)
                     if independentSource { intents[key] = ["key": key, "removedAtMs": 1.0] }
                 } else if !temporary { items[key] = item }
-                try importWatch(ownerID, id, row, history: false, overlay: false)
+                let locator: LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator = independentSource
+                    ? .ownAccountLibraryResponse(index: index)
+                    : (vortx["library"] is [Any] ? .authenticatedOwnerLibrary(index: index) : .authenticatedLegacyRootLibrary(index: index))
+                try importWatch(ownerID, id, row, history: false, overlay: false, locator: locator)
                 try importMarks(ownerID, id, row)
             }
-            if !independentSource {
+            do {
                 let buckets = try object(vortx, "byProfile") ?? [:]
                 for (rawID, value) in buckets where UUID(uuidString: rawID) == UserProfile.ownerID || UUID(uuidString: rawID) == owner.id {
                     guard let bucket = value as? Object else { throw fail("Malformed owner-history bucket") }
-                    for row in try objects(bucket, "ownerHistory") {
+                    for (index, row) in try objects(bucket, "ownerHistory").enumerated() {
                         let id = try string(row, "id")
                         try known(ownerID, id, row)
-                        try importWatch(ownerID, id, row, history: true, overlay: false)
+                        let locator: LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator = independentSource
+                            ? .ownAccountOwnerHistory(index: index)
+                            : .authenticatedOwnerHistory(sourceProfileID: rawID, index: index)
+                        try importWatch(ownerID, id, row, history: true, overlay: false, locator: locator)
                         try importMarks(ownerID, id, row)
                     }
                 }
@@ -1009,10 +1035,12 @@ enum VortxLegacyBootstrapMaterial {
                 let rows = try objects(bucket, "library")
                 let railTitles = Set(try rows.map { try string($0, "id") })
                 try require(railTitles.count == rows.count, "Duplicate overlay title snapshots require reconciliation")
-                for row in rows {
+                for (index, row) in rows.enumerated() {
                     let meta = try string(row, "id")
                     try known(id, meta, row)
-                    try importWatch(id, meta, row, history: false, overlay: true)
+                    let locator: LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator = independentSource
+                        ? .ownAccountProfileLibrary(index: index) : .authenticatedProfileLibrary(index: index)
+                    try importWatch(id, meta, row, history: false, overlay: true, locator: locator)
                     try importMarks(id, meta, row)
                 }
                 for (meta, value) in try object(bucket, "watched") ?? [:] {
@@ -1043,7 +1071,8 @@ enum VortxLegacyBootstrapMaterial {
             }
         }
 
-        func importWatch(_ profile: String, _ meta: String, _ raw: Object, history: Bool, overlay: Bool) throws {
+        func importWatch(_ profile: String, _ meta: String, _ raw: Object, history: Bool, overlay: Bool,
+                         locator: LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator) throws {
             let position = try milliseconds(raw, "t"), duration = try milliseconds(raw, "d")
             let iso = try lastWatched(raw)
             let event = try clock(raw, "eventEpochMs")
@@ -1051,16 +1080,31 @@ enum VortxLegacyBootstrapMaterial {
             let played = history ? event : iso
             let video = try optionalString(raw, "v").flatMap { $0.isEmpty ? nil : $0 }
             let bits = try optionalString(raw, "watched")
-            try require(bits == nil || bits!.isEmpty, "Opaque watched bitfield requires episode reconciliation")
+            var decoded = [String]()
+            if let bits, !bits.isEmpty {
+                guard let accountID, let sourceSHA256, let profileID = UUID(uuidString: profile) else {
+                    throw fail("Opaque watched bitfield requires episode reconciliation")
+                }
+                let matching = watchedEvidence.filter { $0.matches(profileID: profileID, sourceSHA256: sourceSHA256, locator: locator) }
+                try require(matching.count == 1, "Opaque watched bitfield requires episode reconciliation")
+                decoded = try matching[0].videoIDs(accountID: accountID, profileID: profileID, sourceSHA256: sourceSHA256,
+                    verifiedStreamingUID: verifiedStreamingUID, locator: locator, metaID: meta, bitmap: bits)
+            }
             let watched = try boolean(raw, "currentVideoWatched"), whole = try boolean(raw, "wholeTitleWatched")
             let type = try contentType(raw)
             try require(type != "series" || whole != true, "Whole-series watch intent requires episode reconciliation")
             let marks = try strings(raw, "w")
             let marked = try object(raw, "ma") ?? [:], reset = try object(raw, "ua") ?? [:]
-            let hasMarks = !marks.isEmpty || !marked.isEmpty || !reset.isEmpty
+            let hasMarks = !marks.isEmpty || !marked.isEmpty || !reset.isEmpty || !decoded.isEmpty
             let count = try unsigned(raw, "timesWatched", maximum: 0xffff_ffff)
             if overlay && (position ?? 0) == 0 && !hasMarks && watched != true && whole != true {
                 throw fail("Saved-only overlay membership requires explicit reconciliation")
+            }
+            // Bitmap evidence proves bare watched facts only. The normal clocked ma/ua fold
+            // below removes this boolean whenever an explicit mark or reset exists.
+            for video in decoded {
+                var row = context(profile, meta); row["videoId"] = video; row["watched"] = true
+                watches[profile, default: []].append(row)
             }
             // Ordinary saved rows can contain a synthetic lastWatched. Only a positive position or
             // an explicit genuine-history carrier proves playback; a watched bit alone proves no play.
