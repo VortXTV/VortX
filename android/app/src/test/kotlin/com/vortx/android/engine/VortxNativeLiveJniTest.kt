@@ -140,6 +140,45 @@ class VortxNativeLiveJniTest {
         } finally { directory.listFiles()?.forEach { it.delete() }; directory.delete() }
     }
 
+    @Test fun `native repository history includes unsaved playback excludes saved-only and fences cold profile owners`() = runBlocking {
+        assumeTrue("Requires reviewed playback JNI", System.getenv("VORTX_JNI_SYNC") == "1")
+        load()
+        val directory = Files.createTempDirectory(File("build").toPath(), "native-history-jni-").toFile()
+        val key = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()
+        val scope = VortxAccountScope("account.history-fixture", "owner")
+        val store = VortxEncryptedCheckpointStore(directory) { key }
+        var mounted: VortxNativeSession? = null
+        val repository = NativeCatalogRepository { requireNotNull(mounted) }
+        try {
+            mounted = VortxNativeSession.open(scope, "Owner", bindings(), store, noNetwork(), true)
+            mounted.dispatch(listOf(
+                JSONObject("""{"type":"add_profile","id":"guest","name":"Guest"}"""),
+                JSONObject("""{"type":"add_library_item","profileId":"owner","item":{"kind":"standard","id":"saved-only","type":"movie","name":"Never played"}}"""),
+                JSONObject("""{"type":"report_progress","metaId":"unsaved-resume","videoId":"unsaved-resume","name":"Partial unsaved","metadata":{"type":"movie","poster":"https://fixture.invalid/partial"},"positionMs":12000,"durationMs":100000}"""),
+            ))
+            repository.setCatalogWatched(MetaItem("unsaved-watched", MediaType.MOVIE, "Finished unsaved", "https://fixture.invalid/finished"), true).getOrThrow()
+            val captured = repository.continueWatchingOwner()
+            val snapshot = repository.playbackHistorySnapshot(captured).getOrThrow()
+            assertEquals(captured, snapshot.owner)
+            assertEquals(setOf("unsaved-resume", "unsaved-watched"), snapshot.items.map { it.id }.toSet())
+            val finished = snapshot.items.single { it.id == "unsaved-watched" }
+            assertTrue(finished.watched); assertEquals("Finished unsaved", finished.name)
+            assertEquals("https://fixture.invalid/finished", finished.poster)
+            val partial = snapshot.items.single { it.id == "unsaved-resume" }
+            assertFalse(partial.watched); assertEquals(12.0, requireNotNull(partial.resumeSeconds), 0.0)
+            assertEquals(0.12f, requireNotNull(partial.progress), 0.0001f)
+            assertEquals(listOf("unsaved-resume"), repository.continueWatchingSnapshot(captured).getOrThrow().items.map { it.id })
+            mounted.close()
+            mounted = VortxNativeSession.open(scope, "Owner", bindings(), store, noNetwork())
+            assertTrue(repository.playbackHistorySnapshot(captured).isFailure)
+            assertEquals(snapshot.items, repository.playbackHistorySnapshot(repository.continueWatchingOwner()).getOrThrow().items)
+            val reopenedOwner = repository.continueWatchingOwner()
+            mounted.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"guest"}""")))
+            assertTrue(repository.playbackHistorySnapshot(reopenedOwner).isFailure)
+            assertTrue(repository.playbackHistorySnapshot(repository.continueWatchingOwner()).getOrThrow().items.isEmpty())
+        } finally { mounted?.close(); directory.listFiles()?.forEach { it.delete() }; directory.delete() }
+    }
+
     @Test fun `authenticated legacy bootstrap native profile lifecycle and same-account reopen use real JNI`() = runBlocking {
         assumeTrue("Requires reviewed importer JNI", System.getenv("VORTX_JNI_SYNC") == "1")
         load()

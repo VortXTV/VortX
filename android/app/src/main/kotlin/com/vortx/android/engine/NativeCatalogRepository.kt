@@ -199,6 +199,29 @@ internal class NativeCatalogRepository(
         check(owner(read.owner) == expectedOwner) { "Native owner changed" }
         session.owned(read.owner) { ContinueWatchingSnapshot(expectedOwner, cw(read)) }
     }
+    override suspend fun playbackHistorySnapshot(expectedOwner: ContinueWatchingOwner) = attempt {
+        val session = session(); val read = session.read()
+        check(owner(read.owner) == expectedOwner) { "Native history owner changed" }
+        session.owned(read.owner) {
+            val saved = savedItems(read)
+            val projection = playback(read)
+            // Kernel history is completed watches; active partial playback is a separate lane.
+            // Both are viewing evidence, unlike saved library membership alone.
+            val records = projection.getJSONArray("history").objects() + projection.getJSONArray("continueWatching").objects()
+            val items = records.sortedByDescending { it.getLong("updatedAt") }.map { item ->
+                val id = item.getString("metaId")
+                val matches = saved.filter { it.id == id }
+                check(matches.size <= 1) { "Ambiguous native history media identity" }
+                val type = item.optStringOrNull("type")?.let(MediaType::fromId) ?: matches.singleOrNull()?.type
+                    ?: if (item.optStringOrNull("videoId")?.let { it != id } == true) MediaType.SERIES else MediaType.MOVIE
+                val offset = item.getLong("offsetMs"); val duration = item.getLong("durationMs")
+                MetaItem(id, type, item.getString("name"), poster = item.optStringOrNull("poster") ?: matches.singleOrNull()?.poster,
+                    watched = item.getBoolean("watched"), resumeSeconds = offset / 1000.0,
+                    progress = if (duration > 0) (offset.toFloat() / duration).coerceIn(0f, 1f) else 0f)
+            }.distinctBy { it.type to it.id }
+            ContinueWatchingSnapshot(expectedOwner, visibleLocal(items, read))
+        }
+    }
     override suspend fun home(): Result<List<Catalog>> = attempt {
         val session = session(); val read = session.read()
         val specs = catalogs(read).filter { canLoad(it, emptySet()) }
