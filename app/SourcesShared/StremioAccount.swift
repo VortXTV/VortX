@@ -361,7 +361,7 @@ final class StremioAccount: ObservableObject {
         var context = beginAuthOperation()
 #if VORTX_NATIVE_DATA_ENGINE
         let nativeTarget: CoreBridge.NativeAccountLoginTarget?
-        do { nativeTarget = try CoreBridge.shared.captureNativeAccountLogin() }
+        do { nativeTarget = try CoreBridge.shared.captureNativeAccountLogin(importOwnerAddons: true) }
         catch { signInError = "Open this profile before connecting its account."; return }
 #endif
         do {
@@ -397,6 +397,13 @@ final class StremioAccount: ObservableObject {
             await loadAddons(for: context)
         } catch {
 #if VORTX_NATIVE_DATA_ENGINE
+            if error is VortxNativeOwnerAddonImport.Incomplete,
+               let nativeTarget, CredentialScopeRegistry.shared.isCurrent(nativeTarget.binding.credential),
+               authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID {
+                reloadForActiveProfile()
+                signInError = "The connection was saved, but the add-on import could not be confirmed. Refresh and retry the import."
+                return
+            }
             if error is VortxNativeAccountCredentials.OwnerPublicationUncertain,
                let nativeTarget, CredentialScopeRegistry.shared.isCurrent(nativeTarget.binding.credential),
                authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID {
@@ -426,12 +433,19 @@ final class StremioAccount: ObservableObject {
 #if VORTX_NATIVE_DATA_ENGINE
         let nativeCapture = CredentialScopeRegistry.shared.capture()
         do {
-            if let target = try CoreBridge.shared.captureNativeAccountLogin() {
+            if let target = try CoreBridge.shared.captureNativeAccountLogin(importOwnerAddons: true) {
                 try await CoreBridge.shared.authenticateNativeOwnAccount(token: token, target: target)
                 guard authOperationGeneration == context.generation, ProfileStore.shared.active?.id == context.profileID else { return }
                 context = captureAuthOperationContext()
             } else { throw VortxNativeError.closed }
         } catch {
+            if error is VortxNativeOwnerAddonImport.Incomplete,
+               CredentialScopeRegistry.shared.isCurrent(nativeCapture), authOperationGeneration == context.generation,
+               ProfileStore.shared.active?.id == context.profileID {
+                reloadForActiveProfile()
+                signInError = "The connection was saved, but the add-on import could not be confirmed. Refresh and retry the import."
+                return
+            }
             if error is VortxNativeAccountCredentials.OwnerPublicationUncertain,
                CredentialScopeRegistry.shared.isCurrent(nativeCapture), authOperationGeneration == context.generation,
                ProfileStore.shared.active?.id == context.profileID {

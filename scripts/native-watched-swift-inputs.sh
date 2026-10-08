@@ -6,5 +6,6 @@ native_watched_swift_inputs=(
   app/SourcesShared/VortxLegacyBootstrapMaterial.swift
   app/SourcesShared/VortxNativeWatchedArchive.swift
   app/SourcesShared/VortxNativeWatchlist.swift
+  app/SourcesShared/VortxNativeWebsiteAddonEdits.swift
   -lz
 )

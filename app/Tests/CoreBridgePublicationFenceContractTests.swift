@@ -173,7 +173,7 @@ check(nativeBootstrap.contains("resolveRoster(from: document, fullOnly: true)")
                 && nativeBootstrap.contains("await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)")
                 && nativeBootstrap.contains("VortxNativeBootstrapArchive.encode(document: documentBytes, material: material, authenticatedSourceArchive: prepared.sourceArchive)")
                 && nativeBootstrap.contains("allowNewAccount: !hadCheckpoint, initialActions: initialActions")
-                && nativeBootstrap.contains("if didImportLegacy || !websiteEvents.isEmpty { self.requestSyncSoon() }")
+                && nativeBootstrap.contains("if didImportLegacy || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty { self.requestSyncSoon() }")
                 && appearsBefore("validateLegacyCompatibility", "let session = try VortxNativeSession", in: nativeBootstrap)
                 && appearsBefore("await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)", "if !hadCheckpoint", in: nativeBootstrap)
                 && autoAddSource.contains("case .native(let binding): return binding?.profileID")
@@ -197,7 +197,7 @@ check(nativePush.contains("await prepareNativeLegacyMaterial(doc, capture: captu
                 && nativePush.contains("hasDirtySettings: (try? nativeGlobalEdits()) == nil")
                 && nativePush.contains("doc[\"nativeHostPreferences\"]")
                 && nativePush.contains("orderIntent != nil || pendingAddonOrderIntent != nil")
-                && nativePush.contains("return doc\n#else"),
+                && nativePush.contains("return DerivedSyncDoc(document: doc, baseRevision: baseRevision)\n#else"),
               "native export checks the legacy receipt and returns unchanged sibling carriers without legacy mirror rewrites")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")

@@ -74,8 +74,8 @@ struct VortxAccountScope: Codable, Hashable, Sendable {
     }
     private static func supportedNativeSyncSchema(_ value: VortxJSON?) -> Bool {
         switch value {
-        case .integer(let schema): return (1...4).contains(schema)
-        case .unsigned(let schema): return (1...4).contains(schema)
+        case .integer(let schema): return (1...5).contains(schema)
+        case .unsigned(let schema): return (1...5).contains(schema)
         default: return false
         }
     }
@@ -779,6 +779,21 @@ actor VortxNativeSession {
         return Double(offset) / 1000
     }
     /// The kernel materializes membership/order; hosts do not reproduce its merge reducer.
+    func addonSnapshot() throws -> (state: VortxJSON, inventories: [String: [VortxJSON]]) {
+        let state = try scope.validateSnapshot(stateJSON())
+        guard case .object(let profiles) = state["roster"]?["profiles"] else { throw VortxNativeError.invalidSnapshot }
+        var inventories: [String: [VortxJSON]] = [:]
+        for (id, profile) in profiles where profile["deleted"] != .bool(true) {
+            let query: VortxJSON = .object(["kind": .string("installed_addons"), "profileId": .string(id)])
+            let raw = try lease.withActive { try runtime.resolve(String(decoding: JSONEncoder().encode(query), as: UTF8.self)) }
+            let result = try JSONDecoder().decode(VortxJSON.self, from: Data(raw.utf8))
+            guard result["kind"] == .string("installed_addons"), result["profileId"] == .string(id), let rows = result["addons"]?.array else {
+                throw VortxNativeError.invalidResponse
+            }
+            inventories[id] = rows
+        }
+        return (state, inventories)
+    }
     func resourceRegistry() throws -> [VortxResourceAddon] {
         let state = try scope.validateSnapshot(stateJSON())
         guard case .string(let active) = state["activeProfileId"], let profile = state["roster"]?["profiles"]?[active],
@@ -803,7 +818,11 @@ actor VortxNativeSession {
         try lease.withActive { try hostPreferences.document }
     }
     func websiteEditOutcome() throws -> VortxJSON {
-        try lease.withActive { try VortxNativeProfileEditHost.outcome(hostPreferences.local) }
+        try lease.withActive {
+            guard case .object(var result) = try VortxNativeProfileEditHost.outcome(hostPreferences.local) else { throw VortxNativeError.invalidResponse }
+            result["addonConflicts"] = try JSONDecoder().decode(VortxJSON.self, from: JSONEncoder().encode(hostPreferences.local.websiteAddonConflicts ?? []))
+            return .object(result)
+        }
     }
     func pendingOwnAccountOverlays() throws -> VortxJSON {
         try lease.withActive {
@@ -817,7 +836,7 @@ actor VortxNativeSession {
     @discardableResult func dispatch(_ actions: [String], now: UInt64, legacyMaterial: Data? = nil,
                                     hostRemote: VortxJSON? = nil, hostEdits: [VortxNativeHostPreferences.Edit] = [],
                                     legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
-                                    websiteEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
+                                    websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                                     sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) throws -> [String] {
         guard !closed else { throw VortxNativeError.closed }
         guard !persistenceFailed else { throw VortxNativeError.checkpointUncertain }
@@ -905,8 +924,55 @@ actor VortxNativeSession {
             candidateHost.local.websiteConflicts = conflicts
             state = try scope.validateSnapshot(candidate.stateJSON())
         }
+        let addonPending = candidateHost.local.websiteAddonPending ?? []
+        let hasAddonWork = !websiteAddonEvents.isEmpty || !addonPending.isEmpty
+        if hasAddonWork {
+            try VortxNativeWebsiteAddonEdits.validateSource(websiteAddonEvents)
+            try VortxNativeWebsiteAddonEdits.validateIncomingIdentities(websiteAddonEvents)
+            var queue = addonPending
+            for event in websiteAddonEvents where !queue.contains(event) { queue.append(event) }
+            try VortxNativeWebsiteAddonEdits.validateSource(queue)
+            let collidingIDs = VortxNativeWebsiteAddonEdits.collidingIdentities(queue)
+            var retained: [VortxJSON] = []
+            var conflicts = candidateHost.local.websiteAddonConflicts ?? []
+            var receipts = candidateHost.local.websiteAddonReceipts ?? [:]
+            for event in queue {
+                let eventID = (try? event["eventId"]?.decode(String.self)) ?? "invalid-event"
+                if collidingIDs.contains(eventID) {
+                    retained.append(event)
+                    let conflict = VortxNativeWebsiteAddonEdits.Conflict(eventId: eventID, code: "conflicting_addon_event_id", paths: [])
+                    if !conflicts.contains(conflict) { conflicts.append(conflict) }
+                    continue
+                }
+                let trial = try VortxNativeRuntime(abi: abi, snapshot: candidate.stateJSON())
+                var accepted = false
+                defer { if !accepted { trial.close() } }
+                do {
+                    let request = VortxNativeWebsiteAddonEdits.request(event: event, scope: scope)
+                    let response = try trial.dispatch(String(decoding: JSONEncoder().encode(request), as: UTF8.self), now: now)
+                    let result = try JSONDecoder().decode(VortxJSON.self, from: Data(response.utf8))
+                    let next = try scope.validateSnapshot(trial.stateJSON())
+                    let receipt = try VortxNativeWebsiteAddonEdits.validatedReceipt(event: event, result: result, state: next, scope: scope)
+                    if let conflict = try VortxNativeWebsiteAddonEdits.conflict(event: event, receipt: receipt, state: next, runtime: trial) {
+                        if !conflicts.contains(conflict) { conflicts.append(conflict) }
+                    }
+                    // Even a losing event needs its native receipt durably retained. Its replay
+                    // cannot acquire a new clock or undo a later native uninstall.
+                    candidate.close(); candidate = trial; accepted = true
+                    receipts[receipt.id] = receipt.fingerprint; results.append(response)
+                } catch {
+                    retained.append(event)
+                    let conflict = VortxNativeWebsiteAddonEdits.Conflict(eventId: eventID, code: "unsupported_or_invalid_addon_event", paths: [])
+                    if !conflicts.contains(conflict) { conflicts.append(conflict) }
+                }
+            }
+            candidateHost.local.websiteAddonPending = retained
+            candidateHost.local.websiteAddonReceipts = receipts
+            candidateHost.local.websiteAddonConflicts = conflicts
+            state = try scope.validateSnapshot(candidate.stateJSON())
+        }
         let updated = try candidate.stateJSON()
-        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty || !legacyWatchlists.isEmpty || hasWebsiteWork || authenticatedSourceArchive != nil
+        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty || !legacyWatchlists.isEmpty || hasWebsiteWork || hasAddonWork || authenticatedSourceArchive != nil
         let encodedHost = hasHostChanges ? try candidateHost.encoded() : nil
         do {
             try lease.withActive {

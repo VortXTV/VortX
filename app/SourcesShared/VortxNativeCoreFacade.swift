@@ -21,6 +21,26 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private let mutationAccepted: @Sendable () -> Void
     private var failure: String?
     private var resourceRegistryValid = true
+    // Full engine materialization: includes protected and profile-disabled members. Resource/UI
+    // visibility is separate, and no host comparison of membership clocks is authoritative.
+    private var addonInventories: [String: [VortxJSON]] = [:]
+    /// FIFO tasks are unstructured, so cancellation belongs to the original import operation.
+    /// The latch linearizes cancellation with the final checkpoint, not merely queue admission.
+    private final class ImportCommitAuthority: VortxMutationAuthority, @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        private let source: any VortxMutationAuthority
+        init(source: any VortxMutationAuthority) { self.source = source }
+        func cancel() { lock.withLock { cancelled = true } }
+        func withActive(_ operation: () throws -> Void) throws {
+            try source.withActive {
+                try lock.withLock {
+                    guard !cancelled else { throw VortxNativeError.superseded }
+                    try operation()
+                }
+            }
+        }
+    }
     private var pendingProfileTransitions = 0
     private var accountEpoch = UUID()
     private var sourceArchive: Data?
@@ -82,7 +102,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                        changed: @escaping @Sendable ([String]) -> Void) async throws -> VortxNativeCoreFacade {
         guard Set(registry.map(\.id)).count == registry.count else { throw VortxNativeError.invalidResponse }
         let facade = VortxNativeCoreFacade(session: session, registry: registry, mutationAccepted: mutationAccepted, changed: changed)
-        let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        let addonSnapshot = try await session.addonSnapshot()
+        let state = addonSnapshot.state
+        facade.addonInventories = addonSnapshot.inventories
         facade.playback = try await session.playbackProjection()
         facade.values = try facade.stateFields(state)
         facade.values["native_host_preferences"] = try await session.hostPreferencesDocument()
@@ -104,7 +126,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
     }
     func close() {
-        lock.lock(); closed = true; let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); lock.unlock()
+        lock.lock(); closed = true; let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); addonInventories.removeAll(); lock.unlock()
         session.revoke()
         old.forEach { $0.cancel() }; Task { await session.close() }
     }
@@ -129,9 +151,11 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         guard admission.0 else { throw VortxNativeError.superseded }
         await admission.1?.value
         await session.invalidateResources()
+        let addonSnapshot = try await session.addonSnapshot()
         let accepted = lock.withLock { () -> Bool in
             guard !closed, expected.scope == session.scope, expected.generation == registryGeneration,
-                  values["native_state"]?["activeProfileId"] == .string(expected.profileID) else { return false }
+                  values["native_state"]?["activeProfileId"] == .string(expected.profileID), values["native_state"] == addonSnapshot.state else { return false }
+            addonInventories = addonSnapshot.inventories
             registry = replacement; resourceRegistryValid = true; registryGeneration = UUID()
             values["ctx"] = .object(["profile": .object(["addons": .array(replacement.map {
                 .object(["transportUrl": .string($0.transportUrl), "manifest": $0.manifest ?? .object([:])])
@@ -141,6 +165,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     }
     /// Called under lock. Keep the durable-state publication, discard only prior resource ownership.
     private func invalidateResourcePublications() {
+        addonInventories = [:]
         resourceRegistryValid = false
         for (field, task) in tasks where field != "native_state" { task.cancel() }
         generations = generations.filter { $0.key == "native_state" }
@@ -192,7 +217,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                  hostEdits: [VortxNativeHostPreferences.Edit] = [],
                                  legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                                  admission: (@Sendable () -> Bool)? = nil,
-                                 websiteEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
+                                 websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                                  sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil,
                                  completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
@@ -218,16 +243,17 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     return
                 }
                 _ = try await session.dispatch(actions ?? [raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial,
-                                               hostRemote: hostRemote, hostEdits: hostEdits, legacyWatchlists: legacyWatchlists, websiteEvents: websiteEvents, websiteBaseline: websiteBaseline,
+                                               hostRemote: hostRemote, hostEdits: hostEdits, legacyWatchlists: legacyWatchlists, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, websiteBaseline: websiteBaseline,
                                                sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive)
                 durableCommitted = true
-                let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+                let addonSnapshot = try await session.addonSnapshot()
+                let state = addonSnapshot.state
                 let playback = try await session.playbackProjection()
                 let host = try await session.hostPreferencesDocument()
                 let website = try await session.websiteEditOutcome()
                 let ownPending = try await session.pendingOwnAccountOverlays()
                 let sourceArchive = try await session.authenticatedSourceArchive()
-                let websiteChanged = !websiteEvents.isEmpty && self.lock.withLock {
+                let websiteChanged = (!websiteEvents.isEmpty || !websiteAddonEvents.isEmpty) && self.lock.withLock {
                     self.values["native_state"]?["nativeSync"] != state["nativeSync"] ||
                         self.values["native_host_preferences"] != host || self.values["native_website_edits"] != website
                 }
@@ -247,6 +273,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                         if let replacement { self.registry = replacement; self.resourceRegistryValid = true }
                         else { self.failure = "registry_unavailable" }
                     }
+                    self.addonInventories = addonSnapshot.inventories
                     var fields = try self.stateFields(state)
                     fields["native_host_preferences"] = host
                     fields["native_website_edits"] = website
@@ -304,7 +331,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// One durable transaction contains both private-kernel state and public host preferences.
     /// Its returned carrier is read only after the same FIFO's merge/checkpoint acknowledgement.
     func mergeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, legacyMaterial: Data?,
-                              hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [],
+                              hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [],
                               legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                               websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                               sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws -> VortxJSON {
@@ -313,7 +340,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
         return try await withCheckedThrowingContinuation { continuation in
             if !enqueueMutation(type: remote == nil ? "get_state" : "merge_native_sync", raw: raw, legacyMaterial: legacyMaterial,
-                                hostRemote: hostRemote, hostEdits: hostEdits, legacyWatchlists: legacyWatchlists, websiteEvents: websiteEvents, websiteBaseline: websiteBaseline,
+                                hostRemote: hostRemote, hostEdits: hostEdits, legacyWatchlists: legacyWatchlists, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, websiteBaseline: websiteBaseline,
                                 sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive, completion: { [weak self] result in
                 switch result {
                 case .success(let native):
@@ -354,6 +381,51 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         let action: VortxJSON = .object(["type": .string("reorder_addons"), "profileId": .string(bucket), "transportUrls": .array(urls.map(VortxJSON.string))])
         guard let data = try? JSONEncoder().encode(action) else { return false }
         return enqueueMutation(type: "reorder_addons", raw: String(decoding: data, as: UTF8.self))
+    }
+    /// Deliberate authenticated owner import. Keep every existing live member and its position,
+    /// append new imported identities in source order, and commit the complete batch before success.
+    func importOwnerAddons(_ imported: [VortxJSON], expectedProfileID: String, expectedAccountGeneration: UUID,
+                           sourceAuthority: any VortxMutationAuthority) async throws {
+        let operationAuthority = ImportCommitAuthority(source: sourceAuthority)
+        try await withTaskCancellationHandler(operation: {
+            try Task.checkCancellation()
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                lock.lock(); defer { lock.unlock() }
+                let owner = session.scope.ownerProfileID
+                guard !closed, accountEpoch == expectedAccountGeneration, pendingProfileTransitions == 0,
+                      values["native_state"]?["activeProfileId"] == .string(expectedProfileID),
+                      let state = values["native_state"], let current = installedAddonURLs(state: state, owner: owner) else {
+                    continuation.resume(throwing: VortxNativeError.superseded); return
+                }
+                let capturedRegistry = registryGeneration
+                do {
+                    var order = current, identities = Set(current.compactMap(addonMemberKey)), seen = Set<String>()
+                    var actions: [VortxJSON] = []
+                    for addon in imported {
+                        guard let descriptor = addonDescriptor(addon), let identity = addonMemberKey(descriptor.url), seen.insert(identity).inserted else {
+                            throw VortxNativeError.invalidResponse
+                        }
+                        actions.append(.object(["type": .string("install_addon"), "profileId": .string(owner), "addon": addon]))
+                        if identities.insert(identity).inserted { order.append(descriptor.url) }
+                    }
+                    if order != current {
+                        actions.append(.object(["type": .string("reorder_addons"), "profileId": .string(owner), "transportUrls": .array(order.map(VortxJSON.string))]))
+                    }
+                    if actions.isEmpty { actions = [.object(["type": .string("get_state")])] }
+                    let raw = try actions.map { String(decoding: try JSONEncoder().encode($0), as: UTF8.self) }
+                    guard enqueueMutation(type: "import_owner_addons", raw: "", actions: raw, admission: { [weak self] in
+                        guard let self else { return false }
+                        return self.lock.withLock {
+                            !self.closed && self.accountEpoch == expectedAccountGeneration && self.pendingProfileTransitions == 0
+                                && self.registryGeneration == capturedRegistry
+                                && self.values["native_state"]?["activeProfileId"] == .string(expectedProfileID)
+                        }
+                    }, sourceAuthority: operationAuthority, completion: { result in continuation.resume(with: result.map { _ in () }) }) else {
+                        throw VortxNativeError.closed
+                    }
+                } catch { continuation.resume(throwing: error) }
+            }
+        }, onCancel: { operationAuthority.cancel() })
     }
     /// Apply a complete, already-resolved episode inventory in one kernel transaction.  Series
     /// actions deliberately contain only opaque IDs supplied by the current metadata response:
@@ -680,10 +752,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// Kernel membership keys fold only URL scheme and host. The descriptor keeps the original
     /// transport URL, including path and presentation casing, for actions and resource hosting.
     private func addonMemberKey(_ url: String) -> String? {
-        guard var parts = URLComponents(string: url), let scheme = parts.scheme?.lowercased(),
-              ["http", "https"].contains(scheme), let host = parts.host, !host.isEmpty else { return nil }
-        parts.scheme = scheme; parts.host = host.lowercased()
-        return parts.string
+        VortxNativeWebsiteAddonEdits.memberKey(url)
     }
     private func dispatchAddonMutation(subaction: String, args: VortxJSON?) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -736,23 +805,10 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// Resource registry omits profile-disabled add-ons. Kernel reorder requires every live
     /// owner-bucket identity exactly once, so mutation order comes from the unfiltered CRDT map.
     private func installedAddonURLs(state: VortxJSON, owner: String) -> [String]? {
-        guard case .object(let records) = state["nativeSync"]?["addons"]?[owner]?["records"] else { return nil }
-        let live = records.compactMap { key, record -> (String, String, UInt64)? in
-            guard case .object = record["value"], let url = string(record["value"]?["transportUrl"]), addonMemberKey(url) == key,
-                  let addedAt = try? record["addedAt"]?.decode(UInt64.self),
-                  let removedAt = try? record["removedAt"]?.decode(UInt64.self), addedAt > removedAt else { return nil }
-            return (key, url, addedAt)
-        }
-        let liveByKey = Dictionary(uniqueKeysWithValues: live.map { ($0.0, ($0.1, $0.2)) })
-        guard liveByKey.count == live.count else { return nil }
-        // CRDT order retains removed identities. Mirror the kernel: retain only still-live ids,
-        // then append live records which have not yet entered the retained order.
-        let order = (state["nativeSync"]?["addons"]?[owner]?["order"]?["ids"]?.array?.compactMap(string) ?? [])
-            .filter { liveByKey[$0] != nil }
-        let ordered = Set(order)
-        let remaining = live.filter { !ordered.contains($0.0) }
-            .sorted { $0.2 == $1.2 ? $0.0 < $1.0 : $0.2 < $1.2 }.map(\.0)
-        return order.compactMap { liveByKey[$0]?.0 } + remaining.compactMap { liveByKey[$0]?.0 }
+        guard state == values["native_state"], let rows = addonInventories[owner] else { return nil }
+        let urls = rows.compactMap { string($0["transportUrl"]) }
+        guard urls.count == rows.count, Set(urls.compactMap(addonMemberKey)).count == rows.count else { return nil }
+        return urls
     }
     private func acceptedMetadataInventory(metaID: String, type: String) -> [String]? {
         guard let detail = values["meta_details"], detail["selected"]?["metaPath"]?["id"] == .string(metaID),

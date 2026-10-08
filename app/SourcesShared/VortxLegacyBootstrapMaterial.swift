@@ -886,30 +886,37 @@ enum VortxLegacyBootstrapMaterial {
             var publishedStamps = Set<String>()
             for (raw, value) in try object(vortx, "deletedAddonsTs") ?? [:] {
                 guard let entry = value as? Object else { throw fail("Malformed add-on intent") }
-                try require(Set(entry.keys).isSubset(of: ["addedAt", "removedAt"]), "Unsupported add-on intent carrier")
+                try require(Set(entry.keys).isSubset(of: ["addedAt", "removedAt", "intentV3"]), "Unsupported add-on intent carrier")
                 let url = try resolve(raw)
                 if try clock(entry, "addedAt") != nil || clock(entry, "removedAt") != nil { publishedStamps.insert(url) }
                 var intent = intents[url] ?? ["transportUrl": url]
                 try mergeClock(entry, into: &intent, from: "addedAt", to: "addedAtMs")
                 try mergeClock(entry, into: &intent, from: "removedAt", to: "removedAtMs")
+                if let rawIntent = entry["intentV3"] {
+                    let typed = try legacyAddonIntentV3(rawIntent)
+                    if let previous = intent["intentV3"] as? Object {
+                        intent["intentV3"] = try mergeLegacyAddonIntentV3(previous, typed)
+                    } else { intent["intentV3"] = typed }
+                }
                 intents[url] = intent
             }
             for raw in try strings(vortx, "deletedAddons") {
                 let url = try resolve(raw)
                 // Shipping AddonTombstones migration epoch is 1ms, not a fabricated 'now'.
-                if intents[url]?["addedAtMs"] == nil && intents[url]?["removedAtMs"] == nil {
+                if intents[url]?["addedAtMs"] == nil && intents[url]?["removedAtMs"] == nil && intents[url]?["intentV3"] == nil {
                     try require(!publishedStamps.contains(url), "Ambiguous zero-stamp add-on removal requires reconciliation")
                     intents[url] = ["transportUrl": url, "removedAtMs": 1.0]
                 }
             }
             for raw in try strings(document, "webAddonRemovals") {
                 let intent = intents[try resolve(raw)] ?? [:]
-                try require((try clock(intent, "addedAtMs") ?? 0) > 0 || (try clock(intent, "removedAtMs") ?? 0) > 0,
+                try require(intent["intentV3"] != nil || (try clock(intent, "addedAtMs") ?? 0) > 0 || (try clock(intent, "removedAtMs") ?? 0) > 0,
                             "Unclocked web add-on removal requires reconciliation")
             }
             for (url, row) in intents {
                 let added = try clock(row, "addedAtMs") ?? 0, removed = try clock(row, "removedAtMs") ?? 0
-                try require(added <= 0 || added < removed || descriptors[url] != nil,
+                let live = try legacyAddonIntentV3IsPresent(row, added: added, removed: removed)
+                try require(!live || descriptors[url] != nil,
                             "Live add-on install requires descriptor reconciliation")
             }
             let order = try strings(document, "addonOrder").map(resolve)
@@ -1343,6 +1350,45 @@ enum VortxLegacyBootstrapMaterial {
     }
     private static func mergeClock(_ source: [String: Any], into target: inout [String: Any], from: String, to: String) throws {
         if let value = try clock(source, from), value > 0 { target[to] = max(value, try clock(target, to) ?? 0) }
+    }
+    /// Known historical website metadata is forwarded into the typed private baseline verbatim.
+    /// It never replaces source clocks or becomes a newly authored native/web transaction.
+    private static func legacyAddonIntentV3(_ raw: Any) throws -> [String: Any] {
+        guard let value = raw as? [String: Any],
+              Set(value.keys) == ["version", "counter", "eventId", "state", "wallTime", "legacyRemovedSeen", "legacyAddedSeen"],
+              try clock(value, "version") == 3,
+              let text = value["counter"] as? String, let counter = UInt64(text), counter < UInt64.max, String(counter) == text,
+              let id = value["eventId"] as? String, id.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil,
+              let state = value["state"] as? String, state == "present" || state == "removed" else {
+            throw fail("Unsupported add-on intentV3 carrier")
+        }
+        let latest = Date().timeIntervalSince1970 * 1000 + 48 * 60 * 60 * 1000
+        for field in ["wallTime", "legacyRemovedSeen", "legacyAddedSeen"] {
+            guard let stamp = try clock(value, field), stamp <= latest else { throw fail("Invalid add-on intentV3 clock") }
+        }
+        return value
+    }
+    private static func legacyAddonIntentV3IsPresent(_ row: [String: Any], added: Double, removed: Double) throws -> Bool {
+        guard let raw = row["intentV3"] else { return added > 0 && added >= removed }
+        let intent = try legacyAddonIntentV3(raw)
+        let removedAdvanced = removed > (try clock(intent, "legacyRemovedSeen")!)
+        let addedAdvanced = added > (try clock(intent, "legacyAddedSeen")!)
+        if removedAdvanced && addedAdvanced { return added > removed }
+        if removedAdvanced { return false }
+        if addedAdvanced { return true }
+        return intent["state"] as? String == "present"
+    }
+    private static func mergeLegacyAddonIntentV3(_ left: [String: Any], _ right: [String: Any]) throws -> [String: Any] {
+        let leftCounter = UInt64(left["counter"] as! String)!, rightCounter = UInt64(right["counter"] as! String)!
+        let leftID = left["eventId"] as! String, rightID = right["eventId"] as! String
+        if leftCounter == rightCounter && leftID == rightID {
+            try require(left["state"] as? String == right["state"] as? String && (try clock(left, "wallTime")) == clock(right, "wallTime"),
+                        "Ambiguous legacy add-on intentV3 aliases")
+        }
+        var winner = rightCounter > leftCounter || (rightCounter == leftCounter && rightID > leftID) ? right : left
+        winner["legacyAddedSeen"] = try max(clock(left, "legacyAddedSeen")!, clock(right, "legacyAddedSeen")!)
+        winner["legacyRemovedSeen"] = try max(clock(left, "legacyRemovedSeen")!, clock(right, "legacyRemovedSeen")!)
+        return winner
     }
     private static func milliseconds(_ root: [String: Any], _ key: String) throws -> Int64? {
         guard try clock(root, key) != nil, let number = root[key] as? NSNumber else { return nil }

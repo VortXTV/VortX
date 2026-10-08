@@ -231,6 +231,7 @@ final class VortXSyncManager: ObservableObject {
     private var nativeCheckpointGeneration = UUID()
     @Published private(set) var nativeCheckpointStatus = "not_started"
     @Published private(set) var nativeProfileEditConflicts: [VortxNativeProfileEditHost.Conflict] = []
+    @Published private(set) var nativeAddonEditConflicts: [VortxNativeWebsiteAddonEdits.Conflict] = []
     @Published private(set) var nativeOwnAccountResyncUnavailable: [UUID] = []
     @Published private(set) var nativeOwnAccountOverlayPending: [UUID] = []
     @Published private(set) var nativeWatchedMigrationPending: [UUID] = []
@@ -513,6 +514,7 @@ final class VortXSyncManager: ObservableObject {
               roster.profiles.filter(\.isOwner).count == 1,
               let owner = roster.profiles.first(where: \.isOwner) else { throw VortxNativeError.invalidSnapshot }
         _ = try nativeWebsiteEvents(document)
+        _ = try nativeWebsiteAddonEvents(document)
         return try VortxLegacyBootstrapMaterial.encode(document: JSONSerialization.data(withJSONObject: document),
                                                        roster: roster.profiles, ownerProfileID: owner.id,
                                                        rosterModifiedSeconds: roster.modified, deferProfileEdits: true)
@@ -567,7 +569,7 @@ final class VortXSyncManager: ObservableObject {
             baseline["schemaVersion"] == .integer(2) ? try JSONEncoder().encode(baseline) : nil
         }
         let retainedSlots = try validatedSync.flatMap { native in
-            native["schemaVersion"] == .integer(4) || native["schemaVersion"] == .unsigned(4)
+            [VortxJSON.integer(4), .unsigned(4), .integer(5), .unsigned(5)].contains(native["schemaVersion"] ?? .null)
                 ? try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: native) : nil
         } ?? []
         var preferredSources: [String: VortxJSON] = [:]
@@ -661,6 +663,7 @@ final class VortXSyncManager: ObservableObject {
         }
         try authority.withActive {}
         _ = try Self.nativeWebsiteEvents(document)
+        _ = try Self.nativeWebsiteAddonEvents(document)
         let freshIDs = Set(sources.map(\.profileID))
         let envelopes = retainedEnvelopes.filter { !freshIDs.contains($0.profileID) }
         let deferred = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: documentBytes,
@@ -743,9 +746,16 @@ final class VortXSyncManager: ObservableObject {
         try VortxNativeProfileEditHost.validateSource(events)
         return events
     }
+    private static func nativeWebsiteAddonEvents(_ document: [String: Any]) throws -> [VortxJSON] {
+        let carrier = try document["webAddonEdits"].map {
+            try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0, options: [.fragmentsAllowed]))
+        }
+        return try VortxNativeWebsiteAddonEdits.events(carrier)
+    }
     private func publishNativeWebsiteOutcome(_ outcome: VortxJSON, capture: CredentialScopeRegistry.Capture) throws {
         guard isCurrent(capture) else { throw VortxNativeError.superseded }
         nativeProfileEditConflicts = try outcome["conflicts"]?.decode([VortxNativeProfileEditHost.Conflict].self) ?? []
+        nativeAddonEditConflicts = try outcome["addonConflicts"]?.decode([VortxNativeWebsiteAddonEdits.Conflict].self) ?? []
     }
 
     /// Used only after a successful authenticated empty response, before any accepted version.
@@ -852,7 +862,7 @@ final class VortXSyncManager: ObservableObject {
         if let pending = nativeCheckpointTask, nativeCheckpointCapture == capture, nativeCheckpointProfile == selectedProfile {
             return await pending.value
         }
-        let generation = UUID(); nativeCheckpointGeneration = generation; nativeProfileEditConflicts = []; nativeOwnAccountResyncUnavailable = []; nativeOwnAccountOverlayPending = []; nativeOwnAccountOverlayUnattributed = []; nativeWatchedMigrationPending = []
+        let generation = UUID(); nativeCheckpointGeneration = generation; nativeProfileEditConflicts = []; nativeAddonEditConflicts = []; nativeOwnAccountResyncUnavailable = []; nativeOwnAccountOverlayPending = []; nativeOwnAccountOverlayUnattributed = []; nativeWatchedMigrationPending = []
         nativeUnsupportedSettings = []; nativeLegacyWatchlistPending = []
         let previous = nativeCheckpointTask; previous?.cancel(); _ = await previous?.value
         guard isCurrent(capture), nativeCheckpointGeneration == generation else { return false }
@@ -952,10 +962,11 @@ final class VortXSyncManager: ObservableObject {
                     let hostRemote = try document["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                     let watchlists = try self.nativeLegacyWatchlists(document)
                     let websiteEvents = try Self.nativeWebsiteEvents(document)
-                    if hadCheckpoint || remoteNative != nil || hostRemote != nil || !websiteEvents.isEmpty || !watchlists.isEmpty {
+                    let websiteAddonEvents = try Self.nativeWebsiteAddonEvents(document)
+                    if hadCheckpoint || remoteNative != nil || hostRemote != nil || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty || !watchlists.isEmpty {
                         let action = remoteNative.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) } ?? .object(["type": .string("get_state")])
                         _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: material, hostRemote: hostRemote,
-                            legacyWatchlists: watchlists, websiteEvents: websiteEvents, websiteBaseline: VortxNativeProfileEditHost.baselines(roster.profiles),
+                            legacyWatchlists: watchlists, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, websiteBaseline: VortxNativeProfileEditHost.baselines(roster.profiles),
                             sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
                     }
                     guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
@@ -980,7 +991,7 @@ final class VortXSyncManager: ObservableObject {
                     try self.publishNativeWebsiteOutcome(websiteOutcome, capture: capture)
                     // Upload only the new nativeSync carrier. The archive never enters the wire,
                     // and adopting an existing remote carrier must not create an echo push.
-                    if didImportLegacy || !websiteEvents.isEmpty { self.requestSyncSoon() }
+                    if didImportLegacy || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty { self.requestSyncSoon() }
                     self.nativeCheckpointStatus = "mounted"; return true
                 } catch { await session.close(); throw error }
             } catch {
@@ -1628,6 +1639,7 @@ final class VortXSyncManager: ObservableObject {
         guard let capture = credentialAuthority.tryBind(scope) else { return nil }
 #if VORTX_NATIVE_DATA_ENGINE
         nativeProfileEditConflicts = []
+        nativeAddonEditConflicts = []
         nativeOwnAccountResyncUnavailable = []
         nativeOwnAccountOverlayPending = []
         nativeWatchedMigrationPending = []
@@ -1658,6 +1670,7 @@ final class VortXSyncManager: ObservableObject {
         guard let capture = credentialAuthority.tryBind(scope, certifying: certifying) else { return nil }
 #if VORTX_NATIVE_DATA_ENGINE
         nativeProfileEditConflicts = []
+        nativeAddonEditConflicts = []
         nativeOwnAccountResyncUnavailable = []
         nativeOwnAccountOverlayPending = []
         nativeWatchedMigrationPending = []
@@ -2988,7 +3001,7 @@ final class VortXSyncManager: ObservableObject {
             let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
             let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
             let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture,
-                                                                               legacyMaterial: prepared.material, hostEdits: nativeGlobalEdits(), websiteEvents: Self.nativeWebsiteEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc),
+                                                                               legacyMaterial: prepared.material, hostEdits: nativeGlobalEdits(), websiteEvents: Self.nativeWebsiteEvents(doc), websiteAddonEvents: Self.nativeWebsiteAddonEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc),
                                                                                sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
             guard isCurrent(capture) else { return nil }
             doc["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["nativeSync"]!))
@@ -3290,7 +3303,7 @@ final class VortXSyncManager: ObservableObject {
                 let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                 let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                 let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture, legacyMaterial: material,
-                    websiteEvents: Self.nativeWebsiteEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc), sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
+                    websiteEvents: Self.nativeWebsiteEvents(doc), websiteAddonEvents: Self.nativeWebsiteAddonEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc), sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
                 guard isCurrent(capture) else { return false }
                 applyNativeGlobals(merged["nativeHostPreferences"]!)
                 try publishNativeWebsiteOutcome(merged["profileEditResults"]!, capture: capture)

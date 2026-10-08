@@ -18,6 +18,9 @@ struct VortxNativeHostPreferences: Sendable {
         var websitePending: [VortxJSON]? = nil
         var websiteReceipts: [String: String]? = nil
         var websiteConflicts: [VortxNativeProfileEditHost.Conflict]? = nil
+        var websiteAddonPending: [VortxJSON]? = nil
+        var websiteAddonReceipts: [String: String]? = nil
+        var websiteAddonConflicts: [VortxNativeWebsiteAddonEdits.Conflict]? = nil
         var authenticatedSourceArchive: Data? = nil
     }
     struct Edit: Sendable { let profileID: String?; let fields: [String: VortxJSON] }
@@ -46,6 +49,7 @@ struct VortxNativeHostPreferences: Sendable {
             guard Self.validActor(value.actor), value.counter <= Self.maxClock else { throw VortxNativeError.invalidSnapshot }
             try Self.validate(value.document, scope: scope)
             try VortxNativeProfileEditHost.validateJournal(value)
+            try VortxNativeWebsiteAddonEdits.validateJournal(value)
             if let archive = value.authenticatedSourceArchive { try VortxNativeBootstrapArchive.validate(archive) }
             // The installation supplies its own keychain actor. Never adopt a restored actor.
             value.actor = actor; value.counter = max(value.counter, Self.maximum(value.document)); local = value

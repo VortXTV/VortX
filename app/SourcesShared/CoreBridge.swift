@@ -140,14 +140,14 @@ final class CoreBridge: ObservableObject {
     }
     @MainActor
     func mergeNativeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
-                                    legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [],
+                                    legacyMaterial: Data?, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [],
                                     legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
                                     sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws -> VortxJSON {
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
         let baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline)
         let document = try await facade.mergeAccountDocument(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
-            hostEdits: hostEdits, websiteEvents: websiteEvents, legacyWatchlists: legacyWatchlists, websiteBaseline: baseline,
+            hostEdits: hostEdits, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, legacyWatchlists: legacyWatchlists, websiteBaseline: baseline,
             sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive)
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
@@ -278,18 +278,21 @@ final class CoreBridge: ObservableObject {
         let transactionID: String
         let ownerProfileID: UUID
         let expectedOwnerSelection: String?
+        let importOwnerAddons: Bool
+        let addonRegistryGeneration: UUID
         fileprivate let facade: VortxNativeCoreFacade
     }
-    @MainActor func captureNativeAccountLogin() throws -> NativeAccountLoginTarget? {
+    @MainActor func captureNativeAccountLogin(importOwnerAddons: Bool = false) throws -> NativeAccountLoginTarget? {
         guard let profile = ProfileStore.shared.active else { throw VortxNativeError.closed }
         guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }), let facade = nativeFacade,
-              let data = facade.stateData("native_state"), let owner = facade.registryBinding?.scope.ownerProfileID,
-              let ownerID = UUID(uuidString: owner) else { throw VortxNativeError.closed }
+              let data = facade.stateData("native_state"), let registryBinding = facade.registryBinding,
+              let ownerID = UUID(uuidString: registryBinding.scope.ownerProfileID) else { throw VortxNativeError.closed }
         return try .init(profile: profile, binding: binding,
             expected: VortxNativeProfiles.expectedBinding(state: JSONDecoder().decode(VortxJSON.self, from: data), profileID: profile.id),
             transactionID: UUID().uuidString.lowercased(), ownerProfileID: ownerID,
             expectedOwnerSelection: profile.isOwner || !profile.usesOwnAccount
-                ? Self.readNativeCredential(VortxNativeAccountCredentials.ownerSelectionKey(scope: binding.credential.namespace, ownerProfileID: ownerID)) : nil, facade: facade)
+                ? Self.readNativeCredential(VortxNativeAccountCredentials.ownerSelectionKey(scope: binding.credential.namespace, ownerProfileID: ownerID)) : nil,
+            importOwnerAddons: importOwnerAddons, addonRegistryGeneration: registryBinding.generation, facade: facade)
     }
     @MainActor func authenticateNativeOwnAccount(token: String, target: NativeAccountLoginTarget) async throws {
         if target.profile.isOwner || !target.profile.usesOwnAccount {
@@ -356,18 +359,46 @@ final class CoreBridge: ObservableObject {
         guard let (facade, _) = nativePlaybackBinding(.native(target.binding)), facade === target.facade,
               facade.registryBinding?.scope.ownerProfileID == target.ownerProfileID.uuidString else { throw VortxNativeError.superseded }
         let capture = target.binding.credential, epoch = facade.accountGeneration
+        let sourceFence = facade.captureSourceFence(), selectedProfileID = target.profile.id.uuidString
+        let registryGeneration = target.addonRegistryGeneration
         let generation = VortxNativeOwnAccountProducer.capture(slot: ProfileStore.shared.keychainAccount(for: target.profile))
         let authority = VortxNativeOwnAccountProducer.Authority(generations: [generation], validate: {
             CredentialScopeRegistry.shared.isCurrent(capture) && facade.isAvailable && facade.accountGeneration == epoch
+                && sourceFence() && facade.profileSnapshot()?.state["activeProfileId"] == .string(selectedProfileID)
+                && facade.registryBinding?.generation == registryGeneration
         })
         let uid = try await LinkAuthService.authenticatedIdentity(authKey: token).uid
         guard nativePlaybackBinding(.native(target.binding))?.0 === facade else { throw VortxNativeError.superseded }
-        try VortxNativeAccountCredentials.connectOwner(token: token, scope: capture.namespace,
+        let imported: [VortxJSON]?
+        if target.importOwnerAddons {
+            guard let owner = ProfileStore.shared.profiles.first(where: { $0.id == target.ownerProfileID && $0.isOwner }) else { throw VortxNativeError.superseded }
+            imported = try await VortxNativeOwnerAddonImport.fetch(authKey: token, verifiedUID: uid, owner: owner, authority: authority)
+        } else { imported = nil }
+        guard nativePlaybackBinding(.native(target.binding))?.0 === facade else { throw VortxNativeError.superseded }
+        let selectedSlot = try VortxNativeAccountCredentials.connectOwner(token: token, scope: capture.namespace,
             ownerProfileID: target.ownerProfileID, verifiedUID: uid, revision: target.transactionID,
             expectedSelection: target.expectedOwnerSelection, authority: authority, read: Self.readNativeCredential,
             write: { key, value in Keychain.set(value, for: key) == .success },
             restoreSelection: { key, value in Keychain.set(value, for: key) == .success },
             selectionAttempted: { VortxNativeOwnAccountProducer.invalidateContext() })
+        if let imported {
+            do {
+                // Secure selection retires the fetch lease. Authorize the native transaction against
+                // the exact newly selected credential plus the unchanged captured native/profile state.
+                let importGeneration = VortxNativeOwnAccountProducer.capture(slot: selectedSlot)
+                let selectorKey = try VortxNativeAccountCredentials.ownerSelectionKey(scope: capture.namespace, ownerProfileID: target.ownerProfileID)
+                guard let selection = try Self.readNativeCredential(selectorKey) else { throw VortxNativeOwnerAddonImport.Incomplete() }
+                let importAuthority = VortxNativeOwnAccountProducer.Authority(generations: [importGeneration], validate: {
+                    CredentialScopeRegistry.shared.isCurrent(capture) && facade.isAvailable && facade.accountGeneration == epoch && sourceFence()
+                        && facade.profileSnapshot()?.state["activeProfileId"] == .string(selectedProfileID)
+                        && facade.registryBinding?.generation == registryGeneration
+                        && (try? Self.readNativeCredential(selectorKey)) == selection
+                        && (try? Self.readNativeCredential(selectedSlot)) == token
+                })
+                try await facade.importOwnerAddons(imported, expectedProfileID: selectedProfileID, expectedAccountGeneration: epoch, sourceAuthority: importAuthority)
+                guard nativePlaybackBinding(.native(target.binding))?.0 === facade else { throw VortxNativeError.superseded }
+            } catch { throw VortxNativeOwnerAddonImport.Incomplete() }
+        }
         try refreshNativeProfiles(reloadCredentials: false)
     }
     private static func readNativeCredential(_ key: String) throws -> String? {

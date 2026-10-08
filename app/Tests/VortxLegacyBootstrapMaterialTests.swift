@@ -14,6 +14,7 @@ enum VortxLegacyBootstrapMaterialTests {
         try durableHistoryAndClockPolicies()
         try ownerActorTies()
         try descriptorAndRemovalPolicies()
+        try websiteIntentV3()
         try watchConsolidation()
         try profilePreferencesAndIdentity()
         try completenessAndClockEvidence()
@@ -579,6 +580,39 @@ enum VortxLegacyBootstrapMaterialTests {
         check(NSDictionary(dictionary: a).isEqual(to: b), "Fragment order independence")
         newer["eventEpochMs"] = 1000.125
         try fail(doc(["byProfile": [UserProfile.ownerID.uuidString: ["ownerHistory": [old, newer]]]]), "Equal viewing clocks")
+    }
+    static func websiteIntentV3() throws {
+        let url = "https://example.com/Config/manifest.json"
+        let addon: Object = ["transportUrl": url, "manifest": ["id": "fixture", "name": "Fixture", "version": "1.0.0"]]
+        let v3: Object = ["version": 3, "counter": "18446744073709551614", "eventId": String(repeating: "a", count: 32),
+                          "state": "removed", "wallTime": 1000.25, "legacyAddedSeen": 1000.75, "legacyRemovedSeen": 500.5]
+        let source = doc(["addons": [addon], "deletedAddonsTs": [url: ["addedAt": 1000.75, "removedAt": 500.5, "intentV3": v3]]])
+        let bytes = try JSONSerialization.data(withJSONObject: source, options: [.sortedKeys])
+        let result = try material(source, documentData: bytes)
+        let bucket = (result["addons"] as! [String: Object])[owner.id.uuidString]!
+        let intent = (bucket["intents"] as! [Object])[0]
+        check(NSDictionary(dictionary: intent["intentV3"] as! Object).isEqual(to: v3), "All exact typed v3 metadata forwarded")
+        check(intent["addedAtMs"] as? Double == 1000.75 && intent["removedAtMs"] as? Double == 500.5, "V3 never fabricates source clocks")
+        let retainedBytes = try JSONSerialization.data(withJSONObject: source, options: [.sortedKeys])
+        check(retainedBytes == bytes, "Source document bytes remain unchanged")
+        for (key, value) in [("version", 4 as Any), ("counter", "01"), ("counter", "18446744073709551615"),
+                             ("eventId", "A" + String(repeating: "a", count: 31)), ("wallTime", true), ("future", "unknown")] {
+            var invalid = v3; invalid[key] = value
+            try fail(doc(["addons": [addon], "deletedAddonsTs": [url: ["intentV3": invalid]]]), key == "wallTime" ? "Malformed clock" : "Unsupported add-on intentV3")
+        }
+        // Authoritative removed v3 can legitimately have no live descriptor, even if its retained
+        // old addedAt is larger. A later genuine legacy add still requires a descriptor.
+        _ = try material(doc(["deletedAddonsTs": [url: ["addedAt": 1000.75, "removedAt": 500.5, "intentV3": v3]]]))
+        try fail(doc(["deletedAddonsTs": [url: ["addedAt": 1001.0, "removedAt": 500.5, "intentV3": v3]]]), "Live add-on install")
+        var present = v3; present["state"] = "present"
+        try fail(doc(["deletedAddonsTs": [url: ["intentV3": present]]]), "Live add-on install")
+        var older = v3; older["counter"] = "1"; older["legacyAddedSeen"] = 2000.25
+        let aliases = try material(doc(["addons": [addon], "deletedAddonsTs": [url: ["intentV3": v3], "HTTPS://Example.COM/Config/manifest.json": ["intentV3": older]]]))
+        let aliasIntent = ((aliases["addons"] as! [String: Object])[owner.id.uuidString]!["intents"] as! [Object])[0]["intentV3"] as! Object
+        check(aliasIntent["counter"] as? String == v3["counter"] as? String && aliasIntent["legacyAddedSeen"] as? Double == 2000.25,
+              "Alias merge keeps causal winner and componentwise observed legacy maxima")
+        try fail(doc(["addons": [addon], "deletedAddonsTs": [url: ["intentV3": v3], "HTTPS://Example.COM/Config/manifest.json": ["intentV3": present]]]), "Ambiguous legacy add-on intentV3 aliases")
+        print("Strict website intentV3 typed forwarding, unchanged clocks, future metadata rejection and descriptor fences passed")
     }
     static func rejectedEvidence() throws {
         var bits = movie(position: 1); bits["watched"] = "opaque-bitfield"

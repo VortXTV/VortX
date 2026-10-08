@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 
 /// Account-attributed recovery material, sealed beside (never inserted into) the kernel snapshot.
 /// This is deliberately NOT a byte-identical raw cloud backup: explicit credential carriers are
@@ -69,6 +70,7 @@ enum VortxNativeBootstrapArchive {
         if let text = value as? String, typedDigest,
            text.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil { return text }
         if var object = value as? [String: Any] {
+            let websiteEventID = typedWebsiteEventID(object)
             // Backups may be nested under future preference keys, not just `settings`. Recognize
             // their envelope by content and inspect the plist before traversing envelope metadata.
             if object["format"] as? String == "vortx-backup" {
@@ -96,7 +98,11 @@ enum VortxNativeBootstrapArchive {
                     ["token", "password", "authkey", "apikey"].contains(where: { normalized.hasSuffix($0) })) {
                     throw Failure.ambiguousCredentialCarrier
                 }
-                if key == "settings", let encoded = object[key] as? String {
+                if key == "eventId", let websiteEventID {
+                    // A validated protocol identifier is hexadecimal, not opaque base64. Other
+                    // values, even alongside this identifier, still traverse the complete policy.
+                    result[key] = websiteEventID
+                } else if key == "settings", let encoded = object[key] as? String {
                     result[key] = try settings(encoded, path: child, exclusions: &exclusions, depth: depth + 1)
                 } else { result[key] = try sanitize(object[key]!, path: child, exclusions: &exclusions, depth: depth + 1) }
             }
@@ -152,6 +158,33 @@ enum VortxNativeBootstrapArchive {
     private static func structuredPrefix(_ bytes: Data) -> Bool {
         let prefix = String(decoding: bytes.prefix(32), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         return ["{", "[", "bplist", "<?xml", "<!DOCTYPE", "<plist"].contains(where: prefix.hasPrefix)
+    }
+    private static func typedWebsiteEventID(_ object: [String: Any]) -> String? {
+        guard let id = object["eventId"] as? String, id.range(of: "^[0-9a-f]{32}$", options: .regularExpression) != nil,
+              let rawCounter = object["counter"] as? String, let counter = UInt64(rawCounter), counter < UInt64.max,
+              String(counter) == rawCounter else { return nil }
+        func number(_ key: String, integer: Bool = true) -> Double? {
+            guard let value = object[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() else { return nil }
+            let n = value.doubleValue
+            return n.isFinite && n >= 0 && n <= 9_007_199_254_740_990 && (!integer || n.rounded(.towardZero) == n) ? n : nil
+        }
+        let keys = Set(object.keys)
+        if number("version") == 3, keys == ["version", "counter", "eventId", "state", "wallTime", "legacyRemovedSeen", "legacyAddedSeen"],
+           ["present", "removed"].contains(object["state"] as? String ?? ""),
+           ["wallTime", "legacyRemovedSeen", "legacyAddedSeen"].allSatisfy({ number($0, integer: false) != nil }) { return id }
+        guard number("schemaVersion") == 1 else { return nil }
+        let digest = (object["fingerprint"] as? String)?.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil
+        if keys == ["schemaVersion", "counter", "eventId", "fingerprint", "observedClock"], digest, number("observedClock") != nil { return id }
+        guard ["scope", "ownerProfileId", "profileId"].allSatisfy({ (object[$0] as? String)?.isEmpty == false }),
+              let binding = object["expectedBinding"] as? [String: Any], Set(binding.keys) == ["account", "revision", "transactionId"],
+              binding["account"] is [String: Any], binding["revision"] is NSNumber,
+              binding["transactionId"] is String || binding["transactionId"] is NSNull else { return nil }
+        if keys == ["schemaVersion", "counter", "eventId", "fingerprint", "scope", "ownerProfileId", "profileId", "expectedBinding"], digest { return id }
+        let required: Set<String> = ["schemaVersion", "counter", "eventId", "wallTime", "scope", "ownerProfileId", "profileId", "expectedBinding", "observed", "mutations"]
+        if required.isSubset(of: keys), keys.isSubset(of: required.union(["order"])), number("wallTime") != nil,
+           object["observed"] is [String: Any], object["mutations"] is [[String: Any]],
+           object["order"] == nil || object["order"] is [String] { return id }
+        return nil
     }
     private static func settings(_ encoded: String, path: String, exclusions: inout [String], depth: Int) throws -> String {
         guard let bytes = Data(base64Encoded: encoded),

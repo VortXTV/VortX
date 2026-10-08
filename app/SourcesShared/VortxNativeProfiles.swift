@@ -158,13 +158,14 @@ enum VortxNativeProfiles {
                          library: library, watches: watches, identityLinks: links)
     }
 
-    /// Selects the exact active own-account slot from a kernel-validated schema-4 nativeSync.
+    /// Selects the exact active own-account slot from a kernel-validated schema-4/5 nativeSync.
     /// This is intentionally separate from historical `legacyImport.baseline`: after a same-UID
     /// rebind, only the active slot carries the current source proof and typed tuple. The returned
     /// carrier has no token or raw source response and is structurally rechecked by the importer.
     static func activeOwnAccountSlotBaselines(nativeSync: VortxJSON) throws -> [VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline] {
-        guard nativeSync["schemaVersion"] == .integer(4) || nativeSync["schemaVersion"] == .unsigned(4),
-              case .object(let accountSlots)? = nativeSync["accountSlots"] else { throw VortxNativeError.invalidSnapshot }
+        guard let schema = nativeSync["schemaVersion"], [.integer(4), .unsigned(4), .integer(5), .unsigned(5)].contains(schema) else { throw VortxNativeError.invalidSnapshot }
+        guard let rawSlots = nativeSync["accountSlots"] else { return [] }
+        guard case .object(let accountSlots) = rawSlots else { throw VortxNativeError.invalidSnapshot }
         return try accountSlots.compactMap { profileID, raw -> VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline? in
             guard let profile = UUID(uuidString: profileID), profile.uuidString == profileID,
                   case .object(let slotRecord) = raw,
