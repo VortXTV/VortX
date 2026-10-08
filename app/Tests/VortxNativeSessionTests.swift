@@ -149,12 +149,17 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         check(try archived(bytes) == archive)
         let coldStore = try VortxEncryptedCheckpointStore(directory: directory, key: key)
         check(try coldStore.read(scope: scope) == before)
+        check(try coldStore.recovery(account: scope.account) == nil)
+        try coldStore.rememberAuthenticatedScope(scope)
+        let offlineRecovery = try coldStore.recovery(account: scope.account)
+        check(offlineRecovery?.scope == scope && offlineRecovery?.state == before && offlineRecovery?.bootstrap == archive)
+        check(try coldStore.recovery(account: "other-account") == nil)
         try coldStore.commit(before, scope: scope)
         check(try archived(Data(contentsOf: files[0])) == archive)
         let otherScope = VortxAccountScope(account: "account-b", ownerProfileID: scope.ownerProfileID)
         let otherState = before.replacingOccurrences(of: "account-a", with: "account-b")
         try encrypted.commit(otherState, scope: otherScope)
-        let otherFile = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first { $0 != files[0] }!
+        let otherFile = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first { $0 != files[0] && $0.lastPathComponent.hasPrefix("native-state-") }!
         let otherPlain = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: otherFile)), using: key, authenticating: otherScope.authenticatedData)
         check((try JSONSerialization.jsonObject(with: otherPlain) as! [String: Any])["bootstrap"] == nil)
         // Prior raw-runtime files remain readable; their next commit adopts a sealed envelope.
@@ -164,6 +169,7 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         try encrypted.commit(before, scope: scope)
         check(try archived(Data(contentsOf: files[0])) == archive)
         let wrongKey = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(size: .bits256))
+        do { _ = try wrongKey.recovery(account: scope.account); fatalError("wrong key recovered account locator") } catch {}
         do { _ = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: wrongKey, transport: transport, allowNewAccount: true); fatalError("decrypt failure seeded empty owner") }
         catch {}
         let restarted = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: encrypted, transport: transport)

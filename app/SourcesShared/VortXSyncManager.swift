@@ -239,6 +239,65 @@ final class VortXSyncManager: ObservableObject {
                                                        rosterModifiedSeconds: roster.modified)
     }
 
+    /// Used only after a successful authenticated empty response, before any accepted version.
+    /// Reopens the exact first bootstrap across a crash between local commit and initial upload.
+    private func nativeEmptyAccountDocument(capture: CredentialScopeRegistry.Capture) throws -> [String: Any] {
+        guard isCurrent(capture), lastSyncedVersion == 0, let account,
+              let keyBytes = dataKey, keyBytes.count == 32 else { throw VortxNativeError.invalidSnapshot }
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+        if let recovery = try store.recovery(account: capture.namespace) {
+            guard let archive = try JSONSerialization.jsonObject(with: recovery.bootstrap) as? [String: Any],
+                  let document = archive["hostDocument"] as? [String: Any],
+                  document["nativeAccountBootstrap"] as? String == "authenticated-empty-v1" else { throw VortxNativeError.invalidSnapshot }
+            return document
+        }
+        // The constant owner belongs to this new account scope. No pre-existing global profile,
+        // watched item, addon, or preference is silently attributed to the new account.
+        let owner = UserProfile(id: UserProfile.ownerID, name: account.username.isEmpty ? "Main" : account.username,
+                                avatar: "🍿", email: account.email, isOwner: true)
+        guard let roster = ProfileRosterSnapshot.wire([owner]) else { throw VortxNativeError.invalidSnapshot }
+        return ["nativeAccountBootstrap": "authenticated-empty-v1", "vortx": ["roster": roster, "rosterModified": 0]]
+    }
+
+    private func restoreOfflineNativeCheckpoint(capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UUID) async -> Bool {
+        guard let keyBytes = dataKey, keyBytes.count == 32, let selectedProfile,
+              isCurrent(capture), !Task.isCancelled else { return false }
+        do {
+            let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+                .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+            let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+            guard let recovery = try store.recovery(account: capture.namespace) else { throw VortxNativeError.invalidSnapshot }
+            let state = try recovery.scope.validateSnapshot(recovery.state)
+            guard let profile = state["roster"]?["profiles"]?[selectedProfile.uuidString], profile["deleted"] != .bool(true),
+                  case .string(let ownerName) = state["roster"]?["profiles"]?[recovery.scope.ownerProfileID]?["name"],
+                  let archive = try JSONSerialization.jsonObject(with: recovery.bootstrap) as? [String: Any],
+                  let material = archive["legacyImportMaterial"] as? [String: Any] else { throw VortxNativeError.invalidSnapshot }
+            try VortxNativeSession.validateLegacyCompatibility(scope: recovery.scope, ownerName: ownerName,
+                snapshot: recovery.state, nativeSync: nil, material: JSONSerialization.data(withJSONObject: material), abi: VortxCABI())
+            await CoreBridge.shared.closeNativeSession()
+            guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
+                  ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+            let session = try VortxNativeSession(scope: recovery.scope, ownerName: ownerName, abi: VortxCABI(), store: store,
+                                                transport: VortxCResourceTransport())
+            do {
+                if state["activeProfileId"] != .string(selectedProfile.uuidString) {
+                    let action = VortxJSON.object(["type": .string("switch_profile"), "id": .string(selectedProfile.uuidString)])
+                    _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970))
+                }
+                let registry = try await session.resourceRegistry()
+                guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
+                      ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture)
+                nativeCheckpointStatus = "mounted_offline"; return true
+            } catch { await session.close(); throw error }
+        } catch {
+            if isCurrent(capture), nativeCheckpointGeneration == generation { nativeCheckpointStatus = "offline_checkpoint_unavailable" }
+            return false
+        }
+    }
+
     /// The key never leaves this account owner. Only an absent checkpoint permits a complete
     /// authenticated import/native-carrier adoption; failed reads/decryption never mean absence.
     @discardableResult
@@ -263,8 +322,21 @@ final class VortXSyncManager: ObservableObject {
             guard self.isCurrent(capture), !Task.isCancelled else { return false }
             // Global ProfileStore is not account-attribution evidence. Pin the owner from this
             // freshly authenticated/decrypted account roster, including historical PIN-bound IDs.
-            guard case .doc(let document) = await self.pullSyncDocResult(credentialCapture: capture),
-                  self.isCurrent(capture), !Task.isCancelled,
+            let pulled = await self.pullDocVersionedResult(credentialCapture: capture)
+            if case .failed(retryable: true) = pulled {
+                return await self.restoreOfflineNativeCheckpoint(capture: capture, selectedProfile: selectedProfile, generation: generation)
+            }
+            let document: [String: Any]
+            switch pulled {
+            case .doc(let value, let version) where version >= self.lastSyncedVersion: document = value
+            case .empty:
+                guard let value = try? self.nativeEmptyAccountDocument(capture: capture) else {
+                    self.nativeCheckpointStatus = "empty_account_attribution_unavailable"; return false
+                }
+                document = value
+            default: self.nativeCheckpointStatus = "account_document_unavailable"; return false
+            }
+            guard self.isCurrent(capture), !Task.isCancelled,
                   let roster = Self.resolveRoster(from: document, fullOnly: true),
                   let keyBytes = self.dataKey, keyBytes.count == 32 else {
                 if self.isCurrent(capture) { self.nativeCheckpointStatus = "account_document_unavailable" }; return false
@@ -327,6 +399,7 @@ final class VortXSyncManager: ObservableObject {
                     }
                     let registry = try await session.resourceRegistry()
                     guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                    try store.rememberAuthenticatedScope(scope)
                     try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture)
                     guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
                           ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
@@ -1604,8 +1677,9 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture) else { return .failed }
         if code == 404 { return .empty }                 // no backup yet
         guard code == 200 else { return .failed }        // network/server error: do not clobber
-        guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty } // 200, no document
-        let pulledVersion = (json?["version"] as? Int) ?? 0
+        guard let json, json["document"] == nil || json["document"] is NSNull || json["document"] is String else { return .failed }
+        guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .empty } // valid 200 envelope, no document
+        let pulledVersion = (json["version"] as? Int) ?? 0
         // H-2: refuse an honest-label replay of a doc OLDER than what this account has already applied. syncUp
         // uses this as its merge base, so a stale base would drop newer writes made on another surface. A real
         // server only ever returns a version >= what we last stamped, so this only fires on rollback/replay.
@@ -1638,11 +1712,12 @@ final class VortXSyncManager: ObservableObject {
         // request() returns code 0 for a thrown URLSession error (offline / DNS / TLS / timeout) and 5xx is a
         // server fault: both are transient, and both are exactly the "silently returns false" case of #145.
         guard code == 200 else { return .failed(retryable: code == 0 || code >= 500) }
-        guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty }  // 200, no document
+        guard let json, json["document"] == nil || json["document"] is NSNull || json["document"] is String else { return .failed(retryable: false) }
+        guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .empty }  // valid 200 envelope, no document
         // `version` stays `as? Int` (Swift's Int is 64-bit on every platform this app targets), so an epoch-ms
         // version is carried whole. Never narrow this to a 32-bit type: a truncated version corrupts the AAD and
         // GCM auth then fails on every Apple / web doc.
-        guard let version = json?["version"] as? Int else { return .failed(retryable: false) }
+        guard let version = json["version"] as? Int else { return .failed(retryable: false) }
         // A doc we cannot open is NOT an empty account. Refusing it (rather than falling through to a nil that
         // reads as "nothing there") is what keeps a decrypt-miss / ratchet refusal from being pushed over.
         guard let pt = openSyncDocument(docStr, version: version),
@@ -2269,7 +2344,13 @@ final class VortXSyncManager: ObservableObject {
         var doc: [String: Any]
         switch await pullSyncDocResult(credentialCapture: capture) {
         case .failed: return nil
-        case .empty: doc = [:]
+        case .empty:
+#if VORTX_NATIVE_DATA_ENGINE
+            guard let initial = try? nativeEmptyAccountDocument(capture: capture) else { return nil }
+            doc = initial
+#else
+            doc = [:]
+#endif
         case .doc(let existing): doc = existing
         }
         guard isCurrent(capture) else { return nil }

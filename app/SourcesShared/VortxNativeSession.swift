@@ -67,6 +67,15 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
     private let key: SymmetricKey
     private let lock = NSLock()
     private var bootstraps: [VortxAccountScope: Data] = [:]
+    private struct AccountLocator: Codable {
+        let format: String
+        let scope: VortxAccountScope
+    }
+    struct Recovery {
+        let scope: VortxAccountScope
+        let state: String
+        let bootstrap: Data
+    }
     init(directory: URL, key: SymmetricKey, bootstrap: Data? = nil, bootstrapScope: VortxAccountScope? = nil) throws {
         guard key.bitCount == 256 else { throw VortxNativeError.invalidSnapshot }
         if let bootstrap {
@@ -79,6 +88,42 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
     private func url(_ scope: VortxAccountScope) -> URL {
         let digest = SHA256.hash(data: scope.authenticatedData).map { String(format: "%02x", $0) }.joined()
         return directory.appendingPathComponent("native-state-v1-\(digest).sealed")
+    }
+    private func locatorAAD(_ account: String) -> Data { Data(("vortx-native-account-locator-v1\u{0}" + account).utf8) }
+    private func locatorURL(_ account: String) -> URL {
+        let digest = SHA256.hash(data: locatorAAD(account)).map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent("native-account-v1-\(digest).sealed")
+    }
+    /// Publish only after a full authenticated account open. The account key and namespace
+    /// authenticate this owner lookup; global profile preferences never establish ownership.
+    func rememberAuthenticatedScope(_ scope: VortxAccountScope) throws {
+        lock.lock(); defer { lock.unlock() }
+        try scope.validate()
+        let existing = try open(Data(contentsOf: url(scope)), scope: scope)
+        guard existing.bootstrap != nil else { throw VortxNativeError.invalidSnapshot }
+        let payload = try JSONEncoder().encode(AccountLocator(format: "vortx-native-account-locator-v1", scope: scope))
+        let sealed = try AES.GCM.seal(payload, using: key, authenticating: locatorAAD(scope.account))
+        guard let bytes = sealed.combined else { throw VortxNativeError.invalidSnapshot }
+        try bytes.write(to: locatorURL(scope.account), options: [.atomic, .completeFileProtection])
+        let installed = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: locatorURL(scope.account))),
+                                        using: key, authenticating: locatorAAD(scope.account))
+        guard installed == payload else { throw VortxNativeError.invalidSnapshot }
+    }
+    /// Offline recovery is read-only until the caller hydrates the proven checkpoint. Missing
+    /// locator/checkpoint/archive is not permission to provision a new account.
+    func recovery(account: String) throws -> Recovery? {
+        lock.lock(); defer { lock.unlock() }
+        let bytes: Data
+        do { bytes = try Data(contentsOf: locatorURL(account)) }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
+        let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: bytes), using: key, authenticating: locatorAAD(account))
+        let locator = try JSONDecoder().decode(AccountLocator.self, from: plain)
+        guard locator.format == "vortx-native-account-locator-v1", locator.scope.account == account else { throw VortxNativeError.invalidSnapshot }
+        try locator.scope.validate()
+        let envelope = try open(Data(contentsOf: url(locator.scope)), scope: locator.scope)
+        guard let bootstrap = envelope.bootstrap else { throw VortxNativeError.invalidSnapshot }
+        bootstraps[locator.scope] = bootstrap
+        return Recovery(scope: locator.scope, state: envelope.state, bootstrap: bootstrap)
     }
     private func open(_ data: Data, scope: VortxAccountScope) throws -> Envelope {
         let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: data), using: key, authenticating: scope.authenticatedData)
