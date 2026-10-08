@@ -169,6 +169,21 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         var baselineWatch = try VortxNativeHostPreferences(scope: scope, actor: actorA)
         try VortxNativeWatchlist.seed([movie], profileID: watchProfile, into: &baselineWatch)
         check(baselineWatch.local.counter == 0 && baselineWatch.local.document.profiles[watchProfile.uuidString]?.fields[movieKey]?.clock == 0)
+        var otherBaseline = try VortxNativeHostPreferences(scope: scope, actor: actorB)
+        let changedMovie = VortxNativeWatchlist.Entry(id: "tt123", type: "movie", name: "🍿 / Revised", poster: nil, addedAt: 123.5)
+        check(try VortxNativeWatchlist.baselineActor(profileID: watchProfile, field: movieKey,
+            value: VortxNativeWatchlist.value(changedMovie)) == "e2845c02-42cf-6e8c-1cc4-bef50778d4b4")
+        try VortxNativeWatchlist.seed([changedMovie], profileID: watchProfile, into: &otherBaseline)
+        let firstBaseline = try baselineWatch.document, secondBaseline = try otherBaseline.document
+        try baselineWatch.merge(secondBaseline, scope: scope)
+        try otherBaseline.merge(firstBaseline, scope: scope)
+        check(baselineWatch.local.document == otherBaseline.local.document)
+        let seedWinner = try baselineWatch.document
+        try VortxNativeWatchlist.seed([movie], profileID: watchProfile, into: &baselineWatch)
+        check(try baselineWatch.document == seedWinner)
+        try baselineWatch.edit(profileID: watchProfile.uuidString, fields: [movieKey: .null], scope: scope)
+        try baselineWatch.merge(secondBaseline, scope: scope)
+        check(try VortxNativeWatchlist.entries(host: baselineWatch.document, profileID: watchProfile).isEmpty)
         let beforeBadWatch = try watchA.encoded()
         do { try watchA.edit(profileID: watchProfile.uuidString, fields: [movieKey: .object(["id": .string("ttOther")])], scope: scope); check(false) } catch {}
         check(try watchA.encoded() == beforeBadWatch)

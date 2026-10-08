@@ -263,7 +263,7 @@ Local additions at 1,000 live entries refuse without evicting older entries. Lar
 remain visible and removals remain possible; tombstones are not pruned to satisfy a display cap.
 
 Only an authenticated account's profile-qualified legacy settings array seeds missing registers,
-at clock 0 / all-zero UUID actor, inside the accepted candidate after merging remote host state.
+at clock 0 with an immutable content-derived actor, inside the accepted candidate after merging remote host state.
 Existing live registers and tombstones always win over that old array. Unqualified local arrays,
 unknown-profile or malformed old arrays, and unknown dirty settings remain preserved and visibly
 unsynchronized. They neither acquire a fabricated account attribution nor block unrelated supported
@@ -273,3 +273,12 @@ The acknowledged Watchlist API requires `PlaybackMutationTarget` captured synchr
 gesture, before any Task is scheduled. Legacy synchronous mutators cannot bypass native admission.
 The Apple `vortx.quickViewEnabled` and Android `vortx.cinema.quickView` Boolean preferences retain
 their separate names and defaults; accepting both does not synthesize an alias edit or clock.
+
+The baseline actor is the first 32 hexadecimal characters of SHA-256 over the shared
+JavaScript-canonical JSON object `{domain:"vortx-watchlist-baseline-v1",profileId,field,value}`,
+formatted as lowercase UUID `8-4-4-4-12` without changing version bits. `profileId` is uppercase
+canonical UUID; `field` is the canonical per-item key. The value omits missing/null optional name
+and poster and preserves Unicode and finite binary64 seconds through the canonicalizer. Differing
+unversioned authenticated baselines therefore converge as distinct immutable clock-0 events, while
+any explicit native add/removal at clock 1 or higher dominates both. No deployed zero-actor carrier
+is migrated or re-clocked by this rule.

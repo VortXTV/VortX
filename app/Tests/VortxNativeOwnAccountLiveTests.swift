@@ -524,12 +524,20 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
         let watchKey = try VortxNativeWatchlist.field(id: watch.id, type: watch.type)
         _ = try await facade.mergeAccountDocument(nil, hostRemote: nil, legacyMaterial: nil, legacyWatchlists: [owner.id: [watch]])
         check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: owner.id) == [watch])
+        let seededDisk = try store.readHostPreferences(scope: scope)
+        check(seededDisk != nil)
+        let coldSeed = try VortxNativeHostPreferences(scope: scope, actor: "00000000-0000-0000-0000-000000000002", sealed: seededDisk)
+        check(try VortxNativeWatchlist.entries(host: coldSeed.document, profileID: owner.id) == [watch])
         let libraryBeforeWatch = facade.profileSnapshot()!.state["libraries"]
         try await facade.mutateProfiles([], hostEdits: [.init(profileID: owner.id.uuidString, fields: [watchKey: .null])],
             expectedProfileID: owner.id.uuidString, expectedAccountGeneration: facade.accountGeneration)
         _ = try await facade.mergeAccountDocument(nil, hostRemote: nil, legacyMaterial: nil, legacyWatchlists: [owner.id: [watch]])
         check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: owner.id).isEmpty)
         check(facade.profileSnapshot()!.state["libraries"] == libraryBeforeWatch)
+        let historicalProfile = UUID(uuidString: "90000000-0000-0000-0000-000000000099")!
+        _ = try await facade.mergeAccountDocument(nil, hostRemote: nil, legacyMaterial: nil, legacyWatchlists: [historicalProfile: [watch]])
+        check(facade.profileSnapshot()!.host["profiles"]?[historicalProfile.uuidString] == nil)
+        check(facade.profileSnapshot()!.state["roster"]?["profiles"]?[historicalProfile.uuidString] == nil)
         let watchHostBeforeFailure = try store.readHostPreferences(scope: scope)
         do { try await facade.mutateProfiles([], hostEdits: [.init(profileID: owner.id.uuidString, fields: [watchKey: VortxNativeWatchlist.value(watch)])],
             expectedProfileID: owner.id.uuidString, expectedAccountGeneration: UUID()); check(false) } catch VortxNativeError.superseded {}

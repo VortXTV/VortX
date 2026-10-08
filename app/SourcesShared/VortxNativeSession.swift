@@ -840,7 +840,10 @@ actor VortxNativeSession {
         try candidateHost.retainAuthenticatedSourceArchive(authenticatedSourceArchive)
         try candidateHost.merge(hostRemote, scope: scope)
         for (profile, entries) in legacyWatchlists {
-            guard let record = state["roster"]?["profiles"]?[profile.uuidString], record["deleted"] != .bool(true) else { throw VortxNativeError.invalidSnapshot }
+            // The unchanged legacy roster may still carry a profile explicitly deleted by the
+            // native peer. Preserve that old array in its source document, never resurrect the
+            // profile or block unrelated sync because its historical ledger cannot be seeded.
+            guard let record = state["roster"]?["profiles"]?[profile.uuidString], record["deleted"] != .bool(true) else { continue }
             try VortxNativeWatchlist.seed(entries, profileID: profile, into: &candidateHost)
         }
         for edit in hostEdits {
@@ -903,7 +906,7 @@ actor VortxNativeSession {
             state = try scope.validateSnapshot(candidate.stateJSON())
         }
         let updated = try candidate.stateJSON()
-        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty || hasWebsiteWork || authenticatedSourceArchive != nil
+        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty || !legacyWatchlists.isEmpty || hasWebsiteWork || authenticatedSourceArchive != nil
         let encodedHost = hasHostChanges ? try candidateHost.encoded() : nil
         do {
             try lease.withActive {
