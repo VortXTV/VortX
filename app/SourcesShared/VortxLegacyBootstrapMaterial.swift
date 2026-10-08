@@ -201,18 +201,16 @@ enum VortxLegacyBootstrapMaterial {
 
             func buckets() throws -> OwnAccountBuckets {
                 // An independently authenticated account has the same root membership/history
-                // carriers as the primary account, but never borrows root-document or byProfile
-                // data from the profile roster's account. This short-lived adapter intentionally
-                // does not import overlay buckets from the independent source.
+                // carriers as the primary account, but never borrows root-document data from the
+                // profile roster's account. Its envelope carries only the authenticated, exact
+                // UUID-scoped overlay slice when that profile has durable local intents.
                 let profile = UserProfile(id: UUID(uuidString: profileID)!, name: "Independent", avatar: "🍿")
                 let adapter = try Adapter(independentSource: sourceDocument, profile: profile)
-                try require((try object(adapter.vortx, "byProfile") ?? [:]).isEmpty
-                            && (try object(adapter.document, "webProgress") ?? [:]).isEmpty,
-                            "Own-account source overlay carrier requires reconciliation")
                 adapter.watches[profileID] = []
                 adapter.titles[profileID] = [:]
                 let addons = try adapter.addonBucket()
                 let library = try adapter.ownerLibrary()
+                try adapter.importOverlays()
                 try adapter.validateProfileEdits(ownerLibrary: library)
                 return OwnAccountBuckets(addons: addons, library: library,
                                          watches: try VortxLegacyBootstrapMaterial.resolveWatches(adapter.watches[profileID] ?? []),
@@ -223,20 +221,24 @@ enum VortxLegacyBootstrapMaterial {
         /// The authenticated producer retains the exact datastore and add-on response bodies inside
         /// this small envelope.  The source digest covers the envelope bytes, not a host-reserialized
         /// projection; parsing below creates a private compatibility view only after that proof.
-        private static func decodeOwnAccountEnvelope(_ source: Data) throws -> Object {
+        private static func decodeOwnAccountEnvelope(_ source: Data, profileID: String) throws -> Object {
             guard let envelope = try JSONSerialization.jsonObject(with: source) as? Object,
-                  Set(envelope.keys) == ["schemaVersion", "libraryResponseBase64", "addonsResponseBase64"],
+                  Set(envelope.keys) == ["schemaVersion", "libraryResponseBase64", "addonsResponseBase64", "profileOverlayBase64"],
                   let version = envelope["schemaVersion"] as? NSNumber,
                   CFGetTypeID(version) != CFBooleanGetTypeID(), version.intValue == 1,
                   Double(version.intValue) == version.doubleValue,
                   let libraryBase64 = envelope["libraryResponseBase64"] as? String,
                   let addonsBase64 = envelope["addonsResponseBase64"] as? String,
+                  let overlayBase64 = envelope["profileOverlayBase64"] as? String,
                   let libraryBytes = Data(base64Encoded: libraryBase64),
                   let addonBytes = Data(base64Encoded: addonsBase64),
+                  let overlayBytes = Data(base64Encoded: overlayBase64),
                   libraryBytes.base64EncodedString() == libraryBase64,
                   addonBytes.base64EncodedString() == addonsBase64,
+                  overlayBytes.base64EncodedString() == overlayBase64,
                   let libraryEnvelope = try JSONSerialization.jsonObject(with: libraryBytes) as? Object,
                   let addonEnvelope = try JSONSerialization.jsonObject(with: addonBytes) as? Object,
+                  let overlay = try JSONSerialization.jsonObject(with: overlayBytes) as? Object,
                   Set(libraryEnvelope.keys) == ["result"],
                   Set(addonEnvelope.keys) == ["result"],
                   let libraryRows = libraryEnvelope["result"] as? [Any],
@@ -248,6 +250,7 @@ enum VortxLegacyBootstrapMaterial {
             try VortxLegacyBootstrapMaterial.rejectCredentials(envelope)
             try VortxLegacyBootstrapMaterial.rejectCredentials(libraryEnvelope)
             try VortxLegacyBootstrapMaterial.rejectCredentials(addonEnvelope)
+            try VortxLegacyBootstrapMaterial.rejectCredentials(overlay)
             let rows = try libraryRows.map(projectOwnLibraryRow)
             let descriptors = try addons.map { raw -> Object in
                 guard let descriptor = raw as? Object else { throw fail("Malformed own-account add-on descriptor") }
@@ -256,8 +259,34 @@ enum VortxLegacyBootstrapMaterial {
                 _ = try string(manifest, "id"); _ = try string(manifest, "name"); _ = try string(manifest, "version")
                 return descriptor
             }
-            return ["vortx": ["library": rows, "addons": descriptors],
-                    "addonOrder": try descriptors.map { try string($0, "transportUrl") }]
+            var vortx: Object = ["library": rows, "addons": descriptors]
+            var document: Object = ["vortx": vortx,
+                                    "addonOrder": try descriptors.map { try string($0, "transportUrl") }]
+            guard Set(overlay.keys).isSubset(of: ["vortx", "webProgress"]) else {
+                throw fail("Own-account overlay has unsupported source carrier")
+            }
+            if let rawVortx = try object(overlay, "vortx") {
+                guard Set(rawVortx.keys) == ["byProfile"],
+                      let byProfile = try object(rawVortx, "byProfile"),
+                      Set(byProfile.keys) == [profileID],
+                      byProfile[profileID] is Object else {
+                    throw fail("Own-account overlay must be scoped to its authenticated profile")
+                }
+                vortx["byProfile"] = byProfile
+                document["vortx"] = vortx
+            }
+            if let rawProgress = try object(overlay, "webProgress") {
+                guard Set(rawProgress.keys) == ["removed"],
+                      let removed = try object(rawProgress, "removed"),
+                      Set(removed.keys) == ["byProfile"],
+                      let byProfile = try object(removed, "byProfile"),
+                      Set(byProfile.keys) == [profileID],
+                      byProfile[profileID] is [Any] else {
+                    throw fail("Own-account overlay removals must be scoped to its authenticated profile")
+                }
+                document["webProgress"] = ["removed": ["byProfile": byProfile]]
+            }
+            return document
         }
 
         private static func projectOwnLibraryRow(_ raw: Any) throws -> Object {
@@ -337,7 +366,7 @@ enum VortxLegacyBootstrapMaterial {
                             "Own-account source lacks a verified streaming identity")
                 try require(source.sourceDocumentSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
                             "Own-account source has an invalid document digest")
-                let document = try Self.decodeOwnAccountEnvelope(source.sourceDocument)
+                let document = try Self.decodeOwnAccountEnvelope(source.sourceDocument, profileID: profileID)
                 sources[profileID] = ResolvedOwnAccountSource(profileID: profileID,
                     verifiedStreamingUID: source.verifiedStreamingUID,
                     sourceDocumentSHA256: source.sourceDocumentSHA256, sourceDocument: document)
@@ -426,12 +455,17 @@ enum VortxLegacyBootstrapMaterial {
                 try require(seen.insert(key).inserted, "Duplicate owner library identity")
                 var item: Object = ["kind": "standard", "id": id, "type": type, "name": try optionalString(row, "name") ?? ""]
                 if let poster = try optionalString(row, "poster"), !poster.isEmpty { item["poster"] = poster }
-                if try boolean(row, "temp") == true { throw fail("Temporary owner-library membership requires reconciliation") }
-                if try boolean(row, "removed") == true {
+                let temporary = try boolean(row, "temp") == true
+                let removed = try boolean(row, "removed") == true
+                if temporary && !independentSource { throw fail("Temporary owner-library membership requires reconciliation") }
+                if removed && !temporary {
                     // eventEpochMs/lastWatched describe viewing, not membership removal. Require
                     // a separately proven library tombstone below; never promote a viewing clock.
+                    // A freshly authenticated own-account baseline has no causal deletion clock;
+                    // its explicit `removed:true` is represented by the documented weak epoch 1.
                     removedRows.insert(key)
-                } else { items[key] = item }
+                    if independentSource { intents[key] = ["key": key, "removedAtMs": 1.0] }
+                } else if !temporary { items[key] = item }
                 try importWatch(ownerID, id, row, history: false, overlay: false)
                 try importMarks(ownerID, id, row)
             }

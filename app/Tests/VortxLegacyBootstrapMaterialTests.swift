@@ -39,12 +39,14 @@ enum VortxLegacyBootstrapMaterialTests {
     /// Models the producer boundary exactly: independently authenticated Stremio response bodies
     /// are retained byte-for-byte and put behind a small, token-free carrier. The bootstrapper
     /// never accepts a flattened host reconstruction as account proof.
-    static func ownSourceEnvelope(libraryRows: [Object], addons: [Object], extraEnvelope: Object = [:]) throws -> Data {
+    static func ownSourceEnvelope(libraryRows: [Object], addons: [Object], profileOverlay: Object = [:], extraEnvelope: Object = [:]) throws -> Data {
         let libraryResponse = try JSONSerialization.data(withJSONObject: ["result": libraryRows], options: [.sortedKeys])
         let addonsResponse = try JSONSerialization.data(withJSONObject: ["result": ["addons": addons]], options: [.sortedKeys])
+        let overlayResponse = try JSONSerialization.data(withJSONObject: profileOverlay, options: [.sortedKeys])
         var envelope: Object = ["schemaVersion": 1,
                                 "libraryResponseBase64": libraryResponse.base64EncodedString(),
-                                "addonsResponseBase64": addonsResponse.base64EncodedString()]
+                                "addonsResponseBase64": addonsResponse.base64EncodedString(),
+                                "profileOverlayBase64": overlayResponse.base64EncodedString()]
         for (key, value) in extraEnvelope { envelope[key] = value }
         return try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys])
     }
@@ -131,6 +133,29 @@ enum VortxLegacyBootstrapMaterialTests {
               && (result["identityLinks"] as! [String: [[String]]])[own.id.uuidString] == [],
               "Primary bucket is retained and own receipt invents no aliases")
 
+        let overlay: Object = ["vortx": ["byProfile": [own.id.uuidString: ["watched": [
+            "tt-own": ["w": ["overlay-video"]]
+        ]]]]]
+        let overlayReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [ownMovie], addons: [ownAddon], profileOverlay: overlay))
+        let overlayResult = try material(root, roster: [owner, own], ownAccountSources: [overlayReceipt])
+        check(watches(overlayResult, profile: own).contains { $0["metaId"] as? String == "tt-own" && $0["videoId"] as? String == "overlay-video" && $0["watched"] as? Bool == true },
+              "Authenticated UUID-scoped overlay marks survive alongside the independent source")
+
+        var temporary = ownMovie; temporary["_id"] = "tt-temp"; temporary["temp"] = true
+        var temporaryState = temporary["state"] as! Object; temporaryState["video_id"] = "tt-temp"; temporary["state"] = temporaryState
+        var removed = ownMovie; removed["_id"] = "tt-removed"; removed["removed"] = true
+        var removedState = removed["state"] as! Object; removedState["video_id"] = "tt-removed"; removed["state"] = removedState
+        let rawLifecycleReceipt = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [temporary, removed], addons: [ownAddon]))
+        let rawLifecycleResult = try material(root, roster: [owner, own], ownAccountSources: [rawLifecycleReceipt])
+        let rawLibrary = (rawLifecycleResult["libraries"] as! [String: Object])[own.id.uuidString]!
+        check((rawLibrary["items"] as! [Object]).isEmpty
+              && (rawLibrary["intents"] as! [Object]).contains { $0["key"] as? String == "movie:tt-removed" && ($0["removedAtMs"] as? NSNumber)?.doubleValue == 1 },
+              "Temporary rows are watch-only and initial removed rows use the explicit weak tombstone")
+        check(Set(watches(rawLifecycleResult, profile: own).compactMap { $0["metaId"] as? String }) == ["tt-temp", "tt-removed"],
+              "Temporary and removed rows retain independently authenticated watch context")
+
         let highMilliseconds: Int64 = 9_007_199_254_740_989
         var highState = ownMovie["state"] as! Object
         highState["timeOffset"] = NSNumber(value: highMilliseconds)
@@ -178,14 +203,14 @@ enum VortxLegacyBootstrapMaterialTests {
             check(error.reason.contains("Credential-bearing"), "Credential-bearing own source cannot be reduced into a proof")
         }
         let overlaySource = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
-            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [], addons: [], extraEnvelope: ["byProfile": [own.id.uuidString: ["watched": Object()]]]))
+            verifiedStreamingUID: "verified-own-uid", sourceDocument: try ownSourceEnvelope(libraryRows: [], addons: [], profileOverlay: ["vortx": ["byProfile": [owner.id.uuidString: Object()]]]))
         do { _ = try material(root, roster: [owner, own], ownAccountSources: [overlaySource]); preconditionFailure("overlay source imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
-            check(error.reason.contains("exact library and add-on responses"), "Profile overlay cannot masquerade as an independent source")
+            check(error.reason.contains("scoped to its authenticated profile"), "Foreign profile overlay cannot masquerade as an independent source")
         }
         let incompleteEnvelope = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: own.id,
             verifiedStreamingUID: "verified-own-uid", sourceDocument: try JSONSerialization.data(withJSONObject: ["schemaVersion": 1,
-                                                                                                        "libraryResponseBase64": "e30=", "addonsResponseBase64": "e30="]))
+                                                                                                        "libraryResponseBase64": "e30=", "addonsResponseBase64": "e30=", "profileOverlayBase64": "e30="]))
         do { _ = try material(root, roster: [owner, own], ownAccountSources: [incompleteEnvelope]); preconditionFailure("incomplete source imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
             check(error.reason.contains("exact library and add-on responses"), "Missing authenticated response cannot become an empty account")
