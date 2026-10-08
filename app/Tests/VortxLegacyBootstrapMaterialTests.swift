@@ -319,6 +319,11 @@ enum VortxLegacyBootstrapMaterialTests {
 
     static func overlayWitnessContract() throws {
         let vectors: [(String, String)] = [
+            ("0e999999999999", "d9ca9210c68afc33ceba20ab3a4ee98023c5cbe713b0e47b2651575ef393667d"),
+            ("1e-999999999999", "d9ca9210c68afc33ceba20ab3a4ee98023c5cbe713b0e47b2651575ef393667d"),
+            ("0.039304369631583587", "bc7474d66abdbee530ba562c8ae4a1cc4eb02da5a64577c6c4e10ca6534c91b9"),
+            ("0.84551240822557006", "ebe152da89c8c51f1d336aaab4fb6251ccc0ddf2e423702f3539d41a3adcc78b"),
+            ("1.00000000000000011102230246251565404236316680908203125", "c89696df535936b8a46865d7c5fe67fefa2c373f2858d2c42ced36720ee20b23"),
             ("{}", "f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a"),
             ("{\"b\":true,\"a\":\"x/y\",\"n\":null}", "48b922f092adb76b7fcddd4876a9ab2df9432d86dd80fe2a052cb51b23665a5f"),
             ("[-0,0,0.1,1e-7,1.25,9007199254740991]", "6dc7e298ab380f2d71eb83674092f89b1e869df5ae3c9ed460e936e6aaabfff3"),
