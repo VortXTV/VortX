@@ -45,6 +45,10 @@ enum VortxNativeBootstrapArchive {
     }
     private static func sanitize(_ value: Any, path: String, exclusions: inout [String], depth: Int = 0) throws -> Any {
         guard depth <= 64 else { throw Failure.opaquePreference }
+        // Typed SHA-256 evidence is hexadecimal, not a base64 JSON carrier. Some valid hashes
+        // (for example e9...) decode to a leading brace plus arbitrary bytes under base64 probing.
+        if let text = value as? String, ["/valueHash", "/fingerprint"].contains(where: path.hasSuffix),
+           text.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil { return text }
         if var object = value as? [String: Any] {
             // Backups may be nested under future preference keys, not just `settings`. Recognize
             // their envelope by content and inspect the plist before traversing envelope metadata.

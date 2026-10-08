@@ -28,7 +28,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift \
     app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
     "$native_live_dir/UserProfile.swift" "$native_live_dir/Discovery.swift" app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift app/SourcesShared/VortxNativeProfiles.swift app/SourcesShared/VortxNativeProviderCredentials.swift \
-    app/Tests/VortxNativeLiveABITests.swift "$library" -o "$native_live_dir/live-abi"
+    app/SourcesShared/VortxNativeProfileEditHost.swift app/Tests/VortxNativeLiveABITests.swift "$library" -o "$native_live_dir/live-abi"
 DYLD_LIBRARY_PATH="$(dirname "$library"):$(dirname "$library")/deps" \
     "$native_live_dir/live-abi" test/fixtures/native-resource-contract.json "$(<"$native_live_dir/port")" "$native_live_dir/checkpoints" "$native_live_dir/delay-meta"
 test "$library_hash" = "$(shasum -a 256 "$library" | awk '{print $1}')"

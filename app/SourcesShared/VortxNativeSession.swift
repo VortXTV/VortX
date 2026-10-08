@@ -62,7 +62,7 @@ struct VortxAccountScope: Codable, Hashable, Sendable {
               libraries.keys.allSatisfy({ profiles[$0] != nil }) else { throw VortxNativeError.invalidSnapshot }
         if let sync = value["nativeSync"], sync != .null {
             guard sync["scope"] == .string(account), sync["ownerProfileId"] == .string(ownerProfileID),
-                  sync["schemaVersion"] == .integer(1) else { throw VortxNativeError.invalidSnapshot }
+                  [VortxJSON.integer(1), .integer(2)].contains(sync["schemaVersion"] ?? .null) else { throw VortxNativeError.invalidSnapshot }
         }
         return value
     }
@@ -85,11 +85,13 @@ protocol VortxCheckpointStore: Sendable {
     func commit(_ snapshot: String, scope: VortxAccountScope) throws
     func readHostPreferences(scope: VortxAccountScope) throws -> Data?
     func readLegacyMaterial(scope: VortxAccountScope) throws -> Data?
+    func readLegacyProfileEdits(scope: VortxAccountScope) throws -> VortxJSON?
     func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws
 }
 extension VortxCheckpointStore {
     func readHostPreferences(scope: VortxAccountScope) throws -> Data? { nil }
     func readLegacyMaterial(scope: VortxAccountScope) throws -> Data? { nil }
+    func readLegacyProfileEdits(scope: VortxAccountScope) throws -> VortxJSON? { nil }
     func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws { throw VortxNativeError.unavailable }
 }
 
@@ -325,6 +327,14 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         guard let bootstrap, let material = try JSONDecoder().decode(VortxJSON.self, from: bootstrap)["legacyImportMaterial"] else { return nil }
         return try JSONEncoder().encode(material)
     }
+    func readLegacyProfileEdits(scope: VortxAccountScope) throws -> VortxJSON? {
+        lock.lock(); defer { lock.unlock() }
+        let bootstrap: Data?
+        do { bootstrap = try open(Data(contentsOf: url(scope)), scope: scope).bootstrap }
+        catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { bootstrap = bootstraps[scope] }
+        guard let bootstrap else { return nil }
+        return try JSONDecoder().decode(VortxJSON.self, from: bootstrap)["hostDocument"]?["profileEdits"]
+    }
     func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws {
         try VortxNativeHostPreferences.validateSealed(hostPreferences, scope: scope)
         try commitSnapshot(snapshot, scope: scope, hostPreferences: hostPreferences)
@@ -435,6 +445,7 @@ actor VortxNativeSession {
     private var runtime: VortxNativeRuntime
     private var hostPreferences: VortxNativeHostPreferences
     private let legacyBaseline: Data?
+    private let legacyProfileEdits: VortxJSON?
     private var closed = false
     private var persistenceFailed = false
     private var epoch = UUID()
@@ -454,6 +465,7 @@ actor VortxNativeSession {
         guard legacy == nil || legacy?.scope == scope else { throw VortxNativeError.invalidSnapshot }
         self.scope = scope; self.abi = abi; self.store = store; self.transport = transport
         legacyBaseline = try store.readLegacyMaterial(scope: scope)
+        legacyProfileEdits = try store.readLegacyProfileEdits(scope: scope)
         hostPreferences = try VortxNativeHostPreferences(scope: scope, actor: hostActor, sealed: store.readHostPreferences(scope: scope))
         writer = try VortxScopeWriter(scope: scope, lease: lease)
         if let captured = try store.read(scope: scope) {
@@ -599,12 +611,16 @@ actor VortxNativeSession {
     func hostPreferencesDocument() throws -> VortxJSON {
         try lease.withActive { try hostPreferences.document }
     }
+    func websiteEditOutcome() throws -> VortxJSON {
+        try lease.withActive { try VortxNativeProfileEditHost.outcome(hostPreferences.local) }
+    }
     @discardableResult func dispatch(_ actions: [String], now: UInt64, legacyMaterial: Data? = nil,
-                                    hostRemote: VortxJSON? = nil, hostEdits: [VortxNativeHostPreferences.Edit] = []) throws -> [String] {
+                                    hostRemote: VortxJSON? = nil, hostEdits: [VortxNativeHostPreferences.Edit] = [],
+                                    websiteEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:]) throws -> [String] {
         guard !closed else { throw VortxNativeError.closed }
         guard !persistenceFailed else { throw VortxNativeError.checkpointUncertain }
         let old = try stateJSON()
-        let candidate = try VortxNativeRuntime(abi: abi, snapshot: old)
+        var candidate = try VortxNativeRuntime(abi: abi, snapshot: old)
         var installed = false
         defer { if !installed { candidate.close() } }
         try scope.validateHydration(from: old, to: candidate.stateJSON())
@@ -616,8 +632,7 @@ actor VortxNativeSession {
             results.append(result)
         }
         if let legacyMaterial { try Self.validateLegacyReceipt(candidate, scope: scope, material: legacyMaterial, baselineMaterial: legacyBaseline) }
-        let updated = try candidate.stateJSON()
-        let state = try scope.validateSnapshot(updated)
+        var state = try scope.validateSnapshot(candidate.stateJSON())
         var candidateHost = hostPreferences
         try candidateHost.merge(hostRemote, scope: scope)
         for edit in hostEdits {
@@ -626,7 +641,61 @@ actor VortxNativeSession {
             }
             try candidateHost.edit(profileID: edit.profileID, fields: edit.fields, scope: scope)
         }
-        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty
+        let pending = candidateHost.local.websitePending ?? []
+        let hasWebsiteWork = !websiteEvents.isEmpty || !pending.isEmpty
+        if hasWebsiteWork {
+            try VortxNativeProfileEditHost.validateSource(websiteEvents)
+            // Preserve differing payloads sharing one ID: the kernel checks immutable identity;
+            // a conflict must never replace a previously retained event silently.
+            var queue = pending
+            for event in websiteEvents where !queue.contains(event) { queue.append(event) }
+            var retained: [VortxJSON] = [], conflicts: [VortxNativeProfileEditHost.Conflict] = []
+            var receipts = candidateHost.local.websiteReceipts ?? [:]
+            for event in queue {
+                let eventID = (try? event["eventId"]?.decode(String.self)) ?? "invalid-event"
+                let previousEventState = try scope.validateSnapshot(candidate.stateJSON())
+                let trial = try VortxNativeRuntime(abi: abi, snapshot: candidate.stateJSON())
+                var accepted = false
+                defer { if !accepted { trial.close() } }
+                do {
+                    var authoredEvent = event
+                    var requestFields: [String: VortxJSON] = ["type": .string("apply_legacy_profile_edits"),
+                        "scope": .string(scope.account), "ownerProfileId": .string(scope.ownerProfileID)]
+                    if let aggregate = event["legacyAggregate"] {
+                        guard aggregate == legacyProfileEdits, case .object(var fields) = aggregate,
+                              let fingerprint = try scope.validateSnapshot(candidate.stateJSON())["nativeSync"]?["legacyImport"]?["fingerprint"] else { throw VortxNativeError.invalidSnapshot }
+                        fields["eventId"] = .string(eventID); authoredEvent = .object(fields)
+                        requestFields["legacyBootstrapFingerprint"] = fingerprint
+                    }
+                    requestFields["event"] = authoredEvent
+                    let request = VortxJSON.object(requestFields)
+                    let response = try trial.dispatch(String(decoding: JSONEncoder().encode(request), as: UTF8.self), now: now)
+                    let result = try JSONDecoder().decode(VortxJSON.self, from: Data(response.utf8))
+                    guard result["ok"] == .bool(true), let applied = result["events"]?.array?.first,
+                          applied["event"] == .string("legacy_profile_edits_applied"), let receipt = applied["receipt"],
+                          receipt["eventId"] == .string(eventID), case .string(let fingerprint) = receipt["source"]?["fingerprint"],
+                          let patch = applied["hostPatch"] else { throw VortxNativeError.invalidResponse }
+                    let admitted = try VortxNativeProfileEditHost.admit(event: authoredEvent, hostPatch: patch,
+                        preferences: candidateHost, scope: scope, baseline: websiteBaseline,
+                        committedReplay: receipts[eventID] == fingerprint,
+                        remoteReplay: previousEventState["nativeSync"]?["legacyProfileEditReceipts"]?[fingerprint] == receipt)
+                    if let conflict = admitted.conflict { conflicts.append(conflict); retained.append(event); continue }
+                    let next = try scope.validateSnapshot(trial.stateJSON())
+                    guard next["nativeSync"]?["legacyProfileEditReceipts"]?[fingerprint] == receipt else { throw VortxNativeError.invalidResponse }
+                    candidate.close(); candidate = trial; accepted = true; candidateHost = admitted.preferences
+                    receipts[eventID] = fingerprint; results.append(response)
+                } catch {
+                    retained.append(event)
+                    conflicts.append(.init(eventId: eventID, code: "unsupported_or_invalid_event", paths: []))
+                }
+            }
+            candidateHost.local.websitePending = retained
+            candidateHost.local.websiteReceipts = receipts
+            candidateHost.local.websiteConflicts = conflicts
+            state = try scope.validateSnapshot(candidate.stateJSON())
+        }
+        let updated = try candidate.stateJSON()
+        let hasHostChanges = hostRemote != nil || !hostEdits.isEmpty || hasWebsiteWork
         do {
             try lease.withActive {
                 if hasHostChanges { try store.commit(updated, scope: scope, hostPreferences: candidateHost.encoded()) }

@@ -154,6 +154,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                  actions: [String]? = nil, hostRemote: VortxJSON? = nil,
                                  hostEdits: [VortxNativeHostPreferences.Edit] = [],
                                  admission: (@Sendable () -> Bool)? = nil,
+                                 websiteEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                                  completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
         lock.lock(); defer { lock.unlock() }; guard !closed else { return false }
         let predecessor = tasks["native_state"]
@@ -178,11 +179,16 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     return
                 }
                 _ = try await session.dispatch(actions ?? [raw], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: legacyMaterial,
-                                               hostRemote: hostRemote, hostEdits: hostEdits)
+                                               hostRemote: hostRemote, hostEdits: hostEdits, websiteEvents: websiteEvents, websiteBaseline: websiteBaseline)
                 durableCommitted = true
                 let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
                 let playback = try await session.playbackProjection()
                 let host = try await session.hostPreferencesDocument()
+                let website = try await session.websiteEditOutcome()
+                let websiteChanged = !websiteEvents.isEmpty && self.lock.withLock {
+                    self.values["native_state"]?["nativeSync"] != state["nativeSync"] ||
+                        self.values["native_host_preferences"] != host || self.values["native_website_edits"] != website
+                }
                 let resourceChanged = self.lock.withLock { self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) }
                 // Only the native registry query determines installed membership/order. It also
                 // resolves own/share-primary before new-profile resource loads can be admitted.
@@ -199,6 +205,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     }
                     var fields = try self.stateFields(state)
                     fields["native_host_preferences"] = host
+                    fields["native_website_edits"] = website
                     fields.forEach { self.values[$0.key] = $0.value }; return fields
                 }
                 // FIFO intents each publish their acknowledged state before the next task executes.
@@ -206,7 +213,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 }; transitionReleased = true }
                 if let publishedFields { self.changed(Array(publishedFields.keys)) }
                 guard publishedFields != nil, let document = state["nativeSync"] else { throw VortxNativeError.closed }
-                if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) || !hostEdits.isEmpty { self.mutationAccepted() }
+                if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) || !hostEdits.isEmpty || websiteChanged { self.mutationAccepted() }
                 completion?(.success(document))
             } catch VortxNativeError.checkpointUncertain {
                 _ = self.fail("checkpoint_uncertain_reopen_required"); completion?(.failure(VortxNativeError.checkpointUncertain))
@@ -252,17 +259,19 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     /// One durable transaction contains both private-kernel state and public host preferences.
     /// Its returned carrier is read only after the same FIFO's merge/checkpoint acknowledgement.
     func mergeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, legacyMaterial: Data?,
-                              hostEdits: [VortxNativeHostPreferences.Edit] = []) async throws -> VortxJSON {
+                              hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = [],
+                              websiteBaseline: VortxNativeProfileEditHost.Baselines = [:]) async throws -> VortxJSON {
         let action = remote.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) }
             ?? .object(["type": .string("get_state")])
         let raw = String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
         return try await withCheckedThrowingContinuation { continuation in
             if !enqueueMutation(type: remote == nil ? "get_state" : "merge_native_sync", raw: raw, legacyMaterial: legacyMaterial,
-                                hostRemote: hostRemote, hostEdits: hostEdits, completion: { [weak self] result in
+                                hostRemote: hostRemote, hostEdits: hostEdits, websiteEvents: websiteEvents, websiteBaseline: websiteBaseline, completion: { [weak self] result in
                 switch result {
                 case .success(let native):
                     guard let self, let host = self.lock.withLock({ self.values["native_host_preferences"] }) else { continuation.resume(throwing: VortxNativeError.closed); return }
-                    continuation.resume(returning: .object(["nativeSync": native, "nativeHostPreferences": host]))
+                    let website = self.lock.withLock { self.values["native_website_edits"] ?? .object([:]) }
+                    continuation.resume(returning: .object(["nativeSync": native, "nativeHostPreferences": host, "profileEditResults": website]))
                 case .failure(let error): continuation.resume(throwing: error)
                 }
             }) { continuation.resume(throwing: VortxNativeError.closed) }

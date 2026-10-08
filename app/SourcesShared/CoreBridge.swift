@@ -125,10 +125,12 @@ final class CoreBridge: ObservableObject {
     }
     @MainActor
     func mergeNativeAccountDocument(_ remote: VortxJSON?, hostRemote: VortxJSON?, capture: CredentialScopeRegistry.Capture,
-                                    legacyMaterial: Data, hostEdits: [VortxNativeHostPreferences.Edit] = []) async throws -> VortxJSON {
+                                    legacyMaterial: Data, hostEdits: [VortxNativeHostPreferences.Edit] = [], websiteEvents: [VortxJSON] = []) async throws -> VortxJSON {
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }) else { throw VortxNativeError.closed }
-        let document = try await facade.mergeAccountDocument(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial, hostEdits: hostEdits)
+        let baseline = try VortxNativeProfileEditHost.baselines(nativeProfileBaseline)
+        let document = try await facade.mergeAccountDocument(remote, hostRemote: hostRemote, legacyMaterial: legacyMaterial,
+            hostEdits: hostEdits, websiteEvents: websiteEvents, websiteBaseline: baseline)
         guard CredentialScopeRegistry.shared.isCurrent(capture), !enginePublicationBlocked,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { throw VortxNativeError.superseded }
         try refreshNativeProfiles()

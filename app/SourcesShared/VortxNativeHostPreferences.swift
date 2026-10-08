@@ -12,7 +12,13 @@ struct VortxNativeHostPreferences: Sendable {
         var profiles: [String: Fields] = [:]
         var globals = Fields()
     }
-    struct Local: Codable, Sendable { var actor: String; var counter: UInt64; var document: Document }
+    struct Local: Codable, Sendable {
+        var actor: String; var counter: UInt64; var document: Document
+        // Device-local transaction journal, never part of the exported preference carrier.
+        var websitePending: [VortxJSON]? = nil
+        var websiteReceipts: [String: String]? = nil
+        var websiteConflicts: [VortxNativeProfileEditHost.Conflict]? = nil
+    }
     struct Edit: Sendable { let profileID: String?; let fields: [String: VortxJSON] }
     var local: Local
     var document: VortxJSON { get throws { try JSONDecoder().decode(VortxJSON.self, from: JSONEncoder().encode(local.document)) } }
@@ -38,6 +44,7 @@ struct VortxNativeHostPreferences: Sendable {
             var value = try JSONDecoder().decode(Local.self, from: sealed)
             guard Self.validActor(value.actor), value.counter <= Self.maxClock else { throw VortxNativeError.invalidSnapshot }
             try Self.validate(value.document, scope: scope)
+            try VortxNativeProfileEditHost.validateJournal(value)
             // The installation supplies its own keychain actor. Never adopt a restored actor.
             value.actor = actor; value.counter = max(value.counter, Self.maximum(value.document)); local = value
         } else { local = Local(actor: actor, counter: 0, document: Document(schemaVersion: 1, scope: scope.account, ownerProfileId: scope.ownerProfileID)) }
