@@ -308,7 +308,9 @@ final class CoreBridge: ObservableObject {
             profileOverlay: consumedOverlay, framing: pendingOverlay == nil ? .independentNetworkOnly : .authenticatedOverlay, verify: { _ in uid })
         guard nativePlaybackBinding(.native(target.binding))?.0 === facade else { throw VortxNativeError.superseded }
         let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owner.id.uuidString)
-        let previousArchive = facade.authenticatedSourceArchive
+        let previousArchive = try await VortxNativeWatchedArchive.retryHistorical(facade.authenticatedSourceArchive, scope: scope,
+            isCurrent: { (try? authority.withActive {}) != nil }, fetch: { try await VortxLegacyWatchedMetadataTransport.fetch($0) })
+        try authority.withActive {}
         let watched = try await VortxLegacyWatchedMigration.prepare(accountID: capture.namespace, ownerProfileID: owner.id,
             document: consumedOverlay, profileIDs: [owner.id], ownAccountSources: [source],
             archivedEvidence: VortxNativeWatchedArchive.entries(previousArchive, key: VortxNativeWatchedArchive.evidenceKey),

@@ -5,6 +5,22 @@ import Foundation
 enum VortxNativeWatchedArchive {
     static let evidenceKey = "nativeWatchedMigrationEvidence"
     static let pendingKey = "nativeWatchedMigrationPending"
+    /// Resolve historical pending snapshots in their original scope, even if the current cloud
+    /// document changed or removed the row. No validated import rows escape this operation.
+    /// The caller commits the returned immutable union under its captured source authority.
+    static func retryHistorical(_ archive: Data?, scope: VortxAccountScope,
+                                isCurrent: @escaping @Sendable () -> Bool,
+                                fetch: LegacyWatchedBitfieldMigrationEvidence.MetadataFetcher) async throws -> Data? {
+        guard let archive else { return nil }
+        try validate(archive, scope: scope)
+        let pending = try entries(archive, key: pendingKey)
+        guard !pending.isEmpty, let owner = UUID(uuidString: scope.ownerProfileID) else { return archive }
+        let retried = try await VortxLegacyWatchedMigration.retryArchivedPending(pending,
+            accountID: scope.account, ownerProfileID: owner,
+            archivedEvidence: entries(archive, key: evidenceKey), isCurrent: isCurrent, fetch: fetch)
+        // Never replace pending with unresolved: every original raw snapshot remains recoverable.
+        return try retaining(archive, evidence: retried.archives, pending: retried.unresolved, scope: scope)
+    }
     enum Failure: LocalizedError, Equatable {
         case pending, malformed
         var errorDescription: String? {

@@ -282,3 +282,12 @@ and poster and preserves Unicode and finite binary64 seconds through the canonic
 unversioned authenticated baselines therefore converge as distinct immutable clock-0 events, while
 any explicit native add/removal at clock 1 or higher dominates both. No deployed zero-actor carrier
 is migrated or re-clocked by this rule.
+
+Historical watched migration retries read the sealed pending snapshot, not the newest cloud
+document or current streaming credential. Matching includes account, owner, profile, streaming
+UID, exact source digest and row locator; distinct UIDs may legitimately share source bytes.
+Retry returns evidence archives only, never current-import rows. The host unions those archives
+with every original pending snapshot before preparing the current source, then commits that union
+under the same captured source fence. Changed/removed current rows cannot acquire old watched
+state, and successful historical metadata recovery clears the pending notice without deleting
+the original raw history or claiming it was imported into a different current source.

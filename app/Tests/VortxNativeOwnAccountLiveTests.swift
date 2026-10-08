@@ -20,6 +20,7 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
     static func phase(_ value: String) { FileHandle.standardError.write(Data(("Own-account live phase: " + value + "\n").utf8)) }
     static func main() async throws {
         try await watchedMigrationCheckpoint()
+        try await historicalWatchedRetryCheckpoint()
         let owner = UserProfile(id: UserProfile.ownerID, name: "Owner", avatar: "🍿", isOwner: true)
         let own = UserProfile(id: UUID(uuidString: "00000000-0000-0000-0000-00000000B22C")!, name: "Independent", avatar: "🍿", usesOwnAccount: true)
         let scope = VortxAccountScope(account: "account.own-source-fixture", ownerProfileID: owner.id.uuidString)
@@ -455,6 +456,72 @@ private final class OwnSourceCommitGate: VortxMutationAuthority, @unchecked Send
         check(coldState["nativeSync"]?["accountSlots"] == returned["nativeSync"]?["accountSlots"])
         await cold.close()
         print("Own-account schema4 actual C: atomic shared/own CAS, retained buckets, same-profile epoch retirement, inactive failed-CAS credential and credentialless cold slot passed")
+    }
+    static func historicalWatchedRetryCheckpoint() async throws {
+        phase("historical watched retry preserves removed rows and distinct own UID evidence")
+        let owner = UserProfile(id: UUID(uuidString: "90000000-0000-0000-0000-000000000109")!, name: "Owner", avatar: "O", isOwner: true)
+        let ownID = UUID(uuidString: "90000000-0000-0000-0000-000000000110")!
+        let scope = VortxAccountScope(account: "account.historical-watched", ownerProfileID: owner.id.uuidString)
+        let addon: [String: Any] = ["transportUrl": "https://historical.invalid/manifest.json",
+            "manifest": ["id": "historical", "name": "Historical", "version": "1.0.0", "resources": ["meta"], "types": ["series"]]]
+        let bitmap = "tt2934286:1:5:5:eJyTZwAAAEAAIA=="
+        let sourceA = try JSONSerialization.data(withJSONObject: ["vortx": ["library": [["id": "tt2934286", "type": "series", "watched": bitmap]], "addons": [addon]]])
+        let sourceB = try JSONSerialization.data(withJSONObject: ["unrelatedSetting": "changed", "vortx": ["library": [], "addons": [addon]]])
+        let metadata = try JSONSerialization.data(withJSONObject: ["meta": ["id": "tt2934286", "type": "series", "videos": (1...5).map {
+            ["id": "tt2934286:1:\($0)", "season": 1, "episode": $0, "released": "2020-01-0\($0)T00:00:00.000Z"] as [String: Any]
+        }]])
+        let pendingA = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
+            document: sourceA, profileIDs: [owner.id], isCurrent: { true }, fetch: { _ in throw URLError(.notConnectedToInternet) })
+        let libraryBody = try JSONSerialization.data(withJSONObject: ["result": [["_id": "tt2934286", "type": "series", "state": ["watched": bitmap]]]])
+        let addonBody = try JSONSerialization.data(withJSONObject: ["result": ["addons": [addon]]])
+        let envelope = try JSONSerialization.data(withJSONObject: ["schemaVersion": 1,
+            "libraryResponseBase64": libraryBody.base64EncodedString(), "addonsResponseBase64": addonBody.base64EncodedString(),
+            "profileOverlayBase64": Data("{}".utf8).base64EncodedString()])
+        let ownA = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: ownID, verifiedStreamingUID: "historical-A", sourceDocument: envelope)
+        let ownB = VortxLegacyBootstrapMaterial.OwnAccountSource(profileID: ownID, verifiedStreamingUID: "current-B", sourceDocument: envelope)
+        check(ownA.sourceDocumentSHA256 == ownB.sourceDocumentSHA256)
+        let ownPendingA = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
+            document: Data("{}".utf8), profileIDs: [owner.id], ownAccountSources: [ownA], isCurrent: { true }, fetch: { _ in throw URLError(.notConnectedToInternet) })
+        let ownCompleteB = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
+            document: Data("{}".utf8), profileIDs: [owner.id], ownAccountSources: [ownB], isCurrent: { true }, fetch: { .init(request: $0, raw: metadata) })
+        let originalPending = try pendingA.pendingArchives + ownPendingA.pendingArchives
+        let prior = try VortxNativeWatchedArchive.retaining(VortxNativeOwnAccountProducer.archive([]),
+            evidence: ownCompleteB.archives, pending: originalPending, scope: scope)
+        let resolved = try await VortxNativeWatchedArchive.retryHistorical(prior, scope: scope, isCurrent: { true }, fetch: {
+            check($0.scope.verifiedStreamingUID == nil || $0.scope.verifiedStreamingUID == "historical-A")
+            return .init(request: $0, raw: metadata)
+        })!
+        check(try VortxNativeWatchedArchive.pendingProfileIDs(resolved).isEmpty)
+        check(Set(try VortxNativeWatchedArchive.entries(resolved, key: VortxNativeWatchedArchive.pendingKey)) == Set(originalPending))
+        check(try VortxNativeWatchedArchive.entries(resolved, key: VortxNativeWatchedArchive.evidenceKey).count == 3)
+        let replayed = try await VortxNativeWatchedArchive.retryHistorical(resolved, scope: scope, isCurrent: { true }, fetch: { _ in
+            check(false); throw URLError(.unsupportedURL)
+        })
+        check(replayed == resolved)
+        // Current B removed the row. Historical A evidence stays archived but cannot manufacture
+        // a current validated row or native watch entry, even though the pending UI is resolved.
+        let current = try await VortxLegacyWatchedMigration.prepare(accountID: scope.account, ownerProfileID: owner.id,
+            document: sourceB, profileIDs: [owner.id], archivedEvidence: VortxNativeWatchedArchive.entries(resolved, key: VortxNativeWatchedArchive.evidenceKey),
+            isCurrent: { true }, fetch: { _ in check(false); throw URLError(.unsupportedURL) })
+        check(current.rows.isEmpty && current.unresolved.isEmpty)
+        let material = try VortxLegacyBootstrapMaterial.encode(document: sourceB, roster: [owner], ownerProfileID: owner.id,
+            rosterModifiedSeconds: nil, accountID: scope.account, watchedEvidence: current.rows)
+        let directory = URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("historical-watched")
+        let bootstrap = try VortxNativeBootstrapArchive.encode(document: sourceB, material: material, authenticatedSourceArchive: resolved)
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(size: .bits256), bootstrap: bootstrap, bootstrapScope: scope)
+        let action: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account), "ownerProfileId": .string(scope.ownerProfileID),
+            "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
+        let session = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: store,
+            transport: VortxCResourceTransport(), allowNewAccount: true, initialActions: [raw(action)], authenticatedSourceArchive: resolved)
+        let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+        check(state["libraries"]?[owner.id.uuidString]?["items"] == .array([]))
+        check(!String(decoding: try JSONEncoder().encode(state["watches"]), as: UTF8.self).contains("tt2934286"))
+        check(try await session.authenticatedSourceArchive() == resolved)
+        await session.close()
+        let cold = try VortxNativeSession(scope: scope, ownerName: owner.name, abi: VortxCABI(), store: store, transport: VortxCResourceTransport(), allowNewAccount: false)
+        check(try await cold.authenticatedSourceArchive() == resolved)
+        await cold.close()
+        print("Watched historical host actual C: source-A/removed-current-B retry, distinct UID same-byte evidence union, zero-network replay, no imported historical rows and durable cold sidecar passed")
     }
     static func watchedMigrationCheckpoint() async throws {
         phase("watched preflight draft, retry and atomic source sidecars")

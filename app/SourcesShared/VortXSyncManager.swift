@@ -688,6 +688,9 @@ final class VortXSyncManager: ObservableObject {
                 pendingOverlays.removeValue(forKey: source.profileID.uuidString)
             }
         }
+        watchedArchive = try await VortxNativeWatchedArchive.retryHistorical(watchedArchive, scope: scope,
+            isCurrent: { (try? authority.withActive {}) != nil }, fetch: { try await VortxLegacyWatchedMetadataTransport.fetch($0) })
+        try authority.withActive {}
         let watched = try await VortxLegacyWatchedMigration.prepare(accountID: capture.namespace, ownerProfileID: owner.id,
             document: documentBytes, profileIDs: roster.profiles.filter { $0.isOwner || !$0.usesOwnAccount }.map(\.id),
             ownAccountSources: sources, archivedEvidence: VortxNativeWatchedArchive.entries(watchedArchive, key: VortxNativeWatchedArchive.evidenceKey),
