@@ -12,8 +12,9 @@ internal class NativeStreamingAccountLink(
 ) {
     suspend fun signIn(session: VortxNativeSession, account: SessionOwnerSnapshot.Account, profileID: String,
                        email: String, password: String, accountAdmission: (() -> Boolean) -> Boolean,
-                       mountedAdmission: (() -> Boolean) -> Boolean) {
-        val read = session.read()
+                       mountedAdmission: (() -> Boolean) -> Boolean, expectedOwner: VortxNativeOwner? = null) {
+        val read = if (expectedOwner == null) session.read() else session.owned(expectedOwner) { session.read() }
+        check(!session.requiresRecovery()) { "Native account must reopen before signing in" }
         require(read.owner.scope.accountID == "account.${UUID.fromString(account.id).toString().lowercase()}")
         require(profileID != read.owner.scope.ownerProfileID) { "The native owner cannot be relabelled as a streaming account" }
         val profile = NativeProfileAccess.projection(read).profiles.single { it.id == profileID }

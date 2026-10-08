@@ -21,6 +21,7 @@ internal class NativeOwnAccountSource private constructor(
     val accountID: String,
     val profileID: String,
     val verifiedUID: String,
+    val credentialTransactionID: String?,
     bytes: ByteArray,
     private val authority: NativeOwnAccountCredentials.Authority,
 ) {
@@ -96,7 +97,8 @@ internal class NativeOwnAccountSource private constructor(
                 ",\"libraryResponseBase64\":" + JSONObject.quote(Base64.getEncoder().encodeToString(library)) +
                 ",\"profileOverlayBase64\":" + JSONObject.quote(Base64.getEncoder().encodeToString(overlay)) +
                 ",\"schemaVersion\":" + (if (witnessedOverlay) 2 else 1) + "}"
-            NativeOwnAccountSource(capture.accountID, capture.profileID, uid, encoded.toByteArray(Charsets.UTF_8), capture.authority).also { it.legacyDocument() }
+            NativeOwnAccountSource(capture.accountID, capture.profileID, uid, capture.transactionID,
+                encoded.toByteArray(Charsets.UTF_8), capture.authority).also { it.legacyDocument() }
         }
     }
 }
@@ -184,15 +186,18 @@ internal class NativeOwnAccountBaseline private constructor(val scope: VortxAcco
     }
     companion object {
         fun validate(bindings: VortxRuntimeBindings, scope: VortxAccountScope, document: JSONObject,
-                     retainedSourceEnvelopes: Map<String, ByteArray> = emptyMap(), activeBindings: Boolean = true): NativeOwnAccountBaseline {
-            require(document.getInt("schemaVersion") in 3..4 && document.getString("scope") == scope.accountID &&
+                     retainedSourceEnvelopes: Map<String, ByteArray> = emptyMap(), activeBindings: Boolean = true,
+                     priorDocument: JSONObject? = null, retainedSourceUIDs: Map<String, String> = emptyMap()): NativeOwnAccountBaseline {
+            require(document.getInt("schemaVersion") in 1..4 && document.getString("scope") == scope.accountID &&
                 document.getString("ownerProfileId") == scope.ownerProfileID)
             return VortxNativeRuntime.create(bindings, scope.ownerProfileID, "Owner").use { runtime ->
-                for (action in listOf(JSONObject().put("type", "bind_sync_scope").put("scope", scope.accountID),
+                for (action in listOfNotNull(JSONObject().put("type", "bind_sync_scope").put("scope", scope.accountID),
+                    priorDocument?.let { JSONObject().put("type", "merge_native_sync").put("document", it) },
                     JSONObject().put("type", "merge_native_sync").put("document", document))) {
                     check(JSONObject(runtime.dispatch(action.toString())).getBoolean("ok")) { "Native own-account document rejected" }
                 }
                 val validated = JSONObject(runtime.stateJson()).getJSONObject("nativeSync")
+                require(validated.getInt("schemaVersion") in 3..4)
                 val receipt = validated.getJSONObject("legacyImport")
                 require(receipt.getInt("schemaVersion") in 1..2)
                 val baseline = JSONObject(receipt.getJSONObject("baseline").toString())
@@ -219,20 +224,27 @@ internal class NativeOwnAccountBaseline private constructor(val scope: VortxAcco
                     }
                 }
                 val proofs = baseline.getJSONObject("ownAccountSources")
-                val overlays = retainedSourceEnvelopes.filterKeys { proofs.has(it) }.mapValues { (id, bytes) ->
+                val overlays = retainedSourceEnvelopes.filterKeys { proofs.has(it) }.mapNotNull { (id, bytes) ->
                     val immutableBytes = bytes.copyOf()
                     val proof = proofs.getJSONObject(id)
                     val digest = MessageDigest.getInstance("SHA-256").digest(immutableBytes).joinToString("") { "%02x".format(it) }
-                    require(digest == proof.getString("sourceDocumentSha256")) { "Retained own-account source changed" }
+                    val selected = digest == proof.getString("sourceDocumentSha256") &&
+                        (retainedSourceUIDs[id] == null || retainedSourceUIDs[id] == proof.getString("verifiedStreamingUid"))
+                    val historical = validated.getJSONObject("legacyImport").optJSONObject("ownAccountSourceHistory")
+                        ?.optJSONObject(id)?.has(digest) == true || validated.optJSONObject("accountSlots")?.optJSONObject(id)
+                        ?.getJSONObject("slots")?.let { slots -> slots.keys().asSequence().any {
+                            slots.getJSONObject(it).optJSONObject("sourceHistory")?.has(digest) == true
+                        } } == true
+                    require(selected || historical) { "Retained own-account source changed" }
                     val (library, addons, overlay) = decodeOwnEnvelope(immutableBytes)
                     val version = ownObject(immutableBytes).getInt("schemaVersion")
-                    if (proof.has("profileOverlaySha256")) require(version == 2 &&
+                    if (selected && proof.has("profileOverlaySha256")) require(version == 2 &&
                         proof.getString("profileOverlaySha256") == NativeProfileOverlayWitness.digest(overlay)) { "Retained overlay witness changed" }
                     requireOwnAccountSourceCredentialFree(library); requireOwnAccountSourceCredentialFree(addons)
                     requireOwnAccountSourceCredentialFree(overlay)
                     require(NativeHostPreferences.equal(nativeOwnAccountOverlay(overlay, id), overlay)) { "Foreign retained own-account overlay" }
-                    overlay
-                }
+                    if (selected) id to overlay else null
+                }.toMap()
                 NativeOwnAccountBaseline(scope, JSONObject(baseline.toString()), overlays)
             }
         }

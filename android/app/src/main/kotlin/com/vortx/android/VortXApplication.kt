@@ -123,7 +123,19 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 ProfileStore.sharedOrNull()?.clearNativeProjection()
                 nativeRepository.publishAuthentication(com.vortx.android.model.AuthState.SignedOut)
             }
-        }; Unit }) }
+        }; Unit },
+        ownCredentials = com.vortx.android.engine.NativeOwnAccountCredentials.shared(this),
+        captureOwnAccountAdmission = { captured -> syncManager?.let { manager ->
+            val admission = manager.captureLocalLibraryMutationAdmission() ?: return@let null
+            val gate: (() -> Boolean) -> Boolean = { action -> admission {
+                syncManager === manager && manager.sessionOwnerSnapshot() == captured && action()
+            } }
+            gate
+        } }) }
+    internal fun nativeStreamingAccounts(): NativeAccountCoordinator {
+        check(BuildConfig.NATIVE_ENGINE_ENABLED) { "Native streaming accounts are not enabled" }
+        return nativeAccounts
+    }
     private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess { nativeAccounts.session() } }
     private val nativeRepository: NativeCatalogRepository by lazy { NativeCatalogRepository(AndroidNativePlaybackResolver(this), nativeAccounts.changes.map { Unit },
         { check(syncManager?.signOut() == true) { "Account sign-out could not be stored securely" } },

@@ -78,7 +78,11 @@ internal object NativeHostDocument {
                 val profileName = key == "name" && child is String &&
                     Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}").matches(value.optString("id")) &&
                     (value.opt("isOwner") is Boolean || value.opt("owner") is Boolean)
-                result.put(key, if (profileName && cannotBeEncodedText(child as String)) child
+                // Stremio's canonical Mongo IDs are literal identifiers in these typed carriers.
+                // Other values (including recognizable encoded secrets) still receive inspection.
+                val streamingUID = child is String && Regex("[0-9a-f]{24}").matches(child) &&
+                    (key == "verifiedStreamingUid" || key == "value" && value.optString("kind") == "own")
+                result.put(key, if (streamingUID || profileName && cannotBeEncodedText(child as String)) child
                 else if (key == "authenticatedOwnAccountSources")
                     validateNativeOwnAccountArchive(child as? JSONObject ?: reject("Malformed authenticated source archive"))
                 else if (root && key == "settings" && child != JSONObject.NULL)

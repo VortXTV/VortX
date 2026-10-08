@@ -25,13 +25,15 @@ internal fun nativeLegacyMaterial(
     ownAccountSources: List<NativeOwnAccountSource> = emptyList(),
     retainedOwnAccounts: NativeOwnAccountBaseline? = null,
     accountScope: VortxAccountScope? = null,
+    pendingOwnOverlays: Set<String> = emptySet(),
 ): JSONObject = withNativeOwnAccountSources(ownAccountSources) {
     if (ownAccountSources.isNotEmpty() || retainedOwnAccounts != null) {
         val scope = requireNotNull(accountScope) { "Authenticated own-account scope required" }
         require(roster.single { it.isOwner }.id == scope.ownerProfileID && ownAccountSources.all { it.accountID == scope.accountID })
         require(retainedOwnAccounts == null || retainedOwnAccounts.scope == scope) { "Own-account baseline scope changed" }
     }
-    LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts).build()
+    LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts,
+        pendingOwnOverlays = pendingOwnOverlays).build()
 }
 
 /** A rebind source is independent of the owner/global import. Reuse the same typed reducer, with
@@ -55,6 +57,7 @@ private class LegacyMaterialAdapter(
     private val ownSources: List<NativeOwnAccountSource> = emptyList(),
     private val retainedOwn: NativeOwnAccountBaseline? = null,
     private val independentSource: Boolean = false,
+    private val pendingOwnOverlays: Set<String> = emptySet(),
 ) {
     private val vortx = objectField(document, "vortx") ?: JSONObject()
     private val owner = roster.singleOrNull { it.isOwner }
@@ -84,13 +87,16 @@ private class LegacyMaterialAdapter(
         }.distinct()
         requireMaterial(owner.id !in deleted, "Owner profile is tombstoned")
         val ownIDs = roster.filter { it.usesOwnAccount }.map { it.id }.toSet()
+        requireMaterial(ownIDs.containsAll(pendingOwnOverlays), "Pending overlay names a foreign profile")
         requireMaterial(ownSources.map { it.profileID }.distinct().size == ownSources.size && ownSources.all { it.profileID in ownIDs }, "Unexpected own-account source")
         val fresh = ownSources.associateBy { it.profileID }
         requireMaterial(ownIDs.all { it in fresh || it in retainedOwn?.profileIDs().orEmpty() }, "Own-account profile requires an authenticated streaming-account source or validated native receipt")
         val proofs = JSONObject()
         for (id in ownIDs) {
             requireMaterial(UUID.fromString(id).toString().uppercase() == id, "Own-account profile UUID must be canonical uppercase")
-            fresh[id]?.requireOverlayUnchanged(document) ?: requireNotNull(retainedOwn).requireOverlayUnchanged(document, id)
+            if (id !in pendingOwnOverlays) fresh[id]?.requireOverlayUnchanged(document)
+                ?: requireNotNull(retainedOwn).requireOverlayUnchanged(document, id)
+            else fresh[id]?.let { requireMaterial(!it.proof().has("profileOverlaySha256"), "Witnessed source cannot skip current overlay validation") }
             val proof = fresh[id]?.proof()
                 ?: requireNotNull(retainedOwn).proof(id)
             proofs.put(id, proof)

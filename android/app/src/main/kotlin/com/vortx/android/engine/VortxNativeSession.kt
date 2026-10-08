@@ -255,6 +255,7 @@ internal class VortxNativeSession private constructor(
                  allowNewAccount: Boolean = false, bootstrapActions: List<JSONObject> = emptyList(),
                  initialHostProfiles: JSONObject = JSONObject(), initialHostArchive: JSONObject? = null,
                  initialHostPreferences: JSONObject? = null,
+                 verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
                  onMutation: () -> Unit = {}, isAccountCurrent: () -> Boolean = { true }): VortxNativeSession {
             check(isAccountCurrent()) { "Native account changed" }
             scope.rejectCredentials(initialHostProfiles)
@@ -332,6 +333,7 @@ internal class VortxNativeSession private constructor(
                     .put("legacyWebsiteBootstrap", legacyBootstrap)
                     .put("websiteProfileEditPending", pendingWebsiteEdits).put("websiteProfileEditCertificates", websiteCertificates).toString()
                 scope.validateSnapshot(snapshot)
+                verifyCandidate?.invoke(runtime)
                 store.commit(scope, snapshot)
                 check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
                 check(isAccountCurrent()) { "Native account changed" }

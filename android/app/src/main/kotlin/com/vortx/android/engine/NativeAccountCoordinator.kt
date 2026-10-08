@@ -25,13 +25,72 @@ internal class NativeAccountCoordinator(
     private val project: suspend (VortxNativeSession) -> Unit,
     private val onMutation: () -> Unit = {},
     private val onRetired: () -> Unit = {},
+    private val ownCredentials: NativeOwnAccountCredentials? = null,
+    private val ownProducer: NativeOwnAccountProducer = NativeOwnAccountProducer(),
+    private val captureOwnAccountAdmission: (SessionOwnerSnapshot.Account) -> (((() -> Boolean) -> Boolean)?) = { null },
 ) : NativeAccountGateway {
     private data class Mounted(val account: SessionOwnerSnapshot.Account, val session: VortxNativeSession)
     private val mounted = AtomicReference<Mounted?>()
     private val retired = ConcurrentLinkedQueue<VortxNativeSession>()
     private val lifecycleLock = Any()
     private val mutex = Mutex()
+    private data class PendingImport(val id: UUID, val account: SessionOwnerSnapshot.Account, val document: JSONObject,
+                                     val profiles: List<UserProfile>, val isCurrent: () -> Boolean,
+                                     val sources: List<NativeOwnAccountSource>)
+    @Volatile private var pendingImport: PendingImport? = null
+    internal data class StreamingProfile(val profile: UserProfile, val pendingImport: Boolean, val pendingOverlay: Boolean)
+    internal class StreamingTarget internal constructor(internal val account: SessionOwnerSnapshot.Account,
+        val profile: UserProfile, internal val session: VortxNativeSession?, internal val owner: VortxNativeOwner?, internal val pendingID: UUID?)
     val changes = MutableStateFlow(0L)
+    fun streamingProfiles(): List<StreamingProfile> {
+        val current = mounted.get()
+        if (current != null && accountCurrent(current.account)) {
+            val read = current.session.read()
+            val pending = read.state.optJSONObject("hostDocument")?.optJSONObject("nativeOwnAccountPending")
+            return NativeProfileAccess.projection(read).profiles.filter { it.usesOwnAccount && !it.isOwner }.map {
+                StreamingProfile(it, false, pending?.has(it.id) == true)
+            }
+        }
+        return pendingImport?.takeIf { it.isCurrent() && accountCurrent(it.account) }?.profiles.orEmpty()
+            .filter { it.usesOwnAccount && !it.isOwner }.map { StreamingProfile(it, true, true) }
+    }
+    fun captureStreamingTarget(profileID: String): StreamingTarget {
+        mounted.get()?.takeIf { accountCurrent(it.account) }?.let { current ->
+            val read = current.session.read()
+            require(read.owner.profileID == profileID) { "Open this profile through its PIN gate before linking" }
+            val profile = NativeProfileAccess.projection(read).profiles.single { it.id == profileID }
+            require(profile.usesOwnAccount && !profile.isOwner)
+            return StreamingTarget(current.account, profile, current.session, read.owner, null)
+        }
+        val pending = checkNotNull(pendingImport) { "No authenticated profile setup pending" }
+        check(pending.isCurrent() && accountCurrent(pending.account))
+        val profile = pending.profiles.single { it.id == profileID && it.usesOwnAccount && !it.isOwner }
+        return StreamingTarget(pending.account, profile, null, null, pending.id)
+    }
+    suspend fun signInStreaming(target: StreamingTarget, email: String, password: String): Boolean = mutex.withLock {
+        val credentials = checkNotNull(ownCredentials) { "Native streaming sign-in unavailable" }
+        val admission = checkNotNull(captureOwnAccountAdmission(target.account)) { "Native account authentication changed" }
+        val session = target.session
+        if (session != null) {
+            check(mounted.get()?.let { it.account == target.account && it.session === session } == true)
+            NativeStreamingAccountLink(credentials, ownProducer).signIn(session, target.account, target.profile.id, email, password,
+                admission, { action -> withMountedSession(session, target.account, action) }, requireNotNull(target.owner))
+            project(session)
+            check(accountCurrent(target.account) && mounted.get()?.session === session)
+            changes.value += 1
+            return@withLock true
+        }
+        val pending = checkNotNull(pendingImport)
+        check(pending.id == target.pendingID && pending.account == target.account && pending.isCurrent() && accountCurrent(target.account))
+        val capture = ownProducer.signIn(credentials, target.account, target.profile.id, email, password, admission, UUID.randomUUID().toString())
+        // An arbitrary newly entered account cannot attest to historical UUID overlay ownership.
+        val source = ownProducer.fetch(capture, JSONObject(), witnessedOverlay = false)
+        check(pendingImport === pending && pending.isCurrent() && accountCurrent(target.account))
+        val applied = applyDocumentLocked(target.account, pending.document, pending.isCurrent,
+            pending.sources.filterNot { it.profileID == target.profile.id } + source)
+        if (applied) onMutation()
+        applied
+    }
     fun session(): VortxNativeSession = checkNotNull(mounted.get()) { "Native account has not completed authenticated bootstrap" }
         .also { check(accountCurrent(it.account)) { "Native account changed" } }.session
     /** Captures only a still-mounted identity; callers perform account authentication outside this lock. */
@@ -47,6 +106,7 @@ internal class NativeAccountCoordinator(
         if (mounted.get()?.let { it.session === session && it.account == account } == true) action() else false
     }
     override fun retire() {
+        pendingImport = null
         val old = synchronized(lifecycleLock) {
             mounted.getAndSet(null).also { if (it != null) retired.add(it.session) }
         }
@@ -136,6 +196,10 @@ internal class NativeAccountCoordinator(
     }
 
     override suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean = mutex.withLock {
+        applyDocumentLocked(account, document, isCurrent)
+    }
+    private suspend fun applyDocumentLocked(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean,
+                                           suppliedSources: List<NativeOwnAccountSource> = emptyList()): Boolean {
         check(isCurrent() && accountCurrent(account)) { "Native account changed" }
         val parsed = VortXSyncDoc.parse(document)
         val resolved = SettingsBackup.resolveRosterForPull(document.opt("settings"),
@@ -163,21 +227,93 @@ internal class NativeAccountCoordinator(
         // The historical aggregate must never be folded by the broad legacy importer. Its narrow
         // original-baseline reducer runs after the immutable host archive has durably committed.
         val materialDocument = if (legacyAggregate == null) document else JSONObject(document.toString()).also { it.remove("profileEdits") }
-        // Current authenticated legacy material is reconciled against the kernel's acknowledged
-        // baseline. Unsupported/missing causal evidence rejects the complete candidate transaction.
-        val material = nativeLegacyMaterial(materialDocument, roster, resolved.modifiedSeconds)
-        // Full descriptors may contain encoded custom strings. Retain exact typed input only if it
-        // is credential-free; sanitizing it would silently change the shared kernel's receipt input.
-        NativeHostDocument.requireCredentialFree(material)
         val old = mounted.get()
         val retained = old?.takeIf { it.account == account && it.session.scope == scope && !it.session.requiresRecovery() }?.session?.read()?.state
             ?: checkpoints.read(scope)?.let(scope::validateSnapshot)
+        val native = remote ?: retained?.optJSONObject("nativeSync")
+        val hasNative = native != null
+        val legacyOwn = roster.filter { it.usesOwnAccount }.map { it.id }.toSet()
+        val sources = suppliedSources.filter { it.profileID in legacyOwn }
+        sources.forEach { require(it.accountID == namespace) }
+        val retainedSources = retained?.optJSONObject("hostDocument")?.optJSONObject("authenticatedOwnAccountSources")
+        val sourceBytes = retainedSources?.keys()?.asSequence()?.associateWith {
+            java.util.Base64.getDecoder().decode(retainedSources.getJSONObject(it).getString("sourceDocumentBase64"))
+        }.orEmpty()
+        val ownBaseline = if (legacyOwn.isNotEmpty() && native != null &&
+            maxOf(native.optInt("schemaVersion"), retained?.optJSONObject("nativeSync")?.optInt("schemaVersion") ?: 0) >= 3)
+            NativeOwnAccountBaseline.validate(bindings, scope, native, sourceBytes, activeBindings = false,
+                priorDocument = retained?.optJSONObject("nativeSync").takeIf { remote != null },
+                retainedSourceUIDs = retainedSources?.keys()?.asSequence()?.associateWith {
+                    retainedSources.getJSONObject(it).getString("verifiedStreamingUid")
+                }.orEmpty()) else null
+        val unavailable = legacyOwn - sources.map { it.profileID }.toSet() - ownBaseline?.profileIDs().orEmpty()
+        if (unavailable.isNotEmpty() && !hasNative) {
+            // This is an authenticated roster, not a native account. Publish only setup UI; no
+            // blank runtime/checkpoint or unscoped global ProfileStore import is manufactured.
+            pendingImport = PendingImport(UUID.randomUUID(), account, document, roster, isCurrent, sources)
+            changes.value += 1
+            return false
+        }
+        val pendingOverlays = legacyOwn.filter { id ->
+            if (id in unavailable) true else sources.singleOrNull { it.profileID == id }?.let { source ->
+                runCatching { source.requireOverlayUnchanged(materialDocument) }.isFailure
+            } ?: runCatching { requireNotNull(ownBaseline).requireOverlayUnchanged(materialDocument, id) }.isFailure
+        }.toSet()
+        // Current authenticated legacy material is reconciled against the kernel's acknowledged
+        // baseline. Unsupported/missing causal evidence rejects the complete candidate transaction.
+        val material = if (unavailable.isNotEmpty()) null else nativeLegacyMaterial(materialDocument, roster, resolved.modifiedSeconds,
+            sources, ownBaseline, scope, pendingOverlays)
+        // Full descriptors may contain encoded custom strings. Retain exact typed input only if it
+        // is credential-free; sanitizing it would silently change the shared kernel's receipt input.
+        material?.let(NativeHostDocument::requireCredentialFree)
         val hasReceipt = remote?.optJSONObject("legacyImport") != null || retained?.optJSONObject("nativeSync")?.optJSONObject("legacyImport") != null
-        val replay = JSONObject().put("type", if (hasReceipt) "reconcile_legacy_sync" else "import_legacy_sync").put("scope", namespace).put("ownerProfileId", owner.id)
-            .put("material", material)
-        if (hasReceipt) replay.put("baselineMaterial", retained?.optJSONObject("legacyImportMaterial") ?: material)
-        val syncActions = listOfNotNull(remote?.let { JSONObject().put("type", "merge_native_sync").put("document", it) }, replay)
+        val replay = material?.let { JSONObject().put("type", if (hasReceipt) "reconcile_legacy_sync" else "import_legacy_sync")
+            .put("scope", namespace).put("ownerProfileId", owner.id).put("material", it).also { action ->
+                if (hasReceipt) action.put("baselineMaterial", retained?.optJSONObject("legacyImportMaterial") ?: it)
+            } }
+        val syncActions = listOfNotNull(remote?.let { JSONObject().put("type", "merge_native_sync").put("document", it) }, replay).toMutableList()
+        if (!hasNative) sources.forEach { source -> source.credentialTransactionID?.let { transaction ->
+            val expected = NativeAccountBinding.parse(JSONObject().put("account", JSONObject().put("kind", "own").put("value", source.verifiedUID))
+                .put("revision", 0).put("transactionId", JSONObject.NULL))
+            syncActions += NativeStreamingAccountLink.action(scope, source.profileID, expected, transaction, JSONObject().put("kind", "own")
+                .put("carrier", nativeOwnAccountCarrier(source, roster.single { it.id == source.profileID }, JSONObject())))
+        } }
         val archive = NativeHostDocument.archive(document)
+        val archivedDocument = archive.getJSONObject("document")
+        val archivedSources = retainedSources?.let { JSONObject(it.toString()) } ?: JSONObject()
+        sources.forEach { source -> archivedSources.put(source.profileID, JSONObject().put("verifiedStreamingUid", source.verifiedUID)
+            .put("sourceDocumentBase64", source.archiveBase64())) }
+        if (archivedSources.length() > 0) archivedDocument.put("authenticatedOwnAccountSources", validateNativeOwnAccountArchive(archivedSources))
+        archivedDocument.put("nativeOwnAccountPending", JSONObject().also { pending -> pendingOverlays.forEach { id ->
+            val overlay = nativeOwnAccountOverlay(materialDocument, id)
+            NativeHostDocument.requireCredentialFree(overlay)
+            val record = JSONObject().put("reason", if (id in unavailable) "verified-source-required" else "overlay-attribution-required")
+                .put("profileOverlayBase64", java.util.Base64.getEncoder().encodeToString(overlay.toString().toByteArray(Charsets.UTF_8)))
+            // A digest is not a UID: two empty accounts legitimately hash to the same envelope.
+            // Only a kernel-validated historical tuple may attribute this legacy UUID slice.
+            val priorPending = retained?.optJSONObject("hostDocument")?.optJSONObject("nativeOwnAccountPending")?.optJSONObject(id)
+            // A network-only B import did not attest to A's slice. Do not upgrade its unknown
+            // attribution merely because B is now present in the kernel's baseline on restart.
+            val proof = ownBaseline?.takeIf { id in it.profileIDs() }?.proof(id)
+            val attributed = priorPending?.takeIf { it.has("verifiedStreamingUid") && it.has("sourceDocumentSha256") }
+                ?: proof?.takeIf { it.has("profileOverlaySha256") && priorPending == null }
+            attributed?.let { proof ->
+                record.put("verifiedStreamingUid", proof.getString("verifiedStreamingUid"))
+                    .put("sourceDocumentSha256", proof.getString("sourceDocumentSha256"))
+            }
+            pending.put(id, record)
+        } })
+        val verifySources: (VortxNativeRuntime) -> Unit = { candidate ->
+            if (!hasNative) sources.forEach { source -> source.credentialTransactionID?.let { transaction ->
+                val state = JSONObject(candidate.stateJson())
+                val selected = NativeAccountBinding.read(state, source.profileID)
+                check(selected.kind == "own" && selected.streamingUID == source.verifiedUID && selected.transactionID == transaction) {
+                    "Native imported credential selection readback failed"
+                }
+                val active = NativeOwnAccountBaseline.validate(bindings, scope, state.getJSONObject("nativeSync"))
+                check(NativeHostPreferences.equal(active.proof(source.profileID), source.proof())) { "Native imported source readback failed" }
+            } }
+        }
         val baselineHost = NativeHostProfiles.fromDocument(archive.getJSONObject("document"), roster, resolved.modifiedSeconds)
         if (old != null && old.account == account && old.session.scope == scope && !old.session.requiresRecovery()) {
             val read = old.session.read()
@@ -185,14 +321,20 @@ internal class NativeAccountCoordinator(
             val nextHost = if ((resolved.modifiedSeconds ?: 0.0) > host.optDouble("modifiedSeconds", 0.0)) {
                 baselineHost
             } else host
-            old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive,
-                remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost)
+            old.session.owned(read.owner) { withNativeOwnAccountSources(sources) {
+                withAccountAdmission(account, isCurrent) { check(withMountedSession(old.session, account) {
+                    old.session.dispatch(syncActions, read.owner, nextHost, notifyMutation = false, hostArchive = archive,
+                        remoteHostPreferences = remoteHost, baselineHostProfiles = baselineHost, verifyCandidate = verifySources)
+                    true
+                }) { "Native account changed" } }
+            } }
             websiteEvents.forEach { event -> old.session.applyWebsiteProfileEdit(event) }
             legacyAggregate?.let { aggregate -> old.session.applyLegacyWebsiteAggregate(aggregate) }
             check(isCurrent()) { "Native account changed" }
             project(old.session)
             check(isCurrent() && accountCurrent(account) && mounted.get() === old) { "Native account changed" }
-            return@withLock true
+            pendingImport = null
+            return true
         }
         retire()
         // Close is deferred out of the auth lock to avoid lock inversion, but a replacement writer
@@ -200,9 +342,9 @@ internal class NativeAccountCoordinator(
         while (true) { val prior = retired.poll() ?: break; prior.close() }
         val resources = transport()
         val hostProfiles = baselineHost
-        val candidate = try { VortxNativeSession.open(scope, owner.name, bindings, checkpoints, resources,
+        val candidate = try { withNativeOwnAccountSources(sources) { withAccountAdmission(account, isCurrent) { VortxNativeSession.open(scope, owner.name, bindings, checkpoints, resources,
             bootstrapActions = syncActions, initialHostProfiles = hostProfiles, initialHostArchive = archive,
-            initialHostPreferences = remoteHost, onMutation = onMutation) { accountCurrent(account) } }
+            initialHostPreferences = remoteHost, verifyCandidate = verifySources, onMutation = onMutation) { isCurrent() && accountCurrent(account) } } } }
             catch (error: Throwable) { (resources as? AutoCloseable)?.close(); throw error }
         try { websiteEvents.forEach { event -> candidate.applyWebsiteProfileEdit(event) } }
         catch (error: Throwable) { candidate.close(); throw error }
@@ -210,7 +352,21 @@ internal class NativeAccountCoordinator(
         catch (error: Throwable) { candidate.close(); throw error }
         try { checkpoints.remember(scope) }
         catch (error: Throwable) { candidate.close(); throw error }
-        publish(account, candidate, isCurrent)
+        return publish(account, candidate, isCurrent)
+    }
+
+    /** Session -> credential journal (when present) -> auth -> mounted lifecycle. */
+    private fun <T> withAccountAdmission(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean, action: () -> T): T {
+        val admission = captureOwnAccountAdmission(account)
+        // Legacy deterministic gateway fixtures do not inject an auth monitor. Production always
+        // injects it when credential support is enabled, and must never silently lose that fence.
+        check(ownCredentials == null || admission != null) { "Native account admission unavailable" }
+        if (admission == null) { check(isCurrent() && accountCurrent(account)); return action() }
+        var result: Result<T>? = null
+        check(admission { if (!isCurrent() || !accountCurrent(account)) false else { result = runCatching(action); true } }) {
+            "Native account changed"
+        }
+        return requireNotNull(result).getOrThrow()
     }
 
     override fun exportDocument(account: SessionOwnerSnapshot.Account): NativeAccountExport? {
