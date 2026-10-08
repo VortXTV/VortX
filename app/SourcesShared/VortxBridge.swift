@@ -1,6 +1,6 @@
 import Foundation
 import os
-#if canImport(VortxEngine)
+#if canImport(VortxEngine) && (!os(macOS) || VORTX_ENGINE_STATE_BRIDGE)
 import VortxEngine
 #endif
 
@@ -13,9 +13,9 @@ import VortxEngine
 // stream list `StreamRanking` just ranked and logs any ordering divergence. The Swift ranker stays
 // authoritative; nothing here ever feeds the UI.
 //
-// The framework links into VortXiOSNative only for this slice, so the whole engine surface is
-// guarded with `canImport(VortxEngine)`: every other target (tvOS, Mac, legacy) compiles the no-op
-// side and behaves byte-identically.
+// Mac links the kernel for its staged data branch, not to activate legacy shadow ranking.
+// Keep its previous no-op surface unless that branch is explicitly compiled: referencing both
+// independent Rust runtimes from legacy Mac would add a fourth compact-unwind personality.
 
 /// The shadow-ranking feature flag. UserDefaults-backed, default OFF: a build with the flag unset
 /// takes exactly one boolean read and no other new code path.
@@ -24,7 +24,7 @@ enum VortxShadowFlag {
     static var isOn: Bool { UserDefaults.standard.bool(forKey: key) }
 }
 
-#if canImport(VortxEngine)
+#if canImport(VortxEngine) && (!os(macOS) || VORTX_ENGINE_STATE_BRIDGE)
 
 /// Thin wrapper over the vortx-core C ABI, mirroring how `CoreBridge` manages the stremiox_core_*
 /// handle: one process-wide instance, every call serialized on one queue (the FFI contract is one
@@ -142,7 +142,7 @@ enum VortxShadowRanking {
     static func observe(groups: [CoreStreamSourceGroup], continuity: String?, pin: ResolvedPin?,
                         cachedHashes: Set<String>, prefs: SourcePreferences.Snapshot, metaId: String) {
         guard VortxShadowFlag.isOn else { return }
-        #if canImport(VortxEngine)
+        #if canImport(VortxEngine) && (!os(macOS) || VORTX_ENGINE_STATE_BRIDGE)
         Task.detached(priority: .utility) {
             SourcePreferences.$readingOverride.withValue(prefs) {
                 diff(groups: groups, continuity: continuity, pin: pin,
@@ -150,13 +150,12 @@ enum VortxShadowRanking {
             }
         }
         #else
-        // Framework not linked into this target (slice 1 links iOS only): note it (flag-ON only)
-        // so a tester on tvOS/Mac knows why nothing diffs, then keep the live path untouched.
-        log.info("vortxShadowRanking is ON but VortxEngine is not linked in this target")
+        // A missing module or legacy Mac build keeps shadow ranking inert (flag-ON note only).
+        log.info("vortxShadowRanking is ON but shadow bridge is not enabled in this target")
         #endif
     }
 
-    #if canImport(VortxEngine)
+    #if canImport(VortxEngine) && (!os(macOS) || VORTX_ENGINE_STATE_BRIDGE)
 
     private static func diff(groups: [CoreStreamSourceGroup], continuity: String?, pin: ResolvedPin?,
                              cachedHashes: Set<String>, metaId: String) {
