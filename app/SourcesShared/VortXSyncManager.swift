@@ -242,7 +242,7 @@ final class VortXSyncManager: ObservableObject {
     /// Used only after a successful authenticated empty response, before any accepted version.
     /// Reopens the exact first bootstrap across a crash between local commit and initial upload.
     private func nativeEmptyAccountDocument(capture: CredentialScopeRegistry.Capture) throws -> [String: Any] {
-        guard isCurrent(capture), lastSyncedVersion == 0, let account,
+        guard isCurrent(capture), lastSyncedVersion == 0, account != nil,
               let keyBytes = dataKey, keyBytes.count == 32 else { throw VortxNativeError.invalidSnapshot }
         let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
             .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
@@ -255,8 +255,7 @@ final class VortXSyncManager: ObservableObject {
         }
         // The constant owner belongs to this new account scope. No pre-existing global profile,
         // watched item, addon, or preference is silently attributed to the new account.
-        let owner = UserProfile(id: UserProfile.ownerID, name: account.username.isEmpty ? "Main" : account.username,
-                                avatar: "🍿", email: account.email, isOwner: true)
+        let owner = UserProfile(id: UserProfile.ownerID, name: "Main", avatar: "🍿", isOwner: true)
         guard let roster = ProfileRosterSnapshot.wire([owner]) else { throw VortxNativeError.invalidSnapshot }
         return ["nativeAccountBootstrap": "authenticated-empty-v1", "vortx": ["roster": roster, "rosterModified": 0]]
     }

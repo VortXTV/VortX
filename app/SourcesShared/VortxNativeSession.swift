@@ -435,7 +435,12 @@ actor VortxNativeSession {
         do {
             let result = try await bridge.load(ownerID: profile, request: request, addons: addons)
             guard current(name, ticket, capturedEpoch), bridge.accepts(result) else { throw VortxNativeError.superseded }
-            let accepted = (append ? pages[name] ?? [] : []) + [result]
+            var accepted = append ? pages[name] ?? [] : []
+            // A cancelled host publication can leave its already accepted page in this actor.
+            // Retrying the identical source/path replaces that page instead of duplicating it.
+            if let index = accepted.firstIndex(where: { $0.request == result.request && $0.sourceURLs == result.sourceURLs }) {
+                accepted[index] = result
+            } else { accepted.append(result) }
             var registry = append ? catalogRegistries[name] ?? [] : []
             for addon in addons {
                 if let previous = registry.first(where: { $0.id == addon.id }) {

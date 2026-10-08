@@ -54,9 +54,15 @@ import CryptoKit
             try dispatch(["action": "CatalogsWithExtra", "args": ["action": "LoadRange", "args": ["start": 0, "end": 30]]], field: screen)
             await facade.settled()
             check(try field(screen)["catalogs"]?.array?.count == 1)
+            try dispatch(["action": "CatalogsWithExtra", "args": ["action": "LoadNextPage", "args": 0]], field: screen)
+            await facade.settled()
+            check(try field(screen)["catalogs"]?.array?.first?.array?.count == 2)
         }
         try dispatch(["action": "Load", "args": ["model": "CatalogWithFilters", "args": NSNull()]], field: "discover")
         await facade.settled(); check(try field("discover")["catalog"]?.array?.count == 1)
+        check(try field("discover")["selectable"]?["next_page"] != .null)
+        try dispatch(["action": "CatalogWithFilters", "args": ["action": "LoadNextPage"]], field: "discover")
+        await facade.settled(); check(try field("discover")["catalog"]?.array?.count == 2)
         let metaPath = ["resource": "meta", "type": "series", "id": "tt-fixture", "extra": []] as [String: Any]
         let streamPath = ["resource": "stream", "type": "series", "id": "tt-fixture:1:2", "extra": []] as [String: Any]
         try dispatch(["action": "Load", "args": ["model": "MetaDetails", "args": ["metaPath": metaPath, "streamPath": streamPath]]], field: "meta_details")
@@ -154,6 +160,9 @@ import CryptoKit
         let migrated = try VortxNativeSession(scope: legacyScope, ownerName: "Owner", abi: VortxCABI(), store: migrationStore, transport: VortxCResourceTransport(),
                                               allowNewAccount: true, initialActions: [rawImport])
         let migrationState = try await migrated.stateJSON()
+        try migrationStore.rememberAuthenticatedScope(legacyScope)
+        let recovery = try migrationStore.recovery(account: legacyScope.account)
+        check(recovery?.scope == legacyScope && recovery?.state == migrationState && recovery?.bootstrap == archive)
         let stateObject = try JSONDecoder().decode(VortxJSON.self, from: Data(migrationState.utf8))
         check(stateObject["roster"]?["profiles"]?[owner.id.uuidString]?["pin"] == .string(owner.pin!))
         check(stateObject["nativeSync"]?["legacyImport"]?["schemaVersion"] == .integer(1))

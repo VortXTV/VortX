@@ -91,8 +91,15 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
     func load(_ requestJSON: String, cancellation: any VortxResourceCancellation) throws -> String {
         var input = try JSONDecoder().decode(VortxJSON.self, from: Data(requestJSON.utf8))
         if input["request"]?["id"] == .string("slow") { entered.signal(); precondition(release.wait(timeout: .now() + 5) == .success) }
+        var groups: [VortxJSON] = []
+        if input["request"]?["resource"] == .string("catalog"), let addon = input["addons"]?.array?.first?["id"] {
+            let extra = try input["request"]?["extra"]?.decode([[String]].self) ?? []
+            let skip = extra.first { $0.first == "skip" }.flatMap { Int($0[1]) } ?? 0
+            let items: [VortxJSON] = skip >= 2 ? [] : [.object(["id": .string("page-\(skip)"), "type": .string("movie"), "name": .string("Page \(skip)")])]
+            groups = [.object(["addonId": addon, "status": .string("ready"), "content": .object(["metas": .array(items)])])]
+        }
         input = .object(["kind": .string("resource_result"), "requestId": input["requestId"]!, "generation": input["generation"]!,
-                         "request": input["request"]!, "groups": .array([]), "cancelled": .bool(false)])
+                         "request": input["request"]!, "groups": .array(groups), "cancelled": .bool(false)])
         return String(decoding: try JSONEncoder().encode(input), as: UTF8.self)
     }
 }
@@ -210,6 +217,38 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         catch VortxNativeError.closed {}
         check(try firstImportStore.read(scope: scope) == firstImport)
         await candidate.close()
+        let pagingSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: SessionStore(), transport: transport, allowNewAccount: true)
+        let pagingManifest = try JSONDecoder().decode(VortxJSON.self, from: Data(#"{"catalogs":[{"id":"popular","type":"movie","name":"Popular","extra":[{"name":"skip"},{"name":"genre","options":["Drama","Comedy"]}]},{"id":"recent","type":"movie","extra":[{"name":"skip"}]}]}"#.utf8))
+        let paging = try await VortxNativeCoreFacade.create(session: pagingSession, registry: [.init(id: "paging", transportUrl: "https://fixture.example/manifest.json", manifest: pagingManifest)], changed: { _ in })
+        func pagingField(_ field: String) throws -> VortxJSON { try JSONDecoder().decode(VortxJSON.self, from: paging.stateData(field)!) }
+        func pageDispatch(_ raw: String, _ field: String) async {
+            check(paging.dispatch(data: Data(raw.utf8), field: field)); await paging.settled()
+        }
+        await pageDispatch(#"{"action":"Load","args":{"model":"CatalogsWithExtra","args":{"extra":[]}}}"#, "board")
+        await pageDispatch(#"{"action":"CatalogsWithExtra","args":{"action":"LoadRange","args":{"end":1}}}"#, "board")
+        await pageDispatch(#"{"action":"CatalogsWithExtra","args":{"action":"LoadNextPage","args":0}}"#, "board")
+        check(try pagingField("board")["catalogs"]?.array?.first?.array?.count == 2)
+        await pageDispatch(#"{"action":"CatalogsWithExtra","args":{"action":"LoadRange","args":{"end":2}}}"#, "board")
+        check(try pagingField("board")["catalogs"]?.array?.count == 2)
+        check(try pagingField("board")["catalogs"]?.array?.first?.array?.count == 2) // widening keeps horizontal pages
+        await pageDispatch(#"{"action":"Load","args":{"model":"CatalogWithFilters","args":null}}"#, "discover")
+        let selectable = try pagingField("discover")["selectable"]!
+        check(selectable["types"]?.array?.count == 1 && selectable["catalogs"]?.array?.count == 2)
+        check(selectable["extra"]?.array?.first?["options"]?.array?.count == 3)
+        let genreRequest = selectable["extra"]!.array![0]["options"]!.array![1]["request"]!
+        let genreAction: VortxJSON = .object(["action": .string("Load"), "args": .object(["model": .string("CatalogWithFilters"), "args": .object(["request": genreRequest])])])
+        check(paging.dispatch(data: try JSONEncoder().encode(genreAction), field: "discover")); await paging.settled()
+        await pageDispatch(#"{"action":"CatalogWithFilters","args":{"action":"LoadNextPage"}}"#, "discover")
+        check(try pagingField("discover")["catalog"]?.array?.count == 2)
+        let secondPath = try pagingField("discover")["catalog"]!.array![1]["request"]!["path"]!
+        check(try secondPath["extra"]?.decode([[String]].self) == [["genre", "Drama"], ["skip", "1"]])
+        await pageDispatch(#"{"action":"CatalogWithFilters","args":{"action":"LoadNextPage"}}"#, "discover")
+        check(try pagingField("discover")["selectable"]?["next_page"] == .null)
+        let exhausted = try pagingField("discover")
+        await pageDispatch(#"{"action":"CatalogWithFilters","args":{"action":"LoadNextPage"}}"#, "discover")
+        check(try pagingField("discover") == exhausted)
+        check(!paging.dispatch(data: Data(#"{"action":"Load","args":{"model":"CatalogWithFilters","args":{"request":{"base":"https://fixture.example/manifest.json","path":{"resource":"catalog","type":"movie","id":"popular","extra":[["genre","Unknown"]]}}}}}"#.utf8), field: "discover"))
+        await paging.shutdown()
         let transitionStore = SessionStore()
         let transitionSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: transitionStore, transport: transport, allowNewAccount: true)
         let mutations = MutationCounter()

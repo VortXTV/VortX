@@ -366,13 +366,27 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             let catalogs = catalogRequests(extra: extra, type: string(selection["type"]))
             let end = (try? action["args"]?["args"]?["end"]?.decode(Int.self)) ?? catalogs.count
             guard end >= 0 else { return fail("invalid_range") }
+            let previous = values[field]
+            let loaded = previous?["catalogs"]?.array?.filter { $0.array?.first?["content"]?["type"] != .string("Loading") } ?? []
             return enqueue(field) { [self] in
-                var board: VortxJSON = .object(["selected": selection, "catalogs": .array([])])
+                var board: VortxJSON = loaded.isEmpty ? .object(["selected": selection, "catalogs": .array([])]) : previous!
+                var hasPages = !loaded.isEmpty
                 for (index, item) in catalogs.prefix(end).enumerated() {
+                    if index < loaded.count { continue }
                     try Task.checkCancellation()
-                    board = try await session.loadCatalog(screen, request: item.1, addons: [item.0], append: index != 0)
+                    board = try await session.loadCatalog(screen, request: item.1, addons: [item.0], append: hasPages)
+                    hasPages = true
                 }
                 return [field: board]
+            }
+        }
+        if name == "CatalogsWithExtra", string(action["args"]?["action"]) == "LoadNextPage", ["board", "search"].contains(field) {
+            guard let index = try? action["args"]?["args"]?.decode(Int.self), index >= 0,
+                  let rows = values[field]?["catalogs"]?.array, index < rows.count,
+                  let screen = VortxNativeSession.CatalogScreen(rawValue: field) else { return fail("invalid_catalog_page") }
+            guard let next = nextCatalogPage(rows[index].array ?? []) else { return true }
+            return enqueue(field) { [self] in
+                [field: try await session.loadCatalog(screen, request: next.1, addons: [next.0], append: true)]
             }
         }
         if name == "Load", model == "MetaDetails", field == "meta_details" {
@@ -391,19 +405,24 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             let supplied = action["args"]?["args"]?["request"]
             let requests = catalogRequests(extra: [], type: nil)
             let chosen: (VortxResourceAddon, VortxResourceRequest)?
-            if let supplied, let request = try? path(supplied["path"]), let addon = registrySnapshot.first(where: { .string($0.transportUrl) == supplied["base"] }) { chosen = (addon, request) }
+            if let supplied, let request = try? path(supplied["path"]), let addon = registrySnapshot.first(where: { .string($0.transportUrl) == supplied["base"] }), validCatalogRequest(request, addon: addon) { chosen = (addon, request) }
             else if supplied == nil { chosen = requests.first } else { return fail("invalid_catalog_request") }
             guard let chosen else { return fail("no_catalogs") }
             guard let loading = try? loadingEntry(chosen.0, chosen.1) else { return fail("invalid_catalog_request") }
-            let initial: VortxJSON = .object(["catalog": .array([loading]), "selectable": .object(["types": .array([]), "catalogs": .array([]), "extra": .array([]), "next_page": .null])])
+            let initial = discoverProjection(pages: [loading], chosen: chosen, requests: requests)
             return enqueue(field, initial: initial) { [self] in
                 let board = try await session.loadCatalog(.discover, request: chosen.1, addons: [chosen.0])
                 let pages = board["catalogs"]?.array?.flatMap { $0.array ?? [] } ?? []
-                let options = try requests.map { item -> VortxJSON in
-                    .object(["catalog": .string(item.1.id), "type": .string(item.1.type), "selected": .bool(item.0.id == chosen.0.id && item.1 == chosen.1),
-                             "request": .object(["base": .string(item.0.transportUrl), "path": try VortxResourceProjection.path(item.1)])])
-                }
-                return [field: .object(["catalog": .array(pages), "selectable": .object(["types": .array(options), "catalogs": .array(options), "extra": .array([]), "next_page": .null])])]
+                return [field: discoverProjection(pages: pages, chosen: chosen, requests: requests)]
+            }
+        }
+        if name == "CatalogWithFilters", string(action["args"]?["action"]) == "LoadNextPage", field == "discover" {
+            guard let pages = values[field]?["catalog"]?.array else { return fail("missing_selection") }
+            guard let next = nextCatalogPage(pages) else { return true }
+            let requests = catalogRequests(extra: [], type: nil)
+            return enqueue(field) { [self] in
+                let board = try await session.loadCatalog(.discover, request: next.1, addons: [next.0], append: true)
+                return [field: discoverProjection(pages: board["catalogs"]?.array?.flatMap { $0.array ?? [] } ?? [], chosen: next, requests: requests)]
             }
         }
         if name == "Load", model == "LibraryWithFilters", field == "library" {
@@ -422,6 +441,67 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         return fail("unsupported_action")
     }
     private static let nativeActions: Set<String> = ["add_profile", "switch_profile", "delete_profile", "set_parental", "set_ranking_prefs", "report_progress", "mark_watched", "reset_watched", "remove_from_continue_watching", "merge_watch_state", "merge_watch_document", "link_resume_identity", "get_state", "bind_sync_scope", "merge_native_sync", "patch_profile", "install_addon", "remove_addon", "reorder_addons", "add_library_item", "remove_library_item"]
+    private func catalogDefinition(_ request: VortxResourceRequest, addon: VortxResourceAddon) -> VortxJSON? {
+        addon.manifest?["catalogs"]?.array?.first { $0["id"] == .string(request.id) && $0["type"] == .string(request.type) }
+    }
+    private func validCatalogRequest(_ request: VortxResourceRequest, addon: VortxResourceAddon) -> Bool {
+        guard request.resource == .catalog, let definition = catalogDefinition(request, addon: addon),
+              request.extra.allSatisfy({ $0.count == 2 }), Set(request.extra.map { $0[0] }).count == request.extra.count else { return false }
+        let extras = definition["extra"]?.array ?? []
+        let supported = Set(extras.compactMap { string($0["name"]) } + (definition["extraSupported"]?.array ?? []).compactMap { string($0) })
+        guard request.extra.allSatisfy({ supported.contains($0[0]) }),
+              extras.filter({ $0["isRequired"] == .bool(true) }).allSatisfy({ definition in request.extra.contains { .string($0[0]) == definition["name"] } }) else { return false }
+        for extra in request.extra {
+            if extra[0] == "skip", UInt64(extra[1]) == nil { return false }
+            if let options = extras.first(where: { $0["name"] == .string(extra[0]) })?["options"]?.array,
+               !options.contains(.string(extra[1])) { return false }
+        }
+        return true
+    }
+    private func catalogRequest(_ addon: VortxResourceAddon, _ request: VortxResourceRequest) -> VortxJSON {
+        .object(["base": .string(addon.transportUrl), "path": (try? VortxResourceProjection.path(request)) ?? .null])
+    }
+    private func nextCatalogPage(_ pages: [VortxJSON]) -> (VortxResourceAddon, VortxResourceRequest)? {
+        guard let last = pages.last, last["content"]?["type"] == .string("Ready"),
+              let items = last["content"]?["content"]?.array, !items.isEmpty,
+              let request = try? path(last["request"]?["path"]),
+              let addon = registrySnapshot.first(where: { .string($0.transportUrl) == last["request"]?["base"] }),
+              let definition = catalogDefinition(request, addon: addon),
+              (definition["extra"]?.array ?? []).contains(where: { $0["name"] == .string("skip") }) || (definition["extraSupported"]?.array ?? []).contains(.string("skip")) else { return nil }
+        let offset = request.extra.first(where: { $0.first == "skip" }).flatMap { UInt64($0[1]) } ?? 0
+        let (next, overflow) = offset.addingReportingOverflow(UInt64(items.count))
+        guard !overflow else { return nil }
+        let result = VortxResourceRequest(resource: .catalog, type: request.type, id: request.id,
+                                         extra: request.extra.filter { $0.first != "skip" } + [["skip", String(next)]])
+        return validCatalogRequest(result, addon: addon) ? (addon, result) : nil
+    }
+    private func discoverProjection(pages: [VortxJSON], chosen: (VortxResourceAddon, VortxResourceRequest),
+                                    requests: [(VortxResourceAddon, VortxResourceRequest)]) -> VortxJSON {
+        var seenTypes = Set<String>()
+        let types = requests.compactMap { item -> VortxJSON? in
+            guard seenTypes.insert(item.1.type).inserted else { return nil }
+            return .object(["type": .string(item.1.type), "selected": .bool(item.1.type == chosen.1.type), "request": catalogRequest(item.0, item.1)])
+        }
+        let catalogs = requests.filter { $0.1.type == chosen.1.type }.map { item -> VortxJSON in
+            .object(["catalog": catalogDefinition(item.1, addon: item.0)?["name"] ?? .string(item.1.id),
+                     "selected": .bool(item.0.id == chosen.0.id && item.1.id == chosen.1.id), "request": catalogRequest(item.0, item.1)])
+        }
+        let extras = (catalogDefinition(chosen.1, addon: chosen.0)?["extra"]?.array ?? []).compactMap { definition -> VortxJSON? in
+            guard let name = string(definition["name"]), !["skip", "search"].contains(name),
+                  let options = definition["options"]?.array else { return nil }
+            let candidates: [VortxJSON] = (definition["isRequired"] == .bool(true) ? [] : [.null]) + options
+            let selected = chosen.1.extra.first { $0.first == name }.map { VortxJSON.string($0[1]) } ?? .null
+            let choices = candidates.map { value -> VortxJSON in
+                var extra = chosen.1.extra.filter { $0.first != name && $0.first != "skip" }
+                if let value = string(value) { extra.append([name, value]) }
+                let request = VortxResourceRequest(resource: .catalog, type: chosen.1.type, id: chosen.1.id, extra: extra)
+                return .object(["value": value, "selected": .bool(value == selected), "request": catalogRequest(chosen.0, request)])
+            }
+            return .object(["name": .string(name), "options": .array(choices)])
+        }
+        let next = nextCatalogPage(pages).map { VortxJSON.object(["request": catalogRequest($0.0, $0.1)]) } ?? .null
+        return .object(["catalog": .array(pages), "selectable": .object(["types": .array(types), "catalogs": .array(catalogs), "extra": .array(extras), "next_page": next])])
+    }
     private func loadingEntry(_ addon: VortxResourceAddon, _ request: VortxResourceRequest) throws -> VortxJSON {
         .object(["request": .object(["base": .string(addon.transportUrl), "path": try VortxResourceProjection.path(request)]), "content": .object(["type": .string("Loading")])])
     }
