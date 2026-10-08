@@ -71,10 +71,19 @@ import CryptoKit
         await facade.settled(); check(try field("subtitles").array?.first?["content"]?["content"]?.array?.count == 2)
         try dispatch(["action": "Load", "args": ["model": "LibraryWithFilters", "args": ["request": ["sort": "lastwatched", "page": 1]]]], field: "library")
         await facade.settled(); check(try field("library")["catalog"] == .array([]))
+        check(try field("library")["selectable"]?["types"]?.array?.first?["request"]?["sort"] == .string("lastwatched"))
+        try dispatch(["action": "Load", "args": ["model": "LocalSearch"]], field: "local_search")
+        check(try field("local_search")["searchResults"] == .array([]))
         check(try await !facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: scope.ownerProfileID, allowInsert: false))
         let detailBeforeAutoAdd = try field("meta_details")
         check(try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: scope.ownerProfileID, allowInsert: true))
         check(try field("library")["catalog"]?.array?.count == 1)
+        try dispatch(["action": "Load", "args": ["model": "LibraryWithFilters", "args": ["request": ["type": "series", "sort": "name", "page": 1]]]], field: "library")
+        check(try field("library")["catalog"]?.array?.count == 1)
+        check(try field("library")["selectable"]?["types"]?.array?.contains { $0["type"] == .string("series") && $0["selected"] == .bool(true) } == true)
+        check(try field("library")["selectable"]?["sorts"]?.array?.contains { $0["sort"] == .string("name") && $0["selected"] == .bool(true) } == true)
+        try dispatch(["action": "Search", "args": ["searchQuery": "fixture", "maxResults": 10]], field: "local_search")
+        check(try field("local_search")["searchResults"]?.array?.map { $0["id"] } == [.string("tt-fixture")])
         check(try field("meta_details")["selected"] == detailBeforeAutoAdd["selected"])
         check(try field("meta_details")["metaItems"] == detailBeforeAutoAdd["metaItems"])
         do { _ = try await facade.addCatalogItem(id: "tt-fixture", type: "series", profileID: "kid", allowInsert: true); fatalError("stale profile auto-add admitted") }
@@ -121,11 +130,38 @@ import CryptoKit
         check(try field("continue_watching_preview")["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-kid-episode"))
         check(facade.cachedResumeSeconds(id: "opaque-kid-episode") == 3.001)
         check(try await facade.resumeSeconds(id: "opaque-kid-episode", profileID: "kid") == 3.001)
+        check(!facade.setWatchedVideos(metaID: "tt-fixture", videoIDs: [], name: "Fixture", type: "series", poster: nil,
+                                       watched: true, profileID: "kid"))
+        check(facade.lastFailure == "stale_or_empty_watched_inventory")
+        check(facade.setWatchedVideos(metaID: "tt-fixture", videoIDs: ["opaque-kid-a", "opaque-kid-b"], name: "Fixture", type: "series", poster: nil,
+                                      watched: true, profileID: "kid"))
+        await facade.settled()
+        check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("opaque-kid-a")) == true)
+        check(try field("native_playback")["watchedVideoIdsByTitle"]?["tt-fixture"]?.array?.contains(.string("opaque-kid-b")) == true)
         let watchedMovie: VortxJSON = .object(["type": .string("mark_watched"), "metaId": .string("unsaved-movie"), "name": .string("Watched without saving"),
                                               "metadata": .object(["type": .string("movie")])])
         check(facade.dispatchForProfile(watchedMovie, profileID: "kid")); await facade.settled()
         check(try field("native_history")["items"]?.array?.contains { $0["_id"] == .string("unsaved-movie") && $0["state"]?["timesWatched"] == .integer(1) } == true)
         check(try field("library")["catalog"] == .array([]))
+        // Ctx add-on mutations use the exact kernel actions. Invalid new descriptors are rejected before
+        // old membership is considered; replacement, order and removal are committed through one FIFO.
+        let replacementURL = "http://127.0.0.1:\(port)/replacement/manifest.json"
+        let manifestObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(fixture["manifest"]!))
+        let originalDescriptor: [String: Any] = ["transportUrl": addon.transportUrl, "manifest": manifestObject]
+        let replacementDescriptor: [String: Any] = ["transportUrl": replacementURL, "manifest": manifestObject]
+        let invalidReplacement: [String: Any] = ["action": "Ctx", "args": [
+            "action": "ReplaceAddonLocal", "args": ["old": originalDescriptor,
+                                                        "new": ["transportUrl": replacementURL, "manifest": ["id": "bad"]]],
+        ]]
+        check(!facade.dispatch(data: try JSONSerialization.data(withJSONObject: invalidReplacement), field: "ctx"))
+        check(facade.lastFailure == "invalid_addon_replacement")
+        check(try field("ctx")["profile"]?["addons"]?.array?.map { $0["transportUrl"] } == [.string(addon.transportUrl)])
+        try dispatch(["action": "Ctx", "args": ["action": "ReplaceAddonLocal", "args": ["old": originalDescriptor, "new": replacementDescriptor]]], field: "ctx")
+        await facade.settled()
+        check(try field("ctx")["profile"]?["addons"]?.array?.map { $0["transportUrl"] } == [.string(replacementURL)])
+        try dispatch(["action": "Ctx", "args": ["action": "UninstallAddonLocal", "args": replacementDescriptor]], field: "ctx")
+        await facade.settled()
+        check(try field("ctx")["profile"]?["addons"] == .array([]))
         let lastState = try await session.stateJSON()
         await facade.shutdown()
         let reopened = try VortxNativeSession(scope: scope, ownerName: "Fixture", abi: VortxCABI(), store: checkpoint, transport: VortxCResourceTransport())

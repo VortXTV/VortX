@@ -81,6 +81,16 @@ final class CoreBridge: ObservableObject {
         if let videoID { action["videoId"] = .string(videoID) }
         _ = facade.dispatchForProfile(.object(action), profileID: profile.uuidString)
     }
+    /// Native series bulk operations are constrained to the exact episode inventory in the
+    /// currently accepted metadata response.  IDs are opaque provider identities: never derive
+    /// them from season/episode numbers or use a title-level marker that would claim unseen future
+    /// episodes.  The facade sends this list as one checkpointed kernel transaction.
+    private func nativeWatchedInventoryIntent(id: String, videoIDs: [String], name: String, type: String,
+                                              poster: String?, watched: Bool, target: PlaybackMutationTarget? = nil) {
+        guard let (facade, profile) = nativePlaybackBinding(target ?? .capture(core: self)) else { return }
+        _ = facade.setWatchedVideos(metaID: id, videoIDs: videoIDs, name: name, type: type, poster: poster,
+                                    watched: watched, profileID: profile.uuidString)
+    }
     private func nativeDismissContinueWatching(id: String, target: PlaybackMutationTarget? = nil) {
         guard let (facade, profile) = nativePlaybackBinding(target ?? .capture(core: self)) else { return }
         _ = facade.dispatchForProfile(.object(["type": .string("remove_from_continue_watching"), "metaId": .string(id)]), profileID: profile.uuidString)
@@ -2508,9 +2518,13 @@ final class CoreBridge: ObservableObject {
                                                            residentType: residentMeta.type) else { return }
 #if VORTX_NATIVE_DATA_ENGINE
         if usesNativeProfileState {
-            // Whole-series/season completeness is not proved by an addon page. Individual native
-            // episode marks are supported; bulk-series UI stays a cutover gate.
-            guard !EpisodePlaybackIdentity.usesSeriesLifecycle(type: residentMeta.type) else { return }
+            if EpisodePlaybackIdentity.usesSeriesLifecycle(type: residentMeta.type) {
+                let videoIDs = (residentMeta.videos ?? []).map(\.id).filter { !$0.isEmpty }
+                guard !videoIDs.isEmpty else { return }
+                nativeWatchedInventoryIntent(id: residentMeta.id, videoIDs: videoIDs, name: residentMeta.name,
+                                             type: residentMeta.type, poster: residentMeta.poster, watched: isWatched)
+                return
+            }
             nativeWatchedIntent(id: residentMeta.id, name: residentMeta.name, type: residentMeta.type, poster: residentMeta.poster, watched: isWatched)
             return
         }
@@ -2560,13 +2574,19 @@ final class CoreBridge: ObservableObject {
     /// Mark every episode of a season watched/unwatched.
     func markSeasonWatched(_ season: Int, _ isWatched: Bool,
                            expected: LibraryWatchedMutationPolicy.DetailTarget) {
-#if VORTX_NATIVE_DATA_ENGINE
-        if usesNativeProfileState { return } // no native bulk-season completeness proof yet
-#endif
         guard let residentMeta = metaDetails?.meta,
               LibraryWatchedMutationPolicy.residentMatches(expected, residentID: residentMeta.id,
                                                            residentType: residentMeta.type),
               residentMeta.videos?.contains(where: { $0.season == season }) == true else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            let videoIDs = (residentMeta.videos ?? []).filter { $0.season == season }.map(\.id).filter { !$0.isEmpty }
+            guard !videoIDs.isEmpty else { return }
+            nativeWatchedInventoryIntent(id: residentMeta.id, videoIDs: videoIDs, name: residentMeta.name,
+                                         type: residentMeta.type, poster: residentMeta.poster, watched: isWatched)
+            return
+        }
+#endif
         if overlayMarkWatched(isWatched, videoIds: { meta in
             (meta.videos ?? []).filter { $0.season == season }.map(\.id)
         }) { return }

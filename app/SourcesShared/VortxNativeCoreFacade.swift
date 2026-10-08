@@ -267,6 +267,29 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         guard let data = try? JSONEncoder().encode(action) else { return false }
         return enqueueMutation(type: "reorder_addons", raw: String(decoding: data, as: UTF8.self))
     }
+    /// Apply a complete, already-resolved episode inventory in one kernel transaction.  Series
+    /// actions deliberately contain only opaque IDs supplied by the current metadata response:
+    /// a title-level mark would incorrectly claim future or unavailable episodes are watched.
+    func setWatchedVideos(metaID: String, videoIDs: [String], name: String, type: String, poster: String?, watched: Bool,
+                          profileID: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let uniqueIDs = Array(Set(videoIDs.filter { !$0.isEmpty })).sorted()
+        guard !closed, pendingProfileTransitions == 0,
+              values["native_state"]?["activeProfileId"] == .string(profileID), !uniqueIDs.isEmpty else {
+            return fail("stale_or_empty_watched_inventory")
+        }
+        do {
+            let actions = try uniqueIDs.map { videoID -> String in
+                let action: VortxJSON = .object([
+                    "type": .string(watched ? "mark_watched" : "reset_watched"),
+                    "metaId": .string(metaID), "videoId": .string(videoID), "name": .string(name),
+                    "metadata": .object(["type": .string(type), "poster": poster.map(VortxJSON.string) ?? .null]),
+                ])
+                return String(decoding: try JSONEncoder().encode(action), as: UTF8.self)
+            }
+            return enqueueMutation(type: watched ? "mark_watched" : "reset_watched", raw: "", actions: actions)
+        } catch { return fail("invalid_watched_inventory") }
+    }
     /// Metadata comes only from the accepted native registry. The return value acknowledges the
     /// durable FIFO add, not merely HTTP success or UI dispatch. Legacy recovery may only confirm
     /// existing native membership; it cannot manufacture a new save over a native removal.
@@ -334,6 +357,10 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             }
             let native: VortxJSON = .object(["action": .string("Vortx"), "args": .object(intent)])
             guard let bytes = try? JSONEncoder().encode(native) else { return false }; return dispatch(data: bytes, field: "native_state")
+        }
+        if name == "Ctx", let subaction = string(action["args"]?["action"]),
+           ["InstallAddon", "InstallAddonLocal", "ReplaceAddon", "ReplaceAddonLocal", "UninstallAddon", "UninstallAddonLocal"].contains(subaction) {
+            return dispatchAddonMutation(subaction: subaction, args: action["args"]?["args"])
         }
         if name == "Ctx", let subaction = string(action["args"]?["action"]), ["AddToLibrary", "RemoveFromLibrary"].contains(subaction) {
             let state = lock.withLock { values["native_state"] }
@@ -467,13 +494,21 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             }
         }
         if name == "Load", model == "LibraryWithFilters", field == "library" {
-            // Only the default library selection is supported; never silently ignore a filter/sort.
             let request = action["args"]?["args"]?["request"]
-            guard request?["type"] == nil || request?["type"] == .null,
-                  request?["sort"] == nil || request?["sort"] == .string("lastwatched"),
-                  request?["page"] == nil || request?["page"] == .integer(1) else { return fail("unsupported_library_filter") }
-            guard let value = values["library"], let ticket = begin(field) else { return fail("missing_library_state") }
+            guard let state = values["native_state"], let value = libraryProjection(state: state, request: request),
+                  let ticket = begin(field) else { return fail("unsupported_library_filter") }
             publish([field: value], field: field, ticket: ticket); return true
+        }
+        if name == "Load", model == "LocalSearch", field == "local_search" {
+            guard let ticket = begin(field) else { return false }
+            publish([field: .object(["searchResults": .array([])])], field: field, ticket: ticket); return true
+        }
+        if name == "Search", field == "local_search" {
+            guard let query = string(action["args"]?["searchQuery"]),
+                  let maxResults = try? action["args"]?["maxResults"]?.decode(Int.self), (1...100).contains(maxResults),
+                  let state = values["native_state"], let projection = localSearchProjection(state: state, query: query, maxResults: maxResults),
+                  let ticket = begin(field) else { return fail("invalid_local_search_request") }
+            publish([field: projection], field: field, ticket: ticket); return true
         }
         if name == "Load", model == "Subtitles", field == "subtitles", let request = try? path(action["args"]?["args"]) {
             let addons = registrySnapshot
@@ -482,6 +517,64 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         return fail("unsupported_action")
     }
     private static let nativeActions: Set<String> = ["add_profile", "switch_profile", "delete_profile", "set_parental", "set_ranking_prefs", "report_progress", "mark_watched", "reset_watched", "remove_from_continue_watching", "merge_watch_state", "merge_watch_document", "link_resume_identity", "get_state", "bind_sync_scope", "merge_native_sync", "patch_profile", "install_addon", "remove_addon", "reorder_addons", "add_library_item", "remove_library_item"]
+    private func addonOwner(for state: VortxJSON) -> String? {
+        guard let active = string(state["activeProfileId"]),
+              let binding = state["roster"]?["profiles"]?[active]?["addons"],
+              [.string("own"), .string("share_primary")].contains(binding) else { return nil }
+        return binding == .string("share_primary") ? session.scope.ownerProfileID : active
+    }
+    /// CoreBridge verifies the fetched response before it reaches this adapter.  Revalidate the
+    /// immutable transport identity and the manifest's required human/API identity here as well,
+    /// because a raw Ctx action can otherwise bypass that async installer boundary.
+    private func addonDescriptor(_ value: VortxJSON?) -> (url: String, addon: VortxJSON)? {
+        guard let url = string(value?["transportUrl"]), let parts = URLComponents(string: url),
+              ["http", "https"].contains(parts.scheme?.lowercased() ?? ""), parts.host != nil,
+              let manifest = value?["manifest"], case .object = manifest,
+              let id = string(manifest["id"]), !id.isEmpty, let name = string(manifest["name"]), !name.isEmpty else { return nil }
+        return (url, .object(["transportUrl": .string(url), "manifest": manifest]))
+    }
+    private func dispatchAddonMutation(subaction: String, args: VortxJSON?) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, pendingProfileTransitions == 0, let state = values["native_state"], let owner = addonOwner(for: state) else {
+            return fail("stale_or_invalid_addon_owner")
+        }
+        let current = registry
+        func raw(_ action: VortxJSON) throws -> String { String(decoding: try JSONEncoder().encode(action), as: UTF8.self) }
+        do {
+            switch subaction {
+            case "InstallAddon", "InstallAddonLocal":
+                guard let descriptor = addonDescriptor(args), !current.contains(where: { $0.transportUrl == descriptor.url }) else {
+                    return fail("invalid_or_duplicate_addon")
+                }
+                return enqueueMutation(type: "install_addon", raw: try raw(.object([
+                    "type": .string("install_addon"), "profileId": .string(owner), "addon": descriptor.addon,
+                ])))
+            case "UninstallAddon", "UninstallAddonLocal":
+                guard let descriptor = addonDescriptor(args), current.contains(where: { $0.transportUrl == descriptor.url }) else {
+                    return fail("unknown_addon_identity")
+                }
+                return enqueueMutation(type: "remove_addon", raw: try raw(.object([
+                    "type": .string("remove_addon"), "profileId": .string(owner), "transportUrl": .string(descriptor.url),
+                ])))
+            case "ReplaceAddon", "ReplaceAddonLocal":
+                // Validate both immutable identities before queuing any removal.  `dispatch` runs
+                // the whole list against one throwaway runtime, so an install/reorder failure leaves
+                // the old membership, order and visible registry untouched.
+                guard let old = addonDescriptor(args?["old"]), let new = addonDescriptor(args?["new"]),
+                      let oldIndex = current.firstIndex(where: { $0.transportUrl == old.url }),
+                      (old.url == new.url || !current.contains(where: { $0.transportUrl == new.url })) else {
+                    return fail("invalid_addon_replacement")
+                }
+                var order = current.map(\.transportUrl); order[oldIndex] = new.url
+                let install = VortxJSON.object(["type": .string("install_addon"), "profileId": .string(owner), "addon": new.addon])
+                let remove = VortxJSON.object(["type": .string("remove_addon"), "profileId": .string(owner), "transportUrl": .string(old.url)])
+                let reorder = VortxJSON.object(["type": .string("reorder_addons"), "profileId": .string(owner), "transportUrls": .array(order.map(VortxJSON.string))])
+                let actions = old.url == new.url ? [remove, install, reorder] : [install, remove, reorder]
+                return enqueueMutation(type: "replace_addon", raw: "", actions: try actions.map(raw))
+            default: return fail("unsupported_addon_mutation")
+            }
+        } catch { return fail("invalid_addon_mutation") }
+    }
     private func catalogDefinition(_ request: VortxResourceRequest, addon: VortxResourceAddon) -> VortxJSON? {
         addon.manifest?["catalogs"]?.array?.first { $0["id"] == .string(request.id) && $0["type"] == .string(request.type) }
     }
@@ -558,10 +651,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             }
         }
     }
-    private func stateFields(_ state: VortxJSON) throws -> [String: VortxJSON] {
+    private func projectedLibraryItems(_ state: VortxJSON) throws -> [VortxJSON] {
         guard let active = string(state["activeProfileId"]), let library = state["libraries"]?[active] else { throw VortxNativeError.invalidSnapshot }
-        let items = (library["items"]?.array ?? []).filter { $0["kind"] == .string("standard") }
-        let projected = items.compactMap { item -> VortxJSON? in
+        return (library["items"]?.array ?? []).filter { $0["kind"] == .string("standard") }.compactMap { item -> VortxJSON? in
             guard let id = string(item["id"]), let type = string(item["type"]) else { return nil }
             // Exact native selected-unit projection, never max(old episode offsets). A saved
             // membership without watch evidence stays unwatched and out of Continue Watching.
@@ -574,12 +666,68 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                               "video_id": resume?["videoId"] ?? .null, "lastWatched": isoTimestamp(resume?["updatedAt"]),
                                               "flaggedWatched": watched, "timesWatched": watched])])
         }
+    }
+    private func libraryProjection(state: VortxJSON, request: VortxJSON?) -> VortxJSON? {
+        let requestedType: String?
+        switch request?["type"] {
+        case nil, .some(.null): requestedType = nil
+        case .some(.string(let type)) where !type.isEmpty: requestedType = type
+        default: return nil
+        }
+        let sort: String
+        switch request?["sort"] {
+        case nil: sort = "lastwatched"
+        case .some(.string(let value)): sort = value
+        default: return nil
+        }
+        guard ["lastwatched", "name", "namereverse", "timeswatched", "watched", "notwatched"].contains(sort),
+              request?["page"] == nil || request?["page"] == .integer(1),
+              let all = try? projectedLibraryItems(state) else { return nil }
+        let availableTypes = Array(Set(all.compactMap { string($0["type"]) })).sorted()
+        guard requestedType == nil || availableTypes.contains(requestedType!) else { return nil }
+        var rows = all.enumerated().map { (index: $0.offset, row: $0.element) }
+        if let requestedType { rows.removeAll { string($0.row["type"]) != requestedType } }
+        func watched(_ row: VortxJSON) -> Bool { (try? row["state"]?["flaggedWatched"]?.decode(UInt64.self)) ?? 0 > 0 }
+        func count(_ row: VortxJSON) -> UInt64 { (try? row["state"]?["timesWatched"]?.decode(UInt64.self)) ?? 0 }
+        switch sort {
+        case "name": rows.sort { let left = string($0.row["name"]) ?? ""; let right = string($1.row["name"]) ?? ""; return left == right ? $0.index < $1.index : left.localizedCaseInsensitiveCompare(right) == .orderedAscending }
+        case "namereverse": rows.sort { let left = string($0.row["name"]) ?? ""; let right = string($1.row["name"]) ?? ""; return left == right ? $0.index < $1.index : left.localizedCaseInsensitiveCompare(right) == .orderedDescending }
+        case "timeswatched": rows.sort { count($0.row) == count($1.row) ? $0.index < $1.index : count($0.row) > count($1.row) }
+        case "watched": rows.removeAll { !watched($0.row) }
+        case "notwatched": rows.removeAll { watched($0.row) }
+        default: break // Preserve the kernel's current native order for most-recent.
+        }
+        func option(_ type: String?, selected: Bool) -> VortxJSON {
+            .object(["type": type.map(VortxJSON.string) ?? .null, "selected": .bool(selected),
+                     "request": .object(["type": type.map(VortxJSON.string) ?? .null, "sort": .string(sort), "page": .integer(1)])])
+        }
+        let types = [option(nil, selected: requestedType == nil)] + availableTypes.map { option($0, selected: requestedType == $0) }
+        let sorts = ["lastwatched", "name", "namereverse", "timeswatched", "watched", "notwatched"].map {
+            VortxJSON.object(["sort": .string($0), "selected": .bool($0 == sort),
+                              "request": .object(["type": requestedType.map(VortxJSON.string) ?? .null, "sort": .string($0), "page": .integer(1)])])
+        }
+        return .object(["catalog": .array(rows.map(\.row)), "selectable": .object(["types": .array(types), "sorts": .array(sorts)])])
+    }
+    private func localSearchProjection(state: VortxJSON, query: String, maxResults: Int) -> VortxJSON? {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard needle.count >= 2, let rows = try? projectedLibraryItems(state) else { return nil }
+        let matches = rows.filter { row in
+            (string(row["name"]) ?? "").localizedCaseInsensitiveContains(needle) ||
+            (string(row["_id"]) ?? "").localizedCaseInsensitiveContains(needle)
+        }.prefix(maxResults).compactMap { row -> VortxJSON? in
+            guard let id = string(row["_id"]), let name = string(row["name"]), let type = string(row["type"]) else { return nil }
+            return .object(["id": .string(id), "name": .string(name), "type": .string(type), "poster": row["poster"] ?? .null, "releaseInfo": .null])
+        }
+        return .object(["searchResults": .array(Array(matches))])
+    }
+    private func stateFields(_ state: VortxJSON) throws -> [String: VortxJSON] {
+        let projected = try projectedLibraryItems(state)
         let descriptors = (lock.withLock { resourceRegistryValid ? registry : [] }).map { addon in VortxJSON.object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest ?? .object([:])]) }
         var fields: [String: VortxJSON] = ["native_state": state, "ctx": .object(["profile": .object(["addons": .array(descriptors)])]),
                 "native_playback": playback ?? .null,
                 "continue_watching_preview": .object(["items": .array((playback?["continueWatching"]?.array ?? []).compactMap(playbackRow))]),
                 "native_history": .object(["items": .array((playback?["history"]?.array ?? []).compactMap(playbackRow))]),
-                "library": .object(["catalog": .array(projected), "selectable": .object(["types": .array([]), "sorts": .array([])])])]
+                "library": libraryProjection(state: state, request: nil) ?? .object(["catalog": .array(projected), "selectable": .object(["types": .array([]), "sorts": .array([])])])]
         if let detail = values["meta_details"] { fields["meta_details"] = metaWithPlayback(detail, library: projected) }
         return fields
     }
