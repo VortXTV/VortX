@@ -200,6 +200,16 @@ enum VortxNativeProfiles {
         }.sorted { $0.profileID.uuidString < $1.profileID.uuidString }
     }
 
+    /// Strict raw-nativeSync ingress for the host boundary.  This preserves adjacent binary64
+    /// typed clocks before slot-carrier extraction; callers that have already decoded a validated
+    /// `VortxJSON` may use the value overload above.
+    static func activeOwnAccountSlotBaselines(nativeSyncData: Data) throws -> [VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline] {
+        let object = try VortxProfileOverlayWitness.decodeObject(json: nativeSyncData)
+        let value = try JSONDecoder().decode(VortxJSON.self,
+                                              from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]))
+        return try activeOwnAccountSlotBaselines(nativeSync: value)
+    }
+
     /// Builds the only native action permitted to move an account binding.  The caller supplies a
     /// captured CAS receipt and proven target; no profile field is used as account authority.
     static func rebindAction(profileID: UUID, request: AccountRebindRequest) throws -> VortxJSON {

@@ -378,7 +378,9 @@ import CryptoKit
         check(rebindState["nativeSync"]?["schemaVersion"] == .integer(4)
               && rebindState["roster"]?["profiles"]?[child.id.uuidString]?["account"]?["kind"] == .string("own")
               && activeOwnSource(rebindState)?["profileOverlaySha256"] == .string(freshWitness))
-        let activeSlotBaselines = try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: rebindState["nativeSync"]!)
+        let strictRebindState = try VortxProfileOverlayWitness.decodeObject(json: Data(rebindExport.utf8))
+        let strictRebindSync = try JSONSerialization.data(withJSONObject: strictRebindState["nativeSync"]!)
+        let activeSlotBaselines = try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSyncData: strictRebindSync)
         guard activeSlotBaselines.count == 1 else { fatalError("Expected exactly one active own slot") }
         let activeSlotSource = try JSONSerialization.jsonObject(with: activeSlotBaselines[0].sourceBaseline) as! [String: Any]
         check(activeSlotBaselines[0].profileID == child.id
@@ -404,6 +406,26 @@ import CryptoKit
         let lateSlotTarget = try VortxNativeProfiles.ownTarget(material: try JSONDecoder().decode(VortxJSON.self, from: lateSlotMaterial), profileID: child.id)
         check(lateSlotTarget.sourceDocumentSHA256 == freshOwnTarget.sourceDocumentSHA256
               && lateSlotTarget.profileOverlaySHA256 == freshWitness)
+        let retainedClockCarrier = Data(("{\"source\":{\"verifiedStreamingUid\":\"verified-own-uid\",\"sourceDocumentSha256\":\""
+            + String(repeating: "d", count: 64)
+            + "\"},\"addons\":{\"items\":[],\"order\":[],\"intents\":[]},\"library\":{\"items\":[],\"intents\":[]},\"watches\":[{\"metaId\":\"tt-retained-clock\",\"type\":\"movie\",\"videoId\":\"tt-retained-clock\",\"positionMs\":1,\"lastPlayedAtMs\":0.039304369631583576}],\"identityLinks\":[]}").utf8)
+        let retainedClockSlot = VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline(profileID: child.id,
+            sourceBaseline: retainedClockCarrier)
+        let retainedClockMaterial = try VortxLegacyBootstrapMaterial.encode(document: Data("{\"vortx\":{}}".utf8),
+            roster: [owner, ownAccount], ownerProfileID: owner.id, rosterModifiedSeconds: nil,
+            retainedOwnAccountBaseline: preOwnBaseline, retainedOwnAccountSlotBaselines: [retainedClockSlot])
+        let retainedClockJSON = try VortxProfileOverlayWitness.decodeObject(json: retainedClockMaterial)
+        let retainedClock = (((retainedClockJSON["watches"] as? [String: Any])?[child.id.uuidString] as? [[String: Any]])?.first?["lastPlayedAtMs"] as? NSNumber)
+        check(retainedClock?.doubleValue.bitPattern == 0x3fa41fb3cc50aa01)
+        let retainedClockScope = VortxAccountScope(account: "fixture-retained-clock", ownerProfileID: owner.id.uuidString)
+        let retainedClockRuntime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: owner.id.uuidString, ownerName: owner.name)
+        defer { retainedClockRuntime.close() }
+        _ = try retainedClockRuntime.dispatch(String(decoding: JSONEncoder().encode(VortxJSON.object(["type": .string("bind_sync_scope"), "scope": .string(retainedClockScope.account)])), as: UTF8.self), now: 1)
+        _ = try retainedClockRuntime.dispatch(String(decoding: JSONEncoder().encode(VortxJSON.object(["type": .string("import_legacy_sync"), "scope": .string(retainedClockScope.account),
+            "ownerProfileId": .string(owner.id.uuidString), "material": try JSONDecoder().decode(VortxJSON.self, from: retainedClockMaterial)])), as: UTF8.self), now: 2)
+        let retainedClockState = try JSONDecoder().decode(VortxJSON.self, from: Data(retainedClockRuntime.stateJSON().utf8))
+        try VortxNativeSession.validateLegacyCompatibility(scope: retainedClockScope, ownerName: owner.name, snapshot: nil,
+                                                           nativeSync: retainedClockState["nativeSync"], material: retainedClockMaterial, abi: VortxCABI())
         let coldRebindRuntime = try VortxNativeRuntime(abi: VortxCABI(), snapshot: rebindExport)
         defer { coldRebindRuntime.close() }
         let coldRebindExport = try coldRebindRuntime.stateJSON()

@@ -606,7 +606,7 @@ actor VortxNativeSession {
     private static func validateLegacyReceipt(_ candidate: VortxNativeRuntime, scope: VortxAccountScope, material: Data, baselineMaterial: Data?) throws {
         let state = try scope.validateSnapshot(candidate.stateJSON())
         let nativeSchema = legacyImportSchema(state["nativeSync"]?["legacyImport"]?["schemaVersion"])
-        let materialValue = try JSONDecoder().decode(VortxJSON.self, from: material)
+        let materialValue = try strictJSONObject(material)
         guard let nativeSchema, nativeSchema == legacyImportSchema(materialValue["schemaVersion"]), nativeSchema == 1 || nativeSchema == 2 else {
             throw VortxNativeError.invalidSnapshot
         }
@@ -620,9 +620,14 @@ actor VortxNativeSession {
         var reconciliation: [String: VortxJSON] = ["type": .string("reconcile_legacy_sync"), "scope": .string(scope.account),
             "ownerProfileId": .string(scope.ownerProfileID), "material": materialValue]
         if state["nativeSync"]?["legacyImport"]?["baseline"] == nil, let baselineMaterial {
-            reconciliation["baselineMaterial"] = try JSONDecoder().decode(VortxJSON.self, from: baselineMaterial)
+            reconciliation["baselineMaterial"] = try strictJSONObject(baselineMaterial)
         }
         try apply(candidate, action: String(decoding: JSONEncoder().encode(VortxJSON.object(reconciliation)), as: UTF8.self))
+    }
+    private static func strictJSONObject(_ data: Data) throws -> VortxJSON {
+        let object = try VortxProfileOverlayWitness.decodeObject(json: data)
+        return try JSONDecoder().decode(VortxJSON.self,
+                                       from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys, .withoutEscapingSlashes]))
     }
     private static func legacyImportSchema(_ value: VortxJSON?) -> Int? {
         switch value {

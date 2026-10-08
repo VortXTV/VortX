@@ -648,7 +648,7 @@ enum VortxLegacyBootstrapMaterial {
         /// a fresh authenticated source. It intentionally never derives a new source digest.
         private func retainedOwnAccountSources(_ bytes: Data?, requiredProfiles: [UserProfile]) throws -> [String: ResolvedOwnAccountSource] {
             guard let bytes else { return [:] }
-            guard let baseline = try JSONSerialization.jsonObject(with: bytes) as? Object,
+            guard let baseline = try? VortxProfileOverlayWitness.decodeObject(json: bytes),
                   let version = baseline["schemaVersion"] as? NSNumber,
                   CFGetTypeID(version) != CFBooleanGetTypeID(), Double(version.intValue) == version.doubleValue,
                   version.intValue == 1 || version.intValue == 2 else {
@@ -799,7 +799,7 @@ enum VortxLegacyBootstrapMaterial {
         }
 
         private static func decodeSlotBaseline(_ bytes: Data, profileID: String) throws -> ResolvedOwnAccountSource {
-            guard let carrier = try JSONSerialization.jsonObject(with: bytes) as? Object,
+            guard let carrier = try? VortxProfileOverlayWitness.decodeObject(json: bytes),
                   Set(carrier.keys) == ["source", "addons", "library", "watches", "identityLinks"],
                   let source = try object(carrier, "source"),
                   Set(source.keys) == ["verifiedStreamingUid", "sourceDocumentSha256"]

@@ -294,6 +294,21 @@ enum VortxLegacyBootstrapMaterialTests {
                                            retainedOwnAccountSlotBaselines: [activeSlot], deferredOwnAccountOverlays: lateOwnDisposition)
         check(((lateOwnMaterial["ownAccountSources"] as! [String: Object])[own.id.uuidString]!)["sourceDocumentSha256"] as? String == witnessedOverlayReceipt.sourceDocumentSHA256,
               "Late own persona retains the active slot's exact source proof")
+        let retainedClockCarrier = Data(("{\"source\":{\"verifiedStreamingUid\":\"verified-own-uid\",\"sourceDocumentSha256\":\""
+            + String(repeating: "d", count: 64)
+            + "\"},\"addons\":{\"items\":[],\"order\":[],\"intents\":[]},\"library\":{\"items\":[],\"intents\":[]},\"watches\":[{\"metaId\":\"tt-retained-clock-a\",\"type\":\"movie\",\"videoId\":\"tt-retained-clock-a\",\"positionMs\":1,\"lastPlayedAtMs\":0.039304369631583576},{\"metaId\":\"tt-retained-clock-b\",\"type\":\"movie\",\"videoId\":\"tt-retained-clock-b\",\"positionMs\":1,\"lastPlayedAtMs\":0.039304369631583587}],\"identityLinks\":[]}").utf8)
+        let retainedClockSlot = VortxLegacyBootstrapMaterial.RetainedOwnAccountSlotBaseline(profileID: own.id,
+            sourceBaseline: retainedClockCarrier)
+        let retainedClockMaterial = try VortxLegacyBootstrapMaterial.encode(document: try JSONSerialization.data(withJSONObject: root),
+            roster: [owner, own], ownerProfileID: owner.id, rosterModifiedSeconds: nil,
+            retainedOwnAccountBaseline: oldNoOwnBaseline, retainedOwnAccountSlotBaselines: [retainedClockSlot])
+        let retainedClockOutput = try VortxProfileOverlayWitness.decodeObject(json: retainedClockMaterial)
+        let retainedClockRows = ((retainedClockOutput["watches"] as? [String: Any])?[own.id.uuidString] as? [[String: Any]])
+        let retainedClockA = retainedClockRows?.first { $0["metaId"] as? String == "tt-retained-clock-a" }?["lastPlayedAtMs"] as? NSNumber
+        let retainedClockB = retainedClockRows?.first { $0["metaId"] as? String == "tt-retained-clock-b" }?["lastPlayedAtMs"] as? NSNumber
+        check(retainedClockA?.doubleValue.bitPattern == 0x3fa41fb3cc50aa01
+              && retainedClockB?.doubleValue.bitPattern == 0x3fa41fb3cc50aa03,
+              "Retained slot clocks preserve both adjacent shortest-roundtrip binary64 values")
         var partialAbsentBaseline = witnessedOverlayMaterial
         partialAbsentBaseline["ownAccountSources"] = Object()
         do {
