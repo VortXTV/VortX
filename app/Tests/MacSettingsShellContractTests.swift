@@ -101,6 +101,13 @@ require(searchView.contains(".onChange(of: isActive) { active in if !active { se
         "hidden Search and pushed details do not strand keyboard focus")
 require(searchView.contains(".onReceive(MacSearchBridge.shared.$pending)"),
         "desktop search keeps its existing bridge without adding window toolbar items")
+require(searchView.contains(".safeAreaInset(edge: .top, spacing: 0) { macInlineSearchField }") &&
+        searchView.contains("private var macInlineSearchField: some View") &&
+        searchView.contains(".focused($macInlineSearchFocused)"),
+        "Mac Search has a visible in-content field independent of the global popover")
+require(searchView.contains(".onChange(of: isActive) { active in if !active { macInlineSearchFocused = false } }") &&
+        searchView.contains(".onChange(of: path.count) { count in if count > 0 { macInlineSearchFocused = false } }"),
+        "Mac Search releases field focus when hidden or navigating into a result")
 
 require(settings.contains("private var macSettingsShell: some View"), "Settings has a desktop workspace")
 require(settings.contains("private var macSettingsCategoryRail: some View"), "Settings exposes navigable categories")

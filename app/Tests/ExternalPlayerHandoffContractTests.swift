@@ -167,8 +167,14 @@ private enum ExternalPlayerHandoffContractTests {
         check("explicit chooser still probes before handoff",
               ordered(["probeAlive", "ExternalPlayer.open"], in: explicitChooser))
         check("explicit chooser still pauses only after a confirmed handoff",
-              explicitChooser.contains("if launched, !isPaused")
-                  && explicitChooser.contains("coordinator.player?.togglePause()"))
+              ordered(["if launched, !isPaused", "viewerPause()", "else if !launched"],
+                      in: explicitChooser))
+        let viewerPause = section(in: playerScreen, from: "private func viewerPause() {",
+                                  to: "private func viewerPlay() {")
+        check("confirmed handoff pause records intent and pauses the mounted engine",
+              viewerPause.contains("recoveryPauseIntent = true")
+                  && viewerPause.contains("playbackDeadlineClock.setPaused(true")
+                  && viewerPause.contains("coordinator.player?.pause()"))
         check("explicit chooser captures a non-nil production handoff identity",
               explicitChooser.contains("ExternalPlayer.HandoffIdentity")
                   && explicitChooser.contains("guard let externalHandoffLoadToken"))

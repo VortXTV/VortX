@@ -531,7 +531,10 @@ class DetailViewModel(
     /// (iOSDetailView.swift:3433: fires once per episode-page appearance, viewer opt-in only).
     /// [playNextEpisode] arms the SAME latch (unconditionally: an accepted auto-advance must play whether
     /// or not the Smart Source setting is on), together with [pendingAdvanceHint] below.
-    @Volatile private var pendingAutoPick = false
+    private val autoPickIntent = DetailAutoPickIntent()
+    private var pendingAutoPick: Boolean
+        get() = autoPickIntent.isArmed
+        set(value) { autoPickIntent.setArmed(value) }
 
     /// The source of the last play kicked from this page, remembered so an auto-advance can carry its
     /// quality signature + bingeGroup into the NEXT episode's pick (the ranking's continuity/binge
@@ -795,6 +798,19 @@ class DetailViewModel(
         }
     }
 
+    /** Back/Cancel retires queued auto-play as well as a resolver already in flight.
+     * Keep source loading alive for the revealed detail list, but it cannot reopen playback.
+     * Internal source-target replacement uses resolver-only retirement so a freshly armed
+     * episode auto-pick is not accidentally erased before its sources arrive.
+     */
+    fun abandonPlaybackRoute() {
+        pendingAutoPick = false
+        pendingAdvanceHint = null
+        invalidateWarmNextSource()
+        abandonPlaybackResolve()
+        _playback.value = Playback.Idle
+    }
+
     private fun canPublishPlaybackResolve(lease: PlaybackResolveFence.Lease): Boolean =
         playbackResolveFence.accepts(lease) &&
             sourceRequestFence.accepts(lease.sourceRequest, sourceSticky.currentProfileId())
@@ -970,8 +986,8 @@ class DetailViewModel(
                     // signature + bingeGroup so the ranking's next-episode bonuses keep the binge on the
                     // same release family; it also reports a no-source dead end through [_playback] so
                     // the shell's Up Next overlay can bail instead of sitting on "Starting…" forever.
-                    if (pendingAutoPick && update.selectionReady) {
-                        pendingAutoPick = false
+                    val autoPickLease = autoPickIntent.consume(update.selectionReady)
+                    if (autoPickLease != null) {
                         val hint = pendingAdvanceHint
                         pendingAdvanceHint = null
                         val sticky = sourceSticky.preference(id)
@@ -994,6 +1010,7 @@ class DetailViewModel(
                                 prefs = ctx.prefs,
                             )
                         }
+                        if (!autoPickIntent.accepts(autoPickLease)) return@collect
                         when {
                             pick != null -> playAutomatically(pick)
                             hint != null -> _playback.value = Playback.Failed("No playable source for the next episode.")
@@ -1313,6 +1330,7 @@ class DetailViewModel(
             // Persistence follows successful publication. A failed resolve, blank URL, superseded target, or
             // profile switch leaves the previous preference untouched.
             if (nextPlayback is Playback.Ready && stickyWrite != null) {
+                invalidateWarmNextSource()
                 sourceSticky.record(stickyWrite, source.addon, source.bingeGroup)
             }
         }
@@ -1359,6 +1377,9 @@ class DetailViewModel(
                         sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
                 },
                 commitAccepted = {
+                    // An accepted manual choice teaches a new release family. A previously
+                    // published next-episode warm must not override that choice (phone or TV).
+                    invalidateWarmNextSource()
                     lastPlayedSource = source
                     stickyWrite?.let { sourceSticky.record(it, source.addon, source.bingeGroup) }
                 },

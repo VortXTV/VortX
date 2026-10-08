@@ -11,7 +11,10 @@ cross-client profile creation/edit propagation; sparse website profile updates; 
 add-on removal/reorder receipts; chosen add-on/release continuity for episode advance, preload
 and batch downloads; bounded source resolution; terminal playback errors with the correct failed
 episode Retry target; manual-seek retirement of stale resume work; owned preview exit; Mac native
-window controls and a single detail Back; and accepted-seek diagnostic attribution.
+window controls, a single detail Back and a visible Mac Search field; owned downloaded resume;
+preview original-position/pause carry into accepted replacements; Android TV halfway prewarm,
+automatic advance and Back-safe asynchronous auto-pick; source-owned mpv restart/non-EOF
+settlement accounting instead of optimistic seek-target success; and accepted-seek diagnostics.
 
 The website profile fixes are deployed separately and require updated native clients for the
 complete path. Active profile selection remains device-local. This beta includes Apple and Android,

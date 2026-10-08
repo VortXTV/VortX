@@ -652,7 +652,7 @@ fun VortXApp(
             // Hardware/gesture back pops the player overlay instead of exiting the app. It also
             // revokes an Up Next or retry resolver that may still be running behind the player.
             BackHandler {
-                advanceVm?.abandonPlaybackResolve()
+                advanceVm?.abandonPlaybackRoute()
                 playing = null
             }
             DisposableEffect(historyIdentity, advanceVm) {
@@ -677,10 +677,10 @@ fun VortXApp(
             // PLR-8 next-episode preload policy, owned per player session (reset when an episode is switched
             // or advanced). The task owner makes the fetch itself player-owned: dispose and target replacement
             // cancel its network work rather than merely fencing a stale completion.
-            val preloadPolicy = remember(historyIdentity) { NextEpisodePreloadPolicy() }
+            val preloadPolicy = remember(historyIdentity, advanceVm) { NextEpisodePreloadPolicy() }
             val preloadScope = rememberCoroutineScope()
-            val preloadTaskOwner = remember(historyIdentity) { NextEpisodePreloadTaskOwner(preloadScope) }
-            DisposableEffect(historyIdentity) {
+            val preloadTaskOwner = remember(historyIdentity, advanceVm) { NextEpisodePreloadTaskOwner(preloadScope) }
+            DisposableEffect(historyIdentity, advanceVm) {
                 onDispose {
                     preloadTaskOwner.cancel()
                     preloadPolicy.invalidate()
@@ -734,9 +734,17 @@ fun VortXApp(
                     episodeOptions = playerEpisodeOptions,
                     currentSource = advanceVm?.currentPlayerSource(),
                     onSwitchSource = advanceVm?.let { vm ->
-                        // Same-episode source picks retain a useful next-episode warm. The player-side
-                        // source authority cancels/supersedes the resolver itself.
-                        { source -> vm.resolveSourceSwitch(source) }
+                        { source ->
+                            // A new explicit source can teach a different release family. Retire warm
+                            // scheduling before AND after resolution; the accepted VM commit also
+                            // invalidates its published cache, while a failed pick leaves choice intact.
+                            preloadTaskOwner.cancel()
+                            preloadPolicy.invalidate()
+                            try { vm.resolveSourceSwitch(source) } finally {
+                                preloadTaskOwner.cancel()
+                                preloadPolicy.invalidate()
+                            }
+                        }
                     },
                     onSwitchEpisode = advanceVm?.let { vm ->
                         { episodeId ->
@@ -776,11 +784,11 @@ fun VortXApp(
                         )
                     },
                     onBack = {
-                        advanceVm?.abandonPlaybackResolve()
+                        advanceVm?.abandonPlaybackRoute()
                         playing = null
                     },
                     onError = {
-                        advanceVm?.abandonPlaybackResolve()
+                        advanceVm?.abandonPlaybackRoute()
                         playing = null
                     },
                     // Natural end of the stream: offer the next episode when the open series has one,
@@ -788,7 +796,7 @@ fun VortXApp(
                     onEnded = {
                         val next = advanceVm?.nextEpisode()
                         if (next != null) upNext = next else {
-                            advanceVm?.abandonPlaybackResolve()
+                            advanceVm?.abandonPlaybackRoute()
                             playing = null
                         }
                     },
@@ -901,7 +909,7 @@ fun VortXApp(
                         onPlayNow = { autoAdvanceStreak[0] = 0; advanceVm.playNextEpisode() },
                         onCancel = {
                             autoAdvanceStreak[0] = 0
-                            advanceVm.abandonPlaybackResolve()
+                            advanceVm.abandonPlaybackRoute()
                             playing = null
                         },
                     )
@@ -950,7 +958,7 @@ fun VortXApp(
                                 playing = null
                             },
                             onClose = {
-                                advanceVm.abandonPlaybackResolve()
+                                advanceVm.abandonPlaybackRoute()
                                 playing = null
                             },
                         )
@@ -1247,14 +1255,14 @@ fun VortXApp(
                 // DetailScreen so the screen's own nested overlay handlers (person page / nested title,
                 // DetailScreen.kt) register later and therefore take precedence while they are open.
                 BackHandler {
-                    detailVm.abandonPlaybackResolve()
+                    detailVm.abandonPlaybackRoute()
                     openDetail(null)
                 }
                 DetailScreen(
                     viewModel = detailVm,
                     title = current.name,
                     onBack = {
-                        detailVm.abandonPlaybackResolve()
+                        detailVm.abandonPlaybackRoute()
                         openDetail(null)
                     },
                     // DetailScreen supplies the successfully loaded MetaDetail, not the provisional

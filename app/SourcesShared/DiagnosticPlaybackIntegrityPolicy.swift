@@ -318,7 +318,103 @@ enum DeferredResumeFloorPolicy {
     }
 }
 
-/// A deferred resume seek is optimistic until an engine tick proves it landed. When its bounded watchdog gives
+/// Captured at raw event dequeue and revalidated before main-thread delivery. mpv exposes the requested
+/// last_seek_pts while seeking; that timestamp alone is not a successfully resumed frame.
+struct MPVSeekSettlementEvidence: Equatable, Sendable {
+    let generation: UInt64
+    let settled: Bool
+    let attributed: Bool
+    init(generation: UInt64, settled: Bool, attributed: Bool = true) {
+        self.generation = generation
+        self.settled = settled
+        self.attributed = attributed
+    }
+}
+
+/// The controller serializes command admission and raw event dequeue under one lock. Native events
+/// have no command ID: overlapping seeks can settle physically without proving command attribution.
+/// A subsequent command after that observed settlement establishes a fresh, unambiguous boundary.
+struct MPVSeekSettlementPolicy<Owner: Equatable> {
+    enum Phase: Equatable { case awaitingSeek, seekObserved, settled }
+    struct Attempt: Equatable {
+        let owner: Owner
+        let generation: UInt64
+        var phase: Phase
+        let ambiguous: Bool
+    }
+    private(set) var owner: Owner?
+    private(set) var current: Attempt?
+    private var nextGeneration: UInt64 = 0
+    private var admission: Attempt?
+
+    private mutating func next() -> UInt64 {
+        precondition(nextGeneration < UInt64.max)
+        nextGeneration += 1
+        return nextGeneration
+    }
+
+    /// Only accepted source replacement/invalidation resets; rejected loads retain prior evidence.
+    mutating func reset(owner: Owner?) {
+        _ = next()
+        self.owner = owner
+        current = nil
+        admission = nil
+    }
+
+    /// Register before mpv_command while raw dequeue is excluded by the controller's same lock.
+    mutating func beginIssue(owner: Owner, seeking: Bool?) -> UInt64? {
+        guard self.owner == owner, admission == nil else { return nil }
+        let generation = next()
+        // A fresh load reports seeking during initial decoder startup. That is not a previous
+        // command; cold paused recovery must still be able to establish its first seek boundary.
+        let ambiguous = current.map { $0.phase != .settled || seeking != false } ?? false
+        admission = Attempt(owner: owner, generation: generation, phase: .awaitingSeek,
+                            ambiguous: ambiguous)
+        return generation
+    }
+
+    /// Rejection leaves the previously accepted attempt intact.
+    mutating func completeIssue(_ generation: UInt64, accepted: Bool) {
+        guard let candidate = admission, candidate.generation == generation else { return }
+        admission = nil
+        if accepted { current = candidate }
+    }
+
+    mutating func observeSeek(owner: Owner) {
+        guard self.owner == owner else { return }
+        if var attempt = current, attempt.phase == .awaitingSeek {
+            attempt.phase = .seekObserved
+            current = attempt
+        } else {
+            // Track changes and internal mpv refreshes can seek without an app command.
+            let ambiguous = current.map { $0.ambiguous || $0.phase != .settled } ?? false
+            current = Attempt(owner: owner, generation: next(), phase: .seekObserved,
+                              ambiguous: ambiguous)
+        }
+    }
+
+    mutating func observeRestart(owner: Owner, seeking: Bool?, eofReached: Bool?) {
+        guard self.owner == owner, seeking == false, eofReached == false,
+              var attempt = current, attempt.phase == .seekObserved else { return }
+        attempt.phase = .settled
+        current = attempt
+    }
+
+    func evidence(owner: Owner, seeking: Bool?, eofReached: Bool?) -> MPVSeekSettlementEvidence {
+        MPVSeekSettlementEvidence(
+            generation: current?.generation ?? nextGeneration,
+            settled: self.owner == owner && admission == nil && seeking == false && eofReached == false
+                && (current.map { $0.phase == .settled } ?? true),
+            attributed: current.map { !$0.ambiguous } ?? true)
+    }
+
+    func accepts(_ evidence: MPVSeekSettlementEvidence, owner: Owner) -> Bool {
+        self.owner == owner && admission == nil
+            && evidence.generation == (current?.generation ?? nextGeneration)
+    }
+}
+
+/// A deferred resume seek is optimistic until a settled engine sample proves it landed. When its bounded watchdog gives
 /// up, presentation must return to the proven engine position, but persistence retains the requested floor:
 /// one source's failed seek must not erase an otherwise valid Continue Watching position.
 enum DeferredResumeSeekReconciliationPolicy {
