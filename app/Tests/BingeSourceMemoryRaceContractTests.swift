@@ -440,7 +440,9 @@ enum BingeSourceMemoryRaceContractTests {
                "caller clock: every raw settle call passes request-start elapsed time")
         expect(!callerSource.contains("secondsSinceFirstPlayable"),
                "caller clock: no production raw settle loop retains the first-playable reset")
-        expect(callerSource.components(separatedBy: "let settlementStartedAt = Date()").count - 1 == 5
+        let dateStarts = callerSource.components(separatedBy: "let settlementStartedAt = Date()").count - 1
+        let ownedBudgetStarts = callerSource.components(separatedBy: "let elapsed = resolutionBudget.elapsed(").count - 1
+        expect(dateStarts + ownedBudgetStarts == 5 && ownedBudgetStarts == 3
                && callerSource.contains("slotPolicy.settlementStartedAt"),
                "caller clock: raw requests and batch slot own an absolute settlement start")
         let directDeadlineBreaks = callerSource.components(

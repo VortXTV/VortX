@@ -911,7 +911,8 @@ struct TVPlayerView: View {
     @State private var episodeResolutionDeadlineTask: Task<Void, Never>?
     @State private var episodeResolutionOwner: EpisodeResolutionOwner?
     @State private var episodeResolutionAdmitted = false
-    private static let episodeResolutionDeadlineSeconds: Double = 30
+    @State private var failedEpisodeResolutionTarget: CoreVideo?
+    private static let episodeResolutionDeadlineSeconds = EpisodeResolutionBudget.maximumDuration
     // Bounded terminal (EOF) fallback (diag-22). When the EOF handler cannot advance or exit because the
     // requested next target is still resolving (`.persistOutgoingCompletionOnly` / `.markSupersededTerminal`),
     // it arms this deadline instead of trusting an unbounded external resolve - a dead TorBox otherwise froze
@@ -919,10 +920,8 @@ struct TVPlayerView: View {
     // down while mpv reports paused-for-cache (mapped to `buffering`) on that final frame. On expiry - or when
     // the watchdog sees the frame frozen at pos ~= duration - the session advances (if the next load already
     // took, via loadIntoPlayer) or clean-exits, exactly like the last-episode finish path. Retired on any real
-    // new load (`loadIntoPlayer`) or exit (`leavePlayback`). 20s: at the binge auto-next resolution's own ~20s
-    // hard cap (see BingeSourceMemoryRaceContractTests), so a next source the binge loop can still commit will
-    // have issued its load (clearing the flag) before this fires; it sits below the 30s episodeResolution-
-    // deadline so the graceful clean-exit pre-empts the harsher "No playable source" error overlay.
+    // new load (`loadIntoPlayer`) or exit (`leavePlayback`). An exact pending resolver delegates to its
+    // shared source+NNTP+fallback budget; this separate20s escape applies only without that bounded owner.
     @State private var eofFrozenAtTerminal = false
     @State private var terminalAdvanceDeadlineTask: Task<Void, Never>?
     private static let terminalAdvanceDeadlineSeconds: Double = 20
@@ -4354,6 +4353,7 @@ struct TVPlayerView: View {
         sourceHops = 0; exhaustedURLs = []
         nativeDebridFreshLinkRecovery.reset()
         if userInitiated {
+            failedEpisodeResolutionTarget = nil
             // The mounted controller already accepted this load. Keep its engine; only an
             // explicit engine switch may recreate the surface with a different controller.
             recoveryDeadline?.cancel(); recoveryDeadline = nil
@@ -5711,6 +5711,11 @@ struct TVPlayerView: View {
     private func armTerminalAdvanceDeadline(reason: String) {
         eofFrozenAtTerminal = true
         terminalAdvanceDeadlineTask?.cancel()
+        terminalAdvanceDeadlineTask = nil
+        if hasOwnedEpisodeResolutionDeadline {
+            DiagnosticsLog.log("player", "EOF terminal deadline delegated to current bounded episode resolver")
+            return
+        }
         DiagnosticsLog.log("player", "EOF terminal deadline armed (\(reason)); bounded \(Int(Self.terminalAdvanceDeadlineSeconds))s advance-or-exit")
         terminalAdvanceDeadlineTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(Self.terminalAdvanceDeadlineSeconds))
@@ -5729,6 +5734,7 @@ struct TVPlayerView: View {
     /// watchdog can both drive it without racing.
     private func resolveTerminalAdvanceOrExit(reason: String) {
         guard eofFrozenAtTerminal, !leftPlayback else { return }
+        guard !hasOwnedEpisodeResolutionDeadline else { return }
         eofFrozenAtTerminal = false
         terminalAdvanceDeadlineTask?.cancel()
         terminalAdvanceDeadlineTask = nil
@@ -6303,6 +6309,10 @@ struct TVPlayerView: View {
 
     private func retryPlaybackByUser() {
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
+        if let target = failedEpisodeResolutionTarget {
+            play(episode: target)
+            return
+        }
         localNNTPStallRecovery = .init()
         localNNTPShortResume = nil
         let resumeRetry = failedResumeSeekRetry.flatMap {
@@ -9186,7 +9196,7 @@ struct TVPlayerView: View {
     /// Automatic boundary advance must remain a no-op until a real successor is already known. It must not
     /// create the manual inventory intent, because a late inventory refresh after EOF cannot start playback.
     private func playNext() {
-        if let i = episodeIndex, i + 1 < allEpisodes.count { play(episode: allEpisodes[i + 1]) }
+        if let i = episodeIndex, i + 1 < allEpisodes.count { play(episode: allEpisodes[i + 1], origin: .automatic) }
     }
 
     private func playPrevious() {
@@ -9312,13 +9322,21 @@ struct TVPlayerView: View {
         )
     }
 
-    private func armEpisodeResolutionDeadline(owner: EpisodeResolutionOwner) {
+    private var hasOwnedEpisodeResolutionDeadline: Bool {
+        EpisodeResolutionBudget.protectsPendingResolution(
+            deadlineScheduled: episodeResolutionDeadlineTask != nil, owner: episodeResolutionOwner,
+            currentOwner: currentEpisodeResolutionOwner, admitted: episodeResolutionAdmitted, exited: leftPlayback)
+    }
+
+    private func armEpisodeResolutionDeadline(owner: EpisodeResolutionOwner, budget suppliedBudget: EpisodeResolutionBudget? = nil) {
+        let budget = suppliedBudget ?? EpisodeResolutionBudget(episodeID: owner.videoID,
+            origin: .manual, now: ProcessInfo.processInfo.systemUptime)
         episodeResolutionTask?.cancel()
         episodeResolutionDeadlineTask?.cancel()
         episodeResolutionOwner = owner
         episodeResolutionAdmitted = false
         episodeResolutionDeadlineTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(Self.episodeResolutionDeadlineSeconds))
+            try? await Task.sleep(for: .seconds(max(0, budget.deadline - ProcessInfo.processInfo.systemUptime)))
             guard !Task.isCancelled else { return }
             let decision = EpisodeResolutionDeadlinePolicy.decision(
                 captured: owner,
@@ -9333,15 +9351,17 @@ struct TVPlayerView: View {
             episodeResolutionDeadlineTask = nil
             episodeResolutionOwner = nil
             episodeResolutionAdmitted = false
+            eofFrozenAtTerminal = false
+            terminalAdvanceDeadlineTask?.cancel(); terminalAdvanceDeadlineTask = nil
             pendingAdvance = nil
             if restoreSupersededAdvance() { return }
             switchingEpisode = false
             reconnecting = false
             buffering = false
-            loadErrorMsg = "No playable source resolved within 30 seconds."
+            loadErrorMsg = "No playable source resolved within \(Int(Self.episodeResolutionDeadlineSeconds)) seconds."
             DiagnosticsLog.log(
                 "binge",
-                "episode resolve deadline reached before player admission for \(VXProbeRedaction.identityToken(owner.videoID))"
+                "episode resolve deadline reached before player admission for \(VXProbeRedaction.identityToken(owner.videoID)) origin=\(budget.origin.rawValue) elapsed=\(Int(budget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s"
             )
             presentTerminalLoadFailure()
         }
@@ -9373,6 +9393,7 @@ struct TVPlayerView: View {
         guard let owner = episodeResolutionOwner,
               owner == currentEpisodeResolutionOwner else { return }
         episodeResolutionAdmitted = true
+        failedEpisodeResolutionTarget = nil
         episodeResolutionDeadlineTask?.cancel()
         episodeResolutionDeadlineTask = nil
     }
@@ -9440,6 +9461,7 @@ struct TVPlayerView: View {
         var restored = superseded.pending
         restored.generation = episodeSwitchGeneration
         pendingAdvance = restored
+        failedEpisodeResolutionTarget = nil
         pendingAdvance?.generation = episodeSwitchGeneration
         restoreEpisodeSourceSnapshot(superseded.source, for: restored)
         supersededAdvance = nil
@@ -9506,7 +9528,8 @@ struct TVPlayerView: View {
     /// as launch), then reload mpv. If the next episode was prepared in the background, it issues its
     /// already-ranked best source without another source or debrid resolution. The single live player still
     /// mounts and decodes that source here.
-    private func play(episode v: CoreVideo, retryingAudio: Bool = false) {
+    private func play(episode v: CoreVideo, retryingAudio: Bool = false,
+                      origin: EpisodeResolutionBudget.Origin = .manual) {
         episodeInventoryUnavailable = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         guard let m = curMeta, !leftPlayback else { return }
@@ -9525,6 +9548,7 @@ struct TVPlayerView: View {
             )
             return
         }
+        failedEpisodeResolutionTarget = v
         let choice = continuityChoice
         if languageRejectedEpisodeID != v.id || !retryingAudio {
             languageRejectedEpisodeID = v.id
@@ -9587,7 +9611,10 @@ struct TVPlayerView: View {
             sourceGeneration: sourceGeneration,
             videoID: v.id
         )
-        armEpisodeResolutionDeadline(owner: resolutionOwner)
+        let resolutionBudget = EpisodeResolutionBudget(episodeID: v.id,
+            origin: retryingAudio ? .languageRecovery : origin, now: ProcessInfo.processInfo.systemUptime)
+        armEpisodeResolutionDeadline(owner: resolutionOwner, budget: resolutionBudget)
+        DiagnosticsLog.log("binge", "episode resolve begin target=\(VXProbeRedaction.identityToken(v.id)) origin=\(resolutionBudget.origin.rawValue) budget=\(Int(Self.episodeResolutionDeadlineSeconds))s prepared=\(preparedEpisode != nil)")
         showInfo = true; selected = .play; flashControls()
 
         // The preload already fetched and ranked this episode across every add-on → play it now.
@@ -9736,7 +9763,6 @@ struct TVPlayerView: View {
                 generation: episodeGeneration, sourceGeneration: sourceGeneration,
                 videoID: v.id, choice: choice
             ) else { return }
-            let settlementStartedAt = Date()
             core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
             // Wait for THIS episode's streams (matched by id), then take the RANKED best across
             // add-ons: either every add-on has answered or the request-owned bounded deadline expires.
@@ -9751,7 +9777,7 @@ struct TVPlayerView: View {
                 let progress = core.streamLoadProgress(forStreamId: v.id)
                 // Settlement is contributor-complete or request-deadline bounded. Quality and sticky hints are
                 // ranking inputs only, so a fast Comet 1080p cannot open before the user's aggregator lands.
-                let elapsed = Date().timeIntervalSince(settlementStartedAt)
+                let elapsed = resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)
                 let deadlineReached = elapsed >= StreamRanking.completeSetDeadline
                 let settled = StreamRanking.resolveSettled(
                     groups, loaded: progress.loaded, total: progress.total,
@@ -9783,23 +9809,28 @@ struct TVPlayerView: View {
                         desiredAudioLanguage: choice?.audioLanguage,
                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                         debridCachedHashes: debridCachedHashes
-                    )
+                    ).filter { !rejectedStreams.contains($0.id) }
                     let hint = episodeHint(for: newMeta)
                     var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?)?
-                    for candidate in candidates where !rejectedStreams.contains(candidate.id) {
+                    for (index, candidate) in candidates.enumerated() {
+                        guard let legDeadline = EpisodeResolutionBudget.candidateLegDeadline(
+                            overallDeadline: resolutionBudget.candidateDeadline, now: ProcessInfo.processInfo.systemUptime,
+                            isUsenet: candidate.isUsenet, remainingCandidates: candidates.count - index) else { break }
                         let ref: DebridPlaybackRef?
                         if candidate.url == nil, hint == nil {
                             ref = nil
                         } else {
-                            ref = await DebridCoordinator.shared.resolvedPlaybackRef(
-                                for: candidate, episode: hint,
-                                waitForLocalUsenetNode: candidate.isUsenet,
-                                usenetResolveTimeout: candidate.isUsenet ? .seconds(35) : .seconds(5)
-                            )
+                            ref = await BoundedPreloadWorkPool.valueBeforeDeadline(legDeadline) {
+                                await DebridCoordinator.shared.resolvedPlaybackRef(
+                                    for: candidate, episode: hint,
+                                    waitForLocalUsenetNode: candidate.isUsenet,
+                                    usenetResolveTimeout: .seconds(max(0, legDeadline - ProcessInfo.processInfo.systemUptime))
+                                )
+                            } ?? nil
                             guard episodeSwitchIsCurrent(
                                 generation: episodeGeneration, sourceGeneration: sourceGeneration,
                                 videoID: v.id, choice: choice
-                            ) else { return }
+                            ), resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else { return }
                         }
                         if let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
                             isUsenet: candidate.isUsenet, resolvedURL: ref?.url,
@@ -9827,11 +9858,13 @@ struct TVPlayerView: View {
                         presentTerminalLoadFailure()
                         return
                     }
-                    let resolvedResume = await account.resumeOffset(for: newMeta)
+                    guard let resolvedResume = await BoundedPreloadWorkPool.valueBeforeDeadline(resolutionBudget.admissionDeadline, operation: {
+                        await account.resumeOffset(for: newMeta)
+                    }) else { return }
                     guard episodeSwitchIsCurrent(
                         generation: episodeGeneration, sourceGeneration: sourceGeneration,
                         videoID: v.id, choice: choice
-                    ) else { return }
+                    ), resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else { return }
                     DiagnosticsLog.log("binge", "auto-next selected desiredAudio=\(choice?.audioLanguage ?? "unknown") wantedAddon=\(VXProbeRedaction.identityToken(choice?.addon ?? "")) wantedRelease=\(VXProbeRedaction.identityToken(choice?.bingeGroup ?? "")) gotRelease=\(VXProbeRedaction.identityToken(s.behaviorHints?.bingeGroup ?? ""))")
                     pendingAdvance?.url = u
                     pendingAdvance?.debridRef = selected.ref
@@ -10836,6 +10869,7 @@ struct TVPlayerView: View {
     /// exit (Back-to-exit, the close button, the terminal auto-advance) routes through here, so no
     /// engine is leaked.
     private func leavePlayback() {
+        failedEpisodeResolutionTarget = nil
         resetRapidBufferingRecovery(reason: "playback exit")
         clearPostFrameResumeSeekWatchdog()
         let exitLoadToken = coordinator.player?.activeLoadToken

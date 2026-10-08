@@ -1476,7 +1476,7 @@ struct PlayerScreen: View {
     /// A manual Next/Previous press can arrive while a Continue Watching player still has only a partial
     /// series list. It is consumed once, only by the same physical playback after its inventory is accepted.
     @State private var pendingManualEpisodeNavigation: AppleManualEpisodeNavigationIntent?
-    private static let episodeResolutionDeadlineSeconds: Double = 30
+    private static let episodeResolutionDeadlineSeconds = EpisodeResolutionBudget.maximumDuration
     @State private var playbackExited = false
     @State private var terminalFinalityRefreshTarget: AppleCWTerminalRefreshTarget?
     @State private var terminalFinalityRefreshGeneration: Int?
@@ -7408,14 +7408,14 @@ struct PlayerScreen: View {
         )
     }
 
-    private func armEpisodeResolutionDeadline(owner: EpisodeResolutionOwner) {
+    private func armEpisodeResolutionDeadline(owner: EpisodeResolutionOwner, budget: EpisodeResolutionBudget) {
         episodeResolutionTask?.cancel()
         episodeResolutionDeadlineTask?.cancel()
         episodeResolutionOwner = owner
         episodeResolutionTargetVideoID = owner.videoID
         episodeResolutionAdmitted = false
         episodeResolutionDeadlineTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(Self.episodeResolutionDeadlineSeconds))
+            try? await Task.sleep(for: .seconds(max(0, budget.deadline - ProcessInfo.processInfo.systemUptime)))
             guard !Task.isCancelled else { return }
             let decision = EpisodeResolutionDeadlinePolicy.decision(
                 captured: owner,
@@ -7438,10 +7438,10 @@ struct PlayerScreen: View {
             reconnecting = false
             buffering = false
             failedEpisodeResolutionID = owner.videoID
-            loadErrorMsg = "No playable source resolved within 30 seconds."
+            loadErrorMsg = "No playable source resolved within \(Int(Self.episodeResolutionDeadlineSeconds)) seconds."
             DiagnosticsLog.log(
                 "binge",
-                "episode resolve deadline reached before player admission for \(VXProbeRedaction.identityToken(owner.videoID))"
+                "episode resolve deadline reached before player admission for \(VXProbeRedaction.identityToken(owner.videoID)) origin=\(budget.origin.rawValue) elapsed=\(Int(budget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s"
             )
             presentTerminalLoadFailure()
         }
@@ -7614,7 +7614,10 @@ struct PlayerScreen: View {
             sourceGeneration: mediaGeneration,
             videoID: videoId
         )
-        armEpisodeResolutionDeadline(owner: resolutionOwner)
+        let resolutionBudget = EpisodeResolutionBudget(episodeID: videoId,
+            origin: autoAdvance ? .automatic : .manual, now: ProcessInfo.processInfo.systemUptime)
+        armEpisodeResolutionDeadline(owner: resolutionOwner, budget: resolutionBudget)
+        DiagnosticsLog.log("binge", "episode resolve begin target=\(VXProbeRedaction.identityToken(videoId)) origin=\(resolutionBudget.origin.rawValue) budget=\(Int(Self.episodeResolutionDeadlineSeconds))s prepared=\(retainedPreparedEpisode != nil)")
         autoRetryTask?.cancel()
         if duration > 0, currentTime > 0 { reportProgress(currentTime) }   // flush the outgoing episode (floor-guarded)
         withAnimation { panel = nil }
@@ -7678,10 +7681,12 @@ struct PlayerScreen: View {
                     )
                 }
                 if let resolverRoute {
-                    resolved = await SeriesSourceSticky.resolveIfCurrent(choice) {
-                        await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
-                            await SeriesSourceSticky.$rejectedStreams.withValue(rejectedStreams) {
-                                await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                    resolved = await EpisodeResolutionBudget.$current.withValue(resolutionBudget) {
+                        await SeriesSourceSticky.resolveIfCurrent(choice) {
+                            await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
+                                await SeriesSourceSticky.$rejectedStreams.withValue(rejectedStreams) {
+                                    await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                                }
                             }
                         }
                     }
@@ -7707,7 +7712,7 @@ struct PlayerScreen: View {
                 }
                 return
             }
-            guard let es = resolved else {
+            guard let es = resolved, resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else {
                 invalidateEpisodeResolution()
                 episodeResolveGeneration = nil
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")

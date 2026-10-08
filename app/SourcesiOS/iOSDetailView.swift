@@ -214,7 +214,9 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
                              account: StremioAccount) async -> PlayerEpisodeStream? {
     guard !Task.isCancelled else { return nil }
     guard let v = videos.first(where: { $0.id == videoId }) else { return nil }
-    let settlementStartedAt = Date()
+    let resolutionBudget = EpisodeResolutionBudget.current
+        ?? EpisodeResolutionBudget(episodeID: videoId, origin: .manual, now: ProcessInfo.processInfo.systemUptime)
+    guard resolutionBudget.episodeID == videoId else { return nil }
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
     var groups: [CoreStreamSourceGroup] = []
     // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on the show id `seriesId`).
@@ -231,7 +233,7 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
         // Hints affect ranking only after every registered contributor is terminal or this request reaches the
         // shared deadline. A fast matching source cannot open the partial set.
         let progress = core.streamLoadProgress(forStreamId: v.id)
-        let elapsed = Date().timeIntervalSince(settlementStartedAt)
+        let elapsed = resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)
         if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                         secondsSinceRequestStart: elapsed, rememberedQuality: continuity,
                                         wantedAddon: wantedAddon) { break }
@@ -261,6 +263,7 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
                                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                         debridCachedHashes: cachedHashes)
         .filter { !SeriesSourceSticky.rejectedStreams.contains($0.id) }
+    DiagnosticsLog.log("binge", "episode resolve sources settled origin=\(resolutionBudget.origin.rawValue) candidates=\(candidates.count) elapsed=\(Int(resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s")
     let targetSeason = v.season ?? defaultSeason
     // PRESENCE, not truthiness: `episodeNumber` is the DISPLAY helper (`episode ?? 0`), so using it here
     // made an unresolved episode indistinguishable from an explicit E0 special, and the `> 0` test then
@@ -270,9 +273,11 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
         ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
     guard let selected = await iOSResolveRankedEpisodeCandidate(
         candidates, episode: episodeHint, cachedHashes: cachedHashes.isEmpty ? nil : cachedHashes,
+        deadline: resolutionBudget.candidateDeadline,
         stillCurrent: { requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) }
     ) else { return nil }
     let (best, url, ref) = (selected.stream, selected.url, selected.ref)
+    DiagnosticsLog.log("binge", "episode resolve candidate resolved index=\(selected.index) origin=\(resolutionBudget.origin.rawValue) elapsed=\(Int(resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s")
     let pm = PlaybackMeta(libraryId: seriesId, videoId: v.id, type: "series",
                           name: seriesName, poster: v.thumbnail ?? fallbackPoster,
                           season: v.season, episode: v.episode)
@@ -280,10 +285,14 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let resume: Double
     if let engine = core.engineResumeSeconds(for: pm) { resume = engine }
     else {
-        resume = await account.resumeOffset(for: pm)
+        guard let resolvedResume = await BoundedPreloadWorkPool.valueBeforeDeadline(resolutionBudget.admissionDeadline, operation: {
+            await account.resumeOffset(for: pm)
+        }) else { return nil }
+        resume = resolvedResume
         guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
     }
-    guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
+    guard !Task.isCancelled, resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime),
+          requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
     if ref == nil { _ = prepareTorrentStream(best) }   // fire-and-forget prime; self-terminating backoff
     return PlayerEpisodeStream(
         stream: best, url: url, meta: pm, title: title, resume: resume,
@@ -298,7 +307,8 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     waitForLocalUsenetNode: Bool = false,
     deadline: TimeInterval? = nil, stillCurrent: () -> Bool = { true }
 ) async -> (stream: CoreStream, url: URL, ref: DebridPlaybackRef?, index: Int)? {
-    let overallDeadline = deadline ?? (ProcessInfo.processInfo.systemUptime + 25)
+    let overallDeadline = deadline ?? EpisodeResolutionBudget.current?.candidateDeadline
+        ?? (ProcessInfo.processInfo.systemUptime + 25)
     for (index, stream) in candidates.enumerated() {
         guard !Task.isCancelled, stillCurrent() else { return nil }
         let remaining = overallDeadline - ProcessInfo.processInfo.systemUptime
@@ -306,12 +316,14 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
         let ref: DebridPlaybackRef?
         if stream.url == nil, episode == nil { ref = nil }
         else {
-            let legDeadline = min(overallDeadline, ProcessInfo.processInfo.systemUptime + 5)
+            guard let legDeadline = EpisodeResolutionBudget.candidateLegDeadline(
+                overallDeadline: overallDeadline, now: ProcessInfo.processInfo.systemUptime,
+                isUsenet: stream.isUsenet, remainingCandidates: candidates.count - index) else { return nil }
             ref = await BoundedPreloadWorkPool.valueBeforeDeadline(legDeadline) {
                 await DebridCoordinator.shared.resolvedPlaybackRef(
                     for: stream, episode: episode, confirmedCachedHashes: cachedHashes,
                     waitForLocalUsenetNode: waitForLocalUsenetNode && stream.isUsenet,
-                    usenetResolveTimeout: .seconds(min(5, remaining)))
+                    usenetResolveTimeout: .seconds(max(0, legDeadline - ProcessInfo.processInfo.systemUptime)))
             } ?? nil
         }
         guard !Task.isCancelled, stillCurrent(), ProcessInfo.processInfo.systemUptime < overallDeadline else { return nil }
@@ -5555,6 +5567,9 @@ struct iOSEpisodeStreams: View {
     /// player can switch episodes without owning any of that logic. Returns nil when nothing is playable.
     private func loadEpisodeStream(_ videoId: String, refreshedVideo: CoreVideo? = nil) async -> PlayerEpisodeStream? {
         guard !Task.isCancelled else { return nil }
+        let resolutionBudget = EpisodeResolutionBudget.current
+            ?? EpisodeResolutionBudget(episodeID: videoId, origin: .manual, now: ProcessInfo.processInfo.systemUptime)
+        guard resolutionBudget.episodeID == videoId else { return nil }
         let v: CoreVideo
         if let refreshedVideo {
             // PlayerScreen passes this only after its exact request-owned Apple CW receipt and target fences
@@ -5565,7 +5580,6 @@ struct iOSEpisodeStreams: View {
             guard let launchVideo = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
             v = launchVideo
         }
-        let settlementStartedAt = Date()
         core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: v.id)
         var groups: [CoreStreamSourceGroup] = []
         // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on `meta.id`, the SAME
@@ -5582,7 +5596,7 @@ struct iOSEpisodeStreams: View {
             // Settlement is contributor-complete or request-deadline bounded. Quality and sticky hints cannot
             // admit a partial set, which is the diag-22 fast-1080p-before-aggregator race.
             let progress = core.streamLoadProgress(forStreamId: v.id)
-            let elapsed = Date().timeIntervalSince(settlementStartedAt)
+            let elapsed = resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)
             if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
                                             secondsSinceRequestStart: elapsed, rememberedQuality: rememberedQuality,
                                             wantedAddon: wantedAddon) { break }
@@ -5603,6 +5617,7 @@ struct iOSEpisodeStreams: View {
                                             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                             debridCachedHashes: debridCache.cachedHashes)
             .filter { !SeriesSourceSticky.rejectedStreams.contains($0.id) }
+        DiagnosticsLog.log("binge", "episode resolve sources settled origin=\(resolutionBudget.origin.rawValue) candidates=\(candidates.count) elapsed=\(Int(resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s")
         let targetSeason = v.season ?? season
         // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.
         let targetEpisode = v.episode
@@ -5610,15 +5625,20 @@ struct iOSEpisodeStreams: View {
             ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
         guard let selected = await iOSResolveRankedEpisodeCandidate(
             candidates, episode: episodeHint, waitForLocalUsenetNode: true,
+            deadline: resolutionBudget.candidateDeadline,
             stillCurrent: { SeriesSourceSticky.admits(choice) }
         ) else { return nil }
         let (best, url, ref) = (selected.stream, selected.url, selected.ref)
+        DiagnosticsLog.log("binge", "episode resolve candidate resolved index=\(selected.index) origin=\(resolutionBudget.origin.rawValue) elapsed=\(Int(resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s")
         let pm = PlaybackMeta(libraryId: meta.id, videoId: v.id, type: "series",
                               name: meta.name, poster: v.thumbnail ?? meta.poster,
                               season: v.season, episode: v.episode)
         let title = "\(meta.name)  ·  S\(v.season ?? season)E\(v.episodeNumber)"
-        let resolvedResume = await localResume(pm)
-        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
+        guard let resolvedResume = await BoundedPreloadWorkPool.valueBeforeDeadline(resolutionBudget.admissionDeadline, operation: {
+            await localResume(pm)
+        }) else { return nil }
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice),
+              resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else { return nil }
         lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
         torrentPrime?.cancel(); torrentPrime = ref == nil ? prepareTorrentStream(best) : nil
         return PlayerEpisodeStream(
