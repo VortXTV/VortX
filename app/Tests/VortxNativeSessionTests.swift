@@ -100,6 +100,10 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
 @main enum VortxNativeSessionTests {
     static func check(_ value: Bool, line: Int = #line) { precondition(value, "session assertion at line \(line)") }
     static func main() async throws {
+        check(VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: false))
+        check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: true, hasLegacyAddonOrderIntent: false))
+        check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: true))
+        check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: false, overridingLegacySource: true))
         let scope = VortxAccountScope(account: "account-a", ownerProfileID: "owner")
         let abi = SessionABI(), store = SessionStore(), transport = SessionTransport()
         let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: store, transport: transport, allowNewAccount: true)

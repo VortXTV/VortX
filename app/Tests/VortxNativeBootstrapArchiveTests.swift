@@ -54,6 +54,14 @@ import Foundation
         let futurePlist = try PropertyListSerialization.propertyList(from: Data(base64Encoded: future["plist"]!)!, options: [], format: nil) as! [String: Any]
         check(futurePlist["password"] == nil && futurePlist["date"] as? Date == Date(timeIntervalSince1970: 5))
         check((nestedObject["excludedCredentialPaths"] as! [String]).contains("/future/backup/payloadBase64/kcfallback.legacy"))
+        let innerJSON = #"{"token":"quoted-hidden-fixture","unknown":true}"#
+        let quotedJSON = String(decoding: try JSONSerialization.data(withJSONObject: innerJSON, options: [.fragmentsAllowed]), as: UTF8.self)
+        let quotedArchive = try JSONSerialization.jsonObject(with: VortxNativeBootstrapArchive.encode(document: data(["future": quotedJSON]))) as! [String: Any]
+        let sanitizedQuoted = (quotedArchive["hostDocument"] as! [String: String])["future"]!
+        let sanitizedInner = try JSONSerialization.jsonObject(with: Data(sanitizedQuoted.utf8), options: [.fragmentsAllowed]) as! String
+        let sanitizedObject = try JSONSerialization.jsonObject(with: Data(sanitizedInner.utf8)) as! [String: Any]
+        check(sanitizedObject["token"] == nil && sanitizedObject["unknown"] as? Bool == true)
+        check((quotedArchive["excludedCredentialPaths"] as! [String]).contains("/future/token"))
         let unchanged = try data(["keep": true]).base64EncodedString()
         let unchangedArchive = try JSONSerialization.jsonObject(with: VortxNativeBootstrapArchive.encode(document: data(["future": unchanged]))) as! [String: Any]
         check((unchangedArchive["hostDocument"] as! [String: String])["future"] == unchanged)

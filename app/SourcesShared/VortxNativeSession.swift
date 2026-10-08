@@ -2,6 +2,14 @@ import Foundation
 import CryptoKit
 import Darwin
 
+/// Native-only exports cannot acknowledge legacy host edits they deliberately do not serialize.
+enum VortxNativeSyncExportPolicy {
+    static func permitsStateOnlyExport(hasDirtySettings: Bool, hasLegacyAddonOrderIntent: Bool,
+                                       overridingLegacySource: Bool = false) -> Bool {
+        !hasDirtySettings && !hasLegacyAddonOrderIntent && !overridingLegacySource
+    }
+}
+
 struct VortxAccountScope: Codable, Hashable, Sendable {
     let account: String
     let ownerProfileID: String

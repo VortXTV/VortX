@@ -71,6 +71,8 @@ settings/roster/watch/addon/library carriers from native or global mirrors. Nati
 legacy overlay/tombstone/profileEdit mutations after accepting the native transaction. Outbound host
 preference and provider-credential changes still need a separately versioned authority path; existing
 captured-key/provider restore helpers remain in place. This limitation remains a default-cutover gate.
+Pending legacy settings/order edits and explicit legacy-source override refuse a native-only push;
+their dirty acknowledgement cannot be cleared by a carrier that did not export them.
 
 Apple compatibility currently covers board/search Load + LoadRange, default/specific Discover loads,
 metadata/episode streams, subtitles, default library reads, standard AddToLibrary/RemoveFromLibrary,

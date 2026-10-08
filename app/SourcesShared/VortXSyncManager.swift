@@ -2156,6 +2156,11 @@ final class VortXSyncManager: ObservableObject {
     func syncUp(afterUserChoseThisDevice: Bool = false) async -> Bool {
         let capture = credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture) else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        guard VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: !dirtySettings.isEmpty,
+                                                                hasLegacyAddonOrderIntent: pendingAddonOrderIntent != nil,
+                                                                overridingLegacySource: afterUserChoseThisDevice) else { return false }
+#endif
         guard !hasPendingAccountDocApply(for: capture) else {
             NSLog("[sync] push refused: a remote credential apply is pending certification")
             return false
@@ -2240,6 +2245,10 @@ final class VortXSyncManager: ObservableObject {
         // The native CRDT is a TOP-LEVEL sibling of the full legacy/host preference carriers.
         // Merge the freshly pulled peer state through the kernel before exporting; never assign
         // a stale local snapshot over it, and never upload device-local activeProfileId or tokens.
+        // Recheck on every optimistic-concurrency retry. Never clear an unexported host edit merely
+        // because the independent native carrier was pushed successfully.
+        guard VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: !dirtySettings.isEmpty,
+                                                                hasLegacyAddonOrderIntent: orderIntent != nil || pendingAddonOrderIntent != nil) else { return nil }
         do {
             let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
             let merged = try await CoreBridge.shared.mergeNativeSyncDocument(remote, capture: capture, legacyMaterial: Self.nativeLegacyMaterial(doc))

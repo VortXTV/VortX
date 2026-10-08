@@ -95,14 +95,14 @@ enum VortxNativeBootstrapArchive {
             }
             throw Failure.opaquePreference
         }
-        if let text = value as? String, let nested = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
-           nested is [String: Any] || nested is [Any] {
+        if let text = value as? String, let nested = try? JSONSerialization.jsonObject(with: Data(text.utf8), options: [.fragmentsAllowed]),
+           nested is [String: Any] || nested is [Any] || nested is String {
             let prior = exclusions.count
             let safe = try sanitize(nested, path: path, exclusions: &exclusions, depth: depth + 1)
             // Keep the original noncredential string byte-for-byte unless actual exclusions were
             // necessary. A structured string must not hide credentials from the recursive policy.
             if exclusions.count == prior { return text }
-            return String(decoding: try JSONSerialization.data(withJSONObject: safe, options: [.sortedKeys, .withoutEscapingSlashes]), as: UTF8.self)
+            return String(decoding: try JSONSerialization.data(withJSONObject: safe, options: [.sortedKeys, .withoutEscapingSlashes, .fragmentsAllowed]), as: UTF8.self)
         }
         if let text = value as? String, let bytes = Data(base64Encoded: text) {
             // Inspect recognizable base64 JSON/plist containers wherever they occur. Ordinary

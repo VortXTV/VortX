@@ -135,6 +135,9 @@ check(postInstall.contains("self.isCurrent(capture), !Task.isCancelled")
               "final install await rechecks owner, profile, cancellation and opener generation before status or push")
 let nativePush = section(syncSource, from: "private func mergeLocalIntoDoc", until: "// Read-merge the pulled doc's tombstone stamps")
 check(nativePush.contains("legacyMaterial: Self.nativeLegacyMaterial(doc)")
+                && nativePush.contains("VortxNativeSyncExportPolicy.permitsStateOnlyExport")
+                && nativePush.contains("hasDirtySettings: !dirtySettings.isEmpty")
+                && nativePush.contains("orderIntent != nil || pendingAddonOrderIntent != nil")
                 && nativePush.contains("return doc\n#else"),
               "native export checks the legacy receipt and returns unchanged sibling carriers without legacy mirror rewrites")
 
