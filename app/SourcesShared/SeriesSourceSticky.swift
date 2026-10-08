@@ -14,7 +14,8 @@ import Foundation
 /// episode to the remembered add-on would be exactly the fail-closed shape MIS-260731-03 forbids - the add-on
 /// that has nothing for episode N+1 would strand the viewer.
 ///
-/// Only MANUAL picks are recorded. Writing on every auto-next would also be pointless churn, and writes here
+/// Only MANUAL source picks are recorded. Audio is observed from accepted playback or an explicit track pick.
+/// Writing source provenance on every auto-next would teach automatic fallback, and writes here
 /// deliberately do NOT call `StreamRanking.invalidateCaches()`: the sticky preference is applied OUTSIDE the
 /// score memo, so the memo stays valid and the 32768-entry cache that exists to keep re-ranks off the main
 /// thread is never dropped.
@@ -28,6 +29,30 @@ enum SeriesSourceSticky {
         var bingeGroup: String?
         /// When the pick was made, so the cap below evicts the least recently chosen series.
         var ts: Date
+        /// Actual selected audio, never inferred from the subtitle preference or release title.
+        var audioLanguage: String? = nil
+    }
+
+    struct Snapshot: Equatable, Sendable {
+        let seriesKey: String
+        let profile: String
+        let addon: String?
+        let bingeGroup: String?
+        let audioLanguage: String?
+        var source: (addon: String?, bingeGroup: String?) { (addon, bingeGroup) }
+    }
+
+    /// One immutable selection context follows the asynchronous prepare/resolve transaction.
+    @TaskLocal static var resolvingChoice: Snapshot?
+    @TaskLocal static var rejectedStreams: Set<String> = []
+
+    static func snapshot(for seriesKey: String) -> Snapshot {
+        if let resolvingChoice, resolvingChoice.seriesKey == seriesKey,
+           resolvingChoice.profile == activeProfileKey { return resolvingChoice }
+        let (profile, choices) = loaded()
+        let choice = choices[seriesKey]
+        return Snapshot(seriesKey: seriesKey, profile: profile, addon: choice?.addon,
+                        bingeGroup: choice?.bingeGroup, audioLanguage: choice?.audioLanguage)
     }
 
     /// Per-profile cap, pruned on the write that crosses it (the `LastStreamStore` shape): the headroom means
@@ -94,7 +119,8 @@ enum SeriesSourceSticky {
               addon?.isEmpty == false || bingeGroup?.isEmpty == false else { return }
         let (profile, existing) = loaded()
         var dict = existing
-        dict[seriesKey] = Choice(addon: addon, bingeGroup: bingeGroup, ts: Date())
+        dict[seriesKey] = Choice(addon: addon, bingeGroup: bingeGroup, ts: Date(),
+                                 audioLanguage: existing[seriesKey]?.audioLanguage)
         if dict.count > maxSeries {   // cap per profile, least recently chosen out
             dict = Dictionary(uniqueKeysWithValues:
                 dict.sorted { $0.value.ts > $1.value.ts }.prefix(keepSeries).map { ($0.key, $0.value) })
@@ -105,11 +131,61 @@ enum SeriesSourceSticky {
         }
     }
 
+    static func recordAudio(seriesKey: String, language: String) {
+        let language = BingeAudioContinuityPolicy.canonical(language)
+        guard !seriesKey.isEmpty, let language else { return }
+        let (profile, existing) = loaded()
+        guard existing[seriesKey]?.audioLanguage != language else { return }
+        var dict = existing
+        var choice = dict[seriesKey] ?? Choice(addon: nil, bingeGroup: nil, ts: Date())
+        choice.audioLanguage = language
+        choice.ts = Date()
+        dict[seriesKey] = choice
+        if dict.count > maxSeries {
+            dict = Dictionary(uniqueKeysWithValues:
+                dict.sorted { $0.value.ts > $1.value.ts }.prefix(keepSeries).map { ($0.key, $0.value) })
+        }
+        lock.lock(); cachedProfile = profile; cache = dict; lock.unlock()
+        if let data = try? JSONEncoder().encode(dict) {
+            UserDefaults.standard.set(data, forKey: key(profile))
+        }
+    }
+
     /// The remembered pick for `seriesKey`, in the shape `StreamRanking.best` / `rankedCandidates` take.
     /// `nil` when the viewer has never chosen a source for this show.
     static func preference(for seriesKey: String) -> (addon: String?, bingeGroup: String?)? {
         guard !seriesKey.isEmpty, let choice = loaded().choices[seriesKey] else { return nil }
         return (addon: choice.addon, bingeGroup: choice.bingeGroup)
+    }
+}
+
+/// The inventory boundary is intentionally stricter than release metadata. An explicit multi/unknown
+/// release remains a candidate, but a loaded file whose known audio inventory lacks the chosen language
+/// must not publish episode progress while silently playing a different dub.
+enum BingeAudioContinuityPolicy {
+    static let maximumRejectedSources = 3
+
+    static func shouldRetry(newlyRejected: Bool, rejectedCount: Int) -> Bool {
+        newlyRejected && rejectedCount > 0 && rejectedCount < maximumRejectedSources
+    }
+
+    static func canonical(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let raw = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["", "und", "unknown", "mul", "zxx"].contains(raw) else { return nil }
+        let code = AudioLanguagePolicy.canonical(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        return code.isEmpty || ["und", "unknown", "mul", "zxx"].contains(code) ? nil : code
+    }
+
+    static func inventoryLacksDesired(_ languages: [String], desired: String?) -> Bool {
+        guard let desired = canonical(desired), !languages.isEmpty else { return false }
+        let known = languages.compactMap { canonical($0) }
+        // A missing language tag is unknown, not evidence that this file cannot satisfy the viewer.
+        return known.count == languages.count && !known.contains(desired)
+    }
+
+    static func shouldRecordManualSource(explicit: Bool, resume: Bool, accepted: Bool) -> Bool {
+        explicit && !resume && accepted
     }
 }
 

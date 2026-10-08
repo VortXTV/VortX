@@ -25,7 +25,12 @@ import Foundation
         }
         let detail = try String(contentsOfFile: "app/SourcesiOS/iOSDetailView.swift", encoding: .utf8)
         precondition(detail.contains("playWithAddon:") && detail.contains("downloadWithAddon:"))
-        precondition(detail.contains("SeriesSourceSticky.record(seriesKey: meta.id, addon: sourceAddon"))
+        precondition(detail.contains("sourceAddon: sourceAddon") && detail.contains("initialSourceAddon: launch.sourceAddon"))
+        let playPath = detail.components(separatedBy: "struct iOSEpisodeStreams:").last!
+            .components(separatedBy: "private func play(").last!
+            .components(separatedBy: "private func downloadStream").first!
+        precondition(!playPath.contains("SeriesSourceSticky.record(seriesKey: meta.id, addon: sourceAddon"),
+                     "launch cannot persist a source before accepted playback")
         let batch = try String(contentsOfFile: paths[2], encoding: .utf8)
         precondition(batch.contains("sticky: job.sticky"))
         precondition(batch.contains("candidates.dropFirst(selected.index + 1)"), "transfer retry must not resurrect earlier resolution failures")

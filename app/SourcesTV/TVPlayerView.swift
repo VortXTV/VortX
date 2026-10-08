@@ -226,6 +226,7 @@ struct TVPlayerView: View {
     var audioSidecarURL: URL? = nil            // yt-direct adaptive pair: external audio mpv mounts with the video-only url (forces libmpv)
     var debridRef: DebridPlaybackRef? = nil    // native-debrid provenance of the launching link, for CW reresolve of an expired link
     var initialSourceStream: CoreStream? = nil // exact launch row, including a raw torrent's proven fileIdx
+    var initialSourceAddon: String? = nil
     var initialEnginePlayerVideoId: String? = nil   // confirmed exact series binding from the presenter
     /// Account-confirmed debrid-cache snapshot captured at launch, so the cached-advance / binge / failover
     /// re-rank (`rankedCandidates` / `best` / `bestCachedResolution`) sees the same cache awareness the source
@@ -275,6 +276,79 @@ struct TVPlayerView: View {
     /// The remembered manual pick for this show, in the shape `StreamRanking.best` / `rankedCandidates` take.
     private var seriesSticky: (addon: String?, bingeGroup: String?)? {
         seriesStickyKey.flatMap { SeriesSourceSticky.preference(for: $0) }
+    }
+    @State private var manualSourceToRemember: (addon: String?, bingeGroup: String?)?
+    @State private var observedAudioLanguage: String?
+    @State private var pendingAutomaticAudioLanguage: String?
+    @State private var incomingEpisodeChoice: SeriesSourceSticky.Snapshot?
+    @State private var languageRejectedEpisodeID: String?
+    @State private var languageRejectedStreams: Set<String> = []
+    @State private var resumeAfterLanguageRetry = false
+
+    private var continuityChoice: SeriesSourceSticky.Snapshot? {
+        seriesStickyKey.map { SeriesSourceSticky.snapshot(for: $0) }
+    }
+
+    private func rememberSeriesAudio(_ language: String, explicit: Bool) {
+        guard let key = seriesStickyKey, let language = BingeAudioContinuityPolicy.canonical(language),
+              explicit || (observedAudioLanguage == nil && incomingEpisodeChoice == nil) else { return }
+        observedAudioLanguage = language
+        let old = continuityChoice
+        SeriesSourceSticky.recordAudio(seriesKey: key, language: language)
+        if explicit { incomingEpisodeChoice = nil }
+        if old != continuityChoice { invalidateNextEpisodePreparation(reason: "selected audio changed") }
+        DiagnosticsLog.log("binge", "accepted continuity audio=\(language) manualAudio=\(explicit)")
+    }
+
+    private func rememberAcceptedSeriesChoice() {
+        guard let key = seriesStickyKey else { return }
+        if let choice = manualSourceToRemember, currentPickWasExplicit {
+            SeriesSourceSticky.record(seriesKey: key, addon: choice.addon, bingeGroup: choice.bingeGroup)
+            manualSourceToRemember = nil
+            invalidateNextEpisodePreparation(reason: "accepted manual source")
+        }
+        refreshTracks()
+        if !appliedAutoTracks, !audioTracks.isEmpty {
+            appliedAutoTracks = true
+            autoSelectTracks()
+        }
+        if let selected = audioTracks.first(where: { $0.selected && $0.isSelectable }),
+           pendingAutomaticAudioLanguage == nil || TrackSelector.matches(selected.lang, pendingAutomaticAudioLanguage ?? "") {
+            rememberSeriesAudio(selected.lang, explicit: false)
+        }
+    }
+
+    private func admitIncomingEpisodeAudio(loadToken: PlayerLoadToken) -> Bool {
+        guard let pending = pendingAdvance, pending.loadToken == loadToken,
+              let desired = incomingEpisodeChoice?.audioLanguage, !currentPickWasExplicit else { return true }
+        guard !pending.terminal else { return false }
+        let tracks = coordinator.player?.tracks(ofType: "audio").filter(\.isSelectable) ?? []
+        if !BingeAudioContinuityPolicy.inventoryLacksDesired(tracks.map(\.lang), desired: desired) {
+            if let match = tracks.first(where: { TrackSelector.matches($0.lang, desired) }), !match.selected {
+                coordinator.player?.setAudioTrack(match.id)
+                guard coordinator.player?.activeLoadToken == loadToken else { return false }
+            }
+            return true
+        }
+        let newlyRejected = currentStream.map { languageRejectedStreams.insert($0.id).inserted } ?? false
+        let retry = BingeAudioContinuityPolicy.shouldRetry(newlyRejected: newlyRejected, rejectedCount: languageRejectedStreams.count)
+        DiagnosticsLog.log("binge", "audio inventory mismatch target=\(VXProbeRedaction.identityToken(pending.meta.videoId)) desired=\(desired) rejected=\(languageRejectedStreams.count) retry=\(retry)")
+        resumeAfterLanguageRetry = resumeAfterLanguageRetry || !isPaused
+        coordinator.player?.pause()
+        coordinator.player?.invalidateLoadToken()
+        loadTimeout?.cancel()
+        recoveryDeadline?.cancel(); recoveryDeadline = nil
+        hasStartedPlaying = false
+        pendingAdvance?.terminal = true
+        uncommittedIdentityBlocked = true
+        invalidateNextEpisodePreparation(reason: "next episode audio mismatch")
+        if retry, let episode = allEpisodes.first(where: { $0.id == pending.meta.videoId }) {
+            play(episode: episode, retryingAudio: true)
+            return false
+        }
+        loadErrorMsg = "No source with your selected audio language could be played. Choose another source or audio language."
+        presentTerminalLoadFailure()
+        return false
     }
 
     @EnvironmentObject private var account: StremioAccount
@@ -1072,6 +1146,9 @@ struct TVPlayerView: View {
                 curURL = url; curTitle = title; curMeta = meta
                 curIsTorrent = torrent; curHeaders = headers; curIsLive = initialLiveMode
                 currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
+                if startedFromExplicitPick, !startedFromResume {
+                    manualSourceToRemember = (initialSourceAddon, bingeGroup)
+                }
                 currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
                 maybeRouteToDefaultExternalPlayer()
             }
@@ -1520,6 +1597,7 @@ struct TVPlayerView: View {
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
+        rememberAcceptedSeriesChoice()
         localTrickplayCaptureBreaker.reset()
         if !isCurrentLiveStream, pendingAdvance == nil, let m = curMeta, let u = curURL {
             let ref = curDebridRef
@@ -1958,6 +2036,7 @@ struct TVPlayerView: View {
                             autoSkipDelaySeconds > 0 ? "on" : "off"
                         )
                     )
+                    guard admitIncomingEpisodeAudio(loadToken: event.loadToken) else { return }
                     hasStartedPlaying = true
                     rearmAVStallWatchdogItemGenerationIfOwned(by: event.loadToken)
                     cancelAVPostReplacementFirstFrameDeadlineIfOwned(by: event.loadToken)
@@ -2100,6 +2179,10 @@ struct TVPlayerView: View {
                     }
                 }
                 currentTime = d
+                if hasStartedPlaying, observedAudioLanguage == nil, incomingEpisodeChoice == nil,
+                   assetSanityAttempt.isAccepted(owner: event.loadToken) {
+                    rememberAcceptedSeriesChoice()
+                }
                 if assetSanityDeferredStartToken == event.loadToken,
                    !assetSanityAttempt.isAccepted(owner: event.loadToken),
                    !assetSanityAttempt.isRejected(owner: event.loadToken),
@@ -3165,6 +3248,9 @@ struct TVPlayerView: View {
             var rows = groupedTrackRows(audioTracks) { id in
                 suppressRapidBufferingRecovery(reason: "user audio track")
                 optimisticSelect(type: "audio", id: id); coordinator.player?.setAudioTrack(id); refreshTracksSoon()
+                if let track = audioTracks.first(where: { $0.id == id && $0.isSelectable }) {
+                    rememberSeriesAudio(track.lang, explicit: true)
+                }
             }
             // Audio Sync is libmpv-only (setAudioDelay is a no-op on AVPlayer, which offers no track offset), so
             // hide the drill-in when the AVFoundation engine is active (#76). Track selection itself works on both.
@@ -4389,8 +4475,11 @@ struct TVPlayerView: View {
         // a picked stream and its add-on are both in hand. Only MANUAL picks: on tvOS `userInitiated` is exactly
         // that (the two callers are the sources and quality panels; `hopToNextSource` passes false and auto-next
         // never reaches switchStream), and recording an auto-hop would teach the store the failure, not the taste.
-        if userInitiated, let key = seriesStickyKey {
-            SeriesSourceSticky.record(seriesKey: key, addon: addon, bingeGroup: curBinge)
+        manualSourceToRemember = userInitiated ? (addon, curBinge) : nil
+        if userInitiated {
+            observedAudioLanguage = nil
+            pendingAutomaticAudioLanguage = nil
+            incomingEpisodeChoice = nil
         }
         curHint = nextHint
         curHeaders = nextHeaders
@@ -5021,7 +5110,11 @@ struct TVPlayerView: View {
 
     /// Auto-pick defaults once per load, while retaining explicit recovery intent across staged track-list events.
     private func autoSelectTracks(applyAutomaticSelections: Bool = true) {
-        let pick = TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
+        let pick = TrackPreferences.$audioLanguagesOverride.withValue(
+            incomingEpisodeChoice?.audioLanguage.map { [$0] } ?? TrackPreferences.audioLanguagesOverride
+        ) {
+            TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
+        }
         let remuxOwnsInitialAudio =
             (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
         let automaticAudio = TrackSelector.automaticAudioSelection(
@@ -5045,6 +5138,7 @@ struct TVPlayerView: View {
                 self.pendingAudioReapply = nil
             }
         } else if applyAutomaticSelections, let automaticAudio {
+            pendingAutomaticAudioLanguage = audioTracks.first(where: { $0.id == automaticAudio })?.lang
             coordinator.player?.setAudioTrack(automaticAudio)
         }
         // Mandated check 8: an explicit in-session subtitle pick captured before an engine switch must SURVIVE
@@ -9300,7 +9394,7 @@ struct TVPlayerView: View {
     /// as launch), then reload mpv. If the next episode was prepared in the background, it issues its
     /// already-ranked best source without another source or debrid resolution. The single live player still
     /// mounts and decodes that source here.
-    private func play(episode v: CoreVideo) {
+    private func play(episode v: CoreVideo, retryingAudio: Bool = false) {
         episodeInventoryUnavailable = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         guard let m = curMeta, !leftPlayback else { return }
@@ -9319,7 +9413,15 @@ struct TVPlayerView: View {
             )
             return
         }
-        let preparedEpisode = preloaded?.episodeID == v.id ? preloaded : nil
+        let choice = continuityChoice
+        if languageRejectedEpisodeID != v.id || !retryingAudio {
+            languageRejectedEpisodeID = v.id
+            languageRejectedStreams = []
+        }
+        let rejectedStreams = languageRejectedStreams
+        incomingEpisodeChoice = choice
+        manualSourceToRemember = nil
+        let preparedEpisode = preloaded?.episodeID == v.id && preloaded?.choice == choice ? preloaded : nil
         // The old episode's producer and ranged warm read no longer own the player. Preserve only the engine
         // behind the exact prepared target being consumed below; every stale completion is generation-fenced.
         if preparedEpisode != nil {
@@ -9487,6 +9589,10 @@ struct TVPlayerView: View {
                 currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1
                 pendingAdvance?.loadToken = issuedToken
                 pendingAdvance?.issued = true
+                if resumeAfterLanguageRetry {
+                    resumeAfterLanguageRetry = false
+                    coordinator.player?.play()
+                }
                 startLoadTimeout()
                 // Belt-and-braces fallback (kept): once the engine's OWN streams for this episode land, re-point
                 // off the resident stream too (idempotent, confirms the gate). Covers a synchronous re-point that
@@ -9560,14 +9666,15 @@ struct TVPlayerView: View {
                     // Keep this in lockstep with resolvePreloadedEpisode.
                     let candidates = StreamRanking.rankedCandidates(
                         groups, continuity: curHint, binge: curBinge, pin: sourcePin,
-                        sticky: seriesSticky, stickyAuthoritative: false,
+                        sticky: choice?.source, stickyAuthoritative: false,
                         preserveChosenRelease: true,
+                        desiredAudioLanguage: choice?.audioLanguage,
                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                         debridCachedHashes: debridCachedHashes
                     )
                     let hint = episodeHint(for: newMeta)
                     var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?)?
-                    for candidate in candidates {
+                    for candidate in candidates where !rejectedStreams.contains(candidate.id) {
                         let ref: DebridPlaybackRef?
                         if candidate.url == nil, hint == nil {
                             ref = nil
@@ -9613,7 +9720,7 @@ struct TVPlayerView: View {
                         generation: episodeGeneration, sourceGeneration: sourceGeneration,
                         videoID: v.id
                     ) else { return }
-                    DiagnosticsLog.log("binge", "auto-next FALLBACK: wanted binge=\(curBinge ?? "nil") got=\(s.behaviorHints?.bingeGroup ?? "nil") name=\(s.name?.prefix(60) ?? "")")
+                    DiagnosticsLog.log("binge", "auto-next selected desiredAudio=\(choice?.audioLanguage ?? "unknown") wantedAddon=\(VXProbeRedaction.identityToken(choice?.addon ?? "")) wantedRelease=\(VXProbeRedaction.identityToken(choice?.bingeGroup ?? "")) gotRelease=\(VXProbeRedaction.identityToken(s.behaviorHints?.bingeGroup ?? ""))")
                     pendingAdvance?.url = u
                     pendingAdvance?.debridRef = selected.ref
                     let nextHint = StreamRanking.signature(s)
@@ -9670,6 +9777,10 @@ struct TVPlayerView: View {
                     currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1
                     pendingAdvance?.loadToken = issuedToken
                     pendingAdvance?.issued = true
+                    if resumeAfterLanguageRetry {
+                        resumeAfterLanguageRetry = false
+                        coordinator.player?.play()
+                    }
                     startLoadTimeout()
                     return
                 }
@@ -9774,6 +9885,7 @@ struct TVPlayerView: View {
         let bingeGroup: String?
         let addonBase: String?
         let preparedResumeOrigin: Double
+        let choice: SeriesSourceSticky.Snapshot?
         var preparedRemux: VortXPreparedRemuxAttachment?
     }
 
@@ -9820,7 +9932,8 @@ struct TVPlayerView: View {
         let hint = curHint
         let binge = curBinge
         let pin = sourcePin                     // snapshot on-main; the background rank uses it (#15)
-        let sticky = seriesSticky               // same, for the remembered manual pick (diag-21)
+        let choice = continuityChoice
+        let sticky = choice?.source
         let nextID = next.id
         let nextSeason = next.season
         let nextEpisode = next.episodeNumber
@@ -9921,10 +10034,11 @@ struct TVPlayerView: View {
                 bingeGroup: binge,
                 pin: pin,
                 sticky: sticky,
+                desiredAudioLanguage: choice?.audioLanguage,
                 debridCachedHashes: debridCachedHashes,
                 attemptDeadline: attempt.deadline
             )
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, choice == continuityChoice else { return }
             let completion = preloadPolicy.complete(
                 attempt,
                 success: selected != nil,
@@ -9954,7 +10068,7 @@ struct TVPlayerView: View {
                 } ?? 0
                 DiagnosticsLog.log(
                     "binge",
-                    "preload next ep: want binge=\(binge ?? "nil"), \(selected.bingeStreamCount) of \(selected.streamCount) streams carry a bingeGroup"
+                    "preload next ep: desiredAudio=\(choice?.audioLanguage ?? "unknown") wantedAddon=\(VXProbeRedaction.identityToken(choice?.addon ?? "")) wantedRelease=\(VXProbeRedaction.identityToken(choice?.bingeGroup ?? "")) groups=\(completeGroups.count)"
                 )
                 preloaded?.preparedRemux?.abandon(reason: "replacement tvOS prepared episode")
                 preloaded = PreloadedEpisode(
@@ -9967,6 +10081,7 @@ struct TVPlayerView: View {
                     bingeGroup: best.behaviorHints?.bingeGroup,
                     addonBase: selected.addonBase,
                     preparedResumeOrigin: preparedResumeOrigin,
+                    choice: choice,
                     preparedRemux: nil
                 )
                 plog.info("preload ready: \(StreamRanking.qualityLabel(best), privacy: .public) for \(episodeToken, privacy: .public)")
@@ -10087,6 +10202,7 @@ struct TVPlayerView: View {
         bingeGroup: String?,
         pin: ResolvedPin?,
         sticky: (addon: String?, bingeGroup: String?)?,
+        desiredAudioLanguage: String?,
         debridCachedHashes: Set<String>,
         attemptDeadline: TimeInterval
     ) async -> PreloadResolution? {
@@ -10139,11 +10255,12 @@ struct TVPlayerView: View {
             pin: pin,
             sticky: sticky, stickyAuthoritative: false,
             preserveChosenRelease: true,
+            desiredAudioLanguage: desiredAudioLanguage,
             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
             debridCachedHashes: effectiveCachedHashes
         )
 
-        for candidate in candidates {
+        for candidate in candidates where !StreamRanking.continuityLanguageMismatch(candidate, desired: desiredAudioLanguage) {
             guard !Task.isCancelled else { return nil }
             let ref: DebridPlaybackRef?
             let hash = candidate.infoHash?.lowercased()

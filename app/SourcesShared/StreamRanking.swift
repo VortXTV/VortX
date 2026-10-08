@@ -225,11 +225,13 @@ enum StreamRanking {
                      pin: ResolvedPin? = nil, sticky: (addon: String?, bingeGroup: String?)? = nil,
                      stickyAuthoritative: Bool = true,
                      preserveChosenRelease: Bool = false,
+                     desiredAudioLanguage: String? = nil,
                      providerPenalty: ((String) -> Bool)? = nil,
                      debridCachedHashes: Set<String> = []) -> CoreStream? {
         if preserveChosenRelease {
             return rankedCandidates(groups, continuity: hint, binge: binge, pin: pin, sticky: sticky,
                                     stickyAuthoritative: stickyAuthoritative, preserveChosenRelease: true,
+                                    desiredAudioLanguage: desiredAudioLanguage,
                                     providerPenalty: providerPenalty, debridCachedHashes: debridCachedHashes).first
         }
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
@@ -275,8 +277,20 @@ enum StreamRanking {
                                  pin: ResolvedPin? = nil, sticky: (addon: String?, bingeGroup: String?)? = nil,
                                  stickyAuthoritative: Bool = true,
                                  preserveChosenRelease: Bool = false,
+                                 desiredAudioLanguage: String? = nil,
                                  providerPenalty: ((String) -> Bool)? = nil,
                                  debridCachedHashes: Set<String> = []) -> [CoreStream] {
+        // The actual selected audio owns binge ranking, including the optional preferred-audio filter.
+        // Install it for this synchronous transaction without changing the viewer's saved global setting.
+        if preserveChosenRelease, let desiredAudioLanguage,
+           TrackPreferences.current.audioLanguages != [desiredAudioLanguage] {
+            return TrackPreferences.$audioLanguagesOverride.withValue([desiredAudioLanguage]) {
+                rankedCandidates(groups, continuity: hint, binge: binge, pin: pin, sticky: sticky,
+                                 stickyAuthoritative: stickyAuthoritative, preserveChosenRelease: true,
+                                 desiredAudioLanguage: desiredAudioLanguage, providerPenalty: providerPenalty,
+                                 debridCachedHashes: debridCachedHashes)
+            }
+        }
         let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
         let pairs = playablePairs(groups)
         let ordered: [CoreStream]
@@ -306,7 +320,7 @@ enum StreamRanking {
         // retain their normal ordering. This is a preference partition, never a filter: unavailable
         // matching releases leave the generic candidates available for the existing failure ladder.
         let releaseOrdered: [CoreStream]
-        if preserveChosenRelease, let sticky {
+        if preserveChosenRelease, sticky != nil || desiredAudioLanguage != nil {
             // Keep the group beside its stream: identical URLs/stream IDs from two add-ons do not
             // identify which add-on supplied the row. Avoid an O(n²) reverse lookup as well.
             releaseOrdered = pairs.enumerated().map { entry in
@@ -315,7 +329,7 @@ enum StreamRanking {
                 let pinned = pinBonus(stream, addon: addon, pin: pin) > 0
                 let priority = ChosenReleaseContinuityPolicy.priority(
                     addon: addon, bingeGroup: stream.behaviorHints?.bingeGroup,
-                    preferredAddon: sticky.addon, preferredBingeGroup: sticky.bingeGroup,
+                    preferredAddon: sticky?.addon, preferredBingeGroup: sticky?.bingeGroup,
                     unhealthy: providerPenalty?(addon) == true
                 )
                 let rank = SourcePreferences.reading.useAddonOrder ? 0 :
@@ -324,11 +338,14 @@ enum StreamRanking {
                                     stickyAuthoritative: stickyAuthoritative)
                     + pinBonus(stream, addon: addon, pin: pin)
                     + healthPenalty(addon: addon, isUnhealthy: providerPenalty)
-                return (stream: stream, offset: entry.offset, pinned: pinned, priority: priority, rank: rank)
+                let compatible = !continuityLanguageMismatch(stream, desired: desiredAudioLanguage)
+                return (stream: stream, offset: entry.offset, pinned: pinned, priority: priority, rank: rank,
+                        compatible: compatible)
             }.sorted {
                 ChosenReleaseContinuityPolicy.precedes(
                     pinned: $0.pinned, priority: $0.priority, rank: $0.rank, offset: $0.offset,
-                    otherPinned: $1.pinned, otherPriority: $1.priority, otherRank: $1.rank, otherOffset: $1.offset
+                    otherPinned: $1.pinned, otherPriority: $1.priority, otherRank: $1.rank, otherOffset: $1.offset,
+                    languageCompatible: $0.compatible, otherLanguageCompatible: $1.compatible
                 )
             }.map { $0.stream }
         } else {
@@ -649,6 +666,30 @@ enum StreamRanking {
         let tags = technicalTags(text)
         let foreign = langTokens.keys.filter { !preferred.contains($0) }
         return foreign.contains(where: { claimsAudioLanguage(tags, $0) }) ? -5000 : 0
+    }
+
+    /// Automatic episode continuity only. Unknown and multi-audio claims stay viable; a positive
+    /// single foreign-audio claim cannot outrank them through an add-on, release, or saved pin.
+    static func continuityLanguageMismatch(_ stream: CoreStream, desired: String?) -> Bool {
+        guard let desired else { return false }
+        let code = AudioLanguagePolicy.canonical(desired)
+        guard langTokens[code] != nil else { return false }
+        var tags = technicalTags(qualityText(stream))
+        // A subtitle label does not advertise an audio track (e.g. French audio + English subs).
+        let codes = "english|eng|en|french|fra|fre|fr|japanese|jpn|ja|spanish|spa|es|german|ger|deu|de"
+        if let subtitles = regex("(?:(?:" + codes + ")\\s+(?:subtitles?|subs?|cc)\\b|\\b(?:subtitles?|subs?)\\s*[:=]\\s*(?:" + codes + ")\\b)") {
+            tags = subtitles.stringByReplacingMatches(in: tags, range: NSRange(tags.startIndex..., in: tags), withTemplate: " ")
+        }
+        if boundedMatch(tags, #"multi(?:lang|[ ._-]?audio)?|dual(?:[ ._-]?audio)?"#) { return false }
+        let aliases: [String: String] = ["en": "en|eng", "fr": "fr|fre|fra", "ja": "ja|jpn",
+                                        "es": "es|spa", "de": "de|ger|deu", "it": "it|ita",
+                                        "pt": "pt|por", "hi": "hi|hin", "ko": "ko|kor",
+                                        "zh": "zh|chi|zho", "ar": "ar|ara", "ru": "ru|rus"]
+        let advertised = langTokens.keys.filter {
+            claimsAudioLanguage(tags, $0) || boundedMatch(tags, aliases[$0] ?? $0)
+        }
+        if advertised.contains(code) || advertised.count != 1 || flagCount(tags) >= 2 { return false }
+        return true
     }
 
     /// The technical-tags substring (from the first year or resolution marker onward), where audio
@@ -1413,7 +1454,9 @@ enum StreamRanking {
 /// No previous episode URL or provider-specific parsing participates in next-episode selection.
 enum ChosenReleaseContinuityPolicy {
     static func precedes(pinned: Bool, priority: Int, rank: Int, offset: Int,
-                         otherPinned: Bool, otherPriority: Int, otherRank: Int, otherOffset: Int) -> Bool {
+                         otherPinned: Bool, otherPriority: Int, otherRank: Int, otherOffset: Int,
+                         languageCompatible: Bool = true, otherLanguageCompatible: Bool = true) -> Bool {
+        if languageCompatible != otherLanguageCompatible { return languageCompatible }
         if pinned != otherPinned { return pinned }
         if priority != otherPriority { return priority > otherPriority }
         if rank != otherRank { return rank > otherRank }

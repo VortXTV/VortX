@@ -73,6 +73,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         let continuity: String?
         let pin: ResolvedPin?
         let sticky: (addon: String?, bingeGroup: String?)?
+        let desiredAudioLanguage: String?
         let cachedHashes: Set<String>
     }
 
@@ -195,7 +196,8 @@ final class BatchDownloadCoordinator: ObservableObject {
 
         let pendingIds = Set(pending.map { $0.video.id })
         var jobs: [Job] = []
-        let sticky = SeriesSourceSticky.preference(for: seriesId)
+        let choice = SeriesSourceSticky.snapshot(for: seriesId)
+        let sticky = choice.source
         for video in episodes {
             if DownloadStore.shared.hasDownload(videoId: video.id) {
                 tally?.alreadyDownloaded += 1
@@ -204,7 +206,8 @@ final class BatchDownloadCoordinator: ObservableObject {
             guard !pendingIds.contains(video.id), video.id != currentVideoId else { continue }
             jobs.append(Job(seriesId: seriesId, seriesName: seriesName, identityRoles: identityRoles,
                             fallbackPoster: fallbackPoster, video: video, continuity: continuity,
-                            pin: pin, sticky: sticky, cachedHashes: cachedHashes))
+                            pin: pin, sticky: sticky, desiredAudioLanguage: choice.audioLanguage,
+                            cachedHashes: cachedHashes))
         }
 
         pending.append(contentsOf: jobs)
@@ -366,6 +369,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         }
         let candidates = StreamRanking.rankedCandidates(groups, continuity: job.continuity, pin: job.pin,
                                             sticky: job.sticky, stickyAuthoritative: false, preserveChosenRelease: true,
+                                            desiredAudioLanguage: job.desiredAudioLanguage,
                                             debridCachedHashes: job.cachedHashes)
         if Task.isCancelled { return .cancelled }   // don't start a debrid resolve for a stopped batch
         // PRESENCE, not truthiness: episode ZERO is a valid coordinate (specials), and both coordinates are

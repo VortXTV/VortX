@@ -221,8 +221,9 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     // PlayerScreen also drives its binge auto-next through THIS resolver (a Continue-Watching resume launch), so
     // like the detail-page `loadEpisodeStream` and tvOS it must honor the pick. Settlement waits for every raw
     // contributor or the request deadline; only then does `best` prefer it with sticky + provider-health terms.
-    let sticky = SeriesSourceSticky.preference(for: seriesId)
-    let wantedAddon = sticky?.addon
+    let choice = SeriesSourceSticky.snapshot(for: seriesId)
+    let sticky = choice.source
+    let wantedAddon = sticky.addon
     while true {
         guard !Task.isCancelled else { return nil }
         groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
@@ -255,8 +256,10 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let candidates = StreamRanking.rankedCandidates(groups, continuity: continuity, binge: binge, pin: pin,
                                         sticky: sticky, stickyAuthoritative: false,
                                         preserveChosenRelease: preserveChosenRelease,
+                                        desiredAudioLanguage: SeriesSourceSticky.resolvingChoice?.audioLanguage,
                                         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                         debridCachedHashes: cachedHashes)
+        .filter { !SeriesSourceSticky.rejectedStreams.contains($0.id) }
     let targetSeason = v.season ?? defaultSeason
     // PRESENCE, not truthiness: `episodeNumber` is the DISPLAY helper (`episode ?? 0`), so using it here
     // made an unresolved episode indistinguishable from an explicit E0 special, and the `> 0` test then
@@ -786,6 +789,7 @@ struct iOSDetailView: View {
         /// later Continue-Watching resume (recorded into LastStreamStore on play). nil for torrent/direct.
         var debridRef: DebridPlaybackRef? = nil
         var sourceStream: CoreStream? = nil
+        var sourceAddon: String? = nil
         /// Set only after the presenter synchronously dispatches an exact episode engine load.
         var enginePlayerVideoId: String? = nil
         /// One-launch engine choice from the detail/source surface. nil keeps the persisted automatic route;
@@ -1142,6 +1146,7 @@ struct iOSDetailView: View {
                     recordBingeGroup: launch.bingeGroup, recordIsTorrent: launch.isTorrent,
                     recordDebridRef: launch.debridRef,
                     initialSourceStream: launch.sourceStream,
+                    initialSourceAddon: launch.sourceAddon,
                     initialEnginePlayerVideoId: launch.enginePlayerVideoId,
                     initialEnginePreference: launch.enginePreference,
                     startedFromExplicitPick: launch.wasExplicitPick,
@@ -4489,6 +4494,7 @@ struct iOSEpisodeStreams: View {
                     recordBingeGroup: launch.bingeGroup, recordIsTorrent: launch.isTorrent,
                     recordDebridRef: launch.debridRef,
                     initialSourceStream: launch.sourceStream,
+                    initialSourceAddon: launch.sourceAddon,
                     initialEnginePlayerVideoId: launch.enginePlayerVideoId,
                     initialEnginePreference: launch.enginePreference,
                     startedFromExplicitPick: launch.wasExplicitPick,
@@ -4911,16 +4917,13 @@ struct iOSEpisodeStreams: View {
             resumeProposal,
             currentSessionID: TraktAuth.storedSessionID
         ) else { return }
-        if explicit {
-            SeriesSourceSticky.record(seriesKey: meta.id, addon: sourceAddon,
-                                      bingeGroup: stream.behaviorHints?.bingeGroup)
-        }
         presentation = .player(iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
                                             resume: admittedResume.seconds ?? 0, meta: pm,
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup,
                                             isTorrent: isTorrent, debridRef: ref,
                                             sourceStream: stream,
+                                            sourceAddon: sourceAddon,
                                             enginePlayerVideoId: engineVideoID,
                                             enginePreference: enginePreference ?? launchEnginePreference,
                                             wasExplicitPick: explicit))
@@ -5272,8 +5275,9 @@ struct iOSEpisodeStreams: View {
         // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on `meta.id`, the SAME
         // show id the pin uses and every episode shares). This is the binge auto-next lane (`goToEpisode` calls
         // it through `loadEpisode`), so `StreamRanking.best` applies it only after the complete-set gate closes.
-        let sticky = SeriesSourceSticky.preference(for: meta.id)
-        let wantedAddon = sticky?.addon
+        let choice = SeriesSourceSticky.snapshot(for: meta.id)
+        let sticky = choice.source
+        let wantedAddon = sticky.addon
         while true {
             guard !Task.isCancelled else { return nil }
             // Target-engine groups only. The page-owned auxiliary contributors are scoped to shownVideo and
@@ -5299,8 +5303,10 @@ struct iOSEpisodeStreams: View {
         let candidates = StreamRanking.rankedCandidates(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
                                             sticky: sticky, stickyAuthoritative: false,
                                             preserveChosenRelease: true,
+                                            desiredAudioLanguage: choice.audioLanguage,
                                             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
                                             debridCachedHashes: debridCache.cachedHashes)
+            .filter { !SeriesSourceSticky.rejectedStreams.contains($0.id) }
         let targetSeason = v.season ?? season
         // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.
         let targetEpisode = v.episode
@@ -5338,11 +5344,12 @@ struct iOSEpisodeStreams: View {
               let v = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
         let sources = account.streamSources
         let preparationDeadline = request.deadline
-        let sticky = SeriesSourceSticky.preference(for: meta.id)
+        let choice = SeriesSourceSticky.snapshot(for: meta.id)
+        let sticky = choice.source
         async let rawGroups = warmFetchEpisodeSourceGroups(
             sources: sources,
             request: request,
-            wantedAddon: sticky?.addon
+            wantedAddon: sticky.addon
         )
 
         let targetSeason = v.season ?? season
@@ -5429,36 +5436,31 @@ struct iOSEpisodeStreams: View {
         let displayGroups = iOSDisplayGroups(groups)
         // Preload preserves the chosen release exactly as in `loadEpisodeStream`.
         // The two MUST match, or the warm would prepare a different source than the advance then picks.
-        guard let best = StreamRanking.best(
+        let candidates = StreamRanking.rankedCandidates(
             displayGroups,
             continuity: rememberedQuality,
             binge: lastBinge,
             pin: sourcePin,
             sticky: sticky, stickyAuthoritative: false,
             preserveChosenRelease: true,
+            desiredAudioLanguage: choice.audioLanguage,
             providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) },
             debridCachedHashes: debridCache.cachedHashes
-        ) else { return nil }
+        ).filter { !StreamRanking.continuityLanguageMismatch($0, desired: choice.audioLanguage) }
+        // If this bounded contributor pass only yielded known wrong-language files, leave the
+        // preparation policy free to retry instead of warming a file we already know cannot fit.
+        guard !candidates.isEmpty else {
+            DiagnosticsLog.log("binge", "next prepare deferred: no language-compatible candidate desired=\(choice.audioLanguage ?? "unknown")")
+            return nil
+        }
         // PRESENCE, not truthiness: the display helper cannot tell absence from an explicit E0.
         let hint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
             ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
-        let ref: DebridPlaybackRef?
-        if best.url == nil, hint == nil {
-            ref = nil
-        } else {
-            ref = await BoundedPreloadWorkPool.valueBeforeDeadline(preparationDeadline) {
-                await DebridCoordinator.shared.resolvedPlaybackRef(
-                    for: best, episode: hint,
-                    waitForLocalUsenetNode: best.isUsenet,
-                    usenetResolveTimeout: best.isUsenet ? .seconds(35) : .seconds(5)
-                )
-            } ?? nil
-            guard !Task.isCancelled else { return nil }
-        }
-        guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-            isUsenet: best.isUsenet, resolvedURL: ref?.url,
-            fallbackURL: best.playableURL(isEpisode: true)
+        guard let selected = await iOSResolveRankedEpisodeCandidate(
+            candidates, episode: hint, waitForLocalUsenetNode: true,
+            deadline: preparationDeadline
         ) else { return nil }
+        let (best, url, ref) = (selected.stream, selected.url, selected.ref)
 
         // Prime raw torrents without touching CoreBridge's active episode slot. Ordinary direct/debrid links
         // get a bounded prefix read; an eligible AVPlayer remux instead produces its own startup cohort below,
@@ -5556,7 +5558,7 @@ struct iOSEpisodeStreams: View {
         }
         DiagnosticsLog.log(
             "binge",
-            "next prepare resolved target=\(VXProbeRedaction.identityToken(videoId)) settlement=\(String(describing: auxiliary.settlement)) groups=\(displayGroups.count) warmBytes=\(warmResult?.byteCount ?? 0)"
+            "next prepare resolved target=\(VXProbeRedaction.identityToken(videoId)) settlement=\(String(describing: auxiliary.settlement)) groups=\(displayGroups.count) desiredAudio=\(choice.audioLanguage ?? "unknown") wantedAddon=\(VXProbeRedaction.identityToken(choice.addon ?? "")) wantedRelease=\(VXProbeRedaction.identityToken(choice.bingeGroup ?? "")) candidate=\(selected.index) warmBytes=\(warmResult?.byteCount ?? 0)"
         )
         retainTorrentLease = true
         return PlayerEpisodeStream(

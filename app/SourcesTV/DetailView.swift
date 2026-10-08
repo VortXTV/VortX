@@ -3961,14 +3961,11 @@ struct CoreStreamList: View {
                                                 initialEnginePreference: enginePreference ?? launchEnginePreference,
                                                 debridRef: ref,
                                                 sourceStream: stream,
+                                                sourceAddon: sourceAddon,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
-            if explicit, let meta, meta.type == "series" {
-                SeriesSourceSticky.record(seriesKey: meta.libraryId, addon: sourceAddon,
-                                          bingeGroup: stream.behaviorHints?.bingeGroup)
-            }
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.
@@ -3991,15 +3988,12 @@ struct CoreStreamList: View {
                                             headers: stream.requestHeaders,
                                             initialEnginePreference: enginePreference ?? launchEnginePreference,
                                             sourceStream: stream,
+                                            sourceAddon: sourceAddon,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID,
                                             wasExplicitPick: explicit,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
-        if explicit, let meta, meta.type == "series" {
-            SeriesSourceSticky.record(seriesKey: meta.libraryId, addon: sourceAddon,
-                                      bingeGroup: stream.behaviorHints?.bingeGroup)
-        }
     }
 
     private var launchPlayerLabel: String {
