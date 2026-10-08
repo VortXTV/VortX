@@ -347,9 +347,12 @@ enum VortxLegacyBootstrapMaterial {
             // an explicit genuine-history carrier proves playback; a watched bit alone proves no play.
             let hasProgress = (position ?? 0) > 0 || history
             if !hasProgress && watched != true && whole != true && count == nil { return }
+            if type == "series" && (hasProgress || watched == true) {
+                try require(video != nil, "Series progress or completion requires an exact video identity")
+                try require(watched != true || video != meta, "Whole-series completion requires episode reconciliation")
+            }
             if hasProgress {
                 try require(played != nil && played! > 0 && position != nil, "Progress lacks a genuine viewing clock")
-                try require(type != "series" || video != nil, "Series progress requires an exact video identity")
             }
             var row = context(profile, meta)
             for field in ["name", "poster"] {

@@ -162,6 +162,10 @@ enum VortxLegacyBootstrapMaterialTests {
         try fail(doc(["library": [boolProgress]]), "Malformed clock")
         var numericBool = movie(); numericBool["currentVideoWatched"] = 1
         try fail(doc(["library": [numericBool]]), "Malformed boolean")
+        var ambiguousSeries = movie(); ambiguousSeries["type"] = "series"; ambiguousSeries["currentVideoWatched"] = true
+        try fail(doc(["library": [ambiguousSeries]]), "exact video identity")
+        ambiguousSeries["v"] = "tt123"
+        try fail(doc(["library": [ambiguousSeries]]), "Whole-series completion")
         let secret: Object = ["transportUrl": "https://example.com/manifest.json", "manifest": ["id": "fixture", "name": "Fixture", "version": "1.0.0", "accessToken": "sanitized-placeholder"]]
         try fail(doc(["addons": [secret]]), "Credential-bearing")
         try fail(doc(["byProfile": [child.id.uuidString: ["watched": ["untyped-title": ["w": ["untyped-title"]]]]]]), "Whole-title")
