@@ -25,12 +25,14 @@ enum VortxLegacyBootstrapMaterialTests {
     static func material(_ document: Object, roster: [UserProfile] = [owner, child], modified: Double? = 1720000000.1234,
                          deferProfileEdits: Bool = false,
                          ownAccountSources: [VortxLegacyBootstrapMaterial.OwnAccountSource] = [],
-                         retainedOwnAccountBaseline: Data? = nil) throws -> Object {
+                         retainedOwnAccountBaseline: Data? = nil,
+                         retainedOwnAccountSourceEnvelopes: [VortxLegacyBootstrapMaterial.RetainedOwnAccountSourceEnvelope] = []) throws -> Object {
         let data = try JSONSerialization.data(withJSONObject: document)
         let result = try VortxLegacyBootstrapMaterial.encode(document: data, roster: roster, ownerProfileID: owner.id,
                                                               rosterModifiedSeconds: modified, deferProfileEdits: deferProfileEdits,
                                                               ownAccountSources: ownAccountSources,
-                                                              retainedOwnAccountBaseline: retainedOwnAccountBaseline)
+                                                              retainedOwnAccountBaseline: retainedOwnAccountBaseline,
+                                                              retainedOwnAccountSourceEnvelopes: retainedOwnAccountSourceEnvelopes)
         return try JSONSerialization.jsonObject(with: result) as! Object
     }
     static func doc(_ vortx: Object = [:]) -> Object { ["vortx": vortx] }
@@ -194,6 +196,25 @@ enum VortxLegacyBootstrapMaterialTests {
         do { _ = try material(rootWithOwnOverlay, roster: [owner, own], retainedOwnAccountBaseline: retainedBaseline); preconditionFailure("retained tuple silently overwrote root overlay") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
             check(error.reason.contains("requires an authenticated source refresh"), "Retained baseline never discards a live own overlay")
+        }
+        let retainedOverlayBaseline = try JSONSerialization.data(withJSONObject: overlayResult, options: [.sortedKeys])
+        let retainedEnvelope = VortxLegacyBootstrapMaterial.RetainedOwnAccountSourceEnvelope(profileID: own.id,
+            sourceDocument: overlayReceipt.sourceDocument)
+        let coldOverlay = try material(rootWithOwnOverlay, roster: [owner, own], retainedOwnAccountBaseline: retainedOverlayBaseline,
+                                       retainedOwnAccountSourceEnvelopes: [retainedEnvelope])
+        check(NSArray(array: watches(coldOverlay, profile: own)).isEqual(to: watches(overlayResult, profile: own)),
+              "An archived exact source envelope proves an unchanged cold own overlay without reprojecting its typed tuple")
+        do { _ = try material(rootWithOwnOverlay, roster: [owner, own], retainedOwnAccountBaseline: retainedOverlayBaseline,
+                              retainedOwnAccountSourceEnvelopes: [.init(profileID: own.id, sourceDocument: receipt.sourceDocument)]); preconditionFailure("wrong archived source digest admitted") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("does not match the acknowledged source digest"), "Cold overlay archive must match the kernel-acknowledged source assertion")
+        }
+        var changedRootOverlay = rootWithOwnOverlay
+        changedRootOverlay["vortx"] = ["library": [movie("tt-root", position: 1)], "byProfile": [own.id.uuidString: ["watched": ["tt-own": ["w": ["newer-overlay-video"]]]]]]
+        do { _ = try material(changedRootOverlay, roster: [owner, own], retainedOwnAccountBaseline: retainedOverlayBaseline,
+                              retainedOwnAccountSourceEnvelopes: [retainedEnvelope]); preconditionFailure("changed cold overlay admitted") }
+        catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
+            check(error.reason.contains("differs from its authenticated source"), "Changed own overlay remains pending until a new authenticated source proof exists")
         }
 
         var temporary = ownMovie; temporary["_id"] = "tt-temp"; temporary["temp"] = true

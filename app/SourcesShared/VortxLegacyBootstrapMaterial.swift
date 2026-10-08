@@ -32,6 +32,23 @@ enum VortxLegacyBootstrapMaterial {
         }
     }
 
+    /// An exact, token-free own-source envelope retained by the authenticated host archive.  It is
+    /// usable only to prove that a current UUID-scoped root overlay is the same overlay already
+    /// bound into a kernel-validated retained tuple; it never creates a new source assertion.
+    struct RetainedOwnAccountSourceEnvelope: Sendable, Equatable {
+        let profileID: UUID
+        let sourceDocument: Data
+
+        init(profileID: UUID, sourceDocument: Data) {
+            self.profileID = profileID
+            self.sourceDocument = sourceDocument
+        }
+
+        fileprivate var sourceDocumentSHA256: String {
+            SHA256.hash(data: sourceDocument).map { String(format: "%02x", $0) }.joined()
+        }
+    }
+
     /// A Sendable UTF-8 JSON result that can cross the caller's authentication/MainActor boundary.
     /// The result is the `material` member of `import_legacy_sync`, not a runtime or sync document.
     ///
@@ -44,14 +61,16 @@ enum VortxLegacyBootstrapMaterial {
     /// exact `legacyImport.baseline` material 2 bytes, never an engine snapshot or raw source.
     static func encode(document: Data, roster: [UserProfile], ownerProfileID: UUID,
                        rosterModifiedSeconds: Double?, deferProfileEdits: Bool = false,
-                       ownAccountSources: [OwnAccountSource] = [], retainedOwnAccountBaseline: Data? = nil) throws -> Data {
+                       ownAccountSources: [OwnAccountSource] = [], retainedOwnAccountBaseline: Data? = nil,
+                       retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope] = []) throws -> Data {
         guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else {
             throw ReconciliationRequired(reason: "Account document must be an object")
         }
         let adapter = try Adapter(document: source, roster: roster, ownerID: ownerProfileID,
                                   modified: rosterModifiedSeconds, deferProfileEdits: deferProfileEdits)
         return try JSONSerialization.data(withJSONObject: adapter.build(ownAccountSources: ownAccountSources,
-                                                                         retainedOwnAccountBaseline: retainedOwnAccountBaseline), options: [.sortedKeys, .withoutEscapingSlashes])
+                                                                         retainedOwnAccountBaseline: retainedOwnAccountBaseline,
+                                                                         retainedOwnAccountSourceEnvelopes: retainedOwnAccountSourceEnvelopes), options: [.sortedKeys, .withoutEscapingSlashes])
     }
 
     private final class Adapter {
@@ -89,7 +108,8 @@ enum VortxLegacyBootstrapMaterial {
             profiles = Dictionary(uniqueKeysWithValues: roster.map { ($0.id.uuidString, $0) })
         }
 
-        func build(ownAccountSources: [OwnAccountSource], retainedOwnAccountBaseline: Data?) throws -> Object {
+        func build(ownAccountSources: [OwnAccountSource], retainedOwnAccountBaseline: Data?,
+                   retainedOwnAccountSourceEnvelopes: [RetainedOwnAccountSourceEnvelope]) throws -> Object {
             if let modified { _ = try validClock(modified, "rosterModifiedSeconds") }
             // The native `own` binding represents a secondary independently authenticated
             // streaming persona. The resolved primary owner remains local-only, never silently
@@ -101,7 +121,8 @@ enum VortxLegacyBootstrapMaterial {
                 return id.uuidString
             })
             try require(!deleted.contains(owner.id.uuidString), "Owner profile is tombstoned")
-            let sources = try resolveOwnAccountSources(ownAccountSources, retainedBaseline: retainedOwnAccountBaseline)
+            let sources = try resolveOwnAccountSources(ownAccountSources, retainedBaseline: retainedOwnAccountBaseline,
+                                                        retainedSourceEnvelopes: retainedOwnAccountSourceEnvelopes)
             for profile in roster {
                 watches[profile.id.uuidString] = []
                 titles[profile.id.uuidString] = [:]
@@ -374,7 +395,8 @@ enum VortxLegacyBootstrapMaterial {
                           deferProfileEdits: false, allowIndependentSource: true)
         }
 
-        private func resolveOwnAccountSources(_ rawSources: [OwnAccountSource], retainedBaseline: Data?) throws -> [String: ResolvedOwnAccountSource] {
+        private func resolveOwnAccountSources(_ rawSources: [OwnAccountSource], retainedBaseline: Data?,
+                                              retainedSourceEnvelopes: [RetainedOwnAccountSourceEnvelope]) throws -> [String: ResolvedOwnAccountSource] {
             let ownProfiles = roster.filter { !$0.isOwner && $0.usesOwnAccount }
             var sources: [String: ResolvedOwnAccountSource] = [:]
             for source in rawSources {
@@ -392,12 +414,30 @@ enum VortxLegacyBootstrapMaterial {
                     verifiedStreamingUID: source.verifiedStreamingUID,
                     sourceDocumentSHA256: source.sourceDocumentSHA256, sourceDocument: document, retainedBuckets: nil)
             }
+            let freshSourceIDs = Set(sources.keys)
             let retained = try retainedOwnAccountSources(retainedBaseline, requiredProfiles: ownProfiles)
             for profile in ownProfiles where sources[profile.id.uuidString] == nil {
                 guard let source = retained[profile.id.uuidString] else {
                     throw fail("Own-account profiles require exactly one authenticated streaming-account source")
                 }
                 sources[profile.id.uuidString] = source
+            }
+            var retainedEnvelopeIDs = Set<String>()
+            for envelope in retainedSourceEnvelopes {
+                let profileID = envelope.profileID.uuidString
+                try require(retainedEnvelopeIDs.insert(profileID).inserted, "Duplicate retained own-account source envelope")
+                try require(!freshSourceIDs.contains(profileID), "Retained source envelope conflicts with a fresh authenticated source")
+                guard let retainedSource = retained[profileID], let retainedBuckets = retainedSource.retainedBuckets else {
+                    throw fail("Retained source envelope lacks a validated own-account tuple")
+                }
+                try require(envelope.sourceDocumentSHA256 == retainedSource.sourceDocumentSHA256,
+                            "Retained source envelope does not match the acknowledged source digest")
+                let document = try Self.decodeOwnAccountEnvelope(envelope.sourceDocument, profileID: profileID)
+                try require(sources[profileID]?.isRetained == true, "Retained source envelope has no active own-account profile")
+                sources[profileID] = ResolvedOwnAccountSource(profileID: profileID,
+                    verifiedStreamingUID: retainedSource.verifiedStreamingUID,
+                    sourceDocumentSHA256: retainedSource.sourceDocumentSHA256,
+                    sourceDocument: document, retainedBuckets: retainedBuckets)
             }
             let ownIDs = Set(ownProfiles.map { $0.id.uuidString })
             try require(Set(sources.keys) == ownIDs, "Own-account profiles require exactly one authenticated streaming-account source")
