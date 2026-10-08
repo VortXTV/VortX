@@ -57,6 +57,7 @@ import com.vortx.android.R
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.downloads.DownloadStore
 import com.vortx.android.model.AuthState
+import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverFilters
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryFilters
