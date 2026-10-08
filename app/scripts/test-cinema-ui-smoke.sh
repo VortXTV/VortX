@@ -11,6 +11,7 @@ for source in \
   SourcesiOS/CinemaUISmokeHarness.swift \
   SourcesiOS/CinemaUISmokeRendererApp.swift \
   SourcesiOS/CinemaUISmokeIOSRendererApp.swift \
+  SourcesiOS/CinemaUISmokeNodeServerStub.swift \
   SourcesiOS/CinemaJSProviderSourceStub.swift \
   SourcesiOS/CinemaPinnedHTTPClientStub.swift \
   SourcesiOS/CinemaCommunityStreamGatewayStub.swift \
@@ -69,6 +70,14 @@ done
 zsh scripts/test-render-cinema-ui-smoke-native.sh
 if rg -n 'CoreBridge\.shared|StremioAccount\(|PlayerScreen\(' SourcesiOS/CinemaUISmokeIOSRendererApp.swift >/dev/null; then
   print -u2 'native Cinema renderer must not boot production lifecycle owners'
+  exit 1
+fi
+node_stub='SourcesiOS/CinemaUISmokeNodeServerStub.swift'
+rg -Fq '#if CINEMA_UI_SMOKE_RENDERER && os(iOS) && VORTX_NO_EMBEDDED_SERVER' "$node_stub"
+rg -Fq 'preconditionFailure("Cinema UI renderer must not read NodeServer diagnostics")' "$node_stub"
+rg -Fq 'preconditionFailure("Cinema UI renderer must not read NodeServer logs")' "$node_stub"
+if sed '/^[[:space:]]*\/\//d' "$node_stub" | rg -n 'URLSession|NWConnection|startIfNeeded|restart\(|socket' >/dev/null; then
+  print -u2 'Cinema NodeServer diagnostic stub must remain inert'
   exit 1
 fi
 if rg -n -- '-force_load' CinemaUISmokeRenderer.yml >/dev/null; then
