@@ -9,22 +9,38 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 **Unpublished release candidate.** Source identity is **0.5.0**, Apple build **260** and Android
 version code **241**; final packages are not yet verified. The reviewed source since Beta 21 adds VortX's own
 native account/resource/streaming path; encrypted checkpoint-first mutation and recovery;
+merged-base-plus-one sync revisions with fresh-pull retry rather than stale wall-clock overwrite;
 profile-qualified independent streaming accounts; acknowledged per-title Watchlist edits;
 source-backed watched-bitmap migration with retained pending history and historical Retry;
+durable causal website add-on receipts in both hosts and additive explicit Apple owner/shared
+Stremio imports that preserve passive-removal protection;
 unified Cinema Home/Browse/Search/Library/History/Watchlist/Downloads navigation on Apple and
 Android; per-profile add-on visibility/ranking; bounded Continue Watching next-episode
 preparation; actual selected-audio continuity; regular-episode defaults that preserve explicit
-specials; pause and accepted resume/seek targets across replacement; real mpv subtitle
-backgrounds; native NNTP article concurrency and seek cancellation; and fresh FFmpeg 9 /
+specials; pause and accepted resume/seek targets across replacement; a separate native-DV
+metadata deadline and exact-item decoding window; typed mpv cache statistics and owned bounded
+reanchor recovery; complete typed request-header fields admitted before source replacement;
+source-time external-caption refresh while paused; real mpv subtitle backgrounds;
+native NNTP article concurrency and seek cancellation; and fresh FFmpeg 9 /
 Apple SecureTransport MPV build inputs with the Mac CoreAudio lifecycle repair.
 
 Existing Beta 21 player controls, integrations, downloads, catalog/source workflows and
-profile/account fixes are retained. Complete native CI, focused fixtures, native Mac Debug
-compilation and 514 combined Android tests have passed. Both watched/Watchlist hosts and native
-shipping selection are integrated. Fresh final SDK/optimized whole-app rebuilding, actual
-package versions, signing, deployment and physical device/provider acceptance remain pending.
-No public release, installation or universal
-playback/parity closure is established by this entry.
+profile/account fixes are retained. The revised native/web protocol passed 344 targeted native
+tests and complete Linux/macOS CI; both reviewed adapters are integrated, with five actual-native
+Apple suites and 194 Android checks with zero skips. Earlier native Mac Debug compilation and
+528 combined Android tests passed. Fresh silent AVPlayer and overlapping
+mpv seek fixtures passed, as did Apple's 18 paired-base production-sync checks and Android's
+40 native / 52 explicit legacy manager checks. Header admission passed 33 actual extracted
+checks; paused caption-clock handling passed 14 actual-method checks plus recovery. The separate
+encrypted Swift/Kotlin carrier fixture uses real native sessions, but its manual conflict
+recovery is not production-manager retry proof. Both watched/Watchlist hosts and native
+shipping selection and reviewed DV pre-attachment/mpv cache-map repairs are integrated.
+The website's final native projection/edit/optional-manifest source passed independent review,
+128 tests and the Astro/CSP build gate, but is not deployed. Fresh revised SDK/optimized
+whole-app rebuilding, actual package
+versions, signing, deployment and physical device/provider acceptance remain pending. Infuse
+watched-return, mpv PiP and broader parity/features are not claimed complete. No public release,
+installation or universal issue/playback/parity closure is established by this entry.
 
 See [the draft 0.5 Beta 1 notes](docs/releases/0.5.0-beta.1.md) for the full behavior, retained
 features, precise remaining gates, proposed assets and post-publication test checklist.
