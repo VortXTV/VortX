@@ -337,6 +337,12 @@ enum VortxLegacyBootstrapMaterialTests {
         // these distinct UTF-8 keys must both remain representable, whereas two spellings of the
         // same decoded key must still be rejected as a duplicate.
         _ = try VortxProfileOverlayWitness.digest(json: Data("{\"é\":1,\"e\\u0301\":2}".utf8))
+        let decodedIngress = try VortxProfileOverlayWitness.decodeObject(json: Data("{\"safe\":0.039304369631583587,\"items\":[true,null]}".utf8))
+        check((decodedIngress["safe"] as? NSNumber)?.doubleValue.bitPattern == 0x3fa41fb3cc50aa03
+              && (decodedIngress["items"] as? [Any])?.count == 2,
+              "Strict ingress decoder retains correctly rounded values")
+        do { _ = try VortxProfileOverlayWitness.decodeObject(json: Data("{\"é\":1,\"e\\u0301\":2}".utf8)); preconditionFailure("Lossy Unicode dictionary ingress accepted") }
+        catch VortxProfileOverlayWitness.Failure.malformed {}
         for json in ["[1e400]", "[9007199254740992]", "[9007199254740991.1]",
                      "[9007199254740991.000000000000000000000000000001]", "{\"a\":1,\"\\u0061\":2}", "[\"\\uD800\"]"] {
             do { _ = try VortxProfileOverlayWitness.digest(json: Data(json.utf8)); preconditionFailure("Invalid overlay witness input accepted") }

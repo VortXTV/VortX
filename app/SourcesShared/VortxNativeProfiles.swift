@@ -14,8 +14,14 @@ enum VortxNativeProfiles {
 
         fileprivate init(account: VortxJSON, revision: VortxJSON, transactionID: String?) throws {
             try validateAccount(account)
-            guard (try? revision.decode(UInt64.self)) != nil else { throw VortxNativeError.invalidSnapshot }
+            guard let revisionValue = try? revision.decode(UInt64.self), revisionValue <= 9_007_199_254_740_991 else {
+                throw VortxNativeError.invalidSnapshot
+            }
             if let transactionID { try validateTransactionID(transactionID) }
+            // Revision zero denotes the pre-transaction fallback only. Native receipts always
+            // carry the transaction that produced every positive revision, so accepting either
+            // mismatched form would manufacture a CAS parent that the kernel will reject.
+            guard (revisionValue == 0) == (transactionID == nil) else { throw VortxNativeError.invalidSnapshot }
             self.account = account
             self.revision = revision
             self.transactionID = transactionID

@@ -270,6 +270,16 @@ import CryptoKit
         ])
         let expectedBinding = try VortxNativeProfiles.expectedBinding(state: bindingState, profileID: child.id)
         check(expectedBinding.account == .object(["kind": .string("local_only")]) && expectedBinding.revision == .integer(0) && expectedBinding.transactionID == nil)
+        for invalidBinding in [
+            VortxJSON.object(["account": .object(["kind": .string("local_only")]), "revision": .unsigned(9_007_199_254_740_992), "transactionId": .string("too-large")]),
+            VortxJSON.object(["account": .object(["kind": .string("local_only")]), "revision": .integer(0), "transactionId": .string("zero-must-not-name-a-transaction")]),
+            VortxJSON.object(["account": .object(["kind": .string("local_only")]), "revision": .integer(1), "transactionId": .null])
+        ] {
+            let invalidState: VortxJSON = .object(["roster": .object(["profiles": .object([child.id.uuidString: .object(["account": .object(["kind": .string("local_only")])])])]),
+                                                     "nativeSync": .object(["accountSlots": .object([child.id.uuidString: .object(["activeBinding": invalidBinding])])])])
+            do { _ = try VortxNativeProfiles.expectedBinding(state: invalidState, profileID: child.id); fatalError("Invalid account binding receipt accepted") }
+            catch VortxNativeError.invalidSnapshot {}
+        }
         let rebindMaterial: VortxJSON = .object([
             "schemaVersion": .integer(2),
             "ownAccountSources": .object([child.id.uuidString: .object(["verifiedStreamingUid": .string("verified-own-uid"),
@@ -298,6 +308,52 @@ import CryptoKit
                                       sourceDocument: freshSourceEnvelope, profileOverlaySHA256: freshWitness)])
         let freshMaterial = try JSONDecoder().decode(VortxJSON.self, from: freshMaterialData)
         let freshOwnTarget = try VortxNativeProfiles.ownTarget(material: freshMaterial, profileID: child.id)
+        // Exercise the reviewed schema-4 transaction against the actual C artifact: material-2
+        // establishes the proven own account, a CAS visits shared, then the exact witnessed
+        // carrier restores own. The exported cold state and cold nativeSync import must retain the
+        // source proof verbatim.
+        let rebindScope = VortxAccountScope(account: "fixture-rebind-witness", ownerProfileID: owner.id.uuidString)
+        let rebindRuntime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: owner.id.uuidString, ownerName: owner.name)
+        defer { rebindRuntime.close() }
+        func applyRebind(_ action: VortxJSON, now: UInt64) throws -> VortxJSON {
+            let result = try rebindRuntime.dispatch(String(decoding: JSONEncoder().encode(action), as: UTF8.self), now: now)
+            let response = try JSONDecoder().decode(VortxJSON.self, from: Data(result.utf8))
+            check(response["ok"] == .bool(true))
+            return response
+        }
+        _ = try applyRebind(.object(["type": .string("bind_sync_scope"), "scope": .string(rebindScope.account)]), now: 1)
+        _ = try applyRebind(.object(["type": .string("import_legacy_sync"), "scope": .string(rebindScope.account),
+                                     "ownerProfileId": .string(owner.id.uuidString), "material": freshMaterial]), now: 2)
+        let importedRebindState = try JSONDecoder().decode(VortxJSON.self, from: Data(rebindRuntime.stateJSON().utf8))
+        let importedBinding = try VortxNativeProfiles.expectedBinding(state: importedRebindState, profileID: child.id)
+        let sharedRebind = try VortxNativeProfiles.rebindAction(profileID: child.id,
+            request: .init(scope: rebindScope.account, ownerProfileID: owner.id.uuidString,
+                           transactionID: "schema4-shared", expected: importedBinding, target: .shared))
+        _ = try applyRebind(sharedRebind, now: 3)
+        let sharedRebindState = try JSONDecoder().decode(VortxJSON.self, from: Data(rebindRuntime.stateJSON().utf8))
+        let restoredOwn = try VortxNativeProfiles.rebindAction(profileID: child.id,
+            request: .init(scope: rebindScope.account, ownerProfileID: owner.id.uuidString,
+                           transactionID: "schema4-own", expected: try VortxNativeProfiles.expectedBinding(state: sharedRebindState, profileID: child.id),
+                           target: .own(freshOwnTarget)))
+        _ = try applyRebind(restoredOwn, now: 4)
+        let rebindExport = try rebindRuntime.stateJSON()
+        let rebindState = try JSONDecoder().decode(VortxJSON.self, from: Data(rebindExport.utf8))
+        func activeOwnSource(_ state: VortxJSON) -> VortxJSON? {
+            guard let binding = state["nativeSync"]?["accountSlots"]?[child.id.uuidString]?["activeBinding"]?["account"],
+                  case .object(let slots)? = state["nativeSync"]?["accountSlots"]?[child.id.uuidString]?["slots"] else { return nil }
+            return slots.values.first { $0["account"] == binding }?["sourceBaseline"]?["source"]
+        }
+        check(rebindState["nativeSync"]?["schemaVersion"] == .integer(4)
+              && rebindState["roster"]?["profiles"]?[child.id.uuidString]?["account"]?["kind"] == .string("own")
+              && activeOwnSource(rebindState)?["profileOverlaySha256"] == .string(freshWitness))
+        let coldRebindRuntime = try VortxNativeRuntime(abi: VortxCABI(), snapshot: rebindExport)
+        defer { coldRebindRuntime.close() }
+        let coldRebindExport = try coldRebindRuntime.stateJSON()
+        let coldRebindState = try JSONDecoder().decode(VortxJSON.self, from: Data(coldRebindExport.utf8))
+        check(coldRebindExport == rebindExport
+              && activeOwnSource(coldRebindState)?["profileOverlaySha256"] == .string(freshWitness))
+        try VortxNativeSession.validateLegacyCompatibility(scope: rebindScope, ownerName: owner.name, snapshot: nil,
+                                                           nativeSync: rebindState["nativeSync"], material: freshMaterialData, abi: VortxCABI())
         let pendingRequest = try VortxNativeProfiles.AccountRebindRequest(scope: "fixture-account", ownerProfileID: owner.id.uuidString,
                                                                             transactionID: "pending-own-transaction", expected: expectedBinding,
                                                                             target: .pendingOwn)
@@ -493,6 +549,6 @@ import CryptoKit
         check(deletedState["roster"]?["profiles"]?[newProfile.id.uuidString]?["deleted"] == .bool(true))
         await profilesFacade.shutdown()
         print("Live native Swift C ABI: hydration/deltas; full resources; facade Board/Discover/Search/Meta/streams/subtitles/library; scoped FIFO profile/progress, registry rebind and encrypted nativeSync/watchContexts cold reopen passed")
-        print("Live Apple authenticated importer: historical owner/PIN, fractional watch material, saved-vs-played separation, idempotent receipt and encrypted cold episode resume passed")
+        print("Live Apple authenticated importer: historical owner/PIN, fractional watch material, saved-vs-played separation, material-2 witnessed own CAS/shared-return, nativeSync-4 cold export/import and encrypted cold episode resume passed")
     }
 }

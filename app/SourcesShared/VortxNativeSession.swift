@@ -62,9 +62,16 @@ struct VortxAccountScope: Codable, Hashable, Sendable {
               libraries.keys.allSatisfy({ profiles[$0] != nil }) else { throw VortxNativeError.invalidSnapshot }
         if let sync = value["nativeSync"], sync != .null {
             guard sync["scope"] == .string(account), sync["ownerProfileId"] == .string(ownerProfileID),
-                  [VortxJSON.integer(1), .integer(2), .integer(3)].contains(sync["schemaVersion"] ?? .null) else { throw VortxNativeError.invalidSnapshot }
+                  Self.supportedNativeSyncSchema(sync["schemaVersion"]) else { throw VortxNativeError.invalidSnapshot }
         }
         return value
+    }
+    private static func supportedNativeSyncSchema(_ value: VortxJSON?) -> Bool {
+        switch value {
+        case .integer(let schema): return (1...4).contains(schema)
+        case .unsigned(let schema): return (1...4).contains(schema)
+        default: return false
+        }
     }
     func validateHydration(from original: String, to hydrated: String) throws {
         let before = try validateSnapshot(original), after = try validateSnapshot(hydrated)
@@ -598,20 +605,31 @@ actor VortxNativeSession {
     }
     private static func validateLegacyReceipt(_ candidate: VortxNativeRuntime, scope: VortxAccountScope, material: Data, baselineMaterial: Data?) throws {
         let state = try scope.validateSnapshot(candidate.stateJSON())
-        guard [VortxJSON.integer(1), .integer(2)].contains(state["nativeSync"]?["legacyImport"]?["schemaVersion"] ?? .null) else { throw VortxNativeError.invalidSnapshot }
+        let nativeSchema = legacyImportSchema(state["nativeSync"]?["legacyImport"]?["schemaVersion"])
+        let materialValue = try JSONDecoder().decode(VortxJSON.self, from: material)
+        guard let nativeSchema, nativeSchema == legacyImportSchema(materialValue["schemaVersion"]), nativeSchema == 1 || nativeSchema == 2 else {
+            throw VortxNativeError.invalidSnapshot
+        }
         let replay: VortxJSON = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account),
                                        "ownerProfileId": .string(scope.ownerProfileID),
-                                       "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
+                                       "material": materialValue])
         let replayResult = try candidate.dispatch(String(decoding: JSONEncoder().encode(replay), as: UTF8.self), now: UInt64(Date().timeIntervalSince1970))
         if try JSONDecoder().decode(VortxJSON.self, from: Data(replayResult.utf8))["ok"] == .bool(true) { return }
         // Only the private kernel decides which old-peer causal changes are supported. Older
         // artifacts reject this additive action and remain closed; there is no host reducer.
         var reconciliation: [String: VortxJSON] = ["type": .string("reconcile_legacy_sync"), "scope": .string(scope.account),
-            "ownerProfileId": .string(scope.ownerProfileID), "material": try JSONDecoder().decode(VortxJSON.self, from: material)]
+            "ownerProfileId": .string(scope.ownerProfileID), "material": materialValue]
         if state["nativeSync"]?["legacyImport"]?["baseline"] == nil, let baselineMaterial {
             reconciliation["baselineMaterial"] = try JSONDecoder().decode(VortxJSON.self, from: baselineMaterial)
         }
         try apply(candidate, action: String(decoding: JSONEncoder().encode(VortxJSON.object(reconciliation)), as: UTF8.self))
+    }
+    private static func legacyImportSchema(_ value: VortxJSON?) -> Int? {
+        switch value {
+        case .integer(let schema): return schema >= 0 && schema <= Int64(Int.max) ? Int(schema) : nil
+        case .unsigned(let schema): return schema <= UInt64(Int.max) ? Int(schema) : nil
+        default: return nil
+        }
     }
     func close() {
         revoke(); closed = true; invalidateScreens(); runtime.close(); writer.release()

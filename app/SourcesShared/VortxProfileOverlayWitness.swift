@@ -14,6 +14,21 @@ enum VortxProfileOverlayWitness {
         SHA256.hash(data: try framed(json: json)).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Strictly decodes a raw JSON object for host ingress after the same duplicate-key, lexical
+    /// number and resource checks used by witness framing. The returned Foundation shape is only
+    /// for local projection; callers must retain the original bytes for raw-source provenance.
+    /// A Unicode-equivalent Swift dictionary collision is refused rather than silently dropping a
+    /// byte-distinct JSON key.
+    static func decodeObject(json: Data) throws -> [String: Any] {
+        var parser = try Parser(json)
+        let value = try parser.value()
+        try parser.finish()
+        guard case .object(let pairs) = value, let object = try materialize(value) as? [String: Any], object.count == pairs.count else {
+            throw Failure.malformed
+        }
+        return object
+    }
+
     /// Internal so the focused conformance harness can independently check framing boundaries.
     static func framed(json: Data) throws -> Data {
         var parser = try Parser(json)
@@ -23,6 +38,26 @@ enum VortxProfileOverlayWitness {
         try writer.append(contentsOf: Array("vortx.profile-overlay/1".utf8) + [0])
         try writer.write(value)
         return Data(writer.bytes)
+    }
+
+    private static func materialize(_ value: Value) throws -> Any {
+        switch value {
+        case .null: return NSNull()
+        case .bool(let value): return NSNumber(value: value)
+        case .number(let value): return NSNumber(value: value)
+        case .string(let value): return value
+        case .array(let values): return try values.map(materialize)
+        case .object(let pairs):
+            var object: [String: Any] = [:]
+            for (key, value) in pairs {
+                // Foundation/Swift key equality applies Unicode canonical equivalence. The parser
+                // intentionally permits byte-distinct keys, so an ingress dictionary must refuse
+                // this lossy representation rather than overwrite one of them.
+                guard object[key] == nil else { throw Failure.malformed }
+                object[key] = try materialize(value)
+            }
+            return object
+        }
     }
 
     private struct Writer {
