@@ -46,7 +46,7 @@ final class iOSNextEpisodePreparer: ObservableObject {
         let key = "\(request.episodeID)|\(request.attemptSequence)"
         if let inFlight, inFlight.key == key { return await inFlight.task.value }
         inFlight?.task.cancel()
-        let task = Task { [weak self] in
+        let task = Task<PlayerEpisodeStream?, Never> { [weak self] in
             guard let self else { return nil }
             return await self.prepare(request, context: context)
         }
