@@ -31,6 +31,34 @@ private actor OwnSourceRequests {
     func record(_ request: URLRequest) { paths.append(request.url!.lastPathComponent) }
 }
 
+/// In-memory backend only; the exact production secure-store marker protocol runs unchanged.
+private final class OwnerSelectorBackend {
+    var values: [String: String] = [:]
+    var selector = ""
+    var failTargetWriteOnce = false
+    var failTargetWrites = false
+    var failTargetReadOnce = false
+    var failMarkerClearReadOnce = false
+    var failingRead: String?
+    func store() -> KeychainFailureClosedStore {
+        KeychainFailureClosedStore(readSecure: { key in
+            if self.failingRead == key { self.failingRead = nil; return .failure }
+            return self.values[key].map(CredentialDurableReadResult.value) ?? .missing
+        }, writeSecure: { value, key in
+            self.values[key] = value
+            if key == self.selector, self.failTargetReadOnce { self.failTargetReadOnce = false; self.failingRead = key }
+            if key == self.selector, self.failTargetWriteOnce || self.failTargetWrites {
+                self.failTargetWriteOnce = false; return .failure
+            }
+            if key == "marker:" + self.selector, value == nil, self.failMarkerClearReadOnce {
+                self.failMarkerClearReadOnce = false; self.failingRead = key
+            }
+            return .success
+        }, invalidationAccount: { "marker:" + $0 }, invalidationSentinel: "blocked",
+            isLegacyInvalidated: { _ in false }, clearLegacyInvalidated: { _ in }, purgeAllLegacy: {}, purgeLegacy: { _ in })
+    }
+}
+
 @main struct VortxNativeOwnAccountProducerTests {
     static func check(_ value: Bool, line: UInt = #line) { precondition(value, "own source fixture line \(line)") }
     static func main() async throws {
@@ -172,7 +200,8 @@ private actor OwnSourceRequests {
         func connectOwner(_ token: String, _ uid: String, _ revision: String, _ expected: String?) throws -> String {
             try VortxNativeAccountCredentials.connectOwner(token: token, scope: "account-A", ownerProfileID: owner,
                 verifiedUID: uid, revision: revision, expectedSelection: expected, authority: journalAuthority,
-                read: { secure[$0] }, write: { secure[$0] = $1; return true })
+                read: { secure[$0] }, write: { secure[$0] = $1; return true },
+                restoreSelection: { secure[$0] = $1; return true }, selectionAttempted: {})
         }
         let ownerA = try connectOwner("owner-token-A", "owner-A", UUID().uuidString.lowercased(), nil)
         let selectionA = secure[ownerKey]
@@ -193,7 +222,8 @@ private actor OwnSourceRequests {
         do {
             _ = try VortxNativeAccountCredentials.connectOwner(token: "failed-write", scope: "account-A", ownerProfileID: owner,
                 verifiedUID: "owner-C", revision: UUID().uuidString.lowercased(), expectedSelection: beforeFailedOwner,
-                authority: journalAuthority, read: { secure[$0] }, write: { _, _ in false })
+                authority: journalAuthority, read: { secure[$0] }, write: { _, _ in false },
+                restoreSelection: { secure[$0] = $1; return true }, selectionAttempted: {})
             fatalError("failed secure owner write accepted")
         } catch VortxNativeError.unavailable {}
         check(secure[ownerKey] == beforeFailedOwner && secure["stremiox.authKey"] == "unqualified-global-token")
@@ -202,7 +232,7 @@ private actor OwnSourceRequests {
                 verifiedUID: "owner-C", revision: UUID().uuidString.lowercased(), expectedSelection: beforeFailedOwner,
                 authority: journalAuthority, read: { secure[$0] }, write: { key, value in
                     guard key != ownerKey else { return false }; secure[key] = value; return true
-                })
+                }, restoreSelection: { secure[$0] = $1; return true }, selectionAttempted: {})
             fatalError("failed selector publication accepted")
         } catch VortxNativeError.unavailable {}
         check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: "account-A", ownerProfileID: owner, read: { secure[$0] }) == ownerA2)
@@ -217,8 +247,99 @@ private actor OwnSourceRequests {
         do { _ = try connectOwner("retired-owner", "owner-A", UUID().uuidString.lowercased(), secure[ownerKey]); fatalError("retired owner login committed") }
         catch VortxNativeError.superseded {}
         check(secure == beforeRetired)
+        try ownerSelectorAfterEffects()
         print("Native owner credentials: account/owner isolation, verified selector CAS, same-UID ABA, failed publication and no legacy token adoption passed")
         print("Own-account authenticated producer: hardened identity redirect rejection, exact raw source bytes, independent read-only requests, token ABA/profile retirement and failed-source nonempty semantics passed")
+    }
+    static func ownerSelectorAfterEffects() throws {
+        let owner = UserProfile.ownerID, scope = "account-owner-faults"
+        for fault in ["readback", "mutated-failure", "marker-clear", "rollback-unavailable", "first-login"] {
+            let backend = OwnerSelectorBackend()
+            backend.selector = try VortxNativeAccountCredentials.ownerSelectionKey(scope: scope, ownerProfileID: owner)
+            let store = backend.store()
+            func read(_ key: String) throws -> String? {
+                switch store.confirmedString(key) {
+                case .value(let value): return value
+                case .missing: return nil
+                case .failure: throw VortxNativeError.unavailable
+                }
+            }
+            func authority() -> VortxNativeOwnAccountProducer.Authority { .init(generations: [], validate: { true }) }
+            if fault != "first-login" {
+                _ = try VortxNativeAccountCredentials.connectOwner(token: "old", scope: scope, ownerProfileID: owner,
+                    verifiedUID: "UID-A", revision: UUID().uuidString.lowercased(), expectedSelection: nil,
+                    authority: authority(), read: read, write: { store.set($1, for: $0) == .success },
+                    restoreSelection: { store.set($1, for: $0) == .success },
+                    selectionAttempted: { VortxNativeOwnAccountProducer.invalidateContext() })
+            }
+            let old = try read(backend.selector)
+            let oldSlot = try VortxNativeAccountCredentials.selectedOwnerSlot(scope: scope, ownerProfileID: owner, read: read)
+            let staleAuthority = authority()
+            backend.failTargetWriteOnce = fault == "mutated-failure"
+            backend.failTargetWrites = fault == "rollback-unavailable"
+            backend.failTargetReadOnce = fault == "readback" || fault == "first-login"
+            backend.failMarkerClearReadOnce = fault == "marker-clear"
+            do {
+                _ = try VortxNativeAccountCredentials.connectOwner(token: "new", scope: scope, ownerProfileID: owner,
+                    verifiedUID: "UID-B", revision: UUID().uuidString.lowercased(), expectedSelection: old,
+                    authority: authority(), read: read, write: { store.set($1, for: $0) == .success },
+                    restoreSelection: { store.set($1, for: $0) == .success },
+                    selectionAttempted: { VortxNativeOwnAccountProducer.invalidateContext() })
+                fatalError("selector after-effect reported success: " + fault)
+            } catch VortxNativeError.unavailable {}
+            do { try staleAuthority.withActive {}; fatalError("selector attempt retained old producer authority") }
+            catch VortxNativeError.superseded {}
+            let cold = backend.store()
+            func coldRead(_ key: String) throws -> String? {
+                switch cold.confirmedString(key) {
+                case .value(let value): return value
+                case .missing: return nil
+                case .failure: throw VortxNativeError.unavailable
+                }
+            }
+            if fault == "rollback-unavailable" {
+                check(backend.values["marker:" + backend.selector] == "blocked")
+                do { _ = try VortxNativeAccountCredentials.selectedOwnerSlot(scope: scope, ownerProfileID: owner, read: coldRead); fatalError("uncertain rollback selected credential after cold reopen") }
+                catch VortxNativeError.unavailable {}
+            } else {
+                check(try coldRead(backend.selector) == old)
+                check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: scope, ownerProfileID: owner, read: coldRead) == oldSlot)
+            }
+        }
+        // Reviewer repro: an EXTRA read after the secure adapter already certified publication
+        // must not report failure. The helper now trusts that certificate and retires authority.
+        let committedBackend = OwnerSelectorBackend()
+        committedBackend.selector = try VortxNativeAccountCredentials.ownerSelectionKey(scope: scope, ownerProfileID: owner)
+        let committedStore = committedBackend.store()
+        var published = false
+        let retired = VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true })
+        let selected = try VortxNativeAccountCredentials.connectOwner(token: "certified", scope: scope, ownerProfileID: owner,
+            verifiedUID: "UID-B", revision: UUID().uuidString.lowercased(), expectedSelection: nil,
+            authority: VortxNativeOwnAccountProducer.Authority(generations: [], validate: { true }), read: { key in
+                if published && key == committedBackend.selector { throw VortxNativeError.unavailable }
+                switch committedStore.confirmedString(key) {
+                case .value(let value): return value
+                case .missing: return nil
+                case .failure: throw VortxNativeError.unavailable
+                }
+            }, write: { key, value in
+                let committed = committedStore.set(value, for: key) == .success
+                if key == committedBackend.selector && committed { published = true }
+                return committed
+            }, restoreSelection: { committedStore.set($1, for: $0) == .success },
+            selectionAttempted: { VortxNativeOwnAccountProducer.invalidateContext() })
+        check(published)
+        do { try retired.withActive {}; fatalError("certified publication retained stale authority") }
+        catch VortxNativeError.superseded {}
+        let coldCommitted = committedBackend.store()
+        check(try VortxNativeAccountCredentials.selectedOwnerSlot(scope: scope, ownerProfileID: owner, read: { key in
+            switch coldCommitted.confirmedString(key) {
+            case .value(let value): return value
+            case .missing: return nil
+            case .failure: throw VortxNativeError.unavailable
+            }
+        }) == selected)
+        print("Native owner selector actual secure-store: after-effect write/readback/marker failure verified rollback, first-login absence, uncertain rollback cold block and pre-publication authority retirement passed")
     }
 }
 private extension VortxNativeOwnAccountProducer.Generation {

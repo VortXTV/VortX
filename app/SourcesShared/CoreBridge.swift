@@ -312,8 +312,9 @@ final class CoreBridge: ObservableObject {
         try VortxNativeAccountCredentials.connectOwner(token: token, scope: capture.namespace,
             ownerProfileID: target.ownerProfileID, verifiedUID: uid, revision: target.transactionID,
             expectedSelection: target.expectedOwnerSelection, authority: authority, read: Self.readNativeCredential,
-            write: { key, value in Keychain.set(value, for: key) == .success })
-        VortxNativeOwnAccountProducer.invalidateContext()
+            write: { key, value in Keychain.set(value, for: key) == .success },
+            restoreSelection: { key, value in Keychain.set(value, for: key) == .success },
+            selectionAttempted: { VortxNativeOwnAccountProducer.invalidateContext() })
         try refreshNativeProfiles(reloadCredentials: false)
     }
     private static func readNativeCredential(_ key: String) throws -> String? {

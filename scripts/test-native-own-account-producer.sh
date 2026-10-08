@@ -9,6 +9,7 @@ sed -n '1,/^\/\/\/ The profile roster and the active selection\./{ /^\/\/\/ The 
     sed -n '/^struct ProfileDiscoveryPreferences: /,/^}$/p' app/SourcesShared/ProfileDiscoveryPreferences.swift
 } > "$own_source_dir/Discovery.swift"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+    app/SourcesShared/CredentialScope.swift app/SourcesShared/Keychain.swift \
     app/SourcesShared/VortxNativeRuntime.swift app/SourcesShared/VortxResourceBridge.swift app/SourcesShared/VortxResourceProjection.swift \
     app/SourcesShared/VortxNativeBootstrapArchive.swift app/SourcesShared/VortxNativeHostPreferences.swift app/SourcesShared/VortxNativeSession.swift \
     app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProfileEditHost.swift app/SourcesShared/VortxProfileOverlayWitness.swift app/SourcesShared/VortxLegacyBootstrapMaterial.swift \

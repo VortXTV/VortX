@@ -32,7 +32,9 @@ enum VortxNativeAccountCredentials {
     @discardableResult
     static func connectOwner(token: String, scope: String, ownerProfileID: UUID, verifiedUID: String,
                              revision: String, expectedSelection: String?, authority: any VortxMutationAuthority,
-                             read: (String) throws -> String?, write: (String, String) throws -> Bool) throws -> String {
+                             read: (String) throws -> String?, write: (String, String) throws -> Bool,
+                             restoreSelection: (String, String?) throws -> Bool,
+                             selectionAttempted: () -> Void) throws -> String {
         guard UUID(uuidString: revision)?.uuidString.lowercased() == revision else { throw VortxNativeError.invalidSnapshot }
         let selector = try ownerSelectionKey(scope: scope, ownerProfileID: ownerProfileID)
         let selection = OwnerSelection(schemaVersion: 1, scope: scope, ownerProfileID: ownerProfileID, verifiedUID: verifiedUID, revision: revision)
@@ -43,7 +45,22 @@ enum VortxNativeAccountCredentials {
                 guard try read(selector) == expectedSelection else { throw VortxNativeError.superseded }
                 result = try stage(token: token, scope: scope, profileID: ownerProfileID, uid: verifiedUID,
                     transactionID: "owner:" + revision, authority: authority, read: read, write: write)
-                guard try write(selector, encoded), try read(selector) == encoded else { throw VortxNativeError.unavailable }
+                // Retire every pre-publication producer before the secure write, including when
+                // that write takes effect but its acknowledgement/readback fails.
+                selectionAttempted()
+                do {
+                    // `write` is the certified secure-store transaction, including its own exact
+                    // readback and durable marker clearing. A second fallible read here must not
+                    // turn that already committed publication into a reported authentication failure.
+                    guard try write(selector, encoded) else { throw VortxNativeError.unavailable }
+                } catch {
+                    // Restore the exact captured value (or certified absence). The secure adapter
+                    // retains its durable invalidation tombstone if this recovery is uncertain.
+                    // Never claim the prior selection survived without certifying its readback.
+                    guard try restoreSelection(selector, expectedSelection),
+                          try read(selector) == expectedSelection else { throw VortxNativeError.unavailable }
+                    throw error
+                }
             }
         }
         return result!
