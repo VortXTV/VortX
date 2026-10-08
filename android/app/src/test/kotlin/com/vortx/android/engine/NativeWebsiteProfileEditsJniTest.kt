@@ -97,6 +97,12 @@ class NativeWebsiteProfileEditsJniTest {
             assertTrue(gateway.applyDocument(account, original) { true })
             assertEquals("Original A", gateway.session().read().state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(owner.id).getString("name"))
             assertEquals(1, gateway.session().read().state.getJSONObject("nativeSync").getJSONObject("legacyProfileEditReceipts").length())
+            // Durable playback queries share this migrated checkpoint with website sync. Original
+            // host proof must stay sealed on disk without being passed to the detached kernel.
+            val migrated = gateway.session().read()
+            assertTrue(migrated.state.has("legacyWebsiteBootstrap"))
+            assertEquals("profile_playback", gateway.session().resolveCommitted(
+                JSONObject().put("kind", "profile_playback").put("profileId", owner.id), migrated.owner).getString("kind"))
             val peerSync = JSONObject(gateway.session().read().state.getJSONObject("nativeSync").toString())
             val adoptionDirectory = Files.createTempDirectory(File("build").toPath(), "website-adopt-jni-").toFile()
             val adoptionKey = KeyGenerator.getInstance("AES").apply { init(256) }.generateKey()

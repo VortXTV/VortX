@@ -366,7 +366,8 @@ internal class VortxNativeSession private constructor(
         check(NativeHostPreferences.equal(committed, read().state)) { "Native checkpoint no longer matches the mounted state" }
         val core = JSONObject(committed.toString()).also { value ->
             listOf("hostProfilePreferences", "legacyImportMaterial", "hostProfileSyncPending", "nativeHostPreferenceState",
-                "hostDocument", "excludedCredentialPaths", "websiteProfileEditPending", "websiteProfileEditCertificates").forEach(value::remove)
+                "hostDocument", "excludedCredentialPaths", "legacyWebsiteBootstrap",
+                "websiteProfileEditPending", "websiteProfileEditCertificates").forEach(value::remove)
         }
         VortxNativeRuntime.hydrate(bindings, core.toString()).use { restored ->
             JSONObject(restored.resolve(request.toString())).also {
