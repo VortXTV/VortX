@@ -123,11 +123,14 @@ class NativeLegacyMaterialTest {
     }
 
     @Test fun `actual owner history can carry rewind zero without manufacturing saved-row history`() {
-        val history = movie(time = 0.0).put("v", "tt123").put("eventEpochMs", 1767225600123)
+        val history = movie(time = 0.0).put("v", "tt123").put("eventEpochMs", 1767225600999.875)
         val v = JSONObject().put("library", JSONArray().put(movie()))
             .put("byProfile", JSONObject().put(UserProfile.OWNER_ID, JSONObject().put("ownerHistory", JSONArray().put(history))))
         val row = watchRows(material(document(v))).single()
         assertEquals(0L, row.getLong("positionMs")); assertTrue(row.has("lastPlayedAtMs"))
+        assertEquals(1767225600999.875, row.getDouble("lastPlayedAtMs"), 0.0)
+        history.remove("eventEpochMs")
+        failure(document(v), "Malformed genuine owner history")
     }
 
     @Test fun `durable unclocked duplicate cannot resurrect omission from authoritative rail snapshot`() {
@@ -194,11 +197,13 @@ class NativeLegacyMaterialTest {
 
     @Test fun `newer sparse owner history keeps prior real duration and equal-clock offset conflict fails`() {
         val prior = movie(time = 5.0).put("v", "tt123")
-        val newer = movie(time = 2.0).put("v", "tt123").put("lastWatched", "2026-01-02T00:00:00Z").also { it.remove("d") }
+        val newer = movie(time = 2.0).put("v", "tt123").put("lastWatched", "2026-01-02T00:00:00Z")
+            .put("eventEpochMs", 1767312000000.0).also { it.remove("d") }
         val v = JSONObject().put("library", JSONArray().put(prior)).put("byProfile", JSONObject().put(owner.id, JSONObject().put("ownerHistory", JSONArray().put(newer))))
         val row = watchRows(material(document(v))).single()
         assertEquals(2000L, row.getLong("positionMs")); assertEquals(100000L, row.getLong("durationMs"))
         newer.put("lastWatched", prior.getString("lastWatched"))
+        newer.put("eventEpochMs", 1767225600123.456)
         failure(document(v), "equal-clock progress")
     }
 
@@ -213,5 +218,15 @@ class NativeLegacyMaterialTest {
         val rows = watchRows(material(document(JSONObject().put("byProfile", JSONObject().put(child.id, JSONObject().put("watched", durable))))), child.id)
         val row = rows.single()
         assertTrue(row.getBoolean("watched")); assertFalse(row.has("markedAtMs")); assertFalse(row.has("resetAtMs"))
+    }
+
+    @Test fun `owner series mark maps cannot manufacture whole title episode identity`() {
+        for (field in listOf("w", "ma", "ua")) {
+            val series = JSONObject().put("id", "ttSeries").put("type", "series").put("name", "Series")
+            series.put(field, if (field == "w") JSONArray().put("ttSeries") else JSONObject().put("ttSeries", 100.5))
+            failure(document(JSONObject().put("library", JSONArray().put(series))), "Whole-title mark")
+        }
+        val marked = watchRows(material(document(JSONObject().put("library", JSONArray().put(movie().put("w", JSONArray().put("tt123")))))))
+        assertTrue(marked.single().getBoolean("watched"))
     }
 }

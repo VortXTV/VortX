@@ -9,6 +9,11 @@ app_classes="${VORTX_COMPILED_APP:?Point to actual current Android compiled clas
 android_jar="${VORTX_ANDROID_JAR:-/Users/daksh/Library/Android/sdk/platforms/android-36/android.jar}"
 test -f "$app_classes"
 test -f "$android_jar"
+if [[ "${VORTX_JNI_SYNC:-}" == "1" ]]; then
+    fixture_library="${VORTX_JNI_LIBRARY:?Exact reviewed JNI fixture required}"
+    fixture_sha="${VORTX_JNI_EXPECTED_SHA256:?Expected immutable JNI fixture digest required}"
+    test "$(shasum -a 256 "$fixture_library" | awk '{print $1}')" = "$fixture_sha"
+fi
 jar() { rg --files "$cache_root/$1/$2/$3" | rg "/$2-$3.jar$" | head -1; }
 compiler="$(jar org.jetbrains.kotlin kotlin-compiler-embeddable 2.2.10)"
 stdlib="$(jar org.jetbrains.kotlin kotlin-stdlib 2.2.10)"
@@ -33,3 +38,6 @@ cd "$repo_root/android/app"
     com.vortx.android.engine.LegacyWatchedBitfieldMigrationEvidenceTest \
     com.vortx.android.engine.NativeLegacyMaterialTest \
     com.vortx.android.engine.NativeWatchedMigrationProducerTest
+if [[ "${VORTX_JNI_SYNC:-}" == "1" ]]; then
+    test "$(shasum -a 256 "$fixture_library" | awk '{print $1}')" = "$fixture_sha"
+fi

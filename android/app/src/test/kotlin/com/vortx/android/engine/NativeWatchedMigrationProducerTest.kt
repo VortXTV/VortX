@@ -9,6 +9,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.cancel
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -157,6 +159,23 @@ class NativeWatchedMigrationProducerTest {
         job.cancel(CancellationException("test cancellation"))
         job.join()
         assertTrue(job.isCancelled)
+    }
+
+    @Test
+    fun `successful final metadata callback after cancellation cannot return a batch`() = runBlocking {
+        var returned = false
+        val source = document(fixedOwner.id).also { it.getJSONObject("vortx").remove("byProfile") }
+        val producer = NativeWatchedMigrationProducer { request ->
+            currentCoroutineContext().cancel(CancellationException("cancel during successful callback"))
+            response(request)
+        }
+        val task = launch {
+            producer.prepare(VortxAccountScope("account.fixture", fixedOwner.id), source, listOf(fixedOwner), isCurrent = { true })
+            returned = true
+        }
+        task.join()
+        assertTrue(task.isCancelled)
+        assertFalse(returned)
     }
 
     @Test
@@ -446,6 +465,61 @@ class NativeWatchedMigrationProducerTest {
             accountScope = VortxAccountScope("account.fixture", fixedOwner.id), watchedMigration = batch) }
     }
 
+    @Test
+    fun `real JNI retains decoded and explicit unwatch facts across replay and cold hydration`() = runBlocking {
+        org.junit.Assume.assumeTrue(System.getenv("VORTX_JNI_SYNC") == "1" && !System.getenv("VORTX_JNI_LIBRARY").isNullOrBlank())
+        System.load(requireNotNull(System.getenv("VORTX_JNI_LIBRARY")))
+        val bindings = object : VortxRuntimeBindings {
+            override fun create(ownerId: String, ownerName: String) = VortxCore.nativeInitRuntime(JSONObject().put("ownerId", ownerId).put("ownerName", ownerName).toString())
+            override fun hydrate(snapshot: String) = VortxCore.nativeInitFromStateJson(snapshot)
+            override fun dispatch(handle: Long, action: String) = VortxCore.nativeDispatchJson(handle, action)
+            override fun resolve(handle: Long, request: String) = VortxCore.nativeResolveJson(handle, request)
+            override fun state(handle: Long) = VortxCore.nativeGetStateJson(handle)
+            override fun delta(handle: Long) = VortxCore.nativeGetStateDeltaJson(handle)
+            override fun free(handle: Long) = VortxCore.nativeEngineFree(handle)
+        }
+        for (independent in listOf(false, true)) {
+            val scope = VortxAccountScope("account.00000000-0000-0000-0000-000000000456", fixedOwner.id)
+            val source = if (independent) ownDocument() else document(fixedOwner.id)
+            val profiles = listOf(fixedOwner, if (independent) ownProfile else sharedProfile)
+            val own = if (independent) listOf(ownSource(source, ownProfile.id, "verified-streaming-uid")) else emptyList()
+            val first = fakeProducer().prepare(scope, source, profiles, ownSources = own, isCurrent = { true })
+            val material = nativeLegacyMaterial(source, profiles, null, ownAccountSources = own, accountScope = scope, watchedMigration = first)
+            val cold = NativeWatchedMigrationProducer { error("Archived migration must not fetch") }
+                .prepare(scope, source, profiles, ownSources = own, retainedArchive = first.archive(), isCurrent = { true })
+            val replay = nativeLegacyMaterial(source, profiles, null, ownAccountSources = own, accountScope = scope, watchedMigration = cold)
+            fun query(profileID: String) = JSONObject().put("kind", "profile_playback").put("profileId", profileID).toString()
+            fun watched(runtime: VortxNativeRuntime, profileID: String, title: String): Set<String> {
+                val rows = JSONObject(runtime.resolve(query(profileID))).getJSONObject("watchedVideoIdsByTitle").optJSONArray(title) ?: return emptySet()
+                return (0 until rows.length()).map(rows::getString).toSet()
+            }
+            VortxNativeRuntime.create(bindings, fixedOwner.id, fixedOwner.name).use { runtime ->
+                fun dispatch(action: JSONObject) {
+                    val result = JSONObject(runtime.dispatch(action.toString()))
+                    assertTrue(result.toString(), result.getBoolean("ok"))
+                }
+                dispatch(JSONObject().put("type", "bind_sync_scope").put("scope", scope.accountID))
+                fun importAction(value: JSONObject) = JSONObject().put("type", "import_legacy_sync").put("scope", scope.accountID)
+                    .put("ownerProfileId", fixedOwner.id).put("material", value)
+                dispatch(importAction(material))
+                if (independent) {
+                    assertEquals(setOf("own-library:1:1", "own-library:1:3"), watched(runtime, ownProfile.id, "own-library"))
+                    assertEquals(setOf("own-overlay:1:1"), watched(runtime, ownProfile.id, "own-overlay"))
+                } else {
+                    assertEquals(setOf("owner-series:1:1", "owner-series:1:3"), watched(runtime, fixedOwner.id, "owner-series"))
+                    assertEquals(setOf("overlay-series:1:1"), watched(runtime, sharedProfile.id, "overlay-series"))
+                }
+                val before = JSONObject(runtime.stateJson()).getJSONObject("nativeSync")
+                dispatch(importAction(replay))
+                assertTrue(NativeHostPreferences.equal(before, JSONObject(runtime.stateJson()).getJSONObject("nativeSync")))
+                VortxNativeRuntime.hydrate(bindings, runtime.stateJson()).use { reopened ->
+                    assertTrue(NativeHostPreferences.equal(before, JSONObject(reopened.stateJson()).getJSONObject("nativeSync")))
+                    for (profile in profiles) assertEquals(runtime.resolve(query(profile.id)), reopened.resolve(query(profile.id)))
+                }
+            }
+        }
+    }
+
     private fun fakeProducer(
         requests: MutableList<String> = mutableListOf(),
         handler: suspend (LegacyWatchedBitfieldMigrationEvidence.MetadataRequest) -> LegacyWatchedBitfieldMigrationEvidence.MetadataResponse = { request ->
@@ -542,8 +616,10 @@ class NativeWatchedMigrationProducerTest {
 
     private fun ownerHistoryDocument(ownerID: String): JSONObject = document(ownerID).also { source ->
         source.getJSONObject("vortx").getJSONObject("byProfile")
-            .put(ownerID, JSONObject().put("ownerHistory", JSONArray().put(seriesRow("custom-history", setOf(0, 2)))))
-            .put(UserProfile.OWNER_ID, JSONObject().put("ownerHistory", JSONArray().put(seriesRow("historical-history", setOf(1)))))
+            .put(ownerID, JSONObject().put("ownerHistory", JSONArray().put(seriesRow("custom-history", setOf(0, 2))
+                .put("lastWatched", "2026-01-01T00:00:00Z").put("eventEpochMs", 1767225600123.5))))
+            .put(UserProfile.OWNER_ID, JSONObject().put("ownerHistory", JSONArray().put(seriesRow("historical-history", setOf(1))
+                .put("lastWatched", "2026-01-01T00:00:00Z").put("eventEpochMs", 1767225600456.75))))
     }
 
     private fun addon(id: String, transportUrl: String = "https://catalog.example/manifest.json"): JSONObject = JSONObject()

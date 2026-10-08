@@ -6,6 +6,8 @@ import java.nio.charset.CodingErrorAction
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.UUID
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /**
  * Captures the proof required to decode one legacy series bitmap into bare watched episode IDs.
@@ -82,6 +84,7 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
 
     suspend fun capture(scope: Scope, source: ByteArray, rowLocator: SourceRowLocator, addon: AuthorizedAddon,
                         isCurrent: () -> Boolean, fetch: suspend (MetadataRequest) -> MetadataResponse): Evidence {
+        currentCoroutineContext().ensureActive()
         require(isCurrent()) { "Migration account admission revoked" }
         val sourceSnapshot = source.copyOf()
         val addonSnapshot = AuthorizedAddon(addon.transportURL, addon.manifest)
@@ -90,6 +93,7 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
         requireOriginalAddon(sourceTree, rowLocator, addonSnapshot)
         val request = MetadataRequest(scope, addonSnapshot, "series", row.metaID)
         val response = fetch(request)
+        currentCoroutineContext().ensureActive()
         require(isCurrent()) { "Migration account admission revoked" }
         require(response.request == request) { "Metadata response belongs to another request" }
         return replay(scope, sourceSnapshot, rowLocator, addonSnapshot, response.raw, isCurrent)
@@ -129,6 +133,16 @@ internal object LegacyWatchedBitfieldMigrationEvidence {
     }
 
     private fun validatedSourceRow(root: StrictJson.Value, scope: Scope, locator: SourceRowLocator): SourceRow {
+        val index = when (locator) {
+            is SourceRowLocator.AuthenticatedOwnerLibrary -> locator.index
+            is SourceRowLocator.AuthenticatedLegacyRootLibrary -> locator.index
+            is SourceRowLocator.AuthenticatedProfileLibrary -> locator.index
+            is SourceRowLocator.AuthenticatedOwnerHistory -> locator.index
+            is SourceRowLocator.OwnAccountLibraryResponse -> locator.index
+            is SourceRowLocator.OwnAccountProfileLibrary -> locator.index
+            is SourceRowLocator.OwnAccountOwnerHistory -> locator.index
+        }
+        require(index in 0 until 10_000) { "Source row index exceeds migration limit" }
         if (isOwn(locator)) {
             require(scope.verifiedStreamingUID != null && scope.profileID != scope.ownerProfileID) { "Own source requires an independent verified streaming identity" }
             requireOwnEnvelope(root)

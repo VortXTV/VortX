@@ -306,7 +306,10 @@ private class LegacyMaterialAdapter(
     private fun importWatch(profile: String, metaId: String, raw: JSONObject, ownerRow: Boolean, historyOnly: Boolean = false,
                             locator: WatchedLocator) {
         val position = secondsToMillis(raw, "t"); val duration = secondsToMillis(raw, "d")
-        val played = lastWatched(raw)
+        val iso = lastWatched(raw)
+        val event = clockField(raw, "eventEpochMs")
+        requireMaterial(!historyOnly || event != null && event > 0 && iso != null, "Malformed genuine owner history")
+        val played = if (historyOnly) event else iso
         val video = optionalString(raw, "v")?.takeIf(String::isNotBlank)
         val bits = optionalString(raw, "watched")
         val decoded = if (bits.isNullOrEmpty()) emptyList() else watchedMigration?.videoIDs(profile, locator, raw)
@@ -392,6 +395,8 @@ private class LegacyMaterialAdapter(
         val videos = watched + marked.keys + reset.keys
         for (video in videos.sorted()) {
             requireMaterial(video.isNotBlank(), "Empty watched video identity")
+            requireMaterial(video != metaId || knownTitles.getValue(profile)[metaId] == "movie",
+                "Whole-title mark requires verified movie or episode reconciliation")
             val row = JSONObject().put("metaId", metaId).put("videoId", video)
             knownTitles.getValue(profile)[metaId]?.let { row.put("type", it) }
             marked[video]?.let { row.put("markedAtMs", it) }

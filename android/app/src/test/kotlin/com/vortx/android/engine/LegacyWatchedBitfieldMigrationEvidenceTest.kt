@@ -234,6 +234,23 @@ class LegacyWatchedBitfieldMigrationEvidenceTest {
         assertEquals(5, LegacyWatchedBitfieldMigrationEvidence.replay(scope, source, locator, original, metadata()) { true }.watchedVideoIDs.size)
     }
 
+    @Test fun `out of contract source row index fails before metadata fetch`() = runBlocking {
+        val scope = LegacyWatchedBitfieldMigrationEvidence.Scope("account-a", profile, null, profile)
+        val source = JSONObject(sharedSource().toString(Charsets.UTF_8))
+        val rows = source.getJSONObject("vortx").getJSONArray("library")
+        val watched = rows.getJSONObject(0)
+        repeat(10_000) { index -> rows.put(index, JSONObject().put("id", "saved-$index").put("type", "series")) }
+        rows.put(watched)
+        var fetched = false
+        expectFailure {
+            LegacyWatchedBitfieldMigrationEvidence.capture(scope, source.toString().toByteArray(),
+                LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator.AuthenticatedOwnerLibrary(10_000), addon, { true }) { request ->
+                fetched = true; LegacyWatchedBitfieldMigrationEvidence.MetadataResponse(request, metadata())
+            }
+        }
+        org.junit.Assert.assertFalse(fetched)
+    }
+
     private fun sharedSource() = """{"vortx":{"library":[{"id":"tt2934286","type":"series","watched":"tt2934286:1:5:5:eJyTZwAAAEAAIA=="}],"addons":[{"transportUrl":"https://catalog.example/manifest.json","manifest":{"id":"catalog","name":"Original catalog","version":"1.0.0"}}]}}""".toByteArray()
     private fun metadata() = """{"meta":{"id":"tt2934286","type":"series","videos":[{"id":"tt2934286:1:5","season":1,"episode":5,"released":"2005-01-05T00:00:00Z"},{"id":"tt2934286:1:1","season":1,"episode":1,"released":"2005-01-01T01:00:00+01:00"},{"id":"tt2934286:1:2","season":1,"episode":2,"released":"2005-01-02T00:00:00.123Z"},{"id":"tt2934286:1:3","season":1,"episode":3,"released":"2005-01-03T00:00:00Z"},{"id":"tt2934286:1:4","season":1,"episode":4,"released":"2005-01-04T00:00:00Z"}]}}""".toByteArray()
     private fun mutatedMetadata(target: String, replacement: String): ByteArray {

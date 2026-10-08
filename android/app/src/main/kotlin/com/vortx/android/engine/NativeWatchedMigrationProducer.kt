@@ -67,6 +67,7 @@ internal class NativeWatchedMigrationProducer(
             require(prior.size <= 1) { "Duplicate retained watched evidence" }
             if (prior.isNotEmpty()) {
                 accepted += NativeWatchedRowEvidence.replay(prior.single(), isCurrent)
+                currentCoroutineContext().ensureActive()
                 candidate.source.requireCurrent(isCurrent)
                 continue
             }
@@ -76,9 +77,11 @@ internal class NativeWatchedMigrationProducer(
                 currentCoroutineContext().ensureActive()
                 candidate.source.requireCurrent(isCurrent)
                 try {
-                    successful += NativeWatchedRowEvidence.capture(candidate, descriptor, {
+                    val captured = NativeWatchedRowEvidence.capture(candidate, descriptor, {
                         candidate.source.requireCurrent(isCurrent); true
                     }, fetch)
+                    currentCoroutineContext().ensureActive()
+                    successful += captured
                 } catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) {
                     // A failed provider is unresolved evidence, never an empty watched inventory.
@@ -91,6 +94,7 @@ internal class NativeWatchedMigrationProducer(
             else pending.put(candidate.pending(if (first == null) "episode_inventory_unavailable" else "episode_inventory_ambiguous"))
         }
         sources.forEach { it.requireCurrent(isCurrent) }
+        currentCoroutineContext().ensureActive()
         require(sources.first().bytes().contentEquals(nativeWatchedDocumentSnapshot(document))) { "Watched migration source changed" }
         return NativeWatchedMigrationBatch(scope, sources, rosterSnapshot, accepted, pending, isCurrent)
     }
@@ -285,7 +289,7 @@ private fun watchedLocator(row: JSONObject): WatchedLocator {
     val kind = row.getString("kind")
     require(row.keys().asSequence().toSet() == setOf("kind", "index") + if (kind == "owner_history") setOf("sourceProfileId") else emptySet())
     val index = (row.get("index") as? Number)?.toDouble() ?: error("Malformed watched row index")
-    require(index in 0.0..Int.MAX_VALUE.toDouble() && index.toInt().toDouble() == index)
+    require(index >= 0 && index < 10_000 && index.toInt().toDouble() == index)
     return when (kind) {
         "owner_library" -> WatchedLocator.AuthenticatedOwnerLibrary(index.toInt())
         "legacy_root_library" -> WatchedLocator.AuthenticatedLegacyRootLibrary(index.toInt())
