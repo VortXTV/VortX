@@ -383,6 +383,13 @@ struct RootTabView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
         }
         .tint(theme.accent)
+        #if VORTX_NATIVE_DATA_ENGINE
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if launchReady, presenter.request == nil {
+                NativeWatchedMigrationNotice()
+            }
+        }
+        #endif
         // Offline chip (#120): a quiet bottom capsule while the device has no network path. Pure
         // signal (never focusable, never navigates); it clears on its own when connectivity returns,
         // and online tabs stay reachable for cached browsing.

@@ -10,6 +10,7 @@ struct CinemaQuickView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isWatchlisted = false
     @State private var watchlistStatus: String?
+    @StateObject private var watchlistAction = ProfileMutationPresentation()
 
     private var supportsWatchlist: Bool {
         ["movie", "series"].contains(item.type) && LibraryWatchedMutationPolicy.isCanonicalCatalogID(item.id)
@@ -38,6 +39,7 @@ struct CinemaQuickView: View {
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
             refreshWatchlist()
         }
+        .onDisappear { watchlistAction.cancel() }
     }
 
     private var wideLayout: some View {
@@ -122,13 +124,16 @@ struct CinemaQuickView: View {
                 }
                 .buttonStyle(.plain)
                 .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
-                .disabled(!supportsWatchlist)
+                .disabled(!supportsWatchlist || watchlistAction.isRunning)
                 .accessibilityHint(isWatchlisted ? "Removes this title from your watchlist" : "Saves this title to your watchlist")
             }
             if let watchlistStatus {
                 Text(watchlistStatus)
                     .font(Theme.Typography.eyebrow)
                     .foregroundStyle(watchlistStatus.hasPrefix("Added") ? Theme.Palette.accent : Theme.Palette.textSecondary)
+            }
+            if let error = watchlistAction.errorMessage {
+                Text(error).font(.caption).foregroundStyle(Theme.Palette.textSecondary)
             }
             Button {
                 dismiss()
@@ -147,7 +152,7 @@ struct CinemaQuickView: View {
 
     private func refreshWatchlist() {
         #if !CINEMA_UI_SMOKE_RENDERER
-        isWatchlisted = LibraryAutoAdd.isWatchlisted(item.id)
+        isWatchlisted = LibraryAutoAdd.isWatchlisted(item.id, type: item.type)
         #endif
     }
 
@@ -156,9 +161,27 @@ struct CinemaQuickView: View {
         #if CINEMA_UI_SMOKE_RENDERER
         preconditionFailure("Cinema UI renderer must not mutate a watchlist")
         #else
-        isWatchlisted = LibraryAutoAdd.toggleWatchlist(id: item.id, type: item.type,
-                                                       name: item.name, poster: item.poster)
-        watchlistStatus = isWatchlisted ? "Added to Watchlist" : "Removed from Watchlist"
+        let core = CoreBridge.shared
+        let target = PlaybackMutationTarget.capture(core: core)
+        let profileID = ProfileStore.shared.activeID
+        let isCurrent = {
+            ProfileStore.shared.activeID == profileID && target.stillOwnsCurrentContext(core: core)
+        }
+        watchlistStatus = nil
+        watchlistAction.start(operation: {
+            guard isCurrent() else { return false }
+            do {
+                _ = try await LibraryAutoAdd.toggleWatchlistAcknowledged(
+                    id: item.id, type: item.type, name: item.name, poster: item.poster, target: target)
+                return isCurrent()
+            } catch { return false }
+        }, failureMessage: {
+            isCurrent() ? "Couldn't update Watchlist. Please try again." : "Profile changed. Please try again."
+        }, onSuccess: {
+            guard isCurrent() else { return }
+            refreshWatchlist()
+            watchlistStatus = isWatchlisted ? "Added to Watchlist" : "Removed from Watchlist"
+        })
         #endif
     }
 }

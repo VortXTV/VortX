@@ -4319,21 +4319,53 @@ struct LibraryChip: View {
 /// watchlisted. The tvOS twin of the touch `iOSWatchlistChip`.
 struct WatchlistChip: View {
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var profiles: ProfileStore
     @State private var isWatchlisted = false
+    @StateObject private var watchlistAction = ProfileMutationPresentation()
 
     var body: some View {
         if let meta = core.metaDetails?.meta, meta.id.hasPrefix("tt") || meta.id.hasPrefix("tmdb") {
             Button {
-                isWatchlisted = LibraryAutoAdd.toggleWatchlist(id: meta.id, type: meta.type,
-                                                               name: meta.name, poster: meta.poster)
+                let target = PlaybackMutationTarget.capture(core: core)
+                let profileID = profiles.activeID
+                let isCurrent = {
+                    profiles.activeID == profileID && target.stillOwnsCurrentContext(core: core)
+                        && core.metaDetails?.meta?.id == meta.id && core.metaDetails?.meta?.type == meta.type
+                }
+                watchlistAction.start(operation: {
+                    guard isCurrent() else { return false }
+                    do {
+                        _ = try await LibraryAutoAdd.toggleWatchlistAcknowledged(
+                            id: meta.id, type: meta.type, name: meta.name, poster: meta.poster, target: target)
+                        return isCurrent()
+                    } catch { return false }
+                }, failureMessage: {
+                    isCurrent() ? "Couldn't update Watchlist. Please try again." : "Profile changed. Please try again."
+                }, onSuccess: {
+                    guard isCurrent() else { return }
+                    isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type)
+                })
             } label: {
                 Label(isWatchlisted ? "In Watchlist" : "Watchlist",
                       systemImage: isWatchlisted ? "star.fill" : "star")
             }
             .buttonStyle(ChipButtonStyle(selected: isWatchlisted))
-            .onAppear { isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id) }
+            .disabled(watchlistAction.isRunning)
+            .onAppear { isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type) }
+            .onDisappear { watchlistAction.cancel() }
+            .onChange(of: profiles.activeID) { _ in
+                watchlistAction.cancel()
+                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type)
+            }
+            .onChange(of: meta.type + ":" + meta.id) { _ in
+                watchlistAction.cancel()
+                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type)
+            }
             .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
-                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id)
+                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type)
+            }
+            if let error = watchlistAction.errorMessage {
+                Text(error).font(.caption).foregroundStyle(Theme.Palette.textSecondary)
             }
         }
     }
