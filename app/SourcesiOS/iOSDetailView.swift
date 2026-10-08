@@ -222,10 +222,11 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     // like the detail-page `loadEpisodeStream` and tvOS it must honor the pick. Settlement waits for every raw
     // contributor or the request deadline; only then does `best` prefer it with sticky + provider-health terms.
     let choice = SeriesSourceSticky.snapshot(for: seriesId)
+    let requiredChoice = SeriesSourceSticky.resolvingChoice
     let sticky = choice.source
     let wantedAddon = sticky.addon
     while true {
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
         groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
         // Hints affect ranking only after every registered contributor is terminal or this request reaches the
         // shared deadline. A fast matching source cannot open the partial set.
@@ -241,7 +242,7 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
             return nil
         }
     }
-    guard !Task.isCancelled else { return nil }
+    guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
     // The SAME sticky (read above) + provider-health terms the player and the preload rank with (diag-21). This
     // is the lane a viewer actually hits by tapping an episode (and the one a Continue-Watching resume uses), so
@@ -268,7 +269,8 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let episodeHint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
         ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
     guard let selected = await iOSResolveRankedEpisodeCandidate(
-        candidates, episode: episodeHint, cachedHashes: cachedHashes.isEmpty ? nil : cachedHashes
+        candidates, episode: episodeHint, cachedHashes: cachedHashes.isEmpty ? nil : cachedHashes,
+        stillCurrent: { requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) }
     ) else { return nil }
     let (best, url, ref) = (selected.stream, selected.url, selected.ref)
     let pm = PlaybackMeta(libraryId: seriesId, videoId: v.id, type: "series",
@@ -279,9 +281,9 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     if let engine = core.engineResumeSeconds(for: pm) { resume = engine }
     else {
         resume = await account.resumeOffset(for: pm)
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
     }
-    guard !Task.isCancelled else { return nil }
+    guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
     if ref == nil { _ = prepareTorrentStream(best) }   // fire-and-forget prime; self-terminating backoff
     return PlayerEpisodeStream(
         stream: best, url: url, meta: pm, title: title, resume: resume,
@@ -5279,7 +5281,7 @@ struct iOSEpisodeStreams: View {
         let sticky = choice.source
         let wantedAddon = sticky.addon
         while true {
-            guard !Task.isCancelled else { return nil }
+            guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
             // Target-engine groups only. The page-owned auxiliary contributors are scoped to shownVideo and
             // must not leak into a different episode being resolved behind the player.
             groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
@@ -5297,7 +5299,7 @@ struct iOSEpisodeStreams: View {
                 return nil
             }
         }
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
         // Next / Prev / list / binge preserve the chosen release when present. Keep the full filtered
         // candidate set for fallback rather than turning the preference into a source exclusion.
         let candidates = StreamRanking.rankedCandidates(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
@@ -5313,7 +5315,8 @@ struct iOSEpisodeStreams: View {
         let episodeHint = targetSeason >= 0 && (targetEpisode ?? -1) >= 0
             ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
         guard let selected = await iOSResolveRankedEpisodeCandidate(
-            candidates, episode: episodeHint, waitForLocalUsenetNode: true
+            candidates, episode: episodeHint, waitForLocalUsenetNode: true,
+            stillCurrent: { SeriesSourceSticky.admits(choice) }
         ) else { return nil }
         let (best, url, ref) = (selected.stream, selected.url, selected.ref)
         let pm = PlaybackMeta(libraryId: meta.id, videoId: v.id, type: "series",
@@ -5321,7 +5324,7 @@ struct iOSEpisodeStreams: View {
                               season: v.season, episode: v.episode)
         let title = "\(meta.name)  ·  S\(v.season ?? season)E\(v.episodeNumber)"
         let resolvedResume = await localResume(pm)
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
         lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
         torrentPrime?.cancel(); torrentPrime = ref == nil ? prepareTorrentStream(best) : nil
         return PlayerEpisodeStream(
@@ -5411,9 +5414,9 @@ struct iOSEpisodeStreams: View {
                     + NextEpisodePreparationBudget.addonFetchBudget
             )
         )
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
         var groups = await rawGroups
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
         groups = TorBoxSearchSource.merge(
             authorizedBy: SourceIndexIdentity.mergeAuthorization(
                 published: preloadTorboxSearch.publishedTarget, page: target
@@ -5458,7 +5461,7 @@ struct iOSEpisodeStreams: View {
             ? DebridEpisode(season: targetSeason, episode: targetEpisode ?? 0) : nil
         guard let selected = await iOSResolveRankedEpisodeCandidate(
             candidates, episode: hint, waitForLocalUsenetNode: true,
-            deadline: preparationDeadline
+            deadline: preparationDeadline, stillCurrent: { SeriesSourceSticky.admits(choice) }
         ) else { return nil }
         let (best, url, ref) = (selected.stream, selected.url, selected.ref)
 
@@ -5481,6 +5484,7 @@ struct iOSEpisodeStreams: View {
                 retireWarmTorrentEngine(torrentLease, reason: "preparation did not retain winner")
             }
         }
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
         let sourceSignature = StreamRanking.signature(best)
         let isDolbyVision = StreamRanking.isDolbyVision(sourceSignature)
         let preparedMode = VortXPreparedRemuxCallerPolicy.mode(
@@ -5513,7 +5517,7 @@ struct iOSEpisodeStreams: View {
         } else {
             warmResult = nil
         }
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
         if requiresTorrentPreparation, warmResult == nil { return nil }
 
         let pm = PlaybackMeta(libraryId: meta.id, videoId: v.id, type: "series",
@@ -5523,7 +5527,7 @@ struct iOSEpisodeStreams: View {
         let resolvedResume = await BoundedPreloadWorkPool.valueBeforeDeadline(preparationDeadline) {
             await localResume(pm)
         } ?? 0
-        guard !Task.isCancelled else { return nil }
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
         // Source settlement, debrid resolution, torrent create and any bounded range warm-up above all belong
         // to the 34-second attempt. A selected direct/debrid local-AVPlayer remux is different: it may wait
         // behind the current episode's single producer until credits, so begin it only after source work has
@@ -5552,7 +5556,7 @@ struct iOSEpisodeStreams: View {
         } else {
             preparedRemux = nil
         }
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else {
             preparedRemux?.abandon(reason: "iOS preparation cancelled after transport readiness")
             return nil
         }

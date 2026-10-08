@@ -49,10 +49,30 @@ enum SeriesSourceSticky {
     static func snapshot(for seriesKey: String) -> Snapshot {
         if let resolvingChoice, resolvingChoice.seriesKey == seriesKey,
            resolvingChoice.profile == activeProfileKey { return resolvingChoice }
+        return currentSnapshot(for: seriesKey)
+    }
+
+    /// Admission must read the live profile, never its task-local (deliberately frozen) ranking context.
+    static func currentSnapshot(for seriesKey: String) -> Snapshot {
         let (profile, choices) = loaded()
         let choice = choices[seriesKey]
         return Snapshot(seriesKey: seriesKey, profile: profile, addon: choice?.addon,
                         bingeGroup: choice?.bingeGroup, audioLanguage: choice?.audioLanguage)
+    }
+
+    static func admits(_ frozen: Snapshot?) -> Bool {
+        guard let frozen else { return false }
+        return frozen == currentSnapshot(for: frozen.seriesKey)
+    }
+
+    /// The operation may ignore cancellation; its old result still cannot reach the player command.
+    @MainActor static func resolveIfCurrent<Value>(
+        _ frozen: Snapshot?, operation: @MainActor () async -> Value?
+    ) async -> Value? {
+        guard !Task.isCancelled, admits(frozen) else { return nil }
+        let value = await operation()
+        guard !Task.isCancelled, admits(frozen) else { return nil }
+        return value
     }
 
     /// Per-profile cap, pruned on the write that crosses it (the `LastStreamStore` shape): the headroom means
@@ -187,6 +207,33 @@ enum BingeAudioContinuityPolicy {
     static func shouldRecordManualSource(explicit: Bool, resume: Bool, accepted: Bool) -> Bool {
         explicit && !resume && accepted
     }
+}
+
+/// Empty is pending discovery, not an audio track with an unknown language. The owner keeps a late
+/// topology receipt/deadline from accepting a replacement load; the player retains the exact episode
+/// until this boundary admits its real inventory. A file with real untagged tracks remains eligible.
+struct BingeAudioInventoryAdmission<Owner: Equatable> {
+    enum Decision: Equatable { case waiting, accepted, mismatch, unavailable }
+    static var observationGraceSeconds: TimeInterval { 3 }
+    private(set) var owner: Owner?
+    private var startedAt: TimeInterval = 0
+    private var decision: Decision = .waiting
+
+    mutating func evaluate(owner: Owner, languages: [String], desired: String, now: TimeInterval) -> Decision {
+        if self.owner != owner {
+            self.owner = owner
+            startedAt = now
+        }
+        if languages.isEmpty {
+            decision = now - startedAt >= Self.observationGraceSeconds ? .unavailable : .waiting
+        } else {
+            decision = BingeAudioContinuityPolicy.inventoryLacksDesired(languages, desired: desired)
+                ? .mismatch : .accepted
+        }
+        return decision
+    }
+
+    func permitsCommit(owner: Owner) -> Bool { self.owner == owner && decision == .accepted }
 }
 
 /// Short-lived, in-memory memory of which add-on just FAILED, so ranking stops handing it the next episode.

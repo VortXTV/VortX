@@ -281,12 +281,14 @@ struct TVPlayerView: View {
     @State private var observedAudioLanguage: String?
     @State private var pendingAutomaticAudioLanguage: String?
     @State private var incomingEpisodeChoice: SeriesSourceSticky.Snapshot?
+    @State private var incomingAudioInventory = BingeAudioInventoryAdmission<PlayerLoadToken>()
+    @State private var incomingAudioInventoryWaitTask: Task<Void, Never>?
     @State private var languageRejectedEpisodeID: String?
     @State private var languageRejectedStreams: Set<String> = []
     @State private var resumeAfterLanguageRetry = false
 
     private var continuityChoice: SeriesSourceSticky.Snapshot? {
-        seriesStickyKey.map { SeriesSourceSticky.snapshot(for: $0) }
+        seriesStickyKey.map { SeriesSourceSticky.currentSnapshot(for: $0) }
     }
 
     private func rememberSeriesAudio(_ language: String, explicit: Bool) {
@@ -295,9 +297,39 @@ struct TVPlayerView: View {
         observedAudioLanguage = language
         let old = continuityChoice
         SeriesSourceSticky.recordAudio(seriesKey: key, language: language)
-        if explicit { incomingEpisodeChoice = nil }
-        if old != continuityChoice { invalidateNextEpisodePreparation(reason: "selected audio changed") }
+        if old != continuityChoice {
+            invalidateNextEpisodePreparation(reason: "selected audio changed")
+            if explicit, let choice = continuityChoice { restartEpisodeResolutionForAudioChoice(choice) }
+        }
         DiagnosticsLog.log("binge", "accepted continuity audio=\(language) manualAudio=\(explicit)")
+    }
+
+    private func restartEpisodeResolutionForAudioChoice(_ choice: SeriesSourceSticky.Snapshot) {
+        let target = pendingAdvance?.meta.videoId
+        incomingEpisodeChoice = choice
+        guard let target else { return }
+        invalidateEpisodeResolution()
+        episodeSwitchGeneration &+= 1
+        sourceSwitchGeneration &+= 1
+        resumeRetryGeneration &+= 1
+        if pendingAdvance?.issued == true {
+            resumeAfterLanguageRetry = resumeAfterLanguageRetry || !isPaused
+            coordinator.player?.pause()
+            coordinator.player?.invalidateLoadToken()
+            loadTimeout?.cancel()
+            recoveryDeadline?.cancel(); recoveryDeadline = nil
+            hasStartedPlaying = false
+            uncommittedIdentityBlocked = true
+        }
+        pendingAdvance = nil
+        supersededAdvance = nil
+        DiagnosticsLog.log("binge", "audio choice restarted exact episode=\(VXProbeRedaction.identityToken(target))")
+        guard let episode = allEpisodes.first(where: { $0.id == target }) else {
+            loadErrorMsg = "Couldn't reload this episode with your selected audio language. Choose it again from Episodes."
+            presentTerminalLoadFailure()
+            return
+        }
+        play(episode: episode)
     }
 
     private func rememberAcceptedSeriesChoice() {
@@ -319,11 +351,35 @@ struct TVPlayerView: View {
     }
 
     private func admitIncomingEpisodeAudio(loadToken: PlayerLoadToken) -> Bool {
-        guard let pending = pendingAdvance, pending.loadToken == loadToken,
-              let desired = incomingEpisodeChoice?.audioLanguage, !currentPickWasExplicit else { return true }
+        guard let pending = pendingAdvance, pending.loadToken == loadToken else { return true }
         guard !pending.terminal else { return false }
+        guard currentPickWasExplicit || SeriesSourceSticky.admits(incomingEpisodeChoice) else { return false }
+        guard let desired = incomingEpisodeChoice?.audioLanguage, !currentPickWasExplicit else { return true }
         let tracks = coordinator.player?.tracks(ofType: "audio").filter(\.isSelectable) ?? []
-        if !BingeAudioContinuityPolicy.inventoryLacksDesired(tracks.map(\.lang), desired: desired) {
+        if incomingAudioInventory.owner != loadToken {
+            incomingAudioInventoryWaitTask?.cancel(); incomingAudioInventoryWaitTask = nil
+        }
+        let decision = incomingAudioInventory.evaluate(
+            owner: loadToken, languages: tracks.map(\.lang), desired: desired,
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        if decision == .waiting {
+            if incomingAudioInventoryWaitTask == nil {
+                DiagnosticsLog.log("binge", "audio inventory pending; holding exact episode admission")
+                incomingAudioInventoryWaitTask = Task { @MainActor in
+                    do { try await Task.sleep(for: .seconds(BingeAudioInventoryAdmission<PlayerLoadToken>.observationGraceSeconds)) }
+                    catch { return }
+                    guard !Task.isCancelled, incomingAudioInventory.owner == loadToken,
+                          coordinator.player?.activeLoadToken == loadToken,
+                          pendingAdvance?.loadToken == loadToken else { return }
+                    incomingAudioInventoryWaitTask = nil
+                    recheckParkedAssetAfterTelemetry(loadToken: loadToken)
+                }
+            }
+            return false
+        }
+        incomingAudioInventoryWaitTask?.cancel(); incomingAudioInventoryWaitTask = nil
+        if decision == .accepted {
             if let match = tracks.first(where: { TrackSelector.matches($0.lang, desired) }), !match.selected {
                 coordinator.player?.setAudioTrack(match.id)
                 guard coordinator.player?.activeLoadToken == loadToken else { return false }
@@ -332,7 +388,7 @@ struct TVPlayerView: View {
         }
         let newlyRejected = currentStream.map { languageRejectedStreams.insert($0.id).inserted } ?? false
         let retry = BingeAudioContinuityPolicy.shouldRetry(newlyRejected: newlyRejected, rejectedCount: languageRejectedStreams.count)
-        DiagnosticsLog.log("binge", "audio inventory mismatch target=\(VXProbeRedaction.identityToken(pending.meta.videoId)) desired=\(desired) rejected=\(languageRejectedStreams.count) retry=\(retry)")
+        DiagnosticsLog.log("binge", "audio inventory rejected target=\(VXProbeRedaction.identityToken(pending.meta.videoId)) desired=\(desired) reason=\(decision) rejected=\(languageRejectedStreams.count) retry=\(retry)")
         resumeAfterLanguageRetry = resumeAfterLanguageRetry || !isPaused
         coordinator.player?.pause()
         coordinator.player?.invalidateLoadToken()
@@ -2036,6 +2092,8 @@ struct TVPlayerView: View {
                             autoSkipDelaySeconds > 0 ? "on" : "off"
                         )
                     )
+                    assetSanityDeferredStartToken = event.loadToken
+                    assetSanityDeferredStartPosition = d
                     guard admitIncomingEpisodeAudio(loadToken: event.loadToken) else { return }
                     hasStartedPlaying = true
                     rearmAVStallWatchdogItemGenerationIfOwned(by: event.loadToken)
@@ -9183,8 +9241,8 @@ struct TVPlayerView: View {
     }
 
     private func episodeSwitchIsCurrent(generation: Int, sourceGeneration: Int,
-                                        videoID: String) -> Bool {
-        !leftPlayback
+                                        videoID: String, choice: SeriesSourceSticky.Snapshot?) -> Bool {
+        !Task.isCancelled && !leftPlayback && SeriesSourceSticky.admits(choice)
             && generation == episodeSwitchGeneration
             && sourceGeneration == sourceSwitchGeneration
             && pendingAdvance?.generation == generation
@@ -9495,7 +9553,7 @@ struct TVPlayerView: View {
             episodeResolutionTask = Task { @MainActor in
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                    videoID: v.id
+                    videoID: v.id, choice: choice
                 ) else {
                     discardPreparedEpisode(pre, reason: "episode admission became stale")
                     return
@@ -9507,7 +9565,7 @@ struct TVPlayerView: View {
                 let resolvedResume = localPreparedResumeOffset(for: newMeta)
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                    videoID: v.id
+                    videoID: v.id, choice: choice
                 ) else {
                     discardPreparedEpisode(pre, reason: "episode admission became stale before issue")
                     return
@@ -9535,7 +9593,7 @@ struct TVPlayerView: View {
                     discardPreparedEpisode(pre, reason: "player rejected prepared episode command")
                     if episodeSwitchIsCurrent(
                         generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                        videoID: v.id
+                        videoID: v.id, choice: choice
                     ) {
                         pendingAdvance = nil
                         if restoreSupersededAdvance() { return }
@@ -9547,7 +9605,7 @@ struct TVPlayerView: View {
                 }
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                    videoID: v.id
+                    videoID: v.id, choice: choice
                 ) else {
                     discardPreparedEpisode(pre, reason: "prepared command lost admission ownership")
                     return
@@ -9600,7 +9658,7 @@ struct TVPlayerView: View {
                 for _ in 0..<60 {
                     guard episodeSwitchIsCurrent(
                         generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                        videoID: v.id
+                        videoID: v.id, choice: choice
                     ) else { return }
                     if enginePlayerVideoId == nil,
                        !core.streamGroups(forStreamId: v.id).isEmpty {
@@ -9622,18 +9680,18 @@ struct TVPlayerView: View {
         episodeResolutionTask = Task { @MainActor in
             guard episodeSwitchIsCurrent(
                 generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                videoID: v.id
+                videoID: v.id, choice: choice
             ) else { return }
             let settlementStartedAt = Date()
             core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
             // Wait for THIS episode's streams (matched by id), then take the RANKED best across
             // add-ons: either every add-on has answered or the request-owned bounded deadline expires.
             var loggedBingeSourceWait = false
-            let wantedAddon = seriesSticky?.addon               // the source the viewer picked BY HAND for this show
+            let wantedAddon = choice?.addon // The same frozen choice used by ranking and final admission.
             while true {
                 guard episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                    videoID: v.id
+                    videoID: v.id, choice: choice
                 ) else { return }
                 let groups = core.streamGroups(forStreamId: v.id)
                 let progress = core.streamLoadProgress(forStreamId: v.id)
@@ -9686,7 +9744,7 @@ struct TVPlayerView: View {
                             )
                             guard episodeSwitchIsCurrent(
                                 generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                                videoID: v.id
+                                videoID: v.id, choice: choice
                             ) else { return }
                         }
                         if let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
@@ -9718,7 +9776,7 @@ struct TVPlayerView: View {
                     let resolvedResume = await account.resumeOffset(for: newMeta)
                     guard episodeSwitchIsCurrent(
                         generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                        videoID: v.id
+                        videoID: v.id, choice: choice
                     ) else { return }
                     DiagnosticsLog.log("binge", "auto-next selected desiredAudio=\(choice?.audioLanguage ?? "unknown") wantedAddon=\(VXProbeRedaction.identityToken(choice?.addon ?? "")) wantedRelease=\(VXProbeRedaction.identityToken(choice?.bingeGroup ?? "")) gotRelease=\(VXProbeRedaction.identityToken(s.behaviorHints?.bingeGroup ?? ""))")
                     pendingAdvance?.url = u
@@ -9732,7 +9790,7 @@ struct TVPlayerView: View {
                     ) else {
                         if episodeSwitchIsCurrent(
                             generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                            videoID: v.id
+                            videoID: v.id, choice: choice
                         ) {
                             pendingAdvance = nil
                             if restoreSupersededAdvance() { return }
@@ -9744,7 +9802,7 @@ struct TVPlayerView: View {
                     }
                     guard episodeSwitchIsCurrent(
                         generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                        videoID: v.id
+                        videoID: v.id, choice: choice
                     ) else { return }
                     if selected.ref == nil { prepareTorrent(s) }
                     resetRuntimeForIssuedEpisode()
@@ -9789,7 +9847,7 @@ struct TVPlayerView: View {
             }
             guard episodeSwitchIsCurrent(
                 generation: episodeGeneration, sourceGeneration: sourceGeneration,
-                videoID: v.id
+                videoID: v.id, choice: choice
             ) else { return }
             pendingAdvance = nil
             if restoreSupersededAdvance() { return }
@@ -9812,6 +9870,10 @@ struct TVPlayerView: View {
     @discardableResult
     private func commitPendingAdvanceOnFirstFrame(loadToken: PlayerLoadToken) -> Bool {
         guard let pending = pendingAdvance,
+              !pending.terminal,
+              currentPickWasExplicit || SeriesSourceSticky.admits(incomingEpisodeChoice),
+              currentPickWasExplicit || incomingEpisodeChoice?.audioLanguage == nil
+                || incomingAudioInventory.permitsCommit(owner: loadToken),
               pending.generation == episodeSwitchGeneration,
               PlayerLoadProvenanceState.canCommit(
                 callbackToken: loadToken,
@@ -9988,8 +10050,9 @@ struct TVPlayerView: View {
                         + NextEpisodePreloadPolicy.addonFetchBudget
                 )
             )
+            guard !Task.isCancelled, SeriesSourceSticky.admits(choice), preloadPolicy.accepts(attempt) else { return }
             let fetchedRawGroups = await rawGroups
-            guard !Task.isCancelled, preloadPolicy.accepts(attempt) else { return }
+            guard !Task.isCancelled, SeriesSourceSticky.admits(choice), preloadPolicy.accepts(attempt) else { return }
             let torboxAuthorization = SourceIndexIdentity.mergeAuthorization(
                 published: preloadTorboxSearch.publishedTarget, page: target
             )
