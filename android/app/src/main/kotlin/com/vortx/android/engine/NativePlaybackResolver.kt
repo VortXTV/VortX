@@ -10,10 +10,27 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.model.SubtitleRequestMetadata
 import com.vortx.android.usenet.UsenetProviderStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /** Platform resolution only. Credentials stay in their existing owner-scoped secure stores. */
 internal fun interface NativePlaybackResolver {
     suspend fun resolve(source: StreamSource, episode: Episode?): Playable
+
+    /** Captured repository owner/source admission, not a lookup of the currently selected profile. */
+    suspend fun resolve(source: StreamSource, episode: Episode?, isCurrent: () -> Boolean): Playable {
+        currentCoroutineContext().ensureActive()
+        if (!isCurrent()) throw CancellationException("Playback owner changed")
+        val result = resolve(source, episode)
+        try {
+            currentCoroutineContext().ensureActive()
+            if (!isCurrent()) throw CancellationException("Playback owner changed")
+            return result
+        } catch (failure: Throwable) {
+            result.playbackLease?.close()
+            throw failure
+        }
+    }
 }
 
 internal fun nativeDirectPlayable(source: StreamSource): Playable? {
