@@ -21,7 +21,7 @@ enum VortxNativeProfiles {
             self.transactionID = transactionID
         }
 
-        fileprivate var document: VortxJSON {
+        var document: VortxJSON {
             .object(["account": account, "revision": revision,
                      "transactionId": transactionID.map(VortxJSON.string) ?? .null])
         }
@@ -47,7 +47,7 @@ enum VortxNativeProfiles {
             self.addons = addons; self.library = library; self.watches = watches; self.identityLinks = identityLinks
         }
 
-        fileprivate var document: VortxJSON {
+        var document: VortxJSON {
             .object(["kind": .string("own"), "carrier": .object([
                 "source": .object(["verifiedStreamingUid": .string(verifiedStreamingUID),
                                     "sourceDocumentSha256": .string(sourceDocumentSHA256)]),

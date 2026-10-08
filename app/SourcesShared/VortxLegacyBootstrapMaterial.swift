@@ -20,11 +20,13 @@ enum VortxLegacyBootstrapMaterial {
         let profileID: UUID
         let verifiedStreamingUID: String
         let sourceDocument: Data
+        let profileOverlaySHA256: String?
 
-        init(profileID: UUID, verifiedStreamingUID: String, sourceDocument: Data) {
+        init(profileID: UUID, verifiedStreamingUID: String, sourceDocument: Data, profileOverlaySHA256: String? = nil) {
             self.profileID = profileID
             self.verifiedStreamingUID = verifiedStreamingUID
             self.sourceDocument = sourceDocument
+            self.profileOverlaySHA256 = profileOverlaySHA256
         }
 
         var sourceDocumentSHA256: String {
@@ -150,8 +152,9 @@ enum VortxLegacyBootstrapMaterial {
                 titles[profileID] = buckets.titles
                 identityLinks[profileID] = buckets.identityLinks
                 if source.isRetained { retainedWatchProfiles.insert(profileID) }
-                ownSourceMaterial[profileID] = ["verifiedStreamingUid": source.verifiedStreamingUID,
-                                                "sourceDocumentSha256": source.sourceDocumentSHA256]
+                var proof: Object = ["verifiedStreamingUid": source.verifiedStreamingUID, "sourceDocumentSha256": source.sourceDocumentSHA256]
+                if let witness = source.profileOverlaySHA256 { proof["profileOverlaySha256"] = witness }
+                ownSourceMaterial[profileID] = proof
             }
             var result: Object = [
                 "schemaVersion": sources.isEmpty ? 1 : 2, "roster": nativeRoster, "deletedProfileIds": deleted.sorted(),
@@ -233,6 +236,7 @@ enum VortxLegacyBootstrapMaterial {
             let profileID: String
             let verifiedStreamingUID: String
             let sourceDocumentSHA256: String
+            let profileOverlaySHA256: String?
             let sourceDocument: Object?
             let retainedBuckets: OwnAccountBuckets?
             var isRetained: Bool { retainedBuckets != nil }
@@ -409,10 +413,16 @@ enum VortxLegacyBootstrapMaterial {
                             "Own-account source lacks a verified streaming identity")
                 try require(source.sourceDocumentSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
                             "Own-account source has an invalid document digest")
+                try require(source.profileOverlaySHA256 == nil || source.profileOverlaySHA256!.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                            "Own-account source has an invalid overlay witness")
+                if let witness = source.profileOverlaySHA256 {
+                    try require(witness == Self.envelopeOverlayWitness(source.sourceDocument),
+                                "Own-account source overlay witness does not match its exact envelope")
+                }
                 let document = try Self.decodeOwnAccountEnvelope(source.sourceDocument, profileID: profileID)
                 sources[profileID] = ResolvedOwnAccountSource(profileID: profileID,
                     verifiedStreamingUID: source.verifiedStreamingUID,
-                    sourceDocumentSHA256: source.sourceDocumentSHA256, sourceDocument: document, retainedBuckets: nil)
+                    sourceDocumentSHA256: source.sourceDocumentSHA256, profileOverlaySHA256: source.profileOverlaySHA256, sourceDocument: document, retainedBuckets: nil)
             }
             let freshSourceIDs = Set(sources.keys)
             let retained = try retainedOwnAccountSources(retainedBaseline, requiredProfiles: ownProfiles)
@@ -437,11 +447,19 @@ enum VortxLegacyBootstrapMaterial {
                 sources[profileID] = ResolvedOwnAccountSource(profileID: profileID,
                     verifiedStreamingUID: retainedSource.verifiedStreamingUID,
                     sourceDocumentSHA256: retainedSource.sourceDocumentSHA256,
+                    profileOverlaySHA256: retainedSource.profileOverlaySHA256,
                     sourceDocument: document, retainedBuckets: retainedBuckets)
             }
             let ownIDs = Set(ownProfiles.map { $0.id.uuidString })
             try require(Set(sources.keys) == ownIDs, "Own-account profiles require exactly one authenticated streaming-account source")
             return sources
+        }
+
+        private static func envelopeOverlayWitness(_ source: Data) throws -> String {
+            guard let envelope = try JSONSerialization.jsonObject(with: source) as? Object,
+                  let raw = envelope["profileOverlayBase64"] as? String, let bytes = Data(base64Encoded: raw),
+                  bytes.base64EncodedString() == raw else { throw fail("Own-account source envelope lacks an exact overlay") }
+            return try VortxProfileOverlayWitness.digest(json: bytes)
         }
 
         /// A cold peer can retain only the kernel-validated typed tuple. The caller has already
@@ -473,7 +491,7 @@ enum VortxLegacyBootstrapMaterial {
             for profile in requiredProfiles {
                 let id = profile.id.uuidString
                 guard let source = try object(sourceRows, id),
-                      Set(source.keys) == ["verifiedStreamingUid", "sourceDocumentSha256"],
+                      Set(source.keys).isSubset(of: ["verifiedStreamingUid", "sourceDocumentSha256", "profileOverlaySha256"]),
                       let uid = try optionalString(source, "verifiedStreamingUid"),
                       uid == uid.trimmingCharacters(in: .whitespacesAndNewlines), !uid.isEmpty,
                       uid.utf8.count <= 256, uid.rangeOfCharacter(from: .controlCharacters) == nil,
@@ -501,8 +519,11 @@ enum VortxLegacyBootstrapMaterial {
                     guard let row = raw as? [String] else { throw fail("Retained own-account baseline has malformed identity links") }
                     return row
                 }
+                let witness = try optionalString(source, "profileOverlaySha256")
+                try require(witness == nil || witness!.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+                            "Retained own-account baseline has an invalid overlay witness")
                 retained[id] = ResolvedOwnAccountSource(profileID: id, verifiedStreamingUID: uid,
-                    sourceDocumentSHA256: digest, sourceDocument: nil,
+                    sourceDocumentSHA256: digest, profileOverlaySHA256: witness, sourceDocument: nil,
                     retainedBuckets: OwnAccountBuckets(addons: ["items": addonItems, "order": addonOrder, "intents": addonIntents],
                                                        library: ["items": libraryItems, "intents": libraryIntents],
                                                        watches: try watchRows.map { raw in

@@ -9,6 +9,7 @@ enum VortxLegacyBootstrapMaterialTests {
     static func main() throws {
         try fixtureAndRoster()
         try ownAccountSources()
+        try overlayWitnessContract()
         try savedVersusPlayed()
         try durableHistoryAndClockPolicies()
         try ownerActorTies()
@@ -289,6 +290,20 @@ enum VortxLegacyBootstrapMaterialTests {
         do { _ = try material(root, roster: [owner, own], ownAccountSources: [incompleteEnvelope]); preconditionFailure("incomplete source imported") }
         catch let error as VortxLegacyBootstrapMaterial.ReconciliationRequired {
             check(error.reason.contains("exact library and add-on responses"), "Missing authenticated response cannot become an empty account")
+        }
+    }
+
+    static func overlayWitnessContract() throws {
+        let vectors: [(String, String)] = [
+            ("{}", "f3ee41db7e88797180e8b1202101a6daf1b5883944bde95d46e3cd485bd98f2a"),
+            ("{\"b\":true,\"a\":\"x/y\",\"n\":null}", "48b922f092adb76b7fcddd4876a9ab2df9432d86dd80fe2a052cb51b23665a5f"),
+            ("[-0,0,0.1,1e-7,1.25,9007199254740991]", "6dc7e298ab380f2d71eb83674092f89b1e869df5ae3c9ed460e936e6aaabfff3"),
+            ("{\"b\":[2,1],\"a\":{}}", "57a5fd5e71156114902a2d89fc3af92bbd5b6a90c3c6c5b080dcf72e5407a04f")
+        ]
+        for (json, digest) in vectors { let actual = try VortxProfileOverlayWitness.digest(json: Data(json.utf8)); check(actual == digest, "Overlay witness vector mismatch") }
+        for json in ["[1e400]", "[9007199254740992]", "[9007199254740991.1]", "{\"a\":1,\"a\":2}", "[\"\\uD800\"]"] {
+            do { _ = try VortxProfileOverlayWitness.digest(json: Data(json.utf8)); preconditionFailure("Invalid overlay witness input accepted") }
+            catch VortxProfileOverlayWitness.Failure.malformed {}
         }
     }
     static func savedVersusPlayed() throws {
