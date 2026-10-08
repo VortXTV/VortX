@@ -149,7 +149,7 @@ enum VortxLegacyWatchedMigration {
             guard isCurrent() else { throw Evidence.Failure.admissionRevoked }
             try Evidence.validateSource(scope: candidate.scope, source: candidate.source, rowLocator: candidate.locator)
             let digest = sha256(candidate.source)
-            let matches = retained.filter { $0.scope.profileID == candidate.scope.profileID
+            let matches = retained.filter { sameScope($0.scope, candidate.scope)
                 && exact($0.sourceSHA256, digest) && $0.locator == candidate.locator }
             guard matches.count <= 1 else { throw Failure.malformedArchive }
             if let archive = matches.first {
@@ -193,7 +193,7 @@ enum VortxLegacyWatchedMigration {
         for (original, candidate) in zip(archives, pending) where seenPending.insert(original).inserted {
             try requireAdmission(isCurrent)
             let digest = sha256(candidate.source)
-            let matches = retained.filter { $0.scope.profileID == candidate.scope.profileID
+            let matches = retained.filter { sameScope($0.scope, candidate.scope)
                 && exact($0.sourceSHA256, digest) && $0.locator == candidate.locator }
             guard matches.count <= 1 else { throw Failure.malformedArchive }
             if let retained = matches.first {

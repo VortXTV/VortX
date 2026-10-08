@@ -377,21 +377,45 @@ enum VortxLegacyWatchedMigrationTests {
         }
 
         // This receipt has the same profile, exact raw source and locator, but a different
-        // authenticated UID. It must not be adopted as the historical pending row's evidence.
+        // authenticated UID. It may be retained alongside A, but cannot resolve A's pending row.
         let uidBPrepared = try await VortxLegacyWatchedMigration.prepare(accountID: "account-a",
             ownerProfileID: ownerID, document: rootA, profileIDs: [ownerID],
             ownAccountSources: [try ownNetworkOnlySource(verifiedUID: "captured-uid-b")],
             isCurrent: { true }) { request in .init(request: request, raw: metadata()) }
-        do {
-            _ = try await retryPending([pendingA], evidence: uidBPrepared.archives) { request in
-                .init(request: request, raw: metadata())
-            }
-            preconditionFailure("Expected same-source archived evidence with another own UID to be rejected")
-        } catch let failure as VortxLegacyWatchedMigration.Failure {
-            check(failure == .staleBinding, "same-source archived evidence from another own UID rejects as stale binding")
-        } catch {
-            throw error
+        let bOnlyFetches = Locked(0)
+        let recoveredA = try await retryPending([pendingA], evidence: uidBPrepared.archives) { request in
+            bOnlyFetches.modify { $0 += 1 }
+            check(request.scope.verifiedStreamingUID == "captured-uid-a",
+                  "UID-B evidence cannot change the pending retry's captured UID A")
+            return .init(request: request, raw: metadata())
         }
+        check(bOnlyFetches.value > 0 && recoveredA.archives.count == 1 && recoveredA.unresolved.isEmpty,
+              "UID-B-only evidence does not resolve UID-A pending row; retry captures A instead")
+        try await expectStale("UID-A retry evidence cannot rebind to UID B") {
+            _ = try VortxLegacyWatchedMigration.replay(recoveredA.archives[0], accountID: "account-a",
+                profileID: ownID, ownerProfileID: ownerID, verifiedStreamingUID: "captured-uid-b",
+                sourceDocument: ownA.sourceDocument, isCurrent: { true })
+        }
+
+        let bothEvidence = recoveredA.archives + uidBPrepared.archives
+        let aReplayFetches = Locked(0)
+        let replayedA = try await retryPending([pendingA], evidence: bothEvidence) { request in
+            aReplayFetches.modify { $0 += 1 }
+            return .init(request: request, raw: metadata())
+        }
+        check(aReplayFetches.value == 0 && replayedA.archives == recoveredA.archives && replayedA.unresolved.isEmpty,
+              "retained UID-A and UID-B evidence zero-network replays the exact UID-A receipt")
+
+        let bReplayFetches = Locked(0)
+        let bReplay = try await VortxLegacyWatchedMigration.prepare(accountID: "account-a",
+            ownerProfileID: ownerID, document: rootA, profileIDs: [ownerID],
+            ownAccountSources: [try ownNetworkOnlySource(verifiedUID: "captured-uid-b")],
+            archivedEvidence: bothEvidence, isCurrent: { true }) { request in
+                bReplayFetches.modify { $0 += 1 }
+                return .init(request: request, raw: metadata())
+            }
+        check(bReplayFetches.value == 0 && bReplay.rows.count == 1 && bReplay.archives == uidBPrepared.archives,
+              "current UID-B source zero-network selects its exact UID-B receipt from retained A+B")
 
         var missingUID = pendingObject
         missingUID.removeValue(forKey: "verifiedStreamingUid")
