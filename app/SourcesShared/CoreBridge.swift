@@ -3742,7 +3742,8 @@ final class CoreBridge: ObservableObject {
         // ACCOUNT library bucket and sync it, which is exactly what profile separation prevents.
         guard target.overlayProfileID == nil else { return }
         guard !logoutAccountMutationPending else { return }
-        guard durationSeconds.isFinite, timeSeconds.isFinite, durationSeconds > 0, timeSeconds >= 0 else { return }
+        guard durationSeconds.isFinite, timeSeconds.isFinite, durationSeconds > 0, timeSeconds >= 0,
+              durationSeconds * 1000 < Double(Int.max), timeSeconds * 1000 < Double(Int.max) else { return }
         #if os(tvOS)
         let device = "tvOS"
         #else
@@ -3751,6 +3752,14 @@ final class CoreBridge: ObservableObject {
         let payload: [String: Any] = ["time": Int(timeSeconds * 1000),
                                       "duration": Int(durationSeconds * 1000),
                                       "device": device]
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            guard let (facade, _) = nativePlaybackBinding(target),
+                  let data = try? JSONSerialization.data(withJSONObject: ["action": "Player", "args": ["action": "TimeChanged", "args": payload]]) else { return }
+            _ = facade.dispatch(data: data, field: "player")
+            return
+        }
+#endif
         dispatch(action: ["action": "Player", "args": ["action": "TimeChanged", "args": payload]],
                  field: "player")
     }

@@ -101,6 +101,11 @@ check(nativeTarget.contains("core.captureNativePlaybackTarget()")
                 && appearsBefore("reportNativeProgress", "if let profileID = target.overlayProfileID", in: nativeSave)
                 && appearsBefore("nativeResumeSeconds", "ProfileStore.shared.resumeOffset", in: nativeResume),
               "native player callbacks carry account capture and bypass legacy overlay/network resume/progress")
+let selectedProgress = section(bridge, from: "func reportProgress(timeSeconds:", until: "private func dispatchMetaDetails")
+check(selectedProgress.contains("let (facade, _) = nativePlaybackBinding(target)")
+                && selectedProgress.contains("facade.dispatch(data: data, field: \"player\")")
+                && appearsBefore("timeSeconds * 1000 < Double(Int.max)", "Int(timeSeconds * 1000)", in: selectedProgress),
+              "selected native progress keeps the captured facade and bounds millisecond conversion")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")
                 && bridge.contains("private func capturePublicationToken() -> PublicationToken")
