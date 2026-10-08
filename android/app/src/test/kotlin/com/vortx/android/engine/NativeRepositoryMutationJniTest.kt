@@ -103,10 +103,19 @@ class NativeRepositoryMutationJniTest {
             transport.payload = { metadata("series").also { it.getJSONObject("meta").getJSONArray("videos").put(JSONObject().put("id", "opaque-one").put("season", 9).put("episode", 1)) } }
             assertTrue(repository.setWatched(MediaType.SERIES, "series", true).isFailure)
             assertEquals(before, store.value)
-            transport.payload = { metadata("series") }; store.fail = true
+            transport.payload = { metadata("series") }; val owner = session.read().owner; store.fail = true
             assertTrue(repository.setWatched(MediaType.SERIES, "series", true).isFailure)
-            assertEquals(before, store.value); assertTrue(watched(session).isEmpty())
+            assertEquals(before, store.value)
+            assertTrue(session.requiresRecovery()); assertFalse(session.accepts(owner))
+            assertTrue(runCatching { watched(session) }.isFailure)
             store.fail = false
+            assertTrue(repository.setVideoWatched(MediaType.SERIES, "series", "opaque-two", 1, 8, true).isFailure)
+            assertEquals(before, store.value)
+        }
+        // Restoring storage alone cannot revive uncertain ownership; recover from the same disk state.
+        open(store, transport).use { session ->
+            assertTrue(watched(session).isEmpty())
+            val repository = NativeCatalogRepository { session }
             repository.setVideoWatched(MediaType.SERIES, "series", "opaque-two", 1, 8, true).getOrThrow()
             assertEquals(setOf("opaque-two"), watched(session))
         }
@@ -174,9 +183,17 @@ class NativeRepositoryMutationJniTest {
             val old = repository.installedAddons().getOrThrow().single(); val before = store.value
             transport.payload = { JSONObject().put("name", "Invalid") }
             assertTrue(repository.changeAddonUrl(old, "https://new.invalid").isFailure); assertEquals(before, store.value)
-            transport.payload = { manifest("Replacement") }; store.fail = true
+            transport.payload = { manifest("Replacement") }; val owner = session.read().owner; store.fail = true
             assertTrue(repository.changeAddonUrl(old, "https://new.invalid").isFailure); assertEquals(before, store.value)
+            assertTrue(session.requiresRecovery()); assertFalse(session.accepts(owner))
             store.fail = false
+            assertTrue(runCatching { install(session, "https://protected.invalid/manifest.json", true) }.isFailure)
+            assertEquals(before, store.value)
+        }
+        open(store, transport).use { session ->
+            val repository = NativeCatalogRepository { session }
+            val old = repository.installedAddons().getOrThrow().single()
+            assertEquals("https://old.invalid/manifest.json", old.transportUrl)
             install(session, "https://protected.invalid/manifest.json", true)
             val protected = repository.installedAddons().getOrThrow().single { it.isProtected }; val protectedState = store.value; val calls = transport.calls
             assertTrue(repository.changeAddonUrl(protected, "https://new.invalid").isFailure)

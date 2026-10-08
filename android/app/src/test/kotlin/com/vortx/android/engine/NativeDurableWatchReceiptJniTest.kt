@@ -97,17 +97,28 @@ class NativeDurableWatchReceiptJniTest {
 
     @Test fun `failed checkpoint or fresh readback never authorizes cleanup`() = runBlocking {
         val store = Store()
+        var durableBeforeFailure: String? = null
         open(store).use { session ->
             val repository = repository { session }
-            var token = repository.beginPlaybackSession(context(), repository.continueWatchingOwner()).getOrThrow()
-            val before = store.value; store.failWrite = true
+            val token = repository.beginPlaybackSession(context(), repository.continueWatchingOwner()).getOrThrow()
+            val before = store.value; durableBeforeFailure = before
+            val owner = session.read().owner; store.failWrite = true
             assertTrue(repository.endPlaybackSessionWithDurableWatchReceipt(token, 95_000, 100_000).isFailure)
             assertEquals(before, store.value)
+            assertTrue(session.requiresRecovery()); assertFalse(session.accepts(owner))
             store.failWrite = false
-            token = repository.beginPlaybackSession(context(), repository.continueWatchingOwner()).getOrThrow()
+            assertTrue(repository.beginPlaybackSession(context(), repository.continueWatchingOwner()).isFailure)
+            assertEquals(before, store.value)
+        }
+        open(store).use { session ->
+            assertEquals(durableBeforeFailure, store.value)
+            assertFalse(session.requiresRecovery())
+            val repository = repository { session }
+            val token = repository.beginPlaybackSession(context(), repository.continueWatchingOwner()).getOrThrow()
             // The dispatch commit/readback succeeds; the independent committed-query read fails.
             store.failReadAt = store.reads + 2
             assertTrue(repository.endPlaybackSessionWithDurableWatchReceipt(token, 95_000, 100_000).isFailure)
+            assertFalse(session.requiresRecovery())
             store.failReadAt = Int.MAX_VALUE
             val receipt = requireNotNull(finish(repository))
             store.value = "{}"
