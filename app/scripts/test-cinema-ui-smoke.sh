@@ -12,6 +12,7 @@ for source in \
   SourcesiOS/CinemaUISmokeRendererApp.swift \
   SourcesiOS/CinemaJSProviderSourceStub.swift \
   SourcesiOS/CinemaPinnedHTTPClientStub.swift \
+  SourcesiOS/CinemaCommunityStreamGatewayStub.swift \
   SourcesiOS/VortXiOSApp.swift \
   SourcesShared/WatchedIndex.swift; do
   swiftc -parse "$source"
@@ -80,6 +81,16 @@ rg -Fq 'enum PinnedHTTPClient' "$pinned_stub"
 rg -Fq 'preconditionFailure("Cinema UI renderer must not execute PinnedHTTPClient")' "$pinned_stub"
 if sed '/^[[:space:]]*\/\//d' "$pinned_stub" | rg -n 'URLSession|NWConnection|Network|Security|socket' >/dev/null; then
   print -u2 'Cinema pinned HTTP stub must remain inert'
+  exit 1
+fi
+
+gateway_stub='SourcesiOS/CinemaCommunityStreamGatewayStub.swift'
+rg -Fq '#if CINEMA_UI_SMOKE_RENDERER' "$gateway_stub"
+rg -Fq 'final class CommunityStreamGateway' "$gateway_stub"
+rg -Fq 'preconditionFailure("Cinema UI renderer must not resolve CommunityStreamGateway")' "$gateway_stub"
+rg -Fq 'preconditionFailure("Cinema UI renderer must not register CommunityStreamGateway")' "$gateway_stub"
+if sed '/^[[:space:]]*\/\//d' "$gateway_stub" | rg -n 'URLSession|NWConnection|Network|Security|socket|start\(' >/dev/null; then
+  print -u2 'Cinema community gateway stub must remain inert'
   exit 1
 fi
 
