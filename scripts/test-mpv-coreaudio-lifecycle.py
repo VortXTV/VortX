@@ -8,11 +8,12 @@ unchanged from upstream / the exact build patch, NOT reimplemented in this test.
 """
 
 import hashlib
+import http.client
 import os
 import pathlib
 import re
+import ssl
 import subprocess
-import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BUILD = ROOT / "app/build/coreaudio-lifecycle"
@@ -22,6 +23,45 @@ HASHES = {
     "ao.c": "5fd091c800dbeb0d6f2c236ce9b1d88852266994c652f0c5317346ddc1d344e3",
     "buffer.c": "e053296cdfe58a07b6bd2aa5554774ff5c54ca57c622a56636fb6fe8f0fed105",
 }
+UPSTREAM_HOST = "raw.githubusercontent.com"
+MAX_SOURCE_BYTES = 1024 * 1024
+
+
+def verify_source(name, data):
+    if name not in HASHES:
+        raise ValueError("source name is not in the pinned allowlist")
+    if not data or len(data) > MAX_SOURCE_BYTES:
+        raise ValueError(f"source is empty or exceeds the byte limit: {name}")
+    if hashlib.sha256(data).hexdigest() != HASHES[name]:
+        raise ValueError(f"source drift: {name}")
+    return data
+
+
+def fetch_source(name):
+    if name not in HASHES:
+        raise ValueError("source name is not in the pinned allowlist")
+    # HTTPSConnection accepts a host/path, never file:// or another caller-selected URL scheme.
+    # Keep certificate/hostname verification and never follow a redirect to another destination.
+    connection = http.client.HTTPSConnection(UPSTREAM_HOST, timeout=30,
+                                             context=ssl.create_default_context())
+    try:
+        connection.request("GET", f"/mpv-player/mpv/{PIN}/audio/out/{name}",
+                           headers={"Accept-Encoding": "identity"})
+        response = connection.getresponse()
+        if response.status != 200:
+            raise ValueError(f"pinned source HTTP status is not 200: {response.status}")
+        if response.getheader("Content-Encoding", "identity") != "identity":
+            raise ValueError("pinned source has an unexpected content encoding")
+        declared = response.getheader("Content-Length")
+        if declared is not None:
+            if not re.fullmatch(r"[0-9]+", declared) or not 0 < int(declared) <= MAX_SOURCE_BYTES:
+                raise ValueError("pinned source has an invalid or excessive Content-Length")
+        data = response.read(MAX_SOURCE_BYTES + 1)
+        if declared is not None and len(data) != int(declared):
+            raise ValueError("pinned source length differs from Content-Length")
+        return verify_source(name, data)
+    finally:
+        connection.close()
 
 
 def function(source, name):
@@ -52,7 +92,7 @@ def verify_archive_gate(build_script):
     for path in (ffmpeg, mpv):
         path.write_bytes(b"synthetic archive, not a framework")
         os.utime(path, (1001, 1001))
-    environment = dict(os.environ, WORK=str(directory), BUILD_STARTED_MARKER=str(marker))
+    environment = dict(os.environ, WORK=str(directory / "MPVKit"), BUILD_STARTED_MARKER=str(marker))
 
     def run():
         return subprocess.run(["bash", "-eu", "-c", gate], env=environment,
@@ -73,13 +113,15 @@ def main():
     upstream = BUILD / "upstream/audio/out"
     upstream.mkdir(parents=True, exist_ok=True)
     sources = {}
-    for name, digest in HASHES.items():
+    for name in HASHES:
         path = upstream / name
-        if not path.exists():
-            url = f"https://raw.githubusercontent.com/mpv-player/mpv/{PIN}/audio/out/{name}"
-            path.write_bytes(urllib.request.urlopen(url, timeout=30).read())
-        data = path.read_bytes()
-        assert hashlib.sha256(data).hexdigest() == digest, f"source drift: {path}"
+        if path.exists():
+            with path.open("rb") as cached:
+                data = cached.read(MAX_SOURCE_BYTES + 1)
+        else:
+            data = fetch_source(name)
+            path.write_bytes(data)
+        verify_source(name, data)
         sources[name] = data.decode()
 
     # Prove the generic driver's admission/free ordering used by the fixture.
@@ -94,8 +136,11 @@ def main():
     patch = ROOT / "scripts/mpv-coreaudio-hotplug-lifecycle.patch"
     assert patch.is_file(), "missing production CoreAudio lifetime patch"
     build_script = (ROOT / "scripts/build-mpvkit-dvfel.sh").read_text()
-    assert 'cp "$REPO/scripts/mpv-coreaudio-hotplug-lifecycle.patch"' in build_script
-    assert "0005-coreaudio-hotplug-lifecycle.patch" in build_script
+    assert ('copy_exact "$REPO/scripts/mpv-coreaudio-hotplug-lifecycle.patch" \\\n'
+            '  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch"') in build_script
+    copy_helper = re.search(r"^copy_exact\(\) \{\n.*?^\}$", build_script, re.M | re.S).group()
+    assert 'cmp -s "$source" "$destination" || fail' in copy_helper
+    assert 'cp "$source" "$destination"' in copy_helper
     assert "for library in Libavformat Libmpv; do" in build_script
     verify_archive_gate(build_script)
     if patch.exists():
