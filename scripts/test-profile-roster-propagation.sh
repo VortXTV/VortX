@@ -32,3 +32,5 @@ assert(!body.slice(body.indexOf("        } else {")).includes("localRosterDidPer
 const s=readFileSync("app/SourcesShared/VortXSyncManager.swift","utf8");
 assert(s.includes("self?.isApplyingRemote = false\n            self?.drainLocalRosterPush()"));
 console.log("PASS synchronous roster persistence and post-suppression drain wiring");'
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors app/SourcesShared/ProfileMutationPresentation.swift app/Tests/ProfileMutationPresentationTests.swift -o "$profile_test_dir/profile-presentation"
+"$profile_test_dir/profile-presentation"

@@ -63,6 +63,7 @@ struct ProfilePickerView: View {
     @State private var pinTarget: UserProfile?
     @State private var editorProfile: UserProfile?
     @State private var signInNeeded = false
+    @StateObject private var profileAction = ProfileMutationPresentation()
     #if !os(tvOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     /// Measured width of the picker's horizontal scroll viewport (iOS + macOS), used to pin the card row's
@@ -87,6 +88,10 @@ struct ProfilePickerView: View {
                 Text("Who's watching?")
                     .font(usesWideProfileLayout ? Theme.Typography.hero : Theme.Typography.screenTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
+                if profileAction.isRunning { ProgressView("Opening profile…") }
+                if let error = profileAction.errorMessage {
+                    Text(error).font(Theme.Typography.label).foregroundStyle(.red)
+                }
                 // Touch: scroll horizontally so 3+ cards (230pt each) don't overflow + clip both edges
                 // on a phone (systemic fix S1b). tvOS keeps the centered HStack for remote focus nav.
                 // macOS: the picker presents as a `.sheet`, which sizes to content; a horizontal ScrollView
@@ -133,7 +138,7 @@ struct ProfilePickerView: View {
             // window and the horizontal ScrollView carries any overflow. No explicit frame needed.
             // Unfocusable while the PIN gate is up, so focus must move into the gate (on a real
             // remote, focus will not enter an overlay while anything beneath stays focusable).
-            .disabled(pinTarget != nil)
+            .disabled(pinTarget != nil || profileAction.isRunning)
 
             if let target = pinTarget {
                 PinGateOverlay(profile: target,
@@ -152,6 +157,8 @@ struct ProfilePickerView: View {
             iOSSignInView()
             #endif
         }
+        .interactiveDismissDisabled(profileAction.isRunning)
+        .onDisappear { profileAction.cancel() }
     }
 
     private var profileCards: some View {
@@ -200,6 +207,11 @@ struct ProfilePickerView: View {
 
     private func commit(_ profile: UserProfile) {
         pinTarget = nil
+        #if VORTX_NATIVE_DATA_ENGINE
+        let target = core.captureNativePlaybackTarget()
+        profileAction.start(operation: { await store.selectNative(profile, target: target) },
+                            failureMessage: { store.nativeProfileError ?? "Profile could not be opened. Please retry." })
+        #else
         switch store.select(profile) {
         case .sameAccount:
             break
@@ -210,6 +222,7 @@ struct ProfilePickerView: View {
             account.reloadForActiveProfile()
             signInNeeded = true
         }
+        #endif
     }
 
 }
@@ -517,6 +530,7 @@ struct ProfileEditorView: View {
     @State private var confirmDelete = false
     @State private var switchPinPrompt = false   // PIN gate when switching INTO a locked profile
     @State private var signInNeeded = false      // an own-account profile with no stored token
+    @StateObject private var profileAction = ProfileMutationPresentation()
 
     private var isNew: Bool { !store.profiles.contains { $0.id == original.id } }
 
@@ -656,7 +670,7 @@ struct ProfileEditorView: View {
                     }
 
                     HStack(spacing: Theme.Space.md) {
-                        Button("Save") { save() }
+                        Button(profileAction.isRunning ? "Saving…" : "Save") { save() }
                             .buttonStyle(PrimaryActionStyle())
                             .disabled(!canSave)
                         Button("Cancel") { dismiss() }
@@ -668,24 +682,34 @@ struct ProfileEditorView: View {
                     }
                     .padding(.top, Theme.Space.md)
                     .profileFocusSection()
+                    if let error = profileAction.errorMessage {
+                        Text(error).font(Theme.Typography.label).foregroundStyle(.red)
+                    }
                 }
                 .frame(maxWidth: usesWideEditorLayout ? 900 : .infinity, alignment: .leading)
                 .padding(usesWideEditorLayout ? Theme.Space.screenInset : Theme.Space.sm)
             }
             // Unfocusable while the lock is up, so the remote lands in the lock panel (tvOS focus
             // won't enter an overlay while anything beneath stays focusable).
-            .disabled(isLocked)
+            .disabled(isLocked || profileAction.isRunning)
 
             if isLocked { lockedPanel }
         }
         .confirmationDialog("Delete \(original.name)? Its settings and sign-in are removed.",
                             isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
+                #if VORTX_NATIVE_DATA_ENGINE
+                let target = core.captureNativePlaybackTarget()
+                profileAction.start(operation: { await store.removeNative(original, target: target) },
+                                    failureMessage: { store.nativeProfileError ?? "Profile could not be removed. Please retry." },
+                                    onSuccess: { dismiss() })
+                #else
                 store.remove(original)
                 // `remove` authorizes against the current stored record and returns nil both for an
                 // inactive successful deletion and for a rejected deletion. Confirm disappearance before
                 // dismissing so a stale/spoofed owner editor never closes as if destructive work succeeded.
                 if !store.profiles.contains(where: { $0.id == original.id }) { dismiss() }
+                #endif
             }
         }
         .profileCover(isPresented: $signInNeeded) {
@@ -697,6 +721,8 @@ struct ProfileEditorView: View {
             iOSSignInView()
             #endif
         }
+        .interactiveDismissDisabled(profileAction.isRunning)
+        .onDisappear { profileAction.cancel() }
     }
 
     /// The store is the authorization source, not the editable draft or the caller's original copy. Hide the
@@ -721,6 +747,10 @@ struct ProfileEditorView: View {
                 Text("Switch to \(original.name) to use it and edit its settings.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
                     .multilineTextAlignment(.center).frame(maxWidth: 640)
+                if profileAction.isRunning { ProgressView("Opening profile…") }
+                if let error = profileAction.errorMessage {
+                    Text(error).font(Theme.Typography.label).foregroundStyle(.red)
+                }
                 HStack(spacing: Theme.Space.md) {
                     Button("Switch to \(original.name)") {
                         if original.hasPin { switchPinPrompt = true } else { commitSwitch() }
@@ -733,7 +763,7 @@ struct ProfileEditorView: View {
             .padding(Theme.Space.xxl)
             .vortxGlassPanel(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
             // Unfocusable while the PIN gate is up, so the remote lands in the gate (tvOS).
-            .disabled(switchPinPrompt)
+            .disabled(switchPinPrompt || profileAction.isRunning)
 
             if switchPinPrompt {
                 PinGateOverlay(profile: original,
@@ -748,6 +778,12 @@ struct ProfileEditorView: View {
     /// for its PIN first (switchPinPrompt). On .needsSignIn the editor presents sign-in (Option B)
     /// instead of dismissing into a signed-out profile.
     private func commitSwitch() {
+        #if VORTX_NATIVE_DATA_ENGINE
+        let target = core.captureNativePlaybackTarget()
+        profileAction.start(operation: { await store.selectNative(original, target: target) },
+                            failureMessage: { store.nativeProfileError ?? "Profile could not be opened. Please retry." },
+                            onSuccess: { dismiss() })
+        #else
         switch store.select(original) {
         case .sameAccount:
             dismiss()
@@ -759,6 +795,7 @@ struct ProfileEditorView: View {
             account.reloadForActiveProfile()
             signInNeeded = true
         }
+        #endif
     }
 
     private var canSave: Bool {
@@ -772,8 +809,16 @@ struct ProfileEditorView: View {
             draft.pin = UserProfile.pinHash(pinText, profileID: draft.id)
         }
         // empty field keeps the existing PIN; Remove PIN cleared it explicitly
+        #if VORTX_NATIVE_DATA_ENGINE
+        let target = core.captureNativePlaybackTarget()
+        let profile = draft, creating = isNew
+        profileAction.start(operation: { await store.saveNative(profile, creating: creating, target: target) },
+                            failureMessage: { store.nativeProfileError ?? "Profile could not be saved. Please retry." },
+                            onSuccess: { dismiss() })
+        #else
         if isNew { store.add(draft) } else { store.update(draft) }
         dismiss()
+        #endif
     }
 
     @ViewBuilder private func row<Content: View>(_ label: String, @ViewBuilder _ content: () -> Content) -> some View {
