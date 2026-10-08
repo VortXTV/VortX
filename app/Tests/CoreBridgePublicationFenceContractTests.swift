@@ -115,7 +115,7 @@ check(appearsBefore("facade.addCatalogItem", "let binding = settledActiveAccount
               "native auto-add uses captured native metadata and durable membership without a Stremio receipt")
 let nativeBootstrap = section(syncSource, from: "func restoreNativeCheckpoint", until: "/// Shared account-owner epoch")
 check(nativeBootstrap.contains("resolveRoster(from: document, fullOnly: true)")
-                && nativeBootstrap.contains("let checkpoint = try probe.read(scope: scope)")
+                && nativeBootstrap.contains("let checkpoint = try probe.authenticatedCheckpoint(scope: scope)")
                 && nativeBootstrap.contains("let hadCheckpoint = checkpoint != nil")
                 && nativeBootstrap.contains("if !hadCheckpoint")
                 && nativeBootstrap.contains("VortxLegacyBootstrapMaterial.encode(document: documentBytes")

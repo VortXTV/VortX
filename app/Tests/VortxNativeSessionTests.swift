@@ -157,10 +157,14 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         let coldStore = try VortxEncryptedCheckpointStore(directory: directory, key: key)
         check(try coldStore.read(scope: scope) == before)
         check(try coldStore.recovery(account: scope.account) == nil)
+        check(try coldStore.authenticatedCheckpoint(scope: scope) == before)
+        let changedOwner = VortxAccountScope(account: scope.account, ownerProfileID: "replacement-owner")
+        do { _ = try coldStore.authenticatedCheckpoint(scope: changedOwner); fatalError("unindexed checkpoint reset by replacement owner") } catch {}
         try coldStore.rememberAuthenticatedScope(scope)
         let offlineRecovery = try coldStore.recovery(account: scope.account)
         check(offlineRecovery?.scope == scope && offlineRecovery?.state == before && offlineRecovery?.bootstrap == archive)
         check(try coldStore.recovery(account: "other-account") == nil)
+        do { _ = try coldStore.authenticatedCheckpoint(scope: changedOwner); fatalError("authenticated locator owner replaced") } catch {}
         try coldStore.commit(before, scope: scope)
         check(try archived(Data(contentsOf: files[0])) == archive)
         let otherScope = VortxAccountScope(account: "account-b", ownerProfileID: scope.ownerProfileID)

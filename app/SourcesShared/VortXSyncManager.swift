@@ -355,7 +355,7 @@ final class VortXSyncManager: ObservableObject {
                     .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
                 let documentBytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys, .withoutEscapingSlashes])
                 let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
-                let checkpoint = try probe.read(scope: scope)
+                let checkpoint = try probe.authenticatedCheckpoint(scope: scope)
                 let hadCheckpoint = checkpoint != nil
                 // Every open checks the complete legacy projection, including pending web edits.
                 // Native authority cannot silently ignore a later old-client membership/watch edit.
@@ -1678,8 +1678,9 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture) else { return .failed }
         if code == 404 { return .empty }                 // no backup yet
         guard code == 200 else { return .failed }        // network/server error: do not clobber
-        guard let json, json["document"] == nil || json["document"] is NSNull || json["document"] is String else { return .failed }
-        guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .empty } // valid 200 envelope, no document
+        guard let json else { return .failed }
+        if json["document"] is NSNull, json["version"] as? Int == 0 { return .empty }
+        guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .failed }
         let pulledVersion = (json["version"] as? Int) ?? 0
         // H-2: refuse an honest-label replay of a doc OLDER than what this account has already applied. syncUp
         // uses this as its merge base, so a stale base would drop newer writes made on another surface. A real
@@ -1713,8 +1714,9 @@ final class VortXSyncManager: ObservableObject {
         // request() returns code 0 for a thrown URLSession error (offline / DNS / TLS / timeout) and 5xx is a
         // server fault: both are transient, and both are exactly the "silently returns false" case of #145.
         guard code == 200 else { return .failed(retryable: code == 0 || code >= 500) }
-        guard let json, json["document"] == nil || json["document"] is NSNull || json["document"] is String else { return .failed(retryable: false) }
-        guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .empty }  // valid 200 envelope, no document
+        guard let json else { return .failed(retryable: false) }
+        if json["document"] is NSNull, json["version"] as? Int == 0 { return .empty }
+        guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .failed(retryable: false) }
         // `version` stays `as? Int` (Swift's Int is 64-bit on every platform this app targets), so an epoch-ms
         // version is carried whole. Never narrow this to a 32-bit type: a truncated version corrupts the AAD and
         // GCM auth then fails on every Apple / web doc.

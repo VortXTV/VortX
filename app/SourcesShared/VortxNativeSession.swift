@@ -104,7 +104,18 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         let payload = try JSONEncoder().encode(AccountLocator(format: "vortx-native-account-locator-v1", scope: scope))
         let sealed = try AES.GCM.seal(payload, using: key, authenticating: locatorAAD(scope.account))
         guard let bytes = sealed.combined else { throw VortxNativeError.invalidSnapshot }
-        try bytes.write(to: locatorURL(scope.account), options: [.atomic, .completeFileProtection])
+        let staged = directory.appendingPathComponent(".native-locator-\(UUID().uuidString).sealed")
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try bytes.write(to: staged, options: [.withoutOverwriting, .completeFileProtection])
+        let file = try FileHandle(forWritingTo: staged); defer { try? file.close() }
+        try file.synchronize()
+        let stagedPlain = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: staged)), using: key, authenticating: locatorAAD(scope.account))
+        guard stagedPlain == payload else { throw VortxNativeError.invalidSnapshot }
+        guard Darwin.rename(staged.path, locatorURL(scope.account).path) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        let directoryFD = Darwin.open(directory.path, O_RDONLY)
+        guard directoryFD >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        defer { Darwin.close(directoryFD) }
+        guard Darwin.fsync(directoryFD) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         let installed = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(contentsOf: locatorURL(scope.account))),
                                         using: key, authenticating: locatorAAD(scope.account))
         guard installed == payload else { throw VortxNativeError.invalidSnapshot }
@@ -124,6 +135,20 @@ final class VortxEncryptedCheckpointStore: VortxCheckpointStore, @unchecked Send
         guard let bootstrap = envelope.bootstrap else { throw VortxNativeError.invalidSnapshot }
         bootstraps[locator.scope] = bootstrap
         return Recovery(scope: locator.scope, state: envelope.state, bootstrap: bootstrap)
+    }
+    /// A new cloud owner cannot reset a known account. Older unindexed checkpoints require
+    /// their exact authenticated owner before opening; unknown files are never proof of absence.
+    func authenticatedCheckpoint(scope: VortxAccountScope) throws -> String? {
+        let known = try recovery(account: scope.account)
+        guard known == nil || known?.scope == scope else { throw VortxNativeError.invalidSnapshot }
+        let checkpoint = try read(scope: scope)
+        if known == nil, checkpoint == nil {
+            let files: [URL]
+            do { files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) }
+            catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError { return nil }
+            guard !files.contains(where: { $0.lastPathComponent.hasPrefix("native-state-v1-") }) else { throw VortxNativeError.invalidSnapshot }
+        }
+        return checkpoint
     }
     private func open(_ data: Data, scope: VortxAccountScope) throws -> Envelope {
         let plain = try AES.GCM.open(AES.GCM.SealedBox(combined: data), using: key, authenticating: scope.authenticatedData)
