@@ -4,6 +4,33 @@ The app contains additive native state/resource bindings, an Apple account/sessi
 presentation adapters. Shipping `CoreBridge` and `EngineStremioRepository` remain the active data engine. There is no new user
 selector. A native streaming server is a separate capability from the native data engine.
 
+## Integration status — 8 October 2026
+
+The public integration branch is `beta/native-engine-integration-20261008` (remote branch
+`beta-native-engine-integration-20261008`). Native defaults are still off; neither a passing
+fixture nor this document authorizes the default flip. The installed/public release is separate.
+
+- Reviewed Apple provider intent/ACK handling, account checkpoint recovery, add-on replacement,
+  card-level series/season watched actions and library filter retention are integrated.
+- Reviewed Android provider intent/ACK handling and Cinema touch navigation are integrated.
+  Library viewing history uses authoritative watched history plus partial Continue Watching,
+  not saved membership. CW cards use a typed, one-shot resume intent and fall back to details
+  when the device has no matching saved stream.
+- The current real C/JNI fixture is private source `b6de6b861247ab10e304d6686d95660c887c441e`;
+  its immutable library SHA-256 is `34c900f1c64537f275e6eca835925a2e4e8328c4fd801a0986bfbc7e04d7a061`.
+  A newer reviewed website-intent kernel exists, but its host integration and matching fixture
+  are separate pending gates. Do not run new website actions against the older fixture.
+- Own-streaming-account profile migration and projection remain functional cutover blockers,
+  not permission to clear that preference or run those profiles under the owner's identity.
+- Android bulk watched/add-on replacement and durable downloaded-watch receipts are active
+  implementation lanes, not yet covered by the integrated Cinema/provider approvals.
+- Fresh native-flag Apple Mac/iOS/tvOS compilation succeeded using unsigned, unoptimized
+  diagnostic builds. Optimized signed packages, current full Android flavor/ABI packages,
+  physical playback and rendered UI verification remain distinct release gates.
+- A fresh MPVKit rebuild is staged separately. The previous package failed the intended
+  FFmpeg/TLS content contract; source and artifact validation now run before promotion.
+  The installed Mac application has not been restarted or replaced.
+
 ## Implemented and independently exercisable
 
 - Swift/Kotlin serialize every kernel-handle call, hydrate captured state, retain the previous
@@ -48,16 +75,20 @@ before the first atomic checkpoint. The first checkpoint includes the sealed cre
 archive and native import receipt. Failed/decrypt-failed account pulls, invalid owner
 attribution and unavailable artifact queries fail closed; there is no empty-account fallback.
 Unresolved source attribution (including own streaming accounts, ambiguous episode/type/alias evidence,
-and unreflected dashboard edits) requires reconciliation. Offline authenticated-roster recovery remains
-a gate; the production opener still requires a freshly authenticated full roster.
+and unreflected dashboard edits) requires reconciliation. Offline reopening uses an account-key-authenticated
+checkpoint, archived roster and owner locator; it does not provision a fresh account from an unavailable
+cloud response. New-account admission additionally requires a complete authenticated local checkpoint
+inventory. A missing installation index key does not prevent recovery with the existing account key,
+but cannot establish that an unknown account has no prior state.
 
 Every cold open, native-peer adoption and warm native pull/push reprojects the authenticated legacy
 material (including the pending-profile-edit completeness check). An existing/adopted runtime must
 already carry a matching `legacyImport` receipt; the kernel's idempotent importer verifies it on a
-detached candidate or inside the merge/checkpoint transaction. Changed old-client watch, membership
-or profile material fails closed before persistence. Unrelated unknown document preferences do not
-enter that projection. This does not reconcile mixed-client edits: even changed source roster clocks
-can require reconciliation, and native-only carriers without a migration receipt are not admitted.
+detached candidate or inside the merge/checkpoint transaction. The shared legacy reducer admits changes
+with its required source-clock evidence and preserves the original import archive/receipt; ambiguous
+or unclocked changes still fail closed before persistence. Unrelated unknown document preferences do
+not enter that projection. Sparse website intents require the newer website reconciliation contract;
+they must not be restamped as an authoritative whole-roster snapshot.
 
 CoreBridge exposes awaited shutdown and generation-checked installation. Owner boundaries revoke
 both installed sessions and candidates still awaiting installation. Native mutations use the same
@@ -69,26 +100,30 @@ rebind the accepted own/shared registry automatically; no restart or raw-token i
 Native push returns the freshly pulled document plus `nativeSync` only; it does not rebuild legacy
 settings/roster/watch/addon/library carriers from native or global mirrors. Native pull does not replay
 legacy overlay/tombstone/profileEdit mutations after accepting the native transaction. Outbound host
-preference and provider-credential changes still need a separately versioned authority path; existing
-captured-key/provider restore helpers remain in place. This limitation remains a default-cutover gate.
+preferences and provider credentials use separately versioned register carriers. Provider writes retain
+durable prepared intent, complete OAuth tuples, explicit clears and exact event acknowledgements;
+account/session replacement cannot publish or clear an earlier captured event. Credentials never enter
+the native kernel or bootstrap archive. Website sparse host edits must also prove the exact independent
+host-register base before an atomic native/host commit; that integration remains in progress.
 Pending legacy settings/order edits and explicit legacy-source override refuse a native-only push;
 their dirty acknowledgement cannot be cleared by a carrier that did not export them.
 
 Apple compatibility currently covers board/search Load + LoadRange, default/specific Discover loads,
 metadata/episode streams, subtitles, default library reads, standard AddToLibrary/RemoveFromLibrary,
 title/episode watched intents, Player selection/progress attribution and explicit native profile/state
-actions. Loading groups use the shipping read shape. Unsupported pagination/filter/sort/player actions
-return false; there is no silent Stremio fallback. The native library projection currently covers standard
-saved titles, not native magnet/playlist presentation or full Continue Watching/history parity.
+actions. Loading groups use the shipping read shape. Unsupported action variants return false;
+there is no silent Stremio fallback. The native library projection covers standard saved titles,
+with playback history and Continue Watching queried separately; magnet/playlist presentation still
+needs its own coverage rather than being inferred from title membership tests.
 The main Home/Library read paths use native active-profile data for secondary profiles too, and
 native Continue Watching never unions legacy owner caches. The shared `profile_playback` query
 consumer projects exact-millisecond selected episode rows, keeps history separate from saved
 membership and uses whole-title watched counts instead of counting episode IDs. Unknown-type rows
 are not invented as movies. The playback query is mandatory: an unsupported/malformed query
 prevents installation, and projection failure after an acknowledged mutation retires the facade
-until reopen; neither path is reported as successful empty history. The new query and
-metadata-enriched progress need the next exact native artifact/live receipt.
-Watched/statistics readers, recommendations and remaining overlay mutation paths remain gates.
+until reopen; neither path is reported as successful empty history. The current exact native fixture
+exercises this query and metadata-enriched progress. Watched/statistics readers use native projections;
+end-to-end recommendations and remaining overlay mutation callsites still require parity verification.
 
 Native playback targets capture the exact credential epoch and immutable installed-session generation for every profile, including
 historical owner IDs. Native `StremioAccount` resume/progress entry points use kernel reads/writes
@@ -99,7 +134,10 @@ library actions, individual episode/movie watched actions, and CW dismissal have
 Native automatic library adds resolve metadata through the accepted registry in a separate request
 slot, then acknowledge the durable profile-scoped FIFO save before stamping the account/profile
 auto-add ledger. Legacy machine recovery can confirm an existing save, not resurrect a native removal.
-Unproven bulk-season/series marks remain unavailable; these adapters do not invent episode completeness.
+Apple bulk-season/series marks resolve the exact metadata-returned inventory in an isolated resource
+slot and await one durable batch. A card action does not replace visible detail navigation; missing
+inventory, registry replacement or stale ownership rejects the operation. These adapters do not invent
+episode IDs or claim unavailable future episodes were watched.
 The shipping player can produce both a selected-player progress tick and an explicit metadata save;
 the kernel treats repeated completion as one watched count, but duplicate durable commits remain an
 optimization opportunity. No audible playback/device receipt is claimed by source tests.
@@ -107,8 +145,8 @@ Same-account A→B→A and same-profile reopen invalidate old launch targets per
 launches never acquire a later session. The existing owner-gated external scrobble fanout remains
 after this target validation, independently of whether selected-player engine writes are allowed.
 
-The local C-ABI facade/playback fixture passed against integrated private source `61a7d450`, library
-SHA-256 `b69aa916cbe65adc38b378576c3b5d04118433fd3068836f05d985f379d318a9` and header
+The current local C-ABI facade/playback fixture passed against integrated private source `b6de6b86`, library
+SHA-256 `34c900f1c64537f275e6eca835925a2e4e8328c4fd801a0986bfbc7e04d7a061` and header
 `f7e277e197c8c72d230be633db5395234a19ff73ec645f971b0d3e88da376672`, with unchanged before/after
 hashes. That covers real kernel queries/mutations and localhost resources, not full app packaging.
 
@@ -162,9 +200,9 @@ app or media player. The fixture server requires Node 22+ lossless JSON source s
 
 | Owner lane | Required behavior before selecting native by default |
 | --- | --- |
-| Apple facade | Reconciliation for unsupported/ambiguous legacy cohorts and offline owner-roster bootstrap; horizontal and Discover pagination; genre/filter options; remaining history/stat readers, full profile CRUD and live host preference/registry rebinding; remaining player actions. Authenticated typed first import, native checkpoint bootstrap, scoped progress/resume/watch/library and main profile-aware read callsites are implemented behind the gate, not a default cutover. |
-| Android facade | Implement all CatalogRepository/AuthRepository/history interfaces; remove direct Stremio calls from stats and other consumers only after equivalent behavior is tested. |
-| Native state integration | One-time authenticated Apple supported-cohort import and native cold adoption are implemented with atomic state/source/receipt retention; own-account/ambiguous source cohorts explicitly fail closed. Ongoing old-client/website convergence is not implied by this importer and remains required for default cutover. |
+| Apple facade | Own-streaming-account profile identity, migration and projection; remaining reachable unsupported actions and full-app parity verification. Offline authenticated checkpoint recovery, native profile CRUD/preferences, authoritative playback/history/stat readers and reviewed Apple bulk watched/add-on actions are implemented behind the gate, not a default cutover. |
+| Android facade | Finish and integrate whole-series/season/individual authoritative watch inventory, add-on URL replacement, native downloaded-watch receipt, and own-streaming-account profiles. Verify remaining interface defaults at their real consumers; a deliberately unused legacy login method is not itself a native auth gap. |
+| Native state integration | Website immutable sparse events, independent host causal bases, atomic receipt/state/host persistence, exact CAS acknowledgements, native-aware website projection, and own-account/ambiguous source cohorts. Shared clocked legacy reconciliation is implemented; that alone does not establish website convergence. |
 | Sources/playback | Integrate provider/debrid resolution, full subtitle options, current source preferences, source-preserving resume, episode/binge selection and download admission. |
 | Native server | Advertise/test NNTP/archive capabilities before changing Node routes; unsupported archives require the supported fallback. |
 | Packaging | Exact reviewed core pin, both Android flavors and all ABIs, Apple slice/header/export checks, universal Mac and Lite decisions, device verification. |
