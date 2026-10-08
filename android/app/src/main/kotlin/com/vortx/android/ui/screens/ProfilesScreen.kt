@@ -86,7 +86,7 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     val nativeModel: NativeStreamingAccountViewModel? = if (BuildConfig.NATIVE_ENGINE_ENABLED) {
         val app = LocalContext.current.applicationContext as? VortXApplication
         val accounts = remember(app) { runCatching { app?.nativeStreamingAccounts() }.getOrNull() }
-        if (accounts == null) null else viewModel(factory = NativeStreamingAccountViewModel.Factory(accounts))
+        if (accounts == null) null else viewModel(factory = NativeStreamingAccountViewModel.Creator(accounts))
     } else null
     DisposableEffect(nativeModel) { onDispose { nativeModel?.close() } }
     val nativeState = nativeModel?.state?.collectAsState()?.value
@@ -111,8 +111,12 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
 
     // Bumped after any store mutation to force a fresh read of the plain (non-observable) store fields.
     var refresh by remember { mutableStateOf(0) }
-    val roster = nativeState?.profiles ?: remember(refresh) { store.profiles }
-    val activeId = nativeState?.activeID ?: remember(refresh) { store.activeID }
+    // Native setup/unavailable states return above. Keep legacy reads explicitly in comparison
+    // mode; a missing native projection must never borrow the device-local legacy roster.
+    val roster = if (BuildConfig.NATIVE_ENGINE_ENABLED) checkNotNull(nativeState).profiles
+        else remember(refresh) { store.profiles }
+    val activeId = if (BuildConfig.NATIVE_ENGINE_ENABLED) checkNotNull(nativeState).activeID
+        else remember(refresh) { store.activeID }
 
     // The editor overlay (null = closed). Carries the profile being edited and whether it is brand-new; a new
     // draft is minted here so Save can route to add() vs update().

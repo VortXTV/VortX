@@ -1353,7 +1353,7 @@ fun VortXApp(
             }
             val catalogVm: HomeCatalogBrowseViewModel = viewModel(
                 key = "home-catalog-${target.id}",
-                factory = HomeCatalogBrowseViewModel.Factory(repo, target),
+                factory = HomeCatalogBrowseViewModel.Creator(repo, target),
             )
             HomeCatalogBrowseScreen(
                 viewModel = catalogVm,

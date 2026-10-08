@@ -55,7 +55,7 @@ class HomeCatalogBrowseViewModel(
         }
     }
 
-    class Factory(
+    class Creator(
         private val repo: CatalogRepository,
         private val target: HomeCatalogTarget,
     ) : ViewModelProvider.Factory {

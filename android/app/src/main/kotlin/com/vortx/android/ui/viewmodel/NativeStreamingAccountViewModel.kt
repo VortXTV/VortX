@@ -126,7 +126,7 @@ internal class NativeStreamingAccountViewModel(private val accounts: NativeAccou
             }
         }
     }
-    class Factory(private val accounts: NativeAccountCoordinator) : ViewModelProvider.Factory {
+    class Creator(private val accounts: NativeAccountCoordinator) : ViewModelProvider.Factory {
         override fun <T : ViewModel> create(modelClass: Class<T>): T {
             require(modelClass == NativeStreamingAccountViewModel::class.java)
             @Suppress("UNCHECKED_CAST") return NativeStreamingAccountViewModel(accounts) as T
