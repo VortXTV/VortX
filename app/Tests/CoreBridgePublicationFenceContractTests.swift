@@ -74,6 +74,18 @@ let dispatch = section(bridge, from: "func dispatch(action:", until: "/// Compac
 let uninstallAddon = section(bridge, from: "func uninstallAddon(_ descriptor:", until: "/// Normalize a pasted")
 let installAddon = section(bridge, from: "func installAddonConfirmed", until: "struct AddonManifestPreview")
 let hydrateAddons = section(bridge, from: "func hydrateAddonsFromAccount", until: "/// stremio-core")
+let nativeRevoke = section(bridge, from: "private func revokeNativeSession()", until: "private func clearNativePublishedState()")
+let nativeClear = section(bridge, from: "private func clearNativePublishedState()", until: "/// Bumped on every")
+
+check(nativeRevoke.contains("DispatchQueue.main.sync")
+                && appearsBefore("invalidatePublicationEpoch()", "clearNativePublishedState()", in: nativeRevoke)
+                && !nativeClear.contains("DispatchQueue.main.async")
+                && nativeClear.contains("continueWatching = []; boardRows = []; library = nil; metaDetails = nil; discover = nil")
+                && nativeClear.contains("searchResults = []; searchSuggestions = []; searchIsLoading = false")
+                && nativeClear.contains("addons = []; rawAddonsByUrl = [:]; manifestPreviewCache = [:]")
+                && nativeClear.contains("AddonMetaGate.publish(false)")
+                && appearsBefore("revokeNativeSession()", "restoreNativeCheckpoint()", in: profileChange),
+              "native owner/profile revoke clears all published rows and capabilities synchronously before reopen")
 
 check(bridge.contains("private let publicationEpochLock = NSLock()")
                 && bridge.contains("private func capturePublicationToken() -> PublicationToken")

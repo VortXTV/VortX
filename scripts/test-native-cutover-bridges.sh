@@ -13,4 +13,6 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   app/SourcesShared/VortxResourceProjection.swift app/SourcesShared/VortxNativeSession.swift app/SourcesShared/VortxNativeCoreFacade.swift \
   app/Tests/VortxNativeSessionTests.swift -o "$native_test_dir/native-session"
 "$native_test_dir/native-session" "$native_test_dir"
+xcrun swiftc -warnings-as-errors app/Tests/CoreBridgePublicationFenceContractTests.swift -o "$native_test_dir/publication-contract"
+"$native_test_dir/publication-contract"
 bash test/build-mac-server-resolver.sh

@@ -64,8 +64,10 @@ The main Home/Library read paths use native active-profile data for secondary pr
 native Continue Watching never unions legacy owner caches. The shared `profile_playback` query
 consumer projects exact-millisecond selected episode rows, keeps history separate from saved
 membership and uses whole-title watched counts instead of counting episode IDs. Unknown-type rows
-are not invented as movies. Query-unavailable artifacts currently yield no playback projection;
-the new query and metadata-enriched progress need the next exact native artifact/live receipt.
+are not invented as movies. The playback query is mandatory: an unsupported/malformed query
+prevents installation, and projection failure after an acknowledged mutation retires the facade
+until reopen; neither path is reported as successful empty history. The new query and
+metadata-enriched progress need the next exact native artifact/live receipt.
 Watched/statistics readers, recommendations and remaining overlay mutation paths remain gates.
 
 ## Artifact gate

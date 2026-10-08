@@ -29,7 +29,17 @@ final class CoreBridge: ObservableObject {
     private var nativeInstallGeneration = UUID()
     private var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
     var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
-    var hasNativeSession: Bool { nativeFacade != nil }
+    var hasNativeSession: Bool { nativeFacade?.isAvailable == true }
+
+    @MainActor @discardableResult
+    func reorderAddonsForActiveProfile(_ urls: [String], profileID: UUID) -> Bool {
+        guard ProfileStore.shared.activeID == profileID, !enginePublicationBlocked,
+              let facade = nativeFacadeLock.withLock({ () -> VortxNativeCoreFacade? in
+                  guard let capture = nativeCredentialCapture, CredentialScopeRegistry.shared.isCurrent(capture) else { return nil }
+                  return nativeFacadeStorage
+              }) else { return false }
+        return facade.reorderAddonURLs(urls, profileID: profileID.uuidString)
+    }
 
     @MainActor
     func mergeNativeSyncDocument(_ remote: VortxJSON?, capture: CredentialScopeRegistry.Capture) async throws -> VortxJSON {
@@ -86,6 +96,9 @@ final class CoreBridge: ObservableObject {
         await old?.shutdown()
     }
     private func revokeNativeSession() {
+        // Owner/profile selection is published on main. Complete the revoke and UI clear in
+        // that same turn, before any cloud/bootstrap suspension can expose the new owner.
+        if !Thread.isMainThread { DispatchQueue.main.sync { self.revokeNativeSession() }; return }
         VortxNativeSession.revokeAllForOwnerBoundary()
         let old = nativeFacadeLock.withLock {
             nativeInstallGeneration = UUID()
@@ -93,6 +106,23 @@ final class CoreBridge: ObservableObject {
         }
         old?.close()
         invalidatePublicationEpoch()
+        clearNativePublishedState()
+    }
+    private func clearNativePublishedState() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        boardRebuildWork?.cancel(); boardRebuildWork = nil
+        metaDetailsWork?.cancel(); metaDetailsWork = nil
+        continueWatching = []; boardRows = []; library = nil; metaDetails = nil; discover = nil
+        discoverPublishedFingerprint = nil; resetDiscoverPagination()
+        searchResults = []; searchSuggestions = []; searchIsLoading = false
+        addons = []; rawAddonsByUrl = [:]; manifestPreviewCache = [:]
+        AddonMetaGate.publish(false)
+        boardCatalogTotal = 0; boardPageInFlight = false; boardRowPageInFlight = [:]; boardRowExhausted = []
+        metaLoadTargetLock.withLock { requestedMetaLoadTarget = nil }
+        pendingEpisodeWatched = [:]; refindRequest = nil; cancelAppleCWMetaRefresh()
+        invalidateNZBIndexerResults(); streamsEpoch &+= 1
+        changedFields = ["native_state", "ctx", "library", "continue_watching_preview", "board", "search", "discover", "meta_details"]
+        revision &+= 1
     }
 #endif
 
@@ -603,6 +633,7 @@ final class CoreBridge: ObservableObject {
         // them), so this can only ever remove an add-on the user explicitly deleted: a user-installed
         // add-on OR a REMOVABLE official one (YouTube, WatchHub, Public Domain, OpenSubtitles are
         // official=true, protected=false and the engine re-seeds them on every reset, #137).
+#if !VORTX_NATIVE_DATA_ENGINE
         let removed = AddonTombstones.all()
         if !removed.isEmpty {
             func isTombstoned(_ descriptor: CoreDescriptor) -> Bool {
@@ -642,6 +673,7 @@ final class CoreBridge: ObservableObject {
             }
             return
         }
+#endif
         DispatchQueue.main.async { [weak self] in
             guard let self, self.publicationStillCurrent(publicationToken) else { return }
             AddonMetaGate.publish(typed.contains { $0.providesTMDBMeta })
@@ -2033,7 +2065,11 @@ final class CoreBridge: ObservableObject {
     private func assembleStreamGroups(_ details: CoreMetaDetails, streamId: String?) -> [CoreStreamSourceGroup] {
         let names = addonNamesByBase()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+#if VORTX_NATIVE_DATA_ENGINE
+        let removed: Set<String> = [] // account/profile membership is already resolved by the kernel
+#else
         let removed = AddonTombstones.all()                        // durable removal set, hoisted once
+#endif
         var groups: [CoreStreamSourceGroup] = []
         var indexByBase: [String: Int] = [:]
         for group in details.allStreamGroups {
@@ -4092,7 +4128,7 @@ final class CoreBridge: ObservableObject {
     private var enginePublicationBlocked: Bool {
 #if VORTX_NATIVE_DATA_ENGINE
         return nativeFacadeLock.withLock {
-            guard nativeFacadeStorage != nil, let capture = nativeCredentialCapture else { return true }
+            guard nativeFacadeStorage?.isAvailable == true, let capture = nativeCredentialCapture else { return true }
             return !CredentialScopeRegistry.shared.isCurrent(capture)
         }
 #else
@@ -5036,6 +5072,9 @@ final class CoreBridge: ObservableObject {
     /// catalog prefs back. PROTECTED stubs (Cinemeta, Local Files) are never suppressed; a removable
     /// official add-on the user deleted IS, mirroring `refreshAddons` (#137).
     private static func tombstonedBases(in addons: [CoreDescriptor]) -> Set<String> {
+#if VORTX_NATIVE_DATA_ENGINE
+        return [] // native installed membership already applies its own account/profile tombstones
+#else
         let removed = AddonTombstones.all()
         guard !removed.isEmpty else { return [] }
         var out = Set<String>()
@@ -5044,6 +5083,7 @@ final class CoreBridge: ObservableObject {
             if removed.contains(key) { out.insert(key) }
         }
         return out
+#endif
     }
 
     /// The enumeration behind `allCatalogs`. `includeTombstoned: true` keeps the catalogs of removed

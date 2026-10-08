@@ -24,6 +24,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private var pendingProfileTransitions = 0
     private var playback: VortxJSON?
     var lastFailure: String? { lock.withLock { failure } }
+    var isAvailable: Bool { lock.withLock { !closed } }
 
     static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
                        mutationAccepted: @escaping @Sendable () -> Void = {},
@@ -31,7 +32,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         guard Set(registry.map(\.id)).count == registry.count else { throw VortxNativeError.invalidResponse }
         let facade = VortxNativeCoreFacade(session: session, registry: registry, mutationAccepted: mutationAccepted, changed: changed)
         let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
-        facade.playback = try? await session.playbackProjection()
+        facade.playback = try await session.playbackProjection()
         facade.values = try facade.stateFields(state)
         return facade
     }
@@ -132,11 +133,13 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             await predecessor?.value
             guard let self else { completion?(.failure(VortxNativeError.closed)); return }
             defer { if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 } } }
+            var durableCommitted = false
             do {
                 try Task.checkCancellation()
                 _ = try await session.dispatch([raw], now: UInt64(Date().timeIntervalSince1970))
+                durableCommitted = true
                 let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
-                let playback = try? await session.playbackProjection()
+                let playback = try await session.playbackProjection()
                 let resourceChanged = self.lock.withLock { self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) }
                 // Only the native registry query determines installed membership/order. It also
                 // resolves own/share-primary before new-profile resource loads can be admitted.
@@ -162,7 +165,14 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 completion?(.success(document))
             } catch VortxNativeError.checkpointUncertain {
                 _ = self.fail("checkpoint_uncertain_reopen_required"); completion?(.failure(VortxNativeError.checkpointUncertain))
-            } catch { _ = self.fail("native_mutation_failed"); completion?(.failure(error)) }
+            } catch {
+                if durableCommitted {
+                    // The acknowledged snapshot exists, but its required projection failed. Do
+                    // not relabel the previous/empty history as the successful new profile state.
+                    self.close(); _ = self.fail("native_projection_unavailable_reopen_required")
+                } else { _ = self.fail("native_mutation_failed") }
+                completion?(.failure(error))
+            }
         }
         return true
     }
@@ -179,6 +189,20 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 continuation.resume(throwing: VortxNativeError.closed)
             }
         }
+    }
+    /// A synchronous UI admission receipt, not a durable-write acknowledgement. The native FIFO
+    /// owns persistence and rejects stale profile gestures before resolving their effective bucket.
+    func reorderAddonURLs(_ urls: [String], profileID: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, pendingProfileTransitions == 0,
+              values["native_state"]?["activeProfileId"] == .string(profileID),
+              let binding = values["native_state"]?["roster"]?["profiles"]?[profileID]?["addons"],
+              [.string("own"), .string("share_primary")].contains(binding),
+              urls.allSatisfy({ !$0.isEmpty }), Set(urls).count == urls.count else { return fail("stale_or_invalid_addon_order") }
+        let bucket = binding == .string("share_primary") ? session.scope.ownerProfileID : profileID
+        let action: VortxJSON = .object(["type": .string("reorder_addons"), "profileId": .string(bucket), "transportUrls": .array(urls.map(VortxJSON.string))])
+        guard let data = try? JSONEncoder().encode(action) else { return false }
+        return enqueueMutation(type: "reorder_addons", raw: String(decoding: data, as: UTF8.self))
     }
     /// Testing/integration receipt: waits for currently admitted operations, never launches UI/media.
     func settled() async {

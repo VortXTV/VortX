@@ -5,6 +5,8 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
     private let lock = NSLock()
     private var next: UInt = 0
     private var states: [UInt: String] = [:]
+    private var playbackUnavailable = false
+    func failPlaybackQueries() { lock.withLock { playbackUnavailable = true } }
     func create(ownerID: String, ownerName: String) -> UInt {
         hydrate("{\"roster\":{\"profiles\":{\"\(ownerID)\":{\"id\":\"\(ownerID)\",\"owner\":true,\"deleted\":false,\"addons\":\"own\"},\"kid\":{\"id\":\"kid\",\"owner\":false,\"addons\":\"share_primary\"}}},\"activeProfileId\":\"\(ownerID)\",\"libraries\":{\"kid\":{},\"\(ownerID)\":{\"watchContexts\":{\"episode\":{\"name\":\"Retain context\",\"durationMs\":1200001}}}}}")
     }
@@ -35,9 +37,11 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
         return "{\"ok\":true}"
     }
     func resolve(_ handle: UInt, request: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
         guard var query = try? JSONSerialization.jsonObject(with: Data(request.utf8)) as? [String: Any] else { return nil }
         if query["kind"] as? String == "installed_addons" { query["addons"] = [] }
         if query["kind"] as? String == "profile_playback" {
+            if playbackUnavailable { return "{\"kind\":\"error\"}" }
             query["continueWatching"] = [["metaId": "unsaved-series", "videoId": "opaque-video", "name": "In progress", "type": "series", "offsetMs": 120001, "durationMs": 1200001, "updatedAt": 1700000000, "watched": false, "timesWatched": 0]]
             query["history"] = [["metaId": "watched-movie", "name": "Watched movie", "type": "movie", "offsetMs": 0, "durationMs": 1000000, "updatedAt": 1700000001, "watched": true, "timesWatched": 2]]
             query["watchedVideoIdsByTitle"] = ["unsaved-series": ["other-video"]]
@@ -48,6 +52,13 @@ private final class SessionABI: VortxRuntimeABI, @unchecked Sendable {
     func state(_ handle: UInt) -> String? { lock.lock(); defer { lock.unlock() }; return states[handle] }
     func delta(_ handle: UInt) -> String? { "{}" }
     func free(_ handle: UInt) { lock.lock(); defer { lock.unlock() }; precondition(states.removeValue(forKey: handle) != nil) }
+}
+
+private final class MutationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.withLock { count += 1 } }
+    var value: Int { lock.withLock { count } }
 }
 
 private final class SessionStore: VortxCheckpointStore, @unchecked Sendable {
@@ -165,7 +176,8 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         await candidate.close()
         let transitionStore = SessionStore()
         let transitionSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: transitionStore, transport: transport, allowNewAccount: true)
-        let facade = try await VortxNativeCoreFacade.create(session: transitionSession, registry: [], changed: { _ in })
+        let mutations = MutationCounter()
+        let facade = try await VortxNativeCoreFacade.create(session: transitionSession, registry: [], mutationAccepted: { mutations.increment() }, changed: { _ in })
         let nativeCW = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("continue_watching_preview")!)
         check(nativeCW["items"]?.array?.first?["state"]?["timeOffset"] == .integer(120001))
         check(nativeCW["items"]?.array?.first?["state"]?["video_id"] == .string("opaque-video"))
@@ -181,15 +193,30 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         let published = try JSONDecoder().decode(VortxJSON.self, from: facade.stateData("native_state")!)
         check(published["activeProfileId"] == .string("kid"))
         check(facade.registryBinding?.profileID == "kid")
+        check(mutations.value == 1) // switch acknowledged; queued get_state does not schedule a push
         check(facade.lastFailure == nil)
+        check(!facade.reorderAddonURLs([], profileID: "owner"))
+        check(facade.reorderAddonURLs([], profileID: "kid"))
+        await facade.settled()
+        check(mutations.value == 2) // the single admitted local reorder acknowledges once
         let remote: VortxJSON = .object(["schemaVersion": .integer(1), "scope": .string(scope.account), "ownerProfileId": .string(scope.ownerProfileID), "fixturePeer": .string("retained")])
         let exported = try await facade.mergeSyncDocument(remote)
         check(exported == remote && exported["activeProfileId"] == nil && exported["libraries"] == nil)
+        check(mutations.value == 2) // remote merge must not self-echo
         let durable = try JSONDecoder().decode(VortxJSON.self, from: Data(try transitionStore.read(scope: scope)!.utf8))
         check(durable["nativeSync"] == remote && durable["activeProfileId"] == .string("kid"))
         do { _ = try await facade.mergeSyncDocument(.object(["scope": .string("another-account")])); fatalError("foreign account carrier exported") }
         catch VortxNativeError.invalidResponse {}
+        abi.failPlaybackQueries()
+        do { _ = try await facade.mergeSyncDocument(nil); fatalError("failed playback query exported successful empty history") }
+        catch VortxNativeError.invalidResponse {}
+        check(!facade.isAvailable && facade.stateData("continue_watching_preview") == nil)
+        check(facade.lastFailure == "native_projection_unavailable_reopen_required")
         await facade.shutdown()
+        let unavailableSession = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: transitionStore, transport: transport)
+        do { _ = try await VortxNativeCoreFacade.create(session: unavailableSession, registry: [], changed: { _ in }); fatalError("unsupported playback query mounted") }
+        catch VortxNativeError.invalidResponse {}
+        await unavailableSession.close()
         print("Native session: acknowledged transactions, sealed cold state/context, legacy preservation and independent screen/logout fences passed")
     }
 }
