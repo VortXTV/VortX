@@ -112,8 +112,10 @@ render_device() {
   for surface in home search quickView episodeSources; do
     SIMCTL_CHILD_CINEMA_UI_SMOKE_SURFACE="$surface" \
       xcrun simctl launch --terminate-running-process "$uuid" "$bundle" >/dev/null
-    # Allow the fixture scene and, for Quick View, the real SwiftUI sheet presentation to settle.
-    sleep 1
+    # Give the native scene and sheet/window transitions a bounded post-launch settling interval.
+    # A one-second capture after replacing Quick View can retain the previous scene's transient veil.
+    # Keep this renderer-only: it must not change production presentation or relaunch any other bundle.
+    sleep 5
     xcrun simctl io "$uuid" screenshot "$output/cinema-ios-$kind-$surface.png"
     [[ -s "$output/cinema-ios-$kind-$surface.png" ]] || { print -u2 "missing native screenshot: $kind/$surface"; exit 1; }
   done

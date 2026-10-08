@@ -19,6 +19,12 @@ cat > "$fakebin/xcodebuild" <<'EOF'
 mkdir -p "$CINEMA_UI_SMOKE_IOS_DERIVED_DATA/Build/Products/Debug-iphonesimulator/CinemaUISmokeIOSRenderer.app"
 exit 0
 EOF
+cat > "$fakebin/sleep" <<'EOF'
+#!/bin/sh
+set -eu
+printf 'sleep %s\n' "$*" >> "$FIXTURE_CALLS"
+[ "$#" -eq 1 ] && [ "$1" = 5 ]
+EOF
 cat > "$fakebin/xcrun" <<'EOF'
 #!/bin/sh
 set -eu
@@ -43,7 +49,7 @@ if [ "$1" = simctl ] && [ "$2" = io ] && [ "$4" = screenshot ]; then
 fi
 exit 0
 EOF
-chmod +x "$fakebin/xcodegen" "$fakebin/xcodebuild" "$fakebin/xcrun"
+chmod +x "$fakebin/xcodegen" "$fakebin/xcodebuild" "$fakebin/sleep" "$fakebin/xcrun"
 
 run_fixture() {
   local name="$1"
@@ -114,6 +120,24 @@ for kind in phone ipad; do
     [[ -s "$tmp/success/output/cinema-ios-$kind-$surface.png" ]]
   done
 done
+
+# Every surface gets the bounded settle after its own launch and before its own screenshot. The fake
+# sleep records ordering without making these ownership fixtures wait or touching an actual simulator.
+awk '
+  $1 == "simctl" && $2 == "launch" {
+    if (pending) bad = 1
+    pending = 1; settled = 0; next
+  }
+  $1 == "sleep" {
+    if (!pending || NF != 2 || $2 != 5 || settled) bad = 1
+    settled = 1; next
+  }
+  $1 == "simctl" && $2 == "io" && $4 == "screenshot" {
+    if (!pending || !settled) bad = 1
+    pending = 0; captures += 1; next
+  }
+  END { exit (bad || pending || captures != 8) ? 1 : 0 }
+' "$tmp/success/calls"
 
 # A completed receipt is archived, not treated as an active failed run. The exact same output directory
 # can therefore produce a fresh device pair without touching the old receipt or any user simulator.
