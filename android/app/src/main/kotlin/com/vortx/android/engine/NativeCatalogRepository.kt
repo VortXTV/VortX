@@ -96,14 +96,18 @@ internal class NativeCatalogRepository(
     private fun parental(read: VortxNativeRead): Boolean = profile(read).getJSONObject("parental").let {
         it.getBoolean("kids") || (!it.isNull("maturityCeiling") && it.has("maturityCeiling"))
     }
-    private fun policyPage(page: VortxResourceSnapshot, read: VortxNativeRead): VortxResourceSnapshot {
+    private fun policyPage(page: VortxResourceSnapshot, read: VortxNativeRead, slot: String,
+                           completed: List<VortxResourceSnapshot>): VortxResourceSnapshot {
         if (!parental(read)) return page
+        // A completed load can be superseded while its caller parses. Policy evidence is itself
+        // publication: fence the complete admission/revocation, including blocked/null outcomes.
+        return session().publish(slot, read.owner, completed) {
         val kind = when (page.request.resource) {
             VortxResourceRequest.Resource.CATALOG -> "catalog"
             VortxResourceRequest.Resource.META -> "meta"
             else -> error("Parental metadata evidence required")
         }
-        return page.copy(groups = page.groups.map { group ->
+        page.copy(groups = page.groups.map { group ->
             if (group.status != "ready") return@map group
             val raw = JSONObject(requireNotNull(group.contentJson))
             if (kind == "meta" && !raw.isNull("meta")) {
@@ -114,7 +118,8 @@ internal class NativeCatalogRepository(
                 val identities = raw.getJSONArray("metas").objects().map { it.getString("type") to it.getString("id") }
                 require(identities.distinct().size == identities.size) { "Ambiguous parental catalog identity" }
             }
-            val response = session().resolve(JSONObject().put("kind", kind).also {
+            val response = if (kind == "meta" && raw.isNull("meta")) JSONObject().put("kind", kind).put("meta", JSONObject.NULL)
+            else session().resolve(JSONObject().put("kind", kind).also {
                 if (kind == "catalog") it.put("metas", raw.getJSONArray("metas"))
                 else it.put("meta", raw.get("meta"))
             }, read.owner)
@@ -143,10 +148,11 @@ internal class NativeCatalogRepository(
             } }
             group.copy(contentJson = JSONObject(raw.toString()).put(field, allowed).toString())
         })
+        }
     }
     private fun <T> Set<T>.takeLastBounded(size: Int): Set<T> = if (this.size <= size) this else toList().takeLast(size).toSet()
-    private fun board(pages: List<VortxResourceSnapshot>, addons: List<VortxResourceAddon>, read: VortxNativeRead) =
-        VortxResourceProjection.board(pages.map { policyPage(it, read) }, addons)
+    private fun board(pages: List<VortxResourceSnapshot>, addons: List<VortxResourceAddon>, read: VortxNativeRead, slot: String) =
+        VortxResourceProjection.board(pages.map { policyPage(it, read, slot, pages) }, addons)
     private fun rawCount(page: VortxResourceSnapshot) = page.groups.sumOf { it.items(page.request.resource).size }
     private fun visibleLocal(items: List<MetaItem>, read: VortxNativeRead): List<MetaItem> {
         if (!parental(read) || items.isEmpty()) return items
@@ -199,7 +205,7 @@ internal class NativeCatalogRepository(
         val pages = session.load("board", read.owner, specs.map { it.request() to listOf(it.addon) })
         requireAnySettled(pages)
         val rawCounts = specs.zip(pages).associate { (spec, page) -> spec.key to rawCount(page) }
-        val parsedRows = EngineState.parseCatalogs(board(pages, registry(read), read), specs.associate { it.key to it.title }).associateBy { it.id }
+        val parsedRows = EngineState.parseCatalogs(board(pages, registry(read), read, "board"), specs.associate { it.key to it.title }).associateBy { it.id }
         val rows = specs.mapNotNull { spec ->
             val more = spec.accepts("skip") && (rawCounts[spec.key] ?: 0) > 0
             // The presentation decoder omits empty rows; retain this cursor when policy filtered
@@ -245,7 +251,7 @@ internal class NativeCatalogRepository(
         val page = session.load("board:${catalog.id}", read.owner,
             listOf(previous.spec.request(listOf("skip" to previous.count.toString())) to listOf(previous.spec.addon))).single()
         requireSettled(page)
-        val next = EngineState.parseCatalogs(board(listOf(page), listOf(previous.spec.addon), read)).flatMap { it.items }
+        val next = EngineState.parseCatalogs(board(listOf(page), listOf(previous.spec.addon), read, "board:${catalog.id}")).flatMap { it.items }
         session.publish("board:${catalog.id}", read.owner, listOf(page)) {
             synchronized(this) {
                 check(homePages[catalog.id] === previous) { "Native catalog reload superseded page" }
@@ -274,7 +280,7 @@ internal class NativeCatalogRepository(
         check(canLoad(spec, extras.map { it.first }.toSet())) { "Catalog requires a selection" }
         val page = session.load("discover", read.owner, listOf(spec.request(extras) to listOf(spec.addon))).single()
         requireSettled(page)
-        val items = EngineState.parseCatalogs(board(listOf(page), listOf(spec.addon), read)).flatMap { it.items }
+        val items = EngineState.parseCatalogs(board(listOf(page), listOf(spec.addon), read, "discover")).flatMap { it.items }
         session.publish("discover", read.owner, listOf(page)) {
             synchronized(this) { discoverPage = DiscoverPage(read.owner, spec, extras, items, rawCount(page)) }
             DiscoverResult(items, discoverFilters(specs, spec, extras, rawCount(page) > 0))
@@ -288,7 +294,7 @@ internal class NativeCatalogRepository(
         val request = previous.spec.request(previous.extra + ("skip" to previous.count.toString()))
         val page = session.load("discover", read.owner, listOf(request to listOf(previous.spec.addon))).single()
         requireSettled(page)
-        val next = EngineState.parseCatalogs(board(listOf(page), listOf(previous.spec.addon), read)).flatMap { it.items }
+        val next = EngineState.parseCatalogs(board(listOf(page), listOf(previous.spec.addon), read, "discover")).flatMap { it.items }
         val items = (previous.items + next).distinctBy { it.type to it.id }
         session.publish("discover", read.owner, listOf(page)) {
             synchronized(this) { check(discoverPage === previous); discoverPage = previous.copy(items = items, count = previous.count + rawCount(page)) }
@@ -313,7 +319,7 @@ internal class NativeCatalogRepository(
         val specs = catalogs(read).filter { it.accepts("search") && canLoad(it, setOf("search")) }
         val pages = session.load("search", read.owner, specs.map { it.request(listOf("search" to text)) to listOf(it.addon) })
         requireAnySettled(pages)
-        session.publish("search", read.owner, pages) { EngineState.parseCatalogs(board(pages, registry(read), read)).flatMap { it.items }.distinctBy { it.type to it.id } }
+        session.publish("search", read.owner, pages) { EngineState.parseCatalogs(board(pages, registry(read), read, "search")).flatMap { it.items }.distinctBy { it.type to it.id } }
     }
     override fun searchUpdates(query: String): Flow<Pair<List<MetaItem>, Boolean>> = flow {
         if (query.trim().length >= 2) emit(emptyList<MetaItem>() to true)
@@ -325,7 +331,7 @@ internal class NativeCatalogRepository(
         val session = session(); val read = session.read(); val addons = registry(read)
         val page = session.load("meta", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons)).single()
         requireSettled(page)
-        val detail = requireNotNull(EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(policyPage(page, read), null, null, addons))) { "Native metadata unavailable or blocked" }
+        val detail = requireNotNull(EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(policyPage(page, read, "meta", listOf(page)), null, null, addons))) { "Native metadata unavailable or blocked" }
         check(detail.id == id && detail.type == type) { "Native metadata identity mismatch" }
         session.publish("meta", read.owner, listOf(page)) {
             val decorated = decorate(detail, session.read())
@@ -342,7 +348,7 @@ internal class NativeCatalogRepository(
         val session = session(); val read = session.read(); val addons = registry(read)
         val stream = VortxResourceRequest(VortxResourceRequest.Resource.STREAM, type.id, episodeId ?: id)
         val pages = session.load("streams", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons, stream to addons))
-        val metaPage = policyPage(pages[0], read)
+        val metaPage = policyPage(pages[0], read, "streams", pages)
         if (parental(read)) check(metaPage.groups.any { it.items(VortxResourceRequest.Resource.META).isNotEmpty() }) { "Native metadata blocked or uncertified" }
         val detail = EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(metaPage, null, null, addons))
         check(detail == null || (detail.id == id && detail.type == type)) { "Native metadata identity mismatch" }

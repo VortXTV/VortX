@@ -327,6 +327,7 @@ class VortxNativeLiveJniTest {
         val requests = mutableListOf<JSONObject>()
         var firstPageBlocked = false
         var recertified = false
+        var missingMeta = false
         fun meta(id: String) = JSONObject().put("id", id).put("type", "movie").put("name", id).also {
             if (id.startsWith("g")) it.put("certification", if (recertified) "R" else "G")
             if (id == "r") it.put("certification", "R")
@@ -339,7 +340,7 @@ class VortxNativeLiveJniTest {
                 val content = when (request.getString("resource")) {
                     "catalog" -> JSONObject().put("metas", if (request.getJSONArray("extra").toString().contains("skip")) JSONArray().put(meta("g2"))
                         else if (firstPageBlocked) JSONArray().put(meta("r")).put(meta("u")) else JSONArray().put(meta("g")).put(meta("r")).put(meta("u")))
-                    "meta" -> JSONObject().put("meta", meta(request.getString("id")).also {
+                    "meta" -> JSONObject().put("meta", if (missingMeta) JSONObject.NULL else meta(request.getString("id")).also {
                         if (request.getString("type") == "series") it.put("type", "series").put("videos", JSONArray()
                             .put(JSONObject().put("id", "g-series:1:1").put("title", "Episode").put("season", 1).put("episode", 1)))
                     })
@@ -397,9 +398,24 @@ class VortxNativeLiveJniTest {
             assertFalse(com.vortx.android.ui.components.showEmptyCatalogContinuation(row))
             repo.loadHomeRowNextPage(blocked).getOrThrow()
             assertEquals("2", requests.last().getJSONArray("extra").getJSONArray(0).getString(1))
-            recertified = true
-            assertTrue(repo.meta(MediaType.MOVIE, "g").isFailure)
-            assertTrue(repo.admitClientHomeRows(generated, repo.continueWatchingOwner()).getOrThrow().single().items.isEmpty())
+            val policy = NativeCatalogRepository::class.java.getDeclaredMethod("policyPage", VortxResourceSnapshot::class.java,
+                VortxNativeRead::class.java, String::class.java, List::class.java).also { it.isAccessible = true }
+            for (blockedOutcome in listOf("R", "null")) {
+                recertified = false; missingMeta = false
+                repo.meta(MediaType.MOVIE, "g").getOrThrow()
+                val read = session.read()
+                // Deterministic scheduler interleaving: A has completed its transport load but has
+                // not entered policyPage. B then publishes a blocked/null result in the SAME slot.
+                val old = session.load("meta", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, "movie", "g") to
+                    listOf(VortxResourceAddon("https://fixture.invalid/manifest.json", "https://fixture.invalid/manifest.json", manifest.toString()))))
+                recertified = blockedOutcome == "R"; missingMeta = blockedOutcome == "null"
+                assertTrue(repo.meta(MediaType.MOVIE, "g").isFailure)
+                assertTrue(repo.admitClientHomeRows(generated, repo.continueWatchingOwner()).getOrThrow().single().items.isEmpty())
+                val stale = runCatching { policy.invoke(repo, old.single(), read, "meta", old) }.exceptionOrNull()
+                assertTrue(stale is java.lang.reflect.InvocationTargetException && stale.cause is IllegalStateException)
+                assertTrue(repo.admitClientHomeRows(generated, repo.continueWatchingOwner()).getOrThrow().single().items.isEmpty())
+                assertNull(repo.peekMeta(MediaType.MOVIE, "g"))
+            }
         }
     }
 
