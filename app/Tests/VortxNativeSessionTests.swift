@@ -128,6 +128,21 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
         do { try hostB.merge(equivocal.document, scope: scope); fatalError("host carrier accepted equivocal event") } catch {}
         let restoredHost = try VortxNativeHostPreferences(scope: scope, actor: actorB, sealed: hostA.encoded())
         check(restoredHost.local.actor == actorB && restoredHost.local.counter == 2)
+        var credentials = try VortxNativeProviderCredentials(scope: scope.account, actor: actorA)
+        try credentials.edit(["tmdb": .string("fixture-nonproduction")])
+        let sentCredentials = credentials.local.pending
+        try credentials.edit(["tmdb": .null])
+        credentials.acknowledge(sentCredentials)
+        check(credentials.local.pending["tmdb"]?.value == .null) // old push cannot acknowledge newer clear
+        var credentialPeer = try VortxNativeProviderCredentials(scope: scope.account, actor: actorB)
+        try credentialPeer.merge(credentials.document)
+        check(credentialPeer.mirror(into: ["tmdb": "fixture-old", "future": "retained"]) == ["future": "retained"])
+        do { try credentials.edit(["unknownProvider": .string("not-exportable")]); fatalError("unknown provider accepted") } catch {}
+        do { try credentials.edit(["traktAccess": .string("incomplete")]); fatalError("incomplete OAuth group accepted") } catch {}
+        let credentialArchive = try VortxNativeBootstrapArchive.encode(document: JSONEncoder().encode(VortxJSON.object(["nativeProviderCredentials": try credentials.document])))
+        let credentialArchiveJSON = try JSONDecoder().decode(VortxJSON.self, from: credentialArchive)
+        check(credentialArchiveJSON["hostDocument"]?["nativeProviderCredentials"] == nil)
+        check(credentialArchiveJSON["excludedCredentialPaths"] == .array([.string("/nativeProviderCredentials")]))
         let abi = SessionABI(), store = SessionStore(), transport = SessionTransport()
         let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: abi, store: store, transport: transport, allowNewAccount: true)
         for _ in 0..<2 {

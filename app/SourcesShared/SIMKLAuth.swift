@@ -521,7 +521,7 @@ actor SIMKLAuth {
         loginAttempts.invalidate()
         return await performCredentialBoundary {
             guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
-            return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
+            return await clearCredentialsAndPublishBoundary(ownerCapture: capture, explicitNativeDisconnect: true)
         }
     }
 
@@ -861,6 +861,12 @@ actor SIMKLAuth {
                     ownerCapture: capture,
                     ownerNamespace: capture.namespace
                 ) == .success
+#if VORTX_NATIVE_DATA_ENGINE
+                if persisted {
+                    persisted = await MainActor.run { VortXSyncManager.shared.noteNativeProviderMutation([
+                        "simklAccess": .string(token), "simklExpiry": .string("0")], capture: capture, suppressImportedApply: false) }
+                }
+#endif
                 if persisted { loginAttempts.invalidate() }
                 return persisted
             }
@@ -1176,7 +1182,8 @@ actor SIMKLAuth {
     }
 
     private func clearCredentialsAndPublishBoundary(
-        ownerCapture capture: CredentialScopeRegistry.Capture
+        ownerCapture capture: CredentialScopeRegistry.Capture,
+        explicitNativeDisconnect: Bool = false
     ) async -> Bool {
         let resolvedNamespace = capture.namespace
         guard await acquirePublicationBoundary() else { return false }
@@ -1193,8 +1200,23 @@ actor SIMKLAuth {
             write: credentials.write
         ) else { return false }
         SIMKLAuthBoundary.publish(nil)
+#if VORTX_NATIVE_DATA_ENGINE
+        if explicitNativeDisconnect {
+            return await MainActor.run { VortXSyncManager.shared.noteNativeProviderMutation([
+                "simklAccess": .null, "simklExpiry": .null], capture: capture, suppressImportedApply: false) }
+        }
+#endif
         return true
     }
+#if VORTX_NATIVE_DATA_ENGINE
+    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture) async -> Bool {
+        guard ownerCapture() == capture else { return false }
+        return await performCredentialBoundary {
+            guard ownerCapture() == capture else { return false }
+            return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
+        }
+    }
+#endif
 
     private func acquirePublicationBoundary() async -> Bool {
         await CredentialPublicationOutbox.waitForBoundary() == .acquired

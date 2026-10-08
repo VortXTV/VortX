@@ -7,7 +7,7 @@ enum VortxNativeBootstrapArchive {
     enum Failure: Error { case malformed, ambiguousCredentialCarrier, opaquePreference }
     private static let credentials: Set<String> = [
         "auth", "authkey", "password", "apikey", "apikeys", "authorization", "bearer", "datakey",
-        "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials"
+        "token", "accesstoken", "refreshtoken", "authtoken", "clientsecret", "credentials", "nativeprovidercredentials"
     ]
     static func encode(document: Data, material: Data? = nil) throws -> Data {
         guard let source = try JSONSerialization.jsonObject(with: document) as? [String: Any] else { throw Failure.malformed }

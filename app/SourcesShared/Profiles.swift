@@ -205,6 +205,30 @@ final class ProfileStore: ObservableObject {
     private var nativeProjectionTarget: PlaybackMutationTarget?
     private var nativePublishedPlayback: UserProfile.PlaybackPrefs?
     private var nativePublishedDiscovery: ProfileDiscoveryPreferences?
+    static var nativePlaybackProjectionKeys: Set<String> {
+        [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle, TrackPreferences.Key.forced,
+         SubtitleStyle.Key.font, SubtitleStyle.Key.size, SubtitleStyle.Key.color, SubtitleStyle.Key.background,
+         SubtitleStyle.Key.sizeScale, SubtitleStyle.Key.brightness, SourcePreferences.orderKey,
+         SourcePreferences.addonOrderKey, SourcePreferences.excludeKey, SourcePreferences.includeKey,
+         SourcePreferences.safetyKey, SourcePreferences.hideDeadKey, SourcePreferences.instantOnlyKey,
+         SourcePreferences.maxResolutionKey, SourcePreferences.minResolutionKey, SourcePreferences.hideUnknownResKey,
+         SourcePreferences.preferredAudioKey, SourcePreferences.maxFileSizeKey, SourcePreferences.hdrOnlyKey,
+         SourcePreferences.excludeAV1Key, SourcePreferences.regexKey, SourcePreferences.preferKey,
+         SourcePreferences.avoidBehaviorKey, SourcePreferences.autoPickBestKey]
+    }
+    static let nativeThemeProjectionKeys: Set<String> = ["stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textScale"]
+    /// A projection dirty stamp may acknowledge only a value already represented by the durable
+    /// native profile. Unknown/queued/failed writes remain dirty instead of becoming global fields.
+    func nativePreferenceIsAcknowledged(_ key: String) -> Bool {
+        guard let active, CoreBridge.shared.hasNativeSession else { return false }
+        if Self.nativePlaybackProjectionKeys.contains(key) { return active.playback == currentPlaybackPrefs() }
+        if ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key) { return active.discovery == currentDiscoveryPrefs() }
+        if Self.nativeThemeProjectionKeys.contains(key) {
+            let theme = ThemeManager.shared
+            return active.accentID == theme.accentID && active.oled == theme.oled && active.textScale == theme.textScale
+        }
+        return false
+    }
     /// Called only after the native transaction's checkpoint acknowledgement. The old global
     /// roster is replaced as a presentation mirror, never unioned into native account authority.
     func applyNativeProfiles(_ incoming: [UserProfile], activeID selected: UUID) {

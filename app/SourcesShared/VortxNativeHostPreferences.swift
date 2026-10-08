@@ -28,7 +28,7 @@ struct VortxNativeHostPreferences: Sendable {
         if value == .null { return true }
         if globalBooleans.contains(key), case .bool = value { return true }
         if globalStrings.contains(key), case .string = value { return true }
-        if globalIntegers.contains(key), case .integer = value { return true }
+        if globalIntegers.contains(key), case .integer(let number) = value { return number >= Int32.min && number <= Int32.max }
         return globalArrays.contains(key) && value.array?.allSatisfy { if case .string = $0 { return true }; return false } == true
     }
     static func validActor(_ actor: String) -> Bool { UUID(uuidString: actor)?.uuidString.lowercased() == actor }

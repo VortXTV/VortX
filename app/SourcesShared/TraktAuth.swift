@@ -593,7 +593,8 @@ actor TraktAuth {
     @discardableResult
     private func signOut(
         ifCurrent expectedSession: TraktSessionID,
-        ownerCapture capture: CredentialScopeRegistry.Capture
+        ownerCapture capture: CredentialScopeRegistry.Capture,
+        explicitNativeDisconnect: Bool = false
     ) async -> Bool {
         guard CredentialScopeRegistry.shared.isCurrent(capture),
               currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return false }
@@ -601,7 +602,7 @@ actor TraktAuth {
         return await performCredentialBoundary {
             guard CredentialScopeRegistry.shared.isCurrent(capture),
                   currentSessionID(ownerNamespace: capture.namespace) == expectedSession else { return false }
-            return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
+            return await clearCredentialsAndPublishBoundary(ownerCapture: capture, explicitNativeDisconnect: explicitNativeDisconnect)
         }
     }
 
@@ -617,7 +618,7 @@ actor TraktAuth {
             loginAttempts.invalidate()
             return await performCredentialBoundary {
                 guard CredentialScopeRegistry.shared.isCurrent(capture) else { return false }
-                return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
+                return await clearCredentialsAndPublishBoundary(ownerCapture: capture, explicitNativeDisconnect: true)
             }
         }
         do {
@@ -631,7 +632,7 @@ actor TraktAuth {
         } catch {
             DiagnosticsLog.log("trakt-auth", "broker revoke failed; disconnecting locally")
         }
-        return await signOut(ifCurrent: expectedSession, ownerCapture: capture)
+        return await signOut(ifCurrent: expectedSession, ownerCapture: capture, explicitNativeDisconnect: true)
     }
 
     /// Adopt a token set that arrived from ANOTHER device over the E2E `doc.apiKeys` sync channel, so
@@ -931,6 +932,13 @@ actor TraktAuth {
                     ownerCapture: capture,
                     ownerNamespace: capture.namespace
                 ) == .success
+#if VORTX_NATIVE_DATA_ENGINE
+                if persisted {
+                    persisted = await MainActor.run { VortXSyncManager.shared.noteNativeProviderMutation([
+                        "traktAccess": .string(token.accessToken), "traktRefresh": .string(token.refreshToken),
+                        "traktExpiry": .string(String(Int(token.expiresAt.timeIntervalSince1970)))], capture: capture, suppressImportedApply: false) }
+                }
+#endif
                 if persisted { loginAttempts.invalidate() }
                 return persisted
             }
@@ -1193,6 +1201,10 @@ actor TraktAuth {
                   token.expiresIn > 0 else { throw TraktAuthError.decoding }
             // A normal refresh rotates tokens inside the same authenticated account. Never rotate the local
             // session identity here: queued work and snapshots captured before refresh remain valid.
+#if VORTX_NATIVE_DATA_ENGINE
+            guard let nativeRevision = await MainActor.run(body: { VortXSyncManager.shared.nativeProviderRevision(
+                ["traktAccess", "traktRefresh", "traktExpiry"], capture: capture) }) else { throw TraktAuthError.persistenceFailure }
+#endif
             guard CredentialScopeRegistry.shared.isCurrent(capture),
                   currentSessionID(ownerNamespace: capture.namespace) == expectedSession else {
                 throw TraktAuthError.sessionChanged
@@ -1201,6 +1213,13 @@ actor TraktAuth {
             guard storeRefreshedToken(token, ownerCapture: capture) else {
                 throw TraktAuthError.persistenceFailure
             }
+#if VORTX_NATIVE_DATA_ENGINE
+            guard await MainActor.run(body: { VortXSyncManager.shared.noteNativeProviderMutation([
+                "traktAccess": .string(token.accessToken), "traktRefresh": .string(token.refreshToken),
+                "traktExpiry": .string(String(Int(token.expiresAt.timeIntervalSince1970)))], capture: capture, expectedRevision: nativeRevision, suppressImportedApply: false) }) else {
+                throw TraktAuthError.persistenceFailure
+            }
+#endif
             return token
         }
         guard response.status == "invalid_grant" else {
@@ -1639,7 +1658,8 @@ actor TraktAuth {
     }
 
     private func clearCredentialsAndPublishBoundary(
-        ownerCapture capture: CredentialScopeRegistry.Capture
+        ownerCapture capture: CredentialScopeRegistry.Capture,
+        explicitNativeDisconnect: Bool = false
     ) async -> Bool {
         let resolvedNamespace = capture.namespace
         guard await acquirePublicationBoundary() else { return false }
@@ -1659,8 +1679,23 @@ actor TraktAuth {
             write: credentials.write
         ) else { return false }
         TraktAuthBoundary.publish(nil)
+#if VORTX_NATIVE_DATA_ENGINE
+        if explicitNativeDisconnect {
+            return await MainActor.run { VortXSyncManager.shared.noteNativeProviderMutation([
+                "traktAccess": .null, "traktRefresh": .null, "traktExpiry": .null], capture: capture, suppressImportedApply: false) }
+        }
+#endif
         return true
     }
+#if VORTX_NATIVE_DATA_ENGINE
+    func applyNativeCredentialClear(capture: CredentialScopeRegistry.Capture) async -> Bool {
+        guard ownerCapture() == capture else { return false }
+        return await performCredentialBoundary {
+            guard ownerCapture() == capture else { return false }
+            return await clearCredentialsAndPublishBoundary(ownerCapture: capture)
+        }
+    }
+#endif
 
     private func acquirePublicationBoundary() async -> Bool {
         await CredentialPublicationOutbox.waitForBoundary() == .acquired

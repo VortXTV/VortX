@@ -223,9 +223,29 @@ import CryptoKit
         check(try migrationStore.read(scope: legacyScope) == migrationState)
         _ = try await migrated.dispatch([merge], now: 13, legacyMaterial: material)
         check(try migrationStore.read(scope: legacyScope) == migrationState)
+        var acceptedMigrationState = migrationState
+        if remoteCarrier["legacyImport"]?["baseline"] != nil {
+            var clockedMaterial = try JSONSerialization.jsonObject(with: material) as! [String: Any]
+            var clockedRoster = clockedMaterial["roster"] as! [[String: Any]]
+            let ownerIndex = clockedRoster.firstIndex { $0["id"] as? String == owner.id.uuidString }!
+            clockedRoster[ownerIndex]["name"] = "Timestamped peer rename"
+            clockedMaterial["roster"] = clockedRoster; clockedMaterial["rosterModifiedSeconds"] = 1720000100.0
+            let clockedBytes = try JSONSerialization.data(withJSONObject: clockedMaterial)
+            _ = try await migrated.dispatch([#"{"type":"get_state"}"#], now: 1720000200, legacyMaterial: clockedBytes)
+            acceptedMigrationState = try await migrated.stateJSON()
+            let acceptedState = try JSONDecoder().decode(VortxJSON.self, from: Data(acceptedMigrationState.utf8))
+            check(acceptedState["roster"]?["profiles"]?[owner.id.uuidString]?["name"] == .string("Timestamped peer rename"))
+            check(acceptedState["nativeSync"]?["legacyImport"]?["fingerprint"] == remoteCarrier["legacyImport"]?["fingerprint"])
+            check(try migrationStore.readLegacyMaterial(scope: legacyScope).map { try JSONDecoder().decode(VortxJSON.self, from: $0) } == JSONDecoder().decode(VortxJSON.self, from: material))
+            _ = try await migrated.dispatch([#"{"type":"get_state"}"#], now: 1720000300, legacyMaterial: material)
+            check(try await migrated.stateJSON() == acceptedMigrationState) // acknowledged ancestor cannot undo rename
+            try VortxNativeSession.validateLegacyCompatibility(scope: legacyScope, ownerName: owner.name, snapshot: nil,
+                nativeSync: acceptedState["nativeSync"], material: clockedBytes, abi: VortxCABI())
+            print("Live private legacy reconciliation: clocked peer rename, immutable original receipt/archive, ancestor no-op and cold native peer admission passed")
+        }
         await migrated.close()
         let migratedCold = try VortxNativeSession(scope: legacyScope, ownerName: "Owner", abi: VortxCABI(), store: migrationStore, transport: VortxCResourceTransport())
-        check(try await migratedCold.stateJSON() == migrationState)
+        check(try await migratedCold.stateJSON() == acceptedMigrationState)
         _ = try await migratedCold.dispatch([#"{"type":"switch_profile","id":"10000000-0000-0000-0000-000000000001"}"#], now: 11)
         check(try await migratedCold.resumeSeconds(id: "opaque-episode", profileID: child.id.uuidString) == 12.345)
         let profilesFacade = try await VortxNativeCoreFacade.create(session: migratedCold, registry: [], changed: { _ in })

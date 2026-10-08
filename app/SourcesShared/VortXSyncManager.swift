@@ -231,9 +231,108 @@ final class VortXSyncManager: ObservableObject {
     private var nativeCheckpointGeneration = UUID()
     private(set) var nativeCheckpointStatus = "not_started"
     private var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
+    private func nativeProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        let bytes: Data?
+        switch Keychain.confirmedString("vortx.native.providerState." + capture.namespace) {
+        case .missing: bytes = nil
+        case .value(let value): bytes = Data(value.utf8)
+        case .failure: throw VortxNativeError.unavailable
+        }
+        return try VortxNativeProviderCredentials(scope: capture.namespace, actor: nativeHostActor(capture: capture), sealed: bytes)
+    }
+    private func saveNativeProviderState(_ value: VortxNativeProviderCredentials, capture: CredentialScopeRegistry.Capture) throws {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        let slot = "vortx.native.providerState." + capture.namespace
+        let encoded = String(decoding: try value.encoded(), as: UTF8.self)
+        guard Keychain.set(encoded, for: slot), Keychain.string(slot) == encoded else { throw VortxNativeError.unavailable }
+    }
+    /// Called only after a successful account-scoped secure mutation, never on bind/sign-out.
+    /// The caller rolls its mutation back if the durable explicit intent cannot be recorded.
+    func nativeProviderRevision(_ keys: [String], capture: CredentialScopeRegistry.Capture) -> [String: String]? {
+        guard let state = try? nativeProviderState(capture: capture) else { return nil }
+        return Dictionary(uniqueKeysWithValues: keys.map { key in
+            (key, state.local.document.fields[key].map { String($0.clock) + ":" + $0.actor } ?? "absent")
+        })
+    }
+    func noteNativeProviderMutation(_ fields: [String: VortxJSON], capture: CredentialScopeRegistry.Capture,
+                                    expectedRevision: [String: String]? = nil, suppressImportedApply: Bool = true) -> Bool {
+        guard isCurrent(capture) else { return false }
+        guard (!suppressImportedApply || !isApplyingRemote), case .account = capture.scope else { return true }
+        do {
+            var state = try nativeProviderState(capture: capture)
+            if let expectedRevision {
+                guard nativeProviderRevision(Array(fields.keys), capture: capture) == expectedRevision else { return false }
+            }
+            try state.edit(fields); try saveNativeProviderState(state, capture: capture)
+            requestSyncSoon()
+            if isApplyingRemote { Task { @MainActor [weak self] in guard let self, self.isCurrent(capture) else { return }; self.requestSyncSoon() } }
+            return true
+        } catch { return false }
+    }
+    private func mergedNativeProviderState(_ document: [String: Any], capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
+        var state = try nativeProviderState(capture: capture)
+        if let raw = document["nativeProviderCredentials"] {
+            let wire = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: raw))
+            // A legacy peer editing a registered key without its event is not silently promoted.
+            let remote = try wire.decode(VortxNativeProviderCredentials.Document.self)
+            let keys = (document["apiKeys"] as? [String: Any]) ?? [:]
+            let metadata = (keys["metadata"] as? [String: Any]) ?? [:]
+            for (key, event) in remote.fields {
+                let aliases = [keys[key], ["tmdb", "mdblist", "fanart"].contains(key) ? metadata[key] : nil].compactMap { $0 }
+                if case .string(let value) = event.value {
+                    guard !aliases.isEmpty, aliases.allSatisfy({ ($0 as? String) == value }) else { throw VortxNativeError.invalidSnapshot }
+                } else { guard aliases.isEmpty else { throw VortxNativeError.invalidSnapshot } }
+            }
+            try state.merge(wire)
+        }
+        return state
+    }
+    private func mirrorNativeProviderKeys(_ state: VortxNativeProviderCredentials, original: Any?) throws -> [String: Any] {
+        guard original == nil || original is [String: Any] else { throw VortxNativeError.invalidSnapshot }
+        var keys = (original as? [String: Any]) ?? [:]
+        guard keys["metadata"] == nil || keys["metadata"] is [String: Any] else { throw VortxNativeError.invalidSnapshot }
+        var metadata = (keys["metadata"] as? [String: Any]) ?? [:]
+        for (key, event) in state.local.document.fields {
+            let value: String? = if case .string(let value) = event.value { value } else { nil }
+            keys[key] = value
+            if ["tmdb", "mdblist", "fanart"].contains(key) { metadata[key] = value }
+        }
+        if keys["metadata"] != nil || !metadata.isEmpty { keys["metadata"] = metadata }
+        return keys
+    }
+    private func acknowledgeNativeProviders(_ document: [String: Any], capture: CredentialScopeRegistry.Capture) throws {
+        guard let raw = document["nativeProviderCredentials"] else { return }
+        let sent = try JSONDecoder().decode(VortxNativeProviderCredentials.Document.self, from: JSONSerialization.data(withJSONObject: raw))
+        guard sent.scope == capture.namespace else { throw VortxNativeError.invalidSnapshot }
+        var state = try nativeProviderState(capture: capture)
+        state.acknowledge(sent.fields); try saveNativeProviderState(state, capture: capture)
+    }
+    private func persistMergedNativeProviders(_ candidate: VortxNativeProviderCredentials, capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
+        // A credential edit can arrive during the kernel await. Never replace that newer intent
+        // with the pre-await copy; merge again against the current secure state before publishing.
+        var current = try nativeProviderState(capture: capture)
+        try current.merge(candidate.document)
+        try saveNativeProviderState(current, capture: capture)
+        return current
+    }
+    private func retireNativeProviderApply(_ service: ProviderApplyService, capture: CredentialScopeRegistry.Capture) {
+        guard let pending = pendingProviderApply, pending.capture == capture else { return }
+        var values = pending.values; values.removeValue(forKey: service)
+        var failures = pending.failedServices; failures.remove(service)
+        pendingProviderApply = values.isEmpty ? nil : PendingProviderApply(capture: capture, version: pending.version, values: values, failedServices: failures)
+    }
     private func nativeGlobalEdits() throws -> [VortxNativeHostPreferences.Edit] {
         var fields: [String: VortxJSON] = [:]
         for key in dirtySettings.keys {
+            // Old installations can retain dirty stamps for values now explicitly device-local.
+            // They neither enter a shared carrier nor prevent unrelated native state from syncing.
+            if !SettingsBackup.isSyncable(key) || ["stremiox.profiles.active", "stremiox.activeProfileId"].contains(key) { continue }
+            if ProfileStore.nativePlaybackProjectionKeys.contains(key) || ProfileStore.nativeThemeProjectionKeys.contains(key)
+                || ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key) {
+                guard ProfileStore.shared.nativePreferenceIsAcknowledged(key) else { throw VortxNativeError.invalidSnapshot }
+                continue
+            }
             guard VortxNativeHostPreferences.knownGlobals.contains(key) else { throw VortxNativeError.invalidSnapshot }
             let object = UserDefaults.standard.object(forKey: key)
             let value = try object.map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0, options: .fragmentsAllowed)) } ?? .null
@@ -423,6 +522,7 @@ final class VortXSyncManager: ObservableObject {
             guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { return false }
             do {
                 let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owners[0].id.uuidString)
+                _ = try self.mergedNativeProviderState(document, capture: capture) // validate before any native checkpoint commit
                 let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
                     .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
                 let documentBytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys, .withoutEscapingSlashes])
@@ -1871,6 +1971,7 @@ final class VortXSyncManager: ObservableObject {
         if accepted {
 #if VORTX_NATIVE_DATA_ENGINE
             guard rememberNativeBackup(capture: capture) else { return .error }
+            do { try acknowledgeNativeProviders(obj, capture: capture) } catch { return .error }
 #endif
             lastSyncedVersion = max(lastSyncedVersion, version)
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
@@ -2483,6 +2584,7 @@ final class VortXSyncManager: ObservableObject {
         guard VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: (try? nativeGlobalEdits()) == nil,
                                                                 hasLegacyAddonOrderIntent: orderIntent != nil || pendingAddonOrderIntent != nil) else { return nil }
         do {
+            var providers = try mergedNativeProviderState(doc, capture: capture)
             let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
             let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
             let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture,
@@ -2490,6 +2592,9 @@ final class VortXSyncManager: ObservableObject {
             guard isCurrent(capture) else { return nil }
             doc["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["nativeSync"]!))
             doc["nativeHostPreferences"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["nativeHostPreferences"]!))
+            providers = try persistMergedNativeProviders(providers, capture: capture)
+            doc["nativeProviderCredentials"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(providers.document))
+            doc["apiKeys"] = try mirrorNativeProviderKeys(providers, original: doc["apiKeys"])
             applyNativeGlobals(merged["nativeHostPreferences"]!)
         } catch { return nil }
         // Never rewrite the legacy migration baseline from native/profile/overlay mirrors. Until
@@ -2769,9 +2874,10 @@ final class VortXSyncManager: ObservableObject {
         case .apply:
             break
         }
-        let doc = pulled.doc
+        var doc = pulled.doc
 #if VORTX_NATIVE_DATA_ENGINE
         do {
+            var providers = try mergedNativeProviderState(doc, capture: capture)
             let material = try Self.nativeLegacyMaterial(doc)
             if CoreBridge.shared.hasNativeSession {
                 let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
@@ -2780,6 +2886,20 @@ final class VortXSyncManager: ObservableObject {
                 guard isCurrent(capture) else { return false }
                 applyNativeGlobals(merged["nativeHostPreferences"]!)
             }
+            providers = try persistMergedNativeProviders(providers, capture: capture)
+            let mirrored = try mirrorNativeProviderKeys(providers, original: doc["apiKeys"])
+            var keys = mirrored.compactMapValues { $0 as? String }
+            if providers.local.document.fields["traktAccess"]?.value == .null {
+                guard await TraktAuth.shared.applyNativeCredentialClear(capture: capture), isCurrent(capture) else { return false }
+                retireNativeProviderApply(.trakt, capture: capture)
+            }
+            if providers.local.document.fields["simklAccess"]?.value == .null {
+                guard await SIMKLAuth.shared.applyNativeCredentialClear(capture: capture), isCurrent(capture) else { return false }
+                retireNativeProviderApply(.simkl, capture: capture)
+            }
+            // Empty strings are a local secure-store apply instruction, never emitted on wire.
+            for (key, event) in providers.local.document.fields where event.value == .null { keys[key] = "" }
+            doc["apiKeys"] = keys
         } catch { return false }
 #endif
         var restored = false
@@ -3183,6 +3303,18 @@ final class VortXSyncManager: ObservableObject {
         pendingProviderApply = providerPlan
         }   // end withRemoteApplySuppressed
         guard isCurrent(capture), pendingDebridServices.isEmpty else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        if let keys = doc["apiKeys"] as? [String: String] {
+            for (name, slot) in [("tmdb", ApiKeySlots.tmdb(capture.scope)), ("mdblist", ApiKeySlots.mdblist(capture.scope)), ("fanart", ApiKeySlots.fanart(capture.scope))] {
+                guard let expected = keys[name] else { continue }
+                switch Keychain.confirmedString(slot) {
+                case .missing where expected.isEmpty: break
+                case .value(let actual) where actual == expected: break
+                default: return false
+                }
+            }
+        }
+#endif
         let providerSettlement: CredentialProviderRetryOutcome
         if let pending = providerPlan {
             providerSettlement = await CredentialRetryCoordinator.finalizeProviders(
