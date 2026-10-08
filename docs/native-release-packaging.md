@@ -1,9 +1,10 @@
 # Native release packaging
 
-The native build selection is explicit and fail-closed. It is separate from approval of a
-default cutover, migration parity, physical playback, signing and publication. The retained
-`app/project.yml` still generates the legacy comparison project; production cutover changes
-remain subject to the migration, independent review and full build gates.
+The 0.5 shipping paths select the native engine by default and fail closed when its required
+state or artifacts are unavailable. Source selection does not itself establish migration parity,
+physical playback, signing or publication. The retained `app/project.yml` still generates the
+legacy comparison project; the shipping workflow uses the native generator below. All migration,
+independent review, full-build and artifact gates remain required before publication.
 
 ## Apple
 
@@ -35,16 +36,21 @@ command compares the extracted IPA or mounted DMG with the accepted app payload,
 the existing signing operation; mounted Mac apps must also pass deep, strict signature validation.
 The helper requires Python 3.9 or newer and Apple's binary/signing tools.
 
-The protected Apple workflow exposes `native_only` as an explicit, initially off build input.
-That path requires an exact reviewed MPV archive URL and SHA-256 and rejects the older published
-artifact. ABI, aggregate deployment/OSO, simulator launch/dSYM, signing, immutable handoff, feed
-and draft publication gates continue to run. Input, app and final package receipts travel in the
-immutable app handoff. The coordinator retains publication authority.
+The protected Apple workflow defaults `native_only` to true and uses the same effective native
+selection on push events, where dispatch inputs are absent. Explicit false is an artifact-only
+comparison: it cannot target or publish a release, including through coordinator resume. Native
+builds use the pinned reviewed MPV archive and SHA-256; an optional override must supply both and
+still passes the content gate. ABI, aggregate deployment/OSO, simulator launch/dSYM, signing,
+immutable handoff, feed and draft publication gates continue to run. Input, app and final package
+receipts travel in the immutable app handoff. The coordinator retains publication authority.
 
 ## Android
 
-`vortx.nativeEngine=true` requires `vortx.nativeResourceHost=true`; both the repository selection
-in BuildConfig and the Cargo resource-host feature follow these decisions. Native mode excludes
+Absent overrides select `vortx.nativeEngine=true` and a matching resource-host default. An explicit
+Gradle property takes precedence over the environment; false or blank retains comparison mode,
+and malformed values fail configuration. `vortx.nativeEngine=true` requires the resolved
+`vortx.nativeResourceHost=true`; both the repository selection in BuildConfig and the Cargo
+resource-host feature follow these decisions. Native mode excludes
 `libstremiox_core.so` and does not attach the legacy Cargo task/output. Explicit non-native
 comparison builds retain the legacy route.
 

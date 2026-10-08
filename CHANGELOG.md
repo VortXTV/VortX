@@ -6,8 +6,8 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.5.0-beta.1 - Draft: Native core, Cinema, and durable watch state
 
-**Unpublished release candidate.** Apple build **260** and Android version code **241** are
-proposed, not yet set or package-verified. The reviewed source since Beta 21 adds VortX's own
+**Unpublished release candidate.** Source identity is **0.5.0**, Apple build **260** and Android
+version code **241**; final packages are not yet verified. The reviewed source since Beta 21 adds VortX's own
 native account/resource/streaming path; encrypted checkpoint-first mutation and recovery;
 profile-qualified independent streaming accounts; acknowledged per-title Watchlist edits;
 source-backed watched-bitmap migration with retained pending history and historical Retry;
@@ -19,10 +19,11 @@ backgrounds; native NNTP article concurrency and seek cancellation; and fresh FF
 Apple SecureTransport MPV build inputs with the Mac CoreAudio lifecycle repair.
 
 Existing Beta 21 player controls, integrations, downloads, catalog/source workflows and
-profile/account fixes are retained. Complete native CI and focused fixtures have passed;
-Android watched/Watchlist host completion, native-default/package activation, final Apple
-whole-app rebuilding, combined Android checks, versions, signing, deployment and physical
-device/provider acceptance remain pending. No public release, installation or universal
+profile/account fixes are retained. Complete native CI, focused fixtures, native Mac Debug
+compilation and 514 combined Android tests have passed. Both watched/Watchlist hosts and native
+shipping selection are integrated. Fresh final SDK/optimized whole-app rebuilding, actual
+package versions, signing, deployment and physical device/provider acceptance remain pending.
+No public release, installation or universal
 playback/parity closure is established by this entry.
 
 See [the draft 0.5 Beta 1 notes](docs/releases/0.5.0-beta.1.md) for the full behavior, retained

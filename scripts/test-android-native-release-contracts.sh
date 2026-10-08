@@ -42,10 +42,12 @@ require_regex() {
 # One resolver drives both BuildConfig and Cargo feature selection. Gradle properties take
 # precedence over environment values, malformed values fail during configuration, and native=true
 # cannot reach compilation without resource-host=true.
-require_literal "Gradle owns one native boolean resolver" 'fun nativeBooleanFlag(propertyName: String, environmentName: String)' "$GRADLE_BUILD"
-require_literal "native mode remains false unless explicitly selected" 'null, "", "false", "0" -> false' "$GRADLE_BUILD"
-require_literal "Gradle resolves the native application mode once" 'val nativeEngineEnabled = nativeBooleanFlag("vortx.nativeEngine", "VORTX_NATIVE_ENGINE")' "$GRADLE_BUILD"
-require_literal "Gradle resolves the resource-host mode once" 'val nativeResourceHostEnabled = nativeBooleanFlag("vortx.nativeResourceHost", "VORTX_NATIVE_RESOURCE_HOST")' "$GRADLE_BUILD"
+require_literal "Gradle owns one native boolean resolver" 'fun nativeBooleanFlag(propertyName: String, environmentName: String, defaultValue: Boolean)' "$GRADLE_BUILD"
+require_literal "only an absent selection adopts the default" 'null -> defaultValue' "$GRADLE_BUILD"
+require_literal "explicit false or blank retains non-native comparison mode" '"", "false", "0" -> false' "$GRADLE_BUILD"
+require_literal "an explicit Gradle property precedes the environment" 'val raw = property?.trim() ?: System.getenv(environmentName)?.trim()' "$GRADLE_BUILD"
+require_literal "Gradle defaults the native application mode on" 'val nativeEngineEnabled = nativeBooleanFlag("vortx.nativeEngine", "VORTX_NATIVE_ENGINE", defaultValue = true)' "$GRADLE_BUILD"
+require_literal "the resource-host default follows the resolved application mode" 'val nativeResourceHostEnabled = nativeBooleanFlag("vortx.nativeResourceHost", "VORTX_NATIVE_RESOURCE_HOST", defaultValue = nativeEngineEnabled)' "$GRADLE_BUILD"
 require_literal "native mode fails closed without resource-host" 'if (nativeEngineEnabled && !nativeResourceHostEnabled)' "$GRADLE_BUILD"
 require_literal "BuildConfig is derived from the resolved native mode" 'buildConfigField("boolean", "NATIVE_ENGINE_ENABLED", nativeEngineEnabled.toString())' "$GRADLE_BUILD"
 require_literal "resource-host compilation is an explicit Cargo feature" '"jni,server,resource-host"' "$GRADLE_BUILD"

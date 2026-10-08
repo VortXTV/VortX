@@ -70,6 +70,9 @@ jobs:
           yes | sdkmanager "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
+      - name: Prove native defaults and explicit comparison selection
+        run: bash scripts/test-android-native-selection.sh
+
       - name: Exercise signer parsing and strict verification fixtures
         run: |
           bash scripts/test-android-release-signing.sh

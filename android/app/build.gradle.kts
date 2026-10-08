@@ -36,11 +36,12 @@ fun externalSyncSecret(name: String): String =
 // turn a locally-exported flag off; CI passes both properties on every native release invocation.
 // The resource-host feature is required whenever the application selects the native repository
 // (VortxResourceBridge and native sync/playback call these symbols during startup).
-fun nativeBooleanFlag(propertyName: String, environmentName: String): Boolean {
+fun nativeBooleanFlag(propertyName: String, environmentName: String, defaultValue: Boolean): Boolean {
     val property = project.findProperty(propertyName) as? String
     val raw = property?.trim() ?: System.getenv(environmentName)?.trim()
     return when (raw?.lowercase()) {
-        null, "", "false", "0" -> false
+        null -> defaultValue
+        "", "false", "0" -> false
         "true", "1" -> true
         else -> throw GradleException(
             "$propertyName / $environmentName must be true/false or 1/0 (got '$raw')",
@@ -48,8 +49,11 @@ fun nativeBooleanFlag(propertyName: String, environmentName: String): Boolean {
     }
 }
 
-val nativeEngineEnabled = nativeBooleanFlag("vortx.nativeEngine", "VORTX_NATIVE_ENGINE")
-val nativeResourceHostEnabled = nativeBooleanFlag("vortx.nativeResourceHost", "VORTX_NATIVE_RESOURCE_HOST")
+// 0.5 ships native by default. An explicit false/blank still selects the retained comparison
+// mode, including when it overrides an exported environment flag. With no independent override,
+// resource-host follows that same selection rather than silently disagreeing with BuildConfig.
+val nativeEngineEnabled = nativeBooleanFlag("vortx.nativeEngine", "VORTX_NATIVE_ENGINE", defaultValue = true)
+val nativeResourceHostEnabled = nativeBooleanFlag("vortx.nativeResourceHost", "VORTX_NATIVE_RESOURCE_HOST", defaultValue = nativeEngineEnabled)
 if (nativeEngineEnabled && !nativeResourceHostEnabled) {
     throw GradleException(
         "Native engine selection is fail-closed: vortx.nativeEngine=true requires " +
@@ -128,10 +132,10 @@ android {
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
         targetSdk = 36
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 240
-        versionName = "0.4.0"
+        versionCode = 241
+        versionName = "0.5.0"
 
-        // Explicit selection only; missing native session/artifact fails closed and never falls back
+        // Native selection by default; missing native session/artifact fails closed and never falls back
         // to Stremio or previews. This value is resolved from the same property/env contract that
         // selects the resource-host Cargo feature below, so a release cannot compile one mode and
         // advertise another through BuildConfig.
