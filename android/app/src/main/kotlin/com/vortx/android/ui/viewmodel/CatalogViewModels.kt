@@ -872,17 +872,12 @@ internal suspend fun awaitContinueWatchingAbsent(
     timeoutMs: Long = 3_000L,
     pollMs: Long = 75L,
 ): Boolean = withTimeoutOrNull(timeoutMs) {
-    var confirmed = false
-    while (!confirmed) {
-        val authoritative = snapshot().getOrNull() ?: break
-        if (authoritative.owner != target.owner) break
-        if (authoritative.items.none { it.id == target.id && it.type == target.type }) {
-            confirmed = true
-            break
-        }
+    var authoritative = snapshot().getOrNull() ?: return@withTimeoutOrNull false
+    while (authoritative.owner == target.owner && authoritative.items.any { it.id == target.id && it.type == target.type }) {
         delay(pollMs)
+        authoritative = snapshot().getOrNull() ?: return@withTimeoutOrNull false
     }
-    confirmed
+    authoritative.owner == target.owner
 } ?: false
 
 internal class DiscoverPaginationState {
