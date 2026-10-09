@@ -1400,9 +1400,22 @@ jobs:
               .path == ".github/workflows/release-tvos.yml" and .event == "workflow_dispatch" and .head_sha == $sha and .head_branch == $branch and
               .status == "completed" and (.conclusion == "success" or .conclusion == "failure")' "$RECORD" >/dev/null
           done
+          # One-cut retry of a proven pre-write identity failure. This admits only the already
+          # accepted build bytes; the fresh draft/tag/content checks below still run unchanged.
+          PREWRITE_RETRY=false
+          if [ "$RUN_ID" = 37948656496 ] && [ "$ATTEMPT" = 1 ] &&
+             [ "$BUILD_WORKFLOW_SHA" = 2eb740ee611c6a602f1d54679b5e5b13daeb7ce4 ] &&
+             [ "$BUILD_SOURCE_SHA" = 844782d29a93ae51991bfadc639d50bc3619d40b ] &&
+             [ "$BUILD_BRANCH" = main ] && [ "$TAG" = v0.5.0-beta.1 ] &&
+             [ "$RELEASE_ID_INPUT" = 407572242 ] && [ "$(jq -r '.build' <<<"$RESUME_HANDOFF")" = 260 ] &&
+             [ "$APPS_ID" = 11630735650 ] && [ "$FEED_ID" = 11630250815 ]; then
+            jq -e '.conclusion == "failure"' "$RUNNER_TEMP/source-latest-run.json" >/dev/null
+            jq -e '.conclusion == "failure"' "$RUNNER_TEMP/source-run.json" >/dev/null
+            PREWRITE_RETRY=true
+          fi
           # Paginate before flattening: a missing build or a truncated job list never implies success.
           gh api --paginate --slurp -- "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" | jq '[.[].jobs[]]' > "$RUNNER_TEMP/source-jobs.json"
-          jq -e --arg sha "$BUILD_WORKFLOW_SHA" --argjson recovered "$RECOVERED" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" --slurpfile source "$RUNNER_TEMP/source-run.json" '
+          jq -e --arg sha "$BUILD_WORKFLOW_SHA" --argjson recovered "$RECOVERED" --argjson prewrite "$PREWRITE_RETRY" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" --slurpfile source "$RUNNER_TEMP/source-run.json" '
             all(.[]; .run_id == $run and .run_attempt == $attempt and .head_sha == $sha and .status == "completed") and
             ([.[] | select(.name == "build-tvos" and .conclusion == "success")] | length == 1) and
             ([.[] | select(.name == "build-tvos")] | length == 1) and
@@ -1411,13 +1424,30 @@ jobs:
               ([.[] | select(.name == "build-tvos") | .steps[] | select(.name == "Verify immutable recovered source checkout" and .status == "completed" and .conclusion == "success")] | length == 1)
              else true end) and
             ([.[] | select(.name == "attach-release")] | length == 1) and
+            (if $prewrite then
+              ([.[] | select(.conclusion == "failure")] | map(.name) == ["attach-release"]) and
+              all(.[]; .conclusion == "success" or .conclusion == "failure" or .conclusion == "skipped") and
+              ([.[] | select(.name == "build-tvos" and .id == 113881434421)] | length == 1) and
+              all(.[] | select(.name == "build-tvos") | .steps[]; .status == "completed" and (.conclusion == "success" or .conclusion == "skipped")) and
+              ([.[] | select(.name == "attach-release" and .id == 113915206994 and .conclusion == "failure")] | length == 1) and
+              all(.[] | select(.name == "attach-release") | .steps[]; .status == "completed") and
+              ([.[] | select(.name == "attach-release") | .steps[] | select(.conclusion == "failure")] | map(.name) == ["Bind the draft release, tag commit, and monotonic source before any write"]) and
+              ([.[] | select(.name == "attach-release") | .steps[] | select(.name == "Bind the draft release, tag commit, and monotonic source before any write")] | length == 1) and
+              ([.[] | select(.name == "attach-release")] | .[0].steps as $steps |
+                all(["Validate immutable handoff provenance before coordinator resume", "Download and authenticate immutable handoff archives"][]; . as $name |
+                  ([$steps[] | select(.name == $name)] | length == 1) and
+                  ([$steps[] | select(.name == $name and .status == "completed" and .conclusion == "success")] | length == 1)) and
+                all(["Attach only exact draft assets and create the authenticated staged receipt", "Atomically activate the staged feed, prove routes, then publish last"][]; . as $name |
+                  ([$steps[] | select(.name == $name)] | length == 1) and
+                  ([$steps[] | select(.name == $name and .status == "completed" and .conclusion == "skipped")] | length == 1)))
+            else
             ([.[] | select(.name == "attach-release") | .steps[] | select(.name == "Attach only exact draft assets and create the authenticated staged receipt" and .status == "completed" and .conclusion == "success")] | length == 1) and
             (if $source[0].conclusion == "failure" then
               ([.[] | select(.conclusion == "failure")] | map(.name) == ["attach-release"]) and
               ([.[] | select(.conclusion != "success" and .conclusion != "failure" and .conclusion != "skipped")] | length == 0) and
               ([.[] | select(.name == "attach-release") | .steps[] | select(.conclusion == "failure")] | map(.name) == ["Atomically activate the staged feed, prove routes, then publish last"])
             else all(.[]; .conclusion == "success" or .conclusion == "skipped") and
-              ([.[] | select(.name == "attach-release" and .conclusion == "success")] | length == 1) end)' "$RUNNER_TEMP/source-jobs.json" >/dev/null
+              ([.[] | select(.name == "attach-release" and .conclusion == "success")] | length == 1) end) end)' "$RUNNER_TEMP/source-jobs.json" >/dev/null
           for SPEC in "$APPS_ID|VortX-tvOS-ci|Upload the immutable app handoff" "$FEED_ID|VortX-release-feed|Upload the immutable feed handoff"; do
             ID="${SPEC%%|*}"; REST="${SPEC#*|}"; NAME="${REST%%|*}"; UPLOAD_STEP="${REST#*|}"
             gh api -- "repos/$GH_REPO/actions/artifacts/$ID" > "$RUNNER_TEMP/source-artifact.json"
@@ -1429,6 +1459,13 @@ jobs:
               .workflow_run.repository_id == $run.repository.id and .workflow_run.head_repository_id == $run.head_repository.id and
               ([$jobs[0][] | select(.name == "build-tvos") | .steps[] | select(.name == $step and .conclusion == "success" and .status == "completed") |
                 select(.started_at <= $artifact.created_at and .completed_at >= $artifact.created_at)] | length == 1)' "$RUNNER_TEMP/source-artifact.json" >/dev/null
+            if [ "$PREWRITE_RETRY" = true ]; then
+              jq -e 'if .id == 11630735650 then
+                .size_in_bytes == 207345211 and .digest == "sha256:e312b5d76a2225ea875cd91d588d877f81a2e53ff808cbe33ce95213d6e85076"
+                elif .id == 11630250815 then
+                .size_in_bytes == 42877 and .digest == "sha256:606daa234f9394dd45e3b05675ca040de8fa45ea3a5f0c5017230e8542a1918e"
+                else false end' "$RUNNER_TEMP/source-artifact.json" >/dev/null
+            fi
           done
           {
             echo "build_source_sha=$BUILD_SOURCE_SHA"
@@ -1893,7 +1930,7 @@ jobs:
             local current
             current="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
             if [ -n "$current" ] && [ -n "${PUBLISHED_AT:-}" ] && jq -e --arg tag "$TAG" --arg published "$PUBLISHED_AT" --argjson prerelease "$IS_PRERELEASE" '.tag_name == $tag and .prerelease == $prerelease and .draft == false and .published_at == $published' <<<"$current" >/dev/null; then
-              restored="$(gh api --method PATCH -F draft=true -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
+              restored="$(gh api --method PATCH -F draft=true -f tag_name="$TAG" -- "repos/$GH_REPO/releases/$RELEASE_ID" 2>/dev/null || true)"
               jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" --argjson prerelease "$IS_PRERELEASE" '.id == $id and .tag_name == $tag and .prerelease == $prerelease and .draft == true' <<<"$restored" >/dev/null || { echo "::error::incident: GitHub could not restore release $RELEASE_ID to draft"; ROLLBACK_FAILURE=1; }
             elif [ -n "${PUBLISHED_AT:-}" ]; then
               echo "::error::incident: release rollback identity changed before restore"
@@ -1995,7 +2032,7 @@ jobs:
           PUBLISHED=0
           while [ "$(date +%s)" -lt "$PUBLISH_DEADLINE" ]; do
             if [ -z "${PUBLISHED_AT:-}" ]; then
-              RELEASE_JSON="$(gh api --method PATCH -F draft=false -- "repos/$GH_REPO/releases/$RELEASE_ID" || true)"
+              RELEASE_JSON="$(gh api --method PATCH -F draft=false -f tag_name="$TAG" -- "repos/$GH_REPO/releases/$RELEASE_ID" || true)"
             else
               RELEASE_JSON="$(gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" || true)"
             fi
@@ -2010,7 +2047,7 @@ jobs:
             LATEST_JSON='{}'
             if [ "$IS_PRERELEASE" = false ]; then
               # A draft cannot be Latest. Prove publication first, then make this separate transition.
-              LATEST_UPDATE="$(gh api --method PATCH -f make_latest=true -- "repos/$GH_REPO/releases/$RELEASE_ID" || true)"
+              LATEST_UPDATE="$(gh api --method PATCH -f make_latest=true -f tag_name="$TAG" -- "repos/$GH_REPO/releases/$RELEASE_ID" || true)"
               if ! jq -e --arg tag "$TAG" --arg published "$PUBLISHED_AT" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .prerelease == false and .published_at == $published' <<<"$LATEST_UPDATE" >/dev/null; then
                 sleep 5
                 continue

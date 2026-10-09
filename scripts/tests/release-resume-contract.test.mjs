@@ -45,11 +45,11 @@ gh() {
     repos/VortXTV/VortX/git/ref/heads/main) jq -r . "$RUNNER_TEMP/main.json" ;;
     repos/VortXTV/VortX/compare/${handoff.sourceCommit ?? sha}...${code}) command cat "$RUNNER_TEMP/comparison.json" ;;
     repos/VortXTV/VortX/compare/${data.run.head_sha}...${code}) command cat "$RUNNER_TEMP/workflowComparison.json" ;;
-    repos/VortXTV/VortX/actions/runs/123) command cat "$RUNNER_TEMP/latest.json" ;;
-    repos/VortXTV/VortX/actions/runs/123/attempts/2) command cat "$RUNNER_TEMP/run.json" ;;
-    repos/VortXTV/VortX/actions/runs/123/attempts/2/jobs?per_page=100) jq '[{jobs:.}]' "$RUNNER_TEMP/jobs.json" ;;
-    repos/VortXTV/VortX/actions/artifacts/456) command cat "$RUNNER_TEMP/apps.json" ;;
-    repos/VortXTV/VortX/actions/artifacts/457) command cat "$RUNNER_TEMP/feed.json" ;;
+    repos/VortXTV/VortX/actions/runs/${handoff.runId ?? resume.runId}) command cat "$RUNNER_TEMP/latest.json" ;;
+    repos/VortXTV/VortX/actions/runs/${handoff.runId ?? resume.runId}/attempts/${handoff.attempt ?? resume.attempt}) command cat "$RUNNER_TEMP/run.json" ;;
+    repos/VortXTV/VortX/actions/runs/${handoff.runId ?? resume.runId}/attempts/${handoff.attempt ?? resume.attempt}/jobs?per_page=100) jq '[{jobs:.}]' "$RUNNER_TEMP/jobs.json" ;;
+    repos/VortXTV/VortX/actions/artifacts/${handoff.appsArtifactId ?? resume.appsArtifactId}) command cat "$RUNNER_TEMP/apps.json" ;;
+    repos/VortXTV/VortX/actions/artifacts/${handoff.feedArtifactId ?? resume.feedArtifactId}) command cat "$RUNNER_TEMP/feed.json" ;;
     *) echo 'unexpected API request' >&2; return 88 ;;
   esac
 }
@@ -122,6 +122,132 @@ test('executable provenance accepts coordinator-only failure and keeps code/buil
   assert.equal(normal.status, 0);
   assert.equal(normal.outputs, `build_source_sha=${code}\nbuild_workflow_sha=${code}\nbuild_run_id=789\nbuild_attempt=1\nbuild_branch=${tag}\napps_id=456\nfeed_id=457\n`);
 });
+
+const prewriteInput = { runId: 37948656496, attempt: 1, appsArtifactId: 11630735650, feedArtifactId: 11630250815,
+  sourceCommit: '844782d29a93ae51991bfadc639d50bc3619d40b', build: '260' };
+const prewriteEnv = { TAG: 'v0.5.0-beta.1', RELEASE_ID_INPUT: '407572242' };
+function prewriteEvidence() {
+  const data = evidence(), workflowSha = '2eb740ee611c6a602f1d54679b5e5b13daeb7ce4';
+  for (const run of [data.run, data.latest]) Object.assign(run, { id: prewriteInput.runId, run_attempt: 1, head_sha: workflowSha, head_branch: 'main' });
+  for (const job of data.jobs) Object.assign(job, { run_id: prewriteInput.runId, run_attempt: 1, head_sha: workflowSha });
+  data.jobs[0].id = 113881434421;
+  data.jobs[0].steps.push(upload('Validate immutable Beta 1 source recovery'), upload('Verify immutable recovered source checkout'));
+  data.jobs[1].id = 113915206994;
+  data.jobs[1].steps = [upload('Validate immutable handoff provenance before coordinator resume'), upload('Download and authenticate immutable handoff archives'),
+    { ...upload('Bind the draft release, tag commit, and monotonic source before any write'), conclusion: 'failure' },
+    ...['Attach only exact draft assets and create the authenticated staged receipt', 'Atomically activate the staged feed, prove routes, then publish last']
+      .map(name => ({ ...upload(name), conclusion: 'skipped' }))];
+  Object.assign(data.apps, { id: prewriteInput.appsArtifactId, size_in_bytes: 207345211,
+    digest: 'sha256:e312b5d76a2225ea875cd91d588d877f81a2e53ff808cbe33ce95213d6e85076' });
+  Object.assign(data.feed, { id: prewriteInput.feedArtifactId, size_in_bytes: 42877,
+    digest: 'sha256:606daa234f9394dd45e3b05675ca040de8fa45ea3a5f0c5017230e8542a1918e' });
+  for (const artifact of [data.apps, data.feed]) Object.assign(artifact.workflow_run, { id: prewriteInput.runId, head_sha: workflowSha, head_branch: 'main' });
+  data.comparison.merge_base_commit.sha = prewriteInput.sourceCommit;
+  data.workflowComparison = { status: 'ahead', merge_base_commit: { sha: workflowSha } };
+  return data;
+}
+test('exact known pre-write failure admits only original bytes and emits no approval on changed evidence', () => {
+  const result = provenance(prewriteEvidence(), prewriteInput, prewriteEnv);
+  assert.equal(result.status, 0, result.stderr);
+  assert(result.outputs.includes('build_attempt=1\n'));
+  assert(result.outputs.includes('apps_id=11630735650\n'));
+  const mutations = {
+    'latest attempt advanced': e => { e.latest.run_attempt++; },
+    'latest conclusion differs': e => { e.latest.conclusion = 'success'; },
+    'original success': e => { e.run.conclusion = 'success'; },
+    'build ID changed': e => { e.jobs[0].id++; },
+    'attach ID changed': e => { e.jobs[1].id++; },
+    'duplicate build': e => { e.jobs.push(structuredClone(e.jobs[0])); },
+    'missing build': e => { e.jobs.shift(); },
+    'duplicate attach': e => { e.jobs.push(structuredClone(e.jobs[1])); },
+    'missing attach': e => { e.jobs.splice(1, 1); },
+    'unrelated job failure': e => { e.jobs[2].conclusion = 'failure'; },
+    'build failed': e => { e.jobs[0].conclusion = 'failure'; },
+    'failed upload': e => { e.jobs[0].steps[0].conclusion = 'failure'; },
+    'missing upload': e => { e.jobs[0].steps.shift(); },
+    'missing recovery check': e => { e.jobs[0].steps.pop(); },
+    'bind not completed': e => { e.jobs[1].steps[2].status = 'in_progress'; },
+    'different failure': e => { e.jobs[1].steps[2].name = 'Unrelated failure'; },
+    'duplicate bind': e => { e.jobs[1].steps.push(structuredClone(e.jobs[1].steps[2])); },
+    'source ancestry drift': e => { e.comparison.status = 'diverged'; },
+    'workflow ancestry drift': e => { e.workflowComparison.merge_base_commit.sha = sha; },
+    'wrong repository': e => { e.run.repository.full_name = 'fork/VortX'; },
+    'unrelated prewrite workflow': e => {
+      for (const run of [e.run, e.latest]) run.head_sha = sha;
+      for (const job of e.jobs) job.head_sha = sha;
+      for (const artifact of [e.apps, e.feed]) artifact.workflow_run.head_sha = sha;
+      e.workflowComparison.merge_base_commit.sha = sha;
+    }
+  };
+  for (const index of [0, 1, 3, 4]) {
+    mutations[`missing attach step ${index}`] = e => { e.jobs[1].steps.splice(index, 1); };
+    mutations[`duplicate attach step ${index}`] = e => { e.jobs[1].steps.push(structuredClone(e.jobs[1].steps[index])); };
+    for (const conclusion of ['success', 'failure', 'skipped'].filter(value => value !== (index < 2 ? 'success' : 'skipped')))
+      mutations[`wrong attach step ${index} ${conclusion}`] = e => { e.jobs[1].steps[index].conclusion = conclusion; };
+    mutations[`started attach step ${index}`] = e => { e.jobs[1].steps[index].status = 'in_progress'; };
+  }
+  for (const asset of ['apps', 'feed']) for (const [field, value] of Object.entries({ expired: true, size_in_bytes: 999, digest: `sha256:${'d'.repeat(64)}`,
+    created_at: '2026-09-30T12:00:30Z' })) mutations[`${asset} ${field} changed`] = e => { e[asset][field] = value; };
+  for (const [name, mutate] of Object.entries(mutations)) {
+    const data = prewriteEvidence(); mutate(data);
+    const denied = provenance(data, prewriteInput, prewriteEnv);
+    assert.notEqual(denied.status, 0, name); assert.equal(denied.outputs, '', name);
+  }
+  for (const field of Object.keys(prewriteInput)) {
+    const input = { ...prewriteInput, [field]: typeof prewriteInput[field] === 'number' ? prewriteInput[field] + 1 : field === 'build' ? '261' : sha };
+    const denied = provenance(prewriteEvidence(), input, prewriteEnv);
+    assert.notEqual(denied.status, 0, field); assert.equal(denied.outputs, '', field);
+  }
+  for (const env of [{ TAG: 'v0.5.0-beta.2' }, { RELEASE_ID_INPUT: '407572243' }, { GITHUB_REF: 'refs/heads/feature' },
+    { GITHUB_EVENT_NAME: 'push' }, { RECOVERY_SOURCE: prewriteInput.sourceCommit }]) {
+    const denied = provenance(prewriteEvidence(), prewriteInput, { ...prewriteEnv, ...env });
+    assert.notEqual(denied.status, 0, JSON.stringify(env)); assert.equal(denied.outputs, '');
+  }
+});
+
+test('all three actual release PATCH calls explicitly preserve identity under untagged-on-omission API behavior', () => fixture(dir => {
+  const promotion = script('Atomically activate the staged feed, prove routes, then publish last');
+  const calls = promotion.split('\n').filter(line => line.includes('gh api --method PATCH') && line.includes('repos/$GH_REPO/releases/$RELEASE_ID'));
+  assert.equal(calls.length, 3);
+  for (const line of calls) {
+    const command = line.match(/\$\((gh api --method PATCH .*?)\)/)[1];
+    for (const omit of [false, true]) {
+      const actual = omit ? command.replace(' -f tag_name="$TAG"', '') : command;
+      const result = spawnSync('bash', ['-c', `
+gh() {
+  local tag=untagged-fixture draft=false latest=false
+  for arg in "$@"; do
+    case "$arg" in tag_name=*) tag="\${arg#tag_name=}" ;; draft=*) draft="\${arg#draft=}" ;; make_latest=true) latest=true ;; esac
+  done
+  jq -cn --arg tag "$tag" --argjson draft "$draft" --argjson latest "$latest" '{id:407572242,tag_name:$tag,draft:$draft,prerelease:false,published_at:(if $draft then null else "2026-10-09T18:00:00Z" end),latest:$latest}'
+}
+${actual}`], { encoding: 'utf8', env: { ...process.env, GH_REPO: 'VortXTV/VortX', RELEASE_ID: '407572242', TAG: prewriteEnv.TAG } });
+      assert.equal(result.status, 0, result.stderr);
+      const release = JSON.parse(result.stdout);
+      assert.equal(release.id, 407572242);
+      assert.equal(release.tag_name, omit ? 'untagged-fixture' : prewriteEnv.TAG);
+      assert.equal(release.draft, command.includes('draft=true'));
+      assert.equal(release.latest, command.includes('make_latest=true'));
+      assert.equal(release.published_at, release.draft ? null : '2026-10-09T18:00:00Z');
+    }
+  }
+  // Execute the actual compensator, including its fresh-publication ownership check and returned-identity guard.
+  const rollback = promotion.slice(promotion.indexOf('rollback_release() {'), promotion.indexOf('\non_failure() {'));
+  const publicRelease = { id: 407572242, tag_name: prewriteEnv.TAG, prerelease: false, draft: false, published_at: '2026-10-09T18:00:00Z' };
+  for (const wrong of [false, true]) {
+    const result = spawnSync('bash', ['-c', `set -euo pipefail
+gh() {
+  if [[ "$*" == *'--method PATCH'* ]]; then printf '%s' '${JSON.stringify({ ...publicRelease, draft: true, tag_name: wrong ? 'untagged-fixture' : prewriteEnv.TAG })}';
+  else printf '%s' '${JSON.stringify(publicRelease)}'; fi
+}
+${rollback}
+rollback_release
+printf 'rollback-failure:%s' "$ROLLBACK_FAILURE"`], { encoding: 'utf8', env: { ...process.env, GH_REPO: 'VortXTV/VortX', RELEASE_ID: '407572242', TAG: prewriteEnv.TAG,
+      PUBLISHED_AT: publicRelease.published_at, IS_PRERELEASE: 'false', ROLLBACK_FAILURE: '0' } });
+    assert.equal(result.status, 0, result.stderr);
+    assert(result.stdout.endsWith(`rollback-failure:${wrong ? 1 : 0}`));
+  }
+}));
 
 test('recovery resume authenticates workflow execution independently of the unchanged Beta 1 source', () => {
   const source = '844782d29a93ae51991bfadc639d50bc3619d40b', workflowSha = 'b'.repeat(40);
