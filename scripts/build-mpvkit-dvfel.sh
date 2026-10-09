@@ -62,13 +62,17 @@
 # succeeded, with `--enable-decoder=sonic` warning ("did not match anything") and not dying. shaderc
 # itself is still built and still shipped; only FFmpeg stopped linking it.
 #
-# Our delta to MPVKit is TWO files, and they are deliberately kept apart:
+# Our delta to MPVKit is kept in separate reviewable patches:
 #   scripts/mpvkit-dvfel.patch        patches MPVKit's Package.swift and build driver: dependency
 #                                     pins, libplacebo source build, Security.framework linkage,
 #                                     Apple TLS selection, and the E-AC-3 encoder.
 #   scripts/mpv-moltenvk-resize.patch patches MPV itself. Installed below as patch 0004 next to
 #                                     MPVKit's own 0001-0003, because it edits the file MPVKit's 0001
 #                                     creates and so must be applied after it.
+#   scripts/mpv-coreaudio-hotplug-lifecycle.patch patches MPV's native CoreAudio init-failure
+#                                     cleanup. Installed as 0005; no mpv version/audio policy bump.
+#   scripts/mpv-http-seek-interrupt.patch interrupts obsolete HTTP I/O for an accepted seek
+#                                     and reopens only that source at its exact byte offset (0006).
 # Everything not listed above still comes from upstream MPVKit's own prebuilt zips at the versions
 # the MPVKit 1.0.0 base already used.
 #
@@ -76,40 +80,149 @@
 # of FFmpeg, libplacebo and mpv from source. Budget hours, not minutes, and ~20 GB of scratch.
 set -euo pipefail
 
+# Fixture-only source/ref/patch overrides are accepted only in preflight mode; ordinary builds
+# retain the pinned source and patch below. The explicit worktree and destination overrides remain
+# available to the release/build orchestration after its compatibility gates.
+PREFLIGHT_ONLY="${MPVKIT_DVFEL_PREFLIGHT_ONLY:-0}"
 MPVKIT_REF="2103893078c5e339073b11737b86f7f22b9c4491"   # MPVKit 1.0.0 tip, the base for our patch
+if [ "$PREFLIGHT_ONLY" = "1" ] && [ -n "${MPVKIT_DVFEL_REF:-}" ]; then
+  MPVKIT_REF="$MPVKIT_DVFEL_REF"
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
-WORK="${MPVKIT_DVFEL_WORK:-$HOME/.cache/vortx-mpvkit-dvfel}"
-DEST="$REPO/app/Vendor/MPVKit-DVFEL"
+# The canonical source checkout is deliberately a sibling of VortX, so the build does not silently
+# fall back to a second HOME cache that can retain a different MPVKit history. MPVKIT_DVFEL_WORK is
+# an explicit override for an isolated checkout (it names the checkout itself, not its parent).
+MPVKIT_DIR="${MPVKIT_DVFEL_WORK:-$REPO/../MPVKit}"
+# Keep the short name for the focused archive-gate fixture and older local wrappers; it aliases the
+# exact checkout above rather than reintroducing a second cache root.
+WORK="$MPVKIT_DIR"
+MPVKIT_SOURCE_URL="https://github.com/mpvkit/MPVKit.git"
+if [ "$PREFLIGHT_ONLY" = "1" ] && [ -n "${MPVKIT_DVFEL_SOURCE_URL:-}" ]; then
+  MPVKIT_SOURCE_URL="$MPVKIT_DVFEL_SOURCE_URL"
+fi
+# Keep the rebuilt package in the canonical stage directory until the application compatibility
+# build accepts it. Callers may provide an explicit destination after that gate has passed.
+DEST="${MPVKIT_DVFEL_DEST:-$REPO/_build/MPVKit-DVFEL}"
+DEST_ROOT="$(dirname "$DEST")"
+PATCH="$REPO/scripts/mpvkit-dvfel.patch"
+if [ "$PREFLIGHT_ONLY" = "1" ] && [ -n "${MPVKIT_DVFEL_PATCH:-}" ]; then
+  PATCH="$MPVKIT_DVFEL_PATCH"
+fi
+
+fail() {
+  echo "build-mpvkit-dvfel: $*" >&2
+  exit 1
+}
+
+mkdir -p "$DEST_ROOT"
+
+matches_exact_patch_tree() {
+  local patch_path="$1"
+  local temporary path
+  temporary="$(mktemp -d "$DEST_ROOT/mpvkit-state.XXXXXX")"
+
+  if ! (cd "$MPVKIT_DIR" && git archive HEAD | tar -x -C "$temporary"); then
+    rm -rf "$temporary"
+    return 1
+  fi
+  if ! (cd "$MPVKIT_DIR" && git apply --unsafe-paths --directory="$temporary" "$patch_path"); then
+    rm -rf "$temporary"
+    return 1
+  fi
+  while IFS= read -r path; do
+    if [ ! -f "$temporary/$path" ] && [ ! -L "$temporary/$path" ]; then
+      rm -rf "$temporary"
+      return 1
+    fi
+    if ! cmp -s "$temporary/$path" "$MPVKIT_DIR/$path"; then
+      rm -rf "$temporary"
+      return 1
+    fi
+  done < <(git -C "$MPVKIT_DIR" ls-tree -r --name-only HEAD)
+
+  rm -rf "$temporary"
+  return 0
+}
 
 for tool in meson ninja cmake pkg-config nasm wget; do
   command -v "$tool" >/dev/null || { echo "missing build tool: $tool (brew install $tool)" >&2; exit 1; }
 done
 
-mkdir -p "$WORK"
-if [ ! -d "$WORK/MPVKit/.git" ]; then
-  git clone https://github.com/mpvkit/MPVKit.git "$WORK/MPVKit"
+if [ ! -e "$MPVKIT_DIR" ]; then
+  mkdir -p "$(dirname "$MPVKIT_DIR")"
+  git clone --no-checkout "$MPVKIT_SOURCE_URL" "$MPVKIT_DIR" ||
+    fail "fresh MPVKit clone failed: $MPVKIT_DIR"
+  git -C "$MPVKIT_DIR" fetch --quiet --depth 1 origin "$MPVKIT_REF" ||
+    fail "fresh MPVKit clone does not contain pinned commit $MPVKIT_REF"
+  git -C "$MPVKIT_DIR" checkout --quiet --detach "$MPVKIT_REF" ||
+    fail "fresh MPVKit checkout failed for pinned commit $MPVKIT_REF"
+  FRESH_HEAD="$(git -C "$MPVKIT_DIR" rev-parse HEAD)" || fail "cannot read fresh MPVKit HEAD"
+  [ "$FRESH_HEAD" = "$MPVKIT_REF" ] ||
+    fail "fresh MPVKit HEAD mismatch: expected $MPVKIT_REF, got $FRESH_HEAD"
+elif [ ! -e "$MPVKIT_DIR/.git" ]; then
+  fail "MPVKit path exists but is not a Git checkout: $MPVKIT_DIR"
+else
+  CURRENT_HEAD="$(git -C "$MPVKIT_DIR" rev-parse HEAD 2>/dev/null)" ||
+    fail "cannot read existing MPVKit HEAD: $MPVKIT_DIR"
+  [ "$CURRENT_HEAD" = "$MPVKIT_REF" ] ||
+    fail "existing MPVKit checkout is on $CURRENT_HEAD, expected pinned $MPVKIT_REF; refusing to switch it"
+  if ! git -C "$MPVKIT_DIR" diff --cached --quiet; then
+    fail "existing MPVKit checkout has staged changes; refusing to reuse it"
+  fi
+  STATUS="$(git -C "$MPVKIT_DIR" status --porcelain --untracked-files=all)"
+  if [ -n "$STATUS" ] && ! matches_exact_patch_tree "$PATCH"; then
+    fail "existing MPVKit checkout differs from the exact approved VortX patch; refusing arbitrary or partial dirty state"
+  fi
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case "$line" in
+      ' M Package.swift'|'M Package.swift'|' M Sources/BuildScripts/XCFrameworkBuild/main.swift'|'M Sources/BuildScripts/XCFrameworkBuild/main.swift') ;;
+      '?? .build/'*|'?? dist/'*|'?? Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch'|'?? Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch'|'?? Sources/BuildScripts/patch/libmpv/0006-http-seek-interrupt.patch') ;;
+      *) fail "existing MPVKit checkout has unexpected dirty state: $line" ;;
+    esac
+  done <<< "$STATUS"
 fi
-cd "$WORK/MPVKit"
-git fetch --all --quiet
-git checkout --quiet "$MPVKIT_REF"
-git checkout --quiet -- .
-git apply "$REPO/scripts/mpvkit-dvfel.patch"
+
+cd "$MPVKIT_DIR"
+if git apply --check "$PATCH" >/dev/null 2>&1; then
+  git apply "$PATCH"
+elif git apply --reverse --check "$PATCH" >/dev/null 2>&1; then
+  echo "build-mpvkit-dvfel: exact MPVKit patch already applied; reusing it"
+else
+  fail "MPVKit patch neither applies cleanly nor matches the already-applied exact patch; inspect $MPVKIT_DIR"
+fi
+
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+  echo "build-mpvkit-dvfel: preflight-only checkout and patch validation passed"
+  exit 0
+fi
 
 # Install our mpv-side patch alongside MPVKit's own libmpv patches. SpikeGit.applyPatches (added by
 # mpvkit-dvfel.patch) applies that directory in sorted order, so the 0004 prefix guarantees it runs
 # after MPVKit's 0001, which is what creates video/out/vulkan/context_moltenvk.m in the first place.
 # Copied rather than committed into the patch-of-a-patch above so the mpv diff stays readable and
-# reviewable on its own. `git checkout -- .` above does not remove untracked files, so an existing
-# copy from a previous run is simply overwritten.
-cp "$REPO/scripts/mpv-moltenvk-resize.patch" \
-   "$WORK/MPVKit/Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch"
+# reviewable on its own. Existing copies must be byte-identical: an unrelated untracked patch must
+# never be silently overwritten during an otherwise pinned rebuild.
+copy_exact() {
+  local source="$1" destination="$2"
+  if [ -e "$destination" ]; then
+    cmp -s "$source" "$destination" || fail "existing generated patch differs: $destination"
+  else
+    cp "$source" "$destination"
+  fi
+}
+copy_exact "$REPO/scripts/mpv-moltenvk-resize.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch"
+copy_exact "$REPO/scripts/mpv-coreaudio-hotplug-lifecycle.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch"
+copy_exact "$REPO/scripts/mpv-http-seek-interrupt.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0006-http-seek-interrupt.patch"
 
-# A prior interrupted experiment installed this exact VortX-only FFmpeg patch as
-# an untracked file. `git checkout -- .` cannot remove untracked files, so clear
-# that retired patch explicitly before the build driver scans its patch folder.
-find "$WORK/MPVKit/Sources/BuildScripts/patch/FFmpeg" \
-  -type f -name '0001-no-private-secidentity.patch' -delete 2>/dev/null || true
+# A prior interrupted experiment installed this retired VortX-only FFmpeg patch as an untracked
+# file. Do not delete or overwrite it implicitly; fail with an actionable path instead.
+OBSOLETE_PATCH="$MPVKIT_DIR/Sources/BuildScripts/patch/FFmpeg/0001-no-private-secidentity.patch"
+[ ! -e "$OBSOLETE_PATCH" ] || fail "remove retired untracked patch before retrying: $OBSOLETE_PATCH"
 
 # GPL variant: VortX consumes the MPVKit-GPL product (libsmbclient + -Dgpl=true).
 BUILD_STARTED_MARKER="$(mktemp)"
@@ -119,24 +232,29 @@ swift run --build-path ./.build --package-path Sources/BuildScripts \
 
 # Assembly reads the per-library release ZIP, not slice scratch directories.
 # Refuse to package a stale ZIP after an interrupted or incorrectly cached run.
-LIBAVFORMAT_ZIP="$WORK/MPVKit/dist/release/Libavformat.xcframework.zip"
-[ -f "$LIBAVFORMAT_ZIP" ] || {
-  echo "missing rebuilt artifact: $LIBAVFORMAT_ZIP" >&2
-  exit 1
-}
-[ "$LIBAVFORMAT_ZIP" -nt "$BUILD_STARTED_MARKER" ] || {
-  echo "refusing stale Libavformat ZIP: $LIBAVFORMAT_ZIP" >&2
-  exit 1
-}
+# Libmpv must be fresh too: a rebuilt FFmpeg archive alone cannot carry the
+# CoreAudio lifetime fix. Never silently repackage the old vulnerable player.
+for library in Libavformat Libmpv; do
+  library_zip="$WORK/dist/release/$library.xcframework.zip"
+  [ -f "$library_zip" ] || {
+    echo "missing rebuilt artifact: $library_zip" >&2
+    exit 1
+  }
+  [ "$library_zip" -nt "$BUILD_STARTED_MARKER" ] || {
+    echo "refusing stale $library ZIP: $library_zip" >&2
+    exit 1
+  }
+done
 rm -f "$BUILD_STARTED_MARKER"
 trap - EXIT
 
+mkdir -p "$DEST_ROOT"
 STAGED_DEST="$(mktemp -d "${DEST}.staged.XXXXXX")"
 PREVIOUS_DEST="${DEST}.previous"
 trap 'rm -rf "$STAGED_DEST"' EXIT
 
-"$HERE/assemble-mpvkit-dvfel.sh" "$WORK/MPVKit" "$STAGED_DEST"
-"$HERE/verify-mpvkit-dvfel-apple-tls.sh" "$STAGED_DEST"
+"$HERE/assemble-mpvkit-dvfel.sh" "$WORK" "$STAGED_DEST"
+"$HERE/verify-mpvkit-dvfel-artifacts.sh" "$STAGED_DEST"
 
 # Promote only a package that passed every gate. Keep the prior package recoverable
 # until the staged move succeeds, so a failed verification or move cannot install a

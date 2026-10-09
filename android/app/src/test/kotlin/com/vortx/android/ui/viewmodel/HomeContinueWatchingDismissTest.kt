@@ -19,6 +19,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
@@ -165,6 +166,102 @@ class HomeContinueWatchingDismissTest {
 
         assertEquals(listOf(one, two), fixture.viewModel.successRows().single().items)
         fixture.close()
+    }
+
+    @Test
+    fun `confirmation rereads authoritative typed presence using the requested poll interval`() = runTest {
+        val target = ContinueWatchingDismissal(ownerA, one.type, one.id)
+        val sameIdSeries = one.copy(type = MediaType.SERIES)
+        val reads = mutableListOf<Long>()
+        val pending = async {
+            awaitContinueWatchingAbsent(target, snapshot = {
+                reads += testScheduler.currentTime
+                Result.success(ContinueWatchingSnapshot(ownerA,
+                    if (reads.size < 3) listOf(one, sameIdSeries) else listOf(sameIdSeries)))
+            }, pollMs = 25L)
+        }
+        runCurrent()
+        assertFalse(pending.isCompleted)
+        advanceTimeBy(49L); runCurrent()
+        assertFalse(pending.isCompleted)
+        advanceTimeBy(1L); runCurrent()
+        assertTrue(pending.await())
+        assertEquals(listOf(0L, 25L, 50L), reads)
+    }
+
+    @Test
+    fun `confirmation rejects replacement owner even when its title is absent`() = runTest {
+        val target = ContinueWatchingDismissal(ownerA, one.type, one.id)
+        var reads = 0
+        val pending = async {
+            awaitContinueWatchingAbsent(target, snapshot = {
+                reads++
+                Result.success(if (reads == 1) ContinueWatchingSnapshot(ownerA, listOf(one))
+                    else ContinueWatchingSnapshot(ownerB, emptyList()))
+            })
+        }
+        runCurrent(); advanceTimeBy(75L); runCurrent()
+        assertFalse(pending.await()); assertEquals(2, reads)
+    }
+
+    @Test
+    fun `confirmation errors fail closed before or after a successful presence read`() = runTest {
+        val target = ContinueWatchingDismissal(ownerA, one.type, one.id)
+        var reads = 0
+        assertFalse(awaitContinueWatchingAbsent(target, snapshot = {
+            reads++; Result.failure(IllegalStateException("native snapshot unavailable"))
+        }))
+        assertEquals(1, reads)
+        reads = 0
+        val pending = async {
+            awaitContinueWatchingAbsent(target, snapshot = {
+                reads++
+                if (reads == 1) Result.success(ContinueWatchingSnapshot(ownerA, listOf(one)))
+                else Result.failure(IllegalStateException("native snapshot unavailable"))
+            })
+        }
+        runCurrent(); advanceTimeBy(75L); runCurrent()
+        assertFalse(pending.await()); assertEquals(2, reads)
+    }
+
+    @Test
+    fun `default confirmation polls every seventy five milliseconds and times out at exactly three seconds`() = runTest {
+        val target = ContinueWatchingDismissal(ownerA, one.type, one.id)
+        val reads = mutableListOf<Long>()
+        val pending = async {
+            awaitContinueWatchingAbsent(target, snapshot = {
+                reads += testScheduler.currentTime
+                Result.success(ContinueWatchingSnapshot(ownerA, listOf(one)))
+            })
+        }
+        runCurrent(); advanceTimeBy(2_999L); runCurrent()
+        assertFalse(pending.isCompleted)
+        advanceTimeBy(1L); runCurrent()
+        assertFalse(pending.await())
+        assertEquals(3_000L, testScheduler.currentTime)
+        assertEquals((0L until 3_000L step 75L).toList(), reads)
+    }
+
+    @Test
+    fun `confirmation propagates cancellation through both polling delay and suspended snapshot`() = runTest {
+        val target = ContinueWatchingDismissal(ownerA, one.type, one.id)
+        var reads = 0
+        val delayed = async {
+            awaitContinueWatchingAbsent(target, snapshot = {
+                reads++; Result.success(ContinueWatchingSnapshot(ownerA, listOf(one)))
+            })
+        }
+        runCurrent(); delayed.cancel(); runCurrent()
+        assertTrue(delayed.isCancelled)
+        advanceTimeBy(75L); runCurrent(); assertEquals(1, reads)
+        var snapshotCancelled = false
+        val suspended = async {
+            awaitContinueWatchingAbsent(target, snapshot = {
+                try { awaitCancellation() } finally { snapshotCancelled = true }
+            })
+        }
+        runCurrent(); suspended.cancel(); runCurrent()
+        assertTrue(suspended.isCancelled); assertTrue(snapshotCancelled)
     }
 
     @Test

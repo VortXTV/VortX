@@ -259,7 +259,11 @@ internal data class UsenetResolveTarget(
     val fileMustInclude: String?,
     val episode: DebridResolver.Episode?,
     val fileIdx: Int?,
-)
+    val nzbUrls: List<String> = listOf(nzbUrl),
+    val servers: List<String> = emptyList(),
+) {
+    override fun toString(): String = "UsenetResolveTarget(<transient transport>)"
+}
 
 /** Bare-id native removal is allowed only when the carried media type uniquely identifies that id. */
 internal fun validateContinueWatchingRemovalTarget(
@@ -276,7 +280,9 @@ internal fun validateContinueWatchingRemovalTarget(
 internal fun StreamSource.usenetResolveTarget(
     selectedEpisode: Episode?,
 ): UsenetResolveTarget = UsenetResolveTarget(
-    nzbUrl = requireNotNull(nzbUrl) { "Usenet source is missing its NZB URL." },
+    nzbUrl = requireNotNull(usenetUrls.firstOrNull()) { "Usenet source is missing its NZB URL." },
+    nzbUrls = com.vortx.android.usenet.NativeNzbInputs.mirrors(nzbUrl, nzbUrls),
+    servers = com.vortx.android.usenet.NativeNzbInputs.servers(usenetServers),
     knownHash = usenetKnownHash,
     fileMustInclude = fileMustInclude,
     episode = selectedEpisode?.let {
@@ -802,6 +808,8 @@ class EngineStremioRepository(
     private val loadTimeoutSeconds: Long = 12,
 ) : CatalogRepository, AuthRepository, AccountAddonSyncGateway, AccountLibrarySyncGateway {
 
+    init { check(!com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) { "Legacy engine is unavailable in explicit native mode" } }
+
     /**
      * The native account fence captured by VortX account sync. It intentionally carries the complete
      * owner, rather than a display UID alone: profile/account-slot transitions and a same-UID engine
@@ -1078,6 +1086,52 @@ class EngineStremioRepository(
             check(owner == expectedOwner) { "Continue Watching owner changed." }
             val items = strictContinueWatchingItemsLocked()
             check(continueWatchingOwnerLocked(revision) == expectedOwner) { "Continue Watching owner changed." }
+            ContinueWatchingSnapshot(owner, items)
+        }
+    } }
+
+    override suspend fun playbackHistorySnapshot(
+        expectedOwner: ContinueWatchingOwner,
+    ): Result<ContinueWatchingSnapshot> = withContext(Dispatchers.Default) { runCatching {
+        // Capture the owner and route atomically, but never await an engine Load under the process-wide
+        // owner monitor. Profile/account transitions need that monitor to advance their revision; holding
+        // it across `loadFieldUntil` would both fail compilation (the load is suspend) and delay a switch.
+        val (capturedOwner, route) = ContinueWatchingOwnerGate.serialized { revision ->
+            check(!authTransition.inProgress) { "Playback history account transition is in progress." }
+            val owner = continueWatchingOwnerLocked(revision)
+            check(owner == expectedOwner) { "Playback history owner changed." }
+            val route = historyRouteLocked(owner)
+            if (route is HistoryRoute.Engine) {
+                check(started) { "Playback history native engine is not started." }
+                requireEngineHistoryPrincipalMatch()
+            }
+            owner to route
+        }
+        val items = when (route) {
+            is HistoryRoute.Overlay -> route.profiles.withActiveOverlayProfile(route.profileId) { overlay ->
+                overlay.playbackHistory()
+            }
+            HistoryRoute.Engine -> {
+                // `library` is a persisted engine projection, but it still needs a Load before a
+                // cold process can truthfully say that no history exists. This uses the same derived
+                // field/action as LibraryViewModel and treats malformed/unavailable state as failure.
+                val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary()) { true }
+                EngineState.parsePlaybackHistoryStrict(
+                    state,
+                ).getOrThrow()
+            }
+        }
+        // Reacquire immediately before publication. Owner equality includes the monotonically advanced
+        // revision, and historyRouteLocked re-checks both the active route and native principal.
+        ContinueWatchingOwnerGate.serialized { revision ->
+            check(!authTransition.inProgress) { "Playback history account transition is in progress." }
+            val owner = continueWatchingOwnerLocked(revision)
+            check(owner == capturedOwner && owner == expectedOwner) { "Playback history owner changed." }
+            check(historyRouteLocked(owner) == route) { "Playback history route changed." }
+            if (route is HistoryRoute.Engine) {
+                check(started) { "Playback history native engine is not started." }
+                requireEngineHistoryPrincipalMatch()
+            }
             ContinueWatchingSnapshot(owner, items)
         }
     } }

@@ -6,6 +6,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -57,6 +58,7 @@ import com.vortx.android.R
 import com.vortx.android.downloads.DownloadManager
 import com.vortx.android.downloads.DownloadStore
 import com.vortx.android.model.AuthState
+import com.vortx.android.model.Catalog
 import com.vortx.android.model.DiscoverFilters
 import com.vortx.android.model.DiscoverResult
 import com.vortx.android.model.LibraryFilters
@@ -70,12 +72,16 @@ import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.CollectionsHub
 import com.vortx.android.ui.components.CollectionsBrowseScreen
+import com.vortx.android.ui.components.cinemaCardFacts
+import com.vortx.android.ui.components.CinemaLandscapeArt
 import com.vortx.android.ui.components.rememberDiscoverHub
 import kotlinx.coroutines.launch
 import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
+import com.vortx.android.ui.components.PosterRail
+import com.vortx.android.ui.components.LoadingRail
 import com.vortx.android.ui.components.SignedOutState
 import com.vortx.android.ui.components.shimmer
 import com.vortx.android.ui.library.LibrarySegment
@@ -89,10 +95,13 @@ import com.vortx.android.ui.search.searchResultSectionHeaderKey
 import com.vortx.android.ui.search.searchResultSections
 import com.vortx.android.ui.search.titleResourceId
 import com.vortx.android.ui.theme.VortXIcons
+import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.ui.theme.vortxGlass
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.LibraryViewModel
+import com.vortx.android.ui.viewmodel.LibraryLandingViewModel
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.update.UpdateAvailableBanner
 
@@ -268,9 +277,20 @@ private fun DiscoverFilterChips(filters: DiscoverFilters?, hideLive: Boolean, on
 
 /// Library (S04, DESIGN-SYSTEM.md §4 "Library"): type/sort chips over the saved poster grid with the
 /// remove ("x") control per poster.
+/** Touch Library landing: functional large entries precede the existing filters and saved-title grid. */
 @Composable
-fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
+fun LibraryScreen(
+    viewModel: LibraryViewModel,
+    landingViewModel: LibraryLandingViewModel,
+    onItem: (MetaItem) -> Unit,
+    modifier: Modifier = Modifier,
+    onDirectResume: (MetaItem) -> Unit = onItem,
+    onDownloads: (() -> Unit)? = null,
+    onWatchlist: (() -> Unit)? = null,
+    onPreviouslyWatched: (() -> Unit)? = null,
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val landingState by landingViewModel.state.collectAsStateWithLifecycle()
     val result = (state as? UiState.Success<LibraryResult>)?.data
     val filters = result?.filters
     val allItems = result?.items.orEmpty()
@@ -282,25 +302,96 @@ fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modif
     var selectedFilters by remember { mutableStateOf(emptySet<LibrarySmartFilter>()) }
     val activeFilters = selectedFilters intersect applicableFilters.toSet()
 
+    val libraryHeader: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+            if (onDownloads != null || onWatchlist != null || onPreviouslyWatched != null) {
+                LibraryEntryCards(onDownloads, onWatchlist, onPreviouslyWatched)
+            }
+            when (val landing = landingState) {
+                is UiState.Loading -> Unit
+                is UiState.Error -> ErrorState(landing.message, onRetry = landingViewModel::retry)
+                is UiState.Success -> if (landing.data.continueWatching.isNotEmpty()) {
+                    PosterRail(
+                        catalog = Catalog("continue", "Continue Watching", landing.data.continueWatching),
+                        onItem = onDirectResume,
+                        onRemoveFromContinueWatching = landingViewModel::removeFromContinueWatching,
+                        eyebrow = "Pick up where you left off",
+                    )
+                }
+            }
+            LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
+            LibrarySegmentChips(segments = segments, active = activeSegment, onSelect = { selectedSegment = it })
+            LibrarySmartFilterChips(
+                available = applicableFilters,
+                active = activeFilters,
+                onToggle = { selectedFilters = LibrarySmartFilter.toggle(selectedFilters, it) },
+            )
+        }
+    }
     Column(modifier = modifier.fillMaxSize()) {
-        LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
-        LibrarySegmentChips(segments = segments, active = activeSegment, onSelect = { selectedSegment = it })
-        LibrarySmartFilterChips(
-            available = applicableFilters,
-            active = activeFilters,
-            onToggle = { selectedFilters = LibrarySmartFilter.toggle(selectedFilters, it) },
-        )
         when (val s = state) {
-            is UiState.Loading -> ShimmerGrid()
-            is UiState.Error -> ErrorState(s.message, onRetry = viewModel::retry)
+            is UiState.Loading -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                libraryHeader()
+                LoadingRail()
+            }
+            is UiState.Error -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                libraryHeader()
+                ErrorState(s.message, onRetry = viewModel::retry)
+            }
             is UiState.Success -> PosterGrid(
                 items = LibrarySmartFilter.apply(segmentedItems, activeFilters),
                 onItem = onItem,
                 emptyHint = if (activeFilters.isEmpty()) "Titles you save appear here."
                             else "Nothing matches these filters.",
                 onRemove = viewModel::remove,
+                header = libraryHeader,
             )
         }
+    }
+}
+
+@Composable
+private fun LibraryEntryCards(
+    onDownloads: (() -> Unit)?,
+    onWatchlist: (() -> Unit)?,
+    onPreviouslyWatched: (() -> Unit)?,
+) {
+    val entries: @Composable (Modifier) -> Unit = { cardModifier ->
+        onDownloads?.let { LibraryEntryCard("Downloads", "Offline", VortXIcons.download, it, cardModifier) }
+        onWatchlist?.let { LibraryEntryCard("Watchlist", "Plan to watch", VortXIcons.starFill, it, cardModifier) }
+        onPreviouslyWatched?.let { LibraryEntryCard("Watched", "History", VortXIcons.clock, it, cardModifier) }
+    }
+    BoxWithConstraints(Modifier.fillMaxWidth().padding(vertical = VortXTheme.spacing.sm)) {
+        if (maxWidth >= 600.dp) {
+            Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) { entries(Modifier.weight(1f)) }
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) { entries(Modifier.fillMaxWidth()) }
+        }
+    }
+}
+
+@Composable
+private fun LibraryEntryCard(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier
+            .clickable(onClick = onClick)
+            .vortxGlass(
+                shape = VortXShapes.card,
+                fillAlpha = VortXGlass.cardFillAlpha,
+                shadow = VortXGlass.Shadow.flat,
+            )
+            .padding(VortXTheme.spacing.md),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+    ) {
+        Icon(icon, contentDescription = title, tint = VortXTheme.colors.accent)
+        Text(title, style = VortXTheme.type.cardTitle, maxLines = 1)
+        Text(subtitle, style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary), maxLines = 1)
     }
 }
 
@@ -437,6 +528,7 @@ fun SearchScreen(
                 sectioned = true,
                 showMenu = true,
                 gridState = gridState,
+                cinemaSearch = true,
             )
         }
     }
@@ -685,7 +777,14 @@ private fun SettingRow(
         modifier = modifier
             .fillMaxWidth()
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-            .padding(vertical = VortXTheme.spacing.sm),
+            // Settings is the compact touch control surface: a direct, high-contrast card edge makes
+            // entries easy to scan without turning the page into a stack of floating shadows.
+            .vortxGlass(
+                shape = VortXShapes.card,
+                fillAlpha = VortXGlass.cardFillAlpha,
+                shadow = VortXGlass.Shadow.flat,
+            )
+            .padding(horizontal = VortXTheme.spacing.md, vertical = VortXTheme.spacing.sm),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
         Icon(icon, contentDescription = null, tint = colors.accent)
@@ -728,6 +827,8 @@ internal fun PosterGrid(
     gridState: LazyGridState? = null,
     footer: (@Composable () -> Unit)? = null,
     header: (@Composable () -> Unit)? = null,
+    /** Search keeps wide artwork, facts and synopsis together instead of reusing a catalog tile. */
+    cinemaSearch: Boolean = false,
 ) {
     if (items.isEmpty() && header == null) {
         EmptyState(emptyHint, modifier)
@@ -746,7 +847,7 @@ internal fun PosterGrid(
     // Always remember a fallback state (unconditional Composable call); use the hoisted one when supplied.
     val ownGridState = rememberLazyGridState()
     LazyVerticalGrid(
-        columns = GridCells.Adaptive(minSize = 112.dp),
+        columns = GridCells.Adaptive(minSize = if (cinemaSearch) 280.dp else 112.dp),
         state = gridState ?: ownGridState,
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(VortXTheme.spacing.edge),
@@ -769,12 +870,19 @@ internal fun PosterGrid(
                 Box {
                     PosterCard(
                         title = item.name,
-                        subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
+                        subtitle = cinemaCardFacts(item),
                         onClick = { onItem(item) },
                         progress = item.progress,
                         watched = item.watched,
                         menuItem = if (showMenu) item else null,
-                        art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
+                        cinema = true,
+                        landscape = true.takeIf { cinemaSearch },
+                        showLabels = true.takeIf { cinemaSearch },
+                        description = item.description.takeIf { cinemaSearch },
+                        art = {
+                            if (cinemaSearch) CinemaLandscapeArt(item)
+                            else PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
+                        },
                     )
                     if (onRemove != null) {
                         RemoveBadge(
@@ -831,7 +939,7 @@ private fun LoadMoreFooter(loading: Boolean, onClick: () -> Unit) {
 
 /// The shimmer loading state for a poster grid (DESIGN-SYSTEM.md §3 "skeleton shimmer for loading").
 @Composable
-private fun ShimmerGrid() {
+internal fun ShimmerGrid() {
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 112.dp),
         modifier = Modifier.fillMaxSize(),

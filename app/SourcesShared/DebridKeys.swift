@@ -397,6 +397,7 @@ final class DebridKeys: ObservableObject {
               CredentialScopeRegistry.shared.isCurrent(authorityCapture) else { return false }
         let boundOwner = owner
         let account = service.keychainAccount(owner: boundOwner)
+        let previous = keys[service.rawValue]
         let expected: String? = trimmed.isEmpty ? nil : trimmed
         var certified = false
         for _ in 0..<2 {
@@ -416,6 +417,12 @@ final class DebridKeys: ObservableObject {
         guard certified,
               owner == boundOwner,
               CredentialScopeRegistry.shared.isCurrent(authorityCapture) else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        guard VortXSyncManager.shared.noteNativeProviderMutation([service.rawValue: expected.map(VortxJSON.string) ?? .null], capture: authorityCapture) else {
+            _ = storage.mutate(previous, for: account)
+            return false
+        }
+#endif
         if let expected { keys[service.rawValue] = expected }
         else { keys.removeValue(forKey: service.rawValue) }
         publishPlaybackAvailability()

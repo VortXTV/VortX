@@ -1,0 +1,31 @@
+// Applied only by the native-selection configuration test. This inspects the real configured
+// Android model and Cargo task without compiling native code or assembling an application.
+gradle.projectsEvaluated {
+    def app = gradle.rootProject.project(':app')
+    app.tasks.register('verifyNativeSelectionFixture') {
+        doLast {
+            def expected = app.findProperty('fixture.expectedNative')
+            assert expected in ['true', 'false']: 'fixture.expectedNative must be explicit'
+            def selected = expected == 'true'
+            def android = app.extensions.getByName('android')
+            def actual = android.defaultConfig.buildConfigFields['NATIVE_ENGINE_ENABLED'].value
+            assert actual == expected: "BuildConfig mismatch: expected ${expected}, got ${actual}"
+
+            def cargo = app.tasks.named('cargoNdkBuildVortxFfi').get().commandLine
+            def featureIndex = cargo.indexOf('--features')
+            assert featureIndex >= 0 && featureIndex + 1 < cargo.size(): 'Cargo features are missing'
+            def features = cargo[featureIndex + 1]
+            assert features == (selected ? 'jni,server,resource-host' : 'jni,server'):
+                "Cargo features mismatch: ${features}"
+
+            ['Full', 'Play'].each { flavor ->
+                def merge = app.tasks.named("merge${flavor}DebugJniLibFolders").get()
+                def dependencies = merge.taskDependencies.getDependencies(merge)*.name
+                assert dependencies.contains('cargoNdkBuildVortxFfi'): 'Native VortX task is missing'
+                assert dependencies.contains('cargoNdkBuild') == !selected:
+                    "${flavor} legacy dependency mismatch: ${dependencies}"
+            }
+            println "native-selection: BuildConfig=${actual}, features=${features}, legacy=${!selected}"
+        }
+    }
+}

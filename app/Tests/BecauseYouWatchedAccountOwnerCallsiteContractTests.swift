@@ -56,7 +56,8 @@ enum BecauseYouWatchedAccountOwnerCallsiteContractTests {
                   "\(name) Home does not use the pre-fix slot/sign-in-only owner key")
         }
 
-        check(account.contains("Keychain.set(key, for: context.keychainAccount)") &&
+        check(account.contains("Self.storeAuthKey(key, account: context.keychainAccount)") &&
+              account.contains("withCredentialMutation(slot: account)") &&
                 account.contains("guard authOperationStillCurrent(context) else { return }") &&
                 account.contains("if !isSignedIn { isSignedIn = true }"),
               "Stremio sign-in writes its captured credential slot without relying on a true-to-true event")

@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 #if !CREDENTIAL_RETRY_COORDINATOR_STANDALONE
 import SwiftUI
 import CryptoKit   // Curve25519 for the QR sign-in pairing session (QrJoinSession.ephemeral)
@@ -223,6 +224,786 @@ final class VortXSyncManager: ObservableObject {
     private let kcAccount = "vortx.sync.session.v1"
     private var token: String?
     private var dataKey: Data?
+#if VORTX_NATIVE_DATA_ENGINE
+    private var nativeCheckpointTask: Task<Bool, Never>?
+    private var nativeCheckpointCapture: CredentialScopeRegistry.Capture?
+    private var nativeCheckpointProfile: UUID?
+    private var nativeCheckpointGeneration = UUID()
+    @Published private(set) var nativeCheckpointStatus = "not_started"
+    @Published private(set) var nativeProfileEditConflicts: [VortxNativeProfileEditHost.Conflict] = []
+    @Published private(set) var nativeAddonEditConflicts: [VortxNativeWebsiteAddonEdits.Conflict] = []
+    @Published private(set) var nativeOwnAccountResyncUnavailable: [UUID] = []
+    @Published private(set) var nativeOwnAccountOverlayPending: [UUID] = []
+    @Published private(set) var nativeWatchedMigrationPending: [UUID] = []
+    @Published private(set) var nativeUnsupportedSettings: [String] = []
+    private var nativeLegacyWatchlistPending = Set<String>()
+    @Published private(set) var nativeOwnAccountOverlayUnattributed: [UUID] = []
+    private var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
+    private func nativeProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        let bytes: Data?
+        switch Keychain.confirmedString("vortx.native.providerState." + capture.namespace) {
+        case .missing: bytes = nil
+        case .value(let value): bytes = Data(value.utf8)
+        case .failure:
+            // An uncertain intent write may leave a complete prior prepared journal or complete
+            // finalized value. Recertify only those exact durable bytes; never infer absence.
+            let slot = "vortx.native.providerState." + capture.namespace
+            guard case .value(let retained) = Keychain.durableString(slot) else { throw VortxNativeError.unavailable }
+            _ = try VortxNativeProviderCredentials(scope: capture.namespace, actor: nativeHostActor(capture: capture), sealed: Data(retained.utf8))
+            try VortxNativeProviderCredentials.withStoreLock {
+                guard Keychain.set(retained, for: slot) == .success,
+                      case .value(let confirmed) = Keychain.confirmedString(slot), confirmed == retained else { throw VortxNativeError.unavailable }
+            }
+            bytes = Data(retained.utf8)
+        }
+        return try VortxNativeProviderCredentials(scope: capture.namespace, actor: nativeHostActor(capture: capture), sealed: bytes)
+    }
+    private func saveNativeProviderState(_ value: VortxNativeProviderCredentials, capture: CredentialScopeRegistry.Capture) throws {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        let slot = "vortx.native.providerState." + capture.namespace
+        let encoded = String(decoding: try value.encoded(), as: UTF8.self)
+        try VortxNativeProviderCredentials.withStoreLock {
+            guard Keychain.set(encoded, for: slot) == .success, Keychain.string(slot) == encoded else { throw VortxNativeError.unavailable }
+        }
+    }
+    func prepareNativeProviderMutation(_ fields: [String: VortxJSON], capture: CredentialScopeRegistry.Capture) -> [String: VortxNativeProviderCredentials.Register]? {
+        guard isCurrent(capture) else { return nil }
+        guard case .account = capture.scope else { return [:] }
+        do {
+            var state = try nativeProviderState(capture: capture)
+            let events = try state.prepare(fields)
+            try saveNativeProviderState(state, capture: capture)
+            return events
+        } catch { return nil }
+    }
+    func finishNativeProviderMutation(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
+        if events.isEmpty { return isCurrent(capture) }
+        do {
+            var state = try nativeProviderState(capture: capture)
+            try state.finishPrepared(events); try saveNativeProviderState(state, capture: capture)
+            requestSyncSoon(); return true
+        } catch { return false } // prepared secure intent remains; no remote hydration/export may pass it
+    }
+    /// Only an auth actor that has not attempted its tuple mutation may abort this exact event.
+    func abortNativeProviderMutation(_ events: [String: VortxNativeProviderCredentials.Register], capture: CredentialScopeRegistry.Capture) -> Bool {
+        if events.isEmpty { return true }
+        guard case .account = capture.scope else { return false }
+        // The receipt authorizes cleanup of this never-attempted local operation even after account
+        // retirement. It does NOT restore authority to mutate credentials, document, pending events,
+        // account settings or cloud state. Match the original namespace and every event exactly.
+        return VortxNativeProviderCredentials.withStoreLock {
+            let slot = "vortx.native.providerState." + capture.namespace
+            guard case .value(let encoded) = Keychain.confirmedString(slot) else { return false }
+            do {
+                var state = try VortxNativeProviderCredentials(scope: capture.namespace,
+                    actor: "00000000-0000-0000-0000-000000000001", sealed: Data(encoded.utf8))
+                try state.abortPrepared(events)
+                let repaired = String(decoding: try state.encoded(), as: UTF8.self)
+                guard Keychain.set(repaired, for: slot) == .success,
+                      case .value(let confirmed) = Keychain.confirmedString(slot), confirmed == repaired else { return false }
+                return true
+            } catch { return false }
+        }
+    }
+    /// Synchronous credential mutation linearization: the provider register cannot change between
+    /// this exact-event check and the secure tuple mutation. Never hold this lock across an await.
+    nonisolated static func withNativeProviderEvents(_ events: [String: VortxNativeProviderCredentials.Register],
+        capture: CredentialScopeRegistry.Capture, mutation: () -> Bool) -> Bool {
+        VortxNativeProviderCredentials.withStoreLock {
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  case .value(let encoded) = Keychain.confirmedString("vortx.native.providerState." + capture.namespace),
+                  let state = try? VortxNativeProviderCredentials(scope: capture.namespace,
+                    actor: "00000000-0000-0000-0000-000000000001", sealed: Data(encoded.utf8)),
+                  state.authorizes(events) else { return false }
+            return mutation()
+        }
+    }
+    nonisolated static func withNativeProviderSnapshot(_ expected: VortxNativeProviderCredentials.Document,
+        capture: CredentialScopeRegistry.Capture, mutation: () -> Bool) -> Bool {
+        VortxNativeProviderCredentials.withStoreLock {
+            guard CredentialScopeRegistry.shared.isCurrent(capture),
+                  case .value(let encoded) = Keychain.confirmedString("vortx.native.providerState." + capture.namespace),
+                  let state = try? VortxNativeProviderCredentials(scope: capture.namespace,
+                    actor: "00000000-0000-0000-0000-000000000001", sealed: Data(encoded.utf8)),
+                  !state.hasPreparedMutation, state.local.document == expected else { return false }
+            return mutation()
+        }
+    }
+    /// Called only after a successful account-scoped secure mutation, never on bind/sign-out.
+    /// The caller rolls its mutation back if the durable explicit intent cannot be recorded.
+    private func settleNativeProviderJournal(capture: CredentialScopeRegistry.Capture) async -> Bool {
+        do {
+            let state = try nativeProviderState(capture: capture)
+            guard state.hasPreparedMutation else { return true }
+            for (index, group) in VortxNativeProviderCredentials.groups.enumerated() {
+                let events = (state.local.prepared ?? [:]).filter { group.contains($0.key) }
+                guard !events.isEmpty else { continue }
+                let certified: Bool
+                if index == 0 { certified = await TraktAuth.shared.certifiesNativePrepared(events, capture: capture) }
+                else { certified = await SIMKLAuth.shared.certifiesNativePrepared(events, capture: capture) }
+                guard certified, isCurrent(capture), finishNativeProviderMutation(events, capture: capture) else { return false }
+            }
+            return try !nativeProviderState(capture: capture).hasPreparedMutation
+        } catch { return false }
+    }
+    func nativeProviderRevision(_ keys: [String], capture: CredentialScopeRegistry.Capture) -> [String: String]? {
+        guard let state = try? nativeProviderState(capture: capture) else { return nil }
+        return Dictionary(uniqueKeysWithValues: keys.map { key in
+            (key, state.local.document.fields[key].map { String($0.clock) + ":" + $0.actor } ?? "absent")
+        })
+    }
+    func noteNativeProviderMutation(_ fields: [String: VortxJSON], capture: CredentialScopeRegistry.Capture,
+                                    expectedRevision: [String: String]? = nil, suppressImportedApply: Bool = true) -> Bool {
+        guard isCurrent(capture) else { return false }
+        guard (!suppressImportedApply || !isApplyingRemote), case .account = capture.scope else { return true }
+        do {
+            var state = try nativeProviderState(capture: capture)
+            if let expectedRevision {
+                guard nativeProviderRevision(Array(fields.keys), capture: capture) == expectedRevision else { return false }
+            }
+            try state.edit(fields); try saveNativeProviderState(state, capture: capture)
+            requestSyncSoon()
+            if isApplyingRemote { Task { @MainActor [weak self] in guard let self, self.isCurrent(capture) else { return }; self.requestSyncSoon() } }
+            return true
+        } catch { return false }
+    }
+    private func mergedNativeProviderState(_ document: [String: Any], capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
+        var state = try nativeProviderState(capture: capture)
+        guard !state.hasPreparedMutation else { throw VortxNativeError.unavailable }
+        if let raw = document["nativeProviderCredentials"] {
+            let wire = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: raw))
+            // A legacy peer editing a registered key without its event is not silently promoted.
+            let remote = try wire.decode(VortxNativeProviderCredentials.Document.self)
+            let keys = (document["apiKeys"] as? [String: Any]) ?? [:]
+            let metadata = (keys["metadata"] as? [String: Any]) ?? [:]
+            for (key, event) in remote.fields {
+                let aliases = [keys[key], ["tmdb", "mdblist", "fanart"].contains(key) ? metadata[key] : nil].compactMap { $0 }
+                if case .string(let value) = event.value {
+                    guard !aliases.isEmpty, aliases.allSatisfy({ ($0 as? String) == value }) else { throw VortxNativeError.invalidSnapshot }
+                } else { guard aliases.isEmpty else { throw VortxNativeError.invalidSnapshot } }
+            }
+            try state.merge(wire)
+        }
+        return state
+    }
+    private func mirrorNativeProviderKeys(_ state: VortxNativeProviderCredentials, original: Any?) throws -> [String: Any] {
+        guard original == nil || original is [String: Any] else { throw VortxNativeError.invalidSnapshot }
+        var keys = (original as? [String: Any]) ?? [:]
+        guard keys["metadata"] == nil || keys["metadata"] is [String: Any] else { throw VortxNativeError.invalidSnapshot }
+        var metadata = (keys["metadata"] as? [String: Any]) ?? [:]
+        for (key, event) in state.local.document.fields {
+            let value: String? = if case .string(let value) = event.value { value } else { nil }
+            keys[key] = value
+            if ["tmdb", "mdblist", "fanart"].contains(key) { metadata[key] = value }
+        }
+        if keys["metadata"] != nil || !metadata.isEmpty { keys["metadata"] = metadata }
+        return keys
+    }
+    private func acknowledgeNativeProviders(_ document: [String: Any], capture: CredentialScopeRegistry.Capture) throws {
+        guard let raw = document["nativeProviderCredentials"] else { return }
+        let sent = try JSONDecoder().decode(VortxNativeProviderCredentials.Document.self, from: JSONSerialization.data(withJSONObject: raw))
+        guard sent.scope == capture.namespace else { throw VortxNativeError.invalidSnapshot }
+        var state = try nativeProviderState(capture: capture)
+        state.acknowledge(sent.fields); try saveNativeProviderState(state, capture: capture)
+    }
+    private func persistMergedNativeProviders(_ candidate: VortxNativeProviderCredentials, capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
+        // A credential edit can arrive during the kernel await. Never replace that newer intent
+        // with the pre-await copy; merge again against the current secure state before publishing.
+        var current = try nativeProviderState(capture: capture)
+        try current.merge(candidate.document)
+        try saveNativeProviderState(current, capture: capture)
+        return current
+    }
+    private func retireNativeProviderApply(_ service: ProviderApplyService, capture: CredentialScopeRegistry.Capture) {
+        guard let pending = pendingProviderApply, pending.capture == capture else { return }
+        var values = pending.values; values.removeValue(forKey: service)
+        var failures = pending.failedServices; failures.remove(service)
+        pendingProviderApply = values.isEmpty ? nil : PendingProviderApply(capture: capture, version: pending.version, values: values, failedServices: failures)
+    }
+    private func nativeGlobalEdits() throws -> [VortxNativeHostPreferences.Edit] {
+        var fields: [String: VortxJSON] = [:]
+        var unsupported = Array(nativeLegacyWatchlistPending)
+        for key in dirtySettings.keys {
+            // Old installations can retain dirty stamps for values now explicitly device-local.
+            // They neither enter a shared carrier nor prevent unrelated native state from syncing.
+            if !SettingsBackup.isSyncable(key) || ["stremiox.profiles.active", "stremiox.activeProfileId"].contains(key) { continue }
+            if ProfileStore.nativePlaybackProjectionKeys.contains(key) || ProfileStore.nativeThemeProjectionKeys.contains(key)
+                || ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key) {
+                guard ProfileStore.shared.nativePreferenceIsAcknowledged(key) else { throw VortxNativeError.invalidSnapshot }
+                continue
+            }
+            guard VortxNativeHostPreferences.knownGlobals.contains(key) else {
+                unsupported.append(key); continue // Retain dirty data; never acknowledge an unexported value.
+            }
+            let object = UserDefaults.standard.object(forKey: key)
+            let value = try object.map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0, options: .fragmentsAllowed)) } ?? .null
+            guard VortxNativeHostPreferences.validGlobal(key, value: value) else { throw VortxNativeError.invalidSnapshot }
+            fields[key] = value
+        }
+        nativeUnsupportedSettings = Array(Set(unsupported)).sorted()
+        return fields.isEmpty ? [] : [.init(profileID: nil, fields: fields)]
+    }
+    private func nativeLegacyWatchlists(_ document: [String: Any]) throws -> [UUID: [VortxNativeWatchlist.Entry]] {
+        guard let raw = document["settings"] else { return [:] }
+        guard let encoded = raw as? String, let bytes = Data(base64Encoded: encoded),
+              let roster = Self.resolveRoster(from: document, fullOnly: true) else { throw VortxNativeError.invalidSnapshot }
+        let domain = try SettingsBackup.decodeDomain(from: bytes)
+        var result: [UUID: [VortxNativeWatchlist.Entry]] = [:]
+        var pending = Set<String>()
+        for (key, raw) in domain where key == "vortx.watchlist" || key.hasPrefix("vortx.watchlist.") {
+            do {
+                guard let profile = roster.profiles.first(where: { key == "vortx.watchlist." + $0.id.uuidString }),
+                      let data = raw as? Data else { throw VortxNativeError.invalidSnapshot }
+                let entries = try JSONDecoder().decode([VortxNativeWatchlist.Entry].self, from: data)
+                guard entries.count <= VortxNativeWatchlist.displayCap else { throw VortxNativeError.invalidSnapshot }
+                var identities = Set<String>()
+                for entry in entries {
+                    let field = try VortxNativeWatchlist.field(id: entry.id, type: entry.type)
+                    _ = try VortxNativeWatchlist.value(entry)
+                    guard identities.insert(field).inserted else { throw VortxNativeError.invalidSnapshot }
+                }
+                result[profile.id] = entries
+            } catch {
+                // Keep the original authenticated settings blob unchanged. An unqualified,
+                // malformed or unknown-profile ledger does not authorize an empty replacement.
+                pending.insert(key)
+            }
+        }
+        nativeLegacyWatchlistPending = pending
+        nativeUnsupportedSettings = Array(pending.union(dirtySettings.keys.filter { !nativeDirtySettingIsExported($0) })).sorted()
+        return result
+    }
+    private func nativeDirtySettingIsExported(_ key: String) -> Bool {
+        VortxNativeSyncExportPolicy.acknowledgesSetting(key, syncable: SettingsBackup.isSyncable(key),
+            profileProjection: ProfileStore.nativePlaybackProjectionKeys.contains(key) || ProfileStore.nativeThemeProjectionKeys.contains(key)
+                || ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key),
+            projectionAcknowledged: ProfileStore.shared.nativePreferenceIsAcknowledged(key))
+    }
+    private func applyNativeGlobals(_ host: VortxJSON) {
+        guard case .object(let fields) = host["globals"]?["fields"] else { return }
+        withRemoteApplySuppressed {
+            for (key, register) in fields where dirtySettings[key] == nil {
+                guard let value = register["value"], VortxNativeHostPreferences.validGlobal(key, value: value) else { continue }
+                if value == .null { UserDefaults.standard.removeObject(forKey: key) }
+                else if let data = try? JSONEncoder().encode(value), let object = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) { UserDefaults.standard.set(object, forKey: key) }
+            }
+        }
+    }
+    private func nativeBackupSeen(capture: CredentialScopeRegistry.Capture) -> Bool {
+        Keychain.string("vortx.native.backupSeen." + capture.namespace) == "1"
+    }
+    private func rememberNativeBackup(capture: CredentialScopeRegistry.Capture) -> Bool {
+        guard isCurrent(capture) else { return false }
+        let slot = "vortx.native.backupSeen." + capture.namespace
+        return Keychain.set("1", for: slot) == .success && Keychain.string(slot) == "1"
+    }
+    private func nativeHostActor(capture: CredentialScopeRegistry.Capture) throws -> String {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        let slot = "vortx.native.hostActor." + capture.namespace
+        if let actor = Keychain.string(slot) {
+            guard VortxNativeHostPreferences.validActor(actor) else { throw VortxNativeError.invalidSnapshot }; return actor
+        }
+        let actor = UUID().uuidString.lowercased()
+        guard Keychain.set(actor, for: slot) == .success, Keychain.string(slot) == actor else { throw VortxNativeError.unavailable }
+        return actor
+    }
+
+    private static func nativeLegacyMaterial(_ document: [String: Any]) throws -> Data {
+        guard let roster = resolveRoster(from: document, fullOnly: true),
+              roster.profiles.filter(\.isOwner).count == 1,
+              let owner = roster.profiles.first(where: \.isOwner) else { throw VortxNativeError.invalidSnapshot }
+        _ = try nativeWebsiteEvents(document)
+        _ = try nativeWebsiteAddonEvents(document)
+        return try VortxLegacyBootstrapMaterial.encode(document: JSONSerialization.data(withJSONObject: document),
+                                                       roster: roster.profiles, ownerProfileID: owner.id,
+                                                       rosterModifiedSeconds: roster.modified, deferProfileEdits: true)
+    }
+    private struct NativeLegacyPreparation {
+        let material: Data
+        let authority: VortxNativeOwnAccountProducer.Authority?
+        let sourceArchive: Data?
+    }
+    func updateNativeOwnAccountAvailability(missing: [UUID], profiles: [UserProfile], capture: CredentialScopeRegistry.Capture) {
+        guard isCurrent(capture) else { return }
+        let ownIDs = Set(profiles.filter { !$0.isOwner && $0.usesOwnAccount }.map(\.id))
+        nativeOwnAccountResyncUnavailable = Array(Set(nativeOwnAccountResyncUnavailable).intersection(ownIDs).union(missing)).sorted { $0.uuidString < $1.uuidString }
+    }
+    func nativeOwnAccountReconnected(_ profileID: UUID, capture: CredentialScopeRegistry.Capture) {
+        guard isCurrent(capture) else { return }
+        nativeOwnAccountResyncUnavailable.removeAll { $0 == profileID }
+    }
+    func publishNativeWatchedPending(_ archive: Data?, capture: CredentialScopeRegistry.Capture) throws {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        nativeWatchedMigrationPending = try VortxNativeWatchedArchive.pendingProfileIDs(archive)
+    }
+    func retryNativeWatchedMigration() async {
+        if CoreBridge.shared.hasNativeSession { _ = await syncDown(force: true) }
+        else { _ = await restoreNativeCheckpoint() }
+    }
+    func publishNativeOwnOverlayPending(_ value: VortxJSON, capture: CredentialScopeRegistry.Capture) throws {
+        guard isCurrent(capture), case .object(let records) = value else { throw VortxNativeError.superseded }
+        let ids = try records.keys.map { id in
+            guard let uuid = UUID(uuidString: id), uuid.uuidString == id else { throw VortxNativeError.invalidSnapshot }
+            return uuid
+        }.sorted { $0.uuidString < $1.uuidString }
+        if nativeOwnAccountOverlayPending != ids { nativeOwnAccountOverlayPending = ids }
+        nativeOwnAccountOverlayUnattributed = ids.filter { records[$0.uuidString]?["verifiedStreamingUid"] == nil }
+    }
+    private func prepareNativeLegacyMaterial(_ document: [String: Any], capture: CredentialScopeRegistry.Capture,
+                                             enforceMountedFence: Bool = true) async throws -> NativeLegacyPreparation {
+        guard isCurrent(capture), let roster = Self.resolveRoster(from: document, fullOnly: true),
+              let owner = roster.profiles.first(where: \.isOwner), roster.profiles.filter(\.isOwner).count == 1 else { throw VortxNativeError.invalidSnapshot }
+        let profiles = roster.profiles.filter { !$0.isOwner && $0.usesOwnAccount }
+        let selectedProfile = ProfileStore.shared.activeID
+        let mountedSourceFence = CoreBridge.shared.captureNativeSourceFence()
+        guard let keyBytes = dataKey, keyBytes.count == 32 else { throw VortxNativeError.unavailable }
+        let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owner.id.uuidString)
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+        let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes))
+        let remote = try document["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+        let validatedSync = try VortxNativeSession.authenticatedAccountSync(scope: scope, ownerName: owner.name,
+            snapshot: probe.authenticatedCheckpoint(scope: scope), nativeSync: remote, abi: VortxCABI())
+        let retainedBaseline = try validatedSync?["legacyImport"]?["baseline"].flatMap { baseline in
+            baseline["schemaVersion"] == .integer(2) ? try JSONEncoder().encode(baseline) : nil
+        }
+        let retainedSlots = try validatedSync.flatMap { native in
+            [VortxJSON.integer(4), .unsigned(4), .integer(5), .unsigned(5)].contains(native["schemaVersion"] ?? .null)
+                ? try VortxNativeProfiles.activeOwnAccountSlotBaselines(nativeSync: native) : nil
+        } ?? []
+        var preferredSources: [String: VortxJSON] = [:]
+        if case .object(let historical) = validatedSync?["legacyImport"]?["baseline"]?["ownAccountSources"] {
+            preferredSources = historical
+        }
+        for slot in retainedSlots {
+            let carrier = try JSONDecoder().decode(VortxJSON.self, from: slot.sourceBaseline)
+            guard let source = carrier["source"] else { throw VortxNativeError.invalidSnapshot }
+            let historical = preferredSources[slot.profileID.uuidString]
+            // A current B slot is never evidence for the historical UUID-only A overlay.
+            if historical == nil || historical?["verifiedStreamingUid"] == source["verifiedStreamingUid"] {
+                preferredSources[slot.profileID.uuidString] = source
+            }
+        }
+        var retainedEnvelopes: [VortxLegacyBootstrapMaterial.RetainedOwnAccountSourceEnvelope] = []
+        var pendingOverlays: [String: VortxJSON] = [:]
+        let priorWatchedDraft = try probe.readMigrationDraft(scope: scope)
+        var watchedArchive = priorWatchedDraft
+        if let host = try probe.readHostPreferences(scope: scope),
+           let archive = try JSONDecoder().decode(VortxNativeHostPreferences.Local.self, from: host).authenticatedSourceArchive {
+            watchedArchive = try VortxNativeWatchedArchive.retaining(archive, prior: watchedArchive, scope: scope)
+            try VortxNativeBootstrapArchive.validate(archive)
+            let value = try JSONDecoder().decode(VortxJSON.self, from: archive)
+            if case .object(let pending) = value["hostDocument"]?["ownAccountOverlayPending"] { pendingOverlays = pending }
+            if case .object(let retained) = value["hostDocument"]?["ownAccountSources"] {
+                for (id, source) in retained {
+                    if let profile = UUID(uuidString: id), case .string(let encoded) = source["sourceDocumentBase64"], let data = Data(base64Encoded: encoded) {
+                        let envelope = VortxLegacyBootstrapMaterial.RetainedOwnAccountSourceEnvelope(profileID: profile, sourceDocument: data)
+                        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                        if preferredSources[id]?["sourceDocumentSha256"] == .string(digest) {
+                            retainedEnvelopes.append(envelope)
+                        }
+                    }
+                }
+            }
+        }
+        let documentBytes = try VortxNativeBootstrapArchive.credentialFreeDocument(document)
+        let sourceDocument = try JSONDecoder().decode(VortxJSON.self, from: documentBytes)
+        func hasAttribution(_ profileID: UUID) throws -> Bool {
+            try VortxNativeOwnAccountProducer.hasOverlayAttribution(proof: preferredSources[profileID.uuidString],
+                sealedEnvelope: retainedEnvelopes.first(where: { $0.profileID == profileID })?.sourceDocument)
+        }
+        struct Captured: Sendable { let profileID: UUID; let slot: String; let token: String; let generation: VortxNativeOwnAccountProducer.Generation; let framing: VortxNativeOwnAccountProducer.SourceFraming }
+        var unavailable: [UUID] = []
+        let captured = try profiles.compactMap { profile -> Captured? in
+            // After a rebind the old legacy carrier belongs to its original source, not the
+            // currently active external UID. Refresh active own slots only through explicit CAS.
+            if validatedSync?["accountSlots"]?[profile.id.uuidString] != nil { return nil }
+            let attributed = try hasAttribution(profile.id)
+                && !(pendingOverlays[profile.id.uuidString] != nil && pendingOverlays[profile.id.uuidString]?["verifiedStreamingUid"] == nil)
+            if validatedSync != nil && !attributed {
+                let slice = try VortxNativeOwnAccountProducer.overlay(document: sourceDocument, profileID: profile.id)
+                if !(try VortxProfileOverlayWitness.decodeObject(json: slice)).isEmpty {
+                    unavailable.append(profile.id); return nil
+                }
+            }
+            let slot: String
+            if let native = validatedSync, let account = native["profiles"]?[profile.id.uuidString]?["profile"]?["account"] {
+                let binding = VortxJSON.object(["account": account, "revision": .integer(0), "transactionId": .null])
+                slot = try VortxNativeAccountCredentials.selectedSlot(scope: capture.namespace, profileID: profile.id, binding: binding)
+                    ?? "vortx.native.streaming.unavailable." + profile.id.uuidString
+            } else if validatedSync == nil { slot = ProfileStore.legacyKeychainAccount(for: profile) }
+            else { slot = "vortx.native.streaming.unavailable." + profile.id.uuidString }
+            guard slot != ProfileStore.primaryTokenAccount else { throw VortxNativeError.invalidSnapshot }
+            guard case .value(let token) = Keychain.confirmedString(slot), !token.isEmpty else {
+                guard preferredSources[profile.id.uuidString] != nil else { throw VortxNativeError.unavailable }
+                unavailable.append(profile.id); return nil
+            }
+            return Captured(profileID: profile.id, slot: slot, token: token, generation: VortxNativeOwnAccountProducer.capture(slot: slot),
+                framing: validatedSync == nil || attributed ? .authenticatedOverlay : .independentNetworkOnly)
+        }
+        let authority = VortxNativeOwnAccountProducer.Authority(generations: captured.map(\.generation), validate: {
+            CredentialScopeRegistry.shared.isCurrent(capture) && (!enforceMountedFence || mountedSourceFence()) && captured.allSatisfy {
+                if case .value(let current) = Keychain.confirmedString($0.slot) { return current == $0.token }; return false
+            }
+        })
+        var sources: [VortxLegacyBootstrapMaterial.OwnAccountSource] = []
+        // The classifier's admission token binds these exact bytes. Reuse them at encode rather
+        // than serializing an unordered dictionary twice across the asynchronous source fetch.
+        for binding in captured {
+            do {
+                sources.append(try await VortxNativeOwnAccountProducer.fetch(profileID: binding.profileID, authKey: binding.token, authority: authority,
+                    profileOverlay: VortxNativeOwnAccountProducer.overlay(document: sourceDocument, profileID: binding.profileID), framing: binding.framing))
+            } catch {
+                try authority.withActive {} // Cancellation/account/token retirement never falls back.
+                guard preferredSources[binding.profileID.uuidString] != nil else { throw error }
+                unavailable.append(binding.profileID)
+            }
+            guard isCurrent(capture), ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+        }
+        try authority.withActive {}
+        _ = try Self.nativeWebsiteEvents(document)
+        _ = try Self.nativeWebsiteAddonEvents(document)
+        let freshIDs = Set(sources.map(\.profileID))
+        let envelopes = retainedEnvelopes.filter { !freshIDs.contains($0.profileID) }
+        let deferred = try VortxLegacyBootstrapMaterial.classifyDeferredOwnAccountOverlays(document: documentBytes,
+            roster: roster.profiles, ownerProfileID: owner.id, rosterModifiedSeconds: roster.modified,
+            retainedOwnAccountBaseline: retainedBaseline, retainedOwnAccountSourceEnvelopes: envelopes,
+            retainedOwnAccountSlotBaselines: retainedSlots).filter { !freshIDs.contains($0.profileID) }
+        for disposition in deferred {
+            switch disposition.status {
+            case .matchedWitness, .matchedSealedEnvelope:
+                pendingOverlays.removeValue(forKey: disposition.profileID.uuidString)
+            case .missingWitness, .changedWitness:
+                guard disposition.sourceDocumentSHA256 != nil,
+                      case .string(let uid) = preferredSources[disposition.profileID.uuidString]?["verifiedStreamingUid"] else { throw VortxNativeError.invalidSnapshot }
+                let slice = try VortxNativeOwnAccountProducer.overlay(document: sourceDocument, profileID: disposition.profileID)
+                pendingOverlays[disposition.profileID.uuidString] = try VortxNativeOwnAccountProducer.pendingRecord(disposition: disposition,
+                    verifiedUID: uid, overlay: slice, attributed: hasAttribution(disposition.profileID), previous: pendingOverlays[disposition.profileID.uuidString])
+            case .missingRetainedSource: throw VortxNativeError.unavailable
+            }
+        }
+        for source in sources {
+            let slice = try VortxNativeOwnAccountProducer.overlay(document: sourceDocument, profileID: source.profileID)
+            // Omitted carriers do not acknowledge a previously pending edit. An explicit current
+            // slice consumed by this verified source may replace its older pending version.
+            if !(try VortxProfileOverlayWitness.decodeObject(json: slice)).isEmpty {
+                pendingOverlays.removeValue(forKey: source.profileID.uuidString)
+            }
+        }
+        watchedArchive = try await VortxNativeWatchedArchive.retryHistorical(watchedArchive, scope: scope,
+            isCurrent: { (try? authority.withActive {}) != nil }, fetch: { try await VortxLegacyWatchedMetadataTransport.fetch($0) })
+        try authority.withActive {}
+        let watched = try await VortxLegacyWatchedMigration.prepare(accountID: capture.namespace, ownerProfileID: owner.id,
+            document: documentBytes, profileIDs: roster.profiles.filter { $0.isOwner || !$0.usesOwnAccount }.map(\.id),
+            ownAccountSources: sources, archivedEvidence: VortxNativeWatchedArchive.entries(watchedArchive, key: VortxNativeWatchedArchive.evidenceKey),
+            isCurrent: { (try? authority.withActive {}) != nil }, fetch: { try await VortxLegacyWatchedMetadataTransport.fetch($0) })
+        try authority.withActive {}
+        let baseArchive = try VortxNativeOwnAccountProducer.archive(sources, pendingOverlays: pendingOverlays)
+        let archive = try VortxNativeWatchedArchive.retaining(baseArchive, prior: watchedArchive,
+            evidence: watched.archives, pending: watched.pendingArchives, scope: scope)
+        if !watched.unresolved.isEmpty {
+            // Never pair an unimported own source with the existing kernel receipt. Only the
+            // self-contained metadata/pending sidecars enter this no-op checkpoint transaction.
+            let pendingArchive = try VortxNativeWatchedArchive.retaining(VortxNativeOwnAccountProducer.archive([]), prior: watchedArchive,
+                evidence: watched.archives, pending: watched.pendingArchives, scope: scope)
+            if enforceMountedFence, CoreBridge.shared.hasNativeSession {
+                _ = try await CoreBridge.shared.mergeNativeAccountDocument(nil, hostRemote: nil, capture: capture,
+                    legacyMaterial: nil, sourceAuthority: authority, authenticatedSourceArchive: pendingArchive)
+            } else {
+                try probe.retainMigrationDraft(pendingArchive, scope: scope, expected: priorWatchedDraft, authority: authority)
+            }
+            guard isCurrent(capture), !Task.isCancelled else { throw VortxNativeError.superseded }
+            nativeWatchedMigrationPending = try VortxNativeWatchedArchive.pendingProfileIDs(pendingArchive)
+            throw VortxNativeWatchedArchive.Failure.pending
+        }
+        let material = try VortxLegacyBootstrapMaterial.encode(document: documentBytes,
+            roster: roster.profiles, ownerProfileID: owner.id, rosterModifiedSeconds: roster.modified,
+            deferProfileEdits: true, ownAccountSources: sources, retainedOwnAccountBaseline: retainedBaseline,
+            retainedOwnAccountSourceEnvelopes: envelopes, retainedOwnAccountSlotBaselines: retainedSlots,
+            deferredOwnAccountOverlays: deferred, accountID: capture.namespace, watchedEvidence: watched.rows)
+        nativeOwnAccountResyncUnavailable = unavailable
+        for source in sources {
+            guard let binding = captured.first(where: { $0.profileID == source.profileID }) else { throw VortxNativeError.invalidSnapshot }
+            try CoreBridge.stageNativeCredential(token: binding.token, source: source, transactionID: nil, capture: capture, authority: authority)
+        }
+        return .init(material: material, authority: authority, sourceArchive: archive)
+    }
+    private static func nativeWebsiteEvents(_ document: [String: Any]) throws -> [VortxJSON] {
+        let carrier = try document["profileEditEvents"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+        var events = try VortxNativeProfileEditHost.events(carrier)
+        if let raw = document["profileEdits"] {
+            let aggregate = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: raw))
+            let hasRows = !(aggregate["roster"]?.array ?? []).isEmpty
+            let hasAdds: Bool
+            if case .object(let adds) = aggregate["libraryAdds"] { hasAdds = !adds.isEmpty } else { hasAdds = false }
+            if hasRows || hasAdds {
+                // An aggregate has no per-user authoring evidence. Retain it separately; neither
+                // the v2 queue nor a receipt timestamp can retroactively certify its carried fields.
+                events.append(.object(["eventId": .string("legacy-aggregate-" + (try VortxNativeProfileEditHost.valueHash(aggregate))), "legacyAggregate": aggregate]))
+            }
+        }
+        try VortxNativeProfileEditHost.validateSource(events)
+        return events
+    }
+    private static func nativeWebsiteAddonEvents(_ document: [String: Any]) throws -> [VortxJSON] {
+        let carrier = try document["webAddonEdits"].map {
+            try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0, options: [.fragmentsAllowed]))
+        }
+        return try VortxNativeWebsiteAddonEdits.events(carrier)
+    }
+    private func publishNativeWebsiteOutcome(_ outcome: VortxJSON, capture: CredentialScopeRegistry.Capture) throws {
+        guard isCurrent(capture) else { throw VortxNativeError.superseded }
+        nativeProfileEditConflicts = try outcome["conflicts"]?.decode([VortxNativeProfileEditHost.Conflict].self) ?? []
+        nativeAddonEditConflicts = try outcome["addonConflicts"]?.decode([VortxNativeWebsiteAddonEdits.Conflict].self) ?? []
+    }
+
+    /// Used only after a successful authenticated empty response, before any accepted version.
+    /// Reopens the exact first bootstrap across a crash between local commit and initial upload.
+    private func nativeEmptyAccountDocument(capture: CredentialScopeRegistry.Capture) throws -> [String: Any] {
+        guard isCurrent(capture), lastSyncedVersion == 0, !nativeBackupSeen(capture: capture), account != nil,
+              let keyBytes = dataKey, keyBytes.count == 32 else { throw VortxNativeError.invalidSnapshot }
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+        let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
+        if let recovery = try store.recovery(account: capture.namespace) {
+            guard let archive = try JSONSerialization.jsonObject(with: recovery.bootstrap) as? [String: Any],
+                  let document = archive["hostDocument"] as? [String: Any],
+                  document["nativeAccountBootstrap"] as? String == "authenticated-empty-v1" else { throw VortxNativeError.invalidSnapshot }
+            return document
+        }
+        // The constant owner belongs to this new account scope. No pre-existing global profile,
+        // watched item, addon, or preference is silently attributed to the new account.
+        let owner = UserProfile(id: UserProfile.ownerID, name: "Main", avatar: "🍿", isOwner: true)
+        guard let roster = ProfileRosterSnapshot.wire([owner]) else { throw VortxNativeError.invalidSnapshot }
+        return ["nativeAccountBootstrap": "authenticated-empty-v1", "vortx": ["roster": roster, "rosterModified": 0]]
+    }
+
+    /// Never install a provisional owner before the server accepts its create-only seed. A
+    /// rejected/ambiguous PUT is followed by authenticated readback, not a higher-version retry.
+    private func publishDetachedNativeSeed(_ baseline: [String: Any], capture: CredentialScopeRegistry.Capture) async throws -> [String: Any]? {
+        guard isCurrent(capture), let keyBytes = dataKey, keyBytes.count == 32,
+              let roster = Self.resolveRoster(from: baseline, fullOnly: true),
+              let owner = roster.profiles.first(where: \.isOwner) else { throw VortxNativeError.invalidSnapshot }
+        let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owner.id.uuidString)
+        let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+        let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
+        // Preserve historical, already-mounted provisional checkpoints and every edit in them.
+        if try probe.authenticatedCheckpoint(scope: scope) != nil { return baseline }
+        var candidate = baseline
+        let sync = try VortxNativeSession.detachedLegacySync(scope: scope, ownerName: owner.name,
+                                                            material: Self.nativeLegacyMaterial(baseline), abi: VortxCABI())
+        candidate["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(sync))
+        let host = try VortxNativeHostPreferences(scope: scope, actor: nativeHostActor(capture: capture))
+        candidate["nativeHostPreferences"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(host.document))
+        guard isCurrent(capture), !Task.isCancelled else { throw VortxNativeError.superseded }
+        _ = await pushSyncDocAt(candidate, version: 0, credentialCapture: capture)
+        guard isCurrent(capture), !Task.isCancelled else { throw VortxNativeError.superseded }
+        switch await pullDocVersionedResult(credentialCapture: capture) {
+        case .doc(let document, let version) where version >= lastSyncedVersion: return document
+        default: return nil
+        }
+    }
+
+    private func restoreOfflineNativeCheckpoint(capture: CredentialScopeRegistry.Capture, selectedProfile: UUID?, generation: UUID) async -> Bool {
+        guard let keyBytes = dataKey, keyBytes.count == 32, let selectedProfile,
+              isCurrent(capture), !Task.isCancelled else { return false }
+        do {
+            let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+                .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+            let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
+            guard let recovery = try store.recovery(account: capture.namespace) else { throw VortxNativeError.invalidSnapshot }
+            let state = try recovery.scope.validateSnapshot(recovery.state)
+            guard let profile = state["roster"]?["profiles"]?[selectedProfile.uuidString], profile["deleted"] != .bool(true),
+                  case .string(let ownerName) = state["roster"]?["profiles"]?[recovery.scope.ownerProfileID]?["name"],
+                  let archive = try JSONSerialization.jsonObject(with: recovery.bootstrap) as? [String: Any],
+                  let material = archive["legacyImportMaterial"] as? [String: Any] else { throw VortxNativeError.invalidSnapshot }
+            try VortxNativeSession.validateLegacyCompatibility(scope: recovery.scope, ownerName: ownerName,
+                snapshot: recovery.state, nativeSync: nil, material: JSONSerialization.data(withJSONObject: material), abi: VortxCABI())
+            await CoreBridge.shared.closeNativeSession()
+            guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
+                  ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+            let session = try VortxNativeSession(scope: recovery.scope, ownerName: ownerName, abi: VortxCABI(), store: store,
+                                                transport: VortxCResourceTransport(), hostActor: nativeHostActor(capture: capture))
+            do {
+                if state["activeProfileId"] != .string(selectedProfile.uuidString) {
+                    let action = VortxJSON.object(["type": .string("switch_profile"), "id": .string(selectedProfile.uuidString)])
+                    _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970))
+                }
+                let registry = try await session.resourceRegistry()
+                let acceptedHost = try await session.hostPreferencesDocument()
+                let websiteOutcome = try await session.websiteEditOutcome()
+                guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
+                      ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                try store.rememberAuthenticatedScope(recovery.scope)
+                let sourceDocument = archive["hostDocument"] as? [String: Any] ?? [:]
+                let hostProfiles = Self.resolveRoster(from: sourceDocument, fullOnly: true)?.profiles ?? []
+                try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture, hostProfiles: hostProfiles)
+                guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
+                      ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                applyNativeGlobals(acceptedHost)
+                try publishNativeWebsiteOutcome(websiteOutcome, capture: capture)
+                nativeCheckpointStatus = "mounted_offline"; return true
+            } catch { await session.close(); throw error }
+        } catch {
+            if isCurrent(capture), nativeCheckpointGeneration == generation { nativeCheckpointStatus = "offline_checkpoint_unavailable" }
+            return false
+        }
+    }
+
+    /// The key never leaves this account owner. Only an absent checkpoint permits a complete
+    /// authenticated import/native-carrier adoption; failed reads/decryption never mean absence.
+    @discardableResult
+    func restoreNativeCheckpoint(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
+        let capture = suppliedCapture ?? credentialAuthority.capture()
+        let selectedProfile = ProfileStore.shared.activeID
+        guard isSignedIn, isCurrent(capture), case .account = capture.scope else { return false }
+        if let pending = nativeCheckpointTask, nativeCheckpointCapture == capture, nativeCheckpointProfile == selectedProfile {
+            return await pending.value
+        }
+        let generation = UUID(); nativeCheckpointGeneration = generation; nativeProfileEditConflicts = []; nativeAddonEditConflicts = []; nativeOwnAccountResyncUnavailable = []; nativeOwnAccountOverlayPending = []; nativeOwnAccountOverlayUnattributed = []; nativeWatchedMigrationPending = []
+        nativeUnsupportedSettings = []; nativeLegacyWatchlistPending = []
+        let previous = nativeCheckpointTask; previous?.cancel(); _ = await previous?.value
+        guard isCurrent(capture), nativeCheckpointGeneration == generation else { return false }
+        nativeCheckpointCapture = capture; nativeCheckpointProfile = selectedProfile
+        let task = Task { @MainActor [weak self] () -> Bool in
+            guard let self else { return false }
+            defer {
+                if self.nativeCheckpointGeneration == generation {
+                    self.nativeCheckpointTask = nil; self.nativeCheckpointCapture = nil; self.nativeCheckpointProfile = nil
+                }
+            }
+            guard self.isCurrent(capture), !Task.isCancelled else { return false }
+            // Global ProfileStore is not account-attribution evidence. Pin the owner from this
+            // freshly authenticated/decrypted account roster, including historical PIN-bound IDs.
+            let pulled = await self.pullDocVersionedResult(credentialCapture: capture)
+            if case .failed(retryable: true) = pulled {
+                return await self.restoreOfflineNativeCheckpoint(capture: capture, selectedProfile: selectedProfile, generation: generation)
+            }
+            let document: [String: Any]
+            switch pulled {
+            case .doc(let value, let version) where version >= self.lastSyncedVersion: document = value
+            case .empty:
+                guard let value = try? self.nativeEmptyAccountDocument(capture: capture),
+                      let accepted = try? await self.publishDetachedNativeSeed(value, capture: capture) else {
+                    self.nativeCheckpointStatus = "empty_account_attribution_unavailable"; return false
+                }
+                document = accepted
+            default: self.nativeCheckpointStatus = "account_document_unavailable"; return false
+            }
+            guard self.isCurrent(capture), !Task.isCancelled,
+                  let roster = Self.resolveRoster(from: document, fullOnly: true),
+                  let keyBytes = self.dataKey, keyBytes.count == 32 else {
+                if self.isCurrent(capture) { self.nativeCheckpointStatus = "account_document_unavailable" }; return false
+            }
+            let owners = roster.profiles.filter(\.isOwner)
+            guard owners.count == 1, let selectedProfile else {
+                self.nativeCheckpointStatus = "profile_attribution_unavailable"; return false
+            }
+            do {
+                let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owners[0].id.uuidString)
+                _ = try self.mergedNativeProviderState(document, capture: capture) // validate before any native checkpoint commit
+                let directory = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+                    .appendingPathComponent("VortX/native-engine-v1", isDirectory: true)
+                let documentBytes = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys, .withoutEscapingSlashes])
+                let probe = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes), installationKey: VortxNativeInstallationKey.loadOrCreate())
+                let checkpoint = try probe.authenticatedCheckpoint(scope: scope)
+                let preparationHost = try probe.readHostPreferences(scope: scope)
+                let hadCheckpoint = checkpoint != nil
+                // Every open checks the complete legacy projection, including pending web edits.
+                // Native authority cannot silently ignore a later old-client membership/watch edit.
+                let prepared = try await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)
+                guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
+                      ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                guard try probe.authenticatedCheckpoint(scope: scope) == checkpoint,
+                      try probe.readHostPreferences(scope: scope) == preparationHost else { throw VortxNativeError.superseded }
+                let material = prepared.material
+                let remoteNative = try document["nativeSync"].map {
+                    try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0))
+                }
+                if hadCheckpoint || remoteNative != nil {
+                    try VortxNativeSession.validateLegacyCompatibility(scope: scope, ownerName: owners[0].name,
+                                                                       snapshot: checkpoint, nativeSync: remoteNative,
+                                                                       material: material, abi: VortxCABI(), baselineMaterial: probe.readLegacyMaterial(scope: scope))
+                }
+                let didImportLegacy = !hadCheckpoint && remoteNative == nil
+                var initialActions: [String] = []
+                if !hadCheckpoint {
+                    let initial: VortxJSON
+                    if let native = remoteNative {
+                        initial = .object(["type": .string("merge_native_sync"), "document": native])
+                    } else {
+                        initial = .object(["type": .string("import_legacy_sync"), "scope": .string(scope.account),
+                                           "ownerProfileId": .string(scope.ownerProfileID),
+                                           "material": try JSONDecoder().decode(VortxJSON.self, from: material)])
+                    }
+                    initialActions = [String(decoding: try JSONEncoder().encode(initial), as: UTF8.self)]
+                }
+                let archive = try VortxNativeBootstrapArchive.encode(document: documentBytes, material: material, authenticatedSourceArchive: prepared.sourceArchive)
+                // Keep an already validated session visible while authentication/source parsing
+                // is pending or fails. Only retire it once the replacement has passed preflight.
+                await CoreBridge.shared.closeNativeSession()
+                guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
+                      ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                let finalCheckpoint = try probe.authenticatedCheckpoint(scope: scope)
+                // This opener deliberately retires its old facade. Its equivalent source fence
+                // is exact pre-fetch checkpoint+sidecar equality after retirement, not isAvailable.
+                guard finalCheckpoint == checkpoint, try probe.readHostPreferences(scope: scope) == preparationHost else { throw VortxNativeError.superseded }
+                let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes),
+                                                               installationKey: VortxNativeInstallationKey.loadOrCreate(),
+                                                               bootstrap: archive, bootstrapScope: scope)
+                let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
+                                                    transport: VortxCResourceTransport(), allowNewAccount: !hadCheckpoint, initialActions: initialActions,
+                                                    hostActor: self.nativeHostActor(capture: capture), sourceAuthority: prepared.authority,
+                                                    authenticatedSourceArchive: !hadCheckpoint ? prepared.sourceArchive : nil,
+                                                    initialLegacyMaterial: !hadCheckpoint && remoteNative != nil ? material : nil)
+                do {
+                    let hostRemote = try document["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+                    let watchlists = try self.nativeLegacyWatchlists(document)
+                    let websiteEvents = try Self.nativeWebsiteEvents(document)
+                    let websiteAddonEvents = try Self.nativeWebsiteAddonEvents(document)
+                    if hadCheckpoint || remoteNative != nil || hostRemote != nil || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty || !watchlists.isEmpty {
+                        let action = remoteNative.map { VortxJSON.object(["type": .string("merge_native_sync"), "document": $0]) } ?? .object(["type": .string("get_state")])
+                        _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970), legacyMaterial: material, hostRemote: hostRemote,
+                            legacyWatchlists: watchlists, websiteEvents: websiteEvents, websiteAddonEvents: websiteAddonEvents, websiteBaseline: VortxNativeProfileEditHost.baselines(roster.profiles),
+                            sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
+                    }
+                    guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                    let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+                    let selectedRecord = state["roster"]?["profiles"]?[selectedProfile.uuidString]
+                    // A first mount cannot attribute another account's global picker selection.
+                    // Prefer it only when present in this authenticated roster; otherwise its owner.
+                    let installationProfile = (selectedRecord == nil || selectedRecord?["deleted"] == .bool(true)) ? owners[0].id : selectedProfile
+                    if state["activeProfileId"] != .string(installationProfile.uuidString) {
+                        let action = VortxJSON.object(["type": .string("switch_profile"), "id": .string(installationProfile.uuidString)])
+                        _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970))
+                    }
+                    let registry = try await session.resourceRegistry()
+                    let acceptedHost = try await session.hostPreferencesDocument()
+                    let websiteOutcome = try await session.websiteEditOutcome()
+                    guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
+                    try store.rememberAuthenticatedScope(scope)
+                    try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture, hostProfiles: roster.profiles)
+                    guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
+                          ProfileStore.shared.activeID == installationProfile else { throw VortxNativeError.superseded }
+                    self.applyNativeGlobals(acceptedHost)
+                    try self.publishNativeWebsiteOutcome(websiteOutcome, capture: capture)
+                    // Upload only the new nativeSync carrier. The archive never enters the wire,
+                    // and adopting an existing remote carrier must not create an echo push.
+                    if didImportLegacy || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty { self.requestSyncSoon() }
+                    self.nativeCheckpointStatus = "mounted"; return true
+                } catch { await session.close(); throw error }
+            } catch {
+                if self.isCurrent(capture), self.nativeCheckpointGeneration == generation,
+                   ProfileStore.shared.activeID == selectedProfile { self.nativeCheckpointStatus = (error as? VortxNativeWatchedArchive.Failure) == .pending ? "watched_migration_pending" : "native_checkpoint_unavailable" }
+                return false // No empty account, legacy token dispatch, or destructive repair fallback.
+            }
+        }
+        nativeCheckpointTask = task
+        return await task.value
+    }
+#endif
     /// Shared account-owner epoch. Every async sync/auth operation captures this before its first await and
     /// must still own it before applying a result, so an account switch cannot commit A's pull into B.
     private let credentialAuthority = CredentialScopeRegistry.shared
@@ -423,11 +1204,46 @@ final class VortXSyncManager: ObservableObject {
         // Only a real syncable delta may defer receiving peer profile edits.
         if noteLocalSettingsChange() { requestSyncSoon() }
     }
+    private var pendingLocalRosterPush: CredentialScopeRegistry.Capture?
+
+    /// Explicit local persistence is stronger evidence than a queued defaults notification.
+    /// The caller excludes housekeeping and remote profile-edit application.
+    private func noteLocalRosterMutation() {
+        guard isSignedIn else { return }
+        let capture = credentialAuthority.capture()
+        guard isCurrent(capture) else { return }
+        let keys: Set<String> = ["stremiox.profiles", "stremiox.profiles.modified"]
+        var dirty = dirtySettings
+        SettingsDirtyKeys.mark(keys, at: Date().timeIntervalSince1970, into: &dirty)
+        dirtySettings = dirty
+        let current = currentSyncableDomain()
+        for key in keys { settingsShadow[key] = current[key] }
+        if isApplyingRemote { pendingLocalRosterPush = capture }
+        else { requestSyncSoon() }
+    }
+
+    private func drainLocalRosterPush() {
+        guard !isApplyingRemote, let capture = pendingLocalRosterPush else { return }
+        pendingLocalRosterPush = nil
+        guard isSignedIn, isCurrent(capture) else { return }
+        requestSyncSoon()
+    }
+
+    nonisolated static func localRosterDidPersist() {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { shared.noteLocalRosterMutation() }
+        } else {
+            DispatchQueue.main.sync { shared.noteLocalRosterMutation() }
+        }
+    }
     /// Clear the keys a CONFIRMED push carried up, guarded by the stamp `snapshot` taken when that push began so a
     /// key re-edited mid-push stays protected (see `SettingsDirtyKeys.clearPushed`). Under the suppression window:
     /// it is a `vortx.sync.` UserDefaults write and must not arm a self-echo push.
     private func clearPushedDirtySettings(_ snapshot: [String: Double]) {
         guard !snapshot.isEmpty else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        let snapshot = snapshot.filter { nativeDirtySettingIsExported($0.key) }
+#endif
         withRemoteApplySuppressed {
             var dirty = dirtySettings
             SettingsDirtyKeys.clearPushed(snapshot, from: &dirty)
@@ -497,9 +1313,8 @@ final class VortXSyncManager: ObservableObject {
     /// (a fresh install) keep their original relative order at the END so they are never hidden. An empty
     /// order returns the input unchanged, so this is a no-op until the user actually reorders.
     static func orderedByApplied<T>(_ items: [T], url: (T) -> String) -> [T] {
-        AddonAppliedOrder.sorted(items, order: appliedAddonOrder) {
-            AddonTombstones.normalize(url($0))
-        }
+        ProfileAddonPreferencesPolicy.sorted(items,
+            order: ProfileStore.activeAddonOrder(accountOrder: appliedAddonOrder), key: url)
     }
 
     /// Persist a user-chosen add-on order (the in-app Reorder screen) and push it to the account IMMEDIATELY
@@ -587,6 +1402,7 @@ final class VortXSyncManager: ObservableObject {
         capture: CredentialScopeRegistry.Capture,
         version: Int
     ) -> PendingProviderApply? {
+#if !VORTX_NATIVE_DATA_ENGINE
         if let pending = pendingProviderApply,
            pending.capture == capture,
            pending.version == version {
@@ -599,6 +1415,11 @@ final class VortXSyncManager: ObservableObject {
         } else {
             priorValues = [:]
         }
+#else
+        // Native retries are reconstructed from the current merged register snapshot. Retaining an
+        // older value-only plan could resurrect a tuple superseded by a local reconnect or clear.
+        let priorValues: [ProviderApplyService: ProviderApplyValue] = [:]
+#endif
         var values: [ProviderApplyService: ProviderApplyValue] = [:]
         if let keys {
             if let access = keys["traktAccess"], let refresh = keys["traktRefresh"],
@@ -816,6 +1637,15 @@ final class VortXSyncManager: ObservableObject {
         // A busy publication boundary is a hard composition failure. Do not let any dependent store, source
         // index, or session field observe a partial owner transition; the caller leaves all of them untouched.
         guard let capture = credentialAuthority.tryBind(scope) else { return nil }
+#if VORTX_NATIVE_DATA_ENGINE
+        nativeProfileEditConflicts = []
+        nativeAddonEditConflicts = []
+        nativeOwnAccountResyncUnavailable = []
+        nativeOwnAccountOverlayPending = []
+        nativeWatchedMigrationPending = []
+        nativeUnsupportedSettings = []; nativeLegacyWatchlistPending = []
+        nativeOwnAccountOverlayUnattributed = []
+#endif
         if case .account = scope { CoreBridge.excludeAccountHistoryFromGuestRecommendations() }
         cancelProviderLegacyMigration(except: capture)
         ApiKeys.shared.bind(owner: scope)
@@ -838,6 +1668,15 @@ final class VortXSyncManager: ObservableObject {
         certifying: @MainActor () -> CredentialMutationResult
     ) -> CredentialScopeRegistry.Capture? {
         guard let capture = credentialAuthority.tryBind(scope, certifying: certifying) else { return nil }
+#if VORTX_NATIVE_DATA_ENGINE
+        nativeProfileEditConflicts = []
+        nativeAddonEditConflicts = []
+        nativeOwnAccountResyncUnavailable = []
+        nativeOwnAccountOverlayPending = []
+        nativeWatchedMigrationPending = []
+        nativeUnsupportedSettings = []; nativeLegacyWatchlistPending = []
+        nativeOwnAccountOverlayUnattributed = []
+#endif
         if case .account = scope { CoreBridge.excludeAccountHistoryFromGuestRecommendations() }
         cancelProviderLegacyMigration(except: capture)
         ApiKeys.shared.bind(owner: scope)
@@ -1425,6 +2264,17 @@ final class VortXSyncManager: ObservableObject {
         return pt
     }
 
+    private static func decodeDecryptedSyncDocument(_ plaintext: Data) throws -> [String: Any] {
+#if VORTX_NATIVE_DATA_ENGINE
+        // Validate original numeric lexemes, duplicate keys and Unicode before Foundation can
+        // round/drop them. Those values later become authenticated per-profile overlay witnesses.
+        return try VortxProfileOverlayWitness.decodeObject(json: plaintext)
+#else
+        guard let object = try JSONSerialization.jsonObject(with: plaintext) as? [String: Any] else { throw VortxNativeError.invalidResponse }
+        return object
+#endif
+    }
+
     /// DEPRECATED single-state pull: collapses "no backup yet", "network/server failure", and
     /// "undecryptable/ratchet-refused doc" into one nil, so a caller cannot tell a fresh account from a
     /// blip and can misroute a failure into a seed/push decision. Kept only for callers not yet migrated;
@@ -1437,13 +2287,18 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture) else { return nil }
         guard code == 200, let doc = json?["document"] as? String,
               let pt = openSyncDocument(doc, version: (json?["version"] as? Int) ?? 0) else { return nil }
-        return (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any]
+        return try? Self.decodeDecryptedSyncDocument(pt)
     }
 
     /// Tri-state pull used by `syncUp`'s data-loss guard: distinguishes "the account has no backup yet"
     /// (safe to start from an empty doc) from "the pull failed" (must NOT push, or it clobbers the
     /// account's existing document). A non-200/non-404 response or an undecryptable document is a failure.
     private enum SyncDocPull { case doc([String: Any]); case empty; case failed }
+    private static func documentVersion(_ raw: Any?) -> Int? {
+        guard let value = ProfileRosterSyncPolicy.validClock(raw), value <= 9_007_199_254_740_991,
+              value.rounded(.towardZero) == value else { return nil }
+        return Int(value)
+    }
     private func pullSyncDocResult(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> SyncDocPull {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isCurrent(capture), dataKey != nil else { return .failed }
@@ -1451,14 +2306,19 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture) else { return .failed }
         if code == 404 { return .empty }                 // no backup yet
         guard code == 200 else { return .failed }        // network/server error: do not clobber
-        guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty } // 200, no document
-        let pulledVersion = (json?["version"] as? Int) ?? 0
+        guard let json else { return .failed }
+        if json["document"] is NSNull, Self.documentVersion(json["version"]) == 0 { return .empty }
+        guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .failed }
+        guard let pulledVersion = Self.documentVersion(json["version"]) else { return .failed }
         // H-2: refuse an honest-label replay of a doc OLDER than what this account has already applied. syncUp
         // uses this as its merge base, so a stale base would drop newer writes made on another surface. A real
         // server only ever returns a version >= what we last stamped, so this only fires on rollback/replay.
         if pulledVersion < lastSyncedVersion { return .failed }
         guard let pt = openSyncDocument(docStr, version: pulledVersion),
-              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed } // undecryptable / ratchet-refused: do not clobber
+              let obj = try? Self.decodeDecryptedSyncDocument(pt) else { return .failed } // undecryptable / ratchet-refused: do not clobber
+#if VORTX_NATIVE_DATA_ENGINE
+        guard rememberNativeBackup(capture: capture) else { return .failed }
+#endif
         return .doc(obj)
     }
 
@@ -1485,15 +2345,20 @@ final class VortXSyncManager: ObservableObject {
         // request() returns code 0 for a thrown URLSession error (offline / DNS / TLS / timeout) and 5xx is a
         // server fault: both are transient, and both are exactly the "silently returns false" case of #145.
         guard code == 200 else { return .failed(retryable: code == 0 || code >= 500) }
-        guard let docStr = json?["document"] as? String, !docStr.isEmpty else { return .empty }  // 200, no document
+        guard let json else { return .failed(retryable: false) }
+        if json["document"] is NSNull, Self.documentVersion(json["version"]) == 0 { return .empty }
+        guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .failed(retryable: false) }
         // `version` stays `as? Int` (Swift's Int is 64-bit on every platform this app targets), so an epoch-ms
         // version is carried whole. Never narrow this to a 32-bit type: a truncated version corrupts the AAD and
         // GCM auth then fails on every Apple / web doc.
-        guard let version = json?["version"] as? Int else { return .failed(retryable: false) }
+        guard let version = Self.documentVersion(json["version"]) else { return .failed(retryable: false) }
         // A doc we cannot open is NOT an empty account. Refusing it (rather than falling through to a nil that
         // reads as "nothing there") is what keeps a decrypt-miss / ratchet refusal from being pushed over.
         guard let pt = openSyncDocument(docStr, version: version),
-              let obj = (try? JSONSerialization.jsonObject(with: pt)) as? [String: Any] else { return .failed(retryable: false) }
+              let obj = try? Self.decodeDecryptedSyncDocument(pt) else { return .failed(retryable: false) }
+#if VORTX_NATIVE_DATA_ENGINE
+        guard rememberNativeBackup(capture: capture) else { return .failed(retryable: false) }
+#endif
         return .doc(doc: obj, version: version)
     }
 
@@ -1540,8 +2405,17 @@ final class VortXSyncManager: ObservableObject {
         guard code == 200 else { return .error }
         // accepted defaults to true so an older worker without the field (which stored the write) still
         // advances the version, matching the website's `accepted !== false` read.
+#if VORTX_NATIVE_DATA_ENGINE
+        guard let verdict = json?["accepted"] as? NSNumber, CFGetTypeID(verdict) == CFBooleanGetTypeID() else { return .error }
+        let accepted = verdict.boolValue
+#else
         let accepted = (json?["accepted"] as? Bool) ?? true
+#endif
         if accepted {
+#if VORTX_NATIVE_DATA_ENGINE
+            guard rememberNativeBackup(capture: capture) else { return .error }
+            do { try acknowledgeNativeProviders(obj, capture: capture) } catch { return .error }
+#endif
             lastSyncedVersion = max(lastSyncedVersion, version)
             persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
             if Self.writeSyncDocV2 { Self.markSawDocV2(capturedAccountID) }  // H-1: account's stored doc is now v2
@@ -1554,61 +2428,31 @@ final class VortXSyncManager: ObservableObject {
         return .rejected(storedVersion: stored)
     }
 
-    /// Blind single-shot push of a fully-formed doc the caller does not re-derive (it holds no local pending
-    /// changes to re-merge, so on a rejection it just re-pushes the SAME doc above the winner). The version is
-    /// `max(storedVersion+1, epochMs)` so a device whose wall clock has skewed BACKWARD (a lower epoch-ms than
-    /// the stored version) can never lock itself out: it retries strictly above the stored version instead of
-    /// racing a permanently-lower epoch-ms. A rejection is retried once at storedVersion+1 (same as
-    /// pushDerivedDoc); a lost second race or a .error leaves lastSyncedVersion unadvanced so the next pull
-    /// reconciles.
-    @discardableResult
-    func pushSyncDoc(_ obj: [String: Any], credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
-        let capture = suppliedCapture ?? credentialAuthority.capture()
-        guard isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
-        var version = Int(Date().timeIntervalSince1970 * 1000)
-        for attempt in 0..<2 {
-            switch await pushSyncDocAt(obj, version: version, credentialCapture: capture) {
-            case .accepted:
-                return true
-            case .error:
-                return false
-            case .rejected(let storedVersion):
-                // A concurrent write won. Retry strictly above the winner's echoed version (falling back to a
-                // fresh epoch-ms if the worker did not echo one). max(stored+1, epochMs) guarantees a backward
-                // clock still produces a higher version than the stored one, so the device is never locked out.
-                guard attempt < 1 else { return false }
-                if let stored = storedVersion {
-                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
-                } else {
-                    version = Int(Date().timeIntervalSince1970 * 1000)
-                }
-                guard isCurrent(capture) else { return false }
-            }
-        }
-        return false
+    private struct DerivedSyncDoc {
+        let document: [String: Any]
+        let baseRevision: Int?
     }
 
-    /// Push a doc that is DERIVED from a pulled base, with optimistic-concurrency recovery. `rebuild`
-    /// re-runs the caller's exact merge onto a freshly pulled base, so a lost race is recovered by
-    /// re-merging the local pending changes onto the winner's doc and retrying at storedVersion+1 (up to
-    /// `maxRetries`). This preserves the caller's merge semantics (LWW, never clobber libraryItem) on every
-    /// attempt. On exhaustion lastSyncedVersion is left unadvanced so the next natural pull reconciles.
-    private func pushDerivedDoc(_ initial: [String: Any], credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
+    /// Keep each merged document together with the revision it actually read. Two writers from
+    /// the same base propose the same revision, so the loser must pull and merge the winner.
+    /// The relay's echoed revision cannot substitute for the base of a later rebuilt document.
+    private func pushDerivedDoc(_ initial: DerivedSyncDoc, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
                                 onAccepted: ([String: Any]) -> Void = { _ in },
-                                rebuild: () async -> [String: Any]?) async -> Bool {
+                                rebuild: () async -> DerivedSyncDoc?) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
         let maxRetries = 3
         var doc = initial
-        var version = Int(Date().timeIntervalSince1970 * 1000)
         for attempt in 0..<maxRetries {
-            switch await pushSyncDocAt(doc, version: version, credentialCapture: capture) {
+            guard isCurrent(capture), !hasPendingAccountDocApply(for: capture),
+                  let version = SyncDocumentRevisionPolicy.next(after: doc.baseRevision) else { return false }
+            switch await pushSyncDocAt(doc.document, version: version, credentialCapture: capture) {
             case .accepted:
-                onAccepted(doc)
+                onAccepted(doc.document)
                 return true
             case .error:
                 return false   // network / server / encode failure: do not advance, next pull reconciles
-            case .rejected(let storedVersion):
+            case .rejected:
                 // A concurrent write won. Re-pull, re-merge the local pending changes onto it (same merge as
                 // the first attempt), and retry strictly above the winner's version. If the rebuild can no
                 // longer produce a doc (e.g. the account pull now fails), abort WITHOUT advancing so the next
@@ -1616,13 +2460,6 @@ final class VortXSyncManager: ObservableObject {
                 guard attempt < maxRetries - 1, isCurrent(capture), !hasPendingAccountDocApply(for: capture),
                       let rebuilt = await rebuild(), isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
                 doc = rebuilt
-                // storedVersion+1 beats the winner deterministically; fall back to a fresh epoch-ms if the
-                // worker did not echo a version (the row-vanished race), still strictly increasing.
-                if let stored = storedVersion {
-                    version = max(stored + 1, Int(Date().timeIntervalSince1970 * 1000))
-                } else {
-                    version = Int(Date().timeIntervalSince1970 * 1000)
-                }
             }
         }
         return false   // exhausted retries: leave lastSyncedVersion unadvanced, next pull reconciles
@@ -1999,10 +2836,12 @@ final class VortXSyncManager: ObservableObject {
         return roster
     }
 
-    static func resolveRoster(from doc: [String: Any]) -> ProfileRosterSnapshot? {
+    static func resolveRoster(from doc: [String: Any], fullOnly: Bool = false) -> ProfileRosterSnapshot? {
         let domain = (doc["settings"] as? String).flatMap { Data(base64Encoded: $0) }
             .flatMap { try? SettingsBackup.decodeDomain(from: $0) }
-        return ProfileRosterSnapshot.resolve(settingsDomain: domain, vortx: doc["vortx"] as? [String: Any])
+        var vortx = doc["vortx"] as? [String: Any]
+        if fullOnly { vortx?.removeValue(forKey: "profiles") }
+        return ProfileRosterSnapshot.resolve(settingsDomain: domain, vortx: vortx)
     }
 
     /// Web patches are independent of the native carrier and must be consumed before we acknowledge
@@ -2033,6 +2872,12 @@ final class VortXSyncManager: ObservableObject {
     func syncUp(afterUserChoseThisDevice: Bool = false) async -> Bool {
         let capture = credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture) else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        guard await settleNativeProviderJournal(capture: capture), isCurrent(capture) else { return false }
+        guard VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: (try? nativeGlobalEdits()) == nil,
+                                                                hasLegacyAddonOrderIntent: pendingAddonOrderIntent != nil,
+                                                                overridingLegacySource: afterUserChoseThisDevice) else { return false }
+#endif
         guard !hasPendingAccountDocApply(for: capture) else {
             NSLog("[sync] push refused: a remote credential apply is pending certification")
             return false
@@ -2076,6 +2921,21 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture), !hasPendingAccountDocApply(for: capture),
               let initial = await mergeLocalIntoDoc(orderIntent: orderIntent, credentialCapture: capture),
               isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        if nativePreparedSeedCapture == capture {
+            // Deployed worker: version zero INSERT succeeds only while no row exists. Never
+            // escalate a rejected/unknown first insert to an epoch version over a peer's seed.
+            switch await pushSyncDocAt(initial.document, version: 0, credentialCapture: capture) {
+            case .accepted:
+                guard isCurrent(capture) else { return false }
+                clearPushedDirtySettings(dirtyAtPushStart); return true
+            case .rejected, .error:
+                guard isCurrent(capture) else { return false }
+                _ = await syncDown(force: true, credentialCapture: capture)
+                return false
+            }
+        }
+#endif
         let pushed = await pushDerivedDoc(initial, credentialCapture: capture, onAccepted: { [weak self] sentDoc in
             guard let self, self.isCurrent(capture), let id = self.account?.id else { return }
             self.withRemoteApplySuppressed {
@@ -2103,16 +2963,60 @@ final class VortXSyncManager: ObservableObject {
     /// intent is captured once per push; a newer edit stays pending until its own push is acknowledged.
     /// Returns nil on a FAILED pull (network error / undecryptable doc): a failed pull must NEVER overwrite
     /// the account's existing document, or it wipes keys other surfaces wrote.
-    private func mergeLocalIntoDoc(orderIntent: AddonOrderIntent?, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> [String: Any]? {
+    private func mergeLocalIntoDoc(orderIntent: AddonOrderIntent?, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> DerivedSyncDoc? {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isCurrent(capture), isSignedIn else { return nil }
+#if VORTX_NATIVE_DATA_ENGINE
+        nativePreparedSeedCapture = nil
+#endif
         var doc: [String: Any]
-        switch await pullSyncDocResult(credentialCapture: capture) {
+        let baseRevision: Int?
+        switch await pullDocVersionedResult(credentialCapture: capture) {
         case .failed: return nil
-        case .empty: doc = [:]
-        case .doc(let existing): doc = existing
+        case .empty:
+            baseRevision = nil
+#if VORTX_NATIVE_DATA_ENGINE
+            guard let initial = try? nativeEmptyAccountDocument(capture: capture) else { return nil }
+            doc = initial; nativePreparedSeedCapture = capture
+#else
+            doc = [:]
+#endif
+        case .doc(let existing, let version):
+            guard version >= lastSyncedVersion else { return nil }
+            doc = existing; baseRevision = version
         }
         guard isCurrent(capture) else { return nil }
+#if VORTX_NATIVE_DATA_ENGINE
+        // The native CRDT is a TOP-LEVEL sibling of the full legacy/host preference carriers.
+        // Merge the freshly pulled peer state through the kernel before exporting; never assign
+        // a stale local snapshot over it, and never upload device-local activeProfileId or tokens.
+        // Recheck on every optimistic-concurrency retry. Never clear an unexported host edit merely
+        // because the independent native carrier was pushed successfully.
+        guard VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: (try? nativeGlobalEdits()) == nil,
+                                                                hasLegacyAddonOrderIntent: orderIntent != nil || pendingAddonOrderIntent != nil) else { return nil }
+        do {
+            var providers = try mergedNativeProviderState(doc, capture: capture)
+            let prepared = try await prepareNativeLegacyMaterial(doc, capture: capture)
+            guard isCurrent(capture) else { return nil }
+            let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+            let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+            let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture,
+                                                                               legacyMaterial: prepared.material, hostEdits: nativeGlobalEdits(), websiteEvents: Self.nativeWebsiteEvents(doc), websiteAddonEvents: Self.nativeWebsiteAddonEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc),
+                                                                               sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
+            guard isCurrent(capture) else { return nil }
+            doc["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["nativeSync"]!))
+            doc["nativeHostPreferences"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["nativeHostPreferences"]!))
+            doc["profileEditResults"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["profileEditResults"]!))
+            try publishNativeWebsiteOutcome(merged["profileEditResults"]!, capture: capture)
+            providers = try persistMergedNativeProviders(providers, capture: capture)
+            doc["nativeProviderCredentials"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(providers.document))
+            doc["apiKeys"] = try mirrorNativeProviderKeys(providers, original: doc["apiKeys"])
+            applyNativeGlobals(merged["nativeHostPreferences"]!)
+        } catch { return nil }
+        // Never rewrite the legacy migration baseline from native/profile/overlay mirrors. Until
+        // a versioned bidirectional adapter exists, native exports only its own accepted carrier.
+        return DerivedSyncDoc(document: doc, baseRevision: baseRevision)
+#else
         // Read-merge the pulled doc's tombstone stamps into the local stores BEFORE vortxSummary rebuilds them
         // from local state, so a push that raced a peer's fresh re-add stamp adopts that stamp instead of
         // overwriting the doc with a local-only view; this also re-seeds the maps after a b171 peer push that
@@ -2230,7 +3134,8 @@ final class VortXSyncManager: ObservableObject {
         let defaultTerms = SearchHistoryStore.allTerms(for: nil)
         if !defaultTerms.isEmpty { searches["default"] = defaultTerms }
         if searches.isEmpty { doc.removeValue(forKey: "searches") } else { doc["searches"] = searches }
-        return doc
+        return DerivedSyncDoc(document: doc, baseRevision: baseRevision)
+#endif
     }
 
     /// The current add-on order this device holds, as normalized transportUrls in the engine's true
@@ -2385,7 +3290,47 @@ final class VortXSyncManager: ObservableObject {
         case .apply:
             break
         }
-        let doc = pulled.doc
+        var doc = pulled.doc
+#if VORTX_NATIVE_DATA_ENGINE
+        let nativeProviderApplySnapshot: VortxNativeProviderCredentials.Document
+        guard await settleNativeProviderJournal(capture: capture), isCurrent(capture) else { return false }
+        do {
+            var providers = try mergedNativeProviderState(doc, capture: capture)
+            let prepared = try await prepareNativeLegacyMaterial(doc, capture: capture)
+            guard isCurrent(capture) else { return false }
+            let material = prepared.material
+            if CoreBridge.shared.hasNativeSession {
+                let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+                let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+                let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture, legacyMaterial: material,
+                    websiteEvents: Self.nativeWebsiteEvents(doc), websiteAddonEvents: Self.nativeWebsiteAddonEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc), sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
+                guard isCurrent(capture) else { return false }
+                applyNativeGlobals(merged["nativeHostPreferences"]!)
+                try publishNativeWebsiteOutcome(merged["profileEditResults"]!, capture: capture)
+            }
+            providers = try persistMergedNativeProviders(providers, capture: capture)
+            let mirrored = try mirrorNativeProviderKeys(providers, original: doc["apiKeys"])
+            var keys = mirrored.compactMapValues { $0 as? String }
+            if providers.local.document.fields["traktAccess"]?.value == .null {
+                let events = providers.local.document.fields.filter { VortxNativeProviderCredentials.groups[0].contains($0.key) }
+                guard await TraktAuth.shared.applyNativeCredentialClear(capture: capture, events: events), isCurrent(capture) else { return false }
+                retireNativeProviderApply(.trakt, capture: capture)
+            }
+            if providers.local.document.fields["simklAccess"]?.value == .null {
+                let events = providers.local.document.fields.filter { VortxNativeProviderCredentials.groups[1].contains($0.key) }
+                guard await SIMKLAuth.shared.applyNativeCredentialClear(capture: capture, events: events), isCurrent(capture) else { return false }
+                retireNativeProviderApply(.simkl, capture: capture)
+            }
+            // OAuth boundaries suspend. A newer local edit/prepared transaction invalidates this
+            // entire apply snapshot, including metadata/Debrid and any queued provider plan.
+            let currentProviders = try nativeProviderState(capture: capture)
+            guard !currentProviders.hasPreparedMutation, currentProviders.local.document == providers.local.document else { return false }
+            nativeProviderApplySnapshot = currentProviders.local.document
+            // Empty strings are a local secure-store apply instruction, never emitted on wire.
+            for (key, event) in providers.local.document.fields where event.value == .null { keys[key] = "" }
+            doc["apiKeys"] = keys
+        } catch { return false }
+#endif
         var restored = false
         var restoredSettings = false
         var pendingDebridValues = pendingDebridApply?.values ?? [:]
@@ -2400,11 +3345,19 @@ final class VortXSyncManager: ObservableObject {
         // guard and the peer's settings are never applied. The body is fully synchronous (no awaits), so the
         // coalesced notifications drain on the next main-queue turn while the flag is still set.
         withRemoteApplySuppressed {
+#if !VORTX_NATIVE_DATA_ENGINE
         foldDocTombstones(doc) // deletions precede every roster fold, including a fallback-only carrier
+#endif
         providerPlan = providerApplyIntent(
             keys: doc["apiKeys"] as? [String: String],
             capture: capture,
             version: pulled.version)
+#if VORTX_NATIVE_DATA_ENGINE
+        let applyLegacyBaseline = !CoreBridge.shared.hasNativeSession
+#else
+        let applyLegacyBaseline = true
+#endif
+        if applyLegacyBaseline {
         if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64) {
             // Roster records are merged separately by their own clocks, never wholesale-restored.
             // This also protects a still-dirty local edit while admitting cloud-only profile ids.
@@ -2458,6 +3411,7 @@ final class VortXSyncManager: ObservableObject {
             // even on an equal-roster pull, before singletons read a peer's flat preference projection.
             ProfileStore.shared.reloadFromDefaults()
             SettingsBackup.reloadLiveStores()
+        }
         }
         if let keys = doc["apiKeys"] as? [String: String] {
             guard isCurrent(capture) else { return }
@@ -2536,6 +3490,7 @@ final class VortXSyncManager: ObservableObject {
             }
             restored = true
         }
+#if !VORTX_NATIVE_DATA_ENGINE
         // Per-profile library / Continue Watching for OVERLAY profiles (the missing leg): syncUp wrote each
         // profile's overlay into doc.vortx.byProfile (what the dashboard reads); this pulls it BACK into the
         // local overlay so a secondary profile's library + CW actually appear in the app on every device, not
@@ -2762,6 +3717,7 @@ final class VortXSyncManager: ObservableObject {
         // Guarded by the per-stamp editedAt LWW below (once per stamp), which is the correct conflict rule here;
         // no extra version gate (that was reverted with the tombstone gates, since it blocked legitimate edits).
         if applyPendingProfileEdits(doc) { restored = true }
+#endif
         if !pendingDebridServices.isEmpty {
             pendingDebridApply = PendingDebridApply(
                 capture: capture,
@@ -2776,6 +3732,18 @@ final class VortXSyncManager: ObservableObject {
         pendingProviderApply = providerPlan
         }   // end withRemoteApplySuppressed
         guard isCurrent(capture), pendingDebridServices.isEmpty else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        if let keys = doc["apiKeys"] as? [String: String] {
+            for (name, slot) in [("tmdb", ApiKeySlots.tmdb(capture.scope)), ("mdblist", ApiKeySlots.mdblist(capture.scope)), ("fanart", ApiKeySlots.fanart(capture.scope))] {
+                guard let expected = keys[name] else { continue }
+                switch Keychain.confirmedString(slot) {
+                case .missing where expected.isEmpty: break
+                case .value(let actual) where actual == expected: break
+                default: return false
+                }
+            }
+        }
+#endif
         let providerSettlement: CredentialProviderRetryOutcome
         if let pending = providerPlan {
             providerSettlement = await CredentialRetryCoordinator.finalizeProviders(
@@ -2795,11 +3763,18 @@ final class VortXSyncManager: ObservableObject {
                     guard case let .trakt(access, refresh, expiryUnix) = pending.values[.trakt] ?? .none else {
                         return false
                     }
+#if VORTX_NATIVE_DATA_ENGINE
+                    return await TraktAuth.shared.adoptTokens(access: access, refresh: refresh,
+                        expiryUnix: expiryUnix, ownerCapture: pending.capture, mutationGuard: { mutate in
+                            Self.withNativeProviderSnapshot(nativeProviderApplySnapshot, capture: pending.capture, mutation: mutate)
+                        }) == .success
+#else
                     return await TraktAuth.shared.adoptTokens(
                         access: access,
                         refresh: refresh,
                         expiryUnix: expiryUnix,
                         ownerCapture: pending.capture) == .success
+#endif
                 },
                 secondClaim: {
                     pending.values[.simkl] ?? .none
@@ -2813,10 +3788,17 @@ final class VortXSyncManager: ObservableObject {
                     guard case let .simkl(access, expiryUnix) = pending.values[.simkl] ?? .none else {
                         return false
                     }
+#if VORTX_NATIVE_DATA_ENGINE
+                    return await SIMKLAuth.shared.adoptTokens(access: access, expiryUnix: expiryUnix,
+                        ownerCapture: pending.capture, mutationGuard: { mutate in
+                            Self.withNativeProviderSnapshot(nativeProviderApplySnapshot, capture: pending.capture, mutation: mutate)
+                        }) == .success
+#else
                     return await SIMKLAuth.shared.adoptTokens(
                         access: access,
                         expiryUnix: expiryUnix,
                         ownerCapture: pending.capture) == .success
+#endif
                 },
                 sleepBeforeRetry: { [weak self] in
                     guard let self else { return false }
@@ -2862,7 +3844,9 @@ final class VortXSyncManager: ObservableObject {
         // Materialize this exact, just-settled document while its credential owner is still current.
         // This is deliberately after provider settlement and reuses `doc`: no second GET can race a
         // newer owner or an equal/lower version.
+#if !VORTX_NATIVE_DATA_ENGINE
         CoreBridge.shared.hydrateAddonsFromAccount(Self.ownedAddons(from: doc))
+#endif
         // OwnerResumeStore changed without an engine event, so publish its new resume positions now. This stays
         // unconditional because refreshOwnerResumeCache does not contribute to `restored`.
         guard isCurrent(capture) else { return false }
@@ -2885,6 +3869,9 @@ final class VortXSyncManager: ObservableObject {
     /// Hydration installs only descriptors the engine lacks (idempotent). Library recovery is gated to
     /// "engine account library empty AND the account owns one" so it runs at most once per fresh install.
     func hydrateEngineFromOwnedAddons(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async {
+#if VORTX_NATIVE_DATA_ENGINE
+        _ = await restoreNativeCheckpoint(credentialCapture: suppliedCapture)
+#else
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture) else { return }
         guard case let .doc(doc) = await pullSyncDocResult(credentialCapture: capture) else { return }   // .failed/.empty: do nothing
@@ -2939,6 +3926,7 @@ final class VortXSyncManager: ObservableObject {
             credentialCapture: capture,
             library: source.library,
             continueWatching: source.continueWatching)
+#endif
     }
 
     /// Compute the account-owned add-on descriptors from a pulled doc: `doc.vortx.addons` (the app's
@@ -3604,6 +4592,7 @@ final class VortXSyncManager: ObservableObject {
             // the snapshot captures the user's value for it and it stays dirty until its own push confirms.
             self?.refreshSettingsShadow()
             self?.isApplyingRemote = false
+            self?.drainLocalRosterPush()
         }
     }
 
@@ -3640,6 +4629,9 @@ final class VortXSyncManager: ObservableObject {
         Task {
             await self.restoreAccountDocIfNeeded()
             await self.syncDown()
+#if VORTX_NATIVE_DATA_ENGINE
+            _ = await self.restoreNativeCheckpoint()
+#endif
             // A settings change from a PREVIOUS session whose debounced push never landed (relaunch, offline, or a
             // crash before the 2.5s push) is still marked dirty and survived the pull above untouched. Arm a push
             // now so the account and the rest of the fleet converge on it. No-op when nothing is unpushed.

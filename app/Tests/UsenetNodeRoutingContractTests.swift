@@ -59,16 +59,17 @@ private enum UsenetNodeRoutingContractTests {
               && models.contains("var usenetServers: [String]"))
         check("CoreBridge round-trips plural NZBs and servers", bridge.contains("raw[\"nzbUrls\"] = nzbs")
               && bridge.contains("raw[\"servers\"] = servers"))
-        check("NZB control route is Node-only and follows the discovered port", server.contains("static var usenetNodeBase: String?")
+        check("NZB control route follows the selected runtime and preserves legacy port discovery", server.contains("static var usenetEndpoint: UsenetNodeClient.Endpoint?")
               && server.contains("if let port = NodeServer.discoveredPort")
-              && server.contains("never guess 11470 while native is active"))
-        check("resolver posts the Node NZB contract and never generic embedded", resolver.contains("StremioServer.usenetNodeBase")
+              && server.contains("guard !nativeTransportSelected else { return nil }"))
+        check("resolver posts the selected local NZB contract and never generic embedded", resolver.contains("StremioServer.usenetEndpoint")
               && resolver.contains("UsenetNodeClient.createStream") && nodeClient.contains("\"nzbUrls\": nzbURLs")
               && !resolver.contains("let base = StremioServer.embedded"))
         check("add-on server order is tried before a sequential saved-provider fallback",
               resolver.contains("UsenetRoutingPolicy.localAttempts") && resolver.contains("UsenetRoutingPolicy.firstSuccessful(attempts"))
         check("local Node work is leased to its credential authority", coordinator.contains("runProvider(capture: usenetCapture, revision: usenetRevision)")
-              && coordinator.contains("guard isCurrent(usenetCapture, revision: usenetRevision) else { return nil }"))
+              && coordinator.contains("guard await nativeOwnerIsCurrent(), isCurrent(usenetCapture, revision: usenetRevision) else {")
+              && coordinator.contains("local?.nativeLease?.close()"))
         for path in ["app/Sources/PlayerScreen.swift", "app/SourcesTV/TVPlayerView.swift"] {
             let player = try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
             check("\(path) uses the current NZB route for bounded recovery",
@@ -77,7 +78,9 @@ private enum UsenetNodeRoutingContractTests {
                     && player.contains("DebridCoordinator.shared.recoverUsenetPlayback(")
                     && player.contains("if let freshRef = resolvedRef"))
         }
-        check("resolver returns Node redirect endpoint rather than raw NZB", resolver.contains("/nzb/stream?key="))
+        check("resolver returns Node redirect endpoint rather than raw NZB",
+              nodeClient.contains("origin.appendingPathComponent(\"nzb/stream\")")
+                && nodeClient.contains("?key=\\(encodedKey)") && resolver.contains("RoutedStream(url: created.url"))
         check("coordinator supplies add-on mirrors and servers", coordinator.contains("nzbURLs: stream.usenetURLs, servers: stream.usenetServers"))
         check("explicit NZB playback has a typed result while auto retains optional resolution", coordinator.contains("enum ExplicitUsenetResolution")
               && coordinator.contains("func resolveExplicitUsenetPlayback") && coordinator.contains("func resolvedPlaybackRef"))

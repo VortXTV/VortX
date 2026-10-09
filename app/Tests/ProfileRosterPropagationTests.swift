@@ -7,6 +7,14 @@ enum SettingsBackup {
 }
 
 final class ObserverFixture {
+    struct Capture: Equatable { let epoch: Int }
+    final class Authority {
+        var epoch = 1
+        func capture() -> Capture { Capture(epoch: epoch) }
+    }
+    let credentialAuthority = Authority()
+    var pendingLocalRosterPush: Capture?
+    func isCurrent(_ capture: Capture) -> Bool { capture == credentialAuthority.capture() }
     var isSignedIn = true
     var isApplyingRemote = false
     var settingsShadow: [String: Any] = [:]
@@ -85,6 +93,48 @@ final class ObserverFixture {
         observer.isApplyingRemote = false
         observer.observeDefaultsChange()
         precondition(observer.pushes == 1, "delayed remote notification after rebaseline cannot self-echo")
+
+        let localEdit = ObserverFixture()
+        localEdit.domain = ["stremiox.profiles": try JSONEncoder().encode(remote),
+                            "stremiox.profiles.modified": 200.0]
+        localEdit.noteLocalRosterMutation()
+        localEdit.isApplyingRemote = true // same-turn touch:false selection housekeeping
+        localEdit.observeDefaultsChange()
+        localEdit.settingsShadow = localEdit.currentSyncableDomain()
+        localEdit.isApplyingRemote = false
+        localEdit.drainLocalRosterPush()
+        precondition(localEdit.pushes == 1 && Set(localEdit.dirtySettings.keys) ==
+                     ["stremiox.profiles", "stremiox.profiles.modified"],
+                     "housekeeping cannot erase the synchronous dirty mark or queued push")
+
+        let drainingEdit = ObserverFixture()
+        drainingEdit.isApplyingRemote = true
+        drainingEdit.noteLocalRosterMutation()
+        precondition(drainingEdit.pushes == 0 && drainingEdit.dirtySettings.count == 2)
+        drainingEdit.isApplyingRemote = false
+        drainingEdit.drainLocalRosterPush()
+        drainingEdit.drainLocalRosterPush()
+        precondition(drainingEdit.pushes == 1, "local edit during suppression drains exactly once")
+
+        let staleEdit = ObserverFixture()
+        staleEdit.isApplyingRemote = true
+        staleEdit.noteLocalRosterMutation()
+        staleEdit.credentialAuthority.epoch += 1 // sign out/account swap or same-account reopen
+        staleEdit.isApplyingRemote = false
+        staleEdit.drainLocalRosterPush()
+        precondition(staleEdit.pushes == 0 && staleEdit.pendingLocalRosterPush == nil,
+                     "retired account intent cannot arm the replacement account")
+
+        let housekeepingOnly = ObserverFixture()
+        housekeepingOnly.isApplyingRemote = true
+        housekeepingOnly.observeDefaultsChange()
+        housekeepingOnly.isApplyingRemote = false
+        housekeepingOnly.drainLocalRosterPush()
+        precondition(housekeepingOnly.dirtySettings.isEmpty && housekeepingOnly.pushes == 0)
+        let signedOut = ObserverFixture()
+        signedOut.isSignedIn = false
+        signedOut.noteLocalRosterMutation()
+        precondition(signedOut.dirtySettings.isEmpty && signedOut.pushes == 0)
         print("PASS profile propagation: actual model/carriers/clocks/merge/observer; no account or media")
     }
 }

@@ -23,6 +23,8 @@ import java.util.Locale
  *   - `vortx.home.showCuratedRails`        -> Home view model.
  *   - `vortx.discover.showCollectionsHub`  -> phone and TV Discover hub, independent of Home.
  *   - `vortx.mergeDiscoverSearch`          -> application navigation.
+ *   - `vortx.mergeHomeDiscover`            -> Featured/Browse under Home, reversible.
+ *   - `vortx.cinema.quickView`              -> title catalog tap presentation.
  *   - `vortx.detail.showFinancials`        -> phone and TV detail.
  *   - `vortx.detail.spoilerSafe` / `vortx.spoilerBlur` -> episode spoiler veils.
  *   - `stremiox.catalog.hidePosterLabels`  -> poster presentation preferences.
@@ -30,6 +32,23 @@ import java.util.Locale
 class HomeDiscoverPreferences(context: Context) {
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
+
+    var continueWatchingSource: String
+        get() = prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY, "local") ?: "local"
+        set(value) {
+            require(com.vortx.android.home.ContinueWatchingSource.entries.any { it.raw == value && it != com.vortx.android.home.ContinueWatchingSource.UNKNOWN })
+            com.vortx.android.home.ContinueWatchingSelectionRevision.changed()
+            prefs.edit().putString(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY, value).apply()
+            ProfileStore.sharedOrNull()?.captureDiscovery(continueWatchingEdit = true)
+        }
+    var continueWatchingWindow: String
+        get() = prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY, "20") ?: "20"
+        set(value) {
+            require(com.vortx.android.home.ContinueWatchingWindow.entries.any { it.raw == value })
+            com.vortx.android.home.ContinueWatchingSelectionRevision.changed()
+            prefs.edit().putString(com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY, value).apply()
+            ProfileStore.sharedOrNull()?.captureDiscovery(continueWatchingEdit = true)
+        }
 
     var showCuratedRails: Boolean
         get() = prefs.getBoolean(KEY_SHOW_CURATED_RAILS, true)
@@ -66,6 +85,19 @@ class HomeDiscoverPreferences(context: Context) {
     var mergeDiscoverSearch: Boolean
         get() = prefs.getBoolean(KEY_MERGE_DISCOVER_SEARCH, false)
         set(value) { prefs.edit().putBoolean(KEY_MERGE_DISCOVER_SEARCH, value).apply() }
+
+    /** New Cinema shells combine the two owners; an explicit false retains the previous tab layout. */
+    var mergeHomeDiscover: Boolean
+        get() = prefs.getBoolean(KEY_MERGE_HOME_DISCOVER, true)
+        set(value) { prefs.edit().putBoolean(KEY_MERGE_HOME_DISCOVER, value).apply() }
+
+    /**
+     * When enabled, a title catalog tap opens the functional Quick View surface before Detail.
+     * Continue Watching is deliberately excluded at the caller: it must keep its direct-resume route.
+     */
+    var cinemaQuickView: Boolean
+        get() = prefs.getBoolean(KEY_CINEMA_QUICK_VIEW, false)
+        set(value) { prefs.edit().putBoolean(KEY_CINEMA_QUICK_VIEW, value).apply() }
 
     var showFinancials: Boolean
         get() = prefs.getBoolean(KEY_SHOW_FINANCIALS, true)
@@ -130,6 +162,8 @@ class HomeDiscoverPreferences(context: Context) {
         // MUST equal com.vortx.android.home.COLLECTIONS_REFRESH_CADENCE_KEY.
         const val KEY_REFRESH_CADENCE = "vortx.collections.refreshCadence"
         const val KEY_MERGE_DISCOVER_SEARCH = "vortx.mergeDiscoverSearch"
+        const val KEY_MERGE_HOME_DISCOVER = "vortx.mergeHomeDiscover"
+        const val KEY_CINEMA_QUICK_VIEW = "vortx.cinema.quickView"
         const val KEY_SHOW_FINANCIALS = "vortx.detail.showFinancials"
         const val KEY_SPOILER_SAFE = "vortx.detail.spoilerSafe"
         const val KEY_SPOILER_BLUR = "vortx.spoilerBlur"

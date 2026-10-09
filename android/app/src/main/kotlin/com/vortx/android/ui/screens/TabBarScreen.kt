@@ -26,6 +26,7 @@ fun TabBarScreen(
     prefs: TabBarPrefs,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    mergeHomeDiscover: Boolean = false,
 ) {
     val tabs by prefs.state.collectAsStateWithLifecycle()
 
@@ -53,7 +54,7 @@ fun TabBarScreen(
                 title = "Visible tabs",
                 footer = "Home and Settings always stay. Hiding the current tab returns you to Home.",
             ) {
-                ToggleRow("Show Discover tab", null, !tabs.hideDiscover, prefs::setDiscoverVisible)
+                ToggleRow(if (mergeHomeDiscover) "Show Browse in Home" else "Show Discover tab", null, !tabs.hideDiscover, prefs::setDiscoverVisible)
                 ToggleRow(
                     "Show Live TV tab",
                     "Channels from your installed Live TV add-ons.",

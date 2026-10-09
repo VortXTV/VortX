@@ -65,16 +65,22 @@ fun AccountScreen(viewModel: AccountViewModel, onBack: () -> Unit, modifier: Mod
 @Composable
 fun AccountContent(viewModel: AccountViewModel, modifier: Modifier = Modifier) {
     val authState by viewModel.authState.collectAsStateWithLifecycle()
+    val management by viewModel.management.collectAsStateWithLifecycle()
+    val form by viewModel.formState.collectAsStateWithLifecycle()
     Column(modifier = modifier) {
         when (val state = authState) {
-            is AuthState.SignedIn -> SignedInCard(state, onSignOut = viewModel::signOut)
+            is AuthState.SignedIn -> SignedInCard(state, enabled = management.canManage && form !is SignInFormState.Submitting, onSignOut = viewModel::signOut)
             AuthState.SignedOut -> SignInCard(viewModel)
+        }
+        management.message?.let { Text(it, style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary)) }
+        if (authState is AuthState.SignedIn) (form as? SignInFormState.Error)?.let {
+            Text(it.message, style = VortXTheme.type.body.copy(color = VortXTheme.colors.danger))
         }
     }
 }
 
 @Composable
-private fun SignedInCard(state: AuthState.SignedIn, onSignOut: () -> Unit) {
+private fun SignedInCard(state: AuthState.SignedIn, enabled: Boolean, onSignOut: () -> Unit) {
     val colors = VortXTheme.colors
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -94,7 +100,7 @@ private fun SignedInCard(state: AuthState.SignedIn, onSignOut: () -> Unit) {
                     )
                 }
             }
-            PrimaryButton(text = "Sign Out", onClick = onSignOut)
+            PrimaryButton(text = "Sign Out", onClick = onSignOut, enabled = enabled)
         }
     }
 }
@@ -104,6 +110,7 @@ private fun SignInCard(viewModel: AccountViewModel) {
     val email by viewModel.email.collectAsStateWithLifecycle()
     val password by viewModel.password.collectAsStateWithLifecycle()
     val formState by viewModel.formState.collectAsStateWithLifecycle()
+    val management by viewModel.management.collectAsStateWithLifecycle()
     val colors = VortXTheme.colors
     val submitting = formState is SignInFormState.Submitting
 
@@ -118,7 +125,7 @@ private fun SignInCard(viewModel: AccountViewModel) {
                 onValueChange = viewModel::onEmailChange,
                 label = { Text("Email", style = VortXTheme.type.label) },
                 singleLine = true,
-                enabled = !submitting,
+                enabled = !submitting && management.canManage,
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedBorderColor = colors.accent,
@@ -132,7 +139,7 @@ private fun SignInCard(viewModel: AccountViewModel) {
                 onValueChange = viewModel::onPasswordChange,
                 label = { Text("Password", style = VortXTheme.type.label) },
                 singleLine = true,
-                enabled = !submitting,
+                enabled = !submitting && management.canManage,
                 visualTransformation = PasswordVisualTransformation(),
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                 colors = OutlinedTextFieldDefaults.colors(
@@ -149,6 +156,7 @@ private fun SignInCard(viewModel: AccountViewModel) {
                 text = if (submitting) "Signing in…" else "Sign In",
                 onClick = viewModel::signIn,
                 loading = submitting,
+                enabled = management.canManage,
                 modifier = Modifier.fillMaxWidth(),
             )
         }

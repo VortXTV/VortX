@@ -210,16 +210,18 @@ enum DeferredResumePolicy {
 
     /// A source switch may publish its duration later than the first polling tick. Keep waiting while both
     /// duration views are unknown, prefer the surface's committed value when present, and use the engine's
-    /// direct property only as the durationless-event fallback.
+    /// direct property only as the durationless-event fallback. Local NNTP starvation recovery opts into
+    /// the exact opening-seconds target; ordinary launches/switches retain the five-second cutoff.
     static func decision(
         targetSeconds: Double,
         observedDurationSeconds: Double,
         engineDurationSeconds: Double,
-        deadlineReached: Bool
+        deadlineReached: Bool,
+        allowShortResume: Bool = false
     ) -> Decision {
         guard !deadlineReached,
               targetSeconds.isFinite,
-              targetSeconds > 5 else { return .clear }
+              targetSeconds > (allowShortResume ? 0 : 5) else { return .clear }
         let duration: Double
         if observedDurationSeconds.isFinite, observedDurationSeconds > 0 {
             duration = observedDurationSeconds
@@ -282,8 +284,8 @@ enum DeferredResumeUserSeekPolicy {
 enum DeferredResumeFloorPolicy {
     /// Arm the persistence fence synchronously with the deferred seek. A low first-frame or exit callback can
     /// otherwise overwrite the saved resume before the next polling tick observes a usable duration.
-    static func armedFloor(targetSeconds: Double) -> Double? {
-        guard targetSeconds.isFinite, targetSeconds > 5 else { return nil }
+    static func armedFloor(targetSeconds: Double, allowShortResume: Bool = false) -> Double? {
+        guard targetSeconds.isFinite, targetSeconds > (allowShortResume ? 0 : 5) else { return nil }
         return targetSeconds
     }
 
@@ -331,19 +333,75 @@ struct MPVSeekSettlementEvidence: Equatable, Sendable {
     }
 }
 
+/// Numeric/Boolean native evidence only. Never retain a path, header, decoder log, or URL here.
+/// Missing native properties remain unknown; a synthetic target-shaped time-pos is not landing proof.
+struct MPVSeekNativeSnapshot: Sendable {
+    let position: Double?
+    let seeking: Bool?
+    let eof: Bool?
+    let paused: Bool?
+    let pausedForCache: Bool?
+    let cacheDuration: Double?
+    let cacheEnd: Double?
+    let demuxSeeking: Double?
+    let lowLevelSeeks: Int?
+    let forwardBytes: Int?
+    let softwareDecoder: Bool?
+
+    var receipt: String {
+        func number(_ value: Double?) -> String {
+            guard let value, value.isFinite else { return "unknown" }
+            return String(format: "%.3f", value)
+        }
+        func flag(_ value: Bool?) -> String { value.map { $0 ? "true" : "false" } ?? "unknown" }
+        return "pos=\(number(position)) seeking=\(flag(seeking)) eof=\(flag(eof))"
+            + " paused=\(flag(paused)) cachePaused=\(flag(pausedForCache))"
+            + " cacheSec=\(number(cacheDuration)) cacheEnd=\(number(cacheEnd))"
+            + " demuxSeeking=\(number(demuxSeeking)) lowLevelSeeks=\(lowLevelSeeks.map(String.init) ?? "unknown")"
+            + " fwBytes=\(forwardBytes.map(String.init) ?? "unknown") software=\(flag(softwareDecoder))"
+    }
+}
+
+/// The target belongs to an accepted resume command, not to UI time or a saved-position floor.
+struct MPVResumeSeekTicket<Owner: Equatable> {
+    let owner: Owner
+    let generation: UInt64
+    let target: Double
+}
+
+enum MPVResumeSeekRecoveryPolicy {
+    /// Called at the existing active-playback deadline. Preserve the accepted destination on a
+    /// different source; never replace an in-progress absolute seek with the opening-frame clock.
+    static func target<Owner: Equatable>(
+        ticket: MPVResumeSeekTicket<Owner>, activeOwner: Owner?, evidence: MPVSeekSettlementEvidence,
+        playbackRequested: Bool, nativePaused: Bool?, nativeSeeking: Bool?, nativeEOF: Bool?,
+        confirmedPosition: Double, landingTolerance: Double
+    ) -> Double? {
+        guard activeOwner == ticket.owner, evidence.generation == ticket.generation,
+              playbackRequested, nativePaused == false, nativeSeeking != nil, nativeEOF == false,
+              ticket.target.isFinite, ticket.target > 0,
+              confirmedPosition.isFinite, confirmedPosition >= 0,
+              landingTolerance.isFinite, landingTolerance >= 0 else { return nil }
+        if evidence.settled, abs(confirmedPosition - ticket.target) <= landingTolerance { return nil }
+        return ticket.target
+    }
+}
+
 /// The controller serializes command admission and raw event dequeue under one lock. Native events
 /// have no command ID: overlapping seeks can settle physically without proving command attribution.
-/// A subsequent command after that observed settlement establishes a fresh, unambiguous boundary.
+/// A subsequent command establishes a fresh boundary. A drained-queue native read at the latest
+/// absolute destination can also confirm landing without attributing any previously queued event.
 struct MPVSeekSettlementPolicy<Owner: Equatable> {
     enum Phase: Equatable { case awaitingSeek, seekObserved, settled }
     struct Attempt: Equatable {
         let owner: Owner
         let generation: UInt64
         var phase: Phase
-        let ambiguous: Bool
+        var ambiguous: Bool
     }
     private(set) var owner: Owner?
     private(set) var current: Attempt?
+    private(set) var lastAcceptedCommandGeneration: UInt64?
     private var nextGeneration: UInt64 = 0
     private var admission: Attempt?
 
@@ -359,6 +417,7 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
         self.owner = owner
         current = nil
         admission = nil
+        lastAcceptedCommandGeneration = nil
     }
 
     /// Register before mpv_command while raw dequeue is excluded by the controller's same lock.
@@ -377,7 +436,10 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
     mutating func completeIssue(_ generation: UInt64, accepted: Bool) {
         guard let candidate = admission, candidate.generation == generation else { return }
         admission = nil
-        if accepted { current = candidate }
+        if accepted {
+            current = candidate
+            lastAcceptedCommandGeneration = candidate.generation
+        }
     }
 
     mutating func observeSeek(owner: Owner) {
@@ -400,6 +462,28 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
         current = attempt
     }
 
+    /// Call only after MPV_EVENT_NONE, with fresh native properties sampled under the same
+    /// lock as command admission/dequeue. Two accepted scrubs may produce two SEEK events,
+    /// advancing the transport generation beyond the last command. Preserve both identities:
+    /// a later native refresh is not a new viewer command, and a later command invalidates this
+    /// witness even when its target happens to be equal. Optimistic seeking time-pos never qualifies.
+    mutating func confirmDrainedRestart(
+        owner: Owner, commandGeneration: UInt64, target: Double, position: Double?,
+        seeking: Bool?, eofReached: Bool?
+    ) -> MPVSeekSettlementEvidence? {
+        guard self.owner == owner, admission == nil,
+              lastAcceptedCommandGeneration == commandGeneration,
+              var attempt = current, attempt.owner == owner,
+              attempt.phase == .settled, attempt.ambiguous,
+              seeking == false, eofReached == false,
+              target.isFinite, target >= 0,
+              let position, position.isFinite, position >= 0,
+              abs(position - target) <= 0.5 else { return nil }
+        attempt.ambiguous = false
+        current = attempt
+        return evidence(owner: owner, seeking: seeking, eofReached: eofReached)
+    }
+
     func evidence(owner: Owner, seeking: Bool?, eofReached: Bool?) -> MPVSeekSettlementEvidence {
         MPVSeekSettlementEvidence(
             generation: current?.generation ?? nextGeneration,
@@ -411,6 +495,32 @@ struct MPVSeekSettlementPolicy<Owner: Equatable> {
     func accepts(_ evidence: MPVSeekSettlementEvidence, owner: Owner) -> Bool {
         self.owner == owner && admission == nil
             && evidence.generation == (current?.generation ?? nextGeneration)
+    }
+
+    /// Events dequeued after overlapping commands have the current generation, but cannot
+    /// prove which command produced them. They must not mutate the newer EOF/recovery intent.
+    func acceptsAttributedEvent(_ evidence: MPVSeekSettlementEvidence, owner: Owner) -> Bool {
+        evidence.attributed && accepts(evidence, owner: owner)
+    }
+
+    /// Deadline authority belongs to the accepted command, while native refresh SEEKs have
+    /// their own transport generations. Preserve the command ticket across those refreshes;
+    /// only an accepted newer command/source/stop retires it. This never certifies landing.
+    func evidenceForLatestCommand(owner: Owner, generation: UInt64,
+                                  seeking: Bool?, eofReached: Bool?) -> MPVSeekSettlementEvidence? {
+        guard self.owner == owner, admission == nil,
+              lastAcceptedCommandGeneration == generation else { return nil }
+        let transport = evidence(owner: owner, seeking: seeking, eofReached: eofReached)
+        return .init(generation: generation, settled: transport.settled && transport.attributed,
+                     attributed: transport.attributed)
+    }
+
+    var needsNativeWitness: Bool {
+        current.map { $0.phase != .settled || $0.ambiguous } ?? false
+    }
+
+    var needsDrainedRestartConfirmation: Bool {
+        current.map { $0.phase == .settled && $0.ambiguous } ?? false
     }
 }
 

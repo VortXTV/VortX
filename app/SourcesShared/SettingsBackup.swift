@@ -86,6 +86,9 @@ enum SettingsBackup {
     /// VortXSyncManager writes on push and applies on pull. The blob was never its transport.
     static let deviceLocalKeyPrefixes: [String] = [
         "vortx.sync.",
+        // Effective active-viewer projections are rebuilt from the full profile roster. A peer's
+        // selected profile must not overwrite this device's visibility/ranking mirrors.
+        "stremiox.profile.",
         // Legacy unowned add-on receipts are quarantined migration input. The account document's
         // deletedAddonsTs, not a generic settings blob, carries installs/removals across devices.
         "stremiox.addons.",

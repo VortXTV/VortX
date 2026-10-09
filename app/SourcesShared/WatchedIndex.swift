@@ -53,15 +53,24 @@ final class WatchedIndex: ObservableObject {
     private var lastBase: Set<String> = []
     /// The profile the derived set was computed for; a change clears it in `rebuild`.
     private var lastActiveProfile: UUID?
+#if VORTX_NATIVE_DATA_ENGINE
+    private var lastNativeBinding: VortxNativeCoreFacade.RegistryBinding?
+#endif
 
     /// Engine model fields whose change can move watched state: `ctx` carries the library bucket
     /// (every mark / unmark / sync lands there), `library` and `continue_watching_preview` re-emit
     /// on marks and progress saves and back the instant in-memory union.
-    private static let relevantFields: Set<String> = ["ctx", "library", "continue_watching_preview"]
+    private static let relevantFields: Set<String> = ["ctx", "library", "continue_watching_preview", "native_playback"]
     /// How long after a rebuild the resweep re-reads the buckets (see class doc).
     private static let resweepDelay: TimeInterval = 2
 
     private init() {
+        #if CINEMA_UI_SMOKE_RENDERER
+        // The diagnostic renderer must be a zero-owner surface: constructing this index would subscribe
+        // to CoreBridge/ProfileStore and schedule external watched-shadow refreshes. Keep a runtime
+        // tripwire here so a fixture regression fails before any screenshot can be accepted.
+        preconditionFailure("Cinema UI renderer must not construct WatchedIndex.shared")
+        #endif
         let core = CoreBridge.shared
         let profiles = ProfileStore.shared
         let events: [AnyPublisher<Void, Never>] = [
@@ -94,12 +103,22 @@ final class WatchedIndex: ObservableObject {
         // was computed for the OUTGOING profile, so drop it before this profile's pass so a badge never
         // leaks across profiles. Its detail view re-feeds the new profile's completion on next open.
         let currentProfile = ProfileStore.shared.activeID
+#if VORTX_NATIVE_DATA_ENGINE
+        let binding = CoreBridge.shared.nativeRegistryBinding
+        if lastNativeBinding != binding { derivedSeriesWatched.removeAll(); lastNativeBinding = binding }
+#endif
         if currentProfile != lastActiveProfile {
             lastActiveProfile = currentProfile
             derivedSeriesWatched.removeAll()
         }
         generation &+= 1
         let gen = generation
+#if VORTX_NATIVE_DATA_ENGINE
+        let titles = CoreBridge.shared.nativePlaybackSnapshot()?["watchedTitles"]
+        let counts = (try? titles?.decode([String: UInt64].self)) ?? [:]
+        publish(Set(counts.filter { $0.value > 0 }.keys), ifCurrent: gen)
+        return
+#endif
         guard ProfileStore.shared.activeUsesEngineHistory else {
             // Overlay profile: its private overlay only. A whole-title mark records the metaId
             // itself, episode finishes record episode ids; either way non-empty means watched.

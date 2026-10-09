@@ -95,6 +95,12 @@ fun TvApp(
 
         // The title currently open in Detail; null = the Home browse wall.
         var detail by remember { mutableStateOf<MetaItem?>(null) }
+        var unavailableContinueWatching by remember { mutableStateOf<String?>(null) }
+        unavailableContinueWatching?.let { message ->
+            androidx.compose.material3.AlertDialog(onDismissRequest = { unavailableContinueWatching = null },
+                title = { androidx.compose.material3.Text("Continue Watching") }, text = { androidx.compose.material3.Text(message) },
+                confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { androidx.compose.material3.Text("OK") } })
+        }
         var detailGeneration by remember { mutableStateOf(0L) }
         // The resolved source currently playing; null = not in the player. The DETAIL page resolves a
         // chosen source into this [Playable] (through [DetailViewModel]); the shell then covers everything
@@ -143,7 +149,7 @@ fun TvApp(
         val detailSourceEpoch = "$debridOwnerEpoch:$debridCredentialRevision:$sourceSettingsRevision"
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
             detail?.let {
-                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch"
+                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch:${it.continueWatchingAdmission?.let(System::identityHashCode)}"
             } ?: "no-detail:$detailSourceEpoch",
         )
         // A scope tied to the whole shell (not the player layer), so the end-of-playback engine write (final
@@ -174,6 +180,7 @@ fun TvApp(
                         playerDetail.id,
                         playerDetail.name,
                         playerDetail.preferredEpisode,
+                        playerDetail.continueWatchingAdmission,
                     ),
                     appContext = appContext,
                 ),
@@ -435,6 +442,7 @@ fun TvApp(
                                 current.id,
                                 current.name,
                                 current.preferredEpisode,
+                                current.continueWatchingAdmission,
                             ),
                             appContext = appContext,
                         ),
@@ -447,14 +455,16 @@ fun TvApp(
                             detail = null
                         },
                         onPlay = { resolved, loadedMeta, requestedEngine ->
-                            autoAdvanceStreak[0] = 0
-                            playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
-                                requested = requestedEngine,
-                                playable = resolved,
-                                mpvAvailable = MpvEngineFactory.isBundled,
-                            )
-                            playingMeta = loadedMeta
-                            playing = resolved
+                            if (detailVm.isRouteAdmissionCurrent()) {
+                                autoAdvanceStreak[0] = 0
+                                playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                                    requested = requestedEngine,
+                                    playable = resolved,
+                                    mpvAvailable = MpvEngineFactory.isBundled,
+                                )
+                                playingMeta = loadedMeta
+                                playing = resolved
+                            } else resolved.playbackLease?.close()
                         },
                         // A Person-page filmography tile (opened from the detail's cast rail) resolves a
                         // title and opens it as a fresh detail, reusing the SAME detail slot the browse wall
@@ -478,8 +488,13 @@ fun TvApp(
                     searchFocusRestoreSignal = searchFocusRestoreSignal,
                     onRestoreSearchFocus = { searchFocusRestoreSignal++ },
                     onItem = {
-                        detailGeneration += 1
-                        detail = it
+                        if (it.continueWatchingAdmission?.isCurrent() != false) {
+                            if (it.continueWatchingUnavailableMessage != null) unavailableContinueWatching = "${it.name}\n\n${it.continueWatchingUnavailableMessage}"
+                            else {
+                                detailGeneration += 1
+                                detail = it
+                            }
+                        }
                     },
                     // A finished download plays straight into the shared player slot (no detail page), the same
                     // slot a streamed source resolves into. Clears any stale detail meta so the player reads the

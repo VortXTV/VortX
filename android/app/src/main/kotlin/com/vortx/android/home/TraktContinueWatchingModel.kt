@@ -14,6 +14,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
+import java.time.Instant
 
 /** A separately-owned, read-only Trakt paused-playback row. It never alters engine progress. */
 internal const val TRAKT_CONTINUE_WATCHING_CATALOG_ID = "vortx.home.traktContinueWatching"
@@ -28,6 +29,7 @@ internal data class TraktContinueWatchingRefresh(
     val items: List<MetaItem>,
     val changed: Boolean,
     val receipt: TraktContinueWatchingReceipt,
+    val errorMessage: String? = null,
 )
 
 internal interface TraktContinueWatchingSource {
@@ -47,6 +49,7 @@ internal class TraktContinueWatchingModel(
     private var revision = 0L
     private var lastSuccessAt: Long? = null
     private var cached: List<MetaItem> = emptyList()
+    private var errorMessage: String? = null
 
     /** Network/artwork work runs outside [stateLock], so [clear] invalidates immediately. */
     suspend fun refresh(allowOwner: Boolean): TraktContinueWatchingRefresh {
@@ -85,7 +88,9 @@ internal class TraktContinueWatchingModel(
             response.onSuccess {
                 cached = it
                 lastSuccessAt = nowMillis()
+                errorMessage = null
             }
+            response.onFailure { errorMessage = "Couldn't refresh Trakt Continue Watching. Try again." }
             snapshotLocked(fetchPlan.before, fetchPlan.receipt)
         }
     }
@@ -105,6 +110,7 @@ internal class TraktContinueWatchingModel(
         items = cached,
         changed = before != cached,
         receipt = currentReceipt,
+        errorMessage = errorMessage,
     )
 
     private fun resetLocked(nextReceipt: TraktContinueWatchingReceipt?) {
@@ -112,6 +118,7 @@ internal class TraktContinueWatchingModel(
         receipt = nextReceipt
         lastSuccessAt = null
         cached = emptyList()
+        errorMessage = null
     }
 
     private sealed interface RefreshPlan {
@@ -146,9 +153,7 @@ internal fun withTraktContinueWatchingRail(rows: List<Catalog>, items: List<Meta
 private object TraktPlaybackSource : TraktContinueWatchingSource {
     override fun sessionEpoch(): Long? = TraktAuth.currentSessionEpoch
     override fun toggleRevision(): Long = ScrobbleService.toggleChanges.value
-    override fun isEnabled(): Boolean = ScrobbleService.isToggleOn(
-        ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false,
-    )
+    override fun isEnabled(): Boolean = sessionEpoch() != null
 
     override suspend fun fetch(expectedEpoch: Long): Result<List<MetaItem>> = preservingCancellation {
         val movies = TraktAuth.sessionBoundGet("/sync/playback/movies?extended=full", expectedEpoch)
@@ -176,21 +181,21 @@ internal data class TraktContinueWatchingSeed(
     val season: Int? = null,
     val episode: Int? = null,
     val episodeName: String? = null,
+    val aliases: Set<String> = emptySet(),
 )
 
 /** Newest valid pause wins; exact type/id duplicates cannot produce duplicate cards. */
 internal fun foldTraktContinueWatching(rows: List<JSONObject>): List<TraktContinueWatchingSeed> {
-    val byIdentity = linkedMapOf<String, TraktContinueWatchingSeed>()
-    rows.mapNotNull(::traktSeed).sortedByDescending(TraktContinueWatchingSeed::pausedAt).forEach { seed ->
-        byIdentity.putIfAbsent("${seed.type.id}|${seed.id}", seed)
-    }
-    return byIdentity.values.toList()
+    return dedupeContinueWatchingSeeds(rows.mapNotNull(::traktSeed),
+        aliases = { it.aliases.ifEmpty { setOf("${it.type.id}|${it.id}") } },
+        comparator = compareByDescending { seed: TraktContinueWatchingSeed -> parseContinueWatchingActivity(seed.pausedAt) }
+            .thenBy { it.id })
 }
 
 private fun traktSeed(row: JSONObject): TraktContinueWatchingSeed? {
     val progress = row.optDouble("progress", Double.NaN)
     if (!progress.isFinite() || progress <= 0.0 || progress >= 95.0) return null
-    val pausedAt = row.optString("paused_at").takeIf(String::isNotBlank) ?: return null
+    val pausedAt = row.optString("paused_at")
     val episode = row.optJSONObject("episode")
     val isEpisode = row.optString("type") == "episode" || episode != null
     val media = row.optJSONObject(if (isEpisode) "show" else "movie") ?: return null
@@ -206,11 +211,13 @@ private fun traktSeed(row: JSONObject): TraktContinueWatchingSeed? {
         id = id, type = type, name = media.optString("title").takeIf(String::isNotBlank) ?: id,
         progress = progress.toFloat(), pausedAt = pausedAt, tmdbId = tmdb, imdbId = imdb,
         season = season, episode = number, episodeName = episode?.optString("title")?.takeIf(String::isNotBlank),
+        aliases = listOfNotNull(imdb, tmdb?.let { if (isEpisode) "tmdb:tv:$it" else "tmdb:movie:$it" })
+            .mapTo(mutableSetOf()) { "${type.id}|$it" },
     )
 }
 
 /** Reuses the signed TMDB edge. Episodes use the typed TV path and prefer their still over the show backdrop. */
-private object TraktPlaybackArtwork {
+internal object TraktPlaybackArtwork {
     suspend fun resolve(seed: TraktContinueWatchingSeed): MetaItem {
         val tmdb = seed.tmdbId ?: resolveTmdb(seed) ?: return traktContinueWatchingFallback(seed)
         val media = if (seed.type == MediaType.SERIES) "tv" else "movie"
@@ -239,6 +246,7 @@ private object TraktPlaybackArtwork {
 /** Builds the remote read-only card before artwork enrichment; it deliberately has no local resume value. */
 internal fun traktContinueWatchingFallback(seed: TraktContinueWatchingSeed) = MetaItem(
     id = seed.id, type = seed.type, name = seed.name, progress = (seed.progress / 100f).coerceIn(0f, 1f),
+    continueWatchingActivityAtMillis = parseContinueWatchingActivity(seed.pausedAt),
     preferredEpisode = if (seed.type == MediaType.SERIES && seed.season != null && seed.episode != null) {
         PreferredEpisode(season = seed.season, episode = seed.episode)
     } else {

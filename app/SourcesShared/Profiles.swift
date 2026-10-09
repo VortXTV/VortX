@@ -41,6 +41,11 @@ struct UserProfile: Codable, Identifiable, Equatable {
     /// without touching anyone else. Follows the profile across devices like the rest of the roster.
     var disabledAddons: [String]? = nil
 
+    /// nil is a legacy record; the resolver preserves its customized fields. New records carry an
+    /// empty value whose two nil overrides mean live inheritance from Main. Keep the legacy fields
+    /// alongside this full roster carrier for older clients and backups.
+    var addonPreferences: ProfileAddonPreferences? = ProfileAddonPreferences()
+
     /// Kids profile: a parental-controls flag. When this profile is active the source list hides adult
     /// content and CAM/fake junk regardless of the global source filters (see
     /// `StreamRanking.passesUserFilters`). Pair it with a PIN on the adult profiles (so a child can't
@@ -151,18 +156,21 @@ struct UserProfile: Codable, Identifiable, Equatable {
         playback = try c.decodeIfPresent(PlaybackPrefs.self, forKey: .playback)
         discovery = try c.decodeIfPresent(ProfileDiscoveryPreferences.self, forKey: .discovery)
         disabledAddons = try c.decodeIfPresent([String].self, forKey: .disabledAddons)
+        addonPreferences = try c.decodeIfPresent(ProfileAddonPreferences.self, forKey: .addonPreferences)
         isKids = try c.decodeIfPresent(Bool.self, forKey: .isKids) ?? false
     }
 
     init(id: UUID = UUID(), name: String, avatar: String, accentID: String = "ember",
          oled: Bool = false, textScale: Double = 1.0, pin: String? = nil, usesOwnAccount: Bool = false,
          email: String? = nil, isOwner: Bool = false, familyEdit: Bool = false, playback: PlaybackPrefs? = nil,
-         discovery: ProfileDiscoveryPreferences? = nil, disabledAddons: [String]? = nil, isKids: Bool = false) {
+         discovery: ProfileDiscoveryPreferences? = nil, disabledAddons: [String]? = nil, isKids: Bool = false,
+         addonPreferences: ProfileAddonPreferences? = ProfileAddonPreferences()) {
         self.id = id; self.name = name; self.avatar = avatar; self.accentID = accentID
         self.oled = oled; self.textScale = textScale; self.pin = pin; self.usesOwnAccount = usesOwnAccount
         self.email = email; self.isOwner = isOwner; self.familyEdit = familyEdit; self.playback = playback
         self.discovery = discovery
         self.disabledAddons = disabledAddons
+        self.addonPreferences = addonPreferences
         self.isKids = isKids
     }
 }
@@ -192,6 +200,153 @@ final class ProfileStore: ObservableObject {
 
     @Published private(set) var profiles: [UserProfile] = []
     @Published private(set) var activeID: UUID?
+    @Published private(set) var nativeProfileError: String?
+#if VORTX_NATIVE_DATA_ENGINE
+    private var nativeProjectionTarget: PlaybackMutationTarget?
+    private var nativePublishedPlayback: UserProfile.PlaybackPrefs?
+    private var nativePublishedDiscovery: ProfileDiscoveryPreferences?
+    private let continueWatchingLegacyAccount = CredentialScopeRegistry.shared.capture()
+    private struct ContinueWatchingMigrationWitness {
+        let profileID: UUID
+        let target: PlaybackMutationTarget
+        let session: TraktSessionID
+    }
+    private var continueWatchingMigration: ContinueWatchingMigrationWitness?
+    private var continueWatchingMigrationInFlight = false
+    static var nativePlaybackProjectionKeys: Set<String> {
+        [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle, TrackPreferences.Key.forced,
+         SubtitleStyle.Key.font, SubtitleStyle.Key.size, SubtitleStyle.Key.color, SubtitleStyle.Key.background,
+         SubtitleStyle.Key.sizeScale, SubtitleStyle.Key.brightness, SourcePreferences.orderKey,
+         SourcePreferences.addonOrderKey, SourcePreferences.excludeKey, SourcePreferences.includeKey,
+         SourcePreferences.safetyKey, SourcePreferences.hideDeadKey, SourcePreferences.instantOnlyKey,
+         SourcePreferences.maxResolutionKey, SourcePreferences.minResolutionKey, SourcePreferences.hideUnknownResKey,
+         SourcePreferences.preferredAudioKey, SourcePreferences.maxFileSizeKey, SourcePreferences.hdrOnlyKey,
+         SourcePreferences.excludeAV1Key, SourcePreferences.regexKey, SourcePreferences.preferKey,
+         SourcePreferences.avoidBehaviorKey, SourcePreferences.autoPickBestKey]
+    }
+    static let nativeThemeProjectionKeys: Set<String> = ["stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textScale"]
+    /// A projection dirty stamp may acknowledge only a value already represented by the durable
+    /// native profile. Unknown/queued/failed writes remain dirty instead of becoming global fields.
+    func nativePreferenceIsAcknowledged(_ key: String) -> Bool {
+        guard let active, CoreBridge.shared.hasNativeSession else { return false }
+        if Self.nativePlaybackProjectionKeys.contains(key) { return active.playback == currentPlaybackPrefs() }
+        if ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key) { return active.discovery == currentDiscoveryPrefs() }
+        if Self.nativeThemeProjectionKeys.contains(key) {
+            let theme = ThemeManager.shared
+            return active.accentID == theme.accentID && active.oled == theme.oled && active.textScale == theme.textScale
+        }
+        return false
+    }
+    /// Called only after the native transaction's checkpoint acknowledgement. The old global
+    /// roster is replaced as a presentation mirror, never unioned into native account authority.
+    func applyNativeProfiles(_ incoming: [UserProfile], activeID selected: UUID, projectionTarget: PlaybackMutationTarget? = nil) {
+        guard incoming.contains(where: { $0.id == selected }) else { return }
+        let target = projectionTarget ?? CoreBridge.shared.captureNativePlaybackTarget()
+        let sameInstallation = nativeProjectionTarget == target && activeID == selected
+        if !sameInstallation { ContinueWatchingPreferences.retireSelection() }
+        // A same-session sync publication may run before a queued UI preference save. Preserve
+        // its captured flat values until that transaction acknowledges; real switches still reset.
+        let incomingActive = incoming.first { $0.id == selected }
+        // Capture BEFORE resetting the active projection. An outgoing viewer's global toggle is
+        // never evidence for the incoming profile. The native target is the acknowledged account
+        // installation, not an inferred owner/default credential slot.
+        if let witness = continueWatchingMigration,
+           witness.profileID != selected || witness.target != target || TraktAuth.storedSessionID != witness.session {
+            continueWatchingMigration = nil; continueWatchingMigrationInFlight = false
+        }
+        if continueWatchingMigration == nil,
+           CredentialScopeRegistry.shared.isMigrationEligible(continueWatchingLegacyAccount),
+           CredentialScopeRegistry.shared.isCurrent(continueWatchingLegacyAccount),
+           nativeProjectionTarget == nil || nativeProjectionTarget == target,
+           activeID == selected, let previous = active, previous.usesEngineHistory,
+           incomingActive?.usesEngineHistory == true,
+           previous.discovery?.continueWatchingSource == nil,
+           incomingActive?.discovery?.continueWatchingSource == nil,
+           UserDefaults.standard.object(forKey: ContinueWatchingPreferences.sourceKey) == nil,
+           UserDefaults.standard.bool(forKey: ExternalSyncToggle.traktContinueWatching),
+           target.stillOwnsCurrentContext(core: .shared),
+           let session = TraktAuth.storedSessionID {
+            continueWatchingMigration = .init(profileID: selected, target: target, session: session)
+        }
+        if let witness = continueWatchingMigration,
+           witness.profileID == selected, witness.target == target,
+           witness.target.stillOwnsCurrentContext(core: .shared), TraktAuth.storedSessionID == witness.session,
+           incomingActive?.discovery?.continueWatchingSource == "trakt" {
+            // This incoming projection is checkpoint-acknowledged. Admit just the qualified
+            // migration fields before dirty-value comparison; never replace another queued edit.
+            ProfileDiscoveryPreferencesStore.applyContinueWatching(incomingActive?.discovery, resetUnset: true)
+        }
+        let flatPlayback = currentPlaybackPrefs(), flatDiscovery = currentDiscoveryPrefs()
+        let pendingPlayback = sameInstallation && nativePublishedPlayback != flatPlayback && incomingActive?.playback != flatPlayback
+        let pendingDiscovery = sameInstallation && nativePublishedDiscovery != flatDiscovery && incomingActive?.discovery != flatDiscovery
+        profiles = incoming; activeID = selected; nativeProfileError = nil
+        nativeProjectionTarget = target
+        persist(touch: false)
+        if let active {
+            VortXSyncManager.suppressHousekeeping {
+                self.applyTheme(active)
+                if !pendingPlayback { self.applyPlayback(active, resetUnset: true) }
+                if !pendingDiscovery { self.applyDiscovery(active, resetUnset: true) }
+                if !pendingPlayback { self.nativePublishedPlayback = self.currentPlaybackPrefs() }
+                if !pendingDiscovery { self.nativePublishedDiscovery = self.currentDiscoveryPrefs() }
+                SourcePreferences.shared.reload(); SourcePinStore.shared.reload()
+            }
+            migrateContinueWatchingIfQualified(active)
+        }
+    }
+    private func migrateContinueWatchingIfQualified(_ profile: UserProfile) {
+        guard let witness = continueWatchingMigration else { return }
+        guard profile.discovery?.continueWatchingSource == nil else {
+            continueWatchingMigration = nil; return
+        }
+        guard !continueWatchingMigrationInFlight, profile.id == witness.profileID,
+              profile.usesEngineHistory, witness.target.stillOwnsCurrentContext(core: .shared),
+              TraktAuth.storedSessionID == witness.session else { return }
+        continueWatchingMigrationInFlight = true
+        var migrated = profile
+        var discovery = profile.discovery ?? ProfileDiscoveryPreferences()
+        discovery.continueWatchingSource = ContinueWatchingService.trakt.rawValue
+        discovery.continueWatchingWindow = discovery.continueWatchingWindow ?? ContinueWatchingWindow.twenty.rawValue
+        migrated.discovery = discovery
+        Task { @MainActor in
+            guard self.activeID == witness.profileID,
+                  self.continueWatchingMigration?.target == witness.target,
+                  witness.target.stillOwnsCurrentContext(core: .shared),
+                  TraktAuth.storedSessionID == witness.session else {
+                self.continueWatchingMigrationInFlight = false; return
+            }
+            // Publication comes only from saveNative's existing checkpoint-acknowledged projection.
+            // On failure retain this exact witness for a later same-installation retry.
+            _ = await self.saveNative(migrated, creating: false, target: witness.target)
+            self.continueWatchingMigrationInFlight = false
+        }
+    }
+    @MainActor
+    func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget? = nil) async -> Bool {
+        let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
+        do { try await CoreBridge.shared.saveNativeProfile(profile, creating: creating, target: captured); nativeProfileError = nil; return true }
+        catch { nativeProfileError = "Profile could not be saved. Your edits are still here. Refresh the account binding and retry if it changed on another device."; return false }
+    }
+    @MainActor
+    func removeNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil) async -> Bool {
+        VortxNativeOwnAccountProducer.invalidate(slot: keychainAccount(for: profile))
+        let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
+        do { try await CoreBridge.shared.deleteNativeProfile(profile.id, target: captured); nativeProfileError = nil; return true }
+        catch { nativeProfileError = "Profile could not be removed. Please retry."; return false }
+    }
+    @MainActor
+    func selectNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil) async -> Bool {
+        let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
+        guard CoreBridge.shared.nativePlaybackTargetIsCurrent(captured) else { return false }
+        var outgoing = active
+        outgoing?.playback = currentPlaybackPrefs()
+        outgoing?.discovery = currentDiscoveryPrefs()
+        do {
+            try await CoreBridge.shared.switchNativeProfile(profile.id, outgoing: outgoing, target: captured)
+            pickedThisLaunch = true; nativeProfileError = nil; return true
+        } catch { nativeProfileError = "Profile could not be opened. Please retry."; return false }
+    }
+#endif
     /// The launch picker shows once per cold start, and only when there is a real choice to make.
     /// Settings re-opens it by flipping this back to false.
     @Published var pickedThisLaunch = false
@@ -242,6 +397,19 @@ final class ProfileStore: ObservableObject {
         Set(UserDefaults.standard.stringArray(forKey: activeDisabledAddonsKey) ?? [])
     }
 
+    /// Only a custom ranking order is mirrored. Missing means read the current account order, so a
+    /// remote Main reorder becomes visible without materializing a child-profile snapshot.
+    static let activeAddonOrderOverrideKey = "stremiox.profile.addonOrderOverride"
+    static func activeAddonOrder(accountOrder: [String]) -> [String] {
+        #if VORTX_NATIVE_DATA_ENGINE
+        // Native descriptors already arrive in the kernel's account order. Never apply the older
+        // account mirror (which also folded case-sensitive URL paths) over that authoritative input.
+        return UserDefaults.standard.stringArray(forKey: activeAddonOrderOverrideKey) ?? []
+        #else
+        UserDefaults.standard.stringArray(forKey: activeAddonOrderOverrideKey) ?? accountOrder
+        #endif
+    }
+
     /// Flat mirror of the active profile's Kids flag, same off-main pattern as `activeDisabledAddonsKey`,
     /// so the stream filter (which may run off the main actor) can force the parental content guard on
     /// without decoding the roster.
@@ -286,7 +454,6 @@ final class ProfileStore: ObservableObject {
         // profile's set (no CoreBridge call here: the board is built later from the engine event).
         if let active {
             applyTheme(active)
-            UserDefaults.standard.set(active.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
             UserDefaults.standard.set(active.isKids, forKey: Self.activeKidsKey)
         }
         // One-time seed: pre-feature rosters share one flat set of playback preferences, so
@@ -298,6 +465,12 @@ final class ProfileStore: ObservableObject {
                 profiles[index].playback = seed
             }
             persist(touch: false)
+        }
+        // Seed old playback snapshots before flattening inheritance; otherwise an unseeded Main
+        // would overwrite the pre-upgrade flat source-ranking choices with defaults on first launch.
+        if let active {
+            applyAddonPreferences(active)
+            SourcePreferences.shared.reload()
         }
         // Unlike playback's original migration, discovery settings must NOT be copied to every old
         // profile: that would make a new or previously inactive viewer inherit the currently active
@@ -320,16 +493,27 @@ final class ProfileStore: ObservableObject {
     /// The Keychain slot the rest of the app reads the session from right now. StremioAccount and
     /// CoreBridge resolve their token through this, so a profile switch re-points both at once.
     var activeKeychainAccount: String {
+#if VORTX_NATIVE_DATA_ENGINE
+        return active.map(keychainAccount(for:)) ?? "vortx.native.streaming.unavailable.no-profile"
+#else
         active.map(keychainAccount(for:)) ?? Self.primaryTokenAccount
+#endif
     }
 
     func keychainAccount(for profile: UserProfile) -> String {
+#if VORTX_NATIVE_DATA_ENGINE
+        return CoreBridge.shared.nativeCredentialSlot(profileID: profile.id)
+            ?? "vortx.native.streaming.unavailable." + profile.id.uuidString
+#else
+        return Self.legacyKeychainAccount(for: profile)
+#endif
+    }
+    static func legacyKeychainAccount(for profile: UserProfile) -> String {
         // The owner IS the primary account: it always reads the primary slot, no matter what the
         // usesOwnAccount flag says. (A synced roster once arrived with the flag flipped on the
         // owner, which pointed sign-in at an empty per-profile slot and "signed out" every device.)
-        if profile.isOwner { return Self.primaryTokenAccount }
-        return profile.usesOwnAccount ? Self.primaryTokenAccount + "." + profile.id.uuidString
-                                      : Self.primaryTokenAccount
+        if profile.isOwner { return primaryTokenAccount }
+        return profile.usesOwnAccount ? primaryTokenAccount + "." + profile.id.uuidString : primaryTokenAccount
     }
 
     private static func accountFingerprint(_ account: String) -> String? {
@@ -424,6 +608,10 @@ final class ProfileStore: ObservableObject {
     /// Make `profile` active: applies its theme immediately and reports the account work left.
     @discardableResult
     func select(_ profile: UserProfile) -> SwitchOutcome {
+#if VORTX_NATIVE_DATA_ENGINE
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        Task { @MainActor in _ = await selectNative(profile, target: target) }; return .sameAccount
+#endif
         // FIRST, before activeID moves: fold the live flat-key state into the OUTGOING profile. The
         // flat keys are, by the documented invariant, the ACTIVE profile's state, but the 13 stream
         // filters bind straight to the SourcePreferences singleton on both settings screens, so a
@@ -436,6 +624,9 @@ final class ProfileStore: ObservableObject {
         // (remove()'s select-after-removal: the removed profile is already gone from the roster).
         capturePlayback()
         captureDiscovery()
+        // A same-profile selection may have just captured a live Settings edit. Apply that stored
+        // record, not the stale value that the picker passed before capture.
+        let profile = profiles.first(where: { $0.id == profile.id }) ?? profile
         // Persist delayed progress against the outgoing profile before replacing the active watch dictionary.
         flushScheduledWatchCacheSave()
         let beforeAccount = active.map(keychainAccount(for:))
@@ -457,11 +648,19 @@ final class ProfileStore: ObservableObject {
     }
 
     func add(_ profile: UserProfile) {
+#if VORTX_NATIVE_DATA_ENGINE
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        Task { @MainActor in _ = await saveNative(profile, creating: true, target: target) }; return
+#endif
         profiles.append(profile)
         persist()
     }
 
     func update(_ profile: UserProfile) {
+#if VORTX_NATIVE_DATA_ENGINE
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        Task { @MainActor in _ = await saveNative(profile, creating: false, target: target) }; return
+#endif
         guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return }
         profiles[index] = profile
         persist()
@@ -469,6 +668,12 @@ final class ProfileStore: ObservableObject {
             applyTheme(profile)
             applyPlayback(profile)
             applyDiscovery(profile)
+        } else if profile.isOwner, let active, activeSharesMainAddons {
+            // Main edits must reach a currently visible inheriting secondary immediately.
+            applyAddonPreferences(active)
+            SourcePreferences.shared.reload()
+            notifyAddonPreferencesDidChange(profileID: active.id)
+            CoreBridge.shared.rebuildBoardRows()
         }
     }
 
@@ -478,15 +683,143 @@ final class ProfileStore: ObservableObject {
     /// new set into the read key and rebuilds Home so the change shows at once.
     func toggleAddon(base: String) {
         guard var profile = active else { return }
-        var set = Set(profile.disabledAddons ?? [])
-        if set.contains(base) { set.remove(base) } else { set.insert(base) }
-        profile.disabledAddons = set.isEmpty ? nil : set.sorted()
+        var set = Set(effectiveDisabledAddons(for: profile))
+        let key = ProfileAddonPreferencesPolicy.identity(base)
+        if set.contains(key) { set.remove(key) } else { set.insert(key) }
+        var preferences = addonPreferences(for: profile)
+        preferences.disabledAddonURLsOverride = set.sorted()
+        profile.addonPreferences = preferences
+        profile.disabledAddons = set.sorted() // keep explicit [] distinct from inheriting
         update(profile)
     }
 
     /// Whether an add-on (by transport URL) is currently turned off for the active profile.
     func isAddonDisabledForActive(base: String) -> Bool {
-        Set(active?.disabledAddons ?? []).contains(base)
+        guard let active else { return false }
+        return Set(effectiveDisabledAddons(for: active)).contains(ProfileAddonPreferencesPolicy.identity(base))
+    }
+
+    var activeSharesMainAddons: Bool { active.map { !$0.isOwner && !$0.usesOwnAccount } ?? false }
+    var activeInheritsAddonVisibility: Bool {
+        activeSharesMainAddons && active.map { addonPreferences(for: $0).disabledAddonURLsOverride == nil } == true
+    }
+    var activeInheritsAddonRanking: Bool {
+        activeSharesMainAddons && active.map { addonPreferences(for: $0).rankingOverride == nil } == true
+    }
+
+    private var ownerAddonRanking: ProfileAddonRanking {
+        let owner = profiles.first(where: \.isOwner)
+        return ProfileAddonRanking(
+            sourceTypeOrder: owner?.playback?.sourceTypeOrder ?? SourcePreferences.defaultTypeOrder.map(\.rawValue),
+            useAddonOrder: owner?.playback?.useAddonOrder ?? SourcePreferences.defaultUseAddonOrder)
+    }
+
+    private func addonPreferences(for profile: UserProfile) -> ProfileAddonPreferences {
+        profile.addonPreferences ?? ProfileAddonPreferencesPolicy.migrated(
+            legacyDisabled: profile.disabledAddons, legacyTypes: profile.playback?.sourceTypeOrder,
+            legacyUseOrder: profile.playback?.useAddonOrder, inheritedRanking: ownerAddonRanking)
+    }
+
+    private func effectiveDisabledAddons(for profile: UserProfile) -> [String] {
+        let inherited: [String]
+        if !profile.isOwner, !profile.usesOwnAccount, let owner = profiles.first(where: \.isOwner) {
+            inherited = addonPreferences(for: owner).disabledAddonURLsOverride ?? owner.disabledAddons ?? []
+        } else {
+            inherited = profile.disabledAddons ?? []
+        }
+        return ProfileAddonPreferencesPolicy.disabled(
+            override: addonPreferences(for: profile).disabledAddonURLsOverride, inherited: inherited)
+    }
+
+    private func effectiveAddonRanking(for profile: UserProfile) -> ProfileAddonRanking {
+        if let custom = addonPreferences(for: profile).rankingOverride { return custom }
+        if !profile.isOwner, !profile.usesOwnAccount { return ownerAddonRanking }
+        return ProfileAddonRanking(
+            sourceTypeOrder: profile.playback?.sourceTypeOrder ?? SourcePreferences.defaultTypeOrder.map(\.rawValue),
+            useAddonOrder: profile.playback?.useAddonOrder ?? SourcePreferences.defaultUseAddonOrder)
+    }
+
+    private func applyAddonPreferences(_ profile: UserProfile) {
+        let defaults = UserDefaults.standard
+        defaults.set(effectiveDisabledAddons(for: profile), forKey: Self.activeDisabledAddonsKey)
+        let ranking = effectiveAddonRanking(for: profile)
+        if let order = ranking.addonOrder {
+            defaults.set(ProfileAddonPreferencesPolicy.unique(order), forKey: Self.activeAddonOrderOverrideKey)
+        } else {
+            defaults.removeObject(forKey: Self.activeAddonOrderOverrideKey)
+        }
+        defaults.set(ranking.sourceTypeOrder.joined(separator: ","), forKey: SourcePreferences.orderKey)
+        defaults.set(ranking.useAddonOrder, forKey: SourcePreferences.addonOrderKey)
+    }
+
+    private func notifyAddonPreferencesDidChange(profileID: UUID) {
+        Task { @MainActor in
+            guard ProfileStore.shared.activeID == profileID else { return }
+            CoreBridge.shared.addonOrderDidChange()
+            NotificationCenter.default.post(name: VortXSyncManager.addonOrderChangedNote, object: nil)
+        }
+    }
+
+    func customizeAddonVisibility() {
+        guard var profile = active, activeInheritsAddonVisibility else { return }
+        var preferences = addonPreferences(for: profile)
+        preferences.disabledAddonURLsOverride = effectiveDisabledAddons(for: profile)
+        profile.addonPreferences = preferences
+        profile.disabledAddons = preferences.disabledAddonURLsOverride
+        update(profile)
+    }
+
+    func resetAddonVisibilityToMain() {
+        guard var profile = active, activeSharesMainAddons else { return }
+        var preferences = addonPreferences(for: profile)
+        preferences.disabledAddonURLsOverride = nil
+        profile.addonPreferences = preferences
+        profile.disabledAddons = nil
+        update(profile)
+    }
+
+    func customizeAddonRanking() {
+        guard var profile = active, activeInheritsAddonRanking else { return }
+        var preferences = addonPreferences(for: profile)
+        var ranking = effectiveAddonRanking(for: profile)
+        ranking.addonOrder = ProfileAddonPreferencesPolicy.sorted(CoreBridge.shared.addons,
+            order: Self.activeAddonOrder(accountOrder: VortXSyncManager.appliedAddonOrder), key: { $0.transportUrl })
+            .map { ProfileAddonPreferencesPolicy.identity($0.transportUrl) }
+        preferences.rankingOverride = ranking
+        profile.addonPreferences = preferences
+        update(profile)
+    }
+
+    func resetAddonRankingToMain() {
+        guard var profile = active, activeSharesMainAddons else { return }
+        var preferences = addonPreferences(for: profile)
+        preferences.rankingOverride = nil
+        profile.addonPreferences = preferences
+        // These legacy fields remain mirrors only; nil avoids resurrecting a reset on older exports.
+        profile.playback?.sourceTypeOrder = nil
+        profile.playback?.useAddonOrder = nil
+        update(profile)
+        SourcePreferences.shared.reload()
+    }
+
+    /// The editor captures its profile ID when its rows load. A queued drag/remote action after a
+    /// profile switch is rejected before either the profile or account can be changed.
+    @MainActor func setAddonOrder(_ urls: [String], for profileID: UUID) {
+        guard var profile = active, profile.id == profileID else { return }
+        if !activeSharesMainAddons {
+            #if VORTX_NATIVE_DATA_ENGINE
+            CoreBridge.shared.reorderAddonsForActiveProfile(urls, profileID: profileID)
+            #else
+            VortXSyncManager.shared.applyInAppAddonOrder(urls)
+            #endif
+            return
+        }
+        var preferences = addonPreferences(for: profile)
+        var ranking = effectiveAddonRanking(for: profile)
+        ranking.addonOrder = ProfileAddonPreferencesPolicy.unique(urls)
+        preferences.rankingOverride = ranking
+        profile.addonPreferences = preferences
+        update(profile)
     }
 
     /// Remove a non-owner profile (never the last one). Its private session key is deleted with it.
@@ -494,12 +827,21 @@ final class ProfileStore: ObservableObject {
     /// outcome when the removed profile was the active one, nil otherwise.
     @discardableResult
     func remove(_ profile: UserProfile) -> SwitchOutcome? {
+#if VORTX_NATIVE_DATA_ENGINE
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        Task { @MainActor in _ = await removeNative(profile, target: target) }; return nil
+#endif
         guard profiles.count > 1,
               let target = profiles.first(where: { $0.id == profile.id }),
               !target.isOwner,
               target.id != UserProfile.ownerID else { return nil }
         profiles.removeAll { $0.id == target.id }
-        if target.usesOwnAccount { Keychain.set(nil, for: keychainAccount(for: target)) }
+        if target.usesOwnAccount {
+#if VORTX_NATIVE_DATA_ENGINE
+            VortxNativeOwnAccountProducer.invalidate(slot: keychainAccount(for: target))
+#endif
+            Keychain.set(nil, for: keychainAccount(for: target))
+        }
         UserDefaults.standard.removeObject(forKey: Self.watchCacheKey(target.id))
         UserDefaults.standard.removeObject(forKey: Self.watchRemovalKey(target.id))
         savePendingAccountLibraryAdds(pendingAccountLibraryAdds().filter { $0.profileID != target.id })
@@ -563,6 +905,15 @@ final class ProfileStore: ObservableObject {
                         if let kids = st["isKids"] as? Bool, kids != p.isKids { p.isKids = kids; changed = true }
                         if let pbDict = st["playback"] as? [String: Any] {
                             let next = Self.playbackPrefs(from: pbDict, base: p.playback)
+                            if !p.isOwner, !p.usesOwnAccount,
+                               pbDict["sourceTypeOrder"] != nil || pbDict["useAddonOrder"] != nil {
+                                var preferences = addonPreferences(for: p)
+                                var ranking = effectiveAddonRanking(for: p)
+                                ranking.sourceTypeOrder = next.sourceTypeOrder ?? ranking.sourceTypeOrder
+                                ranking.useAddonOrder = next.useAddonOrder ?? ranking.useAddonOrder
+                                preferences.rankingOverride = ranking
+                                if preferences != p.addonPreferences { p.addonPreferences = preferences; changed = true }
+                            }
                             if next != p.playback { p.playback = next; changed = true }
                         }
                     }
@@ -570,7 +921,10 @@ final class ProfileStore: ObservableObject {
                     // the add-on list (doc.vortx.addons), so the dashboard only toggles which ones are off
                     // for this profile; that set rides the profileEdits channel, never doc.vortx.
                     if let da = e["disabledAddons"] as? [String] {
-                        let next = da.isEmpty ? nil : da.sorted()
+                        let next = ProfileAddonPreferencesPolicy.unique(da).sorted()
+                        var preferences = addonPreferences(for: p)
+                        preferences.disabledAddonURLsOverride = next
+                        if preferences != p.addonPreferences { p.addonPreferences = preferences; changed = true }
                         if next != p.disabledAddons { p.disabledAddons = next; changed = true }
                     }
                     if changed { update(p) }
@@ -590,9 +944,17 @@ final class ProfileStore: ObservableObject {
                         if let kids = st["isKids"] as? Bool { created.isKids = kids }
                         if let playback = st["playback"] as? [String: Any] {
                             created.playback = Self.playbackPrefs(from: playback, base: nil)
+                            if playback["sourceTypeOrder"] != nil || playback["useAddonOrder"] != nil {
+                                created.addonPreferences?.rankingOverride = ProfileAddonRanking(
+                                    sourceTypeOrder: created.playback?.sourceTypeOrder ?? ownerAddonRanking.sourceTypeOrder,
+                                    useAddonOrder: created.playback?.useAddonOrder ?? ownerAddonRanking.useAddonOrder)
+                            }
                         }
                     }
-                    created.disabledAddons = (e["disabledAddons"] as? [String]).flatMap { $0.isEmpty ? nil : $0.sorted() }
+                    if let disabled = e["disabledAddons"] as? [String] {
+                        created.disabledAddons = ProfileAddonPreferencesPolicy.unique(disabled).sorted()
+                        created.addonPreferences?.disabledAddonURLsOverride = created.disabledAddons
+                    }
                     add(created)
                 }
             }
@@ -835,7 +1197,7 @@ final class ProfileStore: ObservableObject {
         // Per-profile add-on visibility: flatten this profile's disabled set into the key the off-main
         // board build and streamGroups read, so Home, Discover, and stream sources all honor it the
         // moment this profile becomes active. (Empty array = nothing hidden, the default.)
-        d.set(profile.disabledAddons ?? [], forKey: Self.activeDisabledAddonsKey)
+        applyAddonPreferences(profile)
         d.set(profile.isKids, forKey: Self.activeKidsKey)   // Kids content guard for the stream filter
         let p = profile.playback
         // Track languages + subtitle style. These PlaybackPrefs fields are non-optional, so they are
@@ -865,16 +1227,7 @@ final class ProfileStore: ObservableObject {
         // filters. Every field below is OPTIONAL in PlaybackPrefs: nil means "this profile never recorded
         // it". On a SWITCH the nil is resolved to SourcePreferences' documented default (single source of
         // truth, no magic numbers here); on a sync fold the nil is left alone.
-        if let order = p?.sourceTypeOrder {
-            d.set(order.joined(separator: ","), forKey: SourcePreferences.orderKey)
-        } else if resetUnset {
-            d.set(SourcePreferences.defaultTypeOrderCSV, forKey: SourcePreferences.orderKey)
-        }
-        if let addon = p?.useAddonOrder {
-            d.set(addon, forKey: SourcePreferences.addonOrderKey)
-        } else if resetUnset {
-            d.set(SourcePreferences.defaultUseAddonOrder, forKey: SourcePreferences.addonOrderKey)
-        }
+        // Source ranking was resolved above from the explicit override or Main's live preferences.
         if let v = p?.safetyMode { d.set(v, forKey: SourcePreferences.safetyKey) }
         else if resetUnset { d.set(SourcePreferences.defaultSafetyMode, forKey: SourcePreferences.safetyKey) }
         if let v = p?.instantOnly { d.set(v, forKey: SourcePreferences.instantOnlyKey) }
@@ -924,6 +1277,7 @@ final class ProfileStore: ObservableObject {
         // board on every apply. Cheap: rebuildBoardRows recomputes the same rows and re-publishes,
         // so an unchanged set diffs to a no-op in SwiftUI.
         CoreBridge.shared.rebuildBoardRows()
+        notifyAddonPreferencesDidChange(profileID: profile.id)
     }
 
     /// Mirror of captureTheme for playback preferences: Settings and the in-player options write
@@ -932,9 +1286,28 @@ final class ProfileStore: ObservableObject {
     /// writes from echoing back as roster edits.
     func capturePlayback() {
         guard var profile = active else { return }
-        let now = currentPlaybackPrefs()
-        guard profile.playback != now else { return }
+        var now = currentPlaybackPrefs()
+        let effective = effectiveAddonRanking(for: profile)
+        var preferences = addonPreferences(for: profile)
+        if now.sourceTypeOrder != effective.sourceTypeOrder || now.useAddonOrder != effective.useAddonOrder {
+            if activeSharesMainAddons {
+                var custom = effective
+                custom.sourceTypeOrder = now.sourceTypeOrder ?? effective.sourceTypeOrder
+                custom.useAddonOrder = now.useAddonOrder ?? effective.useAddonOrder
+                preferences.rankingOverride = custom
+            }
+        }
+        // Capturing an outgoing inherited profile must not turn the effective Main values into
+        // personal settings. Preserve its stored legacy fields until the viewer makes a real edit.
+        if activeSharesMainAddons, preferences.rankingOverride == nil {
+            now.sourceTypeOrder = profile.playback?.sourceTypeOrder
+            now.useAddonOrder = profile.playback?.useAddonOrder
+        } else if !activeSharesMainAddons {
+            preferences.rankingOverride = nil // owners keep their established account-ranking fields
+        }
+        guard profile.playback != now || profile.addonPreferences != preferences else { return }
         profile.playback = now
+        profile.addonPreferences = preferences
         update(profile)
     }
 
@@ -950,6 +1323,9 @@ final class ProfileStore: ObservableObject {
     /// and provider caller already reads. A true profile switch clears every missing field so a
     /// new profile starts clean, while sync folds leave unknown old-roster fields untouched.
     private func applyDiscovery(_ profile: UserProfile, resetUnset: Bool = false) {
+        #if !VORTX_NATIVE_DATA_ENGINE
+        if resetUnset { ContinueWatchingPreferences.retireSelection() }
+        #endif
         let p = profile.discovery
         ProfileDiscoveryPreferencesStore.apply(p, resetUnset: resetUnset)
         // The singleton views cache their @Published copies, and the hub holds region/provider
@@ -964,19 +1340,36 @@ final class ProfileStore: ObservableObject {
             CatalogPreferences.shared.reloadFromDefaults()
             CollectionsHubModel.shared.reloadFromProfilePreferences()
             CoreBridge.shared.rebuildBoardRows()
+            NotificationCenter.default.post(name: ContinueWatchingPreferences.changedNote, object: nil)
         }
     }
 
     /// Fold an active viewer's already-applied discovery choices into its synced roster record.
     /// This intentionally persists without applying again: the flat keys are the source of truth
     /// for the live viewer at capture time, so a second reload would needlessly cancel hub work.
-    func captureDiscovery() {
+    func captureDiscovery(continueWatchingEdited: Bool = false) {
         guard let activeID,
               let index = profiles.firstIndex(where: { $0.id == activeID }) else { return }
-        let now = currentDiscoveryPrefs()
+        var now = currentDiscoveryPrefs()
+#if VORTX_NATIVE_DATA_ENGINE
+        if continueWatchingEdited { continueWatchingMigration = nil }
+        else if let witness = continueWatchingMigration,
+                witness.profileID == activeID, witness.target.stillOwnsCurrentContext(core: .shared),
+                TraktAuth.storedSessionID == witness.session {
+            // Keep the qualified old choice in this same durable edit, not the temporary Local
+            // projection used while migration waits. Its acknowledged projection admits it later.
+            now.continueWatchingSource = "trakt"
+        }
+#endif
         guard profiles[index].discovery != now else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        var profile = profiles[index]
+        profile.discovery = now
+        update(profile)
+#else
         profiles[index].discovery = now
         persist()
+#endif
     }
 
     // MARK: Persistence
@@ -1022,10 +1415,9 @@ final class ProfileStore: ObservableObject {
     }
 
     private func persist(touch: Bool = true) {
+        guard let data = try? JSONEncoder().encode(profiles) else { return }
         let writeRosterAndActive = {
-            if let data = try? JSONEncoder().encode(self.profiles) {
-                UserDefaults.standard.set(data, forKey: Self.listKey)
-            }
+            UserDefaults.standard.set(data, forKey: Self.listKey)
             UserDefaults.standard.set(self.activeID?.uuidString, forKey: Self.activeKey)
         }
         if touch && !applyingProfileEdits {
@@ -1034,6 +1426,9 @@ final class ProfileStore: ObservableObject {
             writeRosterAndActive()
             UserDefaults.standard.set(ProfileRosterSyncPolicy.nextLocalClock(
                 now: Date().timeIntervalSince1970, prior: rosterModified.timeIntervalSince1970), forKey: Self.modifiedKey)
+            // Selection can immediately perform suppressed housekeeping before defaults notifications
+            // drain. Protect this real edit synchronously rather than losing its dirty mark on rebaseline.
+            VortXSyncManager.localRosterDidPersist()
             schedulePushRoster()
         } else {
             // Routine housekeeping (normalizeOwner re-key, legacy migrations, per-device selection, tombstone
@@ -1124,6 +1519,9 @@ final class ProfileStore: ObservableObject {
     ///   3. Keeps the legacy two-way Stremio sync alive ONLY while the opt-in "also sync to Stremio" mirror
     ///      is on. By default the roster + overlays stay fresh through the VortX realtime syncDown / poll.
     func bootstrapSync() {
+#if VORTX_NATIVE_DATA_ENGINE
+        return // Native imports use authenticated account-qualified source receipts, never this legacy repair.
+#else
         guard let key = Keychain.string(Self.primaryTokenAccount), !key.isEmpty else { return }
         Task { [weak self] in
             guard let self else { return }
@@ -1141,6 +1539,7 @@ final class ProfileStore: ObservableObject {
                 await MainActor.run { self.refreshWatchFromServer() }
             }
         }
+#endif
     }
 
     /// ONE-TIME migration of the legacy Stremio-datastore roster + per-profile overlay watch history into the
@@ -1321,6 +1720,15 @@ final class ProfileStore: ObservableObject {
             if activeID == old { activeID = UserProfile.ownerID }
         }
         collapseEmptyDuplicateSecondaries()
+        // Freeze only evidence of legacy customization once, before a later Main edit can make an
+        // old equal snapshot look like a personal override. An empty object is a durable migration marker.
+        let inherited = ownerAddonRanking
+        for index in profiles.indices where profiles[index].addonPreferences == nil {
+            let profile = profiles[index]
+            profiles[index].addonPreferences = ProfileAddonPreferencesPolicy.migrated(
+                legacyDisabled: profile.disabledAddons, legacyTypes: profile.playback?.sourceTypeOrder,
+                legacyUseOrder: profile.playback?.useAddonOrder, inheritedRanking: inherited)
+        }
     }
 
     /// Collapse ACCIDENTAL duplicate secondaries: when two or more non-owner profiles share the same name
@@ -1458,6 +1866,9 @@ final class ProfileStore: ObservableObject {
     }
 
     private func schedulePushRoster() {
+#if VORTX_NATIVE_DATA_ENGINE
+        return // The native account carrier owns roster changes; never mirror via the global legacy token.
+#else
         pushRosterTask?.cancel()
         // VortX authoritative: a roster edit already arms a debounced VortX syncUp (the persist() UserDefaults
         // write fires the sync manager's observer), which carries the roster in doc.settings + doc.vortx.profiles.
@@ -1470,6 +1881,7 @@ final class ProfileStore: ObservableObject {
             guard !Task.isCancelled else { return }
             await ProfileSync.pushRoster(snapshot, authKey: key)
         }
+#endif
     }
 
     // MARK: Watch overlay (a non-owner profile's own history, synced through the account)
@@ -1493,7 +1905,8 @@ final class ProfileStore: ObservableObject {
             let item = CoreCWItem(id: metaId, type: entry.type, name: entry.name, poster: entry.poster,
                                   state: CoreLibState(timeOffset: Double(entry.timeOffsetMs),
                                                       duration: Double(entry.durationMs),
-                                                      videoId: entry.videoId))
+                                                      videoId: entry.videoId,
+                                                      lastWatched: entry.lastWatched))
             dated.append((entry.lastWatched, item))
         }
         let ordered = dated.sorted {
@@ -1512,7 +1925,7 @@ final class ProfileStore: ObservableObject {
                     && $0.item.state.duration.isFinite && $0.item.state.duration > 0
             )
         }
-        return unique.prefix(30).map(\.item)
+        return unique.map(\.item) // the selected range is applied once by HomeContinueWatchingSelection
     }
 
     /// The active overlay profile's full Library: EVERY title it has watched, newest first. Unlike
@@ -1619,7 +2032,11 @@ final class ProfileStore: ObservableObject {
     /// Episode ids the active overlay profile has watched for a title; drives the
     /// detail page's per-profile ticks.
     func watchedVideoIds(forMeta metaId: String) -> Set<String> {
+#if VORTX_NATIVE_DATA_ENGINE
+        return Set((try? CoreBridge.shared.nativePlaybackSnapshot()?["watchedVideoIdsByTitle"]?[metaId]?.decode([String].self)) ?? [])
+#else
         Set(watch[metaId]?.watchedVideoIds ?? [])
+#endif
     }
 
     /// Bulk watched toggle for the detail page's episode, season, and whole-series

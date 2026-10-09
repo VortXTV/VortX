@@ -1,0 +1,65 @@
+# Offline iPhone/iPad diagnostic project.  It is separate from project.yml so release targets cannot
+# accidentally inherit the fixture entry point or its simulator-only bundle identifier.
+name: CinemaUISmokeIOSRenderer
+options:
+  bundleIdPrefix: com.stremiox
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+packages:
+  MPVKit:
+    path: Vendor/MPVKit-DVFEL
+settings:
+  base:
+    VORTX_EDGE_SECRET: ""
+    TRAKT_CLIENT_ID: ""
+    SIMKL_CLIENT_ID: ""
+targets:
+  CinemaUISmokeIOSRenderer:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - SourcesiOS
+      - path: SourcesShared
+        excludes: [".claude/**", "JSProviders/**"]
+      - path: Sources/Player
+        excludes: [".claude/**"]
+      - Sources/PlayerScreen.swift
+      - Sources/ShareSheet.swift
+      - Sources/ExternalPlayer.swift
+      - Resources/Assets.xcassets
+      - Resources/Localizable.xcstrings
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL
+      # Use the framework dependencies rather than hand-picked archive paths: Xcode then selects
+      # the actual ios-arm64-simulator slices and does not accidentally reuse the macOS renderer's
+      # ordinary static archives.
+      - framework: Vendor/StremioXCore.xcframework
+        embed: false
+      - framework: Vendor/VortxEngine.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.cinema-ui-smoke.ios
+        PRODUCT_NAME: CinemaUISmokeIOSRenderer
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(BUILT_PRODUCTS_DIR)/include/vortx"
+        # The normal app entry point is excluded under this condition. The fixture app constructs
+        # no CoreBridge/account/player/server owner, and the existing watched/network/provider traps
+        # turn any accidental escape path into an immediate failure.
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: Cinema UI Smoke iOS
+        INFOPLIST_KEY_UILaunchScreen_Generation: "YES"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+schemes:
+  CinemaUISmokeIOSRenderer:
+    build:
+      targets:
+        CinemaUISmokeIOSRenderer: all
+    run:
+      config: Debug

@@ -17,6 +17,19 @@ import java.util.Date
 class SettingsBackupInteropTest {
 
     @Test
+    fun cinemaNavigationChoicesRoundTripWithoutChangingAbsentDefaults() {
+        val choices = mapOf<String, Any>("vortx.mergeHomeDiscover" to false, "vortx.cinema.quickView" to true)
+        assertEquals(choices, SettingsBackup.plistSettingsFrom(choices))
+        val backup = SettingsBackup.makeBackup(choices, "com.vortx.android", now = Date(0))!!
+        val restored = SettingsBackup.restoreValues(backup)!!
+        assertEquals(SettingsBackup.BackupValue.Bool(false), restored["vortx.mergeHomeDiscover"])
+        assertEquals(SettingsBackup.BackupValue.Bool(true), restored["vortx.cinema.quickView"])
+        assertEquals(restored, SettingsBackup.settingsFromBlob(blobFromDomain(choices)))
+        assertTrue(SettingsBackup.plistSettingsFrom(mapOf("vortx.mergeHomeDiscover" to "false", "vortx.cinema.quickView" to 1)).isEmpty())
+        assertFalse(SettingsBackup.plistSettingsFrom(emptyMap<String, Any>()).containsKey("vortx.mergeHomeDiscover"))
+    }
+
+    @Test
     fun homeRailsPreserveOrderedAppleArraysThroughAccountAndFileBackup() {
         val order = listOf("addon:second", "continue", "future:unknown", "addon:first")
         val values = mapOf<String, Any>(

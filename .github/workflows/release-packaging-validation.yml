@@ -70,6 +70,9 @@ jobs:
           yes | sdkmanager "ndk;27.2.12479018"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
+      - name: Prove native defaults and explicit comparison selection
+        run: bash scripts/test-android-native-selection.sh
+
       - name: Exercise signer parsing and strict verification fixtures
         run: |
           bash scripts/test-android-release-signing.sh
@@ -266,12 +269,12 @@ jobs:
 
       - name: Fetch MPVKit-DVFEL artifacts (public release asset, sha256-verified)
         env:
-          MPVKIT_ARTIFACTS_SHA256: "6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1"
+          MPVKIT_ARTIFACTS_SHA256: "737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1"
         run: |
           set -euo pipefail
           DEST="app/Vendor/MPVKit-DVFEL"
           curl -sfL --retry 3 -o "$RUNNER_TEMP/mpvkit.zip" \
-            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-1/mpvkit-dvfel-artifacts.zip"
+            "https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip"
           ACTUAL="$(shasum -a 256 "$RUNNER_TEMP/mpvkit.zip" | cut -d' ' -f1)"
           if [ "$ACTUAL" != "$MPVKIT_ARTIFACTS_SHA256" ]; then
             echo "::error::MPVKit artifact checksum mismatch: expected $MPVKIT_ARTIFACTS_SHA256 got $ACTUAL"
@@ -279,6 +282,7 @@ jobs:
           fi
           rm -rf "$DEST/artifacts"
           unzip -q "$RUNNER_TEMP/mpvkit.zip" -d "$DEST"
+          bash scripts/verify-mpvkit-dvfel-artifacts.sh "$DEST"
 
       - name: Generate CI-only stub engine xcframeworks
         run: |

@@ -7,41 +7,57 @@ package com.vortx.android.integrations
  * holding [mutationLock], then publication rechecks the generation while holding that same lock. Sign-out
  * advances the generation before clearing durable state, so an older response can never restore credentials.
  */
-internal class CredentialMutationCoordinator {
+internal class CredentialMutationCoordinator(private val nativeKeys: Set<String>? = null) {
     private val mutationLock = Any()
     private var generation = 0L
 
     fun operation(): Operation = synchronized(mutationLock) {
-        Operation(generation)
+        Operation(generation, nativeKeys?.let { runCatching { NativeProviderAccess.capture(it) {}?.first }.getOrNull() })
     }
 
     fun <T> snapshot(read: () -> T): CredentialOperationSnapshot<T> =
         synchronized(mutationLock) {
-            CredentialOperationSnapshot(Operation(generation), read())
+            if (nativeKeys == null) CredentialOperationSnapshot(Operation(generation, null), read())
+            else runCatching { NativeProviderAccess.capture(requireNotNull(nativeKeys), read) }.getOrNull()?.let { (guard, value) ->
+                CredentialOperationSnapshot(Operation(generation, guard), value)
+            } ?: CredentialOperationSnapshot(Operation(generation, null), read())
         }
 
     fun invalidate(mutation: () -> Unit) {
         synchronized(mutationLock) {
             generation += 1
-            mutation()
+            if (nativeKeys == null) mutation()
+            else check(NativeProviderAccess.capture(nativeKeys, mutation) != null) { "Provider account unavailable" }
         }
     }
 
     internal inner class Operation internal constructor(
         private val expectedGeneration: Long,
+        private val nativeGuard: NativeProviderAccess.Guard?,
     ) {
         fun isCurrent(): Boolean = synchronized(mutationLock) {
-            generation == expectedGeneration
+            generation == expectedGeneration && (nativeKeys == null || nativeGuard?.let { runCatching { NativeProviderAccess.current(it) }.getOrDefault(false) } == true)
         }
 
         fun <T> mutate(mutation: () -> T): CredentialMutationResult<T> =
             synchronized(mutationLock) {
                 if (generation != expectedGeneration) {
                     CredentialMutationResult.Stale
+                } else if (nativeKeys != null) {
+                    nativeGuard?.let { guard -> NativeProviderAccess.guarded(guard) { CredentialMutationResult.Applied(mutation()) } }
+                        ?: CredentialMutationResult.Stale
                 } else {
                     CredentialMutationResult.Applied(mutation())
                 }
             }
+
+        /** Only a read after acquiring the provider's single-flight mutex may reuse a peer winner. */
+        fun <T> readCurrentOwner(read: () -> T): CredentialMutationResult<T> = synchronized(mutationLock) {
+            if (generation != expectedGeneration) CredentialMutationResult.Stale
+            else if (nativeKeys == null) CredentialMutationResult.Applied(read())
+            else nativeGuard?.let { guard -> NativeProviderAccess.readCurrentOwner(guard) { CredentialMutationResult.Applied(read()) } }
+                ?: CredentialMutationResult.Stale
+        }
 
         suspend fun <T, R> publishAfter(
             awaitValue: suspend () -> T,

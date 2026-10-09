@@ -4,6 +4,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -99,7 +100,6 @@ import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.prefs.TabSlot
 import com.vortx.android.ui.prefs.isVisible
-import com.vortx.android.ui.prefs.resolveSelected
 import com.vortx.android.ui.screens.AccountScreen
 import com.vortx.android.ui.screens.AddonPairingScreen
 import com.vortx.android.ui.screens.AddonStoreScreen
@@ -108,6 +108,8 @@ import com.vortx.android.ui.screens.AppearanceScreen
 import com.vortx.android.stats.WatchStatsScreen
 import com.vortx.android.ui.screens.BackupRestoreScreen
 import com.vortx.android.ui.screens.CustomizeHomeScreen
+import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.screens.CinemaQuickViewScreen
 import com.vortx.android.ui.screens.DebridKeysScreen
 import com.vortx.android.ui.screens.DebridLibraryScreen
 import com.vortx.android.ui.screens.DetailScreen
@@ -115,6 +117,8 @@ import com.vortx.android.ui.screens.DiscoverScreen
 import com.vortx.android.ui.screens.DownloadQueueScreen
 import com.vortx.android.ui.screens.DownloadsScreen
 import com.vortx.android.ui.screens.HomeDiscoverSettingsScreen
+import com.vortx.android.ui.screens.HomeCatalogBrowseScreen
+import com.vortx.android.ui.screens.HomeCatalogSnapshotBrowseScreen
 import com.vortx.android.ui.screens.HomeScreen
 import com.vortx.android.ui.screens.IntegrationsScreen
 import com.vortx.android.ui.screens.LiveScreen
@@ -124,6 +128,7 @@ import com.vortx.android.ui.screens.MediaServersScreen
 import com.vortx.android.ui.screens.MergedDiscoverSearchScreen
 import com.vortx.android.ui.screens.MetadataKeysScreen
 import com.vortx.android.ui.screens.PosterStyleScreen
+import com.vortx.android.ui.screens.PreviouslyWatchedScreen
 import com.vortx.android.ui.screens.PlaybackSettingsScreen
 import com.vortx.android.ui.screens.ProfilesScreen
 import com.vortx.android.ui.screens.SearchScreen
@@ -139,6 +144,7 @@ import com.vortx.android.ui.screens.ConfiguredNzbIndexerSettingsScreen
 import com.vortx.android.ui.screens.UnifiedSignInScreen
 import com.vortx.android.ui.screens.WhatsNewScreen
 import com.vortx.android.ui.screens.WhosWatchingScreen
+import com.vortx.android.ui.screens.WatchlistScreen
 import com.vortx.android.sync.AccountLibrarySync
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.theme.VortXIcons
@@ -153,7 +159,10 @@ import com.vortx.android.ui.viewmodel.AddonsViewModel
 import com.vortx.android.ui.viewmodel.DetailViewModel
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.HomeViewModel
+import com.vortx.android.ui.viewmodel.HomeCatalogBrowseViewModel
+import com.vortx.android.ui.viewmodel.HomeCatalogTarget
 import com.vortx.android.ui.viewmodel.LibraryViewModel
+import com.vortx.android.ui.viewmodel.LibraryLandingViewModel
 import com.vortx.android.ui.viewmodel.Playback
 import com.vortx.android.ui.viewmodel.SearchViewModel
 import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
@@ -166,6 +175,9 @@ import kotlinx.coroutines.launch
 /// Auto-add fires at ~60s of playback, matching Apple's `d >= 60` at PlayerScreen.swift:972 and
 /// TVPlayerView.swift:810. Expressed in ms because Android reports position in ms.
 private const val AUTO_ADD_AFTER_MS = 60_000L
+
+/** One-shot resume intent; type + id prevent an old card tap from arming a colliding later Detail route. */
+private data class DirectResumeTarget(val type: MediaType, val id: String)
 
 internal fun detailViewModelKey(
     prefix: String,
@@ -262,16 +274,43 @@ fun VortXApp(
         ) {
             // WHY audit R02: save enum identity, not ordinal, so shell selection survives process death safely.
             var savedTabName by rememberSaveable { mutableStateOf(Tab.HOME.name) }
-            val tab = Tab.entries.firstOrNull { it.name == savedTabName } ?: Tab.HOME
+            var savedHomeModeName by rememberSaveable { mutableStateOf(CinemaHomeMode.FEATURED.name) }
+            val requestedTab = Tab.entries.firstOrNull { it.name == savedTabName } ?: Tab.HOME
+            val requestedHomeMode = CinemaHomeMode.entries.firstOrNull { it.name == savedHomeModeName } ?: CinemaHomeMode.FEATURED
             // SD-2: the combined Discover+Search surface folds Search into Discover, so the standalone
             // Search tab is dropped from the bar while the pref is on (Apple `visibleTabs`).
             val homeDiscoverPrefs = remember(appContext) { HomeDiscoverPreferences(appContext) }
             var mergeDiscoverSearch by remember { mutableStateOf(homeDiscoverPrefs.mergeDiscoverSearch) }
-            val visibleTabs = Tab.entries.filter {
-                hiddenTabs.isVisible(it.slot) && !(mergeDiscoverSearch && it == Tab.SEARCH)
+            var mergeHomeDiscover by remember { mutableStateOf(homeDiscoverPrefs.mergeHomeDiscover) }
+            var cinemaQuickView by remember { mutableStateOf(homeDiscoverPrefs.cinemaQuickView) }
+            val route = cinemaTabRoute(requestedTab.slot, requestedHomeMode, hiddenTabs, mergeHomeDiscover, mergeDiscoverSearch)
+            val tab = Tab.entries.first { it.slot == route.tab }
+            val homeMode = route.homeMode
+            val visibleSlots = cinemaVisibleTabs(hiddenTabs, mergeHomeDiscover, mergeDiscoverSearch)
+            val visibleTabs = Tab.entries.filter { it.slot in visibleSlots }
+            DisposableEffect(homeDiscoverPrefs) {
+                val stop = homeDiscoverPrefs.observeChanges {
+                    val nextHomeMerge = homeDiscoverPrefs.mergeHomeDiscover
+                    if (nextHomeMerge != mergeHomeDiscover) {
+                        val currentRoute = cinemaTabRoute(
+                            Tab.entries.firstOrNull { it.name == savedTabName }?.slot ?: TabSlot.HOME,
+                            CinemaHomeMode.entries.firstOrNull { it.name == savedHomeModeName } ?: CinemaHomeMode.FEATURED,
+                            tabBarPrefs.state.value, mergeHomeDiscover, mergeDiscoverSearch,
+                        )
+                        val nextRoute = cinemaRouteAfterHomeMergeChange(currentRoute, nextHomeMerge,
+                            homeDiscoverPrefs.mergeDiscoverSearch, tabBarPrefs.state.value)
+                        savedTabName = Tab.entries.first { it.slot == nextRoute.tab }.name
+                        savedHomeModeName = nextRoute.homeMode.name
+                    }
+                    mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+                    mergeHomeDiscover = nextHomeMerge
+                    cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
+                }
+                onDispose { stop() }
             }
-            LaunchedEffect(tab, hiddenTabs) {
-                if (hiddenTabs.resolveSelected(tab.slot) != tab.slot) savedTabName = Tab.HOME.name
+            LaunchedEffect(route) {
+                savedTabName = tab.name
+                savedHomeModeName = homeMode.name
             }
         // WHY audit R02: save only the stable route strings, then rehydrate through the deep-link target hook.
         var savedDetailId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -279,6 +318,9 @@ fun VortXApp(
         var savedDetailEpisodeSeason by rememberSaveable { mutableStateOf<Int?>(null) }
         var savedDetailEpisodeNumber by rememberSaveable { mutableStateOf<Int?>(null) }
         var savedDetailEpisodeIdentity by rememberSaveable { mutableStateOf<String?>(null) }
+        var liveDetailEpisode by remember { mutableStateOf<PreferredEpisode?>(null) }
+        var liveDetailAdmission by remember { mutableStateOf<com.vortx.android.home.ContinueWatchingAdmission?>(null) }
+        var unavailableContinueWatching by remember { mutableStateOf<String?>(null) }
         val savedDetailPreferredEpisode = remember(
             savedDetailEpisodeSeason,
             savedDetailEpisodeNumber,
@@ -294,25 +336,44 @@ fun VortXApp(
                 null
             }
         }
-        val detail = remember(savedDetailId, savedDetailType, savedDetailPreferredEpisode) {
+        val detail = remember(savedDetailId, savedDetailType, savedDetailPreferredEpisode, liveDetailEpisode, liveDetailAdmission) {
             val restoredType = MediaType.entries.firstOrNull { it.id == savedDetailType }
             if (restoredType != null && !savedDetailId.isNullOrEmpty()) {
                 VortXDeepLink(restoredType, savedDetailId!!).toMetaItem().copy(
-                    preferredEpisode = savedDetailPreferredEpisode,
+                    preferredEpisode = liveDetailEpisode ?: savedDetailPreferredEpisode,
+                    continueWatchingAdmission = liveDetailAdmission,
                 )
             } else {
                 null
             }
         }
-        val openDetail: (MetaItem?) -> Unit = { item ->
+        var pendingDirectResumeTarget by remember { mutableStateOf<DirectResumeTarget?>(null) }
+        val openDetail: (MetaItem?) -> Unit = open@{ item ->
+            if (item?.continueWatchingAdmission?.isCurrent() == false) return@open
+            if (item?.continueWatchingUnavailableMessage != null) {
+                unavailableContinueWatching = "${item.name}\n\n${item.continueWatchingUnavailableMessage}"
+                return@open
+            }
+            // Every ordinary Detail route revokes any previous one-shot direct-resume request. Direct
+            // Continue Watching callers install their exact target immediately after opening it.
+            pendingDirectResumeTarget = null
             savedDetailId = item?.id
             savedDetailType = item?.type?.id
-            savedDetailEpisodeSeason = item?.preferredEpisode?.season
-            savedDetailEpisodeNumber = item?.preferredEpisode?.episode
-            savedDetailEpisodeIdentity = item?.preferredEpisode?.videoIdentity
+            liveDetailAdmission = item?.continueWatchingAdmission
+            liveDetailEpisode = item?.preferredEpisode.takeIf { liveDetailAdmission != null }
+            // Remote hints are session-only. Activity restoration preserves the ordinary title route,
+            // but neither its hint nor the capability can be restored without the original authority.
+            val saveableHint = com.vortx.android.home.saveableContinueWatchingEpisode(item?.preferredEpisode, liveDetailAdmission)
+            savedDetailEpisodeSeason = saveableHint?.season
+            savedDetailEpisodeNumber = saveableHint?.episode
+            savedDetailEpisodeIdentity = saveableHint?.videoIdentity
+        }
+        unavailableContinueWatching?.let { message ->
+            androidx.compose.material3.AlertDialog(onDismissRequest = { unavailableContinueWatching = null },
+                title = { Text("Continue Watching") }, text = { Text(message) },
+                confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { Text("OK") } })
         }
         var detailGeneration by remember { mutableStateOf(0L) }
-        var pendingDirectResumeId by remember { mutableStateOf<String?>(null) }
         var playing by remember { mutableStateOf<Playable?>(null) }
         // Session-only route chosen on Detail. It rides source retries and episode advances inside the same
         // player, but every non-detail launch below explicitly resets it to Automatic. No preference store is
@@ -334,7 +395,7 @@ fun VortXApp(
         val autoAdvanceStreak = remember { intArrayOf(0) }
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
             detail?.let {
-                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch"
+                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch:${it.continueWatchingAdmission?.let(System::identityHashCode)}"
             } ?: "no-detail:$detailSourceEpoch",
         )
         // The catalog meta of the title currently in [playing], captured at the moment play starts. This is
@@ -356,6 +417,12 @@ fun VortXApp(
         var showIntegrations by remember { mutableStateOf(false) }
         var showMediaServers by remember { mutableStateOf(false) }
         var showDownloads by remember { mutableStateOf(false) }
+        var showWatchlist by remember { mutableStateOf(false) }
+        var showPreviouslyWatched by remember { mutableStateOf(false) }
+        var catalogBrowseTarget by remember { mutableStateOf<HomeCatalogTarget?>(null) }
+        var catalogBrowseIsClientRail by remember { mutableStateOf(false) }
+        var quickViewItem by remember { mutableStateOf<MetaItem?>(null) }
+        var quickWatchIdentity by remember { mutableStateOf<String?>(null) }
         // Nested under Downloads: the queue manager (reorder / concurrency / storage). Checked BEFORE the
         // showDownloads overlay so it renders on top, and cleared on Back to reveal Downloads underneath.
         var showDownloadQueue by remember { mutableStateOf(false) }
@@ -392,11 +459,10 @@ fun VortXApp(
         // selection to Discover -- or Home if Discover itself is hidden -- exactly like Apple's
         // `.onChange(of: mergeDiscoverSearch)` healer.
         LaunchedEffect(showHomeDiscover) {
-            if (!showHomeDiscover) mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
-        }
-        LaunchedEffect(mergeDiscoverSearch, tab) {
-            if (mergeDiscoverSearch && tab == Tab.SEARCH) {
-                savedTabName = if (hiddenTabs.isVisible(TabSlot.DISCOVER)) Tab.DISCOVER.name else Tab.HOME.name
+            if (!showHomeDiscover) {
+                mergeDiscoverSearch = homeDiscoverPrefs.mergeDiscoverSearch
+                mergeHomeDiscover = homeDiscoverPrefs.mergeHomeDiscover
+                cinemaQuickView = homeDiscoverPrefs.cinemaQuickView
             }
         }
         // SD-6: per-tab re-tap tokens. The shell bumps one when the ALREADY-active tab is re-tapped, and the
@@ -417,6 +483,11 @@ fun VortXApp(
             showIntegrations = false
             showMediaServers = false
             showDownloads = false
+            showWatchlist = false
+            showPreviouslyWatched = false
+            catalogBrowseTarget = null
+            quickViewItem = null
+            quickWatchIdentity = null
             showDownloadQueue = false
             showPlayback = false
             showSources = false
@@ -444,6 +515,13 @@ fun VortXApp(
         val onItem: (MetaItem) -> Unit = {
             detailGeneration += 1
             openDetail(it)
+        }
+        val onCinemaItem: (MetaItem) -> Unit = { item ->
+            if (com.vortx.android.ui.components.cinemaCardOpensQuickView(item, cinemaQuickView)) {
+                quickViewItem = item
+            } else {
+                onItem(item)
+            }
         }
         // A scope tied to the whole shell (not the player overlay), so the end-of-playback engine write
         // (final progress tick + Player unload) still runs after the player leaves composition.
@@ -528,6 +606,7 @@ fun VortXApp(
             TabBarScreen(
                 prefs = tabBarPrefs,
                 onBack = { showTabBar = false },
+                mergeHomeDiscover = mergeHomeDiscover,
             )
             return@VortXTheme
         }
@@ -642,6 +721,7 @@ fun VortXApp(
                                 showForNext.id,
                                 showForNext.name,
                                 showForNext.preferredEpisode,
+                                showForNext.continueWatchingAdmission,
                             ),
                             appContext = appContext,
                         ),
@@ -1073,6 +1153,36 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        if (showWatchlist) {
+            BackHandler { showWatchlist = false }
+            WatchlistScreen(
+                store = com.vortx.android.library.WatchlistStore.shared(appContext),
+                onBack = { showWatchlist = false },
+                onItem = { item ->
+                    showWatchlist = false
+                    onItem(item)
+                },
+            )
+            return@VortXTheme
+        }
+
+        if (showPreviouslyWatched) {
+            BackHandler { showPreviouslyWatched = false }
+            val historyVm: LibraryLandingViewModel = viewModel(
+                key = "library-history",
+                factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext),
+            )
+            PreviouslyWatchedScreen(
+                viewModel = historyVm,
+                onBack = { showPreviouslyWatched = false },
+                onItem = { item ->
+                    showPreviouslyWatched = false
+                    onItem(item)
+                },
+            )
+            return@VortXTheme
+        }
+
         if (showPlayback) {
             // Settings > Playback: device-scoped player preferences. Self-contained like the two above
             // (reads and writes the shared `vortx_settings` SharedPreferences the engines already read at
@@ -1218,6 +1328,62 @@ fun VortXApp(
             return@VortXTheme
         }
 
+        quickViewItem?.let { item ->
+            BackHandler { quickViewItem = null }
+            CinemaQuickViewScreen(
+                item = item,
+                watchlistStore = com.vortx.android.library.WatchlistStore.shared(appContext),
+                onClose = { quickViewItem = null },
+                onWatch = {
+                    quickWatchIdentity = "${item.type.id}:${item.id}"
+                    quickViewItem = null
+                    catalogBrowseTarget = null
+                    onItem(item)
+                },
+                onDetails = {
+                    quickViewItem = null
+                    catalogBrowseTarget = null
+                    onItem(item)
+                },
+            )
+            return@VortXTheme
+        }
+
+        // Home's "See all" grid is a first-class touch route, backed by the same Home board row rather
+        // than a second provider request. It sits above the shell and below detail so opening a tile can
+        // transfer cleanly into the established detail route.
+        catalogBrowseTarget?.let { target ->
+            BackHandler { catalogBrowseTarget = null }
+            val onBrowseItem: (MetaItem) -> Unit = { item ->
+                if (target.id != "continue" && com.vortx.android.ui.components.cinemaCardOpensQuickView(item, cinemaQuickView)) {
+                    quickViewItem = item
+                } else {
+                    catalogBrowseTarget = null
+                    onItem(item)
+                }
+            }
+            if (catalogBrowseIsClientRail) {
+                HomeCatalogSnapshotBrowseScreen(
+                    viewModel = viewModel<HomeViewModel>(factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext)),
+                    target = target,
+                    onBack = { catalogBrowseTarget = null },
+                    onItem = onBrowseItem,
+                )
+                return@VortXTheme
+            }
+            val catalogVm: HomeCatalogBrowseViewModel = viewModel(
+                key = "home-catalog-${target.id}",
+                factory = HomeCatalogBrowseViewModel.Creator(repo, target),
+            )
+            HomeCatalogBrowseScreen(
+                viewModel = catalogVm,
+                title = target.title,
+                onBack = { catalogBrowseTarget = null },
+                onItem = onBrowseItem,
+            )
+            return@VortXTheme
+        }
+
         val current = detail
         if (current != null) {
             // The generation boundary deliberately tears down DetailScreen's local person/nested-title
@@ -1242,13 +1408,18 @@ fun VortXApp(
                             current.id,
                             current.name,
                             current.preferredEpisode,
+                            current.continueWatchingAdmission,
                         ),
                         appContext = appContext,
                     ),
                 )
-                LaunchedEffect(detailVm, pendingDirectResumeId) {
-                    if (pendingDirectResumeId == current.id && detailVm.playLastStream()) {
-                        pendingDirectResumeId = null
+                LaunchedEffect(detailVm, pendingDirectResumeTarget) {
+                    val target = pendingDirectResumeTarget
+                    if (target?.type == current.type && target.id == current.id) {
+                        // One attempt only. Cross-device history frequently has no local exact source;
+                        // that case remains a normal Detail screen and must never arm a later visit.
+                        detailVm.playLastStream()
+                        pendingDirectResumeTarget = null
                     }
                 }
                 // System Back closes the detail overlay back to the browse shell. Composed BEFORE
@@ -1268,15 +1439,19 @@ fun VortXApp(
                     // DetailScreen supplies the successfully loaded MetaDetail, not the provisional
                     // deep-link MetaItem. This keeps auto-add title/poster truth tied to engine metadata.
                     onPlay = { playable, loadedMeta, requestedEngine ->
-                        playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
-                            requested = requestedEngine,
-                            playable = playable,
-                            mpvAvailable = MpvEngineFactory.isBundled,
-                        )
-                        playingMeta = loadedMeta
-                        playing = playable
-                        autoAdvanceStreak[0] = 0
+                        if (detailVm.isRouteAdmissionCurrent()) {
+                            playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                                requested = requestedEngine,
+                                playable = playable,
+                                mpvAvailable = MpvEngineFactory.isBundled,
+                            )
+                            playingMeta = loadedMeta
+                            playing = playable
+                            autoAdvanceStreak[0] = 0
+                        } else playable.playbackLease?.close()
                     },
+                    autoWatch = quickWatchIdentity == "${current.type.id}:${current.id}",
+                    onAutoWatchConsumed = { quickWatchIdentity = null },
                 )
             }
             return@VortXTheme
@@ -1284,6 +1459,9 @@ fun VortXApp(
 
         val factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext)
         val authState by accountVm.authState.collectAsStateWithLifecycle()
+        BackHandler(enabled = mergeHomeDiscover && tab == Tab.HOME && homeMode == CinemaHomeMode.BROWSE) {
+            savedHomeModeName = CinemaHomeMode.FEATURED.name
+        }
         Scaffold(
             topBar = {
                 // The top bar reads as VortX glass: the stock opaque Material3 container is made transparent
@@ -1318,6 +1496,7 @@ fun VortXApp(
                                     when (t) {
                                         Tab.SEARCH -> searchReselect++
                                         Tab.DISCOVER -> discoverReselect++
+                                        Tab.HOME -> if (homeMode == CinemaHomeMode.BROWSE) discoverReselect++
                                         else -> Unit
                                     }
                                 } else {
@@ -1340,49 +1519,89 @@ fun VortXApp(
             // `account.isSignedIn || vortxSync.isSignedIn` gate. Signed out, both show a sign-in prompt.
             val accountSignedIn = authState is AuthState.SignedIn ||
                 vortxSessionUi is VortXSyncManager.SessionUiState.SignedIn
-            when (tab) {
-                Tab.HOME -> HomeScreen(
-                    viewModel = viewModel<HomeViewModel>(factory = factory),
-                    onItem = onItem,
-                    modifier = content,
-                    onDirectResume = { item ->
-                        pendingDirectResumeId = item.id
-                        detailGeneration += 1
-                        openDetail(item)
-                    },
-                )
-                Tab.DISCOVER -> if (mergeDiscoverSearch) {
-                    // SD-2: the combined surface hosts both the Discover browse and the folded-in Search.
+            val browseContent: @Composable (Modifier) -> Unit = { browseModifier ->
+                if (mergeDiscoverSearch) {
                     MergedDiscoverSearchScreen(
                         discoverViewModel = viewModel<DiscoverViewModel>(factory = factory),
                         searchViewModel = viewModel<SearchViewModel>(factory = factory),
-                        onItem = onItem,
-                        modifier = content,
+                        onItem = onCinemaItem,
+                        modifier = browseModifier,
                         signedIn = accountSignedIn,
                         hideLive = hiddenTabs.hideLive,
                         reselectSignal = discoverReselect,
                         quickActions = {
-                            PlayLinkEntry(
-                                onClick = { showPlayLink = true },
-                                onDebridLibraryClick = { showDebridLibrary = true },
-                            )
+                            PlayLinkEntry(onClick = { showPlayLink = true }, onDebridLibraryClick = { showDebridLibrary = true })
                         },
                     )
                 } else {
                     DiscoverScreen(
-                        viewModel<DiscoverViewModel>(factory = factory),
-                        onItem,
-                        content,
+                        viewModel = viewModel<DiscoverViewModel>(factory = factory),
+                        onItem = onCinemaItem,
+                        modifier = browseModifier,
                         signedIn = accountSignedIn,
                         hideLive = hiddenTabs.hideLive,
                         reselectSignal = discoverReselect,
                     )
                 }
+            }
+            when (tab) {
+                Tab.HOME -> Column(content.fillMaxSize()) {
+                    if (mergeHomeDiscover && !hiddenTabs.hideDiscover) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                                .padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
+                            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                        ) {
+                            Chip("Featured", homeMode == CinemaHomeMode.FEATURED, onClick = { savedHomeModeName = CinemaHomeMode.FEATURED.name })
+                            Chip("Browse", homeMode == CinemaHomeMode.BROWSE, onClick = { savedHomeModeName = CinemaHomeMode.BROWSE.name })
+                        }
+                    }
+                    if (mergeHomeDiscover && homeMode == CinemaHomeMode.BROWSE) {
+                        browseContent(Modifier.weight(1f))
+                    } else {
+                        HomeScreen(
+                            viewModel = viewModel<HomeViewModel>(factory = factory),
+                            onItem = onItem,
+                            modifier = Modifier.weight(1f),
+                            onDirectResume = { item ->
+                                openDetail(item)
+                                pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
+                                detailGeneration += 1
+                            },
+                            onDiscover = if (hiddenTabs.hideDiscover) null else {
+                                {
+                                    if (mergeHomeDiscover) savedHomeModeName = CinemaHomeMode.BROWSE.name
+                                    else savedTabName = Tab.DISCOVER.name
+                                }
+                            },
+                            onBrowseCatalog = { catalog ->
+                                catalogBrowseIsClientRail = catalog.engineIndex == null
+                                catalogBrowseTarget = HomeCatalogTarget(catalog.id, catalog.title)
+                            },
+                            onCatalogItem = onCinemaItem,
+                            onQuickView = { item -> quickViewItem = item },
+                        )
+                    }
+                }
+                Tab.DISCOVER -> browseContent(content)
                 Tab.LIVE -> LiveScreen(viewModel<LiveViewModel>(factory = factory), onItem, content)
-                Tab.LIBRARY -> LibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem, content)
+                Tab.LIBRARY -> LibraryScreen(
+                    viewModel = viewModel<LibraryViewModel>(factory = factory),
+                    landingViewModel = viewModel<LibraryLandingViewModel>(key = "library-history", factory = factory),
+                    onItem = onCinemaItem,
+                    modifier = content,
+                    onDirectResume = { item ->
+                        openDetail(item)
+                        pendingDirectResumeTarget = DirectResumeTarget(item.type, item.id)
+                        detailGeneration += 1
+                    },
+                    onDownloads = { showDownloads = true },
+                    onWatchlist = { showWatchlist = true },
+                    onPreviouslyWatched = { showPreviouslyWatched = true },
+                )
                 Tab.SEARCH -> SearchScreen(
                     viewModel<SearchViewModel>(factory = factory),
-                    onItem,
+                    onCinemaItem,
                     content,
                     signedIn = accountSignedIn,
                     reselectSignal = searchReselect,

@@ -317,7 +317,6 @@ internal val traktSyncToggles: List<SyncToggle> = listOf(
     SyncToggle("Import watched history", "Show titles watched on Trakt as watched here.", ScrobbleService.KEY_TRAKT_IMPORT_WATCHED, false),
     SyncToggle("Sync ratings", "Mirror ratings you give to Trakt.", ScrobbleService.KEY_TRAKT_RATINGS, true),
     SyncToggle("Sync watchlist", "Mirror your Library to your Trakt watchlist.", ScrobbleService.KEY_TRAKT_WATCHLIST, true),
-    SyncToggle("Continue Watching from Trakt", "Show a separate, read-only row from Trakt's paused list.", ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false),
     SyncToggle("Check-in action", "Offer an I'm watching this action on detail pages.", ScrobbleService.KEY_TRAKT_CHECKIN, false),
 )
 

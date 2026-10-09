@@ -103,6 +103,27 @@ final class AddonHealthStore: ObservableObject {
     }
 }
 
+/// Add-ons use the compact settings-card treatment on a phone and the wider Cinema Glass card preset on
+/// iPad/Mac. Keeping this switch in one modifier changes only presentation; all action rows remain live.
+private struct AddonSurfaceModifier: ViewModifier {
+    let wide: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if wide {
+            content.vortxCinemaCard()
+        } else {
+            content.vortxSettingsCard()
+        }
+    }
+}
+
+private extension View {
+    func addonSurface(wide: Bool) -> some View {
+        modifier(AddonSurfaceModifier(wide: wide))
+    }
+}
+
 /// Add-ons installed on your account, read live from the engine. Install one by its manifest URL,
 /// or remove a non-default add-on here. Changes sync to your account and to the official apps when mirroring
 /// is enabled; a Change URL is an atomic engine replacement that retains its priority slot.
@@ -112,6 +133,9 @@ struct AddonsView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore
+    #if !os(tvOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
     @ObservedObject private var health = AddonHealthStore.shared
     @State private var newAddonURL = ""
     @State private var installing = false
@@ -125,10 +149,28 @@ struct AddonsView: View {
     // signal to re-run orderedByApplied; without it the new order showed only on the next cold launch.
     @ObservedObject private var orderObserver = AddonOrderObserver.shared
 
+    private var usesWideAddonLayout: Bool {
+        #if os(tvOS)
+        return false
+        #elseif os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
+
+    private var usesCompactAddonLayout: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return !usesWideAddonLayout
+        #endif
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                VStack(alignment: .leading, spacing: usesCompactAddonLayout ? Theme.Space.md : Theme.Space.lg) {
                     // Read the shared order revision so a reorder (in-app drag or remote pull) re-runs body and
                     // re-sorts the ForEach below via orderedByApplied. Must be READ in body to be tracked.
                     let _ = orderObserver.revision
@@ -136,8 +178,13 @@ struct AddonsView: View {
                     if !(account.isSignedIn || vortxSync.isSignedIn) {
                         hint("Sign in to manage your add-ons. They sync across your devices and the official apps.")
                     } else {
-                        installSection
-                        discoverLink
+                        if profiles.activeSharesMainAddons {
+                            ProfileAddonInheritanceControls()
+                            hint("Add-ons are installed on Main. Visibility and ranking can be customized for \(profiles.active?.name ?? "this profile").")
+                        } else {
+                            installSection
+                            discoverLink
+                        }
                         if core.addons.isEmpty {
                             hint("No add-ons yet. Paste an add-on's manifest URL above to install one.")
                         } else {
@@ -149,22 +196,18 @@ struct AddonsView: View {
                                     Spacer()
                                     Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
                                 }
-                                .padding(Theme.Space.md)
+                                .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 // glass-Browse: this nav row is bespoke chrome, not routed through a shared
                                 // row style, so it flips straight to the settings-card glass preset in place
                                 // of the flat surface1 fill (same throughout this file: install/discover/
                                 // reorder rows, the add-on card).
-                                .vortxSettingsCard()
+                                .addonSurface(wide: usesWideAddonLayout)
                             }
                             // tvOS: `.plain` left the system focus platter on over this settings-card row. See ChipButtonStyle.
                             .vortxCardButton()
-                            // Reorder add-ons into the order you want. The order is the PRIORITY spine (which
-                            // add-on's catalogs and sources come first) and syncs to the dashboard + your
-                            // other devices via doc.addonOrder, the same order the dashboard drag writes.
-                            // iOS / Mac use a touch/pointer drag List; tvOS lacks that drag, so it gets a
-                            // focus-based move-up / move-down screen instead - BOTH write THROUGH the same
-                            // canonical `applyInAppAddonOrder`, so there is no per-platform ordering shadow.
+                            // Both drag and remote-button reorder go through the same profile boundary:
+                            // Main edits account order; a shared profile writes only its personal ranking.
                             if core.addons.count > 1 {
                                 NavigationLink {
                                     #if os(tvOS)
@@ -180,9 +223,9 @@ struct AddonsView: View {
                                         Spacer()
                                         Image(systemName: "chevron.right").foregroundStyle(Theme.Palette.textTertiary)
                                     }
-                                    .padding(Theme.Space.md)
+                                    .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .vortxSettingsCard()
+                                    .addonSurface(wide: usesWideAddonLayout)
                                 }
                                 // tvOS: `.plain` leaves the system focus platter on over a settings-card row
                                 // (see ChipButtonStyle); use the shared card-button treatment like the Discover
@@ -193,7 +236,9 @@ struct AddonsView: View {
                                 .buttonStyle(.plain)
                                 #endif
                             }
-                            hint("Tap the eye to turn an add-on off for \(profiles.active?.name ?? "this profile") only. It stays installed on your account and stays on for your other profiles.")
+                            hint(profiles.activeSharesMainAddons
+                                 ? "Tap the eye to customize visibility for this profile. Main's installed add-ons stay unchanged."
+                                 : "Tap the eye to choose visibility. Profiles following Main inherit these choices.")
                             HStack {
                                 // tvOS: keep the button LEFT-aligned so it sits directly above the first
                                 // add-on row (also left-aligned) and a Down press lands on that row. Right-
@@ -214,16 +259,24 @@ struct AddonsView: View {
                                 Spacer()
                                 #endif
                             }
-                            ForEach(VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })) { addon in addonRow(addon) }
+                            ForEach(Array(VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl }).enumerated()), id: \.element.id) { index, addon in
+                                addonRow(addon, position: index + 1)
+                            }
                         }
                     }
                 }
-                .padding(.horizontal, Theme.Space.screenInset)
-                .padding(.vertical, Theme.Space.xl)
+                .padding(.horizontal, usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.screenInset)
+                .padding(.vertical, usesCompactAddonLayout ? Theme.Space.md : Theme.Space.xl)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: usesWideAddonLayout ? 1120 : .infinity, alignment: .center)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
+            .onChange(of: profiles.activeID) { _ in
+                addonSheet = nil
+                showPairing = false
+                showUpdateConfirm = false
+            }
             .sheet(item: $addonSheet) { sheet in
                 switch sheet {
                 case .configure(let a): ConfigureAddonView(addon: a)
@@ -269,7 +322,7 @@ struct AddonsView: View {
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .vortxSettingsCard()
+        .addonSurface(wide: usesWideAddonLayout)
     }
 
     private var discoverLink: some View {
@@ -283,7 +336,7 @@ struct AddonsView: View {
             }
             .padding(Theme.Space.md)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .vortxSettingsCard()
+            .addonSurface(wide: usesWideAddonLayout)
         }
         // tvOS: `.plain` left the system focus platter on over this settings-card row. See ChipButtonStyle.
         .vortxCardButton()
@@ -332,7 +385,8 @@ struct AddonsView: View {
         let symbol = addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill"
         let tint = isOff ? Theme.Palette.textTertiary
                          : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary)
-        AddonLogoIcon(logo: addon.manifest.logo, symbol: symbol, tint: tint, isOff: isOff)
+        AddonLogoIcon(logo: addon.manifest.logo, symbol: symbol, tint: tint, isOff: isOff,
+                      size: usesCompactAddonLayout ? 44 : 56)
     }
 
     /// Add-on logo, DOWNSAMPLED via PosterImageLoader (maxPixel 168 = the 56pt @3x on-screen size) instead of
@@ -346,6 +400,7 @@ struct AddonsView: View {
         let symbol: String
         let tint: Color
         let isOff: Bool
+        let size: CGFloat
         @State private var image: VXPosterImage?
 
         private var warmCache: VXPosterImage? {
@@ -360,10 +415,10 @@ struct AddonsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card / 2, style: .continuous))
                         .opacity(isOff ? 0.5 : 1)
                 } else {
-                    Image(systemName: symbol).font(.system(size: 36)).foregroundStyle(tint)
+                    Image(systemName: symbol).font(.system(size: size * 0.6)).foregroundStyle(tint)
                 }
             }
-            .frame(width: 56, height: 56)
+            .frame(width: size, height: size)
             .task(id: logo) {
                 guard image == nil, let logo, !logo.isEmpty else { return }
                 // 168px = 56pt @3x: only the on-screen size ever sits in memory, never a 1000px+ full-res logo.
@@ -380,16 +435,25 @@ struct AddonsView: View {
         }
     }
 
-    private func addonRow(_ addon: CoreDescriptor) -> some View {
+    private func addonRow(_ addon: CoreDescriptor, position: Int? = nil) -> some View {
         let isOff = profiles.isAddonDisabledForActive(base: addon.transportUrl)
         // Layout regression fix: previously icon + text + up-to-4 action chips all shared ONE HStack, so on a
         // narrow phone the fixed-width chips squeezed the text column toward zero width, forcing the name /
         // detail to wrap one glyph per line and clipping at the edges. Split into a top INFO row (icon + text
         // that always claims the full width) and a separate action row below that flows horizontally.
         return VStack(alignment: .leading, spacing: Theme.Space.sm) {
-            HStack(alignment: .top, spacing: Theme.Space.md) {
+            HStack(alignment: .top, spacing: usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md) {
+                #if !os(tvOS)
+                if let position {
+                    Text("\(position)")
+                        .font(Theme.Typography.eyebrow)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                        .frame(width: usesCompactAddonLayout ? 20 : 28, alignment: .leading)
+                        .accessibilityLabel("Add-on position \(position)")
+                }
+                #endif
                 addonIcon(addon, isOff: isOff)
-                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                VStack(alignment: .leading, spacing: usesCompactAddonLayout ? 3 : Theme.Space.xs) {
                     Text(addon.manifest.name).font(Theme.Typography.cardTitle)
                         .foregroundStyle(isOff ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
                         .fixedSize(horizontal: false, vertical: true)   // wrap by word, never by glyph
@@ -408,9 +472,9 @@ struct AddonsView: View {
             }
             addonActions(addon, isOff: isOff)
         }
-        .padding(Theme.Space.md)
+        .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .vortxSettingsCard()
+        .addonSurface(wide: usesWideAddonLayout)
     }
 
     /// The add-on's action chips, in their own row beneath the info so they never steal width from the name /
@@ -432,7 +496,7 @@ struct AddonsView: View {
     @ViewBuilder private func addonActionChips(_ addon: CoreDescriptor, isOff: Bool) -> some View {
         // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
         // regardless of protected state; protected defaults are not configurable anyway.
-        if addon.isConfigurable {
+        if addon.isConfigurable && !profiles.activeSharesMainAddons {
             Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 .fixedSize()
@@ -440,18 +504,23 @@ struct AddonsView: View {
         if !addon.isProtected {
             // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
             // URL first, then removes the old, so a bad URL never leaves you with neither.
-            Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
-                .buttonStyle(ChipButtonStyle(selected: false))
-                .fixedSize()
+            if !profiles.activeSharesMainAddons {
+                Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .fixedSize()
+            }
             // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
             Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
                 Image(systemName: isOff ? "eye.slash" : "eye")
             }
             .buttonStyle(ChipButtonStyle(selected: !isOff))
             .fixedSize()
-            Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
-                .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
-                .fixedSize()
+            .accessibilityLabel(isOff ? "Show \(addon.manifest.name) for this profile" : "Hide \(addon.manifest.name) for this profile")
+            if !profiles.activeSharesMainAddons {
+                Button { core.uninstallAddon(addon) } label: { Label("Remove", systemImage: "trash") }
+                    .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                    .fixedSize()
+            }
         }
     }
 
@@ -464,19 +533,85 @@ struct AddonsView: View {
     }
 }
 
+/// The same explicit inheritance controls are available with touch, pointer and the TV remote.
+private struct ProfileAddonInheritanceControls: View {
+    @EnvironmentObject private var profiles: ProfileStore
+    #if !os(tvOS)
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #endif
+    var showsVisibility = true
+
+    private var usesWideAddonLayout: Bool {
+        #if os(tvOS)
+        return false
+        #elseif os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
+
+    private var usesCompactAddonLayout: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return !usesWideAddonLayout
+        #endif
+    }
+
+    var body: some View {
+        if profiles.activeSharesMainAddons {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                if showsVisibility {
+                    preferenceRow("Visibility", inherited: profiles.activeInheritsAddonVisibility,
+                                  customize: profiles.customizeAddonVisibility,
+                                  reset: profiles.resetAddonVisibilityToMain)
+                }
+                preferenceRow("Ranking and order", inherited: profiles.activeInheritsAddonRanking,
+                              customize: profiles.customizeAddonRanking,
+                              reset: profiles.resetAddonRankingToMain)
+            }
+            .padding(usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.md)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .addonSurface(wide: usesWideAddonLayout)
+        }
+    }
+
+    private func preferenceRow(_ title: String, inherited: Bool,
+                               customize: @escaping () -> Void, reset: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Text(title).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            Text(inherited ? "Following Main" : "Custom for this profile")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            Button(inherited ? "Customize \(title.lowercased())" : "Reset \(title.lowercased()) to Main",
+                   action: inherited ? customize : reset)
+                .buttonStyle(ChipButtonStyle(selected: !inherited))
+        }
+    }
+}
+
 #if !os(tvOS)
-/// Drag the installed add-ons into your preferred PRIORITY order (which add-on's catalogs and sources come
-/// first). Each drop writes `VortXSyncManager.appliedAddonOrder` and pushes it immediately, so the order
-/// syncs to the dashboard and your other devices via doc.addonOrder - the same order the dashboard drag
-/// writes. iOS forces edit mode on; macOS reorders by native row drag. iOS / Mac only (tvOS lacks the drag).
+/// iOS/iPad/Mac drag editor. Shared profiles create a personal ranking; Main keeps account order.
 struct AddonReorderView: View {
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ObservedObject private var orderObserver = AddonOrderObserver.shared   // re-seed on a remote reorder
     @State private var ordered: [CoreDescriptor] = []
+    @State private var editorProfileID: UUID?
+
+    private var usesWideAddonLayout: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
 
     var body: some View {
         List {
+            ProfileAddonInheritanceControls(showsVisibility: false)
             ForEach(ordered) { addon in
                 HStack(spacing: Theme.Space.md) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -492,14 +627,20 @@ struct AddonReorderView: View {
                     Spacer()
                     Image(systemName: "line.3.horizontal").foregroundStyle(Theme.Palette.textTertiary)
                 }
-                .padding(.vertical, 4)
-                .listRowBackground(Color.clear.vortxGlassListRow(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)))
+                .padding(.vertical, usesWideAddonLayout ? Theme.Space.sm : 4)
+                .listRowBackground(Color.clear.vortxGlassListRow(
+                    in: RoundedRectangle(cornerRadius: usesWideAddonLayout ? Theme.Radius.card + 4 : Theme.Radius.control,
+                                         style: .continuous)))
                 .listRowSeparator(.hidden)
             }
             .onMove(perform: move)
         }
         .scrollContentBackground(.hidden)
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .listRowInsets(EdgeInsets(top: usesWideAddonLayout ? Theme.Space.sm : Theme.Space.xs,
+                                  leading: usesWideAddonLayout ? Theme.Space.md : Theme.Space.sm,
+                                  bottom: usesWideAddonLayout ? Theme.Space.sm : Theme.Space.xs,
+                                  trailing: usesWideAddonLayout ? Theme.Space.md : Theme.Space.sm))
         #if os(iOS)
         .navigationTitle("Reorder Add-ons")
         .navigationBarTitleDisplayMode(.inline)
@@ -507,6 +648,7 @@ struct AddonReorderView: View {
         #endif
         .macBackAffordance()
         .onAppear { reload() }
+        .onChange(of: profiles.activeID) { _ in reload() }
         .onChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds the list
         .onChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local drag
     }
@@ -514,49 +656,38 @@ struct AddonReorderView: View {
     /// Re-seed from the live add-on set in the currently-applied order. Preserves the user's order and folds
     /// in any add-on installed since (appended at the end by orderedByApplied).
     private func reload() {
+        editorProfileID = profiles.activeID
         ordered = VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })
     }
 
     private func move(from source: IndexSet, to destination: Int) {
+        guard let editorProfileID, editorProfileID == profiles.activeID else { reload(); return }
         ordered.move(fromOffsets: source, toOffset: destination)
-        VortXSyncManager.shared.applyInAppAddonOrder(ordered.map { $0.transportUrl })
+        profiles.setAddonOrder(ordered.map { $0.transportUrl }, for: editorProfileID)
     }
 }
 #endif
 
 #if os(tvOS)
-/// tvOS installed-add-on reorder - parity with the iOS / Mac drag-reorder (`AddonReorderView`), which tvOS
-/// excluded because it has no touch/pointer drag. Each add-on row carries two FOCUSABLE, remote-native
-/// controls (Move up / Move down), and every move writes THROUGH THE SAME canonical persisted order the iOS
-/// drag uses - `VortXSyncManager.shared.applyInAppAddonOrder` - which persists the ACCOUNT-scoped
-/// `appliedAddonOrder`, posts the live re-sort note, AND pushes to the account so the dashboard + your other
-/// devices converge via doc.addonOrder. There is deliberately NO tvOS-only display shadow / UserDefaults
-/// leak: the ONE order every surface reads (`orderedByApplied`, `CoreDetail.meta`) is exactly the one this
-/// screen writes, scoped identically to iOS (the account doc is the source of truth; the local key is reset
-/// on sign-out with the rest of the account state).
-///
-/// WHAT THE ORDER DRIVES: `appliedAddonOrder` is the priority spine consulted by `CoreMetaDetails.meta`
-/// (CoreModels.swift, the #144 detail-provider pick - the earliest add-on in the applied order whose meta is
-/// ready wins) and by every add-on list's `orderedByApplied`. Reordering here therefore changes which add-on's
-/// metadata resolves first and the add-on list order, on tvOS exactly as on iOS - non-destructively: it never
-/// calls push_addons_to_api, never touches the protected Cinemeta[0] semantics, and never rewrites the
-/// engine's add-on collection order (a reorder never touches `profile.addons`).
-///
-/// The move + focus math lives in `AddonReorderMove` (asserted by `AddonReorderOrderTests` on the real code):
-/// focus FOLLOWS the moved add-on so holding Move up keeps it climbing, and never lands on a control that
-/// just went disabled at an edge.
+/// TV remote editor uses the same profile-owned mutation as the drag editor. The pure
+/// AddonReorderMove helper keeps focus on the moved add-on's still-enabled control.
 struct AddonReorderTVView: View {
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @ObservedObject private var orderObserver = AddonOrderObserver.shared   // re-seed on a remote reorder
     @State private var ordered: [CoreDescriptor] = []
+    @State private var editorProfileID: UUID?
     @FocusState private var focused: AddonReorderMove.Control?
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 Text("Reorder add-ons").screenTitleStyle()
-                Text("Move an add-on up or down to set which add-on's catalogs and metadata come first. The order syncs to your other devices and the dashboard.")
+                ProfileAddonInheritanceControls(showsVisibility: false)
+                Text(profiles.activeSharesMainAddons
+                     ? "Move an add-on up or down to customize this profile's ranking. Main's order stays unchanged."
+                     : "Move an add-on up or down to set its priority. Profiles following Main inherit this order.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
                     .frame(maxWidth: 820, alignment: .leading)
@@ -571,6 +702,7 @@ struct AddonReorderTVView: View {
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { reload() }
+        .onChange(of: profiles.activeID) { _ in reload() }
         .onChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds
         .onChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local move
     }
@@ -614,25 +746,20 @@ struct AddonReorderTVView: View {
     /// Re-seed from the live add-on set in the currently-applied order. Preserves the user's order and folds
     /// in any add-on installed since (appended at the end by `orderedByApplied`).
     private func reload() {
+        editorProfileID = profiles.activeID
         ordered = VortXSyncManager.orderedByApplied(core.addons, url: { $0.transportUrl })
     }
 
-    /// Move the add-on one step via the pure `AddonReorderMove` helper, apply the new order, persist THROUGH
-    /// the canonical account-scoped store (the same call the iOS drag makes), and follow focus to the add-on's
-    /// still-enabled control.
+    /// Move through the profile boundary and follow focus to the still-enabled control.
     private func move(_ addon: CoreDescriptor, by delta: Int) {
+        guard let editorProfileID, editorProfileID == profiles.activeID else { reload(); return }
         let keys = ordered.map { $0.transportUrl }
         guard let result = AddonReorderMove.move(keys, key: addon.transportUrl, by: delta) else { return }
         // Re-derive the descriptor list from the helper's authoritative new key order (a single neighbor swap).
         let byUrl = Dictionary(ordered.map { ($0.transportUrl, $0) }, uniquingKeysWith: { a, _ in a })
         ordered = result.order.compactMap { byUrl[$0] }
-        // The ONE canonical write - same call the iOS drag makes: persists the account-scoped appliedAddonOrder,
-        // posts the live re-sort note (AddonOrderObserver → the add-on list re-sorts), and pushes to the account
-        // immediately so the dashboard + iOS / Mac converge via doc.addonOrder.
-        VortXSyncManager.shared.applyInAppAddonOrder(ordered.map { $0.transportUrl })
-        // Instrumentation: the persisted priority spine that CoreDetail.meta + orderedByApplied read for real
-        // add-on / metadata resolution now reflects the move. Grep `[addon] tvOS reorder` to see it drive order.
-        NSLog("[addon] tvOS reorder: applied order now %@", VortXSyncManager.appliedAddonOrder.joined(separator: " > "))
+        // A secondary writes its roster override; Main writes its account order.
+        profiles.setAddonOrder(ordered.map { $0.transportUrl }, for: editorProfileID)
         focused = result.focus
     }
 }

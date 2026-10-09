@@ -1,5 +1,9 @@
 package com.vortx.android.stats
 
+import com.vortx.android.BuildConfig
+import com.vortx.android.data.CatalogRepository
+import com.vortx.android.engine.NativeCatalogRepository
+import com.vortx.android.engine.NativeWatchStatsSnapshot
 import com.vortx.android.engine.EngineActions
 import com.vortx.android.engine.EngineState
 import com.vortx.android.engine.StremioCoreNative
@@ -29,6 +33,7 @@ data class WatchStatsUiState(
     val availableYears: List<Int> = emptyList(),
     /** null = all time; otherwise a specific calendar year. */
     val selectedYear: Int? = null,
+    val error: String? = null,
 )
 
 /**
@@ -56,7 +61,8 @@ data class WatchStatsUiState(
  * catalog / detail state the engine currently holds. Everything is fail-soft: a missing / unreadable
  * bucket contributes nothing rather than crashing.
  */
-class WatchStatsModel(private val storageDir: File) {
+class WatchStatsModel(private val storageDir: File, private val repository: CatalogRepository? = null,
+                      private val nativeEnabled: Boolean = BuildConfig.NATIVE_ENGINE_ENABLED) {
 
     private val _state = MutableStateFlow(WatchStatsUiState())
     val state = _state.asStateFlow()
@@ -66,6 +72,7 @@ class WatchStatsModel(private val storageDir: File) {
 
     /** metaId -> genres, joined from the engine's in-memory catalog / detail state. */
     private var genresByID: Map<String, List<String>> = emptyMap()
+    private var nativeSnapshot: NativeWatchStatsSnapshot? = null
 
     /**
      * Read the active profile's watch history (read only) and compute stats. Safe to call repeatedly; it
@@ -74,6 +81,17 @@ class WatchStatsModel(private val storageDir: File) {
      */
     suspend fun load() = withContext(Dispatchers.IO) {
         _state.update { it.copy(isLoading = true) }
+        if (nativeEnabled) {
+            try {
+                val native = checkNotNull(repository as? NativeCatalogRepository) { "Native stats repository unavailable" }
+                val snapshot = native.watchStatsSnapshot()
+                native.withWatchStatsSnapshot(snapshot) {
+                    nativeSnapshot = snapshot; records = snapshot.records; genresByID = snapshot.genres
+                    _state.update { it.copy(error = null) }; finishLoad()
+                }
+            } catch (_: Exception) { nativeUnavailable() }
+            return@withContext
+        }
         val genres = buildGenreIndex()
         val store = ProfileStore.sharedOrNull()
         // Default to the engine path when the store is not up yet (pre-init), mirroring Apple's
@@ -87,9 +105,23 @@ class WatchStatsModel(private val storageDir: File) {
 
     /** Switch the scope. Pure + in-memory (never re-reads the buckets), so it is cheap to call on the main thread. */
     fun selectYear(year: Int?) {
+        if (nativeEnabled) {
+            try {
+                val native = checkNotNull(repository as? NativeCatalogRepository)
+                native.withWatchStatsSnapshot(checkNotNull(nativeSnapshot)) {
+                    _state.update { it.copy(selectedYear = year) }; recompute()
+                }
+            } catch (_: Exception) { nativeUnavailable() }
+            return
+        }
         if (year == _state.value.selectedYear) return
         _state.update { it.copy(selectedYear = year) }
         recompute()
+    }
+
+    private fun nativeUnavailable() {
+        records = emptyList(); genresByID = emptyMap(); nativeSnapshot = null
+        _state.value = WatchStatsUiState(isLoading = false, error = "Native watch history is unavailable for the current account.")
     }
 
     /** Common tail of both load paths: derive the scope years and compute the selected scope. */

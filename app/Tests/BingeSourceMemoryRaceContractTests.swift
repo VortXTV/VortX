@@ -181,10 +181,10 @@ enum SourcePreferences {
     static var reading: SourcePrefsReading { stub }
 }
 
-struct ResolvedPin: Equatable, Sendable {}
+struct ResolvedPin: Equatable, Sendable { var addon: String? = nil }
 
 enum SourcePinStore {
-    static func matches(_ s: CoreStream, addon: String, pin: ResolvedPin) -> Bool { false }
+    static func matches(_ s: CoreStream, addon: String, pin: ResolvedPin) -> Bool { addon == pin.addon }
 }
 
 enum ProviderHealth {
@@ -206,7 +206,11 @@ enum TrackPreferences {
     }
 }
 
-enum ProfileStore { static func activeIsKids() -> Bool { false } }
+enum ProfileStore {
+    static func activeIsKids() -> Bool { false }
+    static func activeDisabledAddons() -> Set<String> { [] }
+    static func activeAddonOrder(accountOrder: [String]) -> [String] { accountOrder }
+}
 
 // MARK: - Assertion harness
 
@@ -259,6 +263,38 @@ private func settledOld(_ groups: [CoreStreamSourceGroup], loaded: Int, total: I
 enum BingeSourceMemoryRaceContractTests {
     static func main() async {
         SourcePreferences.stub = StubPrefs()   // default order: debrid first (torrents NOT ranked first)
+
+        let french = stream(#"{"url":"https://cdn.invalid/french.mkv","name":"Naruto 1080p French","behaviorHints":{"bingeGroup":"pack"}}"#)
+        let english = stream(#"{"url":"https://cdn.invalid/english.mkv","name":"Naruto 720p English"}"#)
+        let dual = stream(#"{"url":"https://cdn.invalid/dual.mkv","name":"Naruto 1080p Dual Audio"}"#)
+        let unknown = stream(#"{"url":"https://cdn.invalid/unknown.mkv","name":"Naruto 720p WEB"}"#)
+        let isoFrench = stream(#"{"url":"https://cdn.invalid/fre.mkv","name":"Naruto 1080p FRE"}"#)
+        let preference = (addon: Optional("Chosen"), bingeGroup: Optional("pack"))
+        for addonOrder in [false, true] {
+            SourcePreferences.stub.useAddonOrder = addonOrder
+            for alternative in [english, dual, unknown] {
+                let groups = [group("Chosen", [french]), group("Alternate", [alternative])]
+                let rank = StreamRanking.rankedCandidates(groups, continuity: nil,
+                    pin: ResolvedPin(addon: "Chosen"), sticky: preference,
+                    preserveChosenRelease: true, desiredAudioLanguage: "eng")
+                expect(rank.first?.id == alternative.id, "binge language precedes release/addon/pin, addonOrder=\(addonOrder)")
+                expect(rank.last?.id == french.id, "known-foreign fallback remains exhaustible")
+                expect(StreamRanking.best(groups, continuity: nil, pin: ResolvedPin(addon: "Chosen"),
+                    sticky: preference, preserveChosenRelease: true, desiredAudioLanguage: "en")?.id == rank.first?.id,
+                    "prepare and advance have the same language-compatible winner")
+                expect(StreamRanking.best(groups, continuity: nil, pin: ResolvedPin(addon: "Chosen"),
+                    sticky: preference)?.id == french.id, "fresh and explicit saved-pin selection remains unchanged")
+            }
+        }
+        SourcePreferences.stub = StubPrefs()
+        expect(StreamRanking.continuityLanguageMismatch(isoFrench, desired: "en"), "ISO FRE is a positive foreign audio claim")
+        let frenchWithEnglishSubs = stream(#"{"url":"https://cdn.invalid/subs.mkv","name":"Naruto 1080p French English Subtitles"}"#)
+        expect(StreamRanking.continuityLanguageMismatch(frenchWithEnglishSubs, desired: "en"), "English subtitles cannot satisfy English audio")
+        expect(!StreamRanking.continuityLanguageMismatch(french, desired: "fra"), "viewer-selected French remains valid")
+        expect(!StreamRanking.continuityLanguageMismatch(unknown, desired: "en"), "unknown language is never rejected from metadata")
+        expect(StreamRanking.rankedCandidates([group("Chosen", [french])], continuity: nil,
+            sticky: preference, preserveChosenRelease: true, desiredAudioLanguage: "en").first?.id == french.id,
+            "all-foreign set still resolves for actual-inventory validation")
 
         // Sanity on the fixtures themselves (proves the real CoreStream decode + classification we rely on).
         expect(cometDirect1080.playableURL != nil && !cometDirect1080.isTorrent && !cometDirect1080.isYouTubeTrailer,
@@ -400,16 +436,20 @@ enum BingeSourceMemoryRaceContractTests {
         ]
         let callerSource = callerPaths.compactMap { try? String(contentsOfFile: $0, encoding: .utf8) }
             .joined(separator: "\n")
-        expect(callerSource.components(separatedBy: "secondsSinceRequestStart:").count - 1 == 7,
+        expect(callerSource.components(separatedBy: "secondsSinceRequestStart:").count - 1 == 8,
                "caller clock: every raw settle call passes request-start elapsed time")
         expect(!callerSource.contains("secondsSinceFirstPlayable"),
                "caller clock: no production raw settle loop retains the first-playable reset")
-        expect(callerSource.components(separatedBy: "let settlementStartedAt = Date()").count - 1 == 6,
-               "caller clock: all six raw requests own an absolute settlement start")
+        let dateStarts = callerSource.components(separatedBy: "let settlementStartedAt = Date()").count - 1
+        let ownedBudgetStarts = callerSource.components(separatedBy: "let elapsed = resolutionBudget.elapsed(").count - 1
+        expect(dateStarts + ownedBudgetStarts == 5 && ownedBudgetStarts == 3
+               && callerSource.contains("slotPolicy.settlementStartedAt"),
+               "caller clock: raw requests and batch slot own an absolute settlement start")
         let directDeadlineBreaks = callerSource.components(
             separatedBy: "if elapsed >= StreamRanking.completeSetDeadline { break }"
         ).count - 1
-        expect(directDeadlineBreaks == 5 && callerSource.contains("if deadlineReached { break }"),
+        expect(directDeadlineBreaks == 4 && callerSource.contains("if deadlineReached { break }")
+               && callerSource.contains("now - slotPolicy.startedAt >= slotPolicy.maximumDuration"),
                "caller clock: every raw loop hard-stops on the same twenty-second request deadline")
 
         print(failures == 0 ? "\nALL PASS" : "\n\(failures) FAILURE(S)")

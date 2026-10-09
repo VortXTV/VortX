@@ -77,7 +77,12 @@ fun HomeScreen(
     onItem: (MetaItem) -> Unit,
     modifier: Modifier = Modifier,
     onDirectResume: (MetaItem) -> Unit = onItem,
+    onDiscover: (() -> Unit)? = null,
+    onBrowseCatalog: ((Catalog) -> Unit)? = null,
+    onCatalogItem: ((MetaItem) -> Unit)? = null,
+    onQuickView: ((MetaItem) -> Unit)? = null,
 ) {
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) { viewModel.refreshContinueWatchingOnFocus() }
     val state by viewModel.state.collectAsStateWithLifecycle()
     val collections by viewModel.collections.collectAsStateWithLifecycle()
     val collectionBrowse by viewModel.collectionBrowse.collectAsStateWithLifecycle()
@@ -119,6 +124,10 @@ fun HomeScreen(
                     hubHidden,
                     onItem,
                     onDirectResume,
+                    onDiscover,
+                    onBrowseCatalog,
+                    onCatalogItem,
+                    onQuickView,
                     lastStreamStore,
                     viewModel,
                     modifier,
@@ -135,18 +144,23 @@ private fun HomeContent(
     hubHidden: Boolean,
     onItem: (MetaItem) -> Unit,
     onDirectResume: (MetaItem) -> Unit,
+    onDiscover: (() -> Unit)?,
+    onBrowseCatalog: ((Catalog) -> Unit)?,
+    onCatalogItem: ((MetaItem) -> Unit)?,
+    onQuickView: ((MetaItem) -> Unit)?,
     lastStreamStore: LastStreamStore,
     viewModel: HomeViewModel,
     modifier: Modifier,
 ) {
     val visibleCatalogs = remember(catalogs) { normalizeHomeCatalogs(catalogs) }
     // The hub is not a catalog, so the hero candidate pool is unaffected by it.
-    val heroCatalog = visibleCatalogs.firstOrNull()
-    val heroCandidates = remember(visibleCatalogs) { PhoneHeroPolicy.candidates(visibleCatalogs) }
+    val heroCatalogs = remember(visibleCatalogs) { com.vortx.android.home.continueWatchingHeroCatalogs(visibleCatalogs) }
+    val heroCatalog = heroCatalogs.firstOrNull()
+    val heroCandidates = remember(heroCatalogs) { PhoneHeroPolicy.candidates(heroCatalogs) }
     val initialHero = heroCandidates.firstOrNull()
     val savedStream = initialHero?.let { lastStreamStore.load() }
     // WHY audit R01: direct resume belongs only to the first Continue Watching hero, never ordinary cards.
-    val heroCanDirectResume = heroCatalog?.id == "continue" && initialHero != null && savedStream?.let {
+    val heroCanDirectResume = heroCatalog?.id == "continue" && !heroCatalog.readOnly && initialHero != null && savedStream?.let {
         it.mediaId == initialHero.id && it.mediaType == initialHero.type && it.positionMs > 0L
     } == true
     val hubShown = collections.isVisible && !hubHidden
@@ -166,13 +180,27 @@ private fun HomeContent(
         contentPadding = PaddingValues(bottom = VortXTheme.spacing.xl),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xl),
     ) {
+        // A single explicit doorway keeps Home and Discover connected without duplicating Discover's
+        // filters or creating a second navigation owner. It is optional for callers such as previews.
+        onDiscover?.let { discover ->
+            item {
+                TextButton(
+                    onClick = discover,
+                    modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+                ) { Text("Browse Discover") }
+            }
+        }
         if (initialHero != null) {
             item {
                 PhoneHeroHeader(
                     candidates = heroCandidates,
-                    onItem = onItem,
+                    onItem = { item ->
+                        if (item.continueWatchingPermit == null || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
+                    },
                     // Direct resume remains an affordance only for the leading Continue Watching title.
-                    onDirectResume = onDirectResume.takeIf { heroCanDirectResume },
+                    onDirectResume = ({ item: MetaItem ->
+                        if (viewModel.isContinueWatchingTapCurrent(item)) onDirectResume(item)
+                    }).takeIf { heroCanDirectResume },
                     directResumeIdentity = initialHero.let(PhoneHeroPolicy::identity).takeIf { heroCanDirectResume },
                 )
             }
@@ -197,7 +225,17 @@ private fun HomeContent(
                     }
                     PosterRail(
                         catalog = catalog,
-                        onItem = onItem,
+                        // Only ordinary catalog taps are redirected to the optional Quick View. Continue
+                        // Watching keeps its established direct-detail/resume behavior and long-press menu.
+                        onItem = { item ->
+                            when {
+                                catalog.id == "continue" && !viewModel.isContinueWatchingTapCurrent(item) -> Unit
+                                catalog.id == "continue" && catalog.readOnly -> onItem(item)
+                                catalog.id == "continue" -> onDirectResume(item)
+                                onCatalogItem != null -> onCatalogItem(item)
+                                else -> onItem(item)
+                            }
+                        },
                         onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
                         eyebrow = eyebrow,
                         onEndReached = if (catalog.hasNextPage) {
@@ -205,6 +243,10 @@ private fun HomeContent(
                         } else {
                             null
                         },
+                        // Engine/CW rows retain repository paging; client rails open their published Home
+                        // projection. Every shelf therefore has a complete grid without a duplicate fetch.
+                        onSeeAll = onBrowseCatalog?.let { browse -> { browse(catalog) } },
+                        onQuickView = onQuickView,
                     )
                 }
             }
@@ -399,6 +441,7 @@ private fun PhoneHeroHeader(
  */
 @Composable
 private fun rememberPhoneEnrichedHeroItem(item: MetaItem, generation: Long): MetaItem {
+    if (!com.vortx.android.home.continueWatchingMayUseGenericEnrichment(item)) return seedPhoneHeroBackdrop(item)
     val context = LocalContext.current.applicationContext
     val itemIdentity = PhoneHeroPolicy.identity(item)
     val request = PhoneHeroRequest(itemIdentity, generation)

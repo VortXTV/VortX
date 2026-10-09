@@ -134,6 +134,25 @@ enum SubtitleStyle {
             || FileManager.default.fileExists(atPath: res + "/NotoSansCJK.otf")
     }
 
+    /// mpv's back color is also its shadow color; color alone cannot enable a subtitle box.
+    /// Always overwrite the border mode and margin/offset so live changes cannot retain the old style.
+    static func mpvBackgroundOptions(background: String, font: String) -> [(String, String)] {
+        switch background {
+        case "shaded", "box":
+            return [
+                ("sub-border-style", "background-box"),
+                ("sub-back-color", background == "box" ? "#FF000000" : "#80000000"),
+                ("sub-shadow-offset", "2"), // background-box uses this as its padding, not a shadow.
+            ]
+        default:
+            return [
+                ("sub-border-style", "outline-and-shadow"),
+                ("sub-back-color", font == "modern" ? "#80000000" : "#00000000"),
+                ("sub-shadow-offset", font == "modern" ? "2" : "0"),
+            ]
+        }
+    }
+
     /// mpv option/property name → value pairs realizing the current style. Applied both at player
     /// setup (as options, before init) and live (as properties). Every option that differs between
     /// font styles appears in both branches, so a live switch fully overwrites the previous one.
@@ -157,18 +176,10 @@ enum SubtitleStyle {
         if fontId == "modern" {
             // Thin outline plus a soft offset shadow carries the contrast instead of a heavy border.
             opts.append(("sub-border-size", "2"))
-            opts.append(("sub-shadow-offset", "2"))
-            opts.append(("sub-shadow-color", "#80000000"))
         } else {
             opts.append(("sub-border-size", "3"))
-            opts.append(("sub-shadow-offset", "0"))
-            opts.append(("sub-shadow-color", "#00000000"))
         }
-        switch backgroundId {
-        case "shaded": opts.append(("sub-back-color", "#80000000"))   // ~50% black box
-        case "box":    opts.append(("sub-back-color", "#FF000000"))   // opaque black box
-        default:       opts.append(("sub-back-color", "#00000000"))   // outline only (transparent)
-        }
+        opts.append(contentsOf: mpvBackgroundOptions(background: backgroundId, font: fontId))
         return opts
     }
 }

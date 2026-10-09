@@ -10,6 +10,22 @@ import org.junit.Test
 
 class WatchOverlayStoreContinueWatchingTest {
     @Test
+    fun completeOverlayProjectionDoesNotTruncateBeforeSelectedWindow() {
+        val prefs = preferences()
+        val now = java.time.Instant.parse("2026-10-09T00:00:00Z").toEpochMilli()
+        val entries = (0 until 125).associate { index -> "tt${1000000 + index}" to WatchEntry(
+            timeOffsetMs = 1_000, durationMs = 10_000, lastWatched = java.time.Instant.ofEpochMilli(now - index * 1000L).toString(),
+            name = "Overlay $index", type = "movie") }
+        prefs.edit().putString(WatchOverlayStore.cacheKey(UserProfile.normalizeId("overlay")), WatchEntry.encodeMap(entries)).commit()
+        val store = WatchOverlayStore(prefs, scope = TestScope())
+        store.activate("overlay", usesEngineHistory = false)
+        val actual = store.continueWatching()
+        assertEquals(125, actual.size)
+        assertEquals(100, com.vortx.android.home.boundContinueWatching(actual, com.vortx.android.home.ContinueWatchingWindow.ITEMS_100, now).size)
+        assertEquals(125, com.vortx.android.home.boundContinueWatching(actual, com.vortx.android.home.ContinueWatchingWindow.LAST_90_DAYS, now).size)
+    }
+
+    @Test
     fun terminalWatchedCommitFailureProducesNoDurableExactVideo() {
         val store = WatchOverlayStore(preferences(commitSucceeds = false), scope = TestScope())
         store.activate("overlay", usesEngineHistory = false)

@@ -4,10 +4,13 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -19,6 +22,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -80,6 +85,26 @@ fun BoxScope.PosterArt(
     }
 }
 
+/** Wide Cinema art with a readable poster inset when the provider supplied only portrait artwork. */
+@Composable
+fun BoxScope.CinemaLandscapeArt(item: MetaItem) {
+    val artwork = cinemaLandscapeArtwork(item)
+    if (artwork == null) {
+        DefaultPosterArt(item.name)
+    } else {
+        AsyncImage(model = artwork, contentDescription = null, contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize())
+    }
+    Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.45f)))))
+    if (item.background.isNullOrBlank() && !item.poster.isNullOrBlank()) {
+        AsyncImage(model = item.poster, contentDescription = null, contentScale = ContentScale.Fit,
+            modifier = Modifier.align(Alignment.Center).fillMaxHeight().aspectRatio(2f / 3f))
+    }
+    item.resumeLabel?.let { label ->
+        Badge(label, modifier = Modifier.align(Alignment.BottomEnd).padding(8.dp))
+    }
+}
+
 /// Eyebrow kicker + section title, the shared header for every rail (DESIGN-SYSTEM.md §2 typography
 /// "eyebrow"/"section title" roles) — the same two-line editorial header the tvOS `RailHeader` uses,
 /// so rows read with hierarchy, not a flat list of titles.
@@ -97,6 +122,9 @@ fun RailHeader(title: String, eyebrow: String? = null, modifier: Modifier = Modi
 /// "continue" is the CW rail, everything else is an add-on catalog row).
 private const val CONTINUE_WATCHING_ROW_ID = "continue"
 
+internal fun showEmptyCatalogContinuation(catalog: Catalog, nativeMode: Boolean = com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED): Boolean =
+    nativeMode && catalog.hasNextPage && catalog.items.isEmpty()
+
 internal fun posterMenuFor(catalog: Catalog): PosterCardMenu = when {
     catalog.readOnly -> PosterCardMenu.NONE
     catalog.id == CONTINUE_WATCHING_ROW_ID -> PosterCardMenu.CONTINUE_WATCHING
@@ -112,6 +140,8 @@ fun PosterRail(
     onRemoveFromContinueWatching: ((MetaItem) -> Unit)? = null,
     eyebrow: String? = null,
     onEndReached: (() -> Unit)? = null,
+    onSeeAll: (() -> Unit)? = null,
+    onQuickView: ((MetaItem) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     // Poster width preset (item 5): the rail card width follows the user's Poster Style choice (default
@@ -119,10 +149,27 @@ fun PosterRail(
     // localized-metadata resolve (item 9), a cheap no-op for English / when the feature is off.
     val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
     LaunchedEffect(catalog.items) {
-        LocalizedMetadataStore.resolve(catalog.items.map { it.id })
+        if (!catalog.readOnly) LocalizedMetadataStore.resolve(catalog.items.map { it.id })
     }
     Column(modifier = modifier) {
-        RailHeader(title = catalog.title, eyebrow = eyebrow)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            RailHeader(title = catalog.title, eyebrow = eyebrow, modifier = Modifier.weight(1f))
+            onSeeAll?.let { seeAll ->
+                androidx.compose.material3.TextButton(
+                    onClick = seeAll,
+                    modifier = Modifier.padding(end = VortXTheme.spacing.edge),
+                ) { androidx.compose.material3.Text("See all") }
+            }
+        }
+        catalog.statusMessage?.let { message ->
+            androidx.compose.material3.Text(message, style = VortXTheme.type.label,
+                modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge))
+        }
+        if (onEndReached != null && showEmptyCatalogContinuation(catalog)) {
+            androidx.compose.material3.TextButton(onClick = onEndReached, modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
+                androidx.compose.material3.Text("Continue catalog")
+            }
+        }
         LazyRow(contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge)) {
             itemsIndexed(catalog.items, key = { _, item -> "${item.type.name}|${item.id}" }) { index, item ->
                 if (onEndReached != null && index == catalog.items.lastIndex) {
@@ -131,9 +178,10 @@ fun PosterRail(
                     }
                 }
                 val menu = posterMenuFor(catalog)
+                val continueWatching = catalog.id == CONTINUE_WATCHING_ROW_ID
                 PosterCard(
                     title = item.name,
-                    subtitle = item.caption ?: listOfNotNull(item.year, item.type.label).joinToString(" · "),
+                    subtitle = item.continueWatchingUnavailableMessage ?: cinemaCardFacts(item),
                     onClick = { onItem(item) },
                     // Continue Watching items carry a watched fraction; the card draws its accent
                     // progress track for them (null on plain catalog items = no track).
@@ -145,8 +193,16 @@ fun PosterRail(
                     onRemoveFromContinueWatching = if (
                         menu == PosterCardMenu.CONTINUE_WATCHING && onRemoveFromContinueWatching != null
                     ) ({ onRemoveFromContinueWatching(item) }) else null,
-                    art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
-                    modifier = Modifier.width(posterStyle.width.compactWidth).padding(end = VortXTheme.spacing.sm),
+                    onQuickView = onQuickView?.let { quickView -> { quickView(item) } },
+                    art = {
+                        if (continueWatching) CinemaLandscapeArt(item)
+                        else PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
+                    },
+                    cinema = true,
+                    landscape = true.takeIf { continueWatching },
+                    reserveLabelSpace = continueWatching,
+                    modifier = Modifier.width(if (continueWatching) maxOf(240.dp, posterStyle.width.compactWidth) else posterStyle.width.compactWidth)
+                        .padding(end = VortXTheme.spacing.sm),
                 )
             }
         }

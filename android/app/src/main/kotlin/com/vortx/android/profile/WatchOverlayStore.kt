@@ -64,7 +64,7 @@ class WatchOverlayStore(
     // ---- Continue Watching / Library derivation ----
 
     /**
-     * Continue Watching for the active overlay profile, newest first, capped at 30. Mirrors the account
+     * Continue Watching for the active overlay profile, newest first, complete before the selected UI window. Mirrors the account
      * rail's rules and Apple `cwItems`: a finished MOVIE leaves (its own id marked watched OR a near-end
      * offset), a series rolls forward (its keep-signal is EPISODE ids, never the series metaId).
      */
@@ -93,7 +93,7 @@ class WatchOverlayStore(
                 freshness = runCatching { Instant.parse(entry.lastWatched).toEpochMilli().toDouble() }.getOrNull(),
                 hasValidProgress = entry.timeOffsetMs > 0 && entry.durationMs > 0,
             )
-        }.take(30).map { it.item }
+        }.map { it.item }
     }
 
     /**
@@ -106,6 +106,18 @@ class WatchOverlayStore(
             .sortedByDescending { it.first }
             .map { it.second }
 
+    /**
+     * Full private playback history, newest first. This intentionally differs from [libraryItems]: a
+     * saved title with neither resume state nor a watched video is not history, while an unsaved finished
+     * title is. It is the overlay counterpart to native playback's persisted history projection.
+     */
+    fun playbackHistory(): List<MetaItem> =
+        watch.asSequence()
+            .filter { (_, entry) -> entry.watchedVideoIds.isNotEmpty() || entry.timeOffsetMs > 0 }
+            .sortedByDescending { (_, entry) -> entry.lastWatched }
+            .map { (metaId, entry) -> metaItem(metaId, entry) }
+            .toList()
+
     private fun metaItem(metaId: String, entry: WatchEntry): MetaItem = MetaItem(
         id = metaId,
         type = MediaType.fromId(entry.type),
@@ -113,6 +125,8 @@ class WatchOverlayStore(
         poster = entry.poster,
         progress = if (entry.durationMs > 0) entry.progress.toFloat() else null,
         resumeSeconds = if (entry.timeOffsetMs > 0) entry.timeOffsetMs / 1000.0 else null,
+        continueWatchingActivityAtMillis = runCatching { Instant.parse(entry.lastWatched).toEpochMilli() }.getOrNull(),
+        watched = entry.watchedVideoIds.isNotEmpty(),
     )
 
     // ---- Player / detail writes (overlay-active only) ----

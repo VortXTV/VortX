@@ -21,6 +21,21 @@ enum VortXRemuxProducerLeadPolicy {
     /// The forward share of ONE retained generation; the history share is reserved separately within W.
     /// Giving both sides all of W overcommits the spool before the predecessor's HLS grace expires.
     static let maximumAheadBytes = VortXHLSConsumptionWindowPolicy.producerAheadMaximumBytes
+    /// Before a master can be consumed there is no playback history. Borrow only that unused share of W,
+    /// retaining the same closed-boundary allowance, predecessor share and aggregate physical spool cap.
+    /// This is not a promise that arbitrary oversized GOPs fit; physical admission remains authoritative.
+    static let startupMaximumAheadBytes = VortXHLSConsumptionWindowPolicy.retainedWindowMaximumBytes
+        - VortXHLSConsumptionWindowPolicy.closedBoundaryAllowanceBytes
+
+    enum Phase: Equatable, Sendable {
+        case startup
+        case steady
+
+        var maximumAheadBytes: Int {
+            self == .startup ? VortXRemuxProducerLeadPolicy.startupMaximumAheadBytes
+                : VortXRemuxProducerLeadPolicy.maximumAheadBytes
+        }
+    }
     /// Stop producing once the produced tail is at least this far (in source seconds) ahead of the confirmed
     /// playhead.
     static let pauseAheadSeconds: Double = 90
@@ -55,9 +70,10 @@ enum VortXRemuxProducerLeadPolicy {
     /// clock may never lift a byte-cap pause.
     static func shouldPauseProducer(leadSeconds: Double,
                                     aheadBytes: Int? = nil,
-                                    currentlyPaused: Bool) -> Bool {
+                                    currentlyPaused: Bool,
+                                    phase: Phase = .steady) -> Bool {
         guard aheadBytes.map({ $0 >= 0 }) ?? true else { return currentlyPaused }
-        let overByteBudget = aheadBytes.map { $0 >= maximumAheadBytes } ?? false
+        let overByteBudget = aheadBytes.map { $0 >= phase.maximumAheadBytes } ?? false
         if overByteBudget { return true }
         guard leadSeconds.isFinite else { return currentlyPaused }
         if currentlyPaused {
@@ -67,7 +83,8 @@ enum VortXRemuxProducerLeadPolicy {
             // byte count fails OPEN (nil resumes), but a measured count that is only a hair under the ceiling
             // stays paused, otherwise one published segment right after resuming re-crossed the cap and
             // re-parked production on the next segment (Beta 26 F3 sawtooth).
-            let underByteResume = aheadBytes.map { $0 < byteResumeThreshold } ?? true
+            let resumeThreshold = Int(Double(phase.maximumAheadBytes) * byteResumeFraction)
+            let underByteResume = aheadBytes.map { $0 < resumeThreshold } ?? true
             return !(leadSeconds < resumeBelowSeconds && underByteResume)
         }
         return leadSeconds >= pauseAheadSeconds || overByteBudget
@@ -306,8 +323,8 @@ struct VortXRemuxProducerLeadLedger: Sendable {
     private var latestPlayhead: Double?
     private var aheadBytes = 0
 
-    /// Only an accepted post-seek clock may reset the monotonic frontier. Rebuild from the real retained
-    /// window: the compacted consumption ledger no longer contains segments a backward seek can revisit.
+    /// An explicit seek reservation or its confirmed landing/cancellation may reset the monotonic frontier.
+    /// Rebuild from the real retained window: the compacted ledger no longer contains revisitable segments.
     mutating func reanchor(to seconds: Double, retainedSegments: [Segment]) {
         guard seconds.isFinite, seconds >= 0 else { return }
         self = Self()
@@ -365,6 +382,7 @@ final class VortXRemuxProducerLeadGate: @unchecked Sendable {
 
     private let condition = NSCondition()
     private var paused = false
+    private var parked = false
     private var cancelled = false
 
     /// Called from the consumer side (today: `VortXRemuxHLSServer`, the one object with a live playhead) with
@@ -386,8 +404,10 @@ final class VortXRemuxProducerLeadGate: @unchecked Sendable {
     func waitAtClosedSegmentBoundaryIfPaused() -> BoundaryOutcome {
         condition.lock()
         while paused, !cancelled {
+            parked = true
             condition.wait()
         }
+        parked = false
         let outcome: BoundaryOutcome = cancelled ? .cancelled : .continued
         condition.unlock()
         return outcome
@@ -411,5 +431,12 @@ final class VortXRemuxProducerLeadGate: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         return paused
+    }
+
+    /// A requested pause is not a producer acknowledgement. Preparation may adopt this receipt only after
+    /// requesting its own park, and only while this exact session's producer is sleeping at a closed boundary.
+    var isParked: Bool {
+        condition.lock(); defer { condition.unlock() }
+        return parked && paused && !cancelled
     }
 }

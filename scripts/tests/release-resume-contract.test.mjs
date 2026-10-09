@@ -62,16 +62,24 @@ ${script('Validate immutable handoff provenance before coordinator resume')}`], 
   });
 }
 
-test('actual protected coordinator condition admits only successful tag builds or explicit main resumes', () => {
+test('actual protected coordinator condition admits only native successful tag builds or native main resumes', () => {
   const job = workflow.split('  attach-release:\n')[1].split('    concurrency:')[0];
   const expression = job.split('    if: >-\n')[1].trim().replaceAll('needs.build-tvos.result', 'result');
   const condition = new Function('github', 'inputs', 'result', 'cancelled', 'always', 'format', `return (${expression});`);
   const allowed = (result, ref, handoff = '', extra = {}, event = 'workflow_dispatch', cancelled = false) =>
-    condition({ event_name: event, ref }, { resume_handoff: handoff, release_tag: tag, tvos_test_only: false, ...extra }, result,
+    condition({ event_name: event, ref }, { resume_handoff: handoff, release_tag: tag, tvos_test_only: false, native_only: true, ...extra }, result,
       () => cancelled, () => true, (_, value) => `refs/tags/${value}`);
   assert(allowed('success', `refs/tags/${tag}`));
   for (const result of ['failure', 'cancelled', 'skipped']) assert(!allowed(result, `refs/tags/${tag}`));
   assert(allowed('skipped', 'refs/heads/main', '{}'));
+  // A resume skips build-tvos and therefore must reject comparison mode independently of that
+  // job's shell preflight. Exercise the actual release-write expression with full write inputs.
+  for (const [result, ref, handoff] of [['success', `refs/tags/${tag}`, ''], ['skipped', 'refs/heads/main', '{}']]) {
+    const release = { release_id: '123', publish_release: true };
+    assert(allowed(result, ref, handoff, { ...release, native_only: true }));
+    assert(!allowed(result, ref, handoff, { ...release, native_only: false }));
+    assert(!allowed(result, ref, handoff, { ...release, native_only: undefined }));
+  }
   for (const result of ['success', 'failure', 'cancelled']) assert(!allowed(result, 'refs/heads/main', '{}'));
   assert(!allowed('skipped', `refs/tags/${tag}`, '{}'));
   assert(!allowed('skipped', 'refs/heads/feature', '{}'));

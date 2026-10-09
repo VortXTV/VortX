@@ -172,6 +172,16 @@ final class ApiKeys: ObservableObject {
             loadingScope = false
             return
         }
+#if VORTX_NATIVE_DATA_ENGINE
+        let provider: String? = if account == ApiKeySlots.tmdb(owner) { "tmdb" }
+            else if account == ApiKeySlots.mdblist(owner) { "mdblist" }
+            else if account == ApiKeySlots.fanart(owner) { "fanart" } else { nil }
+        if let provider, !VortXSyncManager.shared.noteNativeProviderMutation([provider: storedValue.map(VortxJSON.string) ?? .null], capture: boundCapture) {
+            _ = Keychain.set(previous.isEmpty ? nil : previous, for: account)
+            loadingScope = true; restore(); loadingScope = false
+            return
+        }
+#endif
         VortXSyncManager.shared.requestSyncSoon()
     }
 

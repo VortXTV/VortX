@@ -31,6 +31,13 @@ import com.vortx.android.home.TopPicksModel
 import com.vortx.android.home.TraktRailsModel
 import com.vortx.android.home.TraktContinueWatchingModel
 import com.vortx.android.home.TraktContinueWatchingReceipt
+import com.vortx.android.home.ContinueWatchingPreferences
+import com.vortx.android.home.ContinueWatchingSelection
+import com.vortx.android.home.ContinueWatchingSource
+import com.vortx.android.home.ContinueWatchingPermit
+import com.vortx.android.home.SimklContinueWatchingModel
+import com.vortx.android.home.continueWatchingOwnerIsKnown
+import com.vortx.android.home.withSelectedContinueWatchingRail
 import com.vortx.android.home.importedCatalogRails
 import com.vortx.android.home.upcomingMetaBases
 import com.vortx.android.home.withBecauseYouWatchedRail
@@ -168,6 +175,8 @@ class HomeViewModel internal constructor(
     private val watchlistStore: WatchlistStore? = null,
     private val traktRails: TraktRailsModel = TraktRailsModel(),
     private val traktContinueWatching: TraktContinueWatchingModel = TraktContinueWatchingModel(),
+    private val continueWatchingPreferences: ContinueWatchingPreferences? = null,
+    private val simklContinueWatching: SimklContinueWatchingModel = SimklContinueWatchingModel(),
     private val simklRails: SimklRailsModel = SimklRailsModel(),
     private val becauseYouWatched: BecauseYouWatchedModel = BecauseYouWatchedModel(),
     private val mediaServerCatalogs: MediaServerCatalogsModel = MediaServerCatalogsModel(),
@@ -225,6 +234,9 @@ class HomeViewModel internal constructor(
     private var upcomingMovies: List<MetaItem> = emptyList()
     private var traktWatchlist: List<MetaItem> = emptyList()
     private var traktContinueWatchingItems: List<MetaItem> = emptyList()
+    private var continueWatchingStatus: String? = null
+    private var acceptedContinueWatchingPermit: ContinueWatchingPermit? = null
+    private var continueWatchingPermitToken: String? = null
     private var simklWatchlist: List<MetaItem> = emptyList()
     private var becauseYouWatchedRail: Catalog? = null
     private var mediaServerRails: List<Catalog> = emptyList()
@@ -243,6 +255,13 @@ class HomeViewModel internal constructor(
 
     init {
         load()
+        continueWatchingPreferences?.let { preferences ->
+            scope.launch { preferences.state.drop(1).collectLatest {
+                clearSelectedContinueWatching()
+                publishHome()
+                refreshPersonalizedRails()
+            } }
+        }
         collectionsHub?.let { hub ->
             scope.launch {
                 hub.settingsChanges.collectLatest {
@@ -282,7 +301,11 @@ class HomeViewModel internal constructor(
             scope.launch {
                 profileStore.activeProfile
                     .drop(1)
-                    .collectLatest { refreshPersonalizedRails() }
+                    .collectLatest {
+                        clearSelectedContinueWatching()
+                        publishHome()
+                        refreshPersonalizedRails()
+                    }
             }
         }
         watchlistStore?.let { store ->
@@ -307,6 +330,7 @@ class HomeViewModel internal constructor(
             SIMKLAuth.sessionBoundary.drop(1).collectLatest {
                 simklRails.clear()
                 simklWatchlist = emptyList()
+                clearSelectedContinueWatching()
                 publishHome()
                 refreshPersonalizedRails()
             }
@@ -341,6 +365,7 @@ class HomeViewModel internal constructor(
         upcomingMovies = emptyList()
         traktWatchlist = emptyList()
         traktContinueWatchingItems = emptyList()
+        clearSelectedContinueWatching()
         simklWatchlist = emptyList()
         becauseYouWatchedRail = null
         mediaServerRails = emptyList()
@@ -434,6 +459,7 @@ class HomeViewModel internal constructor(
     }
 
     override fun onCleared() {
+        continueWatchingPreferences?.close()
         collectionsHub?.close()
         curatedCollections?.close()
         super.onCleared()
@@ -442,11 +468,14 @@ class HomeViewModel internal constructor(
     private fun refreshPersonalizedRails() {
         val owner = currentReleaseOwner()
         val historyOwner = repo.continueWatchingOwner()
+        val cwPermit = currentContinueWatchingPermit()
         val generation = ++personalizedGeneration
         if (applyReleaseCalendar(releaseCalendar.activate(owner))) publishHome()
         val rows = baseRows
         personalizedJob?.cancel()
         personalizedJob = scope.launch {
+            // Publish service state immediately; it does not wait for unrelated library/provider rails.
+            val selectedWork = async { refreshSelectedContinueWatching(cwPermit, generation) }
             val libraryWork = async { repo.library() }
             val addonsWork = async { repo.installedAddons() }
             val libraryResult = libraryWork.await()
@@ -479,7 +508,6 @@ class HomeViewModel internal constructor(
                 )
             }
             val traktWork = async { traktRails.refresh() }
-            val traktContinueWatchingWork = async { traktContinueWatching.refresh(historyOwner.usesEngineHistory) }
             val simklWork = async { simklRails.refresh() }
             val mediaServerWork = async { mediaServerCatalogs.refresh() }
             val releaseWork = async {
@@ -505,7 +533,7 @@ class HomeViewModel internal constructor(
             val because = becauseWork.await()
             val upcoming = releaseWork.await()
             val trakt = traktWork.await()
-            val traktContinueWatchingRefresh = traktContinueWatchingWork.await()
+            selectedWork.await()
             val simkl = simklWork.await()
             val media = mediaServerWork.await()
             if (!requestIsCurrent()) return@launch
@@ -515,32 +543,103 @@ class HomeViewModel internal constructor(
             val upcomingChanged = upcoming?.let(::applyReleaseCalendar) == true
             if (because.changed) becauseYouWatchedRail = because.rail
             if (media.changed) mediaServerRails = media.rails
-            val currentTraktContinueWatching = isTraktContinueWatchingReceiptCurrent(
-                receipt = traktContinueWatchingRefresh.receipt,
-                currentSessionEpoch = TraktAuth.currentSessionEpoch,
-                currentToggleRevision = ScrobbleService.toggleChanges.value,
-                currentlyEnabled = ScrobbleService.isToggleOn(
-                    ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING,
-                    false,
-                ),
-            )
-            val nextTraktContinueWatching = if (currentTraktContinueWatching) {
-                traktContinueWatchingRefresh.items
-            } else {
-                traktContinueWatchingItems
-            }
-            val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items ||
-                traktContinueWatchingItems != nextTraktContinueWatching
+            val externalChanged = traktWatchlist != trakt.items || simklWatchlist != simkl.items
             traktWatchlist = trakt.items
-            traktContinueWatchingItems = nextTraktContinueWatching
             simklWatchlist = simkl.items
             if (
                 refreshed.changed || because.changed || media.changed || upcomingChanged ||
-                trakt.changed || traktContinueWatchingRefresh.changed || simkl.changed || externalChanged
+                trakt.changed || simkl.changed || externalChanged
             ) {
                 publishHome()
             }
         }
+    }
+
+    private fun currentContinueWatchingPermit(): ContinueWatchingPermit {
+        val selection = continueWatchingPreferences?.current() ?: ContinueWatchingSelection()
+        return ContinueWatchingPermit(repo.continueWatchingOwner(), activeProfileId(), repo.releaseCalendarAccountId(), selection,
+            when (selection.source) {
+                ContinueWatchingSource.TRAKT -> TraktAuth.currentSessionEpoch
+                ContinueWatchingSource.SIMKL -> SIMKLAuth.currentSessionEpoch
+                else -> null
+            })
+    }
+
+    private fun clearSelectedContinueWatching() {
+        traktContinueWatching.clear(); simklContinueWatching.clear()
+        traktContinueWatchingItems = emptyList(); acceptedContinueWatchingPermit = null; continueWatchingPermitToken = null
+        val source = currentContinueWatchingPermit().selection.source
+        continueWatchingStatus = if (source == ContinueWatchingSource.LOCAL) null else "Loading ${source.label} Continue Watching…"
+    }
+
+    private suspend fun refreshSelectedContinueWatching(permit: ContinueWatchingPermit, generation: Long) {
+        fun current() = generation == personalizedGeneration && permit == currentContinueWatchingPermit()
+        if (!current()) return
+        val source = permit.selection.source
+        if (source == ContinueWatchingSource.LOCAL) {
+            if (traktContinueWatchingItems.isNotEmpty() || continueWatchingStatus != null) {
+                traktContinueWatchingItems = emptyList(); continueWatchingStatus = null; publishHome()
+            }
+            return
+        }
+        val unavailable = when {
+            source == ContinueWatchingSource.UNKNOWN -> "This Continue Watching source is unavailable. Choose a source in Home & Discover."
+            !continueWatchingOwnerIsKnown(permit.owner, permit.profileId) || !permit.owner.usesEngineHistory ||
+                !permit.accountId.startsWith("signed-in:") -> "Sign in to this profile's account to load ${source.label} Continue Watching."
+            permit.sessionEpoch == null -> "Connect ${source.label} in Integrations to load Continue Watching."
+            else -> null
+        }
+        if (unavailable != null) {
+            traktContinueWatchingItems = emptyList(); continueWatchingStatus = unavailable
+            acceptedContinueWatchingPermit = null; continueWatchingPermitToken = null; publishHome(); return
+        }
+        if (acceptedContinueWatchingPermit != permit) {
+            traktContinueWatchingItems = emptyList(); continueWatchingStatus = "Loading ${source.label} Continue Watching…"
+            acceptedContinueWatchingPermit = null; continueWatchingPermitToken = null; publishHome()
+        }
+        val (items, failure) = when (source) {
+            ContinueWatchingSource.TRAKT -> traktContinueWatching.refresh(true).let { it.items to it.errorMessage }
+            ContinueWatchingSource.SIMKL -> simklContinueWatching.refresh(true).let { it.items to it.errorMessage }
+            else -> emptyList<MetaItem>() to null
+        }
+        if (!current()) return
+        val token = continueWatchingPermitToken?.takeIf { acceptedContinueWatchingPermit == permit }
+            ?: java.util.UUID.randomUUID().toString()
+        acceptedContinueWatchingPermit = permit; continueWatchingPermitToken = token
+        val admission = com.vortx.android.home.ContinueWatchingAdmission {
+            com.vortx.android.home.continueWatchingPermitIsCurrent(permit, currentContinueWatchingPermit(), renderedOwner,
+                token, continueWatchingPermitToken) && acceptedContinueWatchingPermit == permit
+        }
+        traktContinueWatchingItems = items.map { com.vortx.android.home.continueWatchingItemWithAdmission(it, token, admission) }
+        continueWatchingStatus = failure ?: if (items.isEmpty()) "No titles in progress on ${source.label}." else null
+        publishHome()
+    }
+
+    /** Delayed Compose callbacks recheck profile/account/native owner, service session and preference revision. */
+    fun isContinueWatchingTapCurrent(item: MetaItem): Boolean {
+        val permit = currentContinueWatchingPermit()
+        return if (item.continueWatchingPermit != null) {
+            com.vortx.android.home.continueWatchingPermitIsCurrent(acceptedContinueWatchingPermit, permit, renderedOwner,
+                item.continueWatchingPermit, continueWatchingPermitToken)
+        } else permit.selection.source == ContinueWatchingSource.LOCAL && renderedOwner == permit.owner &&
+            (continueWatchingPreferences == null || permit.owner.profileId == permit.profileId)
+    }
+
+    fun captureContinueWatchingAdmission(item: MetaItem): com.vortx.android.home.ContinueWatchingAdmission? {
+        if (!isContinueWatchingTapCurrent(item)) return null
+        val captured = currentContinueWatchingPermit()
+        val token = item.continueWatchingPermit ?: return null
+        return com.vortx.android.home.ContinueWatchingAdmission {
+            com.vortx.android.home.continueWatchingPermitIsCurrent(captured, currentContinueWatchingPermit(), renderedOwner,
+                token, continueWatchingPermitToken) && acceptedContinueWatchingPermit == captured
+        }
+    }
+
+    /** Home re-entry is a read-only refresh; provider models retain their activities-first throttle. */
+    fun refreshContinueWatchingOnFocus() {
+        val permit = currentContinueWatchingPermit()
+        val generation = personalizedGeneration
+        scope.launch { refreshSelectedContinueWatching(permit, generation) }
     }
 
     private fun currentReleaseBoundary() = ReleaseCalendarBoundary(
@@ -570,6 +669,7 @@ class HomeViewModel internal constructor(
         upcomingMovies = emptyList()
         traktWatchlist = emptyList()
         traktContinueWatchingItems = emptyList()
+        clearSelectedContinueWatching()
         simklWatchlist = emptyList()
         becauseYouWatchedRail = null
         mediaServerRails = emptyList()
@@ -579,8 +679,7 @@ class HomeViewModel internal constructor(
     private fun invalidateTraktPersonalizedRows(clearWatchlist: Boolean = true) {
         personalizedJob?.cancel()
         personalizedGeneration += 1
-        traktContinueWatching.clear()
-        traktContinueWatchingItems = emptyList()
+        clearSelectedContinueWatching()
         if (clearWatchlist) traktWatchlist = emptyList()
         publishHome()
     }
@@ -598,14 +697,30 @@ class HomeViewModel internal constructor(
     }
 
     private fun publishHome() {
-        val hasClientRows = topPicksItems.isNotEmpty() || becauseYouWatchedRail != null ||
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED && renderedOwner == null) return
+        val hasClientRows = continueWatchingStatus != null || topPicksItems.isNotEmpty() || becauseYouWatchedRail != null ||
             traktWatchlist.isNotEmpty() || traktContinueWatchingItems.isNotEmpty() || simklWatchlist.isNotEmpty() || mediaServerRails.isNotEmpty() ||
             importedRails.isNotEmpty() || upcomingEpisodes.isNotEmpty() || upcomingMovies.isNotEmpty() ||
             editorialRails.isNotEmpty()
         if (!sourceHasRows && !hasClientRows) return
         val topRows = withTopPicksRail(baseRows, topPicksItems)
         val becauseRows = withBecauseYouWatchedRail(topRows, becauseYouWatchedRail)
-        val traktContinueWatchingRows = withTraktContinueWatchingRail(becauseRows, traktContinueWatchingItems)
+        val permit = currentContinueWatchingPermit()
+        val local = permit.selection.source == ContinueWatchingSource.LOCAL
+        if (local && renderedOwner == permit.owner && acceptedContinueWatchingPermit != permit) {
+            acceptedContinueWatchingPermit = permit; continueWatchingPermitToken = java.util.UUID.randomUUID().toString()
+        }
+        val remoteCurrent = acceptedContinueWatchingPermit == permit
+        val selectedRows = withSelectedContinueWatchingRail(becauseRows, permit.selection,
+            if (remoteCurrent) traktContinueWatchingItems else emptyList(),
+            if (local) null else continueWatchingStatus, System.currentTimeMillis())
+        val traktContinueWatchingRows = if (local && continueWatchingPreferences != null) selectedRows.map { row ->
+            if (row.id == HomeRail.CONTINUE_CATALOG_ID) row.copy(items = row.items.map {
+                val captured = it.copy(continueWatchingPermit = continueWatchingPermitToken)
+                com.vortx.android.home.continueWatchingItemWithAdmission(captured, continueWatchingPermitToken,
+                    captureContinueWatchingAdmission(captured))
+            }) else row
+        } else selectedRows
         val externalRows = withExternalWatchlistRails(traktContinueWatchingRows, traktWatchlist, simklWatchlist)
         val serverRows = withMediaServerRails(externalRows, mediaServerRails)
         val importedRows = withImportedCatalogRails(serverRows, importedRails)
@@ -619,10 +734,16 @@ class HomeViewModel internal constructor(
         val visibleRows = renderedOwner?.let { owner ->
             withoutContinueWatchingItems(rows, pendingContinueWatchingDismissals, owner)
         } ?: rows
-        _state.value = UiState.Success(visibleRows)
+        // Native admission is the final boundary even for Trakt/Simkl/editorial/server rails.
+        // Their presentation items cannot manufacture certification lost before this layer.
+        val admitted = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
+            renderedOwner?.let { repo.admitClientHomeRows(visibleRows, it).getOrNull() } ?: emptyList()
+        else visibleRows
+        _state.value = UiState.Success(admitted)
     }
 
     fun removeFromContinueWatching(item: MetaItem) {
+        if (currentContinueWatchingPermit().selection.source != ContinueWatchingSource.LOCAL || !isContinueWatchingTapCurrent(item)) return
         val owner = renderedOwner ?: return
         val target = ContinueWatchingDismissal(owner, item.type, item.id)
         if (!pendingContinueWatchingDismissals.add(target)) return
@@ -751,17 +872,12 @@ internal suspend fun awaitContinueWatchingAbsent(
     timeoutMs: Long = 3_000L,
     pollMs: Long = 75L,
 ): Boolean = withTimeoutOrNull(timeoutMs) {
-    var confirmed = false
-    while (!confirmed) {
-        val authoritative = snapshot().getOrNull() ?: break
-        if (authoritative.owner != target.owner) break
-        if (authoritative.items.none { it.id == target.id && it.type == target.type }) {
-            confirmed = true
-            break
-        }
+    var authoritative = snapshot().getOrNull() ?: return@withTimeoutOrNull false
+    while (authoritative.owner == target.owner && authoritative.items.any { it.id == target.id && it.type == target.type }) {
         delay(pollMs)
+        authoritative = snapshot().getOrNull() ?: return@withTimeoutOrNull false
     }
-    confirmed
+    authoritative.owner == target.owner
 } ?: false
 
 internal class DiscoverPaginationState {
@@ -1046,6 +1162,67 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
             _state.value = repo.library(currentRequestJson).toUiState()
         }
     }
+}
+
+/** One owner-fenced read for the two non-library projections shown at the top of the Library landing. */
+data class LibraryLandingResult(
+    val owner: ContinueWatchingOwner,
+    val continueWatching: List<MetaItem>,
+    val playbackHistory: List<MetaItem>,
+)
+
+/**
+ * Keeps Library's Continue Watching rail and full playback History coherent across profile/account
+ * changes. It intentionally does not derive either list from `library()`; native playback may contain an
+ * unsaved watched title, while a saved title can still be unwatched.
+ */
+class LibraryLandingViewModel(private val repo: CatalogRepository) : ViewModel() {
+    private val _state = MutableStateFlow<UiState<LibraryLandingResult>>(UiState.Loading)
+    val state: StateFlow<UiState<LibraryLandingResult>> = _state.asStateFlow()
+
+    private var loadJob: Job? = null
+    private var everLoaded = false
+
+    init {
+        viewModelScope.launch {
+            repo.ctxUpdates().collect { load(showLoading = !everLoaded) }
+        }
+    }
+
+    fun retry() = load(showLoading = true)
+
+    /** Keep the Library-local Continue Watching rail's long-press removal functional without creating Home. */
+    fun removeFromContinueWatching(item: MetaItem) {
+        val owner = repo.continueWatchingOwner()
+        viewModelScope.launch {
+            repo.removeFromContinueWatching(ContinueWatchingDismissal(owner, item.type, item.id))
+                .onSuccess { load(showLoading = false) }
+        }
+    }
+
+    private fun load(showLoading: Boolean) {
+        loadJob?.cancel()
+        if (showLoading) _state.value = UiState.Loading
+        loadJob = viewModelScope.launch {
+            _state.value = loadLibraryLanding(repo).toUiState()
+            everLoaded = true
+        }
+    }
+}
+
+/** Shared by the UI ViewModel and its contract test so an owner switch cannot publish mixed projections. */
+internal suspend fun loadLibraryLanding(repo: CatalogRepository): Result<LibraryLandingResult> = runCatching {
+    val owner = repo.continueWatchingOwner()
+    val history = repo.playbackHistorySnapshot(owner).getOrThrow()
+    val continueWatching = repo.continueWatchingSnapshot(owner).getOrThrow()
+    check(history.owner == owner) { "Playback history owner changed." }
+    check(continueWatching.owner == owner) { "Continue Watching owner changed." }
+    check(repo.continueWatchingOwner() == owner) { "Library landing owner changed." }
+    LibraryLandingResult(
+        owner = owner,
+        continueWatching = continueWatching.items,
+        playbackHistory = history.items,
+    )
 }
 
 /// Search: debounced full-text query across every installed add-on. A query below two trimmed

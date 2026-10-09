@@ -6,6 +6,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -106,9 +108,10 @@ import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.components.cinemaCardFacts
 import com.vortx.android.ui.components.DefaultEpisodeThumb
 import com.vortx.android.ui.components.ErrorState
-import com.vortx.android.ui.components.EpisodeRow
+import com.vortx.android.ui.components.CinemaEpisodeCard
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
 import com.vortx.android.ui.components.PrimaryButton
@@ -165,6 +168,9 @@ fun DetailScreen(
     onBack: () -> Unit,
     onPlay: (Playable, MetaDetail, PlayerEngineRouter.Override) -> Unit,
     modifier: Modifier = Modifier,
+    /** A one-shot request from Cinema Quick View; normal detail visits retain manual playback. */
+    autoWatch: Boolean = false,
+    onAutoWatchConsumed: () -> Unit = {},
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
@@ -447,6 +453,14 @@ fun DetailScreen(
     val resolving = playback is Playback.Resolving
     var sourcesOpen by remember { mutableStateOf(false) }
 
+    // Quick View deliberately delegates to the ordinary ranked source path. The request is consumed before
+    // dispatch so recomposition, an arriving source group, or returning from the player cannot launch twice.
+    LaunchedEffect(autoWatch, metaState, streamsState, resolving) {
+        if (!autoWatch || resolving || metaState !is UiState.Success || viewModel.bestSource() == null) return@LaunchedEffect
+        onAutoWatchConsumed()
+        beginPlayback { viewModel.playBest() }
+    }
+
     Box(modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
         when (val m = metaState) {
             // A non-`tt` catalog id that neither an add-on nor the one-shot recovery could resolve sits in
@@ -599,55 +613,59 @@ fun DetailScreen(
                     val episodes = m.data.videos
                         .filter { it.season == (selectedSeason ?: m.data.videos.first().season) }
                         .sortedBy { it.episode }
-                    items(episodes, key = { it.id }) { episode ->
-                        val episodeFocus = remember(episode.id) { FocusRequester() }
-                        LaunchedEffect(episode.id, episodeFocus) {
-                            episodeFocusRequesters[episode.id] = episodeFocus
-                        }
-                        val currentForSources = episode.id == selectedEpisodeId
-                        val watched = episode.id in m.data.watchedVideoIds
-                        // DET spoiler-safe veil (read-only against watched state): an unwatched, not-yet-
-                        // revealed episode's thumbnail is blurred with an eye-slash overlay and its synopsis
-                        // is withheld behind "Tap to reveal". The first tap on a veiled row REVEALS it (a
-                        // session-only reveal) rather than navigating / choosing sources.
-                        val veiled = spoilerVeiled(spoilerSafe, watched, episode.id in revealedEpisodeIds)
-                        EpisodeRow(
-                            code = if (episode.season > 0) "S${episode.season} · E${episode.episode}" else "Episode ${episode.episode}",
-                            title = episode.title,
-                            overview = if (veiled) "Tap to reveal" else episode.overview,
-                            airDate = episode.released?.take(10),
-                            watched = watched,
-                            progress = episodeProgress(episode, m.data),
-                            onClick = {
-                                restoreEpisodeFocusId = episode.id
-                                if (veiled) {
-                                    // Reveal first: a veiled row's first tap never jumps into a spoilery
-                                    // source list. Session-only; never writes a watched tick.
-                                    revealedEpisodeIds = revealedEpisodeIds + episode.id
-                                } else {
-                                    // With Smart auto-pick on, the tap plays the best source straight away;
-                                    // opening the sources section under it is the escape hatch (backing out
-                                    // of the player reveals the full list, Apple's exact wording).
-                                    if (viewModel.autoPickEnabled) sourcesOpen = true
-                                    viewModel.selectEpisode(episode.id)
+                    item {
+                        // The phone/touch episode surface is intentionally a cinematic rail, not a long
+                        // flat list. Selection and source routing remain the existing per-episode owner.
+                        LazyRow(
+                            contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
+                            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+                        ) {
+                            items(episodes, key = { it.id }) { episode ->
+                                val episodeFocus = remember(episode.id) { FocusRequester() }
+                                LaunchedEffect(episode.id, episodeFocus) {
+                                    episodeFocusRequesters[episode.id] = episodeFocus
                                 }
-                            },
-                            onLongClick = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
-                            focusRequester = episodeFocus,
-                            thumb = { EpisodeThumb(episode, veiled = veiled, fallbackUrls = listOf(m.data.background, m.data.poster)) },
-                            modifier = Modifier
-                                .padding(horizontal = VortXTheme.spacing.edge)
-                                .then(
-                                    // The episode whose sources are currently shown up in the hero
-                                    // cluster gets an accent ring, so "what Watch/Resume will play"
-                                    // stays legible while browsing the rest of the season.
-                                    if (currentForSources) {
-                                        Modifier.border(BorderStroke(1.dp, VortXTheme.colors.accent), VortXShapes.card)
-                                    } else {
-                                        Modifier
+                                val currentForSources = episode.id == selectedEpisodeId
+                                val watched = episode.id in m.data.watchedVideoIds
+                                // A veiled row's first tap reveals only; it never writes watched state or
+                                // enters the source path before the viewer has chosen to see the spoiler.
+                                val veiled = spoilerVeiled(spoilerSafe, watched, episode.id in revealedEpisodeIds)
+                                CinemaEpisodeCard(
+                                    code = if (episode.season > 0) "S${episode.season} · E${episode.episode}" else "Episode ${episode.episode}",
+                                    title = episode.title,
+                                    overview = if (veiled) "Tap to reveal" else episode.overview,
+                                    airDate = episode.released?.take(10),
+                                    watched = watched,
+                                    progress = episodeProgress(episode, m.data),
+                                    onClick = {
+                                        restoreEpisodeFocusId = episode.id
+                                        if (veiled) {
+                                            revealedEpisodeIds = revealedEpisodeIds + episode.id
+                                        } else {
+                                            if (viewModel.autoPickEnabled) sourcesOpen = true
+                                            viewModel.selectEpisode(episode.id)
+                                        }
                                     },
-                                ),
-                        )
+                                    onToggleWatched = { viewModel.setVideoWatched(episode, episode.id !in m.data.watchedVideoIds) },
+                                    runtime = m.data.runtime,
+                                    quality = if (currentForSources) {
+                                        (streamsState as? UiState.Success<List<StreamGroup>>)?.data
+                                            ?.let(StreamRanking::tiers)?.filter { it != "Others" }?.joinToString(" / ")
+                                    } else null,
+                                    focusRequester = episodeFocus,
+                                    thumb = { EpisodeThumb(episode, veiled = veiled, fallbackUrls = listOf(m.data.background, m.data.poster)) },
+                                    modifier = Modifier
+                                        .width(304.dp)
+                                        .then(
+                                            if (currentForSources) {
+                                                Modifier.border(BorderStroke(1.dp, VortXTheme.colors.accent), VortXShapes.card)
+                                            } else {
+                                                Modifier
+                                            },
+                                        ),
+                                )
+                            }
+                        }
                     }
                 }
                 com.vortx.android.model.MediaRelation.visible(
@@ -1423,9 +1441,10 @@ private fun SimilarRail(type: MediaType, titles: List<MetaItem>, onOpen: (MetaIt
             items(titles) { item ->
                 PosterCard(
                     title = item.name,
-                    subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · ").ifBlank { null },
+                    subtitle = cinemaCardFacts(item),
                     onClick = { onOpen(item) },
                     modifier = Modifier.width(120.dp),
+                    cinema = true,
                     art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                 )
             }
@@ -1456,9 +1475,10 @@ private fun CollectionRail(collection: CollectionClient.MovieCollection, onOpen:
             items(collection.parts) { item ->
                 PosterCard(
                     title = item.name,
-                    subtitle = item.year,
+                    subtitle = cinemaCardFacts(item),
                     onClick = { onOpen(item) },
                     modifier = Modifier.width(120.dp),
+                    cinema = true,
                     art = { PosterArt(item.poster, item.name, id = item.id, type = item.type.id) },
                 )
             }
@@ -1714,6 +1734,7 @@ private fun SourcesSection(
     // DET-2 grouped/collapsible source list state: the per-add-on filter ("All" = null), the remembered
     // collapsed add-on set, the render window (grown by "Show more"), and the two-level Quality menu.
     var sourceFilter by remember { mutableStateOf<String?>(null) }
+    var sourceJumpRevision by remember { mutableStateOf(0) }
     var collapsed by remember { mutableStateOf(emptySet<String>()) }
     var renderLimit by remember { mutableStateOf(SOURCE_WINDOW_INITIAL) }
     var qualityOpen by remember { mutableStateOf(false) }
@@ -1736,6 +1757,14 @@ private fun SourcesSection(
                 val total = groups.sumOf { it.streams.size }
                 val effectiveSourceFilter = sourceFilter?.takeIf { addon -> groups.any { it.addon == addon } }
                 val filteredGroups = groups.filter { effectiveSourceFilter == null || it.addon == effectiveSourceFilter }
+                val sourceAnchors = remember(groups.map { it.addon }) {
+                    groups.associate { it.addon to BringIntoViewRequester() }
+                }
+                // A selected add-on is an actual jump into its source section as well as the established
+                // filter. The parent LazyColumn owns the scroll, and the incoming/user order is retained.
+                LaunchedEffect(effectiveSourceFilter, sourceJumpRevision) {
+                    effectiveSourceFilter?.let { sourceAnchors[it]?.bringIntoView() }
+                }
                 val availableAudioLanguages = detailAudioLanguageOptions(filteredGroups)
                 // Header + the "Re-find" escape hatch: re-query the add-ons fresh so an expired/dead source
                 // (or an empty result) is replaced. All the work lives in [DetailViewModel.refreshSources];
@@ -1771,7 +1800,11 @@ private fun SourcesSection(
                                 Chip(
                                     label = "${group.addon} (${group.streams.size})",
                                     selected = effectiveSourceFilter == group.addon,
-                                    onClick = { sourceFilter = group.addon },
+                                    onClick = {
+                                        collapsed = collapsed - group.addon
+                                        sourceFilter = group.addon
+                                        sourceJumpRevision += 1
+                                    },
                                 )
                             }
                         }
@@ -1902,8 +1935,12 @@ private fun SourcesSection(
                 val filtered = filteredGroups
                 var budget = renderLimit
                 var shownRows = 0
+                val anchoredAddons = HashSet<String>()
                 filtered.forEach { group ->
                     val isCollapsed = group.addon in collapsed
+                    // Labels can repeat across transports. Jump to the first matching section, whose
+                    // sources get the render budget first, rather than scrolling through every duplicate.
+                    val sourceAnchor = sourceAnchors[group.addon]?.takeIf { anchoredAddons.add(group.addon) }
                     SourceGroupHeader(
                         addon = group.addon,
                         count = group.streams.size,
@@ -1911,6 +1948,7 @@ private fun SourcesSection(
                         onToggle = {
                             collapsed = if (isCollapsed) collapsed - group.addon else collapsed + group.addon
                         },
+                        modifier = sourceAnchor?.let { Modifier.bringIntoViewRequester(it) } ?: Modifier,
                     )
                     if (!isCollapsed && budget > 0) {
                         val sorted = sortedStreamsInGroup(group.streams, sort)
@@ -1980,9 +2018,9 @@ private fun copyableSourceLinks(groups: List<StreamGroup>): List<String> =
 /// section head of the DET-2 grouped list (Apple's `sectionHeader`). Styled as a glass row so the grouping
 /// reads as a deliberate raised card.
 @Composable
-private fun SourceGroupHeader(addon: String, count: Int, collapsed: Boolean, onToggle: () -> Unit) {
+private fun SourceGroupHeader(addon: String, count: Int, collapsed: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier) {
     Row(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clickable(onClick = onToggle)
             .vortxGlass(VortXShapes.chip, fillAlpha = VortXGlass.badgeFillAlpha, shadow = VortXGlass.Shadow.flat)

@@ -42,6 +42,7 @@ struct PlaybackRequest: Identifiable {
     var debridRef: DebridPlaybackRef? = nil
     /// Exact source row that produced the URL, retained for raw-torrent selector provenance.
     var sourceStream: CoreStream? = nil
+    var sourceAddon: String? = nil
     /// Account-confirmed debrid-cache snapshot captured at launch, so the player's cached-advance / binge /
     /// failover re-rank (`rankedCandidates` / `best` / `bestCachedResolution`) sees the same cache awareness
     /// the source list ranked with (Beta 26 A2). Default empty keeps every existing request site compiling.
@@ -179,6 +180,7 @@ struct RootView: View {
                              trailerYouTubeID: req.trailerYouTubeID,
                              audioSidecarURL: req.audioSidecarURL, debridRef: req.debridRef,
                              initialSourceStream: req.sourceStream,
+                             initialSourceAddon: req.sourceAddon,
                              initialEnginePlayerVideoId: req.enginePlayerVideoId,
                              debridCachedHashes: req.debridCachedHashes,
                              startedFromExplicitPick: req.wasExplicitPick, startedFromResume: req.wasResume,
@@ -351,7 +353,7 @@ struct RootTabView: View {
 
     var body: some View {
         TabView(selection: selectionBinding) {
-            HomeView().id(resetTokens[0])
+            HomeView(isActive: selection == 0).id(resetTokens[0])
                 .tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
             // Discover / Live / Library / Search are the hideable tabs (#117): each drops out of the
             // TabView entirely when its Settings > Tab bar toggle hides it, and the matching .onChange
@@ -381,6 +383,13 @@ struct RootTabView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
         }
         .tint(theme.accent)
+        #if VORTX_NATIVE_DATA_ENGINE
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if launchReady, presenter.request == nil {
+                NativeWatchedMigrationNotice()
+            }
+        }
+        #endif
         // Offline chip (#120): a quiet bottom capsule while the device has no network path. Pure
         // signal (never focusable, never navigates); it clears on its own when connectivity returns,
         // and online tabs stay reachable for cached browsing.

@@ -10,13 +10,41 @@ import SwiftUI
 /// and failed states have no queue position to move). Completed downloads are intentionally absent: they
 /// are finished library items, surfaced for playback by `DownloadsView`, not part of the pending queue.
 ///
-/// Self-contained (no required inputs, no environment dependency), so a later pass can mount it from any
-/// entry point - a NavigationLink in the Downloads screen, or a Settings row - without wiring.
+/// Self-contained (no required inputs; only the ambient size class selects card spacing), so a later pass can
+/// mount it from any entry point - a NavigationLink in the Downloads screen, or a Settings row - without wiring.
 ///
 /// iOS + macOS only (this file lives in SourcesiOS); Apple TV has its own downloads surface (TVDownloadsView).
+private struct DownloadQueueSurfaceModifier: ViewModifier {
+    let wide: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if wide {
+            content.vortxCinemaCard()
+        } else {
+            content.vortxSettingsCard()
+        }
+    }
+}
+
+private extension View {
+    func downloadQueueSurface(wide: Bool) -> some View {
+        modifier(DownloadQueueSurfaceModifier(wide: wide))
+    }
+}
+
 struct DownloadQueueView: View {
     @ObservedObject private var store = DownloadStore.shared
     @ObservedObject private var manager = DownloadManager.shared
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    private var usesWideQueueLayout: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
 
     var body: some View {
         // Snapshot the groups once per render so the drainer order and the disabled-arrow edges agree.
@@ -27,7 +55,7 @@ struct DownloadQueueView: View {
         let isEmpty = downloading.isEmpty && queued.isEmpty && paused.isEmpty && failed.isEmpty
 
         ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.md) {
+            VStack(alignment: .leading, spacing: usesWideQueueLayout ? Theme.Space.md : Theme.Space.sm) {
                 concurrencyCard(active: downloading.count, queued: queued.count)
 
                 if isEmpty {
@@ -42,8 +70,9 @@ struct DownloadQueueView: View {
                             records: failed) { row($0) }
                 }
             }
-            .padding(.horizontal, Theme.Space.md)
-            .padding(.vertical, Theme.Space.lg)
+            .padding(.horizontal, usesWideQueueLayout ? Theme.Space.screenInset : Theme.Space.sm)
+            .padding(.vertical, usesWideQueueLayout ? Theme.Space.lg : Theme.Space.md)
+            .frame(maxWidth: usesWideQueueLayout ? 1120 : .infinity, alignment: .center)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         #if os(iOS)
@@ -75,9 +104,9 @@ struct DownloadQueueView: View {
                 .foregroundStyle(Theme.Palette.textTertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(Theme.Space.sm)
+        .padding(usesWideQueueLayout ? Theme.Space.md : Theme.Space.sm)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .vortxSettingsCard()
+        .downloadQueueSurface(wide: usesWideQueueLayout)
     }
 
     private var concurrencyBinding: Binding<Int> {
@@ -143,25 +172,45 @@ struct DownloadQueueView: View {
     /// One download row. `isFirst` / `isLast` are supplied only for queued rows (they gate the reorder
     /// arrows); every other state passes the defaults and shows no arrows.
     @ViewBuilder private func row(_ record: DownloadRecord, isFirst: Bool = true, isLast: Bool = true) -> some View {
-        HStack(alignment: .top, spacing: Theme.Space.md) {
-            leadingGlyph(record)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(record.displayTitle)
-                    .font(Theme.Typography.body)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                    .lineLimit(2)
-                subtitle(record)
-                if record.state == .downloading || record.state == .paused {
-                    ProgressView(value: record.fractionComplete)
-                        .tint(Theme.Palette.accent)
-                        .padding(.top, 2)
+        if usesWideQueueLayout {
+            HStack(alignment: .top, spacing: Theme.Space.md) {
+                leadingGlyph(record)
+                rowDetails(record)
+                Spacer(minLength: 0)
+                controls(record, isFirst: isFirst, isLast: isLast)
+            }
+            .padding(Theme.Space.md)
+            .downloadQueueSurface(wide: true)
+        } else {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                HStack(alignment: .top, spacing: Theme.Space.sm) {
+                    leadingGlyph(record)
+                    rowDetails(record)
+                }
+                HStack {
+                    Spacer(minLength: 0)
+                    controls(record, isFirst: isFirst, isLast: isLast)
                 }
             }
-            Spacer(minLength: 0)
-            controls(record, isFirst: isFirst, isLast: isLast)
+            .padding(Theme.Space.sm)
+            .downloadQueueSurface(wide: false)
         }
-        .padding(Theme.Space.sm)
-        .vortxSettingsCard()
+    }
+
+    @ViewBuilder private func rowDetails(_ record: DownloadRecord) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(record.displayTitle)
+                .font(Theme.Typography.body)
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .lineLimit(2)
+            subtitle(record)
+            if record.state == .downloading || record.state == .paused {
+                ProgressView(value: record.fractionComplete)
+                    .tint(Theme.Palette.accent)
+                    .padding(.top, 2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder private func leadingGlyph(_ record: DownloadRecord) -> some View {

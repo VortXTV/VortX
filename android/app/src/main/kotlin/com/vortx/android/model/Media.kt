@@ -160,6 +160,16 @@ data class PreferredEpisode(
     val videoIdentity: String? = null,
 )
 
+/** Only an actual engine video identity supplies episode coordinates; sparse titles get no default. */
+internal fun continueWatchingEpisodeFromVideoIdentity(type: MediaType, videoIdentity: String?): PreferredEpisode? {
+    if (type != MediaType.SERIES || videoIdentity.isNullOrBlank()) return null
+    val parts = videoIdentity.split(':')
+    if (parts.size < 3 || parts.dropLast(2).joinToString(":").isBlank()) return null
+    val season = parts[parts.lastIndex - 1].toIntOrNull()?.takeIf { it >= 0 } ?: return null
+    val episode = parts.last().toIntOrNull()?.takeIf { it > 0 } ?: return null
+    return PreferredEpisode(season, episode, videoIdentity)
+}
+
 data class MetaItem(
     val id: String,
     val type: MediaType,
@@ -191,6 +201,12 @@ data class MetaItem(
     /// [MetaDetail.trailerYouTubeId]. Mirrors Apple's Home hero, whose `HomeHeroTrailerModel` fetches the
     /// focused item's meta to find its trailer. Null keeps the hero on its Ken Burns still backdrop.
     val trailerYouTubeId: String? = null,
+    /** Actual provider/native activity time; missing timestamps must stay unknown. */
+    val continueWatchingActivityAtMillis: Long? = null,
+    /** Opaque Home lease checked again on tap, never a credential or a persisted watch mutation. */
+    val continueWatchingPermit: String? = null,
+    val continueWatchingAdmission: com.vortx.android.home.ContinueWatchingAdmission? = null,
+    val continueWatchingUnavailableMessage: String? = null,
 ) {
     /// The formatted "resume 1:03" affordance for a Continue Watching card, or null when there is
     /// nothing to resume (mirrors Apple `CoreCWItem.resumeSeconds` -> `resumeTimecode`).
@@ -213,6 +229,7 @@ data class Catalog(
     val hasNextPage: Boolean = false,
     val pageLoading: Boolean = false,
     val type: String? = null,
+    val statusMessage: String? = null,
 )
 
 /// One episode of a series, mirroring the engine's `CoreVideo`. [season]/[episode] drive the season
@@ -488,16 +505,23 @@ data class StreamSource(
     val externalSubtitles: List<String> = emptyList(),
     /** Structured sidecars preserve provider-specific request metadata without changing URL-only callers. */
     val externalSubtitleTracks: List<ExternalSubtitle> = emptyList(),
+    /** Opaque repository-issued attribution. Never a credential or media URL. */
+    val nativePlaybackToken: String? = null,
+    /** Ordered addon NZB mirrors and NNTP URLs. Transient only; may contain configured credentials. */
+    val nzbUrls: List<String> = emptyList(),
+    val usenetServers: List<String> = emptyList(),
 ) {
     override fun toString(): String =
-        "StreamSource(id=$id, addon=$addon, title=$title, url=${redactedTransportUrl(url)}, " +
+        "StreamSource(id=${if (isUsenet) "<usenet>" else id}, addon=$addon, title=$title, url=${redactedTransportUrl(url)}, " +
             "requestHeaderCount=${requestHeaders.size}, externalSubtitleCount=${externalSubtitleTracks.size})"
 
     /// A USENET stream: no direct [url] yet, but an `.nzb` link to resolve through a usenet-capable
     /// debrid account. Like a raw torrent, it needs resolution before it is playable. Kept mutually
     /// exclusive from [isTorrent] (which also requires `nzbUrl == null`) so a stream is classified as
     /// exactly one of torrent / usenet / direct. Mirrors Apple `CoreStream.isUsenet`.
-    val isUsenet: Boolean get() = url == null && !nzbUrl.isNullOrEmpty()
+    val isUsenet: Boolean get() = url == null && (!nzbUrl.isNullOrEmpty() || nzbUrls.isNotEmpty())
+
+    val usenetUrls: List<String> get() = (listOfNotNull(nzbUrl) + nzbUrls).distinct()
 
     /// A bare YouTube source ([ytId], no [url]/[infoHash]): a trailer/clip from a trailer add-on, not a
     /// full feature stream. Playable via the `/yt` route but excluded from quality ranking + auto-pick.
@@ -518,7 +542,7 @@ data class StreamSource(
     /// URL-construction half; the live resolve path applies its own debrid/torrent resolution.
     fun playableUrl(torBoxConfigured: Boolean, torrentsDisabled: Boolean = false): String? {
         url?.let { return it }
-        if (isUsenet && torBoxConfigured) nzbUrl?.let { return it }
+        if (isUsenet && torBoxConfigured) usenetUrls.firstOrNull()?.let { return it }
         if (!ytId.isNullOrEmpty()) return "$TRAILER_RESOLVER_BASE/yt/$ytId"
         if (torrentsDisabled) return null
         // Raw torrent: no local streaming-server loopback on Android (see the resolve path).

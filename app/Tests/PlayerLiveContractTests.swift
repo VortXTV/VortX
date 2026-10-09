@@ -2954,10 +2954,10 @@ enum PlayerLiveContractTests {
         let midPlaybackWatchdog = sourceSection(
             playerScreen,
             from: "private func startStallWatchdog()",
-            to: "private func recoverFromStall()")
+            to: "private func recoverFromStall(")
         let midPlaybackRecovery = sourceSection(
             playerScreen,
-            from: "private func recoverFromStall()",
+            from: "private func recoverFromStall(",
             to: "/// Show a small transient notice over the video")
         let firstFrameCommit = sourceSection(
             playerScreen,
@@ -3040,7 +3040,7 @@ enum PlayerLiveContractTests {
             to: "private func refreshPendingIntentTransport()")
         let playerScreenAVDemote = sourceSection(
             playerScreen,
-            from: "private func demoteAVPlayerToMPV(silent: Bool, preservingPreviewPause: Bool = false)",
+            from: "private func demoteAVPlayerToMPV(silent: Bool)",
             to: "/// User-invoked mid-title engine swap")
         let tvPlayerAVDemote = sourceSection(
             tvPlayer,
@@ -4100,7 +4100,7 @@ enum PlayerLiveContractTests {
                   "if let intent = pendingPlaybackIntent",
                   "return intent",
                   "if var intent = pendingMediaSelectionIntent",
-                  "intent.updateSourceSeconds(playbackPositionSeconds)",
+                  "intent.updateSourceSeconds(recoverySourceSeconds)",
                   "intent.updateTransport(playbackRequested: playbackRequested, requestedRate: requestedRate)",
                   "return intent",
                   "let subtitle:",
@@ -4109,7 +4109,7 @@ enum PlayerLiveContractTests {
                       "if var intent = pendingPlaybackIntent") == false)
         check("wiring: host loss preserves an existing pending seek before either remount branch",
               playbackIntentCapture?.contains(
-                  "sourceSeconds: playbackPositionSeconds") == true
+                  "sourceSeconds: recoverySourceSeconds") == true
                   && sourceContainsInOrder(externalEngineLoss, [
                       "let intent = capturePlaybackIntent(from: item)",
                       "pendingPlaybackIntent = intent",
@@ -4252,7 +4252,7 @@ enum PlayerLiveContractTests {
                       "func setAudioTrack(_ id: Int)",
                       "remuxSourceAudioTracks.contains(where:",
                       "RemuxAudioReplacementPolicy.State(",
-                      "sourceSeconds: playbackPositionSeconds",
+                      "sourceSeconds: intent.sourceSeconds",
                       "mountCurrentAudioReplacement(reason: \"audio source selected\")",
                   ])
                   && sourceContainsInOrder(sourceAudioSelection, [

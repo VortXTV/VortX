@@ -282,7 +282,7 @@ struct SourceFilterChipsView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(Theme.Space.sm)
-        .vortxGlass(in: RoundedRectangle(cornerRadius: 14, style: .continuous),
+        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
                     fillAlpha: VortXGlass.cardFillAlpha, shadow: .flat)
     }
 }

@@ -55,6 +55,8 @@ import coil3.compose.AsyncImage
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
+import com.vortx.android.BuildConfig
+import com.vortx.android.VortXApplication
 import java.util.Locale
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -72,7 +74,8 @@ import kotlin.math.roundToInt
 fun WatchStatsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
     BackHandler(onBack = onBack)
     val context = LocalContext.current
-    val model = remember(context) { WatchStatsModel(context.applicationContext.filesDir) }
+    val model = remember(context) { WatchStatsModel(context.applicationContext.filesDir,
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) (context.applicationContext as? VortXApplication)?.catalogRepository else null) }
     val state by model.state.collectAsStateWithLifecycle()
     androidx.compose.runtime.LaunchedEffect(Unit) { model.load() }
 
@@ -92,6 +95,7 @@ fun WatchStatsScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
             )
             val stats = state.stats
             when {
+                state.error != null -> Text(state.error!!, color = VortXTheme.colors.textSecondary)
                 state.isLoading && stats == null -> LoadingState()
                 stats != null && stats.hasData -> {
                     Hero(stats)

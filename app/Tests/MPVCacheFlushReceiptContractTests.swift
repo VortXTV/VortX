@@ -59,15 +59,16 @@ private enum MPVCacheFlushReceiptContractTests {
               let finish = section(source, from: "private func finishCacheFlushFlight", to: "    /// mpv's stock User-Agent"),
               let observe = section(source, from: "private func observeCacheReanchorSeek", to: "    private func completeCacheReanchorOnPlaybackRestart") else { return false }
         return !source.contains("no-osd drop-buffers")
-            && ordered(["getString(\"demuxer-seekable-cache\")", "let wasPaused = getFlag(MPVProperty.pause)",
-                        "cacheFlushFlight.install(", "mpv_set_property_string(handle, \"demuxer-seekable-cache\", \"no\")",
-                        "issueCacheReanchorSeek(flight)"], in: flush)
+            && ordered(["MPVCacheReanchorPolicy.admit(native,", "diagnosticString(\"demuxer-seekable-cache\", handle: handle)",
+                        "let wasPaused = admission.paused", "cacheFlushFlight.install(",
+                        "issueCacheReanchorSeek(flight, after: settlement.generation)",
+                        "mpv_set_property_string(handle, \"demuxer-seekable-cache\", \"no\")"], in: flush)
             && ordered(["finishCacheFlushFlight(cacheFlushFlight.reset())", "let issuedToken = PlayerLoadToken()"], in: load)
             && finish.contains("activeLoadToken == flight.owner")
             && finish.contains("cacheFlushFlight.current == nil")
             && finish.contains("flight.originalSeekableCache")
             && !observe.contains("finishCacheFlushFlight")
-            && source.contains("diagnosticInt(\"demuxer-cache-state/debug-low-level-seeks\", handle: handle)")
+            && source.contains("lowLevelSeeks: cache.integer(\"debug-low-level-seeks\")")
             && source.contains("cacheFlushFlight.acceptsEvent(id: witness.id, owner: witness.owner, attempt: witness.attempt)")
             && policy.contains("lowLevelSeeks > flight.lowLevelSeeksAtIssue")
             && policy.contains("flight.reissues == 0")
@@ -210,11 +211,15 @@ private enum MPVCacheFlushReceiptContractTests {
                 "if cacheFlushFlight.current?.owner == owner",
                 "cacheFlushFlight.admit(owner: owner)",
                 "guard cacheFlushFlight.admit(owner: owner) == .started else { return .coalesced }",
-                "getFlag(MPVProperty.seekable)",
-                "let pos = getDouble(MPVProperty.timePos)",
-                "guard pos.isFinite, pos > 0 else { return .skipped }",
+                "loadTokenLock.lock()",
+                "let native = cacheReanchorNativeSample(handle: handle)",
+                "MPVCacheReanchorPolicy.admit(native,",
+                "seekable: diagnosticFlag(MPVProperty.seekable, handle: handle)",
+                "transportSettled: settlement.settled && settlement.attributed",
+                "loadTokenLock.unlock()",
+                "guard sameOwner, let admission, let originalSeekableCache else { return .skipped }",
+                "let pos = admission.target",
                 "let targetArgument = String(format: \"%.3f\", locale: Locale(identifier: \"en_US_POSIX\"), pos)",
-                "callbackLoadToken(requiresLoadedFile: true)",
                 "let flight = cacheFlushFlight.install(",
                 "beginCacheFlushReceipt(flight)",
                 "DispatchQueue.main.asyncAfter",
@@ -247,7 +252,7 @@ private enum MPVCacheFlushReceiptContractTests {
         return hasSingleFlightAdmissionContract(source)
             && ordered(
                 [
-                    "let commandResult = mpv_command_string(",
+                    "let commandResult = optionStatus < 0 ? optionStatus : mpv_command_string(",
                     "if commandResult >= 0",
                     "cacheFlushFlight.markSeekCommandAccepted(id: flight.id, owner: flight.owner)",
                     "} else if let ended = cacheFlushFlight.seekCommandError(id: flight.id, owner: flight.owner)",
@@ -462,6 +467,34 @@ private enum MPVCacheFlushReceiptContractTests {
             && !source.contains("= \"buffers dropped\"")
     }
 
+    private static func hasCacheNativeOwnershipContract(_ source: String) -> Bool {
+        guard let flush = cacheFlushSource(source), let events = eventLoopSource(source),
+              let accept = section(source, from: "private func acceptsCacheReanchorEventWitness", to: "    /// The source inputs"),
+              let sample = section(source, from: "private func cacheReanchorNativeSample", to: "    /// Three bounded observations"),
+              let play = section(source, from: "func play()", to: "    /// Internal EOF repair"),
+              let pause = section(source, from: "func pause()", to: "    /// A new viewer seek") else { return false }
+        return ordered(["self.loadTokenLock.lock()", "mpv_wait_event(handle, 0)",
+                        "let rawCacheWitness = self.cacheReanchorEventWitness",
+                        "self.cacheReanchorNativeSample(handle: handle)", "self.loadTokenLock.unlock()"], in: events)
+            && !source.contains("captureCacheReanchorEventWitness")
+            && accept.contains("callbackToken(requiresLoadedFile: true) == witness.owner")
+            && accept.contains("generation: witness.commandGeneration")
+            && ordered(["seekSettlement.accepts(", "loadTokenLock.unlock()", "cacheFlushFlight.acceptsEvent("], in: accept)
+            && sample.contains("MPVDemuxerCacheSnapshot.read(from: handle)")
+            && sample.contains("diagnosticFlag(MPVProperty.pause, handle: handle)")
+            && sample.contains("diagnosticFlag(\"seeking\", handle: handle)")
+            && sample.contains("diagnosticFlag(\"eof-reached\", handle: handle)")
+            && ordered(["loadTokenLock.lock()", "settlement.generation == generation",
+                        "native.lowLevelSeeks == flight.lowLevelSeeksAtIssue", "MPVCacheReanchorPolicy.canSettle(native,",
+                        "loadTokenLock.unlock()", "finishCacheFlushFlight(cacheFlushFlight.reset(owner: flight.owner))",
+                        "mpv_set_property_string(handle, \"demuxer-seekable-cache\", \"no\")",
+                        "mpv_command_string(", "seekSettlement.completeIssue(", "commandGeneration: settlementLease",
+                        "loadTokenLock.unlock()"], in: flush)
+            && ordered(["if setFlag(MPVProperty.pause, false)", "cacheFlushFlight.updateTransportIntent"], in: play)
+            && ordered(["if setFlag(MPVProperty.pause, true)", "cacheFlushFlight.updateTransportIntent"], in: pause)
+            && source.contains("return mpv_set_property(mpv, name, MPV_FORMAT_FLAG, &data) >= 0")
+    }
+
     static func main() throws {
         let appRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -472,7 +505,13 @@ private enum MPVCacheFlushReceiptContractTests {
         let policy = try String(contentsOf: policyURL, encoding: .utf8)
 
         check("252 maintenance requires low-level completion and exact-owner restoration", hasNonDestructiveReanchor(controller, policy: policy))
-        check("hostile: option readback cannot replace low-level evidence", !hasNonDestructiveReanchor(controller.replacingOccurrences(of: "demuxer-cache-state/debug-low-level-seeks", with: "demuxer-seekable-cache"), policy: policy))
+        check("native cache event captures source command and pause at dequeue", hasCacheNativeOwnershipContract(controller))
+        for needle in ["generation: witness.commandGeneration", "native.lowLevelSeeks == flight.lowLevelSeeksAtIssue",
+                       "let rawCacheWitness = self.cacheReanchorEventWitness", "if setFlag(MPVProperty.pause, false)"] {
+            check("hostile: cache ownership contract rejects removal of \(needle)",
+                  !hasCacheNativeOwnershipContract(controller.replacingOccurrences(of: needle, with: "/* removed */")))
+        }
+        check("hostile: option readback cannot replace low-level evidence", !hasNonDestructiveReanchor(controller.replacingOccurrences(of: "cache.integer(\"debug-low-level-seeks\")", with: "cache.integer(\"demuxer-seekable-cache\")"), policy: policy))
         check("hostile: stale owner cannot restore replacement options", !hasNonDestructiveReanchor(controller.replacingOccurrences(of: "activeLoadToken == flight.owner", with: "true"), policy: policy))
         check("hostile: timeout cannot count as memory relief", !hasNonDestructiveReanchor(controller, policy: policy.replacingOccurrences(of: "return finish(result: .timedOut)", with: "return finish(result: .commandAccepted)")))
         check("hostile: zero after high-target reload cannot restore", !hasNonDestructiveReanchor(controller, policy: policy.replacingOccurrences(of: "abs(position - intent.target) <= 2", with: "true")))
@@ -584,7 +623,7 @@ private enum MPVCacheFlushReceiptContractTests {
               !hasSingleFlightAdmissionContract(postDropOwnerMutant))
 
         let asynchronousSeekMutant = replacingFirst(
-            "let commandResult = mpv_command_string(",
+            "let commandResult = optionStatus < 0 ? optionStatus : mpv_command_string(",
             with: "let commandResult = mpv_command_async(mpv, flight.id, &cargs)",
             in: controller
         )

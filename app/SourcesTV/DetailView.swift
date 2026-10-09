@@ -30,6 +30,7 @@ struct DetailView: View {
     var initialResumeSeconds: Double? = nil
     var initialVideoID: String? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     @State private var resumeHintOpenedAt = Date()
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
@@ -115,12 +116,14 @@ struct DetailView: View {
     /// Navigation-carried Trakt state is private to the credential session that created it. Revalidate at
     /// every use because the detail page can remain mounted across sign-out or an account replacement.
     private var validInitialResumeSeconds: Double? {
+        guard initialContinueWatchingIntent?.isCurrent() != false else { return nil }
         guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialResumeSeconds
     }
 
     private var validInitialVideoID: String? {
+        guard initialContinueWatchingIntent?.isCurrent() != false else { return nil }
         guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialVideoID
@@ -1134,6 +1137,7 @@ struct DetailView: View {
                                                identityRoles: sourceIndexRoles,
                                                initialStartAtSeconds: validInitialResumeSeconds,
                                                initialTraktSessionID: initialTraktSessionID,
+                                               initialContinueWatchingIntent: initialContinueWatchingIntent,
                                                secondaryAction: hasFullTrailer(m) ? AnyView(trailerChip(m)) : nil,
                                                onDetailMove: { direction, region in
                                                    handleDetailMove(direction, from: region, using: proxy)
@@ -1385,7 +1389,8 @@ struct DetailView: View {
                                                            season: primaryEpisode.season ?? 0,
                                                            episodes: orderedEpisodes,
                                                            initialStartAtSeconds: primaryResumeSeconds,
-                                                           initialTraktSessionID: initialTraktSessionID)   // ALL seasons ordered → auto-advance crosses the season boundary
+                                                           initialTraktSessionID: initialTraktSessionID,
+                                                           initialContinueWatchingIntent: initialContinueWatchingIntent)   // ALL seasons ordered → auto-advance crosses the season boundary
                                     } label: {
                                         Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume,
                                                                   resumeSeconds: primaryResumeSeconds),
@@ -1757,10 +1762,11 @@ struct DetailView: View {
            !localWatched.contains(video.id) {
             return (video, true)
         }
-        if let next = ordered.first(where: { !watched.contains($0.id) }) {
+        if let next = EpisodeDefaultSelectionPolicy.firstUnwatched(in: ordered, season: { $0.season },
+                                                                   isWatched: { watched.contains($0.id) }) {
             return (next, false)
         }
-        return ordered.first.map { ($0, false) }
+        return EpisodeDefaultSelectionPolicy.fallback(in: ordered, season: { $0.season }).map { ($0, false) }
     }
 
     private func primaryEpisodeLabel(_ video: CoreVideo, isResume: Bool, resumeSeconds: Double? = nil) -> String {
@@ -2067,7 +2073,7 @@ struct CoreSeasonedEpisodes: View {
     }
 
     private var firstUnwatchedSeason: Int? {
-        videos
+        let ordered = videos
             .sorted {
                 let leftSeason = $0.season ?? 0
                 let rightSeason = $1.season ?? 0
@@ -2077,8 +2083,8 @@ struct CoreSeasonedEpisodes: View {
                 if leftEpisode != rightEpisode { return leftEpisode < rightEpisode }
                 return $0.id < $1.id
             }
-            .first { !watched.contains($0.id) }?
-            .season
+        return EpisodeDefaultSelectionPolicy.firstUnwatched(in: ordered, season: { $0.season },
+                                                             isWatched: { watched.contains($0.id) })?.season
     }
 
     /// Spoiler-safe veil for one episode on the detail list: mode ON, the episode is NOT watched, and it is
@@ -2278,6 +2284,7 @@ struct CoreEpisodeStreams: View {
     var episodes: [CoreVideo] = []
     var initialStartAtSeconds: Double? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
@@ -2301,7 +2308,8 @@ struct CoreEpisodeStreams: View {
         season: Int,
         episodes: [CoreVideo] = [],
         initialStartAtSeconds: Double? = nil,
-        initialTraktSessionID: TraktSessionID? = nil
+        initialTraktSessionID: TraktSessionID? = nil,
+        initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     ) {
         self.meta = meta
         self.video = video
@@ -2309,6 +2317,7 @@ struct CoreEpisodeStreams: View {
         self.episodes = episodes
         self.initialStartAtSeconds = initialStartAtSeconds
         self.initialTraktSessionID = initialTraktSessionID
+        self.initialContinueWatchingIntent = initialContinueWatchingIntent
         _currentVideo = State(initialValue: video)
     }
 
@@ -2410,6 +2419,7 @@ struct CoreEpisodeStreams: View {
                                    ),
                                    initialStartAtSeconds: initialStartAtSeconds,
                                    initialTraktSessionID: initialTraktSessionID,
+                                   initialContinueWatchingIntent: initialContinueWatchingIntent,
                                    onDetailMove: { direction, region in
                                        guard direction == .up,
                                              TVDetailActionFocusPolicy.destination(
@@ -2588,6 +2598,7 @@ struct CoreStreamList: View {
     var initialStartAtSeconds: Double? = nil
     /// Exact Trakt session that owns `initialStartAtSeconds`. nil means the offset is local, not remote.
     var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     /// Optional detail action supplied by the mounting page (the movie trailer). It joins the secondary
     /// row so every action remains in one of the two semantic focus sections instead of forming a stray
     /// third row above the source controls. `AnyView` keeps this view's generic surface unchanged for the
@@ -3092,7 +3103,8 @@ struct CoreStreamList: View {
                     }
                     if actionRows.showsDownload, let best {
                         downloadChip(ready: watchReady) {
-                            requestDownload { Task { await downloadBest(best) } }
+                            let owner = NativeDownloadOwner()
+                            requestDownload { Task { await downloadBest(best, owner: owner) } }
                         }
                     }
                     WatchlistChip()
@@ -3340,28 +3352,30 @@ struct CoreStreamList: View {
     /// the URL EXACTLY as `playResolving` does (cached-debrid direct link preferred, else the source's
     /// `playableURL`) and hands the SAME `PlaybackMeta` this list carries to `DownloadManager`. Device-local
     /// only; writes nothing to the account / libraryItem docs. No-op without a `meta` or a playable URL.
-    @MainActor private func downloadBest(_ best: CoreStream) async {
+    @MainActor private func downloadBest(_ best: CoreStream, owner: NativeDownloadOwner) async {
+        guard owner.allows(best) else { return }
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
         guard let pm = meta else { return }
         let hint = downloadEpisode(pm)
-        let resolved: URL?
+        let ref: DebridPlaybackRef?
         if episodeStreamId != nil, best.url == nil, hint == nil {
-            resolved = nil
+            ref = nil
         } else {
-            resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: hint)
+            ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: best, episode: hint)
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
-            ) else { return }
+            ), owner.allows(best) else { ref?.nativeUsenetLease?.close(); return }
         }
         guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-            isUsenet: best.isUsenet, resolvedURL: resolved,
+            isUsenet: best.isUsenet, resolvedURL: ref?.url,
             fallbackURL: best.playableURL(isEpisode: episodeStreamId != nil)
         ) else { return }
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
-        DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
-                                        sourceName: best.name, qualityText: StreamRanking.signature(best))
+        await DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
+                                        sourceName: best.name, qualityText: StreamRanking.signature(best),
+                                        nativeUsenetLease: ref?.nativeUsenetLease, nativeOwner: owner)
     }
 
     /// The episode context for a debrid resolve, so a series episode resolves to the right file inside a
@@ -3377,6 +3391,7 @@ struct CoreStreamList: View {
     private var isEpisodePlayback: Bool { episodeStreamId != nil }
 
     private func targetIsCurrent(videoID: String?, generation: Int) -> Bool {
+        guard initialContinueWatchingIntent?.isCurrent() != false else { return false }
         if let episodeTargetIsCurrent {
             return episodeTargetIsCurrent(videoID, generation)
         }
@@ -3961,14 +3976,11 @@ struct CoreStreamList: View {
                                                 initialEnginePreference: enginePreference ?? launchEnginePreference,
                                                 debridRef: ref,
                                                 sourceStream: stream,
+                                                sourceAddon: sourceAddon,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID, wasExplicitPick: explicit,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
-            if explicit, let meta, meta.type == "series" {
-                SeriesSourceSticky.record(seriesKey: meta.libraryId, addon: sourceAddon,
-                                          bingeGroup: stream.behaviorHints?.bingeGroup)
-            }
             return
         }
         // A raw NZB URL is a descriptor for the resolver, never media bytes for the player.
@@ -3991,15 +4003,12 @@ struct CoreStreamList: View {
                                             headers: stream.requestHeaders,
                                             initialEnginePreference: enginePreference ?? launchEnginePreference,
                                             sourceStream: stream,
+                                            sourceAddon: sourceAddon,
                                             debridCachedHashes: debridCache.cachedHashes,
                                             enginePlayerVideoId: engineVideoID,
                                             wasExplicitPick: explicit,
                                             startFromZero: fromStart,
                                             startAtSeconds: admittedStart.seconds)
-        if explicit, let meta, meta.type == "series" {
-            SeriesSourceSticky.record(seriesKey: meta.libraryId, addon: sourceAddon,
-                                      bingeGroup: stream.behaviorHints?.bingeGroup)
-        }
     }
 
     private var launchPlayerLabel: String {
@@ -4324,21 +4333,53 @@ struct LibraryChip: View {
 /// watchlisted. The tvOS twin of the touch `iOSWatchlistChip`.
 struct WatchlistChip: View {
     @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var profiles: ProfileStore
     @State private var isWatchlisted = false
+    @StateObject private var watchlistAction = ProfileMutationPresentation()
 
     var body: some View {
         if let meta = core.metaDetails?.meta, meta.id.hasPrefix("tt") || meta.id.hasPrefix("tmdb") {
             Button {
-                isWatchlisted = LibraryAutoAdd.toggleWatchlist(id: meta.id, type: meta.type,
-                                                               name: meta.name, poster: meta.poster)
+                let target = PlaybackMutationTarget.capture(core: core)
+                let profileID = profiles.activeID
+                let isCurrent = {
+                    profiles.activeID == profileID && target.stillOwnsCurrentContext(core: core)
+                        && core.metaDetails?.meta?.id == meta.id && core.metaDetails?.meta?.type == meta.type
+                }
+                watchlistAction.start(operation: {
+                    guard isCurrent() else { return false }
+                    do {
+                        _ = try await LibraryAutoAdd.toggleWatchlistAcknowledged(
+                            id: meta.id, type: meta.type, name: meta.name, poster: meta.poster, target: target)
+                        return isCurrent()
+                    } catch { return false }
+                }, failureMessage: {
+                    isCurrent() ? "Couldn't update Watchlist. Please try again." : "Profile changed. Please try again."
+                }, onSuccess: {
+                    guard isCurrent() else { return }
+                    isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type)
+                })
             } label: {
                 Label(isWatchlisted ? "In Watchlist" : "Watchlist",
                       systemImage: isWatchlisted ? "star.fill" : "star")
             }
             .buttonStyle(ChipButtonStyle(selected: isWatchlisted))
-            .onAppear { isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id) }
+            .disabled(watchlistAction.isRunning)
+            .onAppear { isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type) }
+            .onDisappear { watchlistAction.cancel() }
+            .onChange(of: profiles.activeID) { _ in
+                watchlistAction.cancel()
+                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type)
+            }
+            .onChange(of: meta.type + ":" + meta.id) { _ in
+                watchlistAction.cancel()
+                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type)
+            }
             .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
-                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id)
+                isWatchlisted = LibraryAutoAdd.isWatchlisted(meta.id, type: meta.type)
+            }
+            if let error = watchlistAction.errorMessage {
+                Text(error).font(.caption).foregroundStyle(Theme.Palette.textSecondary)
             }
         }
     }

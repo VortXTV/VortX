@@ -30,6 +30,8 @@ struct ProfileDiscoveryPreferences: Codable, Equatable {
     var hideSearchTab: Bool? = nil
     var showCollectionsHome: Bool? = nil
     var showCollectionsDiscover: Bool? = nil
+    var continueWatchingSource: String? = nil
+    var continueWatchingWindow: String? = nil
 }
 
 /// The one persistence bridge for profile-owned catalog and Discover values. Existing UI and
@@ -50,6 +52,8 @@ enum ProfileDiscoveryPreferencesStore {
         static let hideSearchTab = TabBarPrefs.hideSearch
         static let showCollectionsHome = "vortx.home.showCollectionsHub"
         static let showCollectionsDiscover = "vortx.discover.showCollectionsHub"
+        static let continueWatchingSource = ContinueWatchingPreferences.sourceKey
+        static let continueWatchingWindow = ContinueWatchingPreferences.windowKey
     }
 
     /// The legacy keys are a projection of whichever profile is active on THIS device. They remain
@@ -70,6 +74,8 @@ enum ProfileDiscoveryPreferencesStore {
         Key.hideSearchTab,
         Key.showCollectionsHome,
         Key.showCollectionsDiscover,
+        Key.continueWatchingSource,
+        Key.continueWatchingWindow,
     ]
 
     static func capture(from defaults: UserDefaults = .standard) -> ProfileDiscoveryPreferences {
@@ -89,7 +95,9 @@ enum ProfileDiscoveryPreferencesStore {
             hideLibraryTab: defaults.bool(forKey: Key.hideLibraryTab),
             hideSearchTab: defaults.bool(forKey: Key.hideSearchTab),
             showCollectionsHome: collectionsVisible(Key.showCollectionsHome, from: defaults),
-            showCollectionsDiscover: collectionsVisible(Key.showCollectionsDiscover, from: defaults))
+            showCollectionsDiscover: collectionsVisible(Key.showCollectionsDiscover, from: defaults),
+            continueWatchingSource: defaults.string(forKey: Key.continueWatchingSource),
+            continueWatchingWindow: defaults.string(forKey: Key.continueWatchingWindow))
     }
 
     /// Apply one profile's snapshot to the legacy keys. `resetUnset` is true only for an actual
@@ -134,6 +142,32 @@ enum ProfileDiscoveryPreferencesStore {
             if let value { defaults.set(value, forKey: key) }
             else if resetUnset { defaults.set(true, forKey: key) }
         }
+        applyContinueWatching(prefs, resetUnset: resetUnset, to: defaults)
+    }
+    /// Only these two fields may be projected from an acknowledged migration while unrelated
+    /// discovery edits remain queued. This is still a profile projection, never roster authority.
+    static func applyContinueWatching(_ prefs: ProfileDiscoveryPreferences?, resetUnset: Bool,
+                                     to defaults: UserDefaults = .standard) {
+        let previousContinueWatching = ContinueWatchingPreferences.current(defaults)
+        let nextSource = prefs?.continueWatchingSource ?? (resetUnset ? "local" : defaults.string(forKey: Key.continueWatchingSource))
+        let nextWindow = prefs?.continueWatchingWindow.map { ContinueWatchingWindow(rawValue: $0)?.rawValue ?? "20" }
+            ?? (resetUnset ? "20" : defaults.string(forKey: Key.continueWatchingWindow))
+        if previousContinueWatching != ContinueWatchingPreferences.value(source: nextSource, window: nextWindow) {
+            ContinueWatchingPreferences.retireSelection()
+        }
+        if let raw = prefs?.continueWatchingSource {
+            defaults.set(raw, forKey: Key.continueWatchingSource)
+        } else if resetUnset {
+            defaults.set("local", forKey: Key.continueWatchingSource)
+        }
+        if let raw = prefs?.continueWatchingWindow {
+            defaults.set(ContinueWatchingWindow(rawValue: raw)?.rawValue ?? "20", forKey: Key.continueWatchingWindow)
+        } else if resetUnset {
+            defaults.set("20", forKey: Key.continueWatchingWindow)
+        }
+        // One compatibility projection, not a second user choice or history owner.
+        defaults.set(ContinueWatchingPreferences.current(defaults).source == .trakt,
+                     forKey: "vortx.trakt.continueWatching")
     }
 
     static func collectionsVisible(_ key: String, from defaults: UserDefaults = .standard) -> Bool {

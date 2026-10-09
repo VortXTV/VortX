@@ -22,6 +22,7 @@ struct Issue164TraktContractTests {
         let provider = read(app, "SourcesShared/ExternalScrobbleProvider.swift")
         let settings = read(app, "SourcesShared/ExternalServicesSettingsView.swift")
         let shadow = read(app, "SourcesShared/TraktPlaybackShadow.swift")
+        let homeCWSelection = read(app, "SourcesShared/HomeContinueWatchingSelection.swift")
         let auth = read(app, "SourcesShared/TraktAuth.swift")
         let service = read(app, "SourcesShared/TraktService.swift")
         let syncEngine = read(app, "SourcesShared/TraktSyncEngine.swift")
@@ -65,19 +66,20 @@ struct Issue164TraktContractTests {
                 "Trakt operations must leave sanitized success/failure receipts")
         require(provider.contains("static let traktContinueWatching = \"vortx.trakt.continueWatching\""),
                 "Continue Watching source key must stay stable")
-        require(settings.contains("Use Trakt for Continue Watching"),
+        require(settings.contains("Choose Local / VortX, Trakt, or SIMKL")
+                    && read(app, "SourcesShared/ContinueWatchingSettingsView.swift").contains("Continue Watching source"),
                 "Trakt source selection must be user-visible")
         require(shadow.contains("TraktContinueWatchingFold.fold(playbackRows)"),
                 "whole playback snapshots must feed the shared fold")
         require(shadow.contains("?extended=full"),
                 "runtime-bearing Trakt rows must be requested")
-        require(tvHome.contains("continueWatchingSelection(")
-                    && tvHome.contains("fallback: core.continueWatching")
-                    && tvHome.contains("libraryItems: core.library?.catalog ?? []"),
+        require(tvHome.contains("HomeContinueWatchingSelection.current(core: core, profiles: profiles)")
+                    && homeCWSelection.contains("fallback: localItems")
+                    && homeCWSelection.contains("libraryItems: core.library?.catalog ?? []"),
                 "tvOS Home must consume the selected Trakt source and local catalog artwork")
-        require(iosHome.contains("continueWatchingSelection(")
-                    && iosHome.contains("fallback: core.continueWatching")
-                    && iosHome.contains("libraryItems: core.library?.catalog ?? []"),
+        require(iosHome.contains("HomeContinueWatchingSelection.current(core: core, profiles: profiles)")
+                    && homeCWSelection.contains("fallback: localItems")
+                    && homeCWSelection.contains("libraryItems: core.library?.catalog ?? []"),
                 "iOS and macOS Home must consume the selected Trakt source and local catalog artwork")
 
         // Blocker 2: the offset printed on a Trakt card is the direct player's start offset.
@@ -92,18 +94,18 @@ struct Issue164TraktContractTests {
             [
                 "guard TraktPlaybackSnapshotPolicy.canCommit(",
                 "Self.saveCache(",
-                "guard TraktPlaybackSnapshotPolicy.canCommit(",
+                "guard context.isCurrent(core: .shared, profiles: .shared), TraktPlaybackSnapshotPolicy.canCommit(",
                 "lastActivityStamps = activity",
                 "lock.unlock()",
-                "Self.postChanged()",
+                "Self.postChanged(context: context)",
             ]
         ), "old-account cache persistence must happen under the generation lock")
 
         // Blocker 4: Trakt rows never route their dismiss into the local engine.
-        require(tvHome.contains("menu: continueWatchingSelection.source == .trakt")
+        require(tvHome.contains("menu: renderedContinueWatching.selection.source.isPrivate")
                     && tvHome.contains("? .none"),
                 "tvOS must use actual row provenance before omitting local dismiss")
-        require(iosHome.contains("menu: renderedContinueWatching.provenance.source == .trakt")
+        require(iosHome.contains("menu: renderedContinueWatching.provenance.source.isPrivate")
                     && iosHome.contains("? .none"),
                 "iOS/macOS must use actual row provenance before omitting local dismiss")
 
@@ -395,7 +397,7 @@ struct Issue164TraktContractTests {
                 "iOS direct-resume fallback must retain both local and Trakt resume targets")
         let iosContinueWatchingProvenance = segment(
             in: iosHome,
-            from: "private struct iOSCWProducerProvenance: Sendable",
+            from: "private struct iOSCWProducerProvenance: @unchecked Sendable",
             to: "struct iOSHomeView: View"
         )
         require(iosContinueWatchingProvenance.contains("case .local:")
@@ -413,17 +415,19 @@ struct Issue164TraktContractTests {
             from: "private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot",
             to: "#if os(macOS)"
         )
-        require(occurrences(of: "continueWatchingSelection", in: iosContinueWatchingSnapshot) == 1
-                    && iosContinueWatchingSnapshot.contains("let selection = continueWatchingSelection")
+        require(occurrences(of: "continueWatchingSnapshot", in: iosContinueWatchingSnapshot) == 1
+                    && iosContinueWatchingSnapshot.contains("let snapshot = continueWatchingSnapshot")
+                    && iosContinueWatchingSnapshot.contains("let selection = snapshot.selection")
                     && iosContinueWatchingSnapshot.contains("let items = selection.items.map")
                     && iosContinueWatchingSnapshot.contains("items: items")
                     && iosContinueWatchingSnapshot.contains("source: selection.source")
-                    && iosContinueWatchingSnapshot.contains("traktSessionID: selection.sessionID"),
+                    && iosContinueWatchingSnapshot.contains("traktSessionID: selection.sessionID")
+                    && iosContinueWatchingSnapshot.contains("intent: snapshot.intent"),
                 "iOS rendered Continue Watching items and provenance must come from one selection snapshot")
         let iosHomeBody = segment(
             in: iosHome,
             from: """
-            var body: some View {
+            private var homeNavigation: some View {
                     let renderedContinueWatching = continueWatchingRenderSnapshot
             """,
             to: "private func refreshReleaseCalendar()"
@@ -479,11 +483,11 @@ struct Issue164TraktContractTests {
         let iosEpisodeContentLaunches = segment(
             in: iosDetail,
             from: "private func play(\n        _ stream: CoreStream,\n        url: URL,",
-            to: "private func autoPickAndPlayEpisode() async"
+            to: "private func autoPickAndPlayEpisode("
         )
         let iosEpisodeAutoPick = segment(
             in: iosDetail,
-            from: "private func autoPickAndPlayEpisode() async",
+            from: "private func autoPickAndPlayEpisode(",
             to: "#if !os(tvOS)"
         )
         require(iosDetail.contains("var initialResumeSeconds: Double? = nil")
@@ -497,7 +501,7 @@ struct Issue164TraktContractTests {
                     && occurrences(of: "initialStartGate.admit(", in: iosEpisodeContentLaunches) == 2
                     && occurrences(of: "currentSessionID: TraktAuth.storedSessionID", in: iosEpisodeContentLaunches) == 2
                     && occurrences(of: "presentation = .player", in: iosEpisodeContentLaunches) == 2
-                    && iosEpisodeAutoPick.contains("await playBest(candidates, labeledBest: best)")
+                    && iosEpisodeAutoPick.contains("await playBest(candidates, labeledBest: best")
                     && !iosEpisodeAutoPick.contains("presentation = .player")
                     && !iosDetail.contains("didConsumeInitialResume")
                     && !iosDetail.contains("didConsumeInitialStart"),
@@ -565,7 +569,7 @@ struct Issue164TraktContractTests {
                     && iosHome.contains("TraktAuth.storedSessionID == expectedTraktSession"),
                 "remote Continue Watching actions and targets must carry and revalidate their exact Trakt session")
         require(tvHome.contains("cw: localHistory")
-                    && tvHome.contains("focusModel: continueWatchingSelection.source == .trakt ? nil")
+                    && tvHome.contains("focusModel: renderedContinueWatching.selection.source.isPrivate ? nil")
                     && tvSharedUI.contains("struct WarmPosterArt")
                     && iosHome.contains("struct WarmCachedPosterImage")
                     && iosHome.contains("From Trakt")

@@ -37,10 +37,14 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
     val prefs = remember { HomeDiscoverPreferences(context) }
 
     var showCuratedRails by remember { mutableStateOf(prefs.showCuratedRails) }
+    var continueWatchingSource by remember { mutableStateOf(prefs.continueWatchingSource) }
+    var continueWatchingWindow by remember { mutableStateOf(prefs.continueWatchingWindow) }
     var showHubHome by remember { mutableStateOf(prefs.showCollectionsHubHome) }
     var showHubDiscover by remember { mutableStateOf(prefs.showCollectionsHubDiscover) }
     var refreshCadence by remember { mutableStateOf(prefs.refreshCadence) }
     var mergeDiscoverSearch by remember { mutableStateOf(prefs.mergeDiscoverSearch) }
+    var cinemaQuickView by remember { mutableStateOf(prefs.cinemaQuickView) }
+    var mergeHomeDiscover by remember { mutableStateOf(prefs.mergeHomeDiscover) }
     var regionPreference by remember { mutableStateOf(prefs.regionPreference) }
     var hiddenCategories by remember { mutableStateOf(prefs.hiddenCategories) }
     var showFinancials by remember { mutableStateOf(prefs.showFinancials) }
@@ -50,10 +54,14 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
     DisposableEffect(prefs) {
         val stop = prefs.observeChanges {
             showCuratedRails = prefs.showCuratedRails
+            continueWatchingSource = prefs.continueWatchingSource
+            continueWatchingWindow = prefs.continueWatchingWindow
             showHubHome = prefs.showCollectionsHubHome
             showHubDiscover = prefs.showCollectionsHubDiscover
             refreshCadence = prefs.refreshCadence
             mergeDiscoverSearch = prefs.mergeDiscoverSearch
+            cinemaQuickView = prefs.cinemaQuickView
+            mergeHomeDiscover = prefs.mergeHomeDiscover
             regionPreference = prefs.regionPreference
             hiddenCategories = prefs.hiddenCategories
             showFinancials = prefs.showFinancials
@@ -83,6 +91,13 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
+            SettingsSection(title = "Continue Watching", footer = "Choose the service for this profile's Home row. Connect Trakt or SIMKL in Integrations.") {
+                PickerRow(label = "Source", options = com.vortx.android.home.ContinueWatchingSource.entries
+                    .filter { it != com.vortx.android.home.ContinueWatchingSource.UNKNOWN }.map { it.raw to it.label },
+                    selectedId = continueWatchingSource, onSelect = { continueWatchingSource = it; prefs.continueWatchingSource = it })
+                PickerRow(label = "Show", options = com.vortx.android.home.ContinueWatchingWindow.entries.map { it.raw to it.label },
+                    selectedId = continueWatchingWindow, onSelect = { continueWatchingWindow = it; prefs.continueWatchingWindow = it })
+            }
             SettingsSection(
                 title = "Home",
                 footer = "Editorial rows are built-in and show even with no add-ons. Collections needs a TMDB key.",
@@ -103,6 +118,24 @@ fun HomeDiscoverSettingsScreen(onBack: () -> Unit, modifier: Modifier = Modifier
                     onCheckedChange = {
                         showHubHome = it
                         prefs.showCollectionsHubHome = it
+                    },
+                )
+                ToggleRow(
+                    label = "Open Quick View from catalog cards",
+                    detail = "Home, Discover, Search and Library title taps open Watch, Watchlist and Details. Turn off to open Details directly. Continue Watching resumes directly.",
+                    checked = cinemaQuickView,
+                    onCheckedChange = {
+                        cinemaQuickView = it
+                        prefs.cinemaQuickView = it
+                    },
+                )
+                ToggleRow(
+                    label = "Combine Home & Discover",
+                    detail = "Featured rows and Browse filters share Home. Turn off to restore a separate Discover tab.",
+                    checked = mergeHomeDiscover,
+                    onCheckedChange = {
+                        mergeHomeDiscover = it
+                        prefs.mergeHomeDiscover = it
                     },
                 )
             }

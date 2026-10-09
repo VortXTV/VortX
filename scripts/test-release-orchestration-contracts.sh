@@ -64,7 +64,188 @@ for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
     [[ -z "$engine_pin" || "$engine_pin" = "$pin" ]] || fail "Apple/Android wrapper pins differ"
     engine_pin="$pin"
 done
+candidate_signing_step="$(awk '/name: Verify signed release artifacts against the pinned production signer/{active=1; next}
+    active && /^[[:space:]]+- name:/{exit} active{print}' "$ANDROID_CI_WF")"
+require_grep "signed candidate APK and AAB both verify complete engine ABIs" \
+    'verify-native-android-artifacts\.sh .*--native-only|--native-only --staged-dir android/app/src/main/jniLibs' \
+    <(printf '%s\n' "$candidate_signing_step")
 ok "Apple and both Android lanes use one exact wrapper revision"
+native_pin=""
+for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
+    pin="$(awk '/repository: VortXTV\/vortx-core/{active=1; next}
+        active && /^[[:space:]]+ref:/{print $2; exit}' "$wf")"
+    [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || fail "$(basename "$wf") native engine pin must be immutable"
+    [[ -z "$native_pin" || "$native_pin" = "$pin" ]] || fail "Apple/Android native engine pins differ"
+    native_pin="$pin"
+done
+ok "Apple and both Android lanes use one exact native engine revision"
+
+# A directly invoked gate must survive Git checkout as executable; otherwise CI fails before its
+# artifact checks run. Inspect the actual workflow commands and tracked modes, not a prose list.
+direct_helpers=0
+while IFS= read -r helper; do
+    [[ "$helper" =~ ^\./scripts/[A-Za-z0-9._-]+\.sh$ ]] || fail "unsafe direct Apple helper path: $helper"
+    relative="${helper#./}"
+    mode="$(git -C "$REPO_ROOT" ls-files -s -- "$relative" | awk '{print $1}')"
+    [[ "$mode" == 100755 && -x "$REPO_ROOT/$relative" ]] \
+        || fail "Apple directly executes a non-executable tracked helper: $relative (mode $mode)"
+    direct_helpers=$((direct_helpers + 1))
+done < <(awk '/^[[:space:]]*(run: )?\.\/scripts\// {
+    for (i=1; i<=NF; i++) if ($i ~ /^\.\/scripts\/.*\.sh$/) print $i
+}' "$APPLE_RELEASE_WF" | sort -u)
+[[ "$direct_helpers" -gt 0 ]] || fail "Apple direct-helper contract inspected no commands"
+ok "all actual direct Apple build and artifact-gate helpers have executable Git modes"
+
+# Execute only the real MPV selection prefix, stopping before its first network/download command.
+# This proves the reviewed default works with empty push/dispatch inputs, overrides are atomic,
+# and the retired digest remains rejected independently of the new EXPECTED digest.
+readonly REVIEWED_MPV_SHA='737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1'
+readonly REVIEWED_MPV_URL='https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip'
+readonly LEGACY_MPV_SHA='6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1'
+mpv_selection="$(awk '
+    /name: Fetch the MPVKit-DVFEL artifacts \(pinned, sha256-verified\)/ { step=1; next }
+    step && /^        run: \|$/ { script=1; next }
+    script && /curl -sfL/ { exit }
+    script { sub(/^          /, ""); print }
+' "$APPLE_RELEASE_WF")"
+[[ "$mpv_selection" == *'LEGACY_MPVKIT_SHA256='* && "$mpv_selection" == *'EXPECTED='* ]] \
+    || fail "MPV selection prefix is missing"
+mpv_selected_pair() {
+    REVIEWED_MPVKIT_URL="$1" REVIEWED_MPVKIT_SHA256="$2" \
+        bash -c "$mpv_selection"$'\n''printf "%s\\n%s\\n" "$URL" "$EXPECTED"'
+}
+expected_mpv_pair="$REVIEWED_MPV_URL"$'\n'"$REVIEWED_MPV_SHA"
+[[ "$(mpv_selected_pair '' '')" = "$expected_mpv_pair" ]] \
+    || fail "empty MPV inputs do not select the pinned fresh package"
+[[ "$(mpv_selected_pair "$REVIEWED_MPV_URL" "$REVIEWED_MPV_SHA")" = "$expected_mpv_pair" ]] \
+    || fail "valid explicit fresh MPV pair was rejected"
+for invalid in url-only sha-only bad-sha foreign-url old-sha; do
+    case "$invalid" in
+        url-only) override_url="$REVIEWED_MPV_URL"; override_sha='' ;;
+        sha-only) override_url=''; override_sha="$REVIEWED_MPV_SHA" ;;
+        bad-sha) override_url="$REVIEWED_MPV_URL"; override_sha='latest' ;;
+        foreign-url) override_url='https://example.com/player.zip'; override_sha="$REVIEWED_MPV_SHA" ;;
+        old-sha) override_url="$REVIEWED_MPV_URL"; override_sha="$LEGACY_MPV_SHA" ;;
+    esac
+    if mpv_selected_pair "$override_url" "$override_sha" >/dev/null 2>&1; then
+        fail "MPV selector accepted $invalid override"
+    fi
+done
+require_grep "secretless Apple validation uses the same reviewed MPV digest" \
+    "MPVKIT_ARTIFACTS_SHA256: \"$REVIEWED_MPV_SHA\"" "$VALIDATION_WF"
+grep -Fq "$REVIEWED_MPV_URL" "$VALIDATION_WF" \
+    || fail "secretless Apple validation uses a different MPV URL"
+require_grep "secretless Apple validation retains actual player content verification" \
+    'bash scripts/verify-mpvkit-dvfel-artifacts\.sh "\$DEST"' "$VALIDATION_WF"
+ok "actual MPV selector accepts the reviewed fallback/pair and rejects partial, foreign and legacy inputs"
+
+# Exercise the actual effective expression and generator shell routing without compiling or
+# downloading anything. Command fixtures log only the selected XcodeGen route; the real generated
+# target/dependency/define/floor contract remains in test-native-apple-project.rb.
+node --input-type=module - "$APPLE_RELEASE_WF" "$REPO_ROOT" <<'NODE'
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+const [workflow, root] = process.argv.slice(2);
+const source = readFileSync(workflow, 'utf8');
+const input = source.match(/^      native_only:\n([\s\S]*?)(?=^      [a-z_]+:)/m)?.[1];
+assert.ok(input, 'native selection input must exist');
+assert.match(input, /^        type: boolean$/m);
+const defaultValue = input.match(/^        default: (true|false)$/m)?.[1];
+assert.equal(defaultValue, 'true', 'shipping dispatch must default to native');
+const build = source.match(/^  build-tvos:\n([\s\S]*?)^  attach-release:/m)?.[1];
+assert.ok(build, 'build job must be distinct from the release-write job');
+const expression = build.match(/^      VORTX_NATIVE_ONLY: \$\{\{ (.+) \}\}$/m)?.[1];
+assert.ok(expression, 'build job must define its single effective selector');
+assert.equal((build.match(/inputs\.native_only/g) ?? []).length, 1,
+  'no build consumer may bypass the effective selector with absent push inputs');
+const evaluate = new Function('github', 'inputs', `return (${expression});`);
+const step = (name) => {
+  const block = build.split(/^      - /m).find(value => value.startsWith(`name: ${name}\n`));
+  assert.ok(block, `${name}: required step missing`);
+  return block;
+};
+const run = (block) => {
+  const script = block.split('        run: |\n')[1];
+  assert.ok(script, 'fixture requires the actual step shell');
+  return script.split('\n').filter(line => line.startsWith('          '))
+    .map(line => line.slice(10)).join('\n');
+};
+const shellConsumers = ['Generate the Xcode project', 'Smoke-test tvOS launch in a simulator (fail closed)',
+  'Gate iOS-simulator link + dSYM (fail closed)', 'Package Full tvOS test IPA', 'Package the IPAs'];
+assert.equal((build.match(/^          NATIVE_ONLY:/gm) ?? []).length, shellConsumers.length);
+for (const name of shellConsumers) {
+  assert.match(step(name), /^          NATIVE_ONLY: \$\{\{ env\.VORTX_NATIVE_ONLY \}\}$/m,
+    `${name}: use the same effective native selection`);
+}
+const proofConditions = ['Capture exact native SDK and player inputs before app compilation',
+  'Verify exact native app selection and linked inputs'].map(name => {
+    const condition = step(name).match(/^        if: (.+)$/m)?.[1];
+    assert.equal(condition, "env.VORTX_NATIVE_ONLY == 'true'", `${name}: proof condition`);
+    return new Function('env', `return (${condition});`);
+  });
+const comparison = step('Constrain legacy comparison to artifact-only builds');
+const comparisonCondition = comparison.match(/^        if: (.+)$/m)?.[1];
+assert.equal(comparisonCondition, "env.VORTX_NATIVE_ONLY != 'true'");
+const comparisonRequired = new Function('env', `return (${comparisonCondition});`);
+const generator = run(step('Generate the Xcode project'));
+const commands = 'ruby() { printf "ruby:%s\\n" "$*"; }\nxcodegen() { printf "xcodegen:%s\\n" "$*"; }\n';
+for (const [name, event, inputs, expected] of [
+  ['push without inputs', 'push', {}, true],
+  ['push ignores dispatch comparison value', 'push', {native_only: false}, true],
+  ['default dispatch', 'workflow_dispatch', {native_only: defaultValue === 'true'}, true],
+  ['explicit native dispatch', 'workflow_dispatch', {native_only: true}, true],
+  ['explicit legacy comparison', 'workflow_dispatch', {native_only: false}, false],
+]) {
+  const selected = evaluate({event_name: event}, inputs);
+  assert.equal(selected, expected, name);
+  const env = {VORTX_NATIVE_ONLY: String(selected)};
+  for (const proof of proofConditions) assert.equal(proof(env), expected, `${name}: native proof`);
+  assert.equal(comparisonRequired(env), !expected, `${name}: comparison guard`);
+  const routed = spawnSync('bash', ['-c', commands + generator], {cwd: root, encoding: 'utf8',
+    env: {...process.env, NATIVE_ONLY: env.VORTX_NATIVE_ONLY, VORTX_ENGINE_SOURCE_REVISION: '0'.repeat(40)}});
+  assert.equal(routed.status, 0, `${name}: ${routed.stderr}`);
+  if (expected) {
+    assert.match(routed.stdout, /ruby:..\/scripts\/generate-native-apple-project\.rb --engine-revision 0{40} /);
+    assert.match(routed.stdout, /xcodegen:generate --spec \.native-project\.yml\n/);
+  } else {
+    assert.equal(routed.stdout, 'xcodegen:generate\n', 'explicit comparison keeps the legacy spec');
+  }
+}
+const comparisonScript = run(comparison);
+for (const [name, tag, id, publish, accepted] of [
+  ['artifact-only comparison', '', '', 'false', true],
+  ['comparison with release tag', 'v0.5.0-beta.1', '', 'false', false],
+  ['comparison with release ID', '', '123', 'false', false],
+  ['comparison publication', '', '', 'true', false],
+]) {
+  const result = spawnSync('bash', ['-c', comparisonScript], {encoding: 'utf8',
+    env: {...process.env, COMPARISON_RELEASE_TAG: tag, COMPARISON_RELEASE_ID: id, COMPARISON_PUBLISH: publish}});
+  assert.equal(result.status === 0, accepted, name);
+}
+NODE
+ok "actual Apple effective selector routes push/default dispatch and every proof to native; legacy comparison cannot ship"
+
+require_grep "Apple builds the native resource host" \
+    'run: ./scripts/build-ffi-xcframework.sh --resource-host$' "$APPLE_RELEASE_WF"
+require_grep "Apple verifies resource and state ABI on warm and cold builds" \
+    'run: ./scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework resource-host$' "$APPLE_RELEASE_WF"
+require_grep "Mac server is built from the same pinned private workspace" \
+    'run: ./scripts/build-mac-server.sh$' "$APPLE_RELEASE_WF"
+for wf in "$ANDROID_CI_WF" "$RELEASE_WF"; do
+    # Every engine-required Gradle invocation, including the separately signed
+    # build, must select the same resource-host feature set.
+    awk '/VORTX_REQUIRE_ENGINE: "1"/ { required++; waiting=1; next }
+         waiting { if ($0 !~ /VORTX_NATIVE_RESOURCE_HOST: "1"/) exit 1; enabled++; waiting=0 }
+         END { if (!required || required != enabled || waiting) exit 1 }' "$wf" ||
+        fail "$(basename "$wf") has an engine build without the resource host"
+    require_grep "$(basename "$wf") invokes native-only staged/package verification" \
+        '--native-only --staged-dir android/app/src/main/jniLibs' "$wf"
+done
+require_grep "native-only Android verifier retains resource-host ABI proof" \
+    'verify-native-engine-abi\.sh.*android.*resource-host' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_grep "native-only verifier rejects legacy Stremio JNI packaging" \
+    'native-only artifact still contains legacy libstremiox_core\.so' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_grep "Android quality analysis uses the NDK-aware traced build" \
     'queries: \./\.github/codeql/java-quality\.qls' "$CODEQL_WF"
 require_grep "Android quality suite retains GitHub's maintained selector" \
@@ -142,7 +323,7 @@ require_grep "gradle still declares the distribution flavor dimension" \
     'flavorDimensions \+= "distribution"' "$GRADLE_BUILD"
 
 # The universal label is only honest when every native producer and verifier carries the same ABI
-# set. In particular, armeabi-v7a must never be enabled at packaging level without both Rust engines,
+# set. In particular, armeabi-v7a must never be enabled at packaging level without the VortX engine,
 # the source-built libmpv seam, CI rust-std installation, and artifact inspection following it.
 require_grep "root Gradle contract includes the 32-bit Fire TV ABI" \
     'vortxAndroidAbis.*arm64-v8a.*armeabi-v7a.*x86_64' "$ROOT_GRADLE_BUILD"
@@ -153,34 +334,42 @@ require_grep "mpv seam ABI filter consumes the shared native ABI contract" \
 for wf in "$ANDROID_CI_WF" "$RELEASE_WF"; do
     require_grep "$(basename "$wf") installs the armv7 Rust target" \
         'targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android' "$wf"
-    require_grep "$(basename "$wf") verifies all three shipped ABI directories" \
-        'for abi in arm64-v8a armeabi-v7a x86_64' "$wf"
-    for method in nativeRestoreLibrary nativeReadLibraryEvents; do
-        require_grep "$(basename "$wf") requires $method in the engine artifact" \
-            "Java_com_vortx_android_engine_StremioCoreNative_$method" "$wf"
-    done
-    # Run the exact production symbol predicate against readelf-shaped rows. A matching
-    # import/local/hidden/object must never stand in for a callable JNI definition.
-    symbol_predicate="$(sed -n "s/.*awk -v required=.* '\\(.*\\)' <<<.*/\\1/p" "$wf")"
-    [[ -n "$symbol_predicate" ]] || fail "$(basename "$wf") callable JNI predicate missing"
-    valid_symbol='1: 0000000000000100 64 FUNC GLOBAL DEFAULT 12 nativeRestoreLibrary'
-    awk -v required=nativeRestoreLibrary "$symbol_predicate" <<<"$valid_symbol" \
-        || fail "$(basename "$wf") rejects a defined visible JNI function"
+    require_grep "$(basename "$wf") invokes the shared native-only artifact verifier" \
+        'verify-native-android-artifacts\.sh' "$wf"
+done
+for abi in arm64-v8a armeabi-v7a x86_64; do
+    require_grep "native-only verifier explicitly requires $abi" "$abi/libvortx_ffi\.so" \
+        "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+done
+for method in nativeResourceHostAbiVersion nativeResourceHostNew nativeResourceHostLoadJson nativeResourceHostFree; do
+    require_grep "native-only engine ABI gate checks $method" "$method" \
+        "$REPO_ROOT/scripts/verify-native-engine-abi.sh"
+done
+require_grep "native-only verifier rejects non-little-endian engines" 'Data:.*little endian' \
+    "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+require_grep "native-only verifier rejects non-shared-object engines" 'Type:.*DYN' \
+    "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
+# Keep the original executable JNI predicate negatives after moving the workflow's inline
+# checker into shared helpers. A text match or archive path can never replace callable exports.
+for helper in "$REPO_ROOT/scripts/verify-native-android-artifacts.sh" "$REPO_ROOT/scripts/verify-native-engine-abi.sh"; do
+    symbol_predicate="$(sed -n "s/.*awk -v wanted=.* '\\(.*\\)' <<<.*/\\1/p" "$helper" | awk 'NR == 1 { print }')"
+    [[ -n "$symbol_predicate" ]] || fail "$(basename "$helper") callable JNI predicate missing"
+    valid_symbol='1: 0000000000000100 64 FUNC GLOBAL DEFAULT 12 nativeResourceHostNew'
+    awk -v wanted=nativeResourceHostNew "$symbol_predicate" <<<"$valid_symbol" \
+        || fail "$(basename "$helper") rejects a defined visible JNI function"
     for invalid_symbol in \
-        '1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND nativeRestoreLibrary' \
-        '1: 0000000000000100 64 FUNC LOCAL DEFAULT 12 nativeRestoreLibrary' \
-        '1: 0000000000000100 64 FUNC GLOBAL HIDDEN 12 nativeRestoreLibrary' \
-        '1: 0000000000000100 64 OBJECT GLOBAL DEFAULT 12 nativeRestoreLibrary'; do
-        if awk -v required=nativeRestoreLibrary "$symbol_predicate" <<<"$invalid_symbol"; then
-            fail "$(basename "$wf") accepts a non-callable JNI entry"
+        '1: 0000000000000000 0 FUNC GLOBAL DEFAULT UND nativeResourceHostNew' \
+        '1: 0000000000000100 64 FUNC LOCAL DEFAULT 12 nativeResourceHostNew' \
+        '1: 0000000000000100 64 FUNC GLOBAL HIDDEN 12 nativeResourceHostNew' \
+        '1: 0000000000000100 64 OBJECT GLOBAL DEFAULT 12 nativeResourceHostNew'; do
+        if awk -v wanted=nativeResourceHostNew "$symbol_predicate" <<<"$invalid_symbol"; then
+            fail "$(basename "$helper") accepts a non-callable JNI entry"
         fi
     done
-    require_grep "$(basename "$wf") rejects non-little-endian engines" 'Data:.*little endian' "$wf"
-    require_grep "$(basename "$wf") rejects non-shared-object engines" 'Type:.*DYN' "$wf"
-    ok "$(basename "$wf") JNI predicate rejects undefined/local/hidden/object symbols"
+    ok "$(basename "$helper") JNI predicate rejects undefined/local/hidden/object symbols"
 done
 require_grep "release verifies engines inside the Play AAB as well as both APKs" \
-    'prefix=base/lib' "$RELEASE_WF"
+    '\*\.aab\) prefix=base/lib' "$REPO_ROOT/scripts/verify-native-android-artifacts.sh"
 require_grep "candidate verifies exactly one Full and one Play APK" \
     '\$\{#full_apks\[@\]\} -ne 1.*\$\{#play_apks\[@\]\} -ne 1' "$ANDROID_CI_WF"
 require_grep "secretless packaging proves libmpv for all three shipped ABIs" \
@@ -589,6 +778,37 @@ ok "workflow-driven publication always reaches the downstream verifier after suc
 grep -Fq "github.event_name == 'release'" <<<"$verify_published_block" \
     || fail "published-release verifier no longer accepts external published-release events"
 ok "external published-release events retain independent verification"
+grep -Fq "!startsWith(github.event.release.tag_name, 'vendor-')" <<<"$verify_published_block" \
+    || fail "dependency-only vendor release events must not enter app/feed verification"
+VERIFY_PUBLISHED_BLOCK="$verify_published_block" node --input-type=module <<'NODE'
+import assert from 'node:assert/strict';
+const block = process.env.VERIFY_PUBLISHED_BLOCK;
+const expression = block.match(/^    if: >-\n([\s\S]*?)^    concurrency:/m)?.[1];
+assert.ok(expression, 'published-release job must have its own condition');
+// GitHub expressions accept hyphenated properties; use equivalent JS bracket access.
+const jsExpression = expression.replaceAll('needs.attach-release', "needs['attach-release']");
+const evaluate = new Function('github', 'inputs', 'needs', 'always', 'startsWith', `return (${jsExpression});`);
+const eligible = (event, tag, publish = false, result = 'skipped') => evaluate(
+  {event_name: event, event: {release: {tag_name: tag}}}, {publish_release: publish},
+  {'attach-release': {result}}, () => true,
+  (value, prefix) => String(value).toLowerCase().startsWith(String(prefix).toLowerCase()),
+);
+for (const tag of ['v0.5.0', 'v0.5.0-beta.1', 'v0.5.0-vendor-test', 'other-release']) {
+  assert.equal(eligible('release', tag), true, `${tag}: retain external app verification`);
+}
+for (const tag of ['vendor-mpvkit-dvfel-2', 'vendor-fonts-1', 'VENDOR-nodemobile-1']) {
+  assert.equal(eligible('release', tag), false, `${tag}: dependency-only event`);
+}
+assert.equal(eligible('workflow_dispatch', 'v0.5.0-beta.1', true, 'success'), true);
+assert.equal(eligible('workflow_dispatch', 'vendor-mpvkit-dvfel-2', true, 'success'), true,
+  'vendor event guard must never suppress a dispatch publication verifier');
+for (const result of ['failure', 'cancelled', 'skipped']) {
+  assert.equal(eligible('workflow_dispatch', 'v0.5.0-beta.1', true, result), false);
+}
+assert.equal(eligible('workflow_dispatch', 'v0.5.0-beta.1', false, 'success'), false);
+assert.equal(eligible('push', 'v0.5.0-beta.1', true, 'success'), false);
+NODE
+ok "actual verifier condition isolates vendor events and preserves app/dispatch gates"
 require_grep "attach-release exposes immutable release ID to the downstream verifier" \
     'release_id: \$\{\{ steps\.identity\.outputs\.release_id \}\}' "$APPLE_RELEASE_WF"
 grep -Fq 'needs.attach-release.outputs.release_id' <<<"$verify_published_block" \

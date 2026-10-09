@@ -200,7 +200,8 @@ private struct BecauseYouWatchedHistoryReceiptContractTests {
         }
         check(account.contains("struct AuthOperationContext") &&
                 account.contains("authOperationStillCurrent(context)") &&
-                account.contains("Keychain.set(key, for: context.keychainAccount)") &&
+                account.contains("Self.storeAuthKey(key, account: context.keychainAccount)") &&
+                account.contains("withCredentialMutation(slot: account)") &&
                 account.contains("await loadAddons(for: context)") &&
                 account.contains("await backfillEmail(for: context)"),
               "Stremio auth validates the initiating profile across awaited writes")

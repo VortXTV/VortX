@@ -260,9 +260,10 @@ class WatchlistCodecTest {
             return snapshot
         }
 
-        override fun write(key: String, value: String) {
+        override fun write(key: String, value: String): Boolean {
             threadNames += Thread.currentThread().name
             values[key] = value
+            return true
         }
     }
 

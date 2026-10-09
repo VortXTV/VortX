@@ -6,6 +6,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+data class AuthManagement(val canManage: Boolean = true, val message: String? = null, val revision: String? = null)
+private val unrestrictedAuthManagement = MutableStateFlow(AuthManagement()).asStateFlow()
+
 /// The account seam: the Compose account screen and Settings' Account row depend only on this, same
 /// pattern as [CatalogRepository]. Separate interface (not folded into [CatalogRepository]) because
 /// auth is account-level state every screen may want to *observe* (a live [StateFlow], not a one-shot
@@ -16,6 +19,7 @@ interface AuthRepository {
     /// changes (sign-in, sign-out, or -- on first launch -- a persisted sign-in restored from the
     /// engine's own storage before this is ever read).
     val authState: StateFlow<AuthState>
+    val management: StateFlow<AuthManagement> get() = unrestrictedAuthManagement
 
     /// Email/password sign-in against the account API, through the engine (mirrors Apple
     /// `StremioAccount.signIn`/`CoreBridge`'s `Authenticate`). Success is reflected via [authState]
@@ -23,11 +27,13 @@ interface AuthRepository {
     /// carries the engine/API's own message so the UI shows the real reason (bad password, no
     /// network, ...), never a generic string.
     suspend fun signIn(email: String, password: String): Result<Unit>
+    suspend fun signInForRevision(email: String, password: String, revision: String?): Result<Unit> = signIn(email, password)
 
     /// Sign out. Always succeeds locally (clears the account state) even if the network round-trip to
     /// invalidate the server-side session fails -- the user's device should never get "stuck" signed
     /// in because of a network blip.
     suspend fun signOut()
+    suspend fun signOutForRevision(revision: String?) = signOut()
 }
 
 /// Offline preview/local-testing implementation: a small in-memory state machine so the sign-in

@@ -19,8 +19,8 @@ import Darwin   // getifaddrs / ifaddrs / getnameinfo for LAN IP discovery
 /// NATIVE ENGINE (flag-gated, default OFF): behind `vortxNativeServer` (UserDefaults), the same
 /// lifecycle spawns the native Rust streaming server (`vortx-streaming-server`, bundled from
 /// app/Vendor by scripts/build-mac-server.sh) instead of node + server.js. Same port (11470),
-/// same HTTP contract, same LAN-bind toggle; see spawnNative(binPath:). With the flag OFF, or
-/// the binary absent, everything below runs the node path unchanged.
+/// same HTTP contract, same LAN-bind toggle; see spawnNative(binPath:). Native selection fails
+/// explicitly if its binary is missing. Legacy selection retains the Node path.
 enum NodeServer {
     private(set) static var started = false
     /// Set when the node process exits. A relaunch (or toggling Direct Links Only off) restarts it.
@@ -28,6 +28,11 @@ enum NodeServer {
 
     /// The running child process, kept alive for the app's lifetime (and so we can terminate it).
     private static var process: Process?
+    /// Unique to the currently spawned native child. Never read the legacy Node port file.
+    private static var nativePortReceipt: String?
+    // Endpoint readers must never wait for process launch/reaping on the lifecycle queue.
+    private static let nativePublicationLock = NSLock()
+    private static var nativePublication: (process: Process, receipt: String)?
 
     /// Serializes all access to the mutable child state (`process`, `started`, `exitCode`,
     /// `shutdownRequested`). startIfNeeded/restart dispatch their work to this queue ASYNC so neither
@@ -119,8 +124,10 @@ enum NodeServer {
     /// restarts the child so the engine swap takes effect without an app relaunch, the same
     /// restart pattern as the LAN-sharing toggle above.
     static var nativeServerEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: nativeServerKey) }
+        get { NativeTransportPolicy.selectsNative(required: NativeTransportPolicy.isRequired,
+                                                  preference: UserDefaults.standard.bool(forKey: nativeServerKey)) }
         set {
+            guard !NativeTransportPolicy.isRequired else { return }
             guard newValue != nativeServerEnabled else { return }
             UserDefaults.standard.set(newValue, forKey: nativeServerKey)
             restart()
@@ -135,12 +142,32 @@ enum NodeServer {
         Bundle.main.path(forResource: "vortx-streaming-server", ofType: nil)
     }
 
-    /// True when start/restart would spawn the native engine (flag ON and the binary bundled).
-    private static var usingNativeServer: Bool { nativeServerEnabled && nativeServerBinary != nil }
+    /// Native selection includes a missing native binary: that is unavailable, never a Node fallback.
+    private static var usingNativeServer: Bool { nativeServerEnabled }
 
-    /// Exposed only for protocol routing.  `/nzb/create` is implemented by bundled server.js, not the
-    /// native torrent server, so callers must fail locally rather than POST provider credentials to it.
+    /// Exposed for protocol routing; NNTP also requires an exact local capability check.
     static var isUsingNativeServer: Bool { usingNativeServer }
+
+    /// Publication requires this exact child to be running AND to have bound its socket. A stale
+    /// Node listener on 11470 cannot become the native endpoint while the child retries its bind.
+    static var nativeBaseURL: String? {
+        guard usingNativeServer else { return nil }
+        nativePublicationLock.lock()
+        let published = nativePublication
+        nativePublicationLock.unlock()
+        guard let published else { return nil }
+        let receipt = try? String(contentsOfFile: published.receipt, encoding: .utf8)
+        guard let port = NativeTransportPolicy.boundNativePort(processRunning: published.process.isRunning,
+                                                               receipt: receipt) else { return nil }
+        return "http://127.0.0.1:\(port)"
+    }
+
+    private static func publishNativeProcess(_ process: Process?, receipt: String? = nil) {
+        nativePublicationLock.lock()
+        if let process, let receipt { nativePublication = (process, receipt) }
+        else { nativePublication = nil }
+        nativePublicationLock.unlock()
+    }
 
     /// Locate an ffmpeg/ffprobe pair the server can use for VideoToolbox transcoding. server.js
     /// searches a fixed set of paths but NOT Homebrew's Apple-silicon prefix (/opt/homebrew/bin),
@@ -178,6 +205,7 @@ enum NodeServer {
     static var statusDescription: String {
         if PlaybackSettings.torrentsDisabled { return "Disabled by Direct Links Only" }
         if usingNativeServer {
+            if nativeServerBinary == nil { return "Native streaming server is missing from this build." }
             if !started { return "Not started (native server)" }
             if let code = exitCode { return "Native server exited with code \(code). Relaunch the app to restart it." }
             if sharedOnLAN, let url = lanURL { return "Sharing on this network at \(url) (native server)" }
@@ -206,9 +234,7 @@ enum NodeServer {
         ServerDiagnostics.register(status: { statusDescription }, logTail: { logTail($0) })
         queue.async {
             guard !started, !shutdownRequested else { return }
-            // Flag-gated native engine: same stale-port reclaim, then the native spawn instead of
-            // node. A missing binary (script never run) logs and falls through to the node path,
-            // so flipping the flag on a build without the binary can never kill streaming.
+            // Native selection is terminal here, including an unavailable bundle.
             if nativeServerEnabled {
                 if let nativeBin = nativeServerBinary {
                     reclaimStalePort()
@@ -216,7 +242,8 @@ enum NodeServer {
                     spawnNative(binPath: nativeBin)
                     return
                 }
-                NSLog("StremioX: vortxNativeServer is ON but vortx-streaming-server is not bundled; using node")
+                DiagnosticsLog.log("server", "native streaming selected but server binary is missing")
+                return
             }
             guard let nodeBin = Bundle.main.path(forResource: "node-darwin-arm64", ofType: nil) else {
                 NSLog("StremioX: node binary not found in bundle, streaming server disabled")
@@ -246,6 +273,7 @@ enum NodeServer {
             // Reap whichever engine is running (node or native), then respawn per the flag, so
             // both the LAN-bind toggle and the native-engine toggle swap in place.
             func reapCurrent() {
+                publishNativeProcess(nil)
                 if let proc = process, proc.isRunning {
                     proc.terminationHandler = nil   // expected stop; don't surface it as a crash
                     proc.terminate()
@@ -253,9 +281,15 @@ enum NodeServer {
                 }
                 process = nil
                 exitCode = nil
+                retireNativePortReceipt()
             }
-            if nativeServerEnabled, let nativeBin = nativeServerBinary {
+            if nativeServerEnabled {
                 reapCurrent()
+                started = false
+                guard let nativeBin = nativeServerBinary else {
+                    DiagnosticsLog.log("server", "native streaming selected but server binary is missing")
+                    return
+                }
                 started = true
                 spawnNative(binPath: nativeBin)
                 return
@@ -279,6 +313,8 @@ enum NodeServer {
         queue.sync {
             shutdownRequested = true        // mark intentional: the terminationHandler must not treat this as a crash
             started = false
+            publishNativeProcess(nil)
+            defer { retireNativePortReceipt() }
             guard let proc = process else { return }
             process = nil
 
@@ -477,7 +513,7 @@ enum NodeServer {
         // the serial queue so the state write is race-free, and ignore it once shutdown began.
         proc.terminationHandler = { p in
             queue.async {
-                guard !shutdownRequested else { return }
+                guard !shutdownRequested, process === p else { return }
                 exitCode = p.terminationStatus
                 NSLog("%@", "StremioX: node server exited rc=\(p.terminationStatus)")
                 // Mirror the unexpected exit into the EXPORTABLE diagnostics log so a server death is visible
@@ -522,10 +558,8 @@ enum NodeServer {
         // crates/streaming-server/src/main.rs):
         //   VORTX_SERVER_HOME  data root (settings.json + stremio-cache/), the same
         //                      <AppSupport>/StremioX/stremio-server dir the node server uses
-        //   VORTX_PORT_FILE    where it writes the bound port: <caches>/stremio-server.port, the
-        //                      iOS/tvOS convention (nothing on the Mac reads it today because
-        //                      StremioServer stays fixed at 11470 on macOS; writing it keeps the
-        //                      contract uniform)
+        //   VORTX_PORT_FILE    a unique per-launch bind receipt, read before publishing the endpoint
+        //   VORTX_SERVER_PORT fixed 11470, overriding an inherited development port
         //   VORTX_BIND         0.0.0.0 (LAN sharing ON) vs 127.0.0.1 (private, the default),
         //                      replacing the node preload's listen() monkeypatch
         //   VORTX_LAN_IP       the advertised /settings baseUrl host while sharing
@@ -533,7 +567,10 @@ enum NodeServer {
         // 11471+), so lanURL's fixed :11470 and StremioServer.embedded stay correct.
         var env = ProcessInfo.processInfo.environment
         env["VORTX_SERVER_HOME"] = serverData
-        env["VORTX_PORT_FILE"] = portFilePath
+        retireNativePortReceipt()
+        nativePortReceipt = (home as NSString).appendingPathComponent("native-server-\(UUID().uuidString).port")
+        env["VORTX_PORT_FILE"] = nativePortReceipt
+        env["VORTX_SERVER_PORT"] = "11470"
         if sharedOnLAN {
             env["VORTX_BIND"] = "0.0.0.0"
             if let ip = lanIP { env["VORTX_LAN_IP"] = ip }
@@ -553,8 +590,9 @@ enum NodeServer {
         // (stop()/restart() detach it first), routed through the serial queue.
         proc.terminationHandler = { p in
             queue.async {
-                guard !shutdownRequested else { return }
+                guard !shutdownRequested, process === p else { return }
                 exitCode = p.terminationStatus
+                retireNativePortReceipt()
                 NSLog("%@", "StremioX: native streaming server exited rc=\(p.terminationStatus)")
                 DiagnosticsLog.log("server", "native server exited rc=\(p.terminationStatus) (unexpected; relaunch to restart)")
             }
@@ -564,18 +602,20 @@ enum NodeServer {
             NSLog("%@", "StremioX: starting native streaming server (bin=\(binPath), home=\(serverData))")
             try proc.run()
             process = proc
+            publishNativeProcess(proc, receipt: nativePortReceipt)
         } catch {
             started = false
+            retireNativePortReceipt()
             NSLog("%@", "StremioX: failed to launch native streaming server: \(error)")
         }
     }
 
-    /// The caches path for the port file the native server writes (the iOS/tvOS NodeServer
-    /// convention: <caches>/stremio-server.port).
-    private static var portFilePath: String {
-        let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
-            ?? NSTemporaryDirectory()
-        return (caches as NSString).appendingPathComponent("stremio-server.port")
+    /// Queue-only cleanup after the owning process has been reaped or failed to launch.
+    private static func retireNativePortReceipt() {
+        publishNativeProcess(nil)
+        guard let path = nativePortReceipt else { return }
+        nativePortReceipt = nil
+        try? FileManager.default.removeItem(atPath: path)
     }
 
     /// JSON-encode a string for safe embedding in the preload JS literal.

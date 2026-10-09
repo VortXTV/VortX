@@ -120,7 +120,7 @@ class DirectLinkDisplayGroupsTest {
     fun `source target invalidation revokes resolver before cancellation and generation advance`() {
         val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
         val helper = source.substringAfter("fun abandonPlaybackResolve()")
-            .substringBefore("private fun canPublishPlaybackResolve")
+            .substringBefore("fun abandonPlaybackRoute()")
         val startLoad = source.substringAfter("private fun startSourceLoad")
             .substringBefore("/**\n     * Retire an in-flight detail resolver")
 
@@ -148,7 +148,7 @@ class DirectLinkDisplayGroupsTest {
     fun `abandon contract rejects idle moved after resolving guard`() {
         val source = readProjectFile("src/main/kotlin/com/vortx/android/ui/viewmodel/DetailViewModel.kt")
         val helper = source.substringAfter("fun abandonPlaybackResolve()")
-            .substringBefore("private fun canPublishPlaybackResolve")
+            .substringBefore("fun abandonPlaybackRoute()")
         val acceptedResolve = bracedBlock(
             helper,
             helper.indexOf("if (playbackResolveFence.invalidateForSourceRequest(request)) {"),
@@ -178,16 +178,23 @@ class DirectLinkDisplayGroupsTest {
         assertTrue(methodBody(viewModel, "fun clearPlayback()", "fun clearMutationError").contains("abandonPlaybackResolve()"))
         assertTrue(methodBody(viewModel, "private fun startSourceLoad", "/**\n     * Retire").contains("cancelPlaybackResolveForSourceTargetInvalidation()"))
 
-        assertCallbackAbandonsBeforeRoute(phone, "// Hardware/gesture back pops the player overlay", "BackHandler {", "DisposableEffect(historyIdentity, advanceVm)", "advanceVm?.abandonPlaybackResolve()")
-        assertCallbackAbandonsBeforeRoute(phone, "PlayerScreen(\n                    playable = playable,", "onBack = {", "onError = {", "advanceVm?.abandonPlaybackResolve()")
-        assertCallbackAbandonsBeforeRoute(phone, "PlayerScreen(\n                    playable = playable,", "onError = {", "// Natural end of the stream", "advanceVm?.abandonPlaybackResolve()")
-        assertCallbackAbandonsBeforeRoute(phone, "UpNextOverlay(", "onCancel = {", "},\n                    )", "advanceVm.abandonPlaybackResolve()")
-        assertCallbackAbandonsBeforeRoute(phone, "ManualSourcePickOverlay(", "onClose = {", "},\n                        )", "advanceVm.abandonPlaybackResolve()")
-        assertCallbackAbandonsBeforeRoute(phone, "// System Back closes the detail overlay", "BackHandler {", "DetailScreen(", "detailVm.abandonPlaybackResolve()")
-        assertCallbackAbandonsBeforeRoute(phone, "DetailScreen(\n                    viewModel = detailVm,", "onBack = {", "// DetailScreen supplies", "detailVm.abandonPlaybackResolve()")
+        assertCallbackAbandonsBeforeRoute(phone, "// Hardware/gesture back pops the player overlay", "BackHandler {", "DisposableEffect(historyIdentity, advanceVm)", "advanceVm?.abandonPlaybackRoute()")
+        assertCallbackAbandonsBeforeRoute(phone, "PlayerScreen(\n                    playable = playable,", "onBack = {", "onError = {", "advanceVm?.abandonPlaybackRoute()")
+        assertCallbackAbandonsBeforeRoute(phone, "PlayerScreen(\n                    playable = playable,", "onError = {", "// Natural end of the stream", "advanceVm?.abandonPlaybackRoute()")
+        assertCallbackAbandonsBeforeRoute(phone, "UpNextOverlay(", "onCancel = {", "},\n                    )", "advanceVm.abandonPlaybackRoute()")
+        assertCallbackAbandonsBeforeRoute(phone, "ManualSourcePickOverlay(", "onClose = {", "},\n                        )", "advanceVm.abandonPlaybackRoute()")
+        assertCallbackAbandonsBeforeRoute(phone, "// System Back closes the detail overlay", "BackHandler {", "DetailScreen(", "detailVm.abandonPlaybackRoute()")
+        assertCallbackAbandonsBeforeRoute(phone, "DetailScreen(\n                    viewModel = detailVm,", "onBack = {", "// DetailScreen supplies", "detailVm.abandonPlaybackRoute()")
+
+        val routeRetirement = bracedBlock(viewModel, viewModel.indexOf("fun abandonPlaybackRoute()"))
+        assertTrue(routeRetirement.content.contains("pendingAutoPick = false"))
+        assertTrue(routeRetirement.content.contains("pendingAdvanceHint = null"))
+        assertTrue(routeRetirement.content.contains("invalidateWarmNextSource()"))
+        assertTrue(routeRetirement.content.contains("abandonPlaybackResolve()"))
+        assertTrue(routeRetirement.content.contains("_playback.value = Playback.Idle"))
 
         val tvReturnToBrowse = methodBody(tv, "fun returnToBrowse()", "if (playable != null)")
-        val tvRevoke = tvReturnToBrowse.indexOf("playerVm?.abandonPlaybackResolve()")
+        val tvRevoke = tvReturnToBrowse.indexOf("playerVm?.abandonPlaybackRoute()")
         val tvDismiss = tvReturnToBrowse.indexOf("playing = null")
         assertTrue("TV returnToBrowse must revoke the active resolver", tvRevoke >= 0)
         assertTrue("TV returnToBrowse must dismiss the player", tvDismiss >= 0)
@@ -195,11 +202,14 @@ class DirectLinkDisplayGroupsTest {
 
         val tvPlayerRoutes = tv.substringAfter("// D-pad Back pops the player")
             .substringBefore("onSourceFailed =")
-        assertTrue(tvPlayerRoutes.contains("BackHandler(onBack = ::returnToBrowse)"))
-        assertTrue(tvPlayerRoutes.contains("onBack = ::returnToBrowse"))
-        assertTrue(tvPlayerRoutes.contains("onError = ::returnToBrowse"))
-        assertEquals(3, tvPlayerRoutes.split("::returnToBrowse").size - 1)
-        assertCallbackAbandonsBeforeRoute(tv, "TvDetailScreen(\n                        viewModel = detailVm,", "onBack = {", "onPlay =", "detailVm.abandonPlaybackResolve()")
+        assertTrue(tvPlayerRoutes.contains("BackHandler(onBack = ::exitPlayer)"))
+        assertTrue(tvPlayerRoutes.contains("onBack = ::exitPlayer"))
+        assertTrue(tvPlayerRoutes.contains("onError = ::exitPlayer"))
+        assertEquals(3, tvPlayerRoutes.split("::exitPlayer").size - 1)
+        val exitPlayer = bracedBlock(tv, tv.indexOf("fun exitPlayer()"))
+        assertTrue(exitPlayer.content.contains("cancelPreload()"))
+        assertTrue(exitPlayer.content.contains("returnToBrowse()"))
+        assertCallbackAbandonsBeforeRoute(tv, "TvDetailScreen(\n                        viewModel = detailVm,", "onBack = {", "onPlay =", "detailVm.abandonPlaybackRoute()")
     }
 
     private fun methodBody(source: String, start: String, end: String): String =

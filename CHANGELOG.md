@@ -4,6 +4,103 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.5.0-beta.1 - Draft: Native core, Cinema, and durable watch state
+
+**Unpublished release candidate.** Source identity is **0.5.0**, Apple build **260** and Android
+version code **241**; final packages are not yet verified. The reviewed source since Beta 21 adds VortX's own
+native account/resource/streaming path; encrypted checkpoint-first mutation and recovery;
+merged-base-plus-one sync revisions with fresh-pull retry rather than stale wall-clock overwrite;
+profile-qualified independent streaming accounts; acknowledged per-title Watchlist edits;
+source-backed watched-bitmap migration with retained pending history and historical Retry;
+durable causal website add-on receipts in both hosts and additive explicit Apple owner/shared
+Stremio imports that preserve passive-removal protection;
+unified Cinema Home/Browse/Search/Library/History/Watchlist/Downloads navigation on Apple and
+Android; per-profile add-on visibility/ranking; bounded Continue Watching next-episode
+preparation; actual selected-audio continuity; regular-episode defaults that preserve explicit
+specials; pause and accepted resume/seek targets across replacement; a separate native-DV
+metadata deadline and exact-item decoding window; typed mpv cache statistics and owned bounded
+reanchor recovery; complete typed request-header fields admitted before source replacement;
+immutable configured Safari User-Agent restoration instead of leaking a first source's custom identity;
+source-time external-caption refresh while paused; real mpv subtitle backgrounds;
+bounded HLS startup reservation that avoids parking before the initial playlist is ready;
+native NNTP article concurrency and seek cancellation; retained Apple Trakt Continue Watching
+read choice; integrated per-profile Local/Trakt/SIMKL Continue Watching source and range
+selection; scoped Android native NNTP provider/mirror routing; and fresh FFmpeg 9 /
+Apple SecureTransport MPV build inputs with the Mac CoreAudio lifecycle repair.
+
+Existing Beta 21 player controls, integrations, downloads, catalog/source workflows and
+profile/account fixes are retained. The revised native/web protocol passed 344 targeted native
+tests and complete Linux/macOS CI; both reviewed adapters are integrated, with five actual-native
+Apple suites and 194 Android checks with zero skips. Earlier native Mac Debug compilation and
+528 combined Android tests passed. Fresh silent AVPlayer and overlapping
+mpv seek fixtures passed, as did Apple's 18 paired-base production-sync checks and Android's
+40 native / 52 explicit legacy manager checks. Header admission passed 33 actual extracted
+checks; paused caption-clock handling passed 14 actual-method checks plus recovery. User-Agent
+isolation passed 35 actual native-property checks against seven original
+wrong-default failures. It extracts actual controller setup/header/provenance code and reads
+back the selected mpv library; the successful load-command result is modeled, with no media,
+network, app, audio or decoder proof. The complete local continuity runner passed all seven
+cohorts after a stale test assertion was strengthened to bind batch resolution and retry to the
+same captured-owner-filtered candidate list; production fallback behavior was unchanged.
+The exact reviewed source-contract CI passed, including the HLS startup regression.
+Earlier Apple/Android
+pre-User-Agent candidate runs are diagnostic only, not acceptance of this repair or final packages.
+The separate encrypted Swift/Kotlin carrier fixture uses real native sessions, but its manual conflict
+recovery is not production-manager retry proof. Both watched/Watchlist hosts and native
+shipping selection and reviewed DV pre-attachment/mpv cache-map repairs are integrated.
+The website's final native projection/edit/optional-manifest source passed independent review,
+128 tests and the Astro/CSP build gate, and is now production-deployed with the exact reviewed
+tree, nine byte-matched JavaScript bundles and verified 19-page/seven-hash CSP content. This is
+not authenticated multi-device or live Stremio/provider/device proof. Apple's selected-runtime
+NZB eligibility repair and native seek diagnostics are integrated; the latter passed 32 actual
+property/wiring checks, not an original-freeze fix. The integrated Apple Home/Top Shelf Trakt
+choice repair passed 221 offline checks with a failing baseline; Android native routing passed
+44 Full/Play checks and preserves add-on providers/mirrors through scoped native operations.
+The secure indexer factory captures the actual active profile and fails closed on an unknown
+roster. The reviewed configured-indexer integration passed 96 checks; immutable Apple download
+consumers passed 43 checks (41 executed actual-method behavioral / two source-contract) and
+are integrated. Canonical Android passed 140/140 (70 Full and
+70 Play), all seven classes per flavor with zero failures/errors/skips, hash-bound to source and
+the retained earlier JNI input rather than freshly packaged shipping SDKs. Corrected Apple
+entry-capture producer checks passed 41 plus 99 admission and compatibility/routing checks,
+with four actual original-owner baseline failures. Its sixteen-hash immutable GO is integrated;
+the combined canonical 43 consumer / 41 producer / 99 admission run passed, with all three logs
+byte-identical to independently reviewed author results.
+The reviewed
+sixteen-provider transport repair passed 21 NNTP tests;
+its single complete-article deadline follow-up passed 29, after five of eight baseline regressions
+failed. The reviewed cancellable-operation follow-up passed 59 checks. Full workspace tests
+passed for the operation and RAR-directory follow-ups. The archive/lint corrections now have
+terminal full Linux/macOS native CI success across workspace/ABI/features/lint/server gates.
+Five exact shipping-input pin files and focused source contracts are integrated; the real
+SDK-archive comparison was skipped pending new bytes, so no final SDK/app/package acceptance
+is claimed. Older baseline package readbacks have bounded acceptance only;
+the Apple UTF-8 smoke-readback failure has a source repair, not final launch/package acceptance.
+The integrated HLS startup repair passed 39 startup, 16 seek and 86 producer-policy checks;
+the original startup baseline passed 23 checks but failed 13 real assertions. Its temporary
+288 MiB startup reservation borrows unused history space, then returns to the unchanged
+160 MiB producer ceiling / 136 MiB resume line, without extending readiness timing or
+raising the 1 GiB physical cap. Typed native Apple provenance plists repair a later
+pre-launch package rejection; fresh artifact/whole-app gates still need acceptance.
+A reviewed private Continue Watching follow-up retains the full resumable inventory beyond
+30 titles, including unsaved titles and cold reopening; explicit rewinds to zero, positive
+progress with unknown viewing dates and known aliases are preserved. It passed 177 focused
+checks against seven failing baseline cases; complete Linux/macOS native CI and matching
+shipping-source pins are now accepted. Fresh SDK/app packages and device proof remain pending.
+The reproduced blocked-HTTP/rapid-seek path now has a reviewed interruption and MKV-cues
+retry repair with seven actual Mac-arm64 native controls passing again from the assembled
+player package. All nine Apple slices were rebuilt and byte-verified; the reviewed internal
+vendor package is published and selected by default. This is not an app release, Android AAR
+repair, HLS/curl, provider or hardware acceptance.
+Fresh final
+SDK/optimized whole-app rebuilding, actual package versions, signing, provenance/feeds and
+physical device/provider acceptance remain pending. Infuse watched-return, mpv PiP and broader
+parity/features are not claimed complete and remain part of the active overall goal. No public release,
+installation or universal issue/playback/parity closure is established by this entry.
+
+See [the draft 0.5 Beta 1 notes](docs/releases/0.5.0-beta.1.md) for the full behavior, retained
+features, precise remaining gates, proposed assets and post-publication test checklist.
+
 ## 0.4.0-beta.21 - Profile sync, chosen-source binge playback, and recovery fixes
 
 Apple build **259**, Android version code **240**. Carries the reviewed changes since Beta 20:

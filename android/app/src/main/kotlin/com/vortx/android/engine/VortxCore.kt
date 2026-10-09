@@ -49,6 +49,10 @@ object VortxCore {
     /// engine handle, 0 on bad input. Free exactly once with [nativeEngineFree].
     external fun nativeInitRuntime(configJson: String): Long
 
+    /// Cold-load a previously captured full state. Zero rejects invalid snapshots; never seed a
+    /// fresh account after failure. Requires the audited hydration-capable native artifact.
+    external fun nativeInitFromStateJson(stateJson: String): Long
+
     /// Apply one JSON action at host time (the native side injects the Unix-seconds clock, the
     /// `SystemEnv` semantics). Returns the `DispatchResult` JSON; null only on a native panic.
     external fun nativeDispatchJson(handle: Long, actionJson: String): String?
@@ -60,6 +64,19 @@ object VortxCore {
     /// The full state document JSON (`{}` for a 0 handle); null only on a native panic.
     external fun nativeGetStateJson(handle: Long): String?
 
+    /// Changed records since the last pull; drains the dirty set. Serialize with every handle call.
+    external fun nativeGetStateDeltaJson(handle: Long): String?
+
     /// Free a runtime returned by [nativeInitRuntime]. Safe with 0; free exactly once.
     external fun nativeEngineFree(handle: Long)
+
+    // Additive resource-host ABI. Call only with an artifact that passes the resource-host symbol
+    // gate. Host/cancel lifetimes are managed by VortxJniResourceTransport, never by UI callbacks.
+    external fun nativeResourceHostNew(): Long
+    external fun nativeResourceHostAbiVersion(): Int
+    external fun nativeResourceHostLoadJson(host: Long, requestJson: String, cancel: Long): String?
+    external fun nativeResourceHostFree(host: Long)
+    external fun nativeCancelNew(): Long
+    external fun nativeCancelCancel(cancel: Long)
+    external fun nativeCancelFree(cancel: Long)
 }

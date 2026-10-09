@@ -71,7 +71,7 @@ enum Issue240PlaybackFailureTests {
         }
         let property = section(player, from: "private func handleProperty(", to: "if let loadToken, loadToken == recoveryPauseOwner")
         check("terminal overlay fences late playback callbacks", property.contains("guard !loadFailed else { return }"))
-        let nilEpisode = section(player, from: "guard let es = resolved else {", to: "guard EpisodePlaybackIdentity.canIssueEpisodeSwitch(")
+        let nilEpisode = section(player, from: "guard let es = resolved, resolutionBudget.canAdmit(", to: "guard EpisodePlaybackIdentity.canIssueEpisodeSwitch(")
         check("failed next-episode resolution cannot silently dismiss playback",
               !nilEpisode.isEmpty && !nilEpisode.contains("onClose()") && nilEpisode.contains("presentTerminalLoadFailure()"))
         check("failed episode retains its retry target", nilEpisode.contains("failedEpisodeResolutionID = videoId"))

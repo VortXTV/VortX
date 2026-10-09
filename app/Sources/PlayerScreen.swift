@@ -407,6 +407,87 @@ private struct PlayerSeekTimelineTrack: View {
 /// The build-255 failure was in the OUTER bottom-bar metadata, not only the slider.
 /// These non-generic view boundaries keep each toolbar button and optional editor section's
 /// glass/conditional tree out of its parent's metadata. Keep transport ownership in PlayerScreen.
+///
+/// Player controls intentionally own their tint and shape. SwiftUI's default macOS Button style can
+/// paint a rectangular native button surface around a circular/pill label; that surface is the dark
+/// rectangle visible outside the control in the profile-accent screenshots. Keeping the presentation in
+/// one player-only modifier makes the plain-button contract explicit without changing shared browse/TV
+/// button styles or the global glass presets.
+private enum PlayerControlReduceTransparencyOverrideKey: EnvironmentKey {
+    static let defaultValue: Bool? = nil
+}
+
+private extension EnvironmentValues {
+    /// Testable player-only override; production callers inherit the system accessibility setting.
+    var playerControlReduceTransparencyOverride: Bool? {
+        get { self[PlayerControlReduceTransparencyOverrideKey.self] }
+        set { self[PlayerControlReduceTransparencyOverrideKey.self] = newValue }
+    }
+}
+
+private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
+    let shape: S
+    let prominent: Bool
+    let active: Bool
+
+    @Environment(\.accessibilityReduceTransparency) private var systemReduceTransparency
+    @Environment(\.playerControlReduceTransparencyOverride) private var reduceTransparencyOverride
+    @Environment(\.isEnabled) private var isEnabled
+
+    private var reduceTransparency: Bool {
+        reduceTransparencyOverride ?? systemReduceTransparency
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .foregroundStyle(foreground)
+            // The chosen accent is painted INSIDE the same shape as the label. The shadow below is
+            // deliberately neutral black, so no profile hue can escape as a rectangular halo.
+            .background { shape.fill(fill) }
+            .overlay { shape.strokeBorder(border, lineWidth: 1) }
+            .clipShape(shape)
+            .contentShape(shape)
+            .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, x: 0, y: shadowY)
+    }
+
+    private var fill: Color {
+        // Reduce Transparency is a no-compositing contract here: every enabled player
+        // control must cover the moving video with an opaque profile-accent face.
+        guard isEnabled else { return Theme.Palette.surface1 }
+        if reduceTransparency || prominent { return Theme.Palette.accent }
+        let alpha = active ? 0.28 : 0.17
+        return Theme.Palette.accent.opacity(alpha)
+    }
+
+    private var foreground: Color {
+        guard isEnabled else { return Theme.Palette.textTertiary }
+        return (prominent || reduceTransparency) ? Theme.Palette.onAccent : Theme.Palette.accent
+    }
+
+    private var border: Color {
+        guard isEnabled else { return Theme.Palette.hairline }
+        if reduceTransparency {
+            return prominent ? Theme.Palette.accentBright : Theme.Palette.accent
+        }
+        return prominent
+            ? Theme.Palette.accentBright.opacity(0.50)
+            : Theme.Palette.accent.opacity(active ? 0.78 : 0.55)
+    }
+
+    private var shadowOpacity: Double { isEnabled ? (prominent ? 0.30 : 0.28) : 0.18 }
+    private var shadowRadius: CGFloat { prominent ? 6 : 4 }
+    private var shadowY: CGFloat { prominent ? 3 : 2 }
+}
+
+private extension View {
+    /// Player-only shape-first tinting. Callers still decide the visual size/tap target before the modifier.
+    func playerControlSurface<S: InsettableShape>(in shape: S,
+                                                   prominent: Bool = false,
+                                                   active: Bool = false) -> some View {
+        modifier(PlayerControlSurfaceModifier(shape: shape, prominent: prominent, active: active))
+    }
+}
+
 private struct PlayerControlButton: View {
     let icon: String
     let title: String
@@ -414,33 +495,28 @@ private struct PlayerControlButton: View {
     let action: () -> Void
 
     var body: some View {
-    Button(action: action) {
-        HStack(spacing: 7) {
-            Image(systemName: icon).font(.system(size: 15, weight: .semibold))
-            // #135: force a single line + allow the font to shrink instead of wrapping mid-word
-            // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
-            // fit at full size so minimumScaleFactor is a no-op there.
-            Text(title).font(.subheadline.weight(.medium))
-                .lineLimit(1)
-                #if !os(iOS)
-                .minimumScaleFactor(0.75)
-                #endif
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(systemName: icon).font(.system(size: 15, weight: .semibold))
+                // #135: force a single line + allow the font to shrink instead of wrapping mid-word
+                // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
+                // fit at full size so minimumScaleFactor is a no-op there.
+                Text(title).font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                    #if !os(iOS)
+                    .minimumScaleFactor(0.75)
+                    #endif
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            #if os(iOS)
+            .frame(minHeight: 44)
+            .fixedSize(horizontal: true, vertical: false)
+            #endif
+            .playerControlSurface(in: RoundedRectangle(cornerRadius: 11, style: .continuous), active: active)
         }
-        // Glass control pill (mockup .gp / .gp.on): a subtle chip that turns to the ember active variant
-        // when its feature is engaged. Purely visual; the button's action is unchanged.
-        .foregroundStyle(active ? Theme.Palette.accent : .white)
-        .padding(.horizontal, 12).padding(.vertical, 7)
-        #if os(iOS)
-        .frame(minHeight: 44)
-        .fixedSize(horizontal: true, vertical: false)
-        #endif
-        .background { RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.white.opacity(active ? 0 : 0.06)) }
-        .vortxGlassActive(active, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .strokeBorder(active ? Theme.Palette.accent.opacity(0.4) : .white.opacity(0.14), lineWidth: 1)
-        }
-    }
+        // A player toolbar button must not inherit AppKit's rounded-rectangle Button chrome around the
+        // label. Its own Capsule/RoundedRectangle is the complete visual and hit surface.
+        .buttonStyle(.plain)
     }
 }
 
@@ -691,10 +767,8 @@ private struct PlayerTouchIconButton: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(.white)
                 .frame(width: 44, height: 44)
-                .background(.black.opacity(0.24), in: Circle())
-                .contentShape(Circle())
+                .playerControlSurface(in: Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
@@ -713,9 +787,8 @@ private struct PlayerTouchAspectButton: View {
                 Image(systemName: "aspectratio")
                 Text(title).font(.caption.weight(.semibold))
             }
-            .foregroundStyle(.white)
             .padding(.horizontal, 10).frame(height: 44)
-            .background(.black.opacity(0.24), in: Capsule())
+            .playerControlSurface(in: Capsule(), active: mode != "original")
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Video size: \(title)")
@@ -851,10 +924,8 @@ private struct PlayerTouchTransport: View {
             Button(action: toggle) {
                 Image(systemName: paused ? "play.fill" : "pause.fill")
                     .font(.system(size: 32, weight: .semibold))
-                    .foregroundStyle(.white)
                     .frame(width: 64, height: 64)
-                    .background(.black.opacity(0.3), in: Circle())
-                    .contentShape(Circle())
+                    .playerControlSurface(in: Circle(), prominent: true)
             }
             .buttonStyle(.plain)
             .accessibilityLabel(paused ? "Play" : "Pause")
@@ -972,6 +1043,7 @@ struct PlayerScreen: View {
     var recordIsTorrent: Bool = false                       // stream rides the embedded torrent engine
     var recordDebridRef: DebridPlaybackRef? = nil           // native-debrid provenance, for CW reresolve of an expired link
     var initialSourceStream: CoreStream? = nil               // exact raw torrent selector for CW before groups are resident
+    var initialSourceAddon: String? = nil                   // source group's name, never the stream's transport identity
     /// Exact engine episode identity confirmed by the launch presenter. nil keeps series engine writes closed.
     var initialEnginePlayerVideoId: String? = nil
     /// Session-only engine route chosen on the detail/source surface. nil keeps the persisted automatic route.
@@ -993,6 +1065,16 @@ struct PlayerScreen: View {
     /// The release group of the CURRENTLY playing stream, updated on an in-player episode switch so the
     /// recorded binge group tracks the live episode (not the stale launch value). nil = use recordBingeGroup.
     @State private var curBingeState: String? = nil
+    @State private var manualSourceToRemember: (addon: String?, bingeGroup: String?)?
+    @State private var observedAudioLanguage: String?
+    @State private var pendingAutomaticAudioLanguage: String?
+    @State private var incomingEpisodeChoice: SeriesSourceSticky.Snapshot?
+    @State private var incomingAudioInventory = BingeAudioInventoryAdmission<PlayerLoadToken>()
+    @State private var incomingAudioInventoryWaitTask: Task<Void, Never>?
+    @State private var preparedEpisodeChoice: SeriesSourceSticky.Snapshot?
+    @State private var languageRejectedEpisodeID: String?
+    @State private var languageRejectedStreams: Set<String> = []
+    @State private var resumeAfterLanguageRetry = false
     // In-player episode navigation (series only). The ordered season episodes + a closure resolving any
     // episode id to a ready-to-play stream let the player advance Next / Prev and at end-of-episode IN
     // PLACE (a smooth source hot-swap, no cover teardown). Empty for movies / ad-hoc plays. The caller
@@ -1351,6 +1433,7 @@ struct PlayerScreen: View {
     /// it before a later manual backward seek can look like a failed resume.
     @State private var postFrameResumeSeekWatchdogTarget: Double?
     @State private var postFrameResumeSeekWatchdogOwner: PlayerLoadToken?
+    @State private var failedResumeSeekRetry: (owner: PlayerLoadToken, target: Double)?
     @State private var abandonedResumeRecovery: DeferredResumeSeekReconciliationPolicy.OwnedAbandonment<PlayerLoadToken>?
     @State private var pendingResumeSurfaceTransfer: DeferredResumeSeekReconciliationPolicy.SurfaceTransfer<PlayerLoadToken>?
     @State private var retiredResumePersistenceFloor: DeferredResumeSeekReconciliationPolicy.RetiredPersistenceFloor?
@@ -1393,7 +1476,7 @@ struct PlayerScreen: View {
     /// A manual Next/Previous press can arrive while a Continue Watching player still has only a partial
     /// series list. It is consumed once, only by the same physical playback after its inventory is accepted.
     @State private var pendingManualEpisodeNavigation: AppleManualEpisodeNavigationIntent?
-    private static let episodeResolutionDeadlineSeconds: Double = 30
+    private static let episodeResolutionDeadlineSeconds = EpisodeResolutionBudget.maximumDuration
     @State private var playbackExited = false
     @State private var terminalFinalityRefreshTarget: AppleCWTerminalRefreshTarget?
     @State private var terminalFinalityRefreshGeneration: Int?
@@ -1628,11 +1711,9 @@ struct PlayerScreen: View {
     @State private var recoveryPauseOwner: PlayerLoadToken?
     @State private var recoveryPauseIntent = false
     @State private var recoveryPauseTarget: Double = 0
-    private struct PreviewPauseSurfaceTransfer {
-        let retiringOwner: PlayerLoadToken
-        let context: DeferredResumeSeekReconciliationPolicy.SurfaceContext
-    }
-    @State private var previewPauseSurfaceTransfer: PreviewPauseSurfaceTransfer?
+    @State private var engineSurfaceTransfer: AppleEngineSurfaceTransfer<
+        PlayerLoadToken, DeferredResumeSeekReconciliationPolicy.SurfaceContext
+    >?
     @State private var reconnecting = false          // showing the "Recovering…" auto-retry state
     @State private var reconnectMsg = "Recovering…"
     @State private var autoRetryCount = 0
@@ -1742,6 +1823,7 @@ struct PlayerScreen: View {
     @State private var stalledTicks = 0
     @State private var stallRecoveries = 0
     @State private var stallStableProgressTicks = 0
+    @State private var localNNTPStallRecovery = LocalNNTPStallRecovery<PlayerLoadToken>()
 
     // Skip intro / outro (chapter-derived + crowd-sourced timings), shown as a pill while controls hide.
     @State private var skipSegments: [SkipSegment] = []
@@ -1950,7 +2032,7 @@ struct PlayerScreen: View {
                         engineSurfaceUsesActiveTuple ? (curHint ?? recordQualityText ?? "") : (recordQualityText ?? "")))
                 .live(engineSurfaceUsesActiveTuple ? isLive : initialIsLive)
                 .resumeOrigin(avSurfaceResumeOrigin ?? resumeSeconds)
-                .initiallyPaused(previewPauseForSurface(engine: .avPlayer))
+                .initiallyPaused(enginePauseForSurface(engine: .avPlayer))
                 .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
                 .ignoresSafeArea()
         } else {
@@ -1969,7 +2051,7 @@ struct PlayerScreen: View {
                   audioSidecar: mpvSurfacePlayback.audioSidecar,
                   isDolbyVision: mpvSurfacePlayback.isDolbyVision)
             .live(mpvSurfacePlayback.live)
-            .initiallyPaused(previewPauseForSurface(engine: .libmpv))
+            .initiallyPaused(enginePauseForSurface(engine: .libmpv))
             .onPropertyChange { _, name, data, token in handleProperty(name, data, loadToken: token) }
             .ignoresSafeArea()
     }
@@ -2081,10 +2163,11 @@ struct PlayerScreen: View {
                     HStack {
                         Button { leavePlayback() } label: {
                             Image(systemName: "xmark")
-                                .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                                // Escape-hatch close on the shared TIGHT glass disc (shape-clipped material,
-                                // never glassEffect, so no un-clipped dark halo). Background only; action unchanged.
-                                .padding(12).vortxGlassDisc()
+                                .font(.system(size: 17, weight: .bold))
+                                // Escape-hatch close uses the same player accent surface as the visible
+                                // top-bar close; its cancel shortcut and action remain unchanged.
+                                .frame(width: 44, height: 44)
+                                .playerControlSurface(in: Circle())
                         }
                         .buttonStyle(.plain)
                         .keyboardShortcut(.cancelAction)   // ⌘. / Esc on macOS
@@ -2172,6 +2255,11 @@ struct PlayerScreen: View {
             if curHint == nil { curHint = recordQualityText }   // seed the "playing now" signature from the launch stream
             establishSubtitleTimingScopeIfAvailable()
             currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
+            if BingeAudioContinuityPolicy.shouldRecordManualSource(
+                explicit: startedFromExplicitPick, resume: startedFromResume, accepted: true
+            ) {
+                manualSourceToRemember = (initialSourceAddon, initialSourceStream?.behaviorHints?.bingeGroup ?? recordBingeGroup)
+            }
             currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
             #if os(iOS) || os(macOS)
             if engineLatch == nil { engineLatch = routedToAVPlayer }   // engine picked ONCE per playback
@@ -2206,6 +2294,10 @@ struct PlayerScreen: View {
             installMacKeyMonitor()
             observeMacFullScreen()
             #endif
+        }
+        .onChange(of: curDebridRef?.nativeUsenetLease) { [oldLease = curDebridRef?.nativeUsenetLease] newLease in
+            // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
+            if oldLease != newLease { oldLease?.close() }
         }
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             refreshAutoSkipSettings()
@@ -2467,6 +2559,7 @@ struct PlayerScreen: View {
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
+        rememberAcceptedSeriesChoice()
         localTrickplayCaptureBreaker.reset()
         recordLastStream()
         if let m = curMeta, !effectivelyLive {
@@ -2688,16 +2781,17 @@ struct PlayerScreen: View {
         // A late first-frame/EOF event cannot resurrect a terminal attempt. A deliberate retry or
         // accepted replacement reopens callbacks; the existing load-token gates still fence old events.
         guard !loadFailed else { return }
-        if let loadToken, let transfer = previewPauseSurfaceTransfer,
-           loadToken != transfer.retiringOwner,
-           loadToken == coordinator.player?.activeLoadToken {
-            if previewPauseForSurface(engine: isAVPlayerActive ? .avPlayer : .libmpv) {
+        if let loadToken, let transfer = engineSurfaceTransfer,
+           transfer.accepts(observedOwner: loadToken, activeOwner: coordinator.player?.activeLoadToken,
+                            currentContext: resumeSurfaceContext(engine: isAVPlayerActive ? .avPlayer : .libmpv)) {
+            recoveryPauseOwner = nil
+            if enginePauseForSurface(engine: isAVPlayerActive ? .avPlayer : .libmpv) {
                 recoveryPauseOwner = loadToken
                 recoveryPauseTarget = avSurfaceResumeOrigin ?? currentTime
                 recoveryPauseIntent = true
                 coordinator.player?.pause()
             }
-            previewPauseSurfaceTransfer = nil
+            engineSurfaceTransfer = nil
         }
         if let loadToken, loadToken == recoveryPauseOwner,
            loadToken == coordinator.player?.activeLoadToken,
@@ -2810,6 +2904,11 @@ struct PlayerScreen: View {
                                 pendingToken: pending.loadToken
                               ) else { return }
                     }
+                    // Validate the real audio inventory before committing the next episode or reporting
+                    // progress. A French/Japanese file cannot satisfy an English-audio binge preference.
+                    assetSanityDeferredStartToken = event.loadToken
+                    assetSanityDeferredStartPosition = d
+                    guard admitIncomingEpisodeAudio(loadToken: event.loadToken) else { return }
                     DiagnosticsLog.log(
                         "playback",
                         String(
@@ -3029,6 +3128,10 @@ struct PlayerScreen: View {
                                                  allowEngineWrite: engineWritesOpen)
                     }
                 }
+                if hasStartedPlaying, observedAudioLanguage == nil, incomingEpisodeChoice == nil,
+                   assetSanityAttempt.isAccepted(owner: event.loadToken) {
+                    rememberAcceptedSeriesChoice()
+                }
             }
         case MPVProperty.duration:
             if let d = data as? Double {
@@ -3121,6 +3224,7 @@ struct PlayerScreen: View {
             // idempotent, so running it only on a real change is correct.
             if let b = data as? Bool, b != isPaused {
                 isPaused = b
+                if b { localNNTPStallRecovery.suspend() }
                 #if os(iOS) || os(macOS)
                 if b {
                     suspendAVReplacementFirstFrameDeadline()
@@ -3866,7 +3970,7 @@ struct PlayerScreen: View {
                                 contentHint: String? = nil,
                                 resumeOrigin: Double? = nil,
                                 preservingAbandonedResume: Bool = false,
-                                preservingPreviewPause: Bool = false,
+                                preservingViewerPause: Bool = false,
                                 recoveryOwner: PlayerLoadToken? = nil,
                                 preparedRemux: VortXPreparedRemuxAttachment? = nil,
                                 expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> PlayerLoadToken? {
@@ -3954,7 +4058,7 @@ struct PlayerScreen: View {
             // Same-source recovery retains the latest viewer pause across the new file's startup.
             recoveryPauseIntent = capturedRecoveryPause
             recoveryPauseTarget = requestedResumeOrigin
-            recoveryPauseOwner = (preservingAbandonedResume || preservingPreviewPause) && recoveryPauseIntent
+            recoveryPauseOwner = (preservingAbandonedResume || preservingViewerPause) && recoveryPauseIntent
                 ? issuedToken : nil
             if recoveryPauseOwner != nil { player.pause() }
             abandonedResumeRecovery = DeferredResumeSeekReconciliationPolicy.afterAdmission(
@@ -4050,16 +4154,11 @@ struct PlayerScreen: View {
         )
     }
 
-    private var ownedPausedPreviewOwner: PlayerLoadToken? {
-        guard skipDBPreviewing, pendingAdvance == nil, skipDBPreviewWasPaused,
-              let owner = skipDBPreviewOwner, owner == coordinator.player?.activeLoadToken else { return nil }
-        return owner
-    }
-
-    private func previewPauseForSurface(engine: DeferredResumeSeekReconciliationPolicy.Engine) -> Bool {
-        guard !playbackExited, pendingAdvance == nil, recoveryPauseIntent,
-              playbackDeadlineClock.isPaused, let transfer = previewPauseSurfaceTransfer else { return false }
-        return transfer.context == resumeSurfaceContext(engine: engine)
+    private func enginePauseForSurface(engine: DeferredResumeSeekReconciliationPolicy.Engine) -> Bool {
+        engineSurfaceTransfer?.startsPaused(
+            requestedPause: playbackDeadlineClock.isPaused,
+            currentContext: resumeSurfaceContext(engine: engine), playbackExited: playbackExited
+        ) ?? false
     }
 
     /// Capture the resume origin owned by the exact active load before replacing it. An unframed source hop or
@@ -4072,6 +4171,9 @@ struct PlayerScreen: View {
             ? skipDBPreviewReturnPosition : nil
         if let confirmedPositionOverride, confirmedPositionOverride.isFinite, confirmedPositionOverride >= 0 {
             return confirmedPositionOverride   // proven premature EOF evidence, not the saved floor
+        }
+        if let failedResumeSeekRetry, failedResumeSeekRetry.owner == coordinator.player?.activeLoadToken {
+            return failedResumeSeekRetry.target   // exact terminal resume intent, not an older saved floor
         }
         let activeLoadToken = coordinator.player?.activeLoadToken ?? terminalRetiredAssetSanityOwner
         let activeRequestedResume = RetryResumeTargetPolicy.ownedRequestedResume(
@@ -4496,6 +4598,8 @@ struct PlayerScreen: View {
     /// later dismissal can each call this. Same shape as the debrid-crash straddle root cause
     /// (stop-before-dismiss): engine down first, then the surface state change.
     private func presentTerminalLoadFailure() {
+        pendingAdvance?.debridRef?.nativeUsenetLease?.close()
+        curDebridRef?.nativeUsenetLease?.close()
         deferredResumeAttempt.invalidate()
         autoRetryTask?.cancel(); autoRetryTask = nil
         loadTimeout?.cancel(); loadTimeout = nil
@@ -4534,14 +4638,15 @@ struct PlayerScreen: View {
     }
 
     private func viewerPause() {
-        guard coordinator.player != nil else { return }
+        // A surface handoff may temporarily have no controller. The next mount still owes this input.
+        localNNTPStallRecovery.suspend()
         recoveryPauseIntent = true
         playbackDeadlineClock.setPaused(true, now: ProcessInfo.processInfo.systemUptime)
         coordinator.player?.pause()
     }
 
     private func viewerPlay() {
-        previewPauseSurfaceTransfer = nil
+        // Keep an in-flight handoff: a later Pause before construction must also reach the new surface.
         recoveryPauseIntent = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         coordinator.player?.play()
@@ -4558,11 +4663,29 @@ struct PlayerScreen: View {
             }
             return
         }
+        localNNTPStallRecovery = .init()
+        let resumeRetry = failedResumeSeekRetry.flatMap {
+            $0.owner == coordinator.player?.activeLoadToken ? $0 : nil
+        }
+        let previousURL = curURL
         retryLoad()
+        if let resumeRetry {
+            if let acceptedOwner = coordinator.player?.activeLoadToken, acceptedOwner != resumeRetry.owner {
+                failedResumeSeekRetry = nil
+                viewerPlay()   // release only the accepted replacement from terminal parking
+                if resumeRetry.target <= 5 { nudgeResume(to: resumeRetry.target, allowShortResume: true) }
+            } else {
+                curURL = previousURL
+                loadErrorMsg = "This source could not reach your resume point. Retry or choose another source."
+                presentTerminalLoadFailure()
+            }
+        }
     }
 
     private func viewerToggle() {
-        if isPaused { viewerPlay() } else { viewerPause() }
+        // The old controller cannot echo transport while it is being replaced.
+        let paused = engineSurfaceTransfer != nil ? playbackDeadlineClock.isPaused : isPaused
+        if paused { viewerPlay() } else { viewerPause() }
     }
 
     /// Keep the existing recovery budget, but do not spend it while the viewer chose to pause.
@@ -5044,17 +5167,30 @@ struct PlayerScreen: View {
     /// Safety net for the DEFERRED resume seek issued at first frame (the warm-pipeline scrub). On a slow or
     /// non-Range source that absolute seek can leave mpv parked at the pre-seek position indefinitely; the
     /// plain stall ladder then reloads at the real (low) playhead and silently drops the viewer's resume
-    /// point. If the seek has not landed within 12s, abandon the offset instead: a relative +0.1s nudge (the
-    /// proven wedge release) resumes playback from wherever the source actually is, and the floor armed at
-    /// issuance stays as the persistence floor at abandonment because this source failure cannot invalidate the
-    /// viewer's last valid Continue Watching position.
+    /// point. At 12s an exact-owned native request retains its target through source failover; a queued
+    /// 0.x nudge would overwrite a still-running Range seek. Other engines keep their reconciliation path.
     private func armPostFrameResumeSeekWatchdog(target: Double) {
         cancelPostFrameResumeSeekWatchdog()
         guard let armedToken = coordinator.player?.activeLoadToken else { return }
+        let nativeTicket = (coordinator.player as? MPVMetalViewController)?
+            .resumeSeekRecoveryTicket(target: target, owner: armedToken)
         postFrameResumeSeekWatchdogTarget = target
         postFrameResumeSeekWatchdogOwner = armedToken
         postFrameResumeSeekWatchdog = Task { @MainActor in
             guard await waitForPlaybackTime(postFrameResumeSeekWatchdogSeconds) else { return }
+            guard !Task.isCancelled, !playbackExited, !loadFailed, !isPaused,
+                  !playbackDeadlineClock.isPaused, !scrubbing, pendingAdvance == nil,
+                  coordinator.player?.activeLoadToken == armedToken else { return }
+            if let nativeTicket {
+                // An admitted native request that is still seeking is not an invalid saved
+                // offset. Preserve its destination through failover, never issue a seek to 0.x.
+                guard let mpv = coordinator.player as? MPVMetalViewController,
+                      let resume = mpv.failedResumeSeekTarget(
+                        ticket: nativeTicket, confirmedPosition: confirmedRawPosition(owner: armedToken),
+                        landingTolerance: 5) else { return }
+                recoverFromUnsettledResume(target: resume, owner: armedToken)
+                return
+            }
             guard !Task.isCancelled,
                   let reconciliation = DeferredResumeSeekReconciliationPolicy.abandonment(
                     targetSeconds: target,
@@ -5069,6 +5205,28 @@ struct PlayerScreen: View {
             )
             reconcileUnavailableResume(target: target, actualPosition: reconciliation.presentationSeconds, owner: armedToken)
         }
+    }
+
+    private func recoverFromUnsettledResume(target: Double, owner: PlayerLoadToken) {
+        guard coordinator.player?.activeLoadToken == owner, !playbackExited, !loadFailed,
+              !isPaused, !playbackDeadlineClock.isPaused, !scrubbing, pendingAdvance == nil else { return }
+        cancelPostFrameResumeSeekWatchdog()
+        pendingLibmpvResumeSeek = nil
+        if hopToNextSource(reason: "resume seek did not settle", resumeOverride: target) {
+            if target <= 5 { nudgeResume(to: target, allowShortResume: true) }
+            return
+        }
+        // No accepted replacement: keep this episode/source and the exact requested origin
+        // for Retry. Parking prevents a late old restart from playing behind the error overlay.
+        midPlayFailureResume = target
+        failedResumeSeekRetry = (owner, target)
+        abandonedResumeRecovery = nil
+        suppressedResumeFloor = max(suppressedResumeFloor ?? 0, target)
+        lastReported = max(lastReported, target)
+        hasStartedPlaying = false
+        coordinator.player?.pause()
+        loadErrorMsg = "This source could not reach your resume point. Retry or choose another source."
+        presentTerminalLoadFailure()
     }
 
     private var permitsDecoderResumeSeek: Bool {
@@ -5199,15 +5357,17 @@ struct PlayerScreen: View {
     private func startStallWatchdog() {
         stallWatchdog?.cancel()
         lastObservedTime = -1; stalledTicks = 0; stallStableProgressTicks = 0
+        localNNTPStallRecovery.suspend()   // a fresh frame is not a fresh same-route retry budget
         stallWatchdog = Task { @MainActor in
             while !Task.isCancelled {
                 try? await Task.sleep(
                     for: .seconds(PlayerMidPlaybackStallPolicy.pollIntervalSeconds)
                 )
                 guard !Task.isCancelled else { return }
-                guard PlayerMidPlaybackStallPolicy.shouldObserve(
+                guard !playbackExited, !scrubbing, pendingAdvance == nil,
+                      PlayerMidPlaybackStallPolicy.shouldObserve(
                     hasStartedPlaying: hasStartedPlaying,
-                    isPaused: isPaused,
+                    isPaused: isPaused || playbackDeadlineClock.isPaused,
                     loadFailed: loadFailed,
                     isLive: isLive,
                     duration: duration,
@@ -5218,7 +5378,30 @@ struct PlayerScreen: View {
                     lastObservedTime = -1
                     stalledTicks = 0
                     stallStableProgressTicks = 0
+                    localNNTPStallRecovery.suspend()
                     continue
+                }
+                if LocalNNTPBufferPolicy.isLocalNNTP(curURL ?? url),
+                   let mpv = coordinator.player as? MPVMetalViewController,
+                   let owner = mpv.activeLoadToken {
+                    let action = localNNTPStallRecovery.observe(
+                        owner: owner, sample: mpv.localNNTPPlaybackSample(owner: owner),
+                        now: ProcessInfo.processInfo.systemUptime)
+                    if action != .generalWatchdog {
+                        lastObservedTime = -1; stalledTicks = 0; stallStableProgressTicks = 0
+                        switch action {
+                        case .reload:
+                            DiagnosticsLog.log("player", "local NNTP: sustained empty-cache freeze; one same-source retry")
+                            recoverFromStall(localNNTPStarvation: true)
+                        case .failover:
+                            recoverFromLocalNNTPStarvation(owner: owner)
+                        case .wait, .generalWatchdog:
+                            break
+                        }
+                        continue
+                    }
+                } else {
+                    localNNTPStallRecovery.suspend()
                 }
                 if lastObservedTime < 0 {
                     stalledTicks = 0
@@ -5329,7 +5512,28 @@ struct PlayerScreen: View {
         armAVReplacementFirstFrameDeadline(activeAVPlayer)
     }
 
-    private func recoverFromStall() {
+    /// A second proven empty-cache freeze after the one local retry goes directly to the existing
+    /// bounded source-hop path. Keep the current episode and exact resume calculation owned there.
+    private func recoverFromLocalNNTPStarvation(owner: PlayerLoadToken) {
+        guard !playbackExited, !isPaused, !playbackDeadlineClock.isPaused, !scrubbing,
+              pendingAdvance == nil, hasStartedPlaying, !loadFailed,
+              coordinator.player?.activeLoadToken == owner,
+              LocalNNTPBufferPolicy.isLocalNNTP(curURL ?? url) else { return }
+        let resume = retryResumeTarget()
+        DiagnosticsLog.log("player", "local NNTP: empty-cache freeze repeated after retry; failing over")
+        if hopToNextSource(reason: "local NNTP repeated starvation", resumeOverride: resume) {
+            // The shared source-switch path normally ignores the first five seconds. This recovery
+            // must not replay even that short opening when it is the exact frozen position.
+            if resume > 0, resume <= 5 { nudgeResume(to: resume, allowShortResume: true) }
+            return
+        }
+        loadErrorMsg = "Playback kept buffering on this source."
+        presentTerminalLoadFailure()
+    }
+
+    private func recoverFromStall(localNNTPStarvation: Bool = false) {
+        guard !playbackExited, !isPaused, !playbackDeadlineClock.isPaused, !scrubbing,
+              pendingAdvance == nil, hasStartedPlaying, !loadFailed else { return }
         #if os(iOS) || os(macOS)
         if let avPlayer = coordinator.player as? AVPlayerEngineController {
             let expectedGeneration = avStallWatchdogItemGeneration ?? avPlayer.currentItemGeneration
@@ -5366,6 +5570,10 @@ struct PlayerScreen: View {
             ? coordinator.player?.activeLoadToken : nil
         srcProbe("recoverFromStall ENTER (mid-play freeze) stallRecoveries=\(stallRecoveries)/3 at pos=\(String(format: "%.1f", currentTime))s")
         guard stallRecoveries < 3 else {
+            if localNNTPStarvation, let owner = coordinator.player?.activeLoadToken {
+                recoverFromLocalNNTPStarvation(owner: owner)
+                return
+            }
             // Repeated stalls on one source: hop to another at the current position, falling back to
             // the error overlay once candidates run out.
             srcProbe("recoverFromStall -> stall budget exhausted, trying hopToNextSource")
@@ -5393,9 +5601,19 @@ struct PlayerScreen: View {
             curURL ?? url, headers: curHeaders, live: isLive,
             reusing: recoveryToken, resumeOrigin: resume, preservingAbandonedResume: true
         )
+        if issuedToken == nil, localNNTPStarvation {
+            // A refused local retry must not leave a cleared first-frame flag and an ownerless spinner.
+            if !hopToNextSource(reason: "local NNTP retry rejected", resumeOverride: resume) {
+                loadErrorMsg = "Playback could not recover this source."
+                presentTerminalLoadFailure()
+            } else if resume > 0, resume <= 5 {
+                nudgeResume(to: resume, allowShortResume: true)
+            }
+            return
+        }
         if issuedToken != nil { startLoadTimeout() }
-        if issuedToken != nil, resume > 5 {
-            nudgeResume(to: resume)
+        if issuedToken != nil, resume > 5 || (localNNTPStarvation && resume > 0) {
+            nudgeResume(to: resume, allowShortResume: localNNTPStarvation)
         }
     }
 
@@ -5417,7 +5635,7 @@ struct PlayerScreen: View {
     /// it is not a failover attempt and the "trying another source" overlay never appears; libmpv just
     /// tone-maps a DV link to HDR10 (an acceptable fallback). `silent` suppresses the DV notice: the no-frame
     /// start watchdog demotes silently, while a genuine mid-play decode failure keeps the informative notice.
-    private func demoteAVPlayerToMPV(silent: Bool, preservingPreviewPause: Bool = false) {
+    private func demoteAVPlayerToMPV(silent: Bool) {
         // Consume the one-shot dead-input evidence FIRST, so it can never leak into a later demote.
         // See `demoteFollowedDeadInput`.
         let followedDeadInput = demoteFollowedDeadInput
@@ -5426,8 +5644,8 @@ struct PlayerScreen: View {
         guard let retiringAVPlayer = coordinator.player as? AVPlayerEngineController else { return }
         if let owner = retiringAVPlayer.activeLoadToken { adoptResumeSurfaceIfCurrent(loadToken: owner) }
         resumeRetryGeneration &+= 1
-        if preservingPreviewPause, let owner = retiringAVPlayer.activeLoadToken {
-            previewPauseSurfaceTransfer = .init(retiringOwner: owner, context: resumeSurfaceContext(engine: .libmpv))
+        if let owner = retiringAVPlayer.activeLoadToken {
+            engineSurfaceTransfer = .init(retiringOwner: owner, context: resumeSurfaceContext(engine: .libmpv))
         }
         let reissueEpisodeGeneration = episodeSwitchGeneration
         let reissueSourceGeneration = sourceSwitchGeneration
@@ -5581,7 +5799,6 @@ struct PlayerScreen: View {
         toAVPlayer: Bool,
         preservingNativeDebridRecoveryGeneration: Bool = false
     ) {
-        let previewPauseOwner = ownedPausedPreviewOwner
         if skipDBPreviewing, pendingAdvance == nil { stopSkipDBPreview() }
         // Re-validate against the ACTIVE source before committing: the picker row is gated by
         // canUseAVPlayerEngine, but stand down defensively if the active stream can't play on AVPlayer (a
@@ -5605,14 +5822,14 @@ struct PlayerScreen: View {
         // Resolve a stale provider URL (or join its current refresh) BEFORE the physical AV→MPV handoff.
         // Otherwise the direct demotion bypasses fresh-link recovery and loads the same failed transport.
         if !toAVPlayer, coordinator.player is AVPlayerEngineController {
-            demoteAVPlayerToMPV(silent: true, preservingPreviewPause: previewPauseOwner != nil)
+            demoteAVPlayerToMPV(silent: true)
             close()
             return
         }
         srcProbe("user engine switch -> \(toAVPlayer ? "AVPlayer" : "libmpv") (mid-title, carry position)")
         if !preservingNativeDebridRecoveryGeneration { resumeRetryGeneration &+= 1 }
-        if let previewPauseOwner {
-            previewPauseSurfaceTransfer = .init(retiringOwner: previewPauseOwner,
+        if let retiringOwner = coordinator.player?.activeLoadToken {
+            engineSurfaceTransfer = .init(retiringOwner: retiringOwner,
                 context: resumeSurfaceContext(engine: toAVPlayer ? .avPlayer : .libmpv))
         }
         let reissueEpisodeGeneration = episodeSwitchGeneration
@@ -5705,6 +5922,8 @@ struct PlayerScreen: View {
             // A hosted remux mounts asynchronously. Poll until it attaches, then monitor input/output
             // progress. A one-shot pre-mount sample must not send a healthy DV source to the direct timer.
             let armed = playbackDeadlineNow
+            var nativeDecodeClock = AppleAVStartWatchdogPolicy.NativeDecodeClock(
+                uptime: ProcessInfo.processInfo.systemUptime, activeTime: armed)
             let surfaceRemuxExpected = activeAVPlayerWouldRemux || activeAVPlayerWouldPlainRemux
             var watchedController = coordinator.player as? AVPlayerEngineController
             var watchedLoadToken = watchedController?.activeLoadToken
@@ -5738,12 +5957,17 @@ struct PlayerScreen: View {
                 let remuxSignal = current?.remuxStartupSignal
                 let remuxExpectedNow = surfaceRemuxExpected || remuxSignal?.pendingOrMounted == true
                 let elapsed = now - armed
+                let nativePhase = current?.nativeStartupPhase ?? .notRequired
+                let nativeDecodeElapsed = nativeDecodeClock.elapsed(
+                    phase: nativePhase, uptime: ProcessInfo.processInfo.systemUptime, activeTime: now)
                 let awaitingDecision = AppleAVStartWatchdogPolicy.awaitingMountDecision(
                     elapsed: elapsed, ownerCurrent: ownerCurrent,
                     remuxMounted: remuxSignal?.mounted == true,
                     remuxExpected: remuxExpectedNow,
                     directTimeout: avStartWatchdogSeconds,
-                    remuxAttachTimeout: avRemuxAttachWatchdogSeconds)
+                    remuxAttachTimeout: avRemuxAttachWatchdogSeconds,
+                    nativePhase: nativePhase,
+                    nativeDecodeElapsed: nativeDecodeElapsed)
                 if awaitingDecision == .cancel { return }
                 if !monitoringRemux {
                     switch awaitingDecision {
@@ -5873,10 +6097,10 @@ struct PlayerScreen: View {
     /// so this waits for its authoritative achieved keyframe and never seeks into forward-only bytes. Other
     /// engines keep the ordinary post-load absolute seek.
     @State private var deferredResumeAttempt = DeferredResumeAttempt()
-    private func nudgeResume(to seconds: Double) {
+    private func nudgeResume(to seconds: Double, allowShortResume: Bool = false) {
         let ticket = deferredResumeAttempt.begin(targetSeconds: seconds)
         if let floor = DeferredResumeFloorPolicy.armedFloor(
-            targetSeconds: ticket.targetSeconds
+            targetSeconds: ticket.targetSeconds, allowShortResume: allowShortResume
         ) {
             suppressedResumeFloor = max(suppressedResumeFloor ?? 0, floor)
             lastReported = max(lastReported, suppressedResumeFloor ?? floor)
@@ -5944,7 +6168,8 @@ struct PlayerScreen: View {
                     targetSeconds: ticket.targetSeconds,
                     observedDurationSeconds: resumeDuration,
                     engineDurationSeconds: coordinator.player?.mediaDurationSeconds() ?? 0,
-                    deadlineReached: false
+                    deadlineReached: false,
+                    allowShortResume: allowShortResume
                 )
                 switch decision {
                 case .wait:
@@ -5989,7 +6214,8 @@ struct PlayerScreen: View {
                     targetSeconds: ticket.targetSeconds,
                     observedDurationSeconds: duration,
                     engineDurationSeconds: coordinator.player?.mediaDurationSeconds() ?? 0,
-                    deadlineReached: true
+                    deadlineReached: true,
+                    allowShortResume: allowShortResume
                   ) == .clear else { return }
             let ownedFloor = suppressedResumeFloor == ticket.targetSeconds
             suppressedResumeFloor = DeferredResumeFloorPolicy.floorAfterDecision(
@@ -6026,6 +6252,124 @@ struct PlayerScreen: View {
     /// The remembered manual pick for this show, in the shape `StreamRanking.best` / `rankedCandidates` take.
     private var seriesSticky: (addon: String?, bingeGroup: String?)? {
         seriesStickyKey.flatMap { SeriesSourceSticky.preference(for: $0) }
+    }
+
+    private func rememberAcceptedSeriesChoice() {
+        guard let key = seriesStickyKey else { return }
+        if let choice = manualSourceToRemember, currentPickWasExplicit {
+            SeriesSourceSticky.record(seriesKey: key, addon: choice.addon, bingeGroup: choice.bingeGroup)
+            manualSourceToRemember = nil
+            invalidatePreparedEpisode(reason: "accepted manual source")
+        }
+        refreshTracks()
+        if !appliedAutoTracks, !audioTracks.isEmpty {
+            appliedAutoTracks = true
+            autoSelectTracks()
+        }
+        // Re-read the selected audio after automatic selection; subtitle rows never enter this path.
+        if let selected = coordinator.player?.tracks(ofType: "audio").first(where: { $0.selected && $0.isSelectable }),
+           pendingAutomaticAudioLanguage == nil || TrackSelector.matches(selected.lang, pendingAutomaticAudioLanguage ?? "") {
+            rememberSeriesAudio(selected.lang, explicit: false)
+        }
+    }
+
+    private func rememberSeriesAudio(_ language: String, explicit: Bool) {
+        guard let key = seriesStickyKey, let language = BingeAudioContinuityPolicy.canonical(language),
+              explicit || (observedAudioLanguage == nil && incomingEpisodeChoice == nil) else { return }
+        observedAudioLanguage = language
+        let old = SeriesSourceSticky.currentSnapshot(for: key)
+        SeriesSourceSticky.recordAudio(seriesKey: key, language: language)
+        let choice = SeriesSourceSticky.currentSnapshot(for: key)
+        if old != choice {
+            invalidatePreparedEpisode(reason: "selected audio changed")
+            if explicit { restartEpisodeResolutionForAudioChoice(choice) }
+        }
+        DiagnosticsLog.log("binge", "accepted continuity audio=\(language) addon=\(VXProbeRedaction.identityToken(choice.addon ?? "")) release=\(VXProbeRedaction.identityToken(choice.bingeGroup ?? "")) manualAudio=\(explicit)")
+    }
+
+    private func restartEpisodeResolutionForAudioChoice(_ choice: SeriesSourceSticky.Snapshot) {
+        // A cold resolver has no pendingAdvance yet. Retain its exact requested episode, not Next/EOF.
+        let target = pendingAdvance?.meta.videoId
+            ?? (episodeResolveGeneration != nil ? episodeResolutionTargetVideoID : nil)
+        incomingEpisodeChoice = choice
+        guard let target else { return }
+        invalidateEpisodeResolution()
+        episodeSwitchGeneration &+= 1
+        resumeRetryGeneration &+= 1
+        episodeResolveGeneration = nil
+        if pendingAdvance?.issued == true {
+            resumeAfterLanguageRetry = resumeAfterLanguageRetry || !isPaused
+            coordinator.player?.pause()
+            coordinator.player?.invalidateLoadToken()
+            loadTimeout?.cancel()
+            recoveryDeadline?.cancel(); recoveryDeadline = nil
+            hasStartedPlaying = false
+            uncommittedIdentityBlocked = true
+        }
+        pendingAdvance = nil
+        supersededAdvance = nil
+        DiagnosticsLog.log("binge", "audio choice restarted exact episode=\(VXProbeRedaction.identityToken(target))")
+        if !goToEpisode(target) {
+            failedEpisodeResolutionID = target
+            loadErrorMsg = "Couldn't reload this episode with your selected audio language. Retry to find its sources again."
+            presentTerminalLoadFailure()
+        }
+    }
+
+    private func admitIncomingEpisodeAudio(loadToken: PlayerLoadToken) -> Bool {
+        guard let pending = pendingAdvance, pending.loadToken == loadToken else { return true }
+        guard !pending.terminal else { return false }
+        guard currentPickWasExplicit || SeriesSourceSticky.admits(incomingEpisodeChoice) else { return false }
+        guard let desired = incomingEpisodeChoice?.audioLanguage, !currentPickWasExplicit else { return true }
+        let tracks = coordinator.player?.tracks(ofType: "audio").filter(\.isSelectable) ?? []
+        if incomingAudioInventory.owner != loadToken {
+            incomingAudioInventoryWaitTask?.cancel(); incomingAudioInventoryWaitTask = nil
+        }
+        let decision = incomingAudioInventory.evaluate(
+            owner: loadToken, languages: tracks.map(\.lang), desired: desired,
+            now: ProcessInfo.processInfo.systemUptime
+        )
+        if decision == .waiting {
+            if incomingAudioInventoryWaitTask == nil {
+                DiagnosticsLog.log("binge", "audio inventory pending; holding exact episode admission")
+                incomingAudioInventoryWaitTask = Task { @MainActor in
+                    do { try await Task.sleep(for: .seconds(BingeAudioInventoryAdmission<PlayerLoadToken>.observationGraceSeconds)) }
+                    catch { return }
+                    guard !Task.isCancelled, incomingAudioInventory.owner == loadToken,
+                          coordinator.player?.activeLoadToken == loadToken,
+                          pendingAdvance?.loadToken == loadToken else { return }
+                    incomingAudioInventoryWaitTask = nil
+                    recheckParkedAssetAfterTelemetry(loadToken: loadToken)
+                }
+            }
+            return false
+        }
+        incomingAudioInventoryWaitTask?.cancel(); incomingAudioInventoryWaitTask = nil
+        if decision == .accepted {
+            if let match = tracks.first(where: { TrackSelector.matches($0.lang, desired) }),
+               !match.selected {
+                coordinator.player?.setAudioTrack(match.id)
+                guard coordinator.player?.activeLoadToken == loadToken else { return false }
+            }
+            return true
+        }
+        let newlyRejected = currentStream.map { languageRejectedStreams.insert($0.id).inserted } ?? false
+        let retry = BingeAudioContinuityPolicy.shouldRetry(newlyRejected: newlyRejected, rejectedCount: languageRejectedStreams.count)
+        DiagnosticsLog.log("binge", "audio inventory rejected target=\(VXProbeRedaction.identityToken(pending.meta.videoId)) desired=\(desired) reason=\(decision) rejected=\(languageRejectedStreams.count) retry=\(retry)")
+        resumeAfterLanguageRetry = resumeAfterLanguageRetry || !isPaused
+        coordinator.player?.pause()
+        coordinator.player?.invalidateLoadToken()
+        loadTimeout?.cancel()
+        recoveryDeadline?.cancel(); recoveryDeadline = nil
+        hasStartedPlaying = false
+        pendingAdvance?.terminal = true
+        uncommittedIdentityBlocked = true
+        invalidatePreparedEpisode(reason: "next episode audio mismatch")
+        if retry, goToEpisode(pending.meta.videoId, autoAdvance: true) { return false }
+        loadErrorMsg = "No source with your selected audio language could be played. Choose another source or audio language."
+        failedEpisodeResolutionID = pending.meta.videoId
+        presentTerminalLoadFailure()
+        return false
     }
 
     /// The best playable stream not yet tried for this title / episode, honouring the user's source
@@ -6129,6 +6473,7 @@ struct PlayerScreen: View {
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        engineSurfaceTransfer = nil
         #if !os(tvOS)
         skipDBPreviewing = false
         skipDBPreviewReturnPosition = nil
@@ -6150,6 +6495,7 @@ struct PlayerScreen: View {
         bufferedTime = 0
         stallRecoveries = 0
         stallStableProgressTicks = 0
+        localNNTPStallRecovery = .init()
         if userInitiated {
             sourceHops = 0; exhaustedURLs = []
             recoveryDeadline?.cancel(); recoveryDeadline = nil
@@ -6191,6 +6537,7 @@ struct PlayerScreen: View {
         lastReported = -1
         stallRecoveries = 0
         stallStableProgressTicks = 0
+        localNNTPStallRecovery = .init()
     }
 
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current
@@ -6207,11 +6554,11 @@ struct PlayerScreen: View {
                               mediaGenerationAlreadyClaimed: Bool = false,
                               preparedRemux: VortXPreparedRemuxAttachment? = nil,
                               expectedPreparedRemuxOwner: VortXPreparedRemuxOwnerIdentity? = nil) -> Bool {
-        let preservingPreviewPause = ownedPausedPreviewOwner != nil
         if skipDBPreviewing, pendingAdvance == nil { stopSkipDBPreview() }
         if userInitiated, loadFailed {
             playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         }
+        let preservingViewerPause = playbackDeadlineClock.isPaused
         guard newURL != curURL else {
             if let pending = pendingAdvance, !pending.issued,
                pending.meta.videoId != curMeta?.videoId {
@@ -6281,7 +6628,7 @@ struct PlayerScreen: View {
         let issuedToken = loadIntoPlayer(
             newURL, headers: nextHeaders, live: nextLive, contentHint: nextHint,
             resumeOrigin: resume,
-            preservingPreviewPause: preservingPreviewPause,
+            preservingViewerPause: preservingViewerPause,
             preparedRemux: preparedRemux,
             expectedPreparedRemuxOwner: expectedPreparedRemuxOwner
         )
@@ -6339,9 +6686,13 @@ struct PlayerScreen: View {
         // episode advance also passes `userInitiated: true` (it closes panels and resets the failover budget
         // the same way), and only the sources and quality panels set `explicitPick`. Recording an auto-hop or
         // an advance would teach the store the failure, not the taste.
-        if explicitPick, let key = seriesStickyKey {
-            SeriesSourceSticky.record(seriesKey: key, addon: addon,
-                                      bingeGroup: stream.behaviorHints?.bingeGroup)
+        if explicitPick, seriesStickyKey != nil {
+            manualSourceToRemember = (addon, stream.behaviorHints?.bingeGroup)
+            incomingEpisodeChoice = nil
+            observedAudioLanguage = nil
+            pendingAutomaticAudioLanguage = nil
+        } else {
+            manualSourceToRemember = nil
         }
         if pendingAdvance == nil { curDebridRef = debridRef }
         curHint = nextHint
@@ -6922,6 +7273,7 @@ struct PlayerScreen: View {
             now: now
         ) else { return }
         let originID = curMeta?.videoId
+        let choice = seriesStickyKey.map { SeriesSourceSticky.currentSnapshot(for: $0) }
         let generation = nextEpisodePreparationGeneration
         let mountIsOnDevice: Bool
         if case .onDevice = VortXExternalEngine.shared.mountPlan {
@@ -6938,7 +7290,9 @@ struct PlayerScreen: View {
         preparingEpisodeID = nextID
         DiagnosticsLog.log("binge", "next prepare trigger target=\(VXProbeRedaction.identityToken(nextID)) generation=\(generation) attempt=\(attempt.sequence) credits=\(attempt.nearCredits ? "Y" : "N")")
         nextEpisodePreparationTask = Task { @MainActor in
-            let result = await warm(request)
+            let result = await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
+                await warm(request)
+            }
             guard preparingEpisodeID == nextID,
                   PreparedEpisodeRetentionPolicy.ownsCompletion(
                     capturedGeneration: generation,
@@ -6946,9 +7300,12 @@ struct PlayerScreen: View {
                     capturedOriginEpisodeID: originID,
                     currentOriginEpisodeID: curMeta?.videoId,
                     canceled: Task.isCancelled
-              ) else {
+              ), SeriesSourceSticky.admits(choice) else {
                 retirePreparedTorrentEngine(result?.torrentPreparationLease, reason: "stale completion")
                 result?.preparedRemux?.abandon(reason: "stale iOS preparation completion")
+                if generation == nextEpisodePreparationGeneration, preparingEpisodeID == nextID {
+                    invalidatePreparedEpisode(reason: "continuity changed during preparation")
+                }
                 return
             }
             preparingEpisodeID = nil
@@ -6978,12 +7335,14 @@ struct PlayerScreen: View {
             preparedEpisode?.preparedRemux?.abandon(reason: "replacement prepared episode")
             warmedEpisodeID = nextID
             preparedEpisode = result
+            preparedEpisodeChoice = choice
             DiagnosticsLog.log("binge", "next prepare ready target=\(VXProbeRedaction.identityToken(nextID)) host=\(result.url.host ?? "-") generation=\(generation)")
         }
     }
 
     private func takePreparedEpisode(for videoID: String) -> PlayerEpisodeStream? {
-        let result = PreparedEpisodeRetentionPolicy.consumes(
+        let choiceIsCurrent = preparedEpisodeChoice == seriesStickyKey.map { SeriesSourceSticky.currentSnapshot(for: $0) }
+        let result = choiceIsCurrent && PreparedEpisodeRetentionPolicy.consumes(
             requestedEpisodeID: videoID,
             preparedEpisodeID: preparedEpisode?.meta.videoId
         ) ? preparedEpisode : nil
@@ -6999,6 +7358,7 @@ struct PlayerScreen: View {
         nextEpisodePreparationTask = nil
         preparingEpisodeID = nil
         preparedEpisode = nil
+        preparedEpisodeChoice = nil
         warmedEpisodeID = nil
         nextEpisodeAttemptPolicy.reset()
         if result != nil {
@@ -7015,6 +7375,7 @@ struct PlayerScreen: View {
         retirePreparedTorrentEngine(preparedEpisode?.torrentPreparationLease, reason: reason)
         preparedEpisode?.preparedRemux?.abandon(reason: reason)
         preparedEpisode = nil
+        preparedEpisodeChoice = nil
         warmedEpisodeID = nil
         nextEpisodeAttemptPolicy.reset()
         DiagnosticsLog.log("binge", "next prepare invalidated reason=\(reason)")
@@ -7056,14 +7417,14 @@ struct PlayerScreen: View {
         )
     }
 
-    private func armEpisodeResolutionDeadline(owner: EpisodeResolutionOwner) {
+    private func armEpisodeResolutionDeadline(owner: EpisodeResolutionOwner, budget: EpisodeResolutionBudget) {
         episodeResolutionTask?.cancel()
         episodeResolutionDeadlineTask?.cancel()
         episodeResolutionOwner = owner
         episodeResolutionTargetVideoID = owner.videoID
         episodeResolutionAdmitted = false
         episodeResolutionDeadlineTask = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(Self.episodeResolutionDeadlineSeconds))
+            try? await Task.sleep(for: .seconds(max(0, budget.deadline - ProcessInfo.processInfo.systemUptime)))
             guard !Task.isCancelled else { return }
             let decision = EpisodeResolutionDeadlinePolicy.decision(
                 captured: owner,
@@ -7086,10 +7447,10 @@ struct PlayerScreen: View {
             reconnecting = false
             buffering = false
             failedEpisodeResolutionID = owner.videoID
-            loadErrorMsg = "No playable source resolved within 30 seconds."
+            loadErrorMsg = "No playable source resolved within \(Int(Self.episodeResolutionDeadlineSeconds)) seconds."
             DiagnosticsLog.log(
                 "binge",
-                "episode resolve deadline reached before player admission for \(VXProbeRedaction.identityToken(owner.videoID))"
+                "episode resolve deadline reached before player admission for \(VXProbeRedaction.identityToken(owner.videoID)) origin=\(budget.origin.rawValue) elapsed=\(Int(budget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s"
             )
             presentTerminalLoadFailure()
         }
@@ -7229,6 +7590,12 @@ struct PlayerScreen: View {
         // Keep this through nil results, duplicate outgoing files and rejected player commands.
         // Only an accepted replacement (or a restored healthy pending owner) may clear it.
         failedEpisodeResolutionID = videoId
+        if languageRejectedEpisodeID != videoId || !autoAdvance {
+            languageRejectedEpisodeID = videoId
+            languageRejectedStreams = []
+        }
+        let choice = seriesStickyKey.map { SeriesSourceSticky.currentSnapshot(for: $0) }
+        let rejectedStreams = languageRejectedStreams
         let retainedPreparedEpisode = takePreparedEpisode(for: videoId)
         if let pending = pendingAdvance,
            IssuedPendingEpisodeReentryPolicy.shouldPreserve(
@@ -7256,7 +7623,10 @@ struct PlayerScreen: View {
             sourceGeneration: mediaGeneration,
             videoID: videoId
         )
-        armEpisodeResolutionDeadline(owner: resolutionOwner)
+        let resolutionBudget = EpisodeResolutionBudget(episodeID: videoId,
+            origin: autoAdvance ? .automatic : .manual, now: ProcessInfo.processInfo.systemUptime)
+        armEpisodeResolutionDeadline(owner: resolutionOwner, budget: resolutionBudget)
+        DiagnosticsLog.log("binge", "episode resolve begin target=\(VXProbeRedaction.identityToken(videoId)) origin=\(resolutionBudget.origin.rawValue) budget=\(Int(Self.episodeResolutionDeadlineSeconds))s prepared=\(retainedPreparedEpisode != nil)")
         autoRetryTask?.cancel()
         if duration > 0, currentTime > 0 { reportProgress(currentTime) }   // flush the outgoing episode (floor-guarded)
         withAnimation { panel = nil }
@@ -7284,6 +7654,7 @@ struct PlayerScreen: View {
                     )
                 }
             }
+            guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return }
             let resolved: PlayerEpisodeStream?
             if let retainedPreparedEpisode,
                preparedTorrentLeaseIsAdmissible(
@@ -7319,7 +7690,15 @@ struct PlayerScreen: View {
                     )
                 }
                 if let resolverRoute {
-                    resolved = await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                    resolved = await EpisodeResolutionBudget.$current.withValue(resolutionBudget) {
+                        await SeriesSourceSticky.resolveIfCurrent(choice) {
+                            await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
+                                await SeriesSourceSticky.$rejectedStreams.withValue(rejectedStreams) {
+                                    await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                                }
+                            }
+                        }
+                    }
                 } else {
                     resolved = nil
                 }
@@ -7327,6 +7706,7 @@ struct PlayerScreen: View {
             let resultIsCurrent = !Task.isCancelled && !playbackExited
                 && episodeGeneration == episodeSwitchGeneration
                 && mediaGeneration == resumeRetryGeneration
+                && SeriesSourceSticky.admits(choice)
             guard resultIsCurrent else {
                 // A source change can retire this result without starting a newer episode generation. Clear
                 // only this generation's switch state; a newer episode request owns the state when generations
@@ -7341,7 +7721,7 @@ struct PlayerScreen: View {
                 }
                 return
             }
-            guard let es = resolved else {
+            guard let es = resolved, resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else {
                 invalidateEpisodeResolution()
                 episodeResolveGeneration = nil
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
@@ -7416,11 +7796,13 @@ struct PlayerScreen: View {
                                                    generation: episodeGeneration,
                                                    debridRef: es.debridRef,
                                                    url: es.url, issued: false)
+            incomingEpisodeChoice = choice
             // External sync starts only after the target's first frame commits its identity. The commit point
             // re-mints the session token, and the normal first-frame hook opens the new episode's scrobble.
             // The player command is the transaction boundary. Source state and engine attribution move only
             // after that command returns an exact active token inside switchStream.
             guard !playbackExited,
+                  SeriesSourceSticky.admits(choice),
                   episodeGeneration == episodeSwitchGeneration,
                   mediaGeneration == resumeRetryGeneration,
                   pendingAdvance?.meta.videoId == es.meta.videoId else { return }
@@ -7441,6 +7823,10 @@ struct PlayerScreen: View {
                 expectedPreparedRemuxOwner: expectedPreparedRemuxOwner
             )
             admissionCommandIssued = issued
+            if issued, resumeAfterLanguageRetry {
+                resumeAfterLanguageRetry = false
+                coordinator.player?.play()
+            }
             if issued, let admissionLease, let request = es.preparationRequest {
                 admissionLeaseAdopted = admissionLease.adopt(
                     episodeID: es.meta.videoId,
@@ -7465,6 +7851,10 @@ struct PlayerScreen: View {
     @discardableResult
     private func commitPendingAdvanceOnFirstFrame(loadToken: PlayerLoadToken) -> Bool {
         guard let pending = pendingAdvance,
+              !pending.terminal,
+              currentPickWasExplicit || SeriesSourceSticky.admits(incomingEpisodeChoice),
+              currentPickWasExplicit || incomingEpisodeChoice?.audioLanguage == nil
+                || incomingAudioInventory.permitsCommit(owner: loadToken),
               PlayerLoadProvenanceState.canCommit(
                 callbackToken: loadToken,
                 activeToken: coordinator.player?.activeLoadToken,
@@ -7866,9 +8256,9 @@ struct PlayerScreen: View {
                 showExternalChooser = true
             }
         }
-        // NO GlassEffectContainer here (the old .glassChromeCluster() wrap). Two reasons: (1) the discs are
-        // now the tight material variant (vortxGlassDisc, never glassEffect), so there are no glass panes to
-        // merge and the container only produced the "one continuous blurred slab" over-blur; (2) on OS 26 a
+        // NO GlassEffectContainer here (the old .glassChromeCluster() wrap). Two reasons: (1) the controls
+        // are shape-clipped player accent surfaces with black-only shadows, so there are no glass panes to
+        // merge and the container would only produce the "one continuous blurred slab" over-blur; (2) on OS 26 a
         // GlassEffectContainer renders interactive descendants with its own monochrome/vibrancy treatment,
         // which visually suppressed the volume Slider's ember accent tint (volumeControl lives in this bar).
         // Dropping the container restores the slider's .tint(Theme.Palette.accent) minimum track.
@@ -7923,15 +8313,16 @@ struct PlayerScreen: View {
             }
             Button { Haptics.tap(); viewerToggle(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
-                    .font(.system(size: 50)).foregroundStyle(.white).shadow(radius: 8)
-                    // Glass transport disc (mockup .big) on the TIGHT disc variant: shape-clipped material,
-                    // never glassEffect (whose un-clipped ambient bloom drew a dark rounded halo around the
-                    // disc over bright video). The inner 84pt disc is purely visual; the outer 100pt frame
-                    // keeps the original tap target.
+                    .font(.system(size: 50))
+                    // The inner 84pt accent face is purely visual; the outer 100pt frame keeps the original
+                    // tap target. The player surface clips the accent to the Circle and owns a black-only
+                    // depth shadow, so AppKit cannot add a rectangular button patch around it.
                     .frame(width: 84, height: 84)
-                    .vortxGlassDisc()
+                    .playerControlSurface(in: Circle(), prominent: true)
                     .frame(width: 100, height: 100)
+                    .contentShape(Circle())
             }
+            .buttonStyle(.plain)
             .accessibilityLabel(isPaused ? "Play" : "Pause")
             if !isLive {
                 seekButton("goforward.\(seekStep)", by: seekStepSeconds)
@@ -7975,13 +8366,13 @@ struct PlayerScreen: View {
             seekBy(delta)
         } label: {
             Image(systemName: icon).font(.system(size: 30, weight: .semibold))
-                .foregroundStyle(.white).shadow(radius: 4)
-                // Glass transport disc (mockup .skip) on the TIGHT disc variant (shape-clipped material,
-                // never glassEffect, no halo): inner 54pt visual disc, outer 60pt frame keeps the tap target.
                 .frame(width: 54, height: 54)
-                .vortxGlassDisc()
+                // Inner 54pt accent surface; outer 60pt frame retains the existing tap target.
+                .playerControlSurface(in: Circle())
                 .frame(width: 60, height: 60)
+                .contentShape(Circle())
         }
+        .buttonStyle(.plain)
         .accessibilityLabel(delta < 0 ? "Skip back 10 seconds" : "Skip forward 10 seconds")
     }
 
@@ -8472,13 +8863,12 @@ struct PlayerScreen: View {
     private func iconButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white).padding(11)
-                // Floating top-bar disc (mockup .disc) on the TIGHT disc variant: a shape-clipped material,
-                // never glassEffect, so the top-row buttons read as tight pucks (no dark halo, no over-blur).
-                // Background only, hit shape unchanged.
-                .vortxGlassDisc()
-                .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
+                .frame(width: 44, height: 44)
+                // The accent stays inside the Circle; this helper is shared by every legacy top-bar
+                // action, including macOS, where an unstyled Button would otherwise paint a square.
+                .playerControlSurface(in: Circle())
         }
+        .buttonStyle(.plain)
         .accessibilityLabel(label)
     }
 
@@ -8508,9 +8898,8 @@ struct PlayerScreen: View {
                         }
                     }
                         .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.white).padding(11)
-                        .vortxGlassDisc()
-                        .frame(width: 44, height: 44).contentShape(Circle())
+                        .frame(width: 44, height: 44)
+                        .playerControlSurface(in: Circle())
                 }
                 .buttonStyle(.plain)
                 .disabled(controller.isPictureInPictureTransitioning)
@@ -9207,13 +9596,10 @@ struct PlayerScreen: View {
                     Spacer()
                     Button { close() } label: {
                         Image(systemName: "xmark").font(.system(size: 13, weight: .bold))
-                            // Panel close on the shared TIGHT glass disc, matching the transport discs
-                            // (shape-clipped material, never glassEffect, no halo). Background only;
-                            // close() action unchanged.
-                            .foregroundStyle(.white.opacity(0.7)).padding(7)
-                            .vortxGlassDisc()
-                            .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
+                            .frame(width: 44, height: 44)
+                            .playerControlSurface(in: Circle())
                     }
+                    .buttonStyle(.plain)
                     .accessibilityLabel("Close panel")
                 }
                 .padding(.horizontal).padding(.vertical, 14)
@@ -9291,6 +9677,7 @@ struct PlayerScreen: View {
             }
             .disabled(!row.isEnabled)
             .opacity(row.isEnabled ? 1 : 0.6)
+            .buttonStyle(.plain)
             .accessibilityLabel(row.label)
             .accessibilityValue(row.detail)
             .accessibilityHint(row.accessibilityHint)
@@ -9555,7 +9942,12 @@ struct PlayerScreen: View {
             for b in SubtitleStyle.backgrounds { rs.append(Row(label: Self.l10n(b.label), selected: subBackground == b.id) { setSubtitleBackground(b.id) }) }
             return rs
         case .audio:
-            var rs = groupedTrackRows(audioTracks) { coordinator.player?.setAudioTrack($0) }
+            var rs = groupedTrackRows(audioTracks) { id in
+                coordinator.player?.setAudioTrack(id)
+                if let track = audioTracks.first(where: { $0.id == id && $0.isSelectable }) {
+                    rememberSeriesAudio(track.lang, explicit: true)
+                }
+            }
             rs.append(Row(label: String(localized: "Audio Settings"), detail: "›") { openPanel(.audioSettings) })
             return rs
         case .audioSettings:
@@ -10012,11 +10404,13 @@ struct PlayerScreen: View {
     /// the cover down - so a stuck load can never trap the user with a Task still spinning. Routed from
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
+        pendingAdvance?.debridRef?.nativeUsenetLease?.close()
+        curDebridRef?.nativeUsenetLease?.close()
         // Preview time is temporary editor state, not the viewer's watch progress.
         // Restore it under the original owner before terminal/history/scrobble decisions.
         if skipDBPreviewing { stopSkipDBPreview() }
         let exitLoadToken = coordinator.player?.activeLoadToken
-        previewPauseSurfaceTransfer = nil
+        engineSurfaceTransfer = nil
         let assetSanityAccepted = assetSanityAttempt.isAccepted(owner: exitLoadToken)
         cancelTerminalFinalityRefresh()
         cancelDirectResumeInventoryRefresh()
@@ -10199,7 +10593,11 @@ struct PlayerScreen: View {
 
     /// Auto-pick the audio + subtitle track from the user's language preferences, once tracks are known.
     private func autoSelectTracks(applyAutomaticSelections: Bool = true) {
-        let pick = TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
+        let pick = TrackPreferences.$audioLanguagesOverride.withValue(
+            incomingEpisodeChoice?.audioLanguage.map { [$0] } ?? TrackPreferences.audioLanguagesOverride
+        ) {
+            TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
+        }
         let remuxOwnsInitialAudio =
             (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
         let automaticAudio = TrackSelector.automaticAudioSelection(
@@ -10216,6 +10614,7 @@ struct PlayerScreen: View {
                 self.pendingAudioReapply = nil
             }
         } else if applyAutomaticSelections, let automaticAudio {
+            pendingAutomaticAudioLanguage = audioTracks.first(where: { $0.id == automaticAudio })?.lang
             coordinator.player?.setAudioTrack(automaticAudio)
         }
         // Mandated check 8: an explicit in-session subtitle pick captured before an engine switch must SURVIVE
@@ -10590,10 +10989,10 @@ struct AirPlayRoutePickerButton: View {
     var body: some View {
         AirPlayPickerRepresentable()
             .frame(width: 44, height: 44)
-            // AirPlay disc on the shared TIGHT glass disc, matching the sibling transport discs
-            // (shape-clipped material, never glassEffect, no halo). Background only; the
-            // AVRoutePickerView behavior is unchanged.
-            .vortxGlassDisc()
+            // Keep AVRoutePickerView as the native interaction surface, but give its clear wrapper the
+            // same player-owned accent face as sibling controls. The accent is clipped to the Circle;
+            // the route picker behavior and VoiceOver label remain native.
+            .playerControlSurface(in: Circle())
             .accessibilityLabel("AirPlay")
     }
 }

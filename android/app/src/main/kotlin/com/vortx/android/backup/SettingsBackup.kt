@@ -215,6 +215,10 @@ object SettingsBackup {
         val rosterBytes = domain[ROSTER_KEY] as? ByteArray ?: return null
         return UserProfile.decodeRoster(String(rosterBytes, Charsets.UTF_8))
     }
+    internal fun rawRosterFromBlob(blob: Any?): org.json.JSONArray? {
+        val bytes = domainFromBlob(blob)?.get(ROSTER_KEY) as? ByteArray ?: return null
+        return runCatching { org.json.JSONArray(String(bytes, Charsets.UTF_8)) }.getOrNull()
+    }
 
     /**
      * The roster's modification stamp out of a blob, in epoch SECONDS, or null when absent. Lets a pull
@@ -305,6 +309,7 @@ object SettingsBackup {
         activeId: String? = null,
         deviceSettings: Map<String, Any> = emptyMap(),
         now: Date = Date(),
+        rawRosterJson: String? = null,
     ): String? {
         if (roster.isEmpty()) return null                       // never-zero
 
@@ -324,7 +329,8 @@ object SettingsBackup {
         base.putAll(deviceSettings)
 
         // The roster rides as plist DATA of UTF-8 JSON, matching JSONEncoder().encode(profiles) on Apple.
-        base[ROSTER_KEY] = UserProfile.encodeRoster(roster).toByteArray(Charsets.UTF_8)
+        if (rawRosterJson != null && UserProfile.decodeRoster(rawRosterJson) != roster) return null
+        base[ROSTER_KEY] = (rawRosterJson ?: UserProfile.encodeRoster(roster)).toByteArray(Charsets.UTF_8)
         // A plist REAL of epoch SECONDS, matching Date().timeIntervalSince1970 / double(forKey:) on Apple.
         if (!rosterModifiedSeconds.isFinite() || rosterModifiedSeconds < 0.0) return null
         base[MODIFIED_KEY] = rosterModifiedSeconds
@@ -409,6 +415,8 @@ object SettingsBackup {
         "vortx.home.showCollectionsHub" to SettingType.BOOL,
         "vortx.discover.showCollectionsHub" to SettingType.BOOL,
         "vortx.mergeDiscoverSearch" to SettingType.BOOL,
+        "vortx.mergeHomeDiscover" to SettingType.BOOL,
+        "vortx.cinema.quickView" to SettingType.BOOL,
         "vortx.detail.showFinancials" to SettingType.BOOL,
         "vortx.detail.spoilerSafe" to SettingType.BOOL,
         "vortx.spoilerBlur" to SettingType.BOOL,

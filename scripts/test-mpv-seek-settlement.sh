@@ -14,6 +14,8 @@ mkdir -p "$build_dir"
 } > "$build_dir/PlayerPositionEvent.swift"
 swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift \
+  app/Sources/Player/CacheShedPolicy.swift \
+  app/Sources/Player/TVOSProactiveMemoryPressurePolicy.swift \
   "$build_dir/PlayerPositionEvent.swift" app/Tests/MPVSeekSettlementPolicyTests.swift \
   -o "$build_dir/policy"
 "$build_dir/policy"

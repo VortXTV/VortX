@@ -1,0 +1,10 @@
+{
+  "catalog": {"metas": [{"id":"tt-fixture","type":"series","name":"Fixture Series","poster":"https://images.example/poster.jpg"}]},
+  "meta": {"meta": {"id":"tt-fixture","type":"series","name":"Fixture Series","videos":[{"id":"tt-fixture:1:2","season":1,"episode":2,"title":"Second","streams":[{"url":"https://media.example/embedded.m3u8","behaviorHints":{"bingeGroup":"embedded-season"}}]}]}},
+  "stream": {"streams": [
+    {"infoHash":"0123456789012345678901234567890123456789","fileIdx":2,"name":"Preferred release","behaviorHints":{"bingeGroup":"fixture-season","videoSize":9007199254740993,"proxyHeaders":{"request":{"Referer":"https://media.example/"}}}},
+    {"infoHash":"0123456789012345678901234567890123456789","fileIdx":3,"name":"Alternate episode","extension":{"retain":true}}
+  ]},
+  "subtitles": {"subtitles": [{"id":"en-1","lang":"eng","url":"https://media.example/en.vtt","forced":false},{"id":"hi-1","lang":"hin","url":"https://media.example/hi.srt","extension":{"hearingImpaired":true}}]},
+  "manifest": {"id":"fixture.addon","version":"1.0.0","name":"Fixture","resources":["catalog","meta","stream","subtitles"],"types":["series"],"catalogs":[{"type":"series","id":"popular","extra":[{"name":"search"},{"name":"skip"}]}]}
+}

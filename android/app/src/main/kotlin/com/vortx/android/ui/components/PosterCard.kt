@@ -3,6 +3,7 @@ package com.vortx.android.ui.components
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -83,6 +84,14 @@ fun PosterCard(
     menu: PosterCardMenu = if (menuItem == null) PosterCardMenu.NONE else PosterCardMenu.CATALOG,
     onDetails: (() -> Unit)? = null,
     onRemoveFromContinueWatching: (() -> Unit)? = null,
+    onQuickView: (() -> Unit)? = null,
+    /** Touch presentation opts into the direct-accent cinema frame; TV retains its focus/elevation style. */
+    cinema: Boolean = false,
+    /** Cinema result/CW frames are wide even when the general poster preset remains portrait. */
+    landscape: Boolean? = null,
+    showLabels: Boolean? = null,
+    description: String? = null,
+    reserveLabelSpace: Boolean = false,
     art: @Composable BoxScope.() -> Unit = { DefaultPosterArt(title) },
 ) {
     val colors = VortXTheme.colors
@@ -91,7 +100,7 @@ fun PosterCard(
     // moment a preset changes in the Poster Style screen.
     val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
     val cardShape = RoundedCornerShape(posterStyle.radius.radius)
-    val aspect = if (posterStyle.landscape) 16f / 9f else 2f / 3f
+    val aspect = if (landscape ?: posterStyle.landscape) 16f / 9f else 2f / 3f
     val interactionSource = remember { MutableInteractionSource() }
     val pressed by interactionSource.collectIsPressedAsState()
     val reduced = VortXTheme.reducedMotion
@@ -132,6 +141,7 @@ fun PosterCard(
                 onDismiss = { menuOpen = false },
                 onDetails = onDetails,
                 onRemoveFromContinueWatching = onRemoveFromContinueWatching,
+                onQuickView = onQuickView,
                 repository = { (appContext as? VortXApplication)?.catalogRepository },
             )
         }
@@ -139,8 +149,15 @@ fun PosterCard(
             modifier = Modifier
                 .fillMaxWidth()
                 .aspectRatio(aspect)
-                .vortxShadow(elevationSpec, cardShape)
-                .clip(cardShape),
+                .then(if (cinema) Modifier else Modifier.vortxShadow(elevationSpec, cardShape))
+                .clip(cardShape)
+                .then(
+                    if (cinema) Modifier.border(
+                        width = if (active) 2.dp else 1.dp,
+                        color = if (active) colors.accent else colors.hairline.copy(alpha = 0.82f),
+                        shape = cardShape,
+                    ) else Modifier,
+                ),
         ) {
             art()
             if (watched) {
@@ -174,11 +191,12 @@ fun PosterCard(
         }
         // Hide-labels preset (item 5): the poster art carries the identity, so the title/subtitle rows are
         // dropped when the user opts in. Labels shown is the default, today's look.
-        if (!posterStyle.hideLabels) {
+        if (showLabels ?: !posterStyle.hideLabels) {
             Text(
                 text = title,
                 style = VortXTheme.type.cardTitle.copy(color = if (active) colors.textPrimary else colors.textPrimary.copy(alpha = 0.92f)),
                 maxLines = 2,
+                minLines = if (reserveLabelSpace) 2 else 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 6.dp),
             )
@@ -186,8 +204,18 @@ fun PosterCard(
                 Text(
                     text = subtitle,
                     style = VortXTheme.type.label.copy(color = colors.textTertiary, fontSize = 12.sp),
-                    maxLines = 1,
+                    maxLines = if (description != null || reserveLabelSpace) 2 else 1,
+                    minLines = if (reserveLabelSpace) 2 else 1,
                     overflow = TextOverflow.Ellipsis,
+                )
+            }
+            description?.takeIf(String::isNotBlank)?.let {
+                Text(
+                    text = it,
+                    style = VortXTheme.type.body.copy(color = colors.textSecondary),
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 6.dp),
                 )
             }
         }
@@ -209,6 +237,7 @@ internal fun PosterQuickActionMenu(
     onDismiss: () -> Unit,
     onDetails: (() -> Unit)? = null,
     onRemoveFromContinueWatching: (() -> Unit)? = null,
+    onQuickView: (() -> Unit)? = null,
     repository: () -> CatalogRepository?,
 ) {
     fun fire(action: suspend (CatalogRepository) -> Unit) {
@@ -220,6 +249,12 @@ internal fun PosterQuickActionMenu(
         when (menu) {
             PosterCardMenu.NONE -> Unit
             PosterCardMenu.CATALOG -> {
+                onQuickView?.let { quickView ->
+                    DropdownMenuItem(
+                        text = { Text("Quick view") },
+                        onClick = { onDismiss(); quickView() },
+                    )
+                }
                 DropdownMenuItem(
                     text = { Text("Add to Library") },
                     onClick = { fire { it.addToLibrary(item) } },

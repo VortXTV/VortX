@@ -385,8 +385,10 @@ enum RemuxItemEndPolicyTests {
                   "self.seekCompletionTimeoutTask?.cancel()", "guard finished, landing.isFinite else"]))
         check("wiring: unfinished current seek retires ownership and recovers the exact requested source target",
               containsInOrder(completion, ["guard finished, landing.isFinite else",
+                  "let recoveryRepair = self.recoverySeekSettlement.fail(requestID: requestID)",
                   "self.invalidateSeekRequests()", "seekItem?.cancelPendingSeeks()",
-                  "self.remountForSeek(sourceSeconds: sourceSeconds)", "self.emit(MPVProperty.endFileError",
+                  "let repairSourceSeconds = recoveryRepair?.sourceSeconds ?? sourceSeconds",
+                  "self.remountForSeek(sourceSeconds: repairSourceSeconds)", "self.emit(MPVProperty.endFileError",
                   "return", "self.seekEndBoundary.finish", "self.completeSeekAdmission"]))
         check("wiring: successful seek corrects paused position and cue from the producer's same actual landing",
               containsInOrder(completion, ["let landing = self.player.currentTime().seconds",
@@ -396,8 +398,10 @@ enum RemuxItemEndPolicyTests {
               containsInOrder(seekDeadline, ["Task.sleep", "self.seekRequestGeneration == requestID",
                   "self.itemGeneration == generation", "self.item === seekItem",
                   "self.activeLoadToken == loadToken", "self.seekEndBoundary.requestID == requestID",
+                  "let recoveryRepair = self.recoverySeekSettlement.fail(requestID: requestID)",
                   "self.invalidateSeekRequests()", "seekItem?.cancelPendingSeeks()",
-                  "self.remountForSeek(sourceSeconds: sourceSeconds)"])
+                  "let repairSourceSeconds = recoveryRepair?.sourceSeconds ?? sourceSeconds",
+                  "self.remountForSeek(sourceSeconds: repairSourceSeconds)"])
                 && seekDeadline?.contains("player.play()") == false)
         check("wiring: completion reanchors producer immediately from accepted actual landing",
               containsInOrder(server, ["func completePreparedSeek", "if seekAnchorState.completeSeek",
@@ -471,7 +475,7 @@ enum RemuxItemEndPolicyTests {
         check(
             "wiring: both Apple stall surfaces pass the active AVPlayer recovery token explicitly",
             containsInOrder(iosSurface, [
-                "private func recoverFromStall()",
+                "private func recoverFromStall(",
                 "let recoveryToken = coordinator.player is AVPlayerEngineController",
                 "reusing: recoveryToken, resumeOrigin: resume",
             ])

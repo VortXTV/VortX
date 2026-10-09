@@ -3,6 +3,30 @@ import SwiftUI
 import UIKit
 #endif
 
+#if CINEMA_UI_SMOKE_RENDERER
+// The regular app entry point is intentionally excluded from the offline renderer. These are the two
+// platform-neutral bridge declarations iOSRootView's macOS layout references while it is compiled as a
+// real production view tree; neither starts an account, player, or window lifecycle.
+enum MacCommands {
+    static let tabRequest = Notification.Name("stremiox.macCommands.tabRequest")
+    enum Destination: Int { case home, discover, live, library, search, addons, settings }
+    static func go(_ destination: Destination) {
+        NotificationCenter.default.post(name: tabRequest, object: nil, userInfo: ["tab": destination.rawValue])
+    }
+}
+
+#if os(macOS)
+@MainActor
+final class MacSearchBridge: ObservableObject {
+    static let shared = MacSearchBridge()
+    private init() {}
+    @Published var pending: String?
+}
+#endif
+#endif
+
+#if !CINEMA_UI_SMOKE_RENDERER
+
 /// Native iPhone / iPad entry point. Boots the SAME stremio-core engine + embedded server as the
 /// Apple TV app (no web host), then hands off to the native SwiftUI UI. Mirrors VortXTVApp's
 /// engine/server/profile wiring; the UI layer (SourcesiOS) is touch-native instead of focus-driven.
@@ -72,13 +96,7 @@ struct VortXiOSApp: App {
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {
             NodeServer.startIfNeeded()
-            #if !os(macOS)
-            // Phase 8 (flag `vortxNativeServer`, default OFF): also bring up the in-process engine
-            // streaming server (vortx-core over the C server ABI); the player follows its port via
-            // StremioServer.embeddedPort. One boolean read and a no-op while the flag is off, so
-            // the default launch path is unchanged and nodejs-mobile keeps serving.
-            VortxNativeServer.startIfNeeded()
-            #endif
+            // The lifecycle entry point starts exactly the selected transport.
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
         }
         #endif
@@ -357,59 +375,86 @@ final class MacSearchBridge: ObservableObject {
     @Published var pending: String?
 }
 
-/// Restores the traffic-light buttons on the `.hiddenTitleBar` window. The hiddenTitleBar style (plus
-/// the hidden window toolbar) is what keeps the NSToolbar-insert crash dead, but it can leave the
-/// close/minimize/zoom buttons hidden along with the collapsed titlebar host, the owner's "no window
-/// buttons" report. This keeps `.titled` in the styleMask and unhides the three standard buttons (and
-/// their container view) so they float over the full-size content, without ever attaching an NSToolbar.
+/// Hosts the original traffic-light buttons above full-size content without reviving the collapsed
+/// SwiftUI titlebar. `.hiddenTitleBar` and the hidden window toolbar remain the NSToolbar crash guard.
 private struct MacWindowChrome: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-        // The window isn't attached yet; defer one runloop turn to find + configure it.
-        DispatchQueue.main.async { [weak view, coordinator = context.coordinator] in
-            coordinator.attach(to: view?.window)
-        }
+    func makeNSView(context: Context) -> WindowAccessor {
+        let view = WindowAccessor(frame: .zero)
+        view.windowChanged = { [coordinator = context.coordinator] in coordinator.attach(to: $0) }
         return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
-        // Re-assert on SwiftUI passes so a late chrome update (player overlay up/down, scene phase
-        // churn) can never leave the buttons hidden again.
-        DispatchQueue.main.async { [weak nsView, coordinator = context.coordinator] in
-            coordinator.attach(to: nsView?.window)
-        }
+    func updateNSView(_ nsView: WindowAccessor, context: Context) {
+        context.coordinator.attach(to: nsView.window)
+    }
+
+    static func dismantleNSView(_ nsView: WindowAccessor, coordinator: Coordinator) {
+        nsView.windowChanged = nil
+        coordinator.attach(to: nil)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
-    /// One-shot asyncs lose the race: SwiftUI's toolbar bridge re-collapses the titlebar host on later
-    /// preference passes (every NavigationStack push), so the buttons vanished again after the initial
-    /// unhide. The coordinator owns a long-lived `didUpdate` observer that re-asserts with a cheap
-    /// early-exit, so any re-hide self-heals within one window update cycle.
-    final class Coordinator {
-        private var observed: NSWindow?
-        private var token: NSObjectProtocol?
+    final class WindowAccessor: NSView {
+        var windowChanged: ((NSWindow?) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            windowChanged?(window)
+        }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
 
-        deinit { if let token { NotificationCenter.default.removeObserver(token) } }
+    /// Attachment is driven by the actual NSView lifecycle, including reattachment after a window
+    /// swap. Fullscreen hands the buttons back to AppKit before its titlebar transition begins.
+    @MainActor final class Coordinator: NSObject {
+        private weak var observed: NSWindow?
+        private var inFullScreenTransition = false
+        private var transitionGeneration = 0
+
+        deinit { NotificationCenter.default.removeObserver(self) }
 
         @MainActor func attach(to window: NSWindow?) {
-            guard let window else { return }
-            Self.apply(to: window)
-            Self.probe(window)
-            guard observed !== window else { return }
-            if let token { NotificationCenter.default.removeObserver(token) }
-            observed = window
-            token = NotificationCenter.default.addObserver(
-                forName: NSWindow.didUpdateNotification, object: window, queue: .main
-            ) { note in
-                MainActor.assumeIsolated { Self.apply(to: note.object as? NSWindow) }
-            }
-            // Belt and braces for the first seconds while SwiftUI settles its toolbar/titlebar state.
-            for delay in [0.2, 1.0, 3.0] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak window] in
-                    Self.apply(to: window)
-                    Self.probe(window)
+            if observed !== window {
+                NotificationCenter.default.removeObserver(self)
+                observed = window
+                inFullScreenTransition = false
+                transitionGeneration += 1
+                if let window {
+                    for name in [NSWindow.didUpdateNotification, NSWindow.didResizeNotification,
+                                 NSWindow.willEnterFullScreenNotification, NSWindow.didEnterFullScreenNotification,
+                                 NSWindow.didExitFullScreenNotification] {
+                        NotificationCenter.default.addObserver(self, selector: #selector(windowChanged(_:)),
+                                                               name: name, object: window)
+                    }
                 }
+            }
+            guard let window else { return }
+            apply(to: window)
+            Self.probe(window)
+        }
+
+        @objc private func windowChanged(_ note: Notification) {
+            guard let window = observed else { return }
+            if note.name == NSWindow.willEnterFullScreenNotification {
+                inFullScreenTransition = true
+                transitionGeneration += 1
+                let generation = transitionGeneration
+                MacWindowControls.prepareForFullScreen(in: window)
+                // Failed entry has only an NSWindowDelegate callback, owned by SwiftUI. Recover a
+                // cancelled attempt without replacing that delegate or leaving controls suspended.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self, weak window] in
+                    guard let self, let window, self.observed === window,
+                          self.transitionGeneration == generation,
+                          !window.styleMask.contains(.fullScreen) else { return }
+                    self.inFullScreenTransition = false
+                    self.apply(to: window)
+                }
+            } else {
+                if note.name == NSWindow.didEnterFullScreenNotification || note.name == NSWindow.didExitFullScreenNotification {
+                    inFullScreenTransition = false
+                    transitionGeneration += 1
+                }
+                apply(to: window)
             }
         }
 
@@ -429,6 +474,10 @@ private struct MacWindowChrome: NSViewRepresentable {
                     lines.append("btn \(kind.rawValue): NIL"); continue
                 }
                 var chain = "btn \(kind.rawValue): hidden=\(b.isHidden) alpha=\(b.alphaValue) frame=\(NSStringFromRect(b.frame))"
+                if let frameView = window.contentView?.superview {
+                    let center = b.convert(NSPoint(x: b.bounds.midX, y: b.bounds.midY), to: frameView)
+                    chain += " hit=\(frameView.hitTest(center) === b)"
+                }
                 var v: NSView? = b.superview
                 var depth = 0
                 while let s = v, depth < 3 {
@@ -441,14 +490,11 @@ private struct MacWindowChrome: NSViewRepresentable {
             #endif
         }
 
-        @MainActor private static func apply(to window: NSWindow?) {
-            guard let window else { return }
-            // While the full-window player is up (MacPlayerHost holds its view), do NOT resurrect the
-            // titlebar chain. The player cover runs chrome-free on purpose; re-forcing the titlebar here
-            // painted a persistent grey title strip (with a dead back affordance + the show title) over the
-            // video in fullscreen. Skip until the player is dismissed, at which point the didUpdate observer
-            // + the delayed re-applies restore normal window chrome. No effect when no player is up.
-            if MacPlayerHost.shared.content != nil { return }
+        @MainActor private func apply(to window: NSWindow) {
+            // The player hides the buttons' ancestor chain for its full-bleed cover. Keep that behavior
+            // and AppKit's native fullscreen hover chrome; windowed browsing uses the independent host.
+            guard !inFullScreenTransition, !window.styleMask.contains(.fullScreen),
+                  MacPlayerHost.shared.content == nil else { return }
             MacWindowControls.restore(in: window)
         }
     }
@@ -485,6 +531,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }
 #endif
+#endif // !CINEMA_UI_SMOKE_RENDERER
 
 #if os(iOS)
 /// Reports the app's currently-allowed interface orientations to UIKit. The player flips `lock` to

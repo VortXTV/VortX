@@ -1,13 +1,43 @@
 import Foundation
 
-/// Identity-fenced state for the two AVPlayer operations that may settle after their initiating callback:
-/// native legible deselection and a remount's recovery seek.  The engine owns the AVFoundation calls; this
+/// Identity-fenced state for AVPlayer operations that may settle after their initiating callback:
+/// native legible deselection, admitted seeks and a remount's recovery seek. The engine owns the AVFoundation calls; this
 /// type owns only the deterministic intent/receipt rules so they can be exercised without a media provider.
 enum AVPlayerRecoverySettlementPolicy {
     struct Ownership: Equatable, Sendable {
         let generation: UInt64
         let mountIdentity: UInt64
         let revision: UInt64
+    }
+
+    /// An admitted seek is newer intent than the native clock until its own completion lands.
+    /// Keep it separate from presentation/progress so fallback can recover the destination without
+    /// reporting that an uncompleted seek has already played those seconds.
+    struct SeekDestination: Equatable, Sendable {
+        private(set) var ownership: Ownership?
+        private(set) var sourceSeconds: Double?
+
+        mutating func record(sourceSeconds: Double, ownership: Ownership) {
+            guard sourceSeconds.isFinite else { clear(); return }
+            self.ownership = ownership
+            self.sourceSeconds = max(0, sourceSeconds)
+        }
+
+        func target(ownership: Ownership) -> Double? {
+            self.ownership == ownership ? sourceSeconds : nil
+        }
+
+        @discardableResult
+        mutating func finish(ownership: Ownership) -> Bool {
+            guard self.ownership == ownership else { return false }
+            clear()
+            return true
+        }
+
+        mutating func clear() {
+            ownership = nil
+            sourceSeconds = nil
+        }
     }
 
     /// A ready callback may invoke recovery work that synchronously replaces its item. This receipt fences the

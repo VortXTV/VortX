@@ -47,6 +47,7 @@ class StremioXViewModelFactory(
         val id: String,
         val name: String? = null,
         val preferredEpisode: PreferredEpisode? = null,
+        val continueWatchingAdmission: com.vortx.android.home.ContinueWatchingAdmission? = null,
     )
 
     @Suppress("UNCHECKED_CAST")
@@ -56,6 +57,7 @@ class StremioXViewModelFactory(
             railPreferences = appContext?.let(HomeRailPreferences::shared),
             railSurface = homeSurface,
             watchlistStore = appContext?.let(WatchlistStore::shared),
+            continueWatchingPreferences = appContext?.let { com.vortx.android.home.ContinueWatchingPreferences(it) },
             traktRails = TraktRailsModel(),
             simklRails = SimklRailsModel(appContext?.also(ScrobbleService::init)),
             importedCatalogs = appContext?.let(ImportedCatalogs::shared),
@@ -80,6 +82,7 @@ class StremioXViewModelFactory(
             appContext?.let(CatalogPreferencesStore::shared) ?: CatalogPreferencesStore.inMemory(),
         ) as T
         modelClass.isAssignableFrom(LibraryViewModel::class.java) -> LibraryViewModel(repo) as T
+        modelClass.isAssignableFrom(LibraryLandingViewModel::class.java) -> LibraryLandingViewModel(repo) as T
         modelClass.isAssignableFrom(LiveViewModel::class.java) -> LiveViewModel(repo) as T
         modelClass.isAssignableFrom(SearchViewModel::class.java) -> {
             val context = requireNotNull(appContext) { "SearchViewModel requires an app Context (for SearchHistoryStore)" }
@@ -102,7 +105,7 @@ class StremioXViewModelFactory(
             val context = requireNotNull(appContext) {
                 "DetailViewModel requires an app Context (debrid keys + source-list assembly)"
             }
-            DetailViewModel(repo, args.type, args.id, context, args.name, args.preferredEpisode) as T
+            DetailViewModel(repo, args.type, args.id, context, args.name, args.preferredEpisode, args.continueWatchingAdmission) as T
         }
         else -> throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
     }

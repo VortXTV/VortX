@@ -115,6 +115,9 @@ data class StreamLoadUpdate(
 ///   - [meta]               -> `meta_details.meta`
 ///   - [streams]            -> `meta_details` stream groups (one per stream add-on)
 interface CatalogRepository {
+    /** Final owner-bound admission for host-generated rails whose lossy items lack provider certification. */
+    fun admitClientHomeRows(rows: List<Catalog>, expectedOwner: ContinueWatchingOwner): Result<List<Catalog>> = Result.success(rows)
+
     /// Home rows: Continue Watching first, then the user's add-on catalogs as poster rails.
     suspend fun home(): Result<List<Catalog>>
 
@@ -234,6 +237,20 @@ interface CatalogRepository {
             )
         }
     }
+
+    /**
+     * Authoritative playback history for the one captured [expectedOwner]. Unlike [library], this
+     * projection includes watched or resumed titles which were never saved to the Library, and excludes
+     * a saved-but-unwatched title. Implementations must fail closed when their persisted history cannot
+     * be read; an empty success would make the History route look valid while silently dropping records.
+     *
+     * The existing [ContinueWatchingSnapshot] shape is deliberately reused: both list projections need
+     * the same complete owner/revision proof before a touch screen may publish them together.
+     */
+    suspend fun playbackHistorySnapshot(
+        expectedOwner: ContinueWatchingOwner,
+    ): Result<ContinueWatchingSnapshot> =
+        Result.failure(UnsupportedOperationException("Playback history is unavailable."))
 
     /// Every add-on installed on the signed-in account (S04 "Add-on management"), read live from
     /// `ctx.profile.addons`.
@@ -592,6 +609,24 @@ class PreviewCatalogRepository(
             return Result.failure(IllegalStateException("Continue Watching owner changed."))
         }
         return Result.success(ContinueWatchingSnapshot(expectedOwner, previewContinueWatching.toList()))
+    }
+
+    // The offline preview is a real local model rather than a permissive interface fallback. Its sample
+    // resume row is intentionally marked watched here so the History route exercises the unsaved-history
+    // path instead of borrowing the saved Library grid.
+    override suspend fun playbackHistorySnapshot(
+        expectedOwner: ContinueWatchingOwner,
+    ): Result<ContinueWatchingSnapshot> {
+        if (continueWatchingOwner() != expectedOwner) {
+            return Result.failure(IllegalStateException("Playback history owner changed."))
+        }
+        val history = previewContinueWatching.mapIndexed { index, item ->
+            item.copy(
+                watched = index % 2 == 0,
+                progress = item.progress ?: (0.2f + index * 0.1f).coerceAtMost(0.9f),
+            )
+        }
+        return Result.success(ContinueWatchingSnapshot(expectedOwner, history))
     }
 
     private val previewAddons = mutableListOf(

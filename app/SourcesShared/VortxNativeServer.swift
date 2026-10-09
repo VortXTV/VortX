@@ -12,12 +12,9 @@ import VortxEngine
 /// (start on launch/foreground, stop on background, publish the bound port for the player), same
 /// SourcesShared home.
 ///
-/// ADDITIVE + FLAG-GATED. The `vortxNativeServer` UserDefaults flag defaults OFF: a default build
-/// takes exactly one boolean read here and the nodejs-mobile `NodeServer` path serves the player
-/// byte-identically to today. Flag ON starts THIS server (ephemeral port, loopback) alongside the
-/// node one and `StremioServer.embeddedPort` prefers its published port, so the player streams
-/// through the engine server while every nodejs code path stays untouched and revertable with one
-/// toggle. The flag flip is CEO/device-gated; nothing in the app turns it on by itself.
+/// FLAG-GATED. `vortxNativeServer` defaults OFF in legacy builds; VORTX_NATIVE_DATA_ENGINE requires
+/// native transport. Selection is latched for the process lifetime because Node cannot be stopped
+/// in-process. Exactly one engine starts. Native failure remains unavailable until recovery/relaunch.
 ///
 /// Compile gating, two layers:
 ///   - `canImport(VortxEngine)`: the target links VortxEngine.xcframework at all (today only
@@ -33,7 +30,14 @@ enum VortxNativeServerFlag {
     /// uses this name for its native-server flag too, so one key governs the native-server
     /// cutover on every platform when the branches meet).
     static let key = "vortxNativeServer"
-    static var isOn: Bool { UserDefaults.standard.bool(forKey: key) }
+    // Node is a one-shot in-process runtime. Latch selection before either runtime starts;
+    // preference changes take effect on relaunch, never by running both engines together.
+    static let isOn = NativeTransportPolicy.selectsNative(
+        required: NativeTransportPolicy.isRequired, preference: UserDefaults.standard.bool(forKey: key))
+    static var needsRestart: Bool {
+        isOn != NativeTransportPolicy.selectsNative(
+            required: NativeTransportPolicy.isRequired, preference: UserDefaults.standard.bool(forKey: key))
+    }
 
     /// Whether THIS build can run the in-process engine server (framework linked AND the slice is
     /// server-inclusive). Settings uses it to show the toggle only where flipping it can work.
@@ -59,14 +63,15 @@ enum VortxNativeServer {
     /// The opaque ServerHandle from `vortx_server_start`. Touched only on `queue`. Nulled BEFORE
     /// `vortx_server_stop` consumes it (the pointer is freed by that call; a second stop with the
     /// same pointer would be a double free).
-    private static var handle: UnsafeMutableRawPointer?
+    nonisolated(unsafe) private static var handle: UnsafeMutableRawPointer?
 
     /// Publishes the running server's address to readers on other threads
     /// (`StremioServer.embeddedPort` is read from the player and Settings). Lock-guarded because
     /// the writer is `queue` and the readers are arbitrary threads.
     private static let publishLock = NSLock()
-    private static var _port: Int?
-    private static var _baseURL: String?
+    nonisolated(unsafe) private static var _port: Int?
+    nonisolated(unsafe) private static var _baseURL: String?
+    nonisolated(unsafe) private static var _failure: String?
 
     /// The ACTUAL bound port while the engine server runs, else nil. Ephemeral (port 0 bind), so
     /// it changes across background/foreground cycles; `StremioServer.embeddedPort` re-reads it
@@ -89,8 +94,11 @@ enum VortxNativeServer {
 
     /// One-line state for Settings diagnostics, mirroring NodeServer.statusDescription's role.
     static var statusDescription: String {
+        if VortxNativeServerFlag.needsRestart { return "Restart VortX to change streaming engines." }
         guard VortxNativeServerFlag.isOn else { return "Off" }
         if let base = publishedBaseURL { return "In-process engine server running at \(base)" }
+        publishLock.lock(); defer { publishLock.unlock() }
+        if let failure = _failure { return failure }
         return "Enabled, waiting to start"
     }
 
@@ -105,11 +113,12 @@ enum VortxNativeServer {
 
     /// Start the engine server if the flag is on and it is not already running. Async on the
     /// serial queue, so calling from app init / scenePhase never blocks the main thread.
-    /// Idempotent; a start failure is logged and leaves the nodejs path serving as before.
+    /// Idempotent; a start failure remains explicit and never starts Node.
     static func startIfNeeded() {
         guard VortxNativeServerFlag.isOn else { return }
         queue.async {
             guard handle == nil else { return }
+            publishLock.lock(); _failure = nil; publishLock.unlock()
             // The same writable root the node server uses (tvOS may only write Caches + tmp, so
             // Application Support, the Mac's choice, is not portable here). Its own subdir keeps
             // the engine server's settings.json / piece cache / port file apart from node's.
@@ -118,9 +127,8 @@ enum VortxNativeServer {
             let home = (caches as NSString).appendingPathComponent("vortx-server")
             try? FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
 
-            // Port 0 = ephemeral bind, read back below. Deliberately NOT 11470: with the flag ON
-            // the node server still boots (this path is additive; nothing gates node yet), so
-            // claiming its port would push node into the silent 11471+ EADDRINUSE fallback.
+            // Port 0 = ephemeral bind, read back below. Never guess a conventional local port
+            // before startup publishes the actual native listener.
             let config: [String: Any] = [
                 "serverHome": home,
                 "port": 0,
@@ -134,7 +142,8 @@ enum VortxNativeServer {
             // Blocks until bound and serving (or failed). NULL covers every failure; there is no
             // last-error channel on this ABI surface yet, so the log line is the diagnosis.
             guard let h = json.withCString({ vortx_server_start($0) }) else {
-                DiagnosticsLog.log("server", "vortx_server_start returned NULL; engine in-process server unavailable (node path still serving)")
+                publishLock.lock(); _failure = "Native streaming server failed to start."; publishLock.unlock()
+                DiagnosticsLog.log("server", "vortx_server_start returned NULL; native streaming unavailable")
                 return
             }
             handle = h
@@ -154,23 +163,28 @@ enum VortxNativeServer {
     /// The publish is cleared BEFORE the (briefly blocking) stop so no reader routes a new request
     /// at a server that is shutting down.
     static func stop() {
-        queue.sync {
-            guard let h = handle else { return }
-            handle = nil
-            publish(port: nil, baseURL: nil)
-            vortx_server_stop(h)
-            DiagnosticsLog.log("server", "engine in-process server stopped")
-        }
+        queue.sync { stopOnQueue() }
     }
 
-    /// Background-transition stop, detached so the (up to ~4 s) graceful shutdown never runs on
-    /// the main thread during the OS's backgrounding window. Known trade-off, documented rather
+    /// Queue-only teardown, shared by synchronous shutdown and FIFO background transitions.
+    private static func stopOnQueue() {
+        guard let h = handle else { return }
+        handle = nil
+        publish(port: nil, baseURL: nil)
+        vortx_server_stop(h)
+        DiagnosticsLog.log("server", "engine in-process server stopped")
+    }
+
+    /// Enqueue the background stop immediately. A subsequent foreground start enters the SAME
+    /// FIFO queue after this stop, even if shutdown takes time. A detached Task could enqueue its
+    /// stop after that foreground start and leave the newly active app without its native server.
+    /// Shutdown never runs on the main thread. Known trade-off, documented rather
     /// than hidden: with the flag ON, backgrounding tears the engine server down, so a torrent
     /// stream continued in PiP/background dies with it; foreground restarts on a fresh ephemeral
     /// port and `StremioServer.embeddedPort` follows. The node path (flag OFF) is unaffected.
     static func stopOnBackground() {
         guard VortxNativeServerFlag.isOn else { return }
-        Task.detached(priority: .utility) { stop() }
+        queue.async { stopOnQueue() }
     }
 
     #else
@@ -179,7 +193,7 @@ enum VortxNativeServer {
     // or the Lite build): every entry point is an inert no-op so call sites compile unchanged.
     static var publishedPort: Int? { nil }
     static var publishedBaseURL: String? { nil }
-    static var statusDescription: String { "Not available in this build" }
+    static var statusDescription: String { "Native streaming is not available in this build." }
     static func startIfNeeded() {}
     static func stop() {}
     static func stopOnBackground() {}

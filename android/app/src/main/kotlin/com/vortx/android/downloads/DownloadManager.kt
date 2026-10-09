@@ -415,6 +415,17 @@ object DownloadManager {
         }
     }
 
+    /** Enter before the native repository's session/account fences. Download enqueue already checks
+     * account ownership under [lock], so acquiring this lock from inside those fences would invert
+     * their order. The actual reclaim re-enters [lock] while the authenticated admission is held. */
+    internal fun withWatchedReclaimAdmission(context: Context, action: () -> Boolean): Boolean =
+        DownloadAutoDeleteWatchedAdmission.admit(
+            lock = lock,
+            isEnabled = { sharedSettings(context).getBoolean(AUTO_DELETE_WATCHED_KEY, false) },
+            disabled = { false },
+            reclaim = action,
+        )
+
     /**
      * Reclaim one local download after TWO external facts are already true:
      *

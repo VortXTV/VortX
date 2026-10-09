@@ -858,27 +858,17 @@ struct SettingsView: View {
                     Label("Configure server", systemImage: "server.rack")
                 }
                 .buttonStyle(PrimaryActionStyle())
-                // Phase 8: flag-gated in-process ENGINE streaming server (vortx-core). Rendered only
-                // in builds whose linked VortxEngine slice carries the server symbols (today: none on
-                // tvOS; the guard makes this row appear automatically the day a tvOS server slice
-                // exists). ON starts it immediately and the player follows its port
-                // (StremioServer.embeddedPort); OFF stops it and nodejs-mobile serves again.
-                if VortxNativeServerFlag.isSupported {
+                // Mobile runtimes cannot be swapped in-process: persist the next-launch choice.
+                if VortxNativeServerFlag.isSupported && !NativeTransportPolicy.isRequired {
                     Button {
                         engineServerOn.toggle()
-                        if engineServerOn {
-                            VortxNativeServer.startIfNeeded()
-                        } else {
-                            Task.detached(priority: .utility) { VortxNativeServer.stop() }
-                        }
                     } label: {
                         HStack(alignment: .center, spacing: Theme.Space.lg) {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("Engine streaming server (experimental)")
                                     .font(Theme.Typography.cardTitle)
                                     .foregroundStyle(Theme.Palette.textPrimary)
-                                Text(engineServerOn ? VortxNativeServer.statusDescription
-                                                    : "Serve torrents from the built-in VortX engine instead of the bundled server.")
+                                Text("Restart VortX after changing the streaming engine.")
                                     .font(Theme.Typography.label)
                                     .foregroundStyle(Theme.Palette.textSecondary)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -960,6 +950,7 @@ struct SettingsView: View {
 
     private var appearanceSection: some View {
         section("Appearance") {
+            ContinueWatchingSettingsView()
             ThemeAccentPicker(selection: $theme.accentID).focusSection()
             ThemeBackgroundPicker(oled: $theme.oled).focusSection()
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")

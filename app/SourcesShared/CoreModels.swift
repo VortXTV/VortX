@@ -540,18 +540,21 @@ struct CoreMetaDetails: Decodable {
     var meta: CoreMetaItem? {
         // (addon transport base, meta) for every add-on that returned a ready meta, in engine order.
         var ready: [(base: String, meta: CoreMetaItem)] = []
-        for entry in metaItems {
+        let disabled = ProfileStore.activeDisabledAddons()
+        for entry in metaItems where !disabled.contains(ProfileAddonPreferencesPolicy.identity(entry.request.base)) {
             if let m = entry.content?.ready { ready.append((entry.request.base, m)) }
         }
         guard let first = ready.first else { return nil }
-        let order = VortXSyncManager.appliedAddonOrder
+        let order = ProfileStore.activeAddonOrder(accountOrder: VortXSyncManager.appliedAddonOrder)
         guard !order.isEmpty else { return first.meta }   // no user order -> engine order, unchanged
         var rank: [String: Int] = [:]
-        for (i, url) in order.enumerated() { rank[url] = i }
+        for (i, url) in order.enumerated() where rank[ProfileAddonPreferencesPolicy.identity(url)] == nil {
+            rank[ProfileAddonPreferencesPolicy.identity(url)] = i
+        }
         // Earliest applied-order add-on wins; add-ons not in the order sort AFTER the ordered ones and keep
         // engine order among themselves (a stable min: equal ranks fall back to the first ready seen).
         let best = ready.min { a, b in
-            switch (rank[AddonTombstones.normalize(a.base)], rank[AddonTombstones.normalize(b.base)]) {
+            switch (rank[ProfileAddonPreferencesPolicy.identity(a.base)], rank[ProfileAddonPreferencesPolicy.identity(b.base)]) {
             case let (x?, y?): return x < y
             case (_?, nil):    return true
             case (nil, _?):    return false
@@ -1485,9 +1488,9 @@ struct CoreStream: Decodable, Identifiable, Equatable, Sendable {
         // gate: the TorBox path resolves to a remote link (Lite plays it); the built-in path is full-target
         // only and gated inside `canResolveUsenet`.
         if isUsenet {
-            guard (DebridPlaybackAvailability.shared.canResolveUsenetRemotely
-                || (StremioServer.usenetNodeBase != nil
-                    && (UsenetProviderStore.isConfigured || !usenetServers.isEmpty))),
+            guard DebridPlaybackAvailability.shared.canResolveUsenet(
+                    savedProviderConfigured: UsenetProviderStore.isConfigured,
+                    addonServersAvailable: !usenetServers.isEmpty),
                   let nzb = usenetURLs.first, let parsed = URL(string: nzb) else { return nil }
             return parsed
         }

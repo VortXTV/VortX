@@ -276,16 +276,27 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     private var seekRequestGeneration: UInt64 = 0
     private var preparedSeekTask: Task<Void, Never>?
     private var seekCompletionTimeoutTask: Task<Void, Never>?
+    private var seekDestination = AVPlayerRecoverySettlementPolicy.SeekDestination()
+    private var seekDestinationOwnership: AVPlayerRecoverySettlementPolicy.Ownership {
+        .init(generation: itemGeneration, mountIdentity: playbackMountIdentity, revision: seekRequestGeneration)
+    }
     /// A recovery-position seek shares the normal seek request epoch and HLS admission transaction. This
     /// ticket records only the recovery origin so a later viewer seek can retire it before AVFoundation calls
     /// its completion handler.
     private var recoverySeekSettlement = AVPlayerRecoverySettlementPolicy.RecoverySeekSettlement()
     private weak var registeredSeekServer: VortXRemuxHLSServer?
     private var registeredSeekRequestID: UInt64?
+    private var nativePreflightState = AppleAVStartWatchdogPolicy.NativePreflightState()
+    var nativeStartupPhase: AppleAVStartWatchdogPolicy.NativePreflightState.Phase {
+        nativePreflightState.currentPhase(
+            generation: itemGeneration,
+            terminal: fatalErrorEmitted || terminalLatch.hasEmitted)
+    }
     #if os(tvOS)
     /// Current native-DV preflight. A new load/stop cancels it, and its completion must also match both the
     /// logical load token and exact item generation before it may switch the display or attach anything.
     private var nativePreAttachTask: Task<Void, Never>?
+    private var nativePreAttachDeadlineTask: Task<Void, Never>?
     /// The exact object loaded from `AVAsset.preferredDisplayCriteria`. Ready-to-play may reapply this same
     /// Apple-owned object if the window's display manager was replaced; it never constructs a second criterion.
     private var nativeDisplayCriteria: AVDisplayCriteria?
@@ -877,6 +888,13 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     // MARK: Loading + transport
 
     func invalidateLoadToken() {
+        nativePreflightState.retire()
+        #if os(tvOS)
+        nativePreAttachTask?.cancel()
+        nativePreAttachTask = nil
+        nativePreAttachDeadlineTask?.cancel()
+        nativePreAttachDeadlineTask = nil
+        #endif
         activeLoadToken = nil
     }
 
@@ -885,6 +903,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// leave a server playhead pinned behind an admission that AVPlayer will never receive.
     @discardableResult
     private func supersedeSeekRequest() -> UInt64 {
+        seekDestination.clear()
         seekEndBoundary.reset()
         seekCompletionTimeoutTask?.cancel()
         seekCompletionTimeoutTask = nil
@@ -910,6 +929,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// of playback ticks: AVFoundation may still be waiting for data and cannot prove its own liveness.
     /// This is one recovery of an explicit seek, not a mid-play watchdog or a reason to change engines.
     private func armSeekCompletionDeadline(requestID: UInt64, sourceSeconds: Double) {
+        guard requestID == seekRequestGeneration else { return }
+        seekDestination.record(sourceSeconds: sourceSeconds, ownership: seekDestinationOwnership)
         seekCompletionTimeoutTask?.cancel()
         let seekItem = item
         let generation = itemGeneration
@@ -934,9 +955,18 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             if !self.remountForSeek(sourceSeconds: repairSourceSeconds), let loadToken {
                 // A direct asset cannot use the remux seek replacement. Expose a failure instead of
                 // leaving the chrome frozen or manufacturing an EOF that would advance the episode.
-                self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: loadToken)
+                self.emitUnfinishedSeekFailure(sourceSeconds: repairSourceSeconds, loadToken: loadToken)
             }
         }
+    }
+
+    /// Invalidating the failed native request must not discard its destination before the chrome
+    /// reads it for fallback. A newer seek retires both this receipt and its queued error delivery.
+    private func emitUnfinishedSeekFailure(sourceSeconds: Double, loadToken: PlayerLoadToken) {
+        guard loadToken == activeLoadToken else { return }
+        seekDestination.record(sourceSeconds: sourceSeconds, ownership: seekDestinationOwnership)
+        emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.",
+             loadToken: loadToken, seekRequestID: seekRequestGeneration)
     }
 
     private func registerSeekAdmission(
@@ -1042,6 +1072,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     @discardableResult
     func loadFile(_ url: URL, headers: [String: String]?, live: Bool, audioSidecar: URL?,
                   reusing loadToken: PlayerLoadToken?) -> PlayerLoadToken {
+        let carriedSeekTarget = pendingRequestedSourcePositionSeconds
         invalidateSeekRequests()
         eventOwnedRecoveryTask?.cancel()
         eventOwnedRecoveryTask = nil
@@ -1063,6 +1094,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             terminalClaimed: terminalLatch.hasEmitted)
         if carriesOwnedRecoveryIntent {
             pendingPlaybackIntent = beginPlaybackRemountIntent(from: item)
+            if let carriedSeekTarget { pendingPlaybackIntent?.updateSourceSeconds(carriedSeekTarget) }
         }
         let isIntentRemount = pendingPlaybackIntent != nil
             && (loadToken != nil || carriesOwnedRecoveryIntent)
@@ -1130,6 +1162,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // The new logical request becomes active before any mount failure or observer can emit.
         invalidateLoadToken()
         activeLoadToken = issuedToken
+        nativePreflightState = AppleAVStartWatchdogPolicy.NativePreflightState()
         externalMountTask?.cancel()
         externalMountTask = nil
         hdrFallbackCapabilityRefreshTask?.cancel()
@@ -1455,6 +1488,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         player.replaceCurrentItem(with: newItem)
         guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
               player.currentItem === newItem else { return }
+        nativePreflightState.didAttach(
+            generation: generation, uptime: ProcessInfo.processInfo.systemUptime)
         observe(newItem, loadToken: loadToken)
         // KVO uses [.initial, .new], but an already-ready item still gets an explicit kick.
         if newItem.status != .unknown { handleStatus(newItem, loadToken: loadToken) }
@@ -1467,59 +1502,71 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                                         loadToken: PlayerLoadToken,
                                         generation: UInt64) {
         nativePreAttachTask?.cancel()
+        nativePreAttachDeadlineTask?.cancel()
+        nativePreflightState.begin(generation: generation)
+        // Do not use a structured task group here: AVAsset loading can ignore cancellation, and waiting
+        // for that child on scope exit would defeat the deadline. Both independent tasks share a one-shot
+        // generation/phase fence. Late metadata can neither switch the display nor attach another item.
+        nativePreAttachDeadlineTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(AppleAVStartWatchdogPolicy.nativePreflightTimeoutSeconds))
+            } catch { return }
+            guard let self, !Task.isCancelled else { return }
+            self.completeNativeDVPreAttach(
+                criteria: nil, item: newItem, output: output,
+                loadToken: loadToken, generation: generation, reason: "metadata-deadline-criteria-unavailable")
+        }
         nativePreAttachTask = Task { @MainActor [weak self] in
-            guard let self else { return }
             do {
                 let criteria = try await asset.load(.preferredDisplayCriteria)
-                guard !Task.isCancelled else { return }
-                let outcome = DVPlaybackPolicy.completeNativePreAttach(
-                    loadedCriteria: criteria,
-                    isCurrent: {
-                        self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation)
-                            && !Task.isCancelled
-                    },
-                    apply: { loadedCriteria in
-                        self.nativeDisplayCriteria = loadedCriteria
-                        let applied = HDRDisplayMode.applyNativePreferredCriteria(loadedCriteria, in: nil)
-                        DiagnosticsLog.log(
-                            "dv", "native asset-owned criteria pre-attach apply=\(applied ? "accepted" : "fail-soft") generation=\(generation)")
-                    },
-                    attach: {
-                        self.attachPreparedItem(
-                            newItem,
-                            output: output,
-                            loadToken: loadToken,
-                            generation: generation)
-                    })
-                if self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) {
-                    self.nativePreAttachTask = nil
-                }
-                DiagnosticsLog.log("dv", "native display preflight completed outcome=\(String(describing: outcome)) generation=\(generation)")
+                guard let self, !Task.isCancelled else { return }
+                self.completeNativeDVPreAttach(
+                    criteria: criteria, item: newItem, output: output,
+                    loadToken: loadToken, generation: generation, reason: "metadata-loaded")
             } catch {
-                guard !Task.isCancelled else { return }
-                let outcome = DVPlaybackPolicy.completeNativePreAttach(
-                    loadedCriteria: Optional<AVDisplayCriteria>.none,
-                    isCurrent: {
-                        self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation)
-                            && !Task.isCancelled
-                    },
-                    apply: { _ in },
-                    attach: {
-                        self.attachPreparedItem(
-                            newItem,
-                            output: output,
-                            loadToken: loadToken,
-                            generation: generation)
-                    })
-                if self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation) {
-                    self.nativePreAttachTask = nil
-                }
+                guard let self, !Task.isCancelled else { return }
+                self.completeNativeDVPreAttach(
+                    criteria: nil, item: newItem, output: output,
+                    loadToken: loadToken, generation: generation, reason: "metadata-failed")
                 DiagnosticsLog.log(
-                    "dv", "native preferredDisplayCriteria load failed; attach fail-soft outcome=\(String(describing: outcome)) error=\(error.localizedDescription)")
+                    "dv", "native preferredDisplayCriteria load failed; attach fail-soft error=\(error.localizedDescription)")
             }
         }
         DiagnosticsLog.log(
-            "dv", "native display preflight started; retired item detached, existing chrome start watchdogs remain the outer slow-load bound generation=\(generation)")
+            "dv", "native display preflight started; metadata bounded to \(Int(AppleAVStartWatchdogPolicy.nativePreflightTimeoutSeconds))s, decode budget begins at exact-item attach generation=\(generation)")
+    }
+
+    private func completeNativeDVPreAttach(criteria: AVDisplayCriteria?,
+                                          item newItem: AVPlayerItem,
+                                          output: AVPlayerItemVideoOutput,
+                                          loadToken: PlayerLoadToken,
+                                          generation: UInt64,
+                                          reason: String) {
+        guard pendingLoadIsCurrent(loadToken: loadToken, generation: generation),
+              nativePreflightState.isPreparing(generation: generation),
+              !fatalErrorEmitted, !terminalLatch.hasEmitted else { return }
+        nativePreAttachTask?.cancel()
+        nativePreAttachTask = nil
+        nativePreAttachDeadlineTask?.cancel()
+        nativePreAttachDeadlineTask = nil
+        let outcome = DVPlaybackPolicy.completeNativePreAttach(
+            loadedCriteria: criteria,
+            isCurrent: {
+                self.pendingLoadIsCurrent(loadToken: loadToken, generation: generation)
+                    && self.nativePreflightState.isPreparing(generation: generation)
+                    && !self.fatalErrorEmitted && !self.terminalLatch.hasEmitted
+            },
+            apply: { loadedCriteria in
+                self.nativeDisplayCriteria = loadedCriteria
+                let applied = HDRDisplayMode.applyNativePreferredCriteria(loadedCriteria, in: nil)
+                DiagnosticsLog.log(
+                    "dv", "native asset-owned criteria pre-attach apply=\(applied ? "accepted" : "fail-soft") generation=\(generation)")
+            },
+            attach: {
+                self.attachPreparedItem(newItem, output: output, loadToken: loadToken, generation: generation)
+            })
+        DiagnosticsLog.log(
+            "dv", "native display preflight completed outcome=\(String(describing: outcome)) reason=\(reason) generation=\(generation)")
     }
     #endif
 
@@ -2718,11 +2765,12 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     DiagnosticsLog.log("avplayer", "seek completion interrupted: restoring requested target")
                     let repairSourceSeconds = recoveryRepair?.sourceSeconds ?? sourceSeconds
                     if !self.remountForSeek(sourceSeconds: repairSourceSeconds), let seekLoadToken {
-                        self.emit(MPVProperty.endFileError, "The seek did not finish. Please retry this source.", loadToken: seekLoadToken)
+                        self.emitUnfinishedSeekFailure(sourceSeconds: repairSourceSeconds, loadToken: seekLoadToken)
                     }
                     return
                 }
                 self.seekEndBoundary.finish(requestID: requestID)
+                self.seekDestination.finish(ownership: self.seekDestinationOwnership)
                 _ = self.recoverySeekSettlement.finish(requestID: requestID)
                 if let preparedServer {
                     self.completeSeekAdmission(
@@ -2773,9 +2821,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             origin: remuxTimelineOrigin)
     }
 
-    /// Newest source destination owned by an in-flight replacement. Chrome fallback reads this before stop(),
+    /// Newest source destination owned by an in-flight seek or replacement. Chrome fallback reads this before stop(),
     /// because stop correctly clears every engine transaction and cannot be the point at which resume is derived.
     var pendingRequestedSourcePositionSeconds: Double? {
+        guard activeLoadToken != nil else { return nil }
+        if let target = seekDestination.target(ownership: seekDestinationOwnership) { return target }
         if let pendingSeek, pendingSeek.isFinite { return max(0, pendingSeek) }
         return pendingPlaybackIntent?.sourceSeconds
     }
@@ -3072,10 +3122,11 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// not rewrite an existing one after capture.
     private func capturePlaybackIntent(from currentItem: AVPlayerItem?) -> PlaybackIntentPolicy.Intent {
         if let intent = pendingPlaybackIntent { return intent }
+        let recoverySourceSeconds = pendingRequestedSourcePositionSeconds ?? playbackPositionSeconds
         if var intent = pendingMediaSelectionIntent {
-            // Position has already been restored, so this is the current live clock rather than the old
+            // Use a newer admitted seek, or the live clock once it settles, rather than the old
             // remount target retained by the selection continuation.
-            intent.updateSourceSeconds(playbackPositionSeconds)
+            intent.updateSourceSeconds(recoverySourceSeconds)
             intent.updateTransport(playbackRequested: playbackRequested, requestedRate: requestedRate)
             return intent
         }
@@ -3094,7 +3145,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             audioGroup.flatMap { Self.selectedIndex(in: $0, item: current) }
         }
         return PlaybackIntentPolicy.Intent(
-            sourceSeconds: playbackPositionSeconds,
+            sourceSeconds: recoverySourceSeconds,
             playbackRequested: playbackRequested,
             requestedRate: requestedRate,
             audioSelectionKnown: !remuxSourceAudioTracks.isEmpty || audioGroup != nil,
@@ -3250,7 +3301,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         audioReplacement = RemuxAudioReplacementPolicy.State(
             rollbackSourceIndex: selectedRemuxAudioSourceIndex,
             targetSourceIndex: id,
-            sourceSeconds: playbackPositionSeconds)
+            sourceSeconds: intent.sourceSeconds)
         mountCurrentAudioReplacement(reason: "audio source selected")
     }
     /// Selecting an embedded/HLS legible track (or turning subtitles Off) also turns OFF any external overlay
@@ -3404,7 +3455,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
             return
         }
         subtitleOverlay?.applyStyle()
-        updateSubtitleOverlay(atClock: player.currentTime().seconds)
+        updateSubtitleOverlay(atClock: RemuxResumePolicy.presented(
+            playerSeconds: player.currentTime().seconds, origin: remuxTimelineOrigin))
     }
 
     /// Select option `id` (its index in the group) on the current item, or deselect for mpv's -1 = off.
@@ -3566,7 +3618,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// as the renderer's offset, so the change is live: the next overlay update uses the new offset immediately.
     func setSubDelay(_ seconds: Double) {
         subtitleRenderer.offset = seconds
-        if externalSubActive { updateSubtitleOverlay(atClock: player.currentTime().seconds) }
+        if externalSubActive {
+            updateSubtitleOverlay(atClock: RemuxResumePolicy.presented(
+                playerSeconds: player.currentTime().seconds, origin: remuxTimelineOrigin))
+        }
     }
     /// No-op: AVFoundation exposes no audio-track time offset (unlike libmpv `audio-delay`). The chrome hides
     /// the audio-sync rows when this engine is active, so this is never reached from the UI on the AVPlayer path.
@@ -4892,7 +4947,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         finishFailure()
     }
 
-    private func emit(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil) {
+    private func emit(_ name: String, _ data: Any?, loadToken: PlayerLoadToken? = nil,
+                      seekRequestID: UInt64? = nil) {
         guard let capturedToken = loadToken ?? activeLoadToken,
               capturedToken == activeLoadToken else { return }
         let capturedItemGeneration = itemGeneration
@@ -4901,7 +4957,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         // every event preserves the atomic contract: return/register first, callbacks second.
         DispatchQueue.main.async { [weak self] in
             guard let self, capturedToken == self.activeLoadToken,
-                  capturedItemGeneration == self.itemGeneration else { return }
+                  capturedItemGeneration == self.itemGeneration,
+                  seekRequestID == nil || seekRequestID == self.seekRequestGeneration else { return }
             self.playDelegate?.propertyChange(
                 propertyName: name, data: data, loadToken: capturedToken
             )

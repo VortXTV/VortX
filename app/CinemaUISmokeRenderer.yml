@@ -1,0 +1,66 @@
+# Offline diagnostic project: deliberately contains only the fixture renderer target, so XcodeGen
+# never validates or needs the normal apps' ignored server/node release inputs.
+name: CinemaUISmokeRenderer
+options:
+  bundleIdPrefix: com.stremiox
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+packages:
+  MPVKit:
+    path: Vendor/MPVKit-DVFEL
+settings:
+  base:
+    VORTX_EDGE_SECRET: ""
+    TRAKT_CLIENT_ID: ""
+    SIMKL_CLIENT_ID: ""
+targets:
+  CinemaUISmokeRenderer:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - SourcesiOS
+      - path: SourcesShared
+        # The renderer mounts no JS-provider surface; excluding this legacy C runtime keeps the
+        # diagnostic target out of its unrelated current-toolchain compilation failure.
+        excludes: [".claude/**", "JSProviders/**"]
+      - path: Sources/Player
+        excludes: [".claude/**"]
+      - Sources/PlayerScreen.swift
+      - Sources/ShareSheet.swift
+      - Sources/ExternalPlayer.swift
+      - Resources/Assets.xcassets
+      - Resources/Localizable.xcstrings
+    dependencies:
+      - package: MPVKit
+        product: MPVKit-GPL
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stremiox.cinema-ui-smoke
+        PRODUCT_NAME: CinemaUISmokeRenderer
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Player/VortX-Bridging.h
+        # Xcode 26 rejects locally linked static XCFramework roots in an ad-hoc project even when
+        # their macOS slices validate. Expose the same checked module maps and ordinary archives
+        # directly. Do not force-load whole Rust archives: this renderer neither starts an engine
+        # nor needs unreachable native code, and forcing them exceeds macOS compact-unwind limits.
+        SWIFT_INCLUDE_PATHS: "$(inherited) $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64/Headers $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64/Headers/vortx"
+        LIBRARY_SEARCH_PATHS: "$(inherited) $(SRCROOT)/Vendor/StremioXCore.xcframework/macos-arm64 $(SRCROOT)/Vendor/VortxEngine.xcframework/macos-arm64"
+        OTHER_LDFLAGS: "$(inherited) -lstremiox_core -lvortx_ffi"
+        DEAD_CODE_STRIPPING: "YES"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER"
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: Cinema UI Smoke
+        # MPVKit is a static archive with several foreign unwind personalities. Xcode's Debug-dylib
+        # indirection exceeds compact-unwind's per-image personality table before this fixture executable
+        # can link; keeping this diagnostic target as one normal executable avoids that linker-only limit.
+        ENABLE_DEBUG_DYLIB: "NO"
+        CODE_SIGNING_ALLOWED: "NO"
+        CODE_SIGNING_REQUIRED: "NO"
+schemes:
+  CinemaUISmokeRenderer:
+    build:
+      targets:
+        CinemaUISmokeRenderer: all
+    run:
+      config: Debug

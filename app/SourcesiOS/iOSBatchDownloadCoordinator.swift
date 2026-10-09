@@ -24,7 +24,7 @@ import Combine
 ///     (`StreamRanking.languageScore` over `TrackPreferences.audioLanguages`) all apply per episode.
 ///     There is no per-download language chooser - a download fetches the picked source's file - so
 ///     language preference is honored exactly the way a manual best-download honors it: via ranking.
-///  4. Cached-debrid resolve (`DebridCoordinator.resolvedPlaybackURL`, season-pack episode aware) and
+///  4. Cached-debrid resolve (`DebridCoordinator.resolvedPlaybackRef`, season-pack episode aware) and
 ///     the loopback torrent prime for raw torrents, then `DownloadManager.download(...)`, whose
 ///     existing byte-queue (cap 2) takes over. Records appear in DownloadsView immediately as
 ///     `.queued` because `download()` upserts before any transfer starts.
@@ -73,7 +73,9 @@ final class BatchDownloadCoordinator: ObservableObject {
         let continuity: String?
         let pin: ResolvedPin?
         let sticky: (addon: String?, bingeGroup: String?)?
+        let desiredAudioLanguage: String?
         let cachedHashes: Set<String>
+        let downloadOwner: NativeDownloadOwner
     }
 
     /// End-of-batch result, shown inline on the series detail page until dismissed (or replaced by the
@@ -111,6 +113,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         let alternate: CoreStream
         let pm: PlaybackMeta
         let episode: DebridEpisode?
+        let owner: NativeDownloadOwner
     }
 
     // MARK: Published state (drives the inline status line on the detail page)
@@ -195,7 +198,9 @@ final class BatchDownloadCoordinator: ObservableObject {
 
         let pendingIds = Set(pending.map { $0.video.id })
         var jobs: [Job] = []
-        let sticky = SeriesSourceSticky.preference(for: seriesId)
+        let choice = SeriesSourceSticky.snapshot(for: seriesId)
+        let sticky = choice.source
+        let downloadOwner = NativeDownloadOwner()
         for video in episodes {
             if DownloadStore.shared.hasDownload(videoId: video.id) {
                 tally?.alreadyDownloaded += 1
@@ -204,7 +209,8 @@ final class BatchDownloadCoordinator: ObservableObject {
             guard !pendingIds.contains(video.id), video.id != currentVideoId else { continue }
             jobs.append(Job(seriesId: seriesId, seriesName: seriesName, identityRoles: identityRoles,
                             fallbackPoster: fallbackPoster, video: video, continuity: continuity,
-                            pin: pin, sticky: sticky, cachedHashes: cachedHashes))
+                            pin: pin, sticky: sticky, desiredAudioLanguage: choice.audioLanguage,
+                            cachedHashes: cachedHashes, downloadOwner: downloadOwner))
         }
 
         pending.append(contentsOf: jobs)
@@ -366,6 +372,7 @@ final class BatchDownloadCoordinator: ObservableObject {
         }
         let candidates = StreamRanking.rankedCandidates(groups, continuity: job.continuity, pin: job.pin,
                                             sticky: job.sticky, stickyAuthoritative: false, preserveChosenRelease: true,
+                                            desiredAudioLanguage: job.desiredAudioLanguage,
                                             debridCachedHashes: job.cachedHashes)
         if Task.isCancelled { return .cancelled }   // don't start a debrid resolve for a stopped batch
         // PRESENCE, not truthiness: episode ZERO is a valid coordinate (specials), and both coordinates are
@@ -375,12 +382,21 @@ final class BatchDownloadCoordinator: ObservableObject {
                 season >= 0 && episode >= 0 ? DebridEpisode(season: season, episode: episode) : nil
             }
         }
+        let downloadCandidates = candidates.filter { job.downloadOwner.allows($0) }
+        let requiresNativeOwner = StremioServer.nativeTransportSelected && downloadCandidates.contains { $0.isUsenet }
         guard let selected = await iOSResolveRankedEpisodeCandidate(
-            candidates, episode: ep, deadline: slotPolicy.startedAt + slotPolicy.maximumDuration,
-            stillCurrent: { self.currentSeriesId == job.seriesId && self.currentVideoId == job.video.id }
+            downloadCandidates, episode: ep, deadline: slotPolicy.startedAt + slotPolicy.maximumDuration,
+            stillCurrent: {
+                self.currentSeriesId == job.seriesId && self.currentVideoId == job.video.id
+                    && (!requiresNativeOwner || job.downloadOwner.isCurrent)
+            }
         ) else { return Task.isCancelled ? .cancelled : .noSource }
         guard !Task.isCancelled, currentSeriesId == job.seriesId, currentVideoId == job.video.id,
-              ProcessInfo.processInfo.systemUptime < slotPolicy.startedAt + slotPolicy.maximumDuration else { return .cancelled }
+              ProcessInfo.processInfo.systemUptime < slotPolicy.startedAt + slotPolicy.maximumDuration,
+              job.downloadOwner.allows(selected.stream) else {
+            selected.ref?.nativeUsenetLease?.close()
+            return .cancelled
+        }
         let (best, url, resolved) = (selected.stream, selected.url, selected.ref?.url)
         // Raw torrent: the loopback server must be told to /create it first (#21). Fire-and-forget:
         // the prime's retry loop is self-terminating (~15s max), same as the CW-resume prime.
@@ -388,17 +404,18 @@ final class BatchDownloadCoordinator: ObservableObject {
         let pm = PlaybackMeta(libraryId: job.seriesId, videoId: job.video.id, type: "series",
                               name: job.seriesName, poster: job.video.thumbnail ?? job.fallbackPoster,
                               season: job.video.season, episode: job.video.episode)
-        let record = DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
+        let record = await DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
                                                      sourceName: best.name,
-                                                     qualityText: StreamRanking.signature(best))
+                                                     qualityText: StreamRanking.signature(best),
+                                                     nativeUsenetLease: selected.ref?.nativeUsenetLease, nativeOwner: job.downloadOwner)
         // download() can refuse synchronously (an HLS source on a device that can't save HLS, a storage
         // shortfall): that episode was NOT queued, so report it as skipped, not as a success.
         if DownloadStore.shared.record(id: record.id)?.state == .failed { return .noSource }
         // #119 remainder: arm ONE auto-swap to the next-best DISTINCT source if this download later fails its
         // byte transfer. Same ranking the batch just used (rankedCandidates mirrors best()); a nil alternate
         // (nothing else playable) arms no plan, so that episode simply fails honestly as before.
-        if let alternate = candidates.dropFirst(selected.index + 1).first(where: { !sameSource($0, best) }) {
-            retryPlans[record.id] = RetryPlan(alternate: alternate, pm: pm, episode: ep)
+        if let alternate = downloadCandidates.dropFirst(selected.index + 1).first(where: { !sameSource($0, best) }) {
+            retryPlans[record.id] = RetryPlan(alternate: alternate, pm: pm, episode: ep, owner: job.downloadOwner)
         }
         return .queued
     }
@@ -437,24 +454,33 @@ final class BatchDownloadCoordinator: ObservableObject {
     /// the swap window leaves the original failed row on disk to retry from, never a vanished episode.
     private func performRetrySwap(failedRecordID id: UUID, plan: RetryPlan) {
         guard retryPlans.removeValue(forKey: id) != nil else { return }   // already swapped: one swap per episode
+        let replacingNative = DownloadStore.shared.record(id: id)?.remoteURL == DownloadManager.nativeSourceMarker
+        guard !replacingNative || plan.owner.isCurrent else { return }
         Task { @MainActor in
-            let resolved: URL?
+            guard (!replacingNative || plan.owner.isCurrent), plan.owner.allows(plan.alternate) else { return }
+            let ref: DebridPlaybackRef?
             if plan.alternate.url == nil, plan.episode == nil {
-                resolved = nil
+                ref = nil
             } else {
-                resolved = await DebridCoordinator.shared.resolvedPlaybackURL(
+                ref = await DebridCoordinator.shared.resolvedPlaybackRef(
                     for: plan.alternate, episode: plan.episode
                 )
             }
+            guard (!replacingNative || plan.owner.isCurrent), plan.owner.allows(plan.alternate) else { ref?.nativeUsenetLease?.close(); return }
+            let resolved = ref?.url
             if resolved == nil, plan.alternate.isTorrent { _ = prepareTorrentStream(plan.alternate) }
             guard let fallback = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
                 isUsenet: plan.alternate.isUsenet, resolvedURL: resolved,
                 fallbackURL: plan.alternate.playableURL(isEpisode: true)
             ) else { return }   // no URL: keep the failed row, do not orphan the episode
-            let record = DownloadManager.shared.download(stream: plan.alternate, meta: plan.pm,
+            let record = await DownloadManager.shared.download(stream: plan.alternate, meta: plan.pm,
                                                          resolvedURL: fallback,
                                                          sourceName: plan.alternate.name,
-                                                         qualityText: StreamRanking.signature(plan.alternate))
+                                                         qualityText: StreamRanking.signature(plan.alternate),
+                                                         nativeUsenetLease: ref?.nativeUsenetLease, nativeOwner: plan.owner,
+                                                         requiresNativeOwner: replacingNative)
+            guard (!replacingNative || plan.owner.isCurrent),
+                  DownloadStore.shared.record(id: record.id)?.state != .failed else { return }
             // Replacement is queued: now drop the failed download via the canonical DownloadManager path
             // (cancels the live task, clears taskForRecord / resumeData / cannotCreateFileRetries / the HLS
             // asset-task map, then removes the record + file). DownloadStore.remove would leak that bookkeeping.

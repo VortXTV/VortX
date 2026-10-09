@@ -351,6 +351,14 @@ internal fun detailSourceAudioLanguages(
 /// load. Watched-state and library mutations dispatch through [repo] and swap [meta] with the
 /// engine's freshly re-pulled snapshot, so ticks/progress/the library chip flip live with no
 /// separate reload.
+internal fun selectedPlaybackStartPosition(nativeEnabled: Boolean, resolved: Long, cached: Long,
+                                           explicitOverride: Long? = null, fromStart: Boolean = false): Long = when {
+    fromStart -> 0L
+    nativeEnabled -> explicitOverride?.coerceAtLeast(0L) ?: resolved.coerceAtLeast(0L)
+    cached > 0L -> cached
+    else -> resolved
+}
+
 class DetailViewModel(
     private val repo: CatalogRepository,
     private val type: MediaType,
@@ -358,6 +366,7 @@ class DetailViewModel(
     appContext: Context,
     private val routeName: String? = null,
     private val initialPreferredEpisode: PreferredEpisode? = null,
+    private val continueWatchingAdmission: com.vortx.android.home.ContinueWatchingAdmission? = null,
 ) : ViewModel() {
 
     private val app = appContext.applicationContext
@@ -411,8 +420,8 @@ class DetailViewModel(
     private var profileReloadJob: Job? = null
     private val watchlistStore = WatchlistStore.shared(app)
     val watchlisted: StateFlow<Boolean> = watchlistStore.items
-        .map { items -> items.any { it.id == id } }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, watchlistStore.isWatchlisted(id))
+        .map { items -> items.any { it.id == id && it.type == type } }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, watchlistStore.isWatchlisted(id, type))
 
     /// Gate for the [sourceModel] -> [_streams] bridge: true only after the raw engine groups for the current
     /// target have loaded, so the coalescer's empty first-paint (and the empty state at each new load) never
@@ -650,7 +659,7 @@ class DetailViewModel(
             // so meta must land (above) before the sources fan-out is scoped.
             val target = detailEpisodeTargetForRoute(
                 videos = detail.videos,
-                preferredEpisode = initialPreferredEpisode,
+                preferredEpisode = detailPreferredEpisodeForAdmission(initialPreferredEpisode, continueWatchingAdmission),
                 manualEpisodeId = explicitManualEpisodeId,
             ) ?: primaryEpisodeOf(detail)?.first
             if (target != null) {
@@ -812,7 +821,7 @@ class DetailViewModel(
     }
 
     private fun canPublishPlaybackResolve(lease: PlaybackResolveFence.Lease): Boolean =
-        playbackResolveFence.accepts(lease) &&
+        isRouteAdmissionCurrent() && playbackResolveFence.accepts(lease) &&
             sourceRequestFence.accepts(lease.sourceRequest, sourceSticky.currentProfileId())
 
     private fun publishPlaybackResolve(lease: PlaybackResolveFence.Lease, state: Playback): Boolean {
@@ -873,7 +882,7 @@ class DetailViewModel(
                 detail?.let {
                     detailEpisodeTargetForRoute(
                         videos = it.videos,
-                        preferredEpisode = initialPreferredEpisode,
+                        preferredEpisode = detailPreferredEpisodeForAdmission(initialPreferredEpisode, continueWatchingAdmission),
                         manualEpisodeId = explicitManualEpisodeId,
                     )
                 }
@@ -1283,6 +1292,10 @@ class DetailViewModel(
         manualPick: Boolean,
         startPositionOverrideMs: Long?,
     ) {
+        if (!isRouteAdmissionCurrent()) {
+            _playback.value = Playback.Failed("This Continue Watching request expired. Open the title again from Home.")
+            return
+        }
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
@@ -1314,7 +1327,8 @@ class DetailViewModel(
                     } else {
                         Playback.Ready(
                             playable.copy(
-                            startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
+                            startPositionMs = selectedPlaybackStartPosition(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED,
+                                playable.startPositionMs, resumeMs, startPositionOverrideMs),
                             mediaRef = ref,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),
@@ -1654,7 +1668,7 @@ class DetailViewModel(
                 return@launch
             }
             // 1) CW resume: replay the exact stored debrid source for this target if we have one.
-            resumeRef?.takeIf { it.targetId == targetId && it.ref.owner == actionOwner }?.let { stored ->
+            resumeRef?.takeIf { !com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED && it.targetId == targetId && it.ref.owner == actionOwner }?.let { stored ->
                 val resumed = debrid.resumePlaybackURL(stored.ref, stored.url, stored.savedAtMs)
                 if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
                     publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
@@ -1673,7 +1687,9 @@ class DetailViewModel(
                 }
             }
             // 2) Failover among the account-confirmed-cached candidates (label-authoritative gate applied).
-            val winner = resolveBestViaFailover(groups, best, debridEpisode, actionOwner)
+            // Native sources carry an immutable session/source lease. Resolve through the repository
+            // so cached debrid fast paths cannot manufacture an unowned Playable after account changes.
+            val winner = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) null else resolveBestViaFailover(groups, best, debridEpisode, actionOwner)
             if (!isActionOwnerCurrent(actionOwner) || !canPublishPlaybackResolve(resolveLease)) {
                 winner?.ref?.progressiveSession?.close()
                 publishPlaybackResolve(resolveLease, Playback.Failed(OWNER_CHANGED_MESSAGE))
@@ -1703,7 +1719,8 @@ class DetailViewModel(
                 onSuccess = { playable ->
                     Playback.Ready(
                         playable.copy(
-                            startPositionMs = if (resumeMs > 0L) resumeMs else playable.startPositionMs,
+                            startPositionMs = selectedPlaybackStartPosition(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED,
+                                playable.startPositionMs, resumeMs, startPositionOverrideMs, fromStart),
                             mediaRef = ref,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),
@@ -1761,18 +1778,18 @@ class DetailViewModel(
         )
     }
 
+    fun isRouteAdmissionCurrent(): Boolean = continueWatchingAdmission?.isCurrent() != false
+
     private fun isActionOwnerCurrent(owner: DebridOwnerToken?): Boolean =
-        debridKeys.ownerToken() == owner
+        isRouteAdmissionCurrent() && debridKeys.ownerToken() == owner
 
     private suspend fun resolveForOwner(
         source: StreamSource,
         episode: Episode?,
         owner: DebridOwnerToken?,
-    ): Result<Playable> = ownerBoundResult(
-        expectedOwner = owner,
-        currentOwner = debridKeys::ownerToken,
-    ) {
-        repo.resolve(source, episode)
+    ): Result<Playable> = com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission,
+        discard = { it.playbackLease?.close() }) {
+        ownerBoundResult(expectedOwner = owner, currentOwner = debridKeys::ownerToken) { repo.resolve(source, episode) }
     }
 
     private fun currentModelEpisode(): Episode? {
@@ -1857,9 +1874,12 @@ class DetailViewModel(
 
     /** WHY audit R01: Home's first CW hero restores the persisted exact source through CWResume. */
     fun playLastStream(): Boolean {
+        if (!isRouteAdmissionCurrent()) return false
         val saved = lastStreamStore.load()?.takeIf { it.mediaId == id && it.mediaType == type } ?: return false
         viewModelScope.launch {
-            val streamState = streams.first { it !is UiState.Loading }
+            val streamState = com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission) {
+                Result.success(streams.first { it !is UiState.Loading })
+            }.getOrNull() ?: return@launch
             if (streamState !is UiState.Success) return@launch
             val owner = debridKeys.ownerToken()
             val service = saved.debridService
@@ -2247,18 +2267,7 @@ class DetailViewModel(
         return primaryEpisodeOf(detail)
     }
 
-    private fun primaryEpisodeOf(detail: MetaDetail): Pair<Episode, Boolean>? {
-        if (detail.videos.isEmpty()) return null
-        val sorted = detailEpisodeTargetOrder(detail.videos)
-        val lib = detail.libraryItem
-        if (lib != null && lib.timeOffsetMs > 0 && lib.videoId != null) {
-            val resumeVideo = sorted.firstOrNull { it.id == lib.videoId }
-            if (resumeVideo != null && resumeVideo.id !in detail.watchedVideoIds) return resumeVideo to true
-        }
-        val next = sorted.firstOrNull { it.id !in detail.watchedVideoIds }
-        if (next != null) return next to false
-        return sorted.first() to false
-    }
+    private fun primaryEpisodeOf(detail: MetaDetail): Pair<Episode, Boolean>? = detailPrimaryEpisode(detail)
 
     // ---- S05: watched-state + library mutations ----
     //
@@ -2321,18 +2330,22 @@ class DetailViewModel(
         }
     }
 
-    /** Toggle the separate profile-local want-to-watch ledger without mutating the account library. */
+    /** Watchlist remains separate from engine library; capture authority before enqueueing work. */
     fun toggleWatchlist() {
         val current = (_meta.value as? UiState.Success)?.data ?: return
+        val intent = try {
+            watchlistStore.captureToggle(MetaItem(id = current.id, type = current.type, name = current.name, poster = current.poster))
+        } catch (_: Exception) {
+            _mutationError.value = "Could not update Watchlist. Try again."
+            return
+        }
         viewModelScope.launch {
-            watchlistStore.toggle(
-                MetaItem(
-                    id = current.id,
-                    type = current.type,
-                    name = current.name,
-                    poster = current.poster,
-                ),
-            )
+            try {
+                watchlistStore.toggle(intent)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _mutationError.value = "Could not update Watchlist. Try again."
+            }
         }
     }
 
@@ -2470,8 +2483,8 @@ internal suspend fun resolveRelatedDetailTitle(item: MetaItem): MetaItem {
 
 /**
  * Detail's target policy intentionally ignores season-zero specials whenever a title has actual episodes.
- * Specials remain available in the episode browser; they simply cannot hijack Continue Watching's primary
- * resume/next target ahead of the first real episode.
+ * Specials remain available in the episode browser and explicit saved resumes; they cannot hijack a fresh
+ * or next target ahead of the first real episode.
  */
 internal fun detailEpisodeTargetOrder(videos: List<Episode>): List<Episode> {
     val ordered = videos.sortedWith(compareBy({ it.season }, { it.episode }, { it.id }))
@@ -2479,11 +2492,28 @@ internal fun detailEpisodeTargetOrder(videos: List<Episode>): List<Episode> {
     return actualEpisodes.ifEmpty { ordered }
 }
 
+/** Explicit saved progress can resume a special; only fresh/next selection skips season zero. */
+internal fun detailPrimaryEpisode(detail: MetaDetail): Pair<Episode, Boolean>? {
+    if (detail.videos.isEmpty()) return null
+    val sorted = detailEpisodeTargetOrder(detail.videos)
+    val lib = detail.libraryItem
+    if (lib != null && lib.timeOffsetMs > 0 && lib.videoId != null) {
+        val resumeVideo = detail.videos.firstOrNull { it.id == lib.videoId }
+        if (resumeVideo != null && resumeVideo.id !in detail.watchedVideoIds) return resumeVideo to true
+    }
+    val next = sorted.firstOrNull { it.id !in detail.watchedVideoIds }
+    if (next != null) return next to false
+    return sorted.first() to false
+}
+
 /**
  * Resolves a route-provided episode only against the metadata for the title currently open.
  * An explicit user-selected episode always wins, while a stale or malformed remote hint deliberately returns null
  * so the existing primary-episode policy remains the fallback.
  */
+internal fun detailPreferredEpisodeForAdmission(hint: PreferredEpisode?, admission: com.vortx.android.home.ContinueWatchingAdmission?): PreferredEpisode? =
+    hint.takeIf { admission?.isCurrent() != false }
+
 internal fun detailEpisodeTargetForRoute(
     videos: List<Episode>,
     preferredEpisode: PreferredEpisode?,

@@ -28,7 +28,7 @@ class TvDebridCloudSearchContractTest {
         assertTrue(shell.contains("restoreQuickActionsFocusSignal = searchFocusRestoreSignal"))
         assertTrue(app.contains("var shellDestination by remember { mutableStateOf(TvDestination.HOME) }"))
         assertTrue(app.contains("var searchFocusRestoreSignal by remember { mutableStateOf(0) }"))
-        assertTrue(app.contains("BackHandler(onBack = ::returnToBrowse)"))
+        assertTrue(app.contains("BackHandler(onBack = ::exitPlayer)"))
         assertTrue(app.contains("onRestoreSearchFocus = { searchFocusRestoreSignal++ }"))
         assertTrue(shell.contains("onRestoreSearchFocus()"))
         assertFalse(shell.contains("destination = TvDestination.DOWNLOADS"))
@@ -59,9 +59,10 @@ class TvDebridCloudSearchContractTest {
         val app = read("src/main/kotlin/com/vortx/android/ui/tv/TvApp.kt")
 
         assertTrue(playerExitCallbacksUseReturnToBrowse(app))
-        assertFalse(playerExitCallbacksUseReturnToBrowse(app.replace("onBack = ::returnToBrowse", "onBack = { playing = null }")))
-        assertFalse(playerExitCallbacksUseReturnToBrowse(app.replace("onError = ::returnToBrowse", "onError = { playing = null }")))
-        assertTrue(app.contains("BackHandler(onBack = ::returnToBrowse)"))
+        assertFalse(playerExitCallbacksUseReturnToBrowse(app.replace("onBack = ::exitPlayer", "onBack = { playing = null }")))
+        assertFalse(playerExitCallbacksUseReturnToBrowse(app.replace("onError = ::exitPlayer", "onError = { playing = null }")))
+        assertFalse(playerExitCallbacksUseReturnToBrowse(app.replace("returnToBrowse()\n            }", "playing = null\n            }")))
+        assertTrue(app.contains("BackHandler(onBack = ::exitPlayer)"))
     }
 
     @Test
@@ -134,7 +135,10 @@ class TvDebridCloudSearchContractTest {
     private fun playerExitCallbacksUseReturnToBrowse(source: String): Boolean {
         val player = source.substringAfter("PlayerScreen(", missingDelimiterValue = "")
             .substringBefore("return@VortXTheme", missingDelimiterValue = "")
-        return player.contains("onBack = ::returnToBrowse") && player.contains("onError = ::returnToBrowse")
+        val exitPlayer = source.substringAfter("fun exitPlayer() {", missingDelimiterValue = "")
+            .substringBefore("\n            }", missingDelimiterValue = "")
+        return player.contains("onBack = ::exitPlayer") && player.contains("onError = ::exitPlayer") &&
+            exitPlayer.contains("cancelPreload()") && exitPlayer.contains("returnToBrowse()")
     }
 
     private fun read(relativePath: String): String {

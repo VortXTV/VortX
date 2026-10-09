@@ -37,6 +37,16 @@ import com.vortx.android.debrid.DebridAccountOwnerState
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.diagnostics.CrashReporter
 import com.vortx.android.engine.EngineStremioRepository
+import com.vortx.android.engine.NativeCatalogRepository
+import com.vortx.android.engine.AndroidNativePlaybackResolver
+import com.vortx.android.engine.NativeAccountCoordinator
+import com.vortx.android.engine.NativeProfileAccess
+import com.vortx.android.engine.VortxAccountScope
+import com.vortx.android.engine.VortxAndroidCheckpointKey
+import com.vortx.android.engine.VortxEncryptedCheckpointStore
+import com.vortx.android.engine.VortxJniBindings
+import com.vortx.android.engine.VortxJniResourceTransport
+import com.vortx.android.engine.VortxNativeSession
 import com.vortx.android.iptv.IPTVCleanupCoordinator
 import com.vortx.android.iptv.IPTVPlaylists
 import com.vortx.android.iptv.iptvCleanupActions
@@ -53,6 +63,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.map
 
 /// Owns the ONE [EngineStremioRepository] instance for the process's lifetime.
 ///
@@ -97,6 +109,56 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
 
     private val fallbackCatalogRepository by lazy { PreviewCatalogRepository() }
     private val fallbackAuthRepository by lazy { PreviewAuthRepository() }
+    private val nativeAccounts: NativeAccountCoordinator by lazy { NativeAccountCoordinator(VortxJniBindings,
+        VortxEncryptedCheckpointStore(java.io.File(noBackupFilesDir, "native-state"), VortxAndroidCheckpointKey::get),
+        ::VortxJniResourceTransport, { syncManager?.sessionOwnerSnapshot() == it },
+        { close -> applicationScope.launch { close() }; Unit },
+        { withContext(Dispatchers.Main) {
+            ProfileStore.sharedOrNull()?.attachNativeGateway(nativeProfiles)
+        } },
+        { applicationScope.launch { syncManager?.onLocalOwnerLibraryChanged() }; Unit },
+        { applicationScope.launch(Dispatchers.Main) {
+            if (runCatching { nativeAccounts.session() }.isFailure) {
+                ProfileStore.sharedOrNull()?.clearNativeProjection()
+            }
+        }; Unit },
+        ownCredentials = com.vortx.android.engine.NativeOwnAccountCredentials.shared(this),
+        captureOwnAccountAdmission = { captured -> syncManager?.let { manager ->
+            val admission = manager.captureLocalLibraryMutationAdmission() ?: return@let null
+            val gate: (() -> Boolean) -> Boolean = { action -> admission {
+                syncManager === manager && manager.sessionOwnerSnapshot() == captured && action()
+            } }
+            gate
+        } }, onAuthorityChanged = { com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority() }) }
+    internal fun nativeStreamingAccounts(): NativeAccountCoordinator {
+        check(BuildConfig.NATIVE_ENGINE_ENABLED) { "Native streaming accounts are not enabled" }
+        return nativeAccounts
+    }
+    private val nativeProfiles: NativeProfileAccess by lazy { NativeProfileAccess { nativeAccounts.session() } }
+    private val nativeWatchlist by lazy { com.vortx.android.engine.NativeWatchlistAccess(nativeAccounts) }
+    private val nativeStreamingAuth by lazy { com.vortx.android.engine.NativeStreamingAuthRepository(nativeAccounts, applicationScope) }
+    private val nativeRepository: NativeCatalogRepository by lazy { NativeCatalogRepository(AndroidNativePlaybackResolver(this), nativeAccounts.changes.map { Unit },
+        { check(syncManager?.signOut() == true) { "Account sign-out could not be stored securely" } },
+        captureReclaimAdmission = { session, owner ->
+            syncManager?.let { manager -> com.vortx.android.engine.captureNativeReclaimAdmission(nativeAccounts, session, owner,
+                { if (syncManager === manager) manager.sessionOwnerSnapshot() else com.vortx.android.sync.SessionOwnerSnapshot.UnknownOrUnavailable(0) },
+                manager::captureLocalLibraryMutationAdmission) }
+        },
+        withReclaimLifecycle = { action -> DownloadManager.withWatchedReclaimAdmission(this, action) },
+        nzbSourceAggregator = run {
+            val keys = DebridKeys(this)
+            com.vortx.android.engine.NzbSourceAggregator(
+                com.vortx.android.nzb.NzbIndexerStore(
+                    this,
+                    keys::ownerToken,
+                    { ProfileStore.sharedOrNull()?.active?.id },
+                    keys::mutateCurrentOwner,
+                ),
+            )
+        }) {
+        nativeAccounts.session().also { it.read() }
+    } }
+
 
     /// Warm the media-server store from disk at process start (idempotent), so a Plex/Jellyfin/Emby server
     /// connected in a previous run is queryable for direct-play sources on the very first detail page WITHOUT
@@ -118,6 +180,9 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         // per-profile key and the switch-listener reload hook wired in EngineStremioRepository.
         runCatching { ProfileStore.init(this) }
             .onFailure { Log.w(TAG, "Profile store init failed; profiles stay at defaults", it) }
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) {
+            com.vortx.android.library.WatchlistStore.shared(this).installNativeGateway(nativeWatchlist) { BuildConfig.NATIVE_ENGINE_ENABLED }
+        }
         // Bootstrap the RemoteConfig snapshot (baked defaults, signed config.vortx.tv fetch with ETag/304).
         // Loads the last-good cached config synchronously, then refreshes once in the background. Fail-soft:
         // every feature flag + typed value reads its baked (== shipping) default until a remote value lands.
@@ -293,7 +358,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                             DebridAccountOwnerState.UnknownOrUnavailable
                     }
                 }
-                manager.attachSyncSeams(store)
+                if (!BuildConfig.NATIVE_ENGINE_ENABLED) manager.attachSyncSeams(store)
             }
         }
             .getOrElse {
@@ -301,6 +366,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 return
             }
         syncManager = manager
+        if (BuildConfig.NATIVE_ENGINE_ENABLED) manager.attachNativeGateway(nativeAccounts)
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             /// Count of currently-started activities. Touched only from the main thread (every
             /// ActivityLifecycleCallbacks callback is delivered on the main looper), so a plain Int is safe.
@@ -334,12 +400,12 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
     /// The one [CatalogRepository] the whole app shares. Falls back to the offline preview data (same
     /// fail-soft boundary [MainActivity] used to own directly) so a native-side problem degrades the
     /// UI instead of crashing it.
-    val catalogRepository: CatalogRepository get() = accountConnectedEngine() ?: fallbackCatalogRepository
+    val catalogRepository: CatalogRepository get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeRepository else accountConnectedEngine() ?: fallbackCatalogRepository
 
     /// The one [AuthRepository] the whole app shares -- the SAME underlying engine instance as
     /// [catalogRepository] when the engine is up (one repository class implements both contracts), so
     /// a sign-in immediately shows up in every catalog call that reads `ctx`-derived state.
-    val authRepository: AuthRepository get() = accountConnectedEngine() ?: fallbackAuthRepository
+    val authRepository: AuthRepository get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) nativeStreamingAuth else accountConnectedEngine() ?: fallbackAuthRepository
 
     /** Keep initialization lazy; attach the real engine only when a normal app consumer requests it. */
     private fun accountConnectedEngine(): EngineStremioRepository? = engine?.also { repository ->

@@ -433,7 +433,8 @@ struct iOSCategoryBrowse: View {
                         ProgressView().frame(maxWidth: .infinity).padding(Theme.Space.xxl)
                     }
                 } else {
-                    PosterGrid(items: items, onTap: open, menu: .catalog, showWatchedBadges: true, onReachEnd: { Task { await loadNext() } })
+                    PosterGrid(items: items, onTap: open, onWatch: watch, menu: .catalog,
+                               showWatchedBadges: true, onReachEnd: { Task { await loadNext() } })
                 }
             }
             .padding(.bottom, Theme.Space.md)
@@ -470,6 +471,15 @@ struct iOSCategoryBrowse: View {
         pushResolvingHubID(FeaturedHeroItem.from(rail: item))
     }
 
+    /// A quick-view Watch must remain distinct from a Details tap even when this paginated screen had
+    /// to resolve a TMDB catalog identifier first. The detail owner consumes `autoPlay` only after its
+    /// existing authoritative metadata/source gates settle.
+    private func watch(_ item: RailItem) {
+        guard Date().timeIntervalSince(lastPush) > 0.6 else { return }
+        lastPush = Date()
+        pushResolvingHubID(FeaturedHeroItem.from(rail: item), autoPlay: true)
+    }
+
     /// Hero Play button - same double-push guard as a poster tap, but the hero already hands us a FeaturedHeroItem.
     private func openHero(_ item: FeaturedHeroItem) {
         guard Date().timeIntervalSince(lastPush) > 0.6 else { return }
@@ -483,8 +493,15 @@ struct iOSCategoryBrowse: View {
     /// meta). Resolve tmdb:->tt BEFORE pushing so the pushed item carries a tt id. A non-tmdb id pushes
     /// immediately; the resolve is fail-soft (push the unresolved item so detail still opens with seed art +
     /// the de-gated Play button). external_ids is edge-cached, so a warm title resolves in a few ms.
-    private func pushResolvingHubID(_ item: FeaturedHeroItem) {
-        guard item.id.hasPrefix("tmdb:") else { path.append(item); return }
+    private func pushResolvingHubID(_ item: FeaturedHeroItem, autoPlay: Bool = false) {
+        func append(_ resolved: FeaturedHeroItem) {
+            if autoPlay {
+                path.append(CinemaDetailTarget(item: resolved, autoPlay: true))
+            } else {
+                path.append(resolved)
+            }
+        }
+        guard item.id.hasPrefix("tmdb:") else { append(item); return }
         // The 0.6s lastPush window can reopen before a cold-cache external_ids resolve returns (>0.6s),
         // letting a second tap push the same detail twice. Gate the async path on a dedicated in-flight flag.
         guard !resolving else { return }
@@ -495,7 +512,7 @@ struct iOSCategoryBrowse: View {
             // The user may have popped this screen during a cold-cache resolve; don't append a detail page
             // behind them (onDisappear cancels this task).
             guard !Task.isCancelled else { return }
-            path.append(tt.map { item.withResolvedIMDbID($0) } ?? item)
+            append(tt.map { item.withResolvedIMDbID($0) } ?? item)
         }
     }
 

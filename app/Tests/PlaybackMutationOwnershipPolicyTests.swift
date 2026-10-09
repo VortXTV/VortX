@@ -29,6 +29,22 @@ private struct PlaybackMutationOwnershipPolicyTests {
         let overlay = UUID()
         let replacement = UUID()
         let account = "stremiox.auth"
+        let credential = CredentialScopeRegistry.Capture(generation: 7)
+        let nativeA = Policy.NativeBinding(profileID: owner, credential: credential, sessionGeneration: UUID(), accountGeneration: UUID())
+        let nativeTarget = Policy.Target.native(nativeA)
+        let nativeB = Policy.NativeBinding(profileID: overlay, credential: credential, sessionGeneration: UUID(), accountGeneration: UUID())
+        let reopenedA = Policy.NativeBinding(profileID: owner, credential: credential, sessionGeneration: UUID(), accountGeneration: UUID())
+        check(Policy.allowsNative(nativeTarget, binding: nativeA), "native launch owns its exact installed session")
+        check(!Policy.allowsNative(nativeTarget, binding: nativeB), "native A callback cannot write B")
+        let otherAccountSameOwner = Policy.NativeBinding(profileID: owner, credential: .init(generation: 8), sessionGeneration: UUID(), accountGeneration: UUID())
+        var reboundSameProfile = nativeA; reboundSameProfile.accountGeneration = UUID()
+        check(!Policy.allowsNative(.native(nativeA), binding: reboundSameProfile), "same-profile account rebind retires paused callbacks")
+        var missingEpoch = nativeA; missingEpoch.accountGeneration = nil
+        check(!Policy.allowsNative(.native(missingEpoch), binding: missingEpoch), "native target without account epoch never authorizes writes")
+        check(!Policy.allowsNative(nativeTarget, binding: otherAccountSameOwner), "queued profile save captured before Task cannot write another account with the same A11C owner")
+        check(!Policy.allowsNative(nativeTarget, binding: reopenedA), "native A to B to A or same-profile reopen cannot revive old player")
+        check(!Policy.allowsNative(nativeTarget, binding: nil), "revoked native session cannot accept callback")
+        check(!Policy.allowsNative(.native(nil), binding: nativeA), "unavailable launch never acquires later native session")
         let ownerContext = Policy.Context(activeProfileID: owner, activeUsesEngineHistory: true,
                                           activeKeychainAccount: account, activeUID: "owner-uid",
                                           extantOverlayProfileIDs: [overlay])

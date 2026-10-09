@@ -6,6 +6,10 @@ build_dir="$repo_root/app/build/source-contracts"
 mkdir -p "$build_dir"
 
 swiftc -strict-concurrency=complete -warnings-as-errors \
+  app/Sources/Player/SubtitleStyle.swift app/Tests/SubtitleStyleBackgroundTests.swift \
+  -o "$build_dir/subtitle-style-background"
+"$build_dir/subtitle-style-background"
+swiftc -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/SubtitleRequestMetadata.swift app/SourcesShared/SubtitleAddons.swift \
   app/Tests/SubtitleAddonFileMatchingTests.swift -o "$build_dir/subtitle-file-matching"
 "$build_dir/subtitle-file-matching"

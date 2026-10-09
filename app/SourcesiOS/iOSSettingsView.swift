@@ -38,6 +38,7 @@ struct iOSSettingsView: View {
     @EnvironmentObject private var vortxSync: VortXSyncManager
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ObservedObject private var updates = UpdateChecker.shared
     @EnvironmentObject private var profiles: ProfileStore
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
@@ -120,6 +121,9 @@ struct iOSSettingsView: View {
     @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
     @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
+    /// Whether catalog cards may open the compact, data-honest quick-view sheet. This is deliberately a
+    /// flat app preference: the shell reads the same key, and it should not follow a profile switch.
+    @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
     // Apple TV Top Shelf mirror of Continue Watching. Settings parity: the SAME flat key the tvOS
     // SettingsView binds ("vortx.topShelf.showContinueWatching", declared on tvOS by
     // TopShelfSnapshotWriter, which the phone targets do not compile). It is surfaced here BECAUSE the
@@ -135,6 +139,7 @@ struct iOSSettingsView: View {
     // has a single source of truth (no leftover legacy default-on blur when the user turns spoiler-safe off).
     @AppStorage(SourcePreferences.spoilerSafeKey) private var spoilerSafe = SourcePreferences.defaultSpoilerSafe
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false   // fold Search into Discover (one surface)
+    @AppStorage("vortx.mergeHomeDiscover") private var mergeHomeDiscover = true
     // Compact source rows (#117): parsed quality line instead of the raw release name. SAME key as tvOS.
     @AppStorage("vortx.streams.compactLabels") private var compactStreamLabels = false
     #if os(iOS) || os(macOS)
@@ -207,6 +212,26 @@ struct iOSSettingsView: View {
     @State private var macSettingsCategory: MacSettingsCategory = .profile
     #endif
 
+    /// The phone keeps the Settings form tight and scannable. Regular iPad layouts and macOS have enough
+    /// width for the Cinema Glass card rhythm, so they get larger insets and a softer, broader corner.
+    private var usesWideSettingsLayout: Bool {
+        #if os(macOS)
+        return true
+        #else
+        return horizontalSizeClass == .regular
+        #endif
+    }
+
+    private var settingsCardRadius: CGFloat {
+        usesWideSettingsLayout ? Theme.Radius.card + 4 : Theme.Radius.control
+    }
+
+    private var settingsRowInsets: EdgeInsets {
+        usesWideSettingsLayout
+            ? EdgeInsets(top: Theme.Space.sm, leading: Theme.Space.md, bottom: Theme.Space.sm, trailing: Theme.Space.md)
+            : EdgeInsets(top: Theme.Space.xs / 2, leading: Theme.Space.sm, bottom: Theme.Space.xs / 2, trailing: Theme.Space.sm)
+    }
+
     var body: some View {
         NavigationStack {
             #if os(macOS)
@@ -216,13 +241,13 @@ struct iOSSettingsView: View {
                 // Phase-0 seeding banner for the com.vortx move (see MoveSeeding): pinned above the search
                 // field, ungated by the settings filter so the move state is ALWAYS inspectable here. Not
                 // launch-gated (unlike the nag sheet): signed-out it prompts, signed-in it confirms.
-                seedingSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+                styledSettingsSection(seedingSection)
                 // Search field pinned at the top: typing filters the sections below (additive, the whole
                 // tree stays intact and returns the moment the field is cleared).
-                searchSection
+                styledSettingsSection(searchSection)
                 // When a search matches nothing, say so instead of leaving a blank form.
                 if isSearching && !hasAnySettingsMatch {
-                    noSettingsMatchRow
+                    styledSettingsSection(noSettingsMatchRow)
                 }
                 // Each section's row cards use the brand surface, not the system grouped grey (#49
                 // follow-up): `.listRowBackground` on a Section repaints all its rows. Combined with
@@ -230,31 +255,34 @@ struct iOSSettingsView: View {
                 // as warm dark surfaces with canvas showing between them, matching the rest of the app
                 // (and identical on iPadOS, which shares this view). Each section is gated by
                 // `sectionMatches`, so an empty query shows the whole tree and a query keeps only the hits.
-                if sectionMatches(.profiles) { profilesSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.language) { languageSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.account) { accountSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.stremioMirror) { stremioMirrorSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.playback) { playbackSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.downloads) { downloadsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.notifications) { notificationsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.streams) { streamsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.community) { communitySection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.server) { serverSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.tabBar) { tabBarSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.appearance) { appearanceSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.audioSubtitle) { audioSubtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.subtitle) { subtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.advanced) { advancedSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.backup) { backupSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.about) { aboutSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
-                if sectionMatches(.engine) { engineSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle())) }
+                if sectionMatches(.profiles) { styledSettingsSection(profilesSection) }
+                if sectionMatches(.language) { styledSettingsSection(languageSection) }
+                if sectionMatches(.account) { styledSettingsSection(accountSection) }
+                if sectionMatches(.stremioMirror) { styledSettingsSection(stremioMirrorSection) }
+                if sectionMatches(.playback) { styledSettingsSection(playbackSection) }
+                if sectionMatches(.downloads) { styledSettingsSection(downloadsSection) }
+                if sectionMatches(.notifications) { styledSettingsSection(notificationsSection) }
+                if sectionMatches(.streams) { styledSettingsSection(streamsSection) }
+                if sectionMatches(.community) { styledSettingsSection(communitySection) }
+                if sectionMatches(.server) { styledSettingsSection(serverSection) }
+                if sectionMatches(.tabBar) { styledSettingsSection(tabBarSection) }
+                if sectionMatches(.appearance) { styledSettingsSection(appearanceSection) }
+                if sectionMatches(.audioSubtitle) { styledSettingsSection(audioSubtitleSection) }
+                if sectionMatches(.subtitle) { styledSettingsSection(subtitleSection) }
+                if sectionMatches(.advanced) { styledSettingsSection(advancedSection) }
+                if sectionMatches(.backup) { styledSettingsSection(backupSection) }
+                if sectionMatches(.about) { styledSettingsSection(aboutSection) }
+                if sectionMatches(.engine) { styledSettingsSection(engineSection) }
             }
             // Grouped form style renders proper inset section cards + headers and a centered column
             // on macOS (the default macOS form style is the ugly full-width label-left layout). On the
             // brand canvas instead of the system gray, so it reads like the rest of the app.
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
+            .listRowInsets(settingsRowInsets)
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            .frame(maxWidth: usesWideSettingsLayout ? 1120 : .infinity, alignment: .center)
+            .padding(.horizontal, usesWideSettingsLayout ? Theme.Space.sm : 0)
             #endif
         }
             // The whole Form follows the app accent (#49): toggles, segmented selections, picker
@@ -426,6 +454,16 @@ struct iOSSettingsView: View {
 
     // MARK: Settings search
 
+    /// The same rounded Cinema Glass row treatment is used by the phone form and the wide iPad/Mac form.
+    /// Keeping it in one wrapper prevents a section from accidentally falling back to SwiftUI's grey
+    /// grouped-list platter when a new section is added.
+    private func styledSettingsSection<Content: View>(_ content: Content) -> some View {
+        content
+            .listRowBackground(Color.clear.vortxGlassListRow(
+                in: RoundedRectangle(cornerRadius: settingsCardRadius, style: .continuous)))
+            .listRowInsets(settingsRowInsets)
+    }
+
     /// The trimmed, lowercased query, computed once per body pass so `sectionMatches` is a plain `contains`.
     private var trimmedSettingsQuery: String {
         settingsQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -474,7 +512,6 @@ struct iOSSettingsView: View {
                 }
             }
         }
-        .listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
     }
 
     /// Shown in place of the settings tree when a query matches nothing, so the form is never blank.
@@ -484,7 +521,6 @@ struct iOSSettingsView: View {
                 .font(.callout)
                 .foregroundStyle(Theme.Palette.textSecondary)
         }
-        .listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
     }
 
     #if os(macOS)
@@ -498,10 +534,10 @@ struct iOSSettingsView: View {
                 .frame(width: 1)
                 .accessibilityHidden(true)
             Form {
-                seedingSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-                searchSection
+                styledSettingsSection(seedingSection)
+                styledSettingsSection(searchSection)
                 if isSearching && !hasAnySettingsMatch {
-                    noSettingsMatchRow
+                    styledSettingsSection(noSettingsMatchRow)
                 } else {
                     ForEach(macVisibleSettingsSections, id: \.title) { section in
                         macSettingsSection(section)
@@ -510,6 +546,7 @@ struct iOSSettingsView: View {
             }
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
+            .listRowInsets(settingsRowInsets)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
@@ -584,24 +621,24 @@ struct iOSSettingsView: View {
     /// from growing a second copy of any settings control or binding.
     @ViewBuilder private func macSettingsSection(_ section: SettingsSearchSection) -> some View {
         switch section {
-        case .profiles: profilesSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .language: languageSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .account: accountSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .stremioMirror: stremioMirrorSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .playback: playbackSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .downloads: downloadsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .notifications: notificationsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .streams: streamsSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .community: communitySection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .server: serverSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .tabBar: tabBarSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .appearance: appearanceSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .audioSubtitle: audioSubtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .subtitle: subtitleSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .advanced: advancedSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .backup: backupSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .about: aboutSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
-        case .engine: engineSection.listRowBackground(Color.clear.vortxGlassListRow(in: Rectangle()))
+        case .profiles: styledSettingsSection(profilesSection)
+        case .language: styledSettingsSection(languageSection)
+        case .account: styledSettingsSection(accountSection)
+        case .stremioMirror: styledSettingsSection(stremioMirrorSection)
+        case .playback: styledSettingsSection(playbackSection)
+        case .downloads: styledSettingsSection(downloadsSection)
+        case .notifications: styledSettingsSection(notificationsSection)
+        case .streams: styledSettingsSection(streamsSection)
+        case .community: styledSettingsSection(communitySection)
+        case .server: styledSettingsSection(serverSection)
+        case .tabBar: styledSettingsSection(tabBarSection)
+        case .appearance: styledSettingsSection(appearanceSection)
+        case .audioSubtitle: styledSettingsSection(audioSubtitleSection)
+        case .subtitle: styledSettingsSection(subtitleSection)
+        case .advanced: styledSettingsSection(advancedSection)
+        case .backup: styledSettingsSection(backupSection)
+        case .about: styledSettingsSection(aboutSection)
+        case .engine: styledSettingsSection(engineSection)
         }
     }
     #endif
@@ -1386,27 +1423,14 @@ struct iOSSettingsView: View {
                     Button(role: .destructive) { exit(0) } label: {
                         Label("Restart server (quits VortX, then reopen it)", systemImage: "arrow.clockwise")
                     }
-                    // Phase 8: flag-gated in-process ENGINE streaming server (vortx-core). Rendered only
-                    // in builds whose linked VortxEngine slice carries the server symbols, so the toggle
-                    // can never dangle. ON starts it immediately and the player follows its port
-                    // (StremioServer.embeddedPort); OFF stops it and nodejs-mobile serves again. The
-                    // node path itself is never touched either way.
-                    if VortxNativeServerFlag.isSupported {
+                    // Mobile runtimes cannot be swapped in-process: persist the next-launch choice.
+                    if VortxNativeServerFlag.isSupported && !NativeTransportPolicy.isRequired {
                         Toggle(isOn: $engineServerOn) {
                             Label("Engine streaming server (experimental)", systemImage: "gearshape.2")
                         }
-                        .onChange(of: engineServerOn) { on in
-                            if on {
-                                VortxNativeServer.startIfNeeded()
-                            } else {
-                                Task.detached(priority: .utility) { VortxNativeServer.stop() }
-                            }
-                        }
-                        if engineServerOn {
-                            Text(VortxNativeServer.statusDescription)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
+                        Text("Restart VortX after changing the streaming engine.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 #endif
@@ -1832,19 +1856,26 @@ struct iOSSettingsView: View {
     /// tab is hidden.
     @ViewBuilder private var tabBarSection: some View {
         Section {
-            Toggle("Show Discover tab", isOn: Binding(get: { !hideDiscoverTab }, set: { hideDiscoverTab = !$0 }))
+            Toggle("Combine Home & Discover", isOn: $mergeHomeDiscover)
+            Toggle(mergeHomeDiscover ? "Show Browse in Home" : "Show Discover tab",
+                   isOn: Binding(get: { !hideDiscoverTab }, set: { hideDiscoverTab = !$0 }))
             Toggle("Show Live TV tab", isOn: Binding(get: { !hideLiveTab }, set: { hideLiveTab = !$0 }))
             Toggle("Show Library tab", isOn: Binding(get: { !hideLibraryTab }, set: { hideLibraryTab = !$0 }))
             Toggle("Show Search tab", isOn: Binding(get: { !hideSearchTab }, set: { hideSearchTab = !$0 }))
         } header: {
             Text("Tab bar")
         } footer: {
-            Text("Choose which tabs appear in the tab bar. Home, Add-ons, and Settings always stay. If the tab you are on is hidden, you land on Home.")
+            Text("Combined Home has Featured and Browse modes. Turn the combination off to restore a separate Discover tab. Home, Add-ons, and Settings always stay. Hiding Browse returns Home to Featured; hiding another active tab lands on Home.")
         }
     }
 
     @ViewBuilder private var appearanceSection: some View {
         Section {
+            ContinueWatchingSettingsView()
+            Toggle("Quick view", isOn: $quickViewEnabled)
+            Text("Open compact details before entering a full title page. Applies to catalog cards across Home and Discover.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             // The built-in editorial Home rails (Critically Acclaimed, Hidden Gems, etc.) are Cinemeta-
             // backed and show even with no add-ons installed; this hides them (the "extra catalogs I
             // cannot remove from Home" report).
@@ -2300,7 +2331,8 @@ private enum SettingsSearchSection: CaseIterable {
                                   "hide poster labels", "accent", "background", "oled", "dolby vision", "hdr",
                                   "match frame rate", "frame rate", "judder", "24p", "refresh rate",
                                   "text size", "performance",
-                                  "top shelf", "tv home screen", "home screen", "continue watching"]
+                                  "top shelf", "tv home screen", "home screen", "continue watching",
+                                  "quick view", "quick-view", "title preview"]
         case .audioSubtitle: return ["audio language", "fallback audio", "subtitle language", "fallback subtitle",
                                      "subtitles", "forced", "match audio to subtitle"]
         case .subtitle: return ["font", "size", "fine size", "color", "background", "subtitle style"]

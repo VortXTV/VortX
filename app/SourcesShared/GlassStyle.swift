@@ -470,6 +470,15 @@ private struct VortXGlassStripModifier: ViewModifier {
 }
 
 extension View {
+    /// Cinema Glass's broad media and library surfaces. This stays separate from the compact row preset:
+    /// cards are intentionally a little more raised and use the shared rounded Cinema radius, while still
+    /// inheriting Reduce Transparency and Liquid Glass behavior from the base modifier.
+    func vortxCinemaCard() -> some View {
+        vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous),
+                    fillAlpha: VortXGlass.cardFillAlpha,
+                    shadow: .card)
+    }
+
     /// Apply the VortX glass material in `shape`. Renders the same warm glass on every OS / platform and
     /// upgrades to real Liquid Glass on OS 26. `fillAlpha` / `highlight` / `shadow` tune it per surface
     /// (defaults suit a floating bar or pill).

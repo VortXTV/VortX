@@ -15,11 +15,13 @@ struct DebridPlaybackRef: Sendable { let url: URL }
     var resolved: [String: URL] = [:]
     var onResolve: (() -> Void)?
     var delay: Duration = .zero
+    var delays: [String: Duration] = [:]
     func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode?,
         confirmedCachedHashes: Set<String>?, waitForLocalUsenetNode: Bool,
         usenetResolveTimeout: Duration) async -> DebridPlaybackRef? {
         calls.append(stream.name)
         onResolve?()
+        let delay = delays[stream.name] ?? delay
         if delay > .zero { try? await Task.sleep(for: delay) }
         return resolved[stream.name].map(DebridPlaybackRef.init(url:))
     }
@@ -45,6 +47,22 @@ struct DebridPlaybackRef: Sendable { let url: URL }
                                                               deadline: started + 0.05)
         precondition(timedOut == nil && ProcessInfo.processInfo.systemUptime - started < 1, "whole local+cloud resolution must obey owner deadline")
         backend.delay = .zero
+        backend.resolved = [:]
+        backend.calls = []
+        backend.delays[bad.name] = .seconds(35)
+        let fallbackStart = ProcessInfo.processInfo.systemUptime
+        let boundedFallback = await iOSResolveRankedEpisodeCandidate([bad, good], episode: .init(season: 1, episode: 2),
+            deadline: fallbackStart + 0.4)
+        precondition(boundedFallback?.index == 1 && ProcessInfo.processInfo.systemUptime - fallbackStart < 0.4,
+                     "cooperative35s NNTP fault cannot consume the alternate's reserved budget")
+        backend.delays = [:]
+        let inheritedBudget = EpisodeResolutionBudget(episodeID: "episode2", origin: .automatic,
+                                                       now: ProcessInfo.processInfo.systemUptime - 40)
+        let lateCandidate = await EpisodeResolutionBudget.$current.withValue(inheritedBudget) {
+            await iOSResolveRankedEpisodeCandidate([good], episode: .init(season: 1, episode: 2))
+        }
+        precondition(lateCandidate?.stream.name == good.name,
+                     "late candidate at40s is admitted inside the same request, not canceled by old30s timer")
         backend.calls = []
         let expired = await iOSResolveRankedEpisodeCandidate([bad, good], episode: nil,
                                                             deadline: ProcessInfo.processInfo.systemUptime - 1)

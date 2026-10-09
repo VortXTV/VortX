@@ -78,7 +78,7 @@ enum LinkAuthService {
         return .pending
     }
 
-    struct AuthenticatedIdentity: Equatable {
+    struct AuthenticatedIdentity: Equatable, Sendable {
         let uid: String
         let email: String?
     }
@@ -86,7 +86,7 @@ enum LinkAuthService {
     /// Validates a Stremio auth key against the main account API and returns the authenticated user
     /// identity. This is the only token-to-user proof used by CoreBridge; it never parses a token
     /// locally or infers identity from an active profile.
-    static func authenticatedIdentity(authKey: String) async throws -> AuthenticatedIdentity {
+    static func authenticatedIdentity(authKey: String, transport: AuthenticatedHTTPTransport = .shared) async throws -> AuthenticatedIdentity {
         struct Req: Encodable { let authKey: String }
         guard let url = URL(string: "\(accountAPI)/getUser") else { throw LinkAuthError.badURL }
         var request = URLRequest(url: url)
@@ -96,11 +96,14 @@ enum LinkAuthService {
         request.timeoutInterval = 15
         request.cachePolicy = .reloadIgnoringLocalCacheData
         let data: Data
-        let response: URLResponse
-        do { (data, response) = try await URLSession.shared.data(for: request) }
+        let response: AuthenticatedHTTPResponse
+        do {
+            response = try await transport.send(request, allowedHosts: ["api.strem.io"], maxResponseBytes: AuthenticatedHTTPTransport.controlResponseLimit)
+            data = response.data
+        }
         catch { throw IdentityVerificationError.transient }
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            if (400..<500).contains(http.statusCode), http.statusCode != 408, http.statusCode != 429 {
+        if !(200..<300).contains(response.statusCode) {
+            if (400..<500).contains(response.statusCode), response.statusCode != 408, response.statusCode != 429 {
                 throw IdentityVerificationError.rejected
             }
             throw IdentityVerificationError.transient

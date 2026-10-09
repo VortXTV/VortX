@@ -87,6 +87,7 @@ struct iOSRootView: View {
     }
 
     @State private var tab: Tab = .home
+    @State private var homeBrowse = false
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     #if os(macOS)
@@ -130,6 +131,9 @@ struct iOSRootView: View {
     /// Merge Discover + Search into one surface (Settings toggle, default OFF, reversible). When ON the
     /// Search tab is dropped from the bar and Discover hosts an inline search field; OFF keeps them separate.
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
+    /// A reversible presentation fold; the existing Discover filters, search, and paging stay owned
+    /// by iOSDiscoverView. An absent key defaults to the unified Cinema landing surface.
+    @AppStorage("vortx.mergeHomeDiscover") private var mergeHomeDiscover = true
     @Environment(\.openURL) private var openURL
     /// The profile roster + launch-picker gate, shared with every surface. When the roster has more than
     /// one profile and none has been chosen this launch, the "Who's watching?" picker is owed at cold
@@ -209,6 +213,11 @@ struct iOSRootView: View {
             VStack(spacing: 0) {
                 offlineBanner
                 updateBanner
+                #if VORTX_NATIVE_DATA_ENGINE
+                if launchReady, shellVisible, !playbackGate.playerActive {
+                    NativeWatchedMigrationNotice()
+                }
+                #endif
             }
         }
         // Hide the whole shell (screens, tab bar, update banner) behind brand canvas while the launch
@@ -296,6 +305,7 @@ struct iOSRootView: View {
         // bar can never point at a screen it no longer shows (the tvOS RootTabView twin does the same).
         .onChange(of: hideDiscoverTab) { hidden in
             if hidden, tab == .discover { tab = .home }
+            if hidden { homeBrowse = false }
         }
         .onChange(of: hideLibraryTab) { hidden in
             if hidden, tab == .library { tab = .home }
@@ -307,7 +317,16 @@ struct iOSRootView: View {
             // Search folds into Discover: if the bar was pointing at the now-dropped Search tab, land
             // on Discover, unless Discover itself is hidden in Settings > Tab bar (#117 rule: never
             // route to a hidden tab, fall back to Home like every other healer).
-            if merged, tab == .search { tab = hideDiscoverTab ? .home : .discover }
+            if merged, tab == .search { selectTab(hideDiscoverTab ? .home : .discover) }
+        }
+        .onChange(of: mergeHomeDiscover) { merged in
+            if merged, tab == .discover {
+                homeBrowse = !hideDiscoverTab
+                tab = .home
+            } else if !merged, tab == .home, homeBrowse {
+                homeBrowse = false
+                tab = hideDiscoverTab ? .home : .discover
+            }
         }
         .onAppear {
             updates.startMonitoring()   // cached result immediately, network at most once per day
@@ -325,12 +344,12 @@ struct iOSRootView: View {
             if dest == .search {
                 macSearchPresented = true
                 macSearchFocused = true
-                tab = searchDestination
+                selectTab(searchDestination)
                 return
             }
             // Same rule for every other Go-menu destination: a tab hidden in Settings > Tab bar is
             // never routed to; fall back to Home instead of resurrecting a hidden screen.
-            tab = hiddenTabs.contains(dest) ? .home : dest
+            selectTab(hiddenTabs.contains(dest) ? .home : dest)
         }
         #endif
         // Launch "Who's watching?" picker: a real modal at cold start when the roster has more than one
@@ -363,7 +382,8 @@ struct iOSRootView: View {
     @ViewBuilder private var selectedTabContent: some View {
         switch tab {
         case .home:
-            iOSHomeView(isActive: true)
+            if mergeHomeDiscover { unifiedHomeContent }
+            else { iOSHomeView(isActive: true) }
         case .discover:
             if !hideDiscoverTab { iOSDiscoverView(isActive: true) }
         case .live:
@@ -377,6 +397,40 @@ struct iOSRootView: View {
         case .settings:
             iOSSettingsView()
         }
+    }
+
+    private var unifiedHomeContent: some View {
+        VStack(spacing: 0) {
+            if !hideDiscoverTab {
+                HStack(spacing: Theme.Space.xs) {
+                    homeModeButton("Featured", browse: false)
+                    homeModeButton("Browse", browse: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.vertical, Theme.Space.xs)
+                .background(Theme.Palette.canvas)
+            }
+            if homeBrowse, !hideDiscoverTab {
+                iOSDiscoverView(isActive: true)
+            } else {
+                iOSHomeView(isActive: true, onBrowse: hideDiscoverTab ? nil : { homeBrowse = true })
+            }
+        }
+    }
+
+    private func homeModeButton(_ title: LocalizedStringKey, browse: Bool) -> some View {
+        let selected = homeBrowse == browse
+        return Button { homeBrowse = browse } label: {
+            Text(title)
+                .font(.system(size: 14, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+                .padding(.horizontal, Theme.Space.md)
+                .frame(minHeight: 44)
+                .background(selected ? Theme.Palette.accent : Theme.Palette.surface1, in: Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 
     #if os(macOS)
@@ -454,7 +508,7 @@ struct iOSRootView: View {
         guard !query.isEmpty else { return }
         let destination = searchDestination
         if destination != .home { MacSearchBridge.shared.pending = query }
-        tab = destination
+        selectTab(destination)
         macSearchPresented = false
     }
 
@@ -483,6 +537,7 @@ struct iOSRootView: View {
         HStack(spacing: Theme.Space.sm) {
             VortXWordmark(fontSize: 22).fixedSize()
             horizontalTabBar
+            profileSwitchButton
             #if os(macOS)
             Button { macSearchPresented = true } label: {
                 Image(systemName: "magnifyingglass")
@@ -543,8 +598,15 @@ struct iOSRootView: View {
     }
 
     private func selectTab(_ item: Tab) {
-        if tab == item { TabScrollToTop.shared.bump(item.scrollKey) }
-        else { tab = item }
+        if mergeHomeDiscover, item == .discover {
+            let alreadyBrowsing = tab == .home && homeBrowse && !hideDiscoverTab
+            homeBrowse = !hideDiscoverTab
+            tab = .home
+            if alreadyBrowsing { TabScrollToTop.shared.bump(TabScrollKeys.discover) }
+        } else if tab == item {
+            TabScrollToTop.shared.bump(item == .home && mergeHomeDiscover && homeBrowse
+                                      ? TabScrollKeys.discover : item.scrollKey)
+        } else { tab = item }
     }
 
     private func horizontalTabButton(_ item: Tab) -> some View {
@@ -598,6 +660,7 @@ struct iOSRootView: View {
     private var visibleTabs: [Tab] {
         Tab.allCases.filter {
             if hiddenTabs.contains($0) { return false }
+            if mergeHomeDiscover, $0 == .discover { return false }
             // Merged mode folds Search into Discover, so drop the standalone Search tab.
             if mergeDiscoverSearch, $0 == .search { return false }
             return true
@@ -616,24 +679,14 @@ struct iOSRootView: View {
     }
 
     private var customTabBar: some View {
-        HStack(spacing: 0) {
-            ForEach(compactTabLayout.primary, id: \.rawValue) { item in
-                tabButton(item)
+        CinemaTabBarChrome {
+            HStack(spacing: 0) {
+                ForEach(compactTabLayout.primary, id: \.rawValue) { item in
+                    tabButton(item)
+                }
+                if !compactTabLayout.overflow.isEmpty { overflowTabMenu }
             }
-            if !compactTabLayout.overflow.isEmpty { overflowTabMenu }
         }
-        #if os(macOS)
-        .focusSection()
-        #endif
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Tabs")
-        // The same floating capsule as TV, with at most five touch targets instead of squeezing
-        // all seven labels into a phone. The shell reserves its real height below scrolling content.
-        .padding(.horizontal, Theme.Space.sm)
-        .padding(.vertical, Theme.Space.xs)
-        .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .padding(.horizontal, Theme.Space.md)
-        .padding(.vertical, Theme.Space.xs)
     }
 
     private var compactTabLayout: (primary: [Tab], overflow: [Tab]) {
@@ -643,6 +696,10 @@ struct iOSRootView: View {
     private var overflowTabMenu: some View {
         let selected = compactTabLayout.overflow.contains(tab)
         return Menu {
+            Button { profiles.pickedThisLaunch = false } label: {
+                Label("Switch Profile", systemImage: "person.crop.circle")
+            }
+            Divider()
             ForEach(compactTabLayout.overflow, id: \.rawValue) { item in
                 Button { selectTab(item) } label: {
                     Label(item.title, systemImage: tab == item ? "checkmark" : item.inactiveIcon)
@@ -659,32 +716,26 @@ struct iOSRootView: View {
         .accessibilityAddTraits(selected ? [.isSelected] : [])
     }
 
+    /// A first-class profile affordance in the wide Cinema shell. It reuses the root's existing picker
+    /// gate, preserving profile/session fencing instead of inventing a parallel account sheet.
+    private var profileSwitchButton: some View {
+        Button { profiles.pickedThisLaunch = false } label: {
+            Image(systemName: "person.crop.circle")
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .frame(width: 44, height: 44)
+                .vortxGlassDisc()
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Switch Profile")
+        .accessibilityHint("Opens profile selection")
+    }
+
     private func compactTabLabel(title: String, icon: String, selected: Bool,
                                  downloadBadge: Bool = false) -> some View {
-        VStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 20, weight: .semibold))
-                .frame(height: 22)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 3)
-                .background {
-                    if selected { Capsule().fill(Theme.Palette.accent) }
-                }
-                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
-                .overlay(alignment: .topTrailing) {
-                    if downloadBadge, activeDownloadCount > 0 {
-                        downloadCountBadge(activeDownloadCount)
-                    }
-                }
-            Text(title)
-                .font(.system(size: compactLabelSize, weight: selected ? .semibold : .medium))
-                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-        }
-        .frame(maxWidth: .infinity, minHeight: 44)
-        .padding(.bottom, 2)
-        .contentShape(Rectangle())
+        CinemaCompactTabLabel(title: title, icon: icon, selected: selected,
+                              downloadBadge: downloadBadge ? activeDownloadCount : nil,
+                              fontSize: compactLabelSize)
     }
 
     /// Quiet, persistent "You're offline" strip (#120), shown across every tab while the device has no
@@ -812,6 +863,79 @@ struct iOSRootView: View {
     }
 }
 
+/// Shared compact navigation chrome. RootTabView supplies the real destination buttons; the offline
+/// Cinema fixture supplies inert buttons, which lets it render the actual safe-area treatment without
+/// constructing the root's account/session state.
+struct CinemaTabBarChrome<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            #if os(macOS)
+            .focusSection()
+            #endif
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Tabs")
+            .padding(.horizontal, Theme.Space.sm)
+            .padding(.vertical, Theme.Space.xs)
+            .vortxGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.vertical, Theme.Space.xs)
+    }
+}
+
+/// Shared compact tab glyph/label treatment. The root continues to own tab selection and download state.
+struct CinemaCompactTabLabel: View {
+    let title: String
+    let icon: String
+    let selected: Bool
+    var downloadBadge: Int? = nil
+    var fontSize: CGFloat = 12
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 20, weight: .semibold))
+                .frame(height: 22)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 3)
+                .background { if selected { Capsule().fill(Theme.Palette.accent) } }
+                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+                .overlay(alignment: .topTrailing) {
+                    if let downloadBadge, downloadBadge > 0 {
+                        Text(downloadBadge > 9 ? "9+" : "\(downloadBadge)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(Theme.Palette.onAccent)
+                            .padding(.horizontal, 5)
+                            .frame(minWidth: 16, minHeight: 16)
+                            .background(Theme.Palette.accent, in: Capsule())
+                            .offset(x: 6, y: -6)
+                            .accessibilityLabel("\(downloadBadge) active downloads")
+                    }
+                }
+            Text(title)
+                .font(.system(size: fontSize, weight: selected ? .semibold : .medium))
+                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .padding(.bottom, 2)
+        .contentShape(Rectangle())
+    }
+}
+
+private struct CinemaFixtureDisablesArtworkLoadingKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var cinemaFixtureDisablesArtworkLoading: Bool {
+        get { self[CinemaFixtureDisablesArtworkLoadingKey.self] }
+        set { self[CinemaFixtureDisablesArtworkLoadingKey.self] = newValue }
+    }
+}
+
 private extension View {
     /// macOS: reclaim the top container safe area (the window titlebar / traffic-light band) so a
     /// full-bleed root view reaches the physical window top (y=0) instead of starting below the ~20pt
@@ -835,19 +959,32 @@ private struct iOSCWDetailTarget: Hashable {
     let resumeSeconds: Double?
     let videoID: String?
     let traktSessionID: TraktSessionID?
+    let intent: HomeContinueWatchingSelection.Intent
 }
 
-private struct iOSCWProducerProvenance: Sendable {
+/// A quick-view Watch intent. Detail owns authoritative metadata/source settlement; this value only says
+/// that the viewer explicitly chose Watch, keeping it distinct from a plain Details navigation. It remains
+/// module-visible so the paginated category browser can preserve that distinction after resolving a `tmdb:` id.
+struct CinemaDetailTarget: Hashable {
+    let item: FeaturedHeroItem
+    let autoPlay: Bool
+}
+
+private struct iOSCWProducerProvenance: @unchecked Sendable {
     let source: TraktPlaybackShadow.ContinueWatchingSource
     let traktSessionID: TraktSessionID?
+    let intent: HomeContinueWatchingSelection.Intent
 
     func isCurrent(traktSessionID currentSessionID: TraktSessionID?) -> Bool {
+        guard intent.isCurrent() else { return false }
         switch source {
         case .local:
             return traktSessionID == nil
         case .trakt:
             guard let traktSessionID else { return false }
             return currentSessionID == traktSessionID
+        case .simkl:
+            return intent.simklSessionID != nil && SIMKLAuth.storedSessionID == intent.simklSessionID
         }
     }
 }
@@ -855,11 +992,14 @@ private struct iOSCWProducerProvenance: Sendable {
 private struct iOSCWRenderSnapshot {
     let items: [RailItem]
     let provenance: iOSCWProducerProvenance
+    let status: String?
 }
 
 struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
+    var onBrowse: (() -> Void)? = nil
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
@@ -881,9 +1021,11 @@ struct iOSHomeView: View {
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
     @ObservedObject private var homeCatalogPrefs = CatalogPreferences.shared
     private var showCollectionsHub: Bool { homeCatalogPrefs.showCollectionsHome }
-    @AppStorage(ExternalSyncToggle.traktContinueWatching) private var useTraktContinueWatching = false
+    @AppStorage(ContinueWatchingPreferences.sourceKey) private var continueWatchingSource = "local"
+    @AppStorage(ContinueWatchingPreferences.windowKey) private var continueWatchingWindow = "20"
     @State private var traktContinueWatchingRevision = 0
     @State private var path = NavigationPath()
+    @State private var unavailableContinueWatching: String?
     @State private var showCustomizeHome = false   // presents the Home rows reorder/hide editor
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
@@ -904,29 +1046,34 @@ struct iOSHomeView: View {
     /// carry their in-progress `video_id` so a direct resume can confirm the remembered link
     /// still matches the episode the engine is parked on. The owner profile rides the account's
     /// engine history; an overlay profile rides its own private synced overlay (never the account).
-    private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
-        if profiles.activeUsesEngineHistory {
-            _ = traktContinueWatchingRevision
-            return TraktPlaybackShadow.shared.continueWatchingSelection(
-                fallback: core.continueWatching,
-                libraryItems: core.library?.catalog ?? []
-            )
-        }
-        return .init(items: profiles.cwItems, source: .local, sessionID: nil)
+    private var continueWatchingSnapshot: HomeContinueWatchingSelection.Snapshot {
+        _ = traktContinueWatchingRevision
+        return HomeContinueWatchingSelection.current(core: core, profiles: profiles)
     }
 
     private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot {
-        let selection = continueWatchingSelection
+        let snapshot = continueWatchingSnapshot
+        let selection = snapshot.selection
+        let residentCatalog = core.boardRows.flatMap(\.items)
         let items = selection.items.map {
-            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
-                     cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
+            // Remote private history keeps its own bounded snapshot. Local history can reuse public
+            // metadata already resident in the catalog/detail; drawing a shelf never fetches anything.
+            if selection.source.isPrivate {
+                return RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster,
+                                progress: selection.displayProgress[$0.id] ?? $0.progress,
+                                cwVideoId: $0.state.videoId, caption: selection.captions[$0.id],
+                                resumeSeconds: $0.resumeSeconds)
+            }
+            return cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta)
         }
         return iOSCWRenderSnapshot(
             items: items,
             provenance: iOSCWProducerProvenance(
                 source: selection.source,
-                traktSessionID: selection.sessionID
-            )
+                traktSessionID: selection.sessionID,
+                intent: snapshot.intent
+            ),
+            status: selection.status
         )
     }
 
@@ -940,7 +1087,7 @@ struct iOSHomeView: View {
     private var allRailItems: [RailItem] {
         // A remote Trakt row stays keyboard-focusable, but never enters the generic hero enrichment pool.
         let continueWatching = continueWatchingRenderSnapshot
-        var out = continueWatching.provenance.source == .trakt ? [] : continueWatching.items
+        var out = continueWatching.provenance.source.isPrivate ? [] : continueWatching.items
         out += topPicks.items.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         out += core.boardRows.flatMap { $0.items }.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
@@ -1032,7 +1179,7 @@ struct iOSHomeView: View {
         let metaByID = Dictionary(core.boardRows.flatMap { $0.items }.map { ($0.id, $0) },
                                   uniquingKeysWith: { first, _ in first })
         // Overlay profiles seed from their own watch overlay, never the account's CW.
-        let cwSource = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        let cwSource = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
         var items: [FeaturedHeroItem] = cwSource.prefix(3).map { cw in
             if let meta = metaByID[cw.id] { return FeaturedHeroItem.from(meta: meta) }
             return FeaturedHeroItem.from(cw: cw)
@@ -1065,6 +1212,17 @@ struct iOSHomeView: View {
                     // back-to-top button appears; it hides again when you return to the top (#8).
                     // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
                     Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.home, active: isActive)
+                    // Unified Home switches to the existing Discover owner, keeping its filters and
+                    // paging. Separate-tab mode retains this legacy category/deep-link destination.
+                    Group {
+                        if let onBrowse {
+                            Button(action: onBrowse) { CinemaBrowseEntry() }
+                        } else {
+                            NavigationLink(value: HubTarget.discover(.trending)) { CinemaBrowseEntry() }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, Theme.Space.md)
                     #if os(macOS)
                     // macOS has no navigation-bar toolbar on Home (custom chrome), and this app's shared
                     // NSToolbar is fragile (see the Sign In toolbar note below), so the "Customize Home"
@@ -1086,8 +1244,8 @@ struct iOSHomeView: View {
                         // the exact last-played stream straight into the player (#11), falling back to opening
                         // detail when no remembered link fits. Long-press offers "Remove from Continue Watching".
                         homeRail(PosterRail(title: String(localized: "Continue Watching"),
-                                            eyebrow: renderedContinueWatching.provenance.source == .trakt
-                                                ? String(localized: "From Trakt")
+                                            eyebrow: renderedContinueWatching.provenance.source.isPrivate
+                                                ? "From \(renderedContinueWatching.provenance.source.label)"
                                                 : String(localized: "Pick up where you left off"),
                                             items: renderedContinueWatching.items,
                                             onTap: {
@@ -1099,7 +1257,7 @@ struct iOSHomeView: View {
                                             // Trakt-sourced rows are read-only. Their dismiss action targets
                                             // the local engine, not Trakt, so omit it until remote delete is
                                             // separately designed and authorized.
-                                            menu: renderedContinueWatching.provenance.source == .trakt
+                                            menu: renderedContinueWatching.provenance.source.isPrivate
                                                 ? .none
                                                 : .continueWatching,
                                             onDetails: {
@@ -1110,9 +1268,12 @@ struct iOSHomeView: View {
                                                 path.append(target)
                                             },
                                             accessibilityProvenance:
-                                                renderedContinueWatching.provenance.source == .trakt
-                                                ? String(localized: "From Trakt")
+                                                renderedContinueWatching.provenance.source.isPrivate
+                                                ? "From \(renderedContinueWatching.provenance.source.label)"
                                                 : nil))
+                    }
+                    if let status = renderedContinueWatching.status {
+                        Text(status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, Theme.Space.md)
                     }
                     // Every other Home section renders in the user's arranged order, minus the hidden ones
                     // (HomeRailPreferences). Default order + nothing hidden == today's Home exactly, so this is
@@ -1202,6 +1363,9 @@ struct iOSHomeView: View {
             #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .sheet(isPresented: $showCustomizeHome) { HomeRailEditorView() }
+            .alert("Playback unavailable", isPresented: Binding(get: { unavailableContinueWatching != nil }, set: { if !$0 { unavailableContinueWatching = nil } })) {
+                Button("OK", role: .cancel) { unavailableContinueWatching = nil }
+            } message: { Text(unavailableContinueWatching ?? "") }
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 // Thread the hub card's already-resolved art so the detail hero never blanks while (or if)
                 // Cinemeta meta is nil for a new/unreleased title.
@@ -1209,7 +1373,7 @@ struct iOSHomeView: View {
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
             .navigationDestination(for: iOSCWDetailTarget.self) { target in
-                if target.traktSessionID == nil
+                if target.intent.permitsDetails(id: target.item.id, type: target.item.type, videoID: target.videoID), target.traktSessionID == nil
                     || TraktAuth.storedSessionID == target.traktSessionID {
                     iOSDetailView(
                         id: target.item.id,
@@ -1219,12 +1383,21 @@ struct iOSHomeView: View {
                         seedLogo: target.item.logo,
                         initialResumeSeconds: target.resumeSeconds,
                         initialVideoID: target.videoID,
-                        initialTraktSessionID: target.traktSessionID
+                        initialTraktSessionID: target.traktSessionID,
+                        initialContinueWatchingIntent: target.intent
                     )
                 }
             }
+            .navigationDestination(for: CinemaDetailTarget.self) { target in
+                iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                              seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                              autoPlayOnAppear: target.autoPlay)
+            }
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
+            }
+            .navigationDestination(for: CinemaBoardCatalogTarget.self) { target in
+                CinemaBoardCatalogBrowse(target: target, path: $path)
             }
             .iOSPlayerCover($player, account: account, core: core)
         }
@@ -1243,7 +1416,13 @@ struct iOSHomeView: View {
         // Hidden tabs stay mounted (opacity-switched) and never hit onDisappear, so quiet the ambient
         // hero rotation while this is not the visible tab and re-arm it on return (#24 main-thread work).
         .onChange(of: isActive) { active in
-            if active { hero.seed(heroCandidates, reduceMotion: reduceMotion) } else { hero.stop() }
+            if active {
+                if scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
+                hero.seed(heroCandidates, reduceMotion: reduceMotion)
+            } else { hero.stop() }
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active, isActive { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
         }
         // Reseed the pool as content arrives; the model ignores no-op reseeds so rotation isn't reset
         // by routine engine re-emits.
@@ -1254,7 +1433,7 @@ struct iOSHomeView: View {
             // so a signed-in session (board already loaded at bootstrap) isn't re-fetched.
             if core.boardRows.isEmpty { core.loadBoard() }
             FeaturedHeroModel.configureMetaSources(core.addons)
-            TraktPlaybackShadow.shared.refreshIfStale()
+            if isActive, scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             refreshTopPicks()
             refreshReleaseCalendar()
@@ -1312,11 +1491,22 @@ struct iOSHomeView: View {
         .onChange(of: BecauseYouWatchedModel.observationSignature(items: profiles.cwItems)) { _ in
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
         }
-        .onChange(of: profiles.activeID) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
-        .onChange(of: useTraktContinueWatching) { on in
-            if on { TraktPlaybackShadow.shared.refreshNow() }
+        .onChange(of: profiles.activeID) { _ in
+            HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        }
+        .onChange(of: continueWatchingSource) { _ in
+            HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
             refreshTopPicks()
+        }
+        .onChange(of: continueWatchingWindow) { _ in traktContinueWatchingRevision &+= 1 }
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingPreferences.changedNote)) { _ in
+            HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
+            traktContinueWatchingRevision &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SIMKLContinueWatchingShadow.changedNote)) { _ in
+            traktContinueWatchingRevision &+= 1
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in
             traktContinueWatchingRevision &+= 1
@@ -1524,7 +1714,12 @@ struct iOSHomeView: View {
                                                  releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
                                                  genres: $0.genres)
                                     },
-                                    onTap: handleTap, showWatchedBadges: true,
+                                    onTap: handleTap,
+                                    onSeeAll: {
+                                        path.append(CinemaBoardCatalogTarget(rowID: row.id, title: row.title,
+                                                                             engineIndex: row.engineIndex))
+                                    },
+                                    showWatchedBadges: true,
                                     onReachEnd: { core.loadBoardRowNextPage(engineIndex: row.engineIndex) }))
                     .onAppear {
                         if row.id == core.boardRows.last(where: { !$0.items.isEmpty })?.id {
@@ -1572,13 +1767,17 @@ struct iOSHomeView: View {
     /// rails are byte-for-byte unchanged. Returns the (possibly reconfigured) `PosterRail` directly so
     /// the `@ViewBuilder` parents see a plain View, not a `()` from a mutating statement.
     private func homeRail(_ rail: PosterRail) -> PosterRail {
-        #if os(macOS)
         var configured = rail
+        configured.onWatch = watchFromQuickView
+        #if os(macOS)
         configured.macFocus = $macFocus
-        return configured
-        #else
-        return rail
         #endif
+        return configured
+    }
+
+    private func watchFromQuickView(_ item: RailItem) {
+        hero.noteInteraction()
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
 
     /// Tapping a poster opens that title's detail through normal navigation; it does NOT "feature" it
@@ -1729,6 +1928,14 @@ struct iOSHomeView: View {
     ) {
         hero.noteInteraction()
         guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
+        if let reason = provenance.intent.unavailableReason(id: item.id, type: item.type, videoID: item.cwVideoId) {
+            unavailableContinueWatching = reason
+            return
+        }
+        if provenance.source == .simkl {
+            if let target = cwDetailTarget(for: item, provenance: provenance) { path.append(target) }
+            return
+        }
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
         // Task; fall back to opening detail when no remembered link fits.
         Task {
@@ -1764,11 +1971,17 @@ struct iOSHomeView: View {
         provenance: iOSCWProducerProvenance
     ) -> iOSCWDetailTarget? {
         guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return nil }
+        if let reason = provenance.intent.unavailableReason(id: item.id, type: item.type, videoID: item.cwVideoId) {
+            unavailableContinueWatching = reason
+            return nil
+        }
+        guard provenance.intent.permitsDetails(id: item.id, type: item.type, videoID: item.cwVideoId) else { return nil }
         return iOSCWDetailTarget(
             item: FeaturedHeroItem.from(rail: item),
             resumeSeconds: item.resumeSeconds,
             videoID: item.cwVideoId,
-            traktSessionID: provenance.traktSessionID
+            traktSessionID: provenance.traktSessionID,
+            intent: provenance.intent
         )
     }
 
@@ -1963,6 +2176,7 @@ struct iOSLibraryView: View {
     enum LibraryRoute: Hashable {
         case downloads
         case queue        // the download-queue manager (reorder / pause / concurrency), pushed from Downloads
+        case watchlist
     }
 
     #if !os(tvOS)
@@ -1976,10 +2190,10 @@ struct iOSLibraryView: View {
     /// The owner profile's Library is the account library (engine); an overlay profile's Library is its
     /// own private watch overlay (every watched title), never the account.
     private var libraryItems: [RailItem] {
-        let source = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
-        return source.map {
-            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress)
-        }
+        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        let residentCatalog = core.boardRows.flatMap(\.items)
+        return source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta,
+                                                  includesResume: false) }
     }
 
     /// True when there is at least one offline download; keeps the empty-Library placeholder from
@@ -1995,8 +2209,18 @@ struct iOSLibraryView: View {
     /// The hero pool: the first few saved titles. Library entries carry no backdrop field, so (like
     /// tvOS) the hero derives 16:9 art from metahub for IMDB ids and enriches the rest in the background.
     private var heroCandidates: [FeaturedHeroItem] {
-        let source = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
         return source.prefix(5).map(FeaturedHeroItem.from(cw:))
+    }
+
+    /// The Library's compact Continue Watching shelf uses the same owner/profile source and the same
+    /// direct-resume primitive as Home. It is a second entry point, not a second history model.
+    private var libraryContinueWatchingItems: [RailItem] {
+        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory
+            ? core.continueWatching
+            : profiles.cwItems
+        let residentCatalog = core.boardRows.flatMap(\.items)
+        return source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta) }
     }
 
     var body: some View {
@@ -2004,15 +2228,41 @@ struct iOSLibraryView: View {
             ScrollView {
                 Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Library tab -> scroll here
                 #if !os(tvOS)
-                // Downloads is reachable ONLY through this single pill inside Library (owner's final
-                // directive): no inline DownloadsView mount at the top, no Home/Discover hub tile. The pill
-                // shows only when there is at least one download and pushes the standalone screen.
-                if !downloads.records.isEmpty {
-                    iOSLibraryDownloadsPill(count: downloads.records.count)
-                        .padding(.horizontal, Theme.Space.md)
-                        .padding(.bottom, Theme.Space.lg)
+                // Cinema Library leads with durable destinations before the saved-title grid. They retain
+                // the existing value route / local filters: nothing here creates a second data source.
+                VStack(spacing: Theme.Space.sm) {
+                    NavigationLink(value: LibraryRoute.downloads) {
+                        CinemaLibraryEntryCard(
+                            title: "Downloads",
+                            subtitle: downloads.records.isEmpty
+                                ? "Saved episodes available offline appear here."
+                                : "\(downloads.records.count) saved \(downloads.records.count == 1 ? "item" : "items")",
+                            systemImage: "arrow.down.circle.fill",
+                            badge: downloads.records.isEmpty ? nil : "\(downloads.records.count)"
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    NavigationLink(value: LibraryRoute.watchlist) {
+                        CinemaLibraryEntryCard(title: "Watchlist", subtitle: "Titles bookmarked to watch later", systemImage: "bookmark.fill")
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        segment = .all
+                        activeFilters = [.watched]
+                    } label: {
+                        CinemaLibraryEntryCard(title: "Previously Watched", subtitle: "Titles marked watched in this profile",
+                                               systemImage: "checkmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
                 }
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.bottom, Theme.Space.lg)
                 #endif
+                if !libraryContinueWatchingItems.isEmpty {
+                    PosterRail(title: "Continue Watching", eyebrow: "Pick up where you left off",
+                               items: libraryContinueWatchingItems, onTap: resumeLibraryContinueWatching,
+                               menu: .continueWatching, onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) })
+                }
                 // The owner profile's Library is the account library (engine), with its type/sort filter
                 // chips; an overlay profile's Library is its own private watch overlay, with no engine
                 // `selectable` so the filter chips are omitted. Both gate on the profile-aware
@@ -2037,7 +2287,7 @@ struct iOSLibraryView: View {
                             // profiles, replacing the engine's type chips; the engine's SORT chips stay
                             // owner-only (they need the engine `selectable`).
                             segmentBar(libraryItems)
-                            if profiles.activeUsesEngineHistory, let lib = core.library {
+                            if core.usesNativeProfileState || profiles.activeUsesEngineHistory, let lib = core.library {
                                 sortChips(lib.selectable)
                             }
                             // Smart filters (Unwatched / In Progress / Watched / Short) sit below the type
@@ -2046,7 +2296,7 @@ struct iOSLibraryView: View {
                             // RailItem grid is then narrowed to the matching ids.
                             smartFilterBar(segmentedSource())
                             PosterGrid(items: smartFiltered(segmented(libraryItems), pass: smartPassIDs(segmentedSource())),
-                                       onTap: handleTap, menu: .library)
+                                       onTap: handleTap, onWatch: watchFromQuickView, menu: .library)
                         }
                     }
                     .padding(.bottom, Theme.Space.md)
@@ -2072,12 +2322,18 @@ struct iOSLibraryView: View {
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
+            .navigationDestination(for: CinemaDetailTarget.self) { target in
+                iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                              seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                              autoPlayOnAppear: target.autoPlay)
+            }
             #if !os(tvOS)
             // Value-routed Downloads push (#25): the pill appends `LibraryRoute.downloads`.
             .navigationDestination(for: LibraryRoute.self) { route in
                 switch route {
                 case .downloads: iOSDownloadsScreen()
                 case .queue: DownloadQueueView()
+                case .watchlist: CinemaWatchlist(onOpen: handleTap, onWatch: watchFromQuickView)
                 }
             }
             .iOSPlayerCover($downloadPlayer, account: account, core: core)
@@ -2128,6 +2384,26 @@ struct iOSLibraryView: View {
     private func handleTap(_ item: RailItem) {
         hero.noteInteraction()
         path.append(FeaturedHeroItem.from(rail: item))
+    }
+
+    private func watchFromQuickView(_ item: RailItem) {
+        hero.noteInteraction()
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
+    }
+
+    private func resumeLibraryContinueWatching(_ item: RailItem) {
+        hero.noteInteraction()
+        #if !os(tvOS)
+        Task {
+            if let launch = await iOSDirectResume(for: item, core: core, account: account, expectedTraktSession: nil) {
+                downloadPlayer = launch
+            } else {
+                path.append(FeaturedHeroItem.from(rail: item))
+            }
+        }
+        #else
+        path.append(FeaturedHeroItem.from(rail: item))
+        #endif
     }
 
     /// The engine's SORT chip row (#15), mirroring the tvOS `LibraryView.sortChips`: each chip carries
@@ -2182,7 +2458,7 @@ struct iOSLibraryView: View {
     /// profile's are its own private watch overlay. This is the SOURCE the smart filters read: the grid's
     /// `RailItem` drops the media runtime + watched signal the predicates need, so they are evaluated here.
     private var sourceItems: [CoreCWItem] {
-        profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
+        core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
     }
 
     /// The source titles filtered to the active type segment, so the smart-filter chips + predicate track
@@ -2210,6 +2486,7 @@ struct iOSLibraryView: View {
     /// watched bookkeeping (plus the derived series-completion set), an overlay reads only its private
     /// overlay, never the account. Read-only.
     private func isWatched(_ item: CoreCWItem) -> Bool {
+        if core.usesNativeProfileState { return item.isWatched }
         if watchedIndex.ids.contains(item.id) { return true }
         return profiles.activeUsesEngineHistory
             ? item.isWatched
@@ -2651,7 +2928,7 @@ struct iOSSearchView: View {
     #endif
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
-    @State private var path: [FeaturedHeroItem] = []
+    @State private var path = NavigationPath()
     @State private var showOpenLink = false
     @State private var pastedPlayer: iOSPlayerLaunch?   // paste-a-link player, presented from here (not the sheet)
     @State private var pendingLaunch: iOSPlayerLaunch?  // staged while the link sheet dismisses, presented in onDismiss
@@ -2697,6 +2974,11 @@ struct iOSSearchView: View {
                 // Cinemeta meta is nil for a new/unreleased title.
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
+            }
+            .navigationDestination(for: CinemaDetailTarget.self) { target in
+                iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                              seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                              autoPlayOnAppear: target.autoPlay)
             }
             .onAppear {
                 core.loadSearchSuggestions()
@@ -2904,12 +3186,17 @@ struct iOSSearchView: View {
             // catalog actions (#14).
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(resultSections, id: \.title) { section in
-                    PosterRail(title: section.title,
-                               items: section.items.map {
-                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
-                               },
-                               onTap: { saveToHistory(query); path.append(FeaturedHeroItem.from(rail: $0)) },
-                               menu: .catalog, showWatchedBadges: true)
+                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                        Text(section.title).sectionTitleStyle().padding(.horizontal, Theme.Space.md)
+                        CinemaSearchResults(items: section.items.map {
+                            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
+                                     background: $0.background, description: $0.description,
+                                     releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
+                        }, onOpen: { item in
+                            saveToHistory(query)
+                            path.append(FeaturedHeroItem.from(rail: item))
+                        }, onWatch: watchFromQuickView)
+                    }
                 }
             }
         }
@@ -2964,6 +3251,11 @@ struct iOSSearchView: View {
         guard trimmed.count >= 2 else { return }
         SearchHistoryStore.add(trimmed, profileID: profiles.activeID)
         history = SearchHistoryStore.load(profileID: profiles.activeID)
+    }
+
+    private func watchFromQuickView(_ item: RailItem) {
+        saveToHistory(query)
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
 
     private var hasSearchQuery: Bool {
@@ -3111,6 +3403,11 @@ struct iOSDiscoverView: View {
                 iOSDetailView(id: item.id, type: item.type, title: item.name,
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
+            .navigationDestination(for: CinemaDetailTarget.self) { target in
+                iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                              seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                              autoPlayOnAppear: target.autoPlay)
+            }
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
             }
@@ -3233,9 +3530,12 @@ struct iOSDiscoverView: View {
                 ForEach(sections, id: \.0) { section in
                     PosterRail(title: section.0,
                                items: section.1.map {
-                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0)
+                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
+                                            background: $0.background, description: $0.description,
+                                            releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
                                },
                                onTap: { path.append(FeaturedHeroItem.from(rail: $0)) },
+                               onWatch: watchFromQuickView,
                                menu: .catalog, showWatchedBadges: true)
                 }
             }
@@ -3261,6 +3561,11 @@ struct iOSDiscoverView: View {
     private func handleTap(_ item: RailItem) {
         hero.noteInteraction()
         path.append(FeaturedHeroItem.from(rail: item))
+    }
+
+    private func watchFromQuickView(_ item: RailItem) {
+        hero.noteInteraction()
+        path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
 
     private func chipScroll<C: View>(@ViewBuilder _ content: () -> C) -> some View {
@@ -3325,7 +3630,7 @@ struct iOSDiscoverView: View {
                 RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
                          background: $0.background, description: $0.description,
                          releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-            }, onTap: handleTap, showWatchedBadges: true, onReachEnd: { core.loadDiscoverNextPage() })
+            }, onTap: handleTap, onWatch: watchFromQuickView, showWatchedBadges: true, onReachEnd: { core.loadDiscoverNextPage() })
         }
     }
 
@@ -3570,6 +3875,39 @@ struct RailItem: Identifiable {
     var resumeSeconds: Double? = nil
 }
 
+/// Reuses only metadata the current UI has already received. History membership, artwork identity, and
+/// resume offsets remain owned by the history entry; catalog facts never create a metadata/network join.
+private func cinemaHistoryRailItem(_ item: CoreCWItem, catalog: [CoreMeta], residentMeta: CoreMetaItem?,
+                                   includesResume: Bool = true) -> RailItem {
+    let preview = catalog.first { $0.id == item.id && $0.type == item.type }
+    let meta = residentMeta.flatMap { $0.id == item.id && $0.type == item.type ? $0 : nil }
+    let measuredMinutes = item.state.duration.isFinite && item.state.duration >= 60_000 && item.state.duration <= 86_400_000
+        ? Int((item.state.duration / 60_000).rounded()) : nil
+    let runtime = measuredMinutes.map { minutes in
+        minutes >= 60 ? "\(minutes / 60)h \(minutes % 60)m" : "\(minutes)m"
+    } ?? meta?.runtime
+    var facts: [String] = []
+    for value in [runtime, preview?.releaseInfo ?? meta?.releaseInfo] {
+        if let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty,
+           !facts.contains(value) { facts.append(value) }
+    }
+    let video = item.state.videoId.flatMap { id in meta?.videos?.first { $0.id == id } }
+    let coordinate = video.flatMap { video -> String? in
+        guard let episode = video.episode else { return nil }
+        if let season = video.season { return "S\(season) · E\(episode)" }
+        return "E\(episode)"
+    }
+    return RailItem(id: item.id, type: item.type, name: item.name, poster: item.poster, progress: item.progress,
+                    background: preview?.background ?? meta?.background,
+                    description: preview?.description ?? meta?.description,
+                    releaseInfo: facts.isEmpty ? nil : facts.joined(separator: " · "),
+                    imdbRating: preview?.imdbRating ?? meta?.imdbRating,
+                    genres: preview?.genres ?? meta?.genres,
+                    cwVideoId: includesResume ? item.state.videoId : nil,
+                    caption: includesResume ? coordinate : nil,
+                    resumeSeconds: includesResume ? item.resumeSeconds : nil)
+}
+
 // MARK: - Poster context menu (#14, ported from tvOS PosterCard.menuItems)
 
 /// Which long-press (context) menu a `PosterCardiOS` shows, mirroring the tvOS `PosterMenu`.
@@ -3622,6 +3960,11 @@ struct iOSPlayerLaunch: Identifiable {
     /// Resolver for an exact CoreVideo admitted by PlayerScreen's request-owned authoritative refresh. This
     /// remains available even when the launch inventory was empty, so a newly surfaced successor can play.
     var loadEpisodeWithMetadata: ((CoreVideo) async -> PlayerEpisodeStream?)? = nil
+    /// The same bounded E+1 preparation contract used by the detail player. nil remains correct for movies,
+    /// downloads, and pasted links; a CW series launch supplies a per-launch owner below.
+    var warmNextEpisode: ((NextEpisodePreparationRequest) async -> PlayerEpisodeStream?)? = nil
+    /// Releases the per-launch preparation owner when this player is dismissed. Nil for non-series launches.
+    var cancelNextEpisodePreparation: (() -> Void)? = nil
     /// A Continue-Watching launch carries the identity needed for one owned,
     /// deferred source contribution after the player exits.
     var resumeHoardContentID: String? = nil
@@ -3655,6 +3998,7 @@ extension View {
                 audioSidecarURL: item.audioSidecarURL,
                 episodes: item.episodes, loadEpisode: item.loadEpisode,
                 loadEpisodeWithMetadata: item.loadEpisodeWithMetadata,
+                warmNextEpisode: item.warmNextEpisode,
                 // Feed the engine Player so Continue Watching updates live + watched time is tracked (the
                 // direct-resume / paste-a-link path was missing this, like the detail covers). It's keyed off
                 // the engine's loaded Player, so it runs regardless of `item.meta` and no-ops if none is loaded.
@@ -3663,6 +4007,7 @@ extension View {
                 onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                 onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                 onClose: {
+                    item.cancelNextEpisodePreparation?()
                     core.unloadEnginePlayer()
                     launch.wrappedValue = nil
                 }
@@ -3685,6 +4030,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     guard expectedTraktSession == nil
             || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let pid = ProfileStore.shared.activeID
+    let accountBoundary = account.credentialBoundaryGeneration
     guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
         LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
     }
@@ -3730,8 +4076,9 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // entry carries debrid provenance; a non-debrid entry returns the stored url unchanged (refreshed == false),
     // so torrent / plain-direct resumes are byte-identical to before.
     let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
-    guard expectedTraktSession == nil
-            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+          ProfileStore.shared.activeID == pid,
+          account.credentialBoundaryGeneration == accountBoundary else { return nil }
     let playURL = refreshed ? resolvedURL : url
     if hasEpisodicPhysicalIdentity, entry.torrent == true, entry.fileIdx == nil, !refreshed {
         LastStreamStore.logResume("episodeTorrentMissingFileIdx", libraryId: item.id, profileID: pid)
@@ -3791,6 +4138,8 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     var episodes: [PlayerEpisodeRef] = []
     var loadEpisode: ((String) async -> PlayerEpisodeStream?)? = nil
     var loadEpisodeWithMetadata: ((CoreVideo) async -> PlayerEpisodeStream?)? = nil
+    var warmNextEpisode: ((NextEpisodePreparationRequest) async -> PlayerEpisodeStream?)? = nil
+    var cancelNextEpisodePreparation: (() -> Void)? = nil
     var enginePlayerVideoId: String? = nil
     var launchSource: CoreStream? = nil
     if usesSeriesLifecycle {
@@ -3862,6 +4211,44 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                 return resolved
             }
         }
+        // Do not freeze `allSeriesVideos`: a direct-resume player can mount before the series inventory
+        // settles, then run for many minutes before PlayerScreen reaches its preparation threshold. The
+        // supplier reads the exact current title metadata at THAT point and the captured owner/profile/
+        // credential fence rejects a replacement account or profile before and after every async stage.
+        let preparer = iOSNextEpisodePreparer()
+        cancelNextEpisodePreparation = { preparer.cancel() }
+        warmNextEpisode = { request in
+            let valid = {
+                ProfileStore.shared.activeID == pid
+                    && account.credentialBoundaryGeneration == accountBoundary
+                    && (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession)
+            }
+            let context = iOSNextEpisodePreparationContext(
+                seriesID: item.id, seriesName: entry.name, defaultSeason: season,
+                defaultVideoID: nil, poster: entry.poster, sources: account.streamSources,
+                continuity: entry.qualityText, binge: entry.bingeGroup, pin: SourcePinStore.shared.effectivePin(
+                    SourcePinContext(metaId: item.id, isSeries: true)), cachedHashes: [],
+                signedInToVortX: VortXSyncManager.shared.isSignedIn,
+                videos: {
+                    // CW navigation has a request-owned alias payload. It is authoritative even when the
+                    // global active meta slot has moved, and it proves both library and current video identity.
+                    let navigation = core.appleCWMetaRefreshDetails?.appleCWNavigationMeta(
+                        for: item.id, streamID: entry.videoId
+                    ) ?? core.metaDetails?.appleCWNavigationMeta(for: item.id, streamID: entry.videoId)
+                    guard let navigation else {
+                        return []
+                    }
+                    return (navigation.videos ?? []).orderedBySeasonEpisode
+                },
+                resumeOffset: { playbackMeta in
+                    if let engine = core.engineResumeSeconds(for: playbackMeta) { return engine }
+                    return await account.resumeOffset(for: playbackMeta)
+                },
+                isCurrent: valid
+            )
+            guard valid() else { return nil }
+            return await preparer.warm(request, context: context)
+        }
     }
     if hasEpisodicPhysicalIdentity {
         let groups = core.streamGroups(forStreamId: entry.videoId)
@@ -3895,8 +4282,9 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             )
         }
     }
-    guard expectedTraktSession == nil
-            || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
+    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+          ProfileStore.shared.activeID == pid,
+          account.credentialBoundaryGeneration == accountBoundary else { return nil }
     return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,
                            resume: resume, meta: meta,
                            qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
@@ -3906,6 +4294,8 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                            wasExplicitPick: wasExplicitPick, wasResume: true,
                            episodes: episodes, loadEpisode: loadEpisode,
                            loadEpisodeWithMetadata: loadEpisodeWithMetadata,
+                           warmNextEpisode: warmNextEpisode,
+                           cancelNextEpisodePreparation: cancelNextEpisodePreparation,
                            resumeHoardContentID: resumeHoardContentID,
                            resumeHoardStreamID: resumeHoardContentID == nil ? nil : entry.videoId)
 }
@@ -4370,6 +4760,9 @@ private enum OpenLinkMagnet {
 struct PosterGrid: View {
     let items: [RailItem]
     let onTap: (RailItem) -> Void
+    /// Explicit Watch is distinct from Details: callers can route it through the detail owner's
+    /// authoritative autoplay/source-selection contract.
+    var onWatch: ((RailItem) -> Void)? = nil
     /// Which long-press context menu each card shows on this surface (#14). `.none` for surfaces
     /// where no engine action applies.
     var menu: iOSPosterMenu = .none
@@ -4386,6 +4779,10 @@ struct PosterGrid: View {
     @ObservedObject private var apiKeys = ApiKeys.shared
     // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
     @ObservedObject private var watchedIndex = WatchedIndex.shared
+    /// Catalog cards open a compact, reversible preview before the full detail route. Continue Watching
+    /// remains outside this component's quick-view path and therefore keeps its one-tap resume contract.
+    @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
+    @State private var quickViewItem: RailItem?
     @Environment(\.horizontalSizeClass) private var hSize
     // Center the adaptive tracks so the cards distribute evenly across the available width.
     private var columns: [GridItem] {
@@ -4403,9 +4800,12 @@ struct PosterGrid: View {
     var body: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
             ForEach(items) { item in
-                Button { onTap(item) } label: {
+                Button {
+                    if shouldPresentQuickView(for: item) { quickViewItem = item }
+                    else { onTap(item) }
+                } label: {
                     PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
-                                  progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
+                                  releaseInfo: item.releaseInfo, progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
                                   isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id))
                 }
                 // S3: the shared card treatment (resting depth shadow, Mac pointer-hover lift, designed
@@ -4425,6 +4825,15 @@ struct PosterGrid: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, Theme.Space.md)
+        .sheet(item: $quickViewItem) { item in
+            CinemaQuickView(item: item, onWatch: {
+                if let onWatch { onWatch(item) } else { onTap(item) }
+            }, onDetails: { onTap(item) })
+        }
+    }
+
+    private func shouldPresentQuickView(for item: RailItem) -> Bool {
+        quickViewEnabled && menu != .continueWatching && item.cwVideoId == nil && item.resumeSeconds == nil
     }
 }
 
@@ -4458,7 +4867,7 @@ struct iOSGroupHeader: View {
     }
 }
 
-private struct PosterRail: View {
+private struct PosterRailBody: View {
     let title: String
     /// An optional dim uppercase kicker above the shelf title (the redesign mockup's "Pick up where you left
     /// off" style eyebrow). Tertiary-toned to match the mockup's shelf eyebrows and the tvOS RailHeader
@@ -4466,6 +4875,10 @@ private struct PosterRail: View {
     var eyebrow: String? = nil
     let items: [RailItem]
     let onTap: (RailItem) -> Void
+    var onWatch: ((RailItem) -> Void)? = nil
+    /// A catalog shelf can expose the same live row as a full, paginated grid. Nil keeps personal and
+    /// editorial rails compact (and avoids presenting an action that cannot represent their source).
+    var onSeeAll: (() -> Void)? = nil
     /// Which long-press context menu each card shows on this surface (#14).
     var menu: iOSPosterMenu = .none
     /// Opens a card's detail page (used by the Continue Watching menu's Details item, since a CW tap resumes).
@@ -4478,6 +4891,10 @@ private struct PosterRail: View {
     /// cards carry the resume timecode + progress stripe, not a watched badge).
     /// Declared before `onReachEnd` so the synthesized memberwise init accepts the call-site argument order.
     var showWatchedBadges: Bool = false
+    /// Live wrappers pass the active-profile watched set; fixture callers pass an inert empty set.
+    let watchedIDs: Set<String>
+    /// Supplying a static presentation bypasses the live preference/localization/card owners.
+    var fixtureCardPresentation: ((RailItem) -> CinemaPosterCardPresentation)? = nil
     /// Horizontal infinite scroll: fired when the LAST card appears, so a Home catalog row loads its next
     /// page of items (#95). nil on rails that do not paginate (Continue Watching, editorial collections).
     var onReachEnd: (() -> Void)? = nil
@@ -4489,8 +4906,8 @@ private struct PosterRail: View {
     var macFocus: FocusState<MacBrowseFocus?>.Binding? = nil
     #endif
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
-    // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
-    @ObservedObject private var watchedIndex = WatchedIndex.shared
+    @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
+    @State private var quickViewItem: RailItem?
     /// Pointer hovering the rail (#3). Never fires on pure-touch iPhone, so the
     /// scroll arrows reveal only on Mac / iPad-with-trackpad, where swiping a long
     /// row is awkward. On touch the row stays swipe-only.
@@ -4507,9 +4924,22 @@ private struct PosterRail: View {
             // uppercase eyebrow above the title matches the redesign mockup's shelf headers (and tvOS
             // RailHeader), so a shelf like Continue Watching reads "Pick up where you left off / Continue
             // Watching" exactly as the mockup and the tvOS home do.
-            VStack(alignment: .leading, spacing: 4) {
-                if let eyebrow { Text(eyebrow).eyebrowStyle() }
-                Text(title).sectionTitleStyle()
+            HStack(alignment: .lastTextBaseline, spacing: Theme.Space.sm) {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let eyebrow { Text(eyebrow).eyebrowStyle() }
+                    Text(title).sectionTitleStyle()
+                }
+                Spacer(minLength: Theme.Space.sm)
+                if let onSeeAll {
+                    Button(action: onSeeAll) {
+                        Label("See all", systemImage: "chevron.right")
+                            .font(Theme.Typography.label.weight(.semibold))
+                            .foregroundStyle(Theme.Palette.accent)
+                            .frame(minHeight: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Opens the full \(title) catalog")
+                }
             }
             .padding(.horizontal, Theme.Space.md)
             ScrollViewReader { proxy in
@@ -4537,18 +4967,42 @@ private struct PosterRail: View {
             // authority and cards stay `.focusable()` only to show the ring. (Mac arrow-key nav; device-verify.)
         }
         .onHover { hovering = $0 }
+        .sheet(item: $quickViewItem) { item in
+            CinemaQuickView(item: item, onWatch: {
+                if let onWatch { onWatch(item) } else { onTap(item) }
+            }, onDetails: { onTap(item) })
+        }
     }
 
     /// One rail card. The touch/iOS body is identical across platforms; on macOS, when the rail opts in,
     /// the card additionally becomes `.focusable()` + shows the accent ring while focused and auto-scrolls
     /// into view, all additive modifiers so touch / VoiceOver / the existing tap + long-press are unchanged.
     @ViewBuilder private func railCard(_ item: RailItem, proxy: ScrollViewProxy) -> some View {
-        let base = Button { onTap(item) } label: {
-            PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
-                          progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
-                          isWatched: showWatchedBadges && watchedIndex.ids.contains(item.id),
-                          onDetails: onDetails.map { od in { od(item) } },
-                          privateArtwork: accessibilityProvenance != nil)
+        let base = Button {
+            // Continue Watching carries a concrete resumed source and must never be interposed by a
+            // generic preview. Catalog and Library cards can use the quick view, which routes back to
+            // this exact `onTap` closure for the existing detail path.
+            if shouldPresentQuickView(for: item) { quickViewItem = item }
+            else { onTap(item) }
+        } label: {
+            Group {
+                if let fixtureCardPresentation {
+                    CinemaPosterCardBody(id: item.id, type: item.type, name: item.name, poster: item.poster,
+                                         fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
+                                         releaseInfo: item.releaseInfo, progress: item.progress,
+                                         resumeSeconds: item.resumeSeconds, menu: menu,
+                                         isWatched: showWatchedBadges && watchedIDs.contains(item.id),
+                                         onDetails: onDetails.map { od in { od(item) } },
+                                         privateArtwork: accessibilityProvenance != nil,
+                                         presentation: fixtureCardPresentation(item))
+                } else {
+                    PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
+                                  releaseInfo: item.releaseInfo, progress: item.progress, resumeSeconds: item.resumeSeconds, menu: menu,
+                                  isWatched: showWatchedBadges && watchedIDs.contains(item.id),
+                                  onDetails: onDetails.map { od in { od(item) } },
+                                  privateArtwork: accessibilityProvenance != nil)
+                }
+            }
         }
         // S3: shared card treatment (resting shadow, Mac hover lift, designed press, Reduce-Motion aware),
         // matching the browse grid and tvOS poster cards. scale 1.04 is touch-tuned.
@@ -4583,6 +5037,10 @@ private struct PosterRail: View {
         #endif
     }
 
+    private func shouldPresentQuickView(for item: RailItem) -> Bool {
+        quickViewEnabled && menu != .continueWatching && item.cwVideoId == nil && item.resumeSeconds == nil
+    }
+
     /// Arrows matter only when a pointer is present and the row actually overflows a page.
     private var showArrows: Bool { hovering && items.count > Self.pageStride }
 
@@ -4614,6 +5072,72 @@ private struct PosterRail: View {
     }
 }
 
+/// Live rail wrapper. The only watched-index subscription remains here, so normal catalog reactivity is
+/// unchanged while the fixture can render the same body with a static watched set.
+private struct PosterRail: View {
+    let title: String
+    var eyebrow: String? = nil
+    let items: [RailItem]
+    let onTap: (RailItem) -> Void
+    var onWatch: ((RailItem) -> Void)? = nil
+    var onSeeAll: (() -> Void)? = nil
+    var menu: iOSPosterMenu = .none
+    var onDetails: ((RailItem) -> Void)? = nil
+    var accessibilityProvenance: String? = nil
+    var showWatchedBadges: Bool = false
+    var onReachEnd: (() -> Void)? = nil
+    #if os(macOS)
+    var macFocus: FocusState<MacBrowseFocus?>.Binding? = nil
+    #endif
+    @ObservedObject private var watchedIndex = WatchedIndex.shared
+
+    var body: some View {
+        #if os(macOS)
+        PosterRailBody(title: title, eyebrow: eyebrow, items: items, onTap: onTap, onWatch: onWatch,
+                       onSeeAll: onSeeAll, menu: menu, onDetails: onDetails,
+                       accessibilityProvenance: accessibilityProvenance,
+                       showWatchedBadges: showWatchedBadges, watchedIDs: watchedIndex.ids,
+                       onReachEnd: onReachEnd, macFocus: macFocus
+        )
+        #else
+        PosterRailBody(title: title, eyebrow: eyebrow, items: items, onTap: onTap, onWatch: onWatch,
+                       onSeeAll: onSeeAll, menu: menu, onDetails: onDetails,
+                       accessibilityProvenance: accessibilityProvenance,
+                       showWatchedBadges: showWatchedBadges, watchedIDs: watchedIndex.ids,
+                       onReachEnd: onReachEnd)
+        #endif
+    }
+}
+
+// MARK: - Debug-only Cinema fixture seam
+
+#if DEBUG
+/// An inert entry point to the shipping shelf.  The UI smoke host deliberately owns only static
+/// `RailItem` values and no `CoreBridge`/account lifecycle, so it can exercise Cinema card geometry
+/// without booting an engine, resolving artwork, or issuing a catalog request.
+struct CinemaFixturePosterRail: View {
+    let title: String
+    var eyebrow: String? = nil
+    let items: [RailItem]
+    var continueWatching = false
+    var includesSeeAll = false
+
+    var body: some View {
+        PosterRailBody(
+            title: title,
+            eyebrow: eyebrow,
+            items: items,
+            onTap: { _ in },
+            onSeeAll: includesSeeAll ? {} : nil,
+            menu: continueWatching ? .continueWatching : .none,
+            onDetails: { _ in },
+            watchedIDs: [],
+            fixtureCardPresentation: { .fixture(name: $0.name, poster: $0.poster) }
+        )
+    }
+}
+#endif
+
 // The old image-only `iOSHeroBackdrop` was replaced by the interactive `FeaturedHeroView`
 // (FeaturedHeroView.swift) on all three browse screens; its 16:9-art helpers now live on
 // `FeaturedHeroItem`.
@@ -4635,6 +5159,7 @@ struct CachedPosterImage: View {
     let url: String?
     @State private var image: VXPosterImage?
     @State private var failed = false
+    @Environment(\.cinemaFixtureDisablesArtworkLoading) private var disablesArtworkLoading
 
     /// Paint instantly (no task hop, no blank frame) when the decoded image is already in memory. The
     /// `.task` still runs to load a cold poster; on a warm one it returns immediately.
@@ -4644,7 +5169,7 @@ struct CachedPosterImage: View {
     }
 
     var body: some View {
-        Group {
+        let renderedImage = Group {
             if let image = image ?? synchronousCache {
                 imageView(image).resizable().scaledToFill()
             } else if failed {
@@ -4654,7 +5179,11 @@ struct CachedPosterImage: View {
                 Theme.Palette.surface1
             }
         }
-        .task(id: url) { await load() }
+        if disablesArtworkLoading {
+            renderedImage
+        } else {
+            renderedImage.task(id: url) { await load() }
+        }
     }
 
     private func imageView(_ img: VXPosterImage) -> Image {
@@ -4817,7 +5346,25 @@ private struct LandscapeArtiOS: View {
 /// Reused across rails on every surface: catalog rows, Continue Watching, the browse grid, and the detail
 /// page's "More Like This" rail. Because it reads `CatalogPreferences` directly, every rail that uses it
 /// honors the poster-orientation (landscape/portrait) and hide-labels settings consistently.
-struct PosterCardiOS: View {
+/// Immutable presentation inputs for the shared card body. The live wrapper observes preferences and
+/// localized metadata; the renderer supplies this value directly so no credential or metadata singleton
+/// is constructed merely to draw a fixture card.
+struct CinemaPosterCardPresentation {
+    let landscape: Bool
+    let width: PosterWidthPreset
+    let radius: PosterRadiusPreset
+    let hidesLabels: Bool
+    let displayName: String
+    let displayPoster: String?
+    var usesInertArtwork = false
+
+    static func fixture(name: String, poster: String?) -> Self {
+        .init(landscape: true, width: .balanced, radius: .rounded, hidesLabels: false,
+              displayName: name, displayPoster: poster, usesInertArtwork: true)
+    }
+}
+
+private struct CinemaPosterCardBody: View {
     let id: String
     let type: String
     let name: String
@@ -4830,6 +5377,9 @@ struct PosterCardiOS: View {
     var caption: String? = nil
     /// IMDb rating to show as a small star badge on the poster, when the catalog item carries one. Nil hides it.
     var imdbRating: String? = nil
+    /// Release / year data carried by engine catalog previews. It is rendered only when present; never
+    /// infer a year, runtime, or episode count from a title string.
+    var releaseInfo: String? = nil
     let progress: Double
     /// The saved resume position in seconds, shown as a small "1:03" timecode badge on the poster (above
     /// the progress stripe) so Continue Watching cards say where playback resumes. Nil on every non-CW
@@ -4846,20 +5396,18 @@ struct PosterCardiOS: View {
     /// Account-private remote rows may reuse only already-warm local art. They must not enrich, resolve,
     /// fetch, or persist artwork based on private playback history.
     var privateArtwork = false
-    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
-    @ObservedObject private var apiKeys = ApiKeys.shared
-    @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized title/poster override
+    let presentation: CinemaPosterCardPresentation
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @Environment(\.horizontalSizeClass) private var hSize
 
     /// The title to show: the pooled localized title in the user's language when available, else the add-on's.
-    private var displayName: String { privateArtwork ? name : (l10n.title(for: id) ?? name) }
+    private var displayName: String { presentation.displayName }
     /// The poster to show: the pooled localized (language-matched) poster when available, else the add-on's.
-    private var displayPoster: String? { privateArtwork ? poster : (l10n.poster(for: id) ?? poster) }
+    private var displayPoster: String? { presentation.displayPoster }
 
-    /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
-    /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
-    private var landscape: Bool { !privateArtwork && catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    /// The existing Appearance control remains authoritative. When Landscape is selected it applies to
+    /// every card, including private history rows; those rows use an already-warm-only renderer below.
+    private var landscape: Bool { presentation.landscape }
     /// Preserve this card's actual catalog identity for its context menu. CoreBridge uses it only if
     /// board/discover/search no longer has the engine's resident raw preview, then validates id/type.
     private var catalogPreview: LibraryWatchedMutationPolicy.MetaPreview {
@@ -4870,7 +5418,7 @@ struct PosterCardiOS: View {
     // + cards stay in lockstep and the responsive column count recomputes from the chosen width. The height
     // follows the card's own aspect (16:9 landscape, 2:3 portrait) so posters aren't distorted.
     private var cardW: CGFloat {
-        iOSPillMetrics.gridPosterWidth(preset: catalogPrefs.posterWidth, compact: isCompactWidth)
+        iOSPillMetrics.gridPosterWidth(preset: presentation.width, compact: isCompactWidth)
     }
     /// True on a compact-width class (iPhone portrait), where the preset uses its narrower compact widths.
     private var isCompactWidth: Bool {
@@ -4882,7 +5430,12 @@ struct PosterCardiOS: View {
     }
     private var cardH: CGFloat { landscape ? cardW * 9.0 / 16.0 : cardW * 3.0 / 2.0 }
     /// The poster clip radius from the user's preset (default `.rounded` = Theme.Radius.card).
-    private var cornerRadius: CGFloat { catalogPrefs.posterRadius.radius }
+    private var cornerRadius: CGFloat { presentation.radius.radius }
+    private var cinemaFacts: [String] {
+        [releaseInfo, imdbRating.map { "★ \($0)" }, caption]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
 
     var body: some View {
         card.modifier(PosterContextMenu(id: id, menu: menu, catalogPreview: catalogPreview, onDetails: onDetails))
@@ -4895,8 +5448,14 @@ struct PosterCardiOS: View {
                 // retries, the blank-poster cause). Landscape uses a clean TMDB backdrop (LandscapeArtiOS);
                 // portrait crops the poster to the card so non-2:3 add-on posters fill cleanly (F37).
                 Group {
-                    if landscape {
-                        LandscapeArtiOS(id: id, type: type, title: displayName, poster: displayPoster ?? fallbackArt)
+                    if presentation.usesInertArtwork {
+                        WarmCachedPosterImage(url: nil)
+                    } else if landscape {
+                        if privateArtwork {
+                            privateLandscapeArt
+                        } else {
+                            LandscapeArtiOS(id: id, type: type, title: displayName, poster: displayPoster ?? fallbackArt)
+                        }
                     } else if privateArtwork, TraktArtworkPolicy.isFirstPartyArtwork(displayPoster ?? fallbackArt) {
                         // Trakt's documented first-party CDN art may use the normal cache-backed loader.
                         // Preserve the exact validated row URL and skip PosterArtwork enrichment: private
@@ -4915,7 +5474,8 @@ struct PosterCardiOS: View {
                         // When a poster service bakes the rating into the image (VortX/XRDB or ERDB), skip
                         // the native overlay to avoid a double badge. Also skipped on a watched card, whose
                         // topTrailing corner carries the check badge instead (mirror of tvOS PosterCard).
-                        if !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings(forID: id) {
+                        if !presentation.usesInertArtwork,
+                           !isWatched, let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings(forID: id) {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))
@@ -4981,14 +5541,20 @@ struct PosterCardiOS: View {
             // The title label is hidden when the user turns off poster labels in Poster Style (default:
             // shown). The caption (Upcoming Episodes "S2E5 · Jun 30") is a functional date, not a title, so
             // it stays visible even with labels hidden.
-            if !catalogPrefs.hidePosterLabels {
+            if !presentation.hidesLabels {
                 Text(displayName)
-                    .font(Theme.Typography.label)
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1).frame(width: cardW, alignment: .leading)
+            }
+            if !cinemaFacts.isEmpty {
+                Text(cinemaFacts.joined(separator: "  ·  "))
+                    .font(Theme.Typography.eyebrow)
                     .foregroundStyle(Theme.Palette.textSecondary)
                     .lineLimit(1).frame(width: cardW, alignment: .leading)
             }
             // Optional secondary caption (Upcoming Episodes: "S2E5 · Jun 30"); absent on every other rail.
-            if let caption {
+            if let caption, !cinemaFacts.contains(caption) {
                 Text(caption)
                     .font(Theme.Typography.eyebrow)
                     .foregroundStyle(Theme.Palette.textTertiary)
@@ -5000,8 +5566,57 @@ struct PosterCardiOS: View {
         // inter-child gap and rounded-corner regions are dead zones that fall through to the adjacent
         // grid cell, the reported "tap a card in row 1, the row-2 item opens". Rectangle (not the
         // poster's RoundedRectangle) so the title and gap are inside the target and corners aren't dead.
-        .frame(width: cardW, alignment: .leading)
+            .frame(width: cardW, alignment: .leading)
         .contentShape(Rectangle())
+    }
+
+    /// A wide private-history card must not call catalog/backdrop services. It simply re-frames the
+    /// already-warm poster over a dim canvas, preserving both privacy and the shared Cinema footprint.
+    private var privateLandscapeArt: some View {
+        ZStack {
+            Theme.Palette.surface1
+            WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
+                .blur(radius: 18).opacity(0.5)
+            WarmCachedPosterImage(url: displayPoster ?? fallbackArt)
+                .scaledToFit()
+                .padding(6)
+        }
+    }
+}
+
+/// Live card wrapper. Keeping the observed preference/localization owners here preserves normal app
+/// reactivity while allowing the smoke renderer to reuse `CinemaPosterCardBody` without constructing them.
+struct PosterCardiOS: View {
+    let id: String
+    let type: String
+    let name: String
+    let poster: String?
+    var fallbackArt: String? = nil
+    var caption: String? = nil
+    var imdbRating: String? = nil
+    var releaseInfo: String? = nil
+    let progress: Double
+    var resumeSeconds: Double? = nil
+    var menu: iOSPosterMenu = .none
+    var isWatched: Bool = false
+    var onDetails: (() -> Void)? = nil
+    var privateArtwork = false
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var l10n = LocalizedMetadataStore.shared
+    @EnvironmentObject private var theme: ThemeManager
+
+    var body: some View {
+        CinemaPosterCardBody(
+            id: id, type: type, name: name, poster: poster, fallbackArt: fallbackArt, caption: caption,
+            imdbRating: imdbRating, releaseInfo: releaseInfo, progress: progress, resumeSeconds: resumeSeconds,
+            menu: menu, isWatched: isWatched, onDetails: onDetails, privateArtwork: privateArtwork,
+            presentation: .init(
+                landscape: catalogPrefs.landscapeCards, width: catalogPrefs.posterWidth,
+                radius: catalogPrefs.posterRadius, hidesLabels: catalogPrefs.hidePosterLabels,
+                displayName: privateArtwork ? name : (l10n.title(for: id) ?? name),
+                displayPoster: privateArtwork ? poster : (l10n.poster(for: id) ?? poster)
+            )
+        )
     }
 }
 

@@ -19,6 +19,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MediaRelation
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
+import com.vortx.android.model.continueWatchingEpisodeFromVideoIdentity
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.profile.ContinueWatchingDedupe
@@ -259,17 +260,23 @@ internal object EngineState {
                     flaggedWatched = state?.optInt("flaggedWatched", 0) ?: 0,
                     timesWatched = state?.optInt("timesWatched", 0) ?: 0,
                 )
+            val type = MediaType.fromId(typeRaw)
+            val videoId = state?.optStringOrNull("video_id") ?: state?.optStringOrNull("videoId")
+            val preferredEpisode = continueWatchingEpisodeFromVideoIdentity(type, videoId)
+            val activity = state?.optStringOrNull("lastWatched")?.let { raw -> runCatching { Instant.parse(raw).toEpochMilli() }.getOrNull() }
+            val timeOffset = state?.optDouble("timeOffset", 0.0) ?: 0.0
+            val duration = state?.optDouble("duration", 0.0) ?: 0.0
+            val clockedRewind = activity != null && timeOffset == 0.0 && duration.isFinite() && duration > 0 && preferredEpisode != null
             val item = MetaItem(
                 id = obj.optString("_id").ifEmpty { obj.optString("id") },
-                type = MediaType.fromId(typeRaw),
+                type = type,
                 name = obj.optString("name"),
                 poster = obj.optStringOrNull("poster"),
                 progress = cwProgress(state),
-                resumeSeconds = cwResumeSeconds(state),
+                resumeSeconds = if (clockedRewind) 0.0 else cwResumeSeconds(state),
+                preferredEpisode = preferredEpisode,
+                continueWatchingActivityAtMillis = activity,
             )
-            val timeOffset = state?.optDouble("timeOffset", 0.0) ?: 0.0
-            val duration = state?.optDouble("duration", 0.0) ?: 0.0
-            val videoId = state?.optStringOrNull("video_id") ?: state?.optStringOrNull("videoId")
             val freshness = state?.optStringOrNull("lastWatched")?.let { raw ->
                 runCatching { Instant.parse(raw).toEpochMilli().toDouble() }.getOrNull()
             }
@@ -280,8 +287,8 @@ internal object EngineState {
                 type = typeRaw,
                 aliases = listOfNotNull(videoId),
                 freshness = freshness,
-                hasValidProgress = timeOffset.isFinite() && timeOffset > 0 &&
-                    duration.isFinite() && duration > 0,
+                hasValidProgress = clockedRewind || (timeOffset.isFinite() && timeOffset > 0 &&
+                    duration.isFinite() && duration > 0),
                 removed = removed || finished,
             )
         }
@@ -468,6 +475,32 @@ internal object EngineState {
             item.optString("_id").ifEmpty { item.optString("id") }.takeIf(String::isNotEmpty)?.let(watched::add)
         }
         return watched
+    }
+
+    /**
+     * Decode the complete persisted playback projection from the engine's live Library model. The engine
+     * writes catalog-only watches as temporary entries, so filtering `temp` here would wrongly omit an
+     * unsaved title that has real watched/progress state. Conversely a plain saved entry is deliberately
+     * excluded unless it has watched ticks or a resume offset. Engine order is retained (most-recent first).
+     */
+    fun parsePlaybackHistoryStrict(json: String): Result<List<MetaItem>> = runCatching {
+        val root = JSONObject(json)
+        val catalog = root.getJSONArray("catalog")
+        buildList {
+            for (index in 0 until catalog.length()) {
+                val item = catalog.getJSONObject(index)
+                val id = item.optString("_id").ifEmpty { item.optString("id") }
+                require(id.isNotBlank() && id != "null") { "Playback history item $index is missing id." }
+                val type = item.optString("type", "movie")
+                require(MediaType.entries.any { it.id.equals(type, ignoreCase = true) }) {
+                    "Playback history item $index has an invalid media type."
+                }
+                val state = item.optJSONObject("state")
+                val watched = (state?.optInt("timesWatched", 0) ?: 0) > 0
+                val resumed = (state?.optDouble("timeOffset", 0.0) ?: 0.0) > 0.0
+                if (watched || resumed) add(parseLibraryItem(item))
+            }
+        }
     }
 
     /// Parse the `meta_details` field into a UI [MetaDetail] plus its grouped [StreamGroup]s. The meta
@@ -1017,13 +1050,24 @@ internal object EngineState {
         val externalUrl = obj.optStringOrNull("externalUrl")
         val ytId = obj.optStringOrNull("ytId")
         val nzbUrl = obj.optStringOrNull("nzbUrl")
-        val fileIdx = if (obj.has("fileIdx") && !obj.isNull("fileIdx")) obj.optInt("fileIdx") else null
+        val nzbUrls = com.vortx.android.usenet.NativeNzbInputs.mirrors(nzbUrl,
+            com.vortx.android.usenet.NativeNzbInputs.strings(obj, "nzbUrls"))
+        val usenetServers = com.vortx.android.usenet.NativeNzbInputs.servers(
+            com.vortx.android.usenet.NativeNzbInputs.strings(obj, "servers"))
+        val fileIdx = if (obj.has("fileIdx") && !obj.isNull("fileIdx")) {
+            if (nzbUrls.isEmpty()) obj.optInt("fileIdx") else {
+                val number = obj.opt("fileIdx") as? Number ?: throw IllegalArgumentException("Invalid NZB file index")
+                val exact = try { java.math.BigDecimal(number.toString()).intValueExact() }
+                    catch (_: Exception) { throw IllegalArgumentException("Invalid NZB file index") }
+                require(exact >= 0) { "Invalid NZB file index" }; exact
+            }
+        } else null
         // isTorrent mirrors Apple `CoreStream.isTorrent` (`url == nil && infoHash != nil && nzbUrl ==
         // nil`) so a USENET stream (`.nzb`, no url) is classified as usenet, never torrent.
-        val isTorrent = url == null && infoHash != null && nzbUrl == null
+        val isTorrent = url == null && infoHash != null && nzbUrls.isEmpty()
         val behaviorHints = obj.optJSONObject("behaviorHints")
         // Stable id matching CoreStream.id: (url|externalUrl|infoHash|nzbUrl) + "#" + name + description.
-        val handle = url ?: externalUrl ?: infoHash ?: nzbUrl ?: "?"
+        val handle = url ?: externalUrl ?: nzbUrls.firstOrNull() ?: infoHash ?: "?"
         val name = obj.optStringOrNull("name")
         val description = obj.optStringOrNull("description")
         return StreamSource(
@@ -1039,6 +1083,8 @@ internal object EngineState {
             fileIdx = fileIdx,
             externalUrl = externalUrl,
             nzbUrl = nzbUrl,
+            nzbUrls = nzbUrls,
+            usenetServers = usenetServers,
             usenetKnownHash = parseUsenetKnownHash(obj),
             fileMustInclude = obj.optStringOrNull("fileMustInclude"),
             vortxProvider = obj.optStringOrNull("vortxProvider"),

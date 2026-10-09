@@ -62,12 +62,12 @@ object TraktAuth {
     private const val TAG = "TraktAuth"
 
     @Volatile private var tokenStore: TokenPersistence? = null
-    private val tokenMutations = CredentialMutationCoordinator()
+    private val tokenMutations = CredentialMutationCoordinator(if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderCredentials.GROUPS[0] else null)
     private val sessionEpoch = AtomicLong(0L)
     private val _sessionBoundary = MutableStateFlow(0L)
 
     /** Changes after a confirmed sign-in replacement or disconnect so mounted Home rails reconcile now. */
-    internal val sessionBoundary: StateFlow<Long> = _sessionBoundary.asStateFlow()
+    internal val sessionBoundary: StateFlow<Long> get() = if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.revision else _sessionBoundary.asStateFlow()
 
     /// A single in-flight refresh serializer. Trakt rotates the refresh token on every refresh, so two
     /// concurrent refreshes would race and the loser 401s on an already-spent token, dropping the session.
@@ -80,7 +80,7 @@ object TraktAuth {
         if (tokenStore == null) {
             synchronized(this) {
                 if (tokenStore == null) {
-                    tokenStore = TokenPersistence(SecureTokenStore(context, PREFS_FILE), ::nowSeconds)
+                    tokenStore = TokenPersistence(if (BuildConfig.NATIVE_ENGINE_ENABLED) NativeProviderAccess.oauthStore("trakt") else SecureTokenStore(context, PREFS_FILE), ::nowSeconds)
                 }
             }
         }
@@ -107,7 +107,7 @@ object TraktAuth {
     /** Stable only for the currently connected credential generation. Contains no credential material. */
     internal val currentSessionEpoch: Long?
         get() = tokenMutations.snapshot {
-            sessionEpoch.get() to (tokenStore?.connectionState == CredentialConnectionState.CONNECTED)
+            currentSessionEpoch() to (tokenStore?.connectionState == CredentialConnectionState.CONNECTED)
         }.value.let { (epoch, connected) -> epoch.takeIf { isConfigured && connected } }
 
     // MARK: - Step 1: request a device code
@@ -244,16 +244,29 @@ object TraktAuth {
     /// instead of spending the already-rotated refresh token (which would 401 and drop the session).
     private suspend fun refresh(
         operation: CredentialMutationCoordinator.Operation,
+    ): TraktToken = refreshAfterSerialization(operation, tokenStore ?: throw TraktAuthException.SecureStorage) { current ->
+        performRefresh(operation, current)
+    }
+
+    internal suspend fun refreshAfterSerialization(
+        operation: CredentialMutationCoordinator.Operation,
+        persistence: TokenPersistence,
+        refreshCurrent: suspend (TokenPersistence.StoredToken) -> TraktToken,
     ): TraktToken = refreshMutex.withLock {
         // A refresh may have completed while we waited on the lock; reuse its result rather than spending
         // the now-rotated token again.
-        val current = when (val result = operation.mutate(::currentStoredToken)) {
+        val current = when (val result = operation.mutate(persistence::loadStored)) {
             is CredentialMutationResult.Applied ->
                 result.value ?: throw TraktAuthException.NotSignedIn
-            CredentialMutationResult.Stale -> throw TraktAuthException.NotSignedIn
+            CredentialMutationResult.Stale -> {
+                val peer = operation.readCurrentOwner(persistence::loadStored)
+                val token = (peer as? CredentialMutationResult.Applied)?.value?.token
+                if (token != null && !token.isExpired) return@withLock token
+                throw TraktAuthException.NotSignedIn
+            }
         }
         if (!current.token.isExpired) return@withLock current.token
-        performRefresh(operation, current)
+        refreshCurrent(current)
     }
 
     private suspend fun performRefresh(
@@ -383,7 +396,7 @@ object TraktAuth {
     }
 
     private fun isSessionCurrent(expectedEpoch: Long): Boolean = tokenMutations.snapshot {
-        sessionEpoch.get() == expectedEpoch &&
+        currentSessionEpoch() == expectedEpoch &&
             tokenStore?.connectionState == CredentialConnectionState.CONNECTED
     }.value
 
@@ -391,6 +404,9 @@ object TraktAuth {
         val next = sessionEpoch.incrementAndGet()
         _sessionBoundary.value = next
     }
+
+    private fun currentSessionEpoch(): Long = if (BuildConfig.NATIVE_ENGINE_ENABLED)
+        NativeProviderAccess.read(NativeProviderCredentials.GROUPS[0])?.revision ?: -1 else sessionEpoch.get()
 
     internal class TokenPersistence(
         private val store: CredentialStoreAccess,
