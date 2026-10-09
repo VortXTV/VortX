@@ -1263,6 +1263,10 @@ final class VortXSyncManager: ObservableObject {
     /// A remote projection's notification-suppression turn must not drop this upload admission.
     func nativeMutationDidCommit(credentialCapture capture: CredentialScopeRegistry.Capture) {
         guard isSignedIn, isCurrent(capture) else { return }
+        // Record the generation immediately, including the suppression turn. Otherwise an older
+        // upload could clear the durable flag before this deferred admission reaches its worker.
+        nativePushQueue.request()
+        nativeDurablePushPending = true
         if isApplyingRemote { pendingNativeMutationPush = capture }
         else { requestSyncSoon() }
     }
@@ -1421,7 +1425,17 @@ final class VortXSyncManager: ObservableObject {
     }
 #if VORTX_NATIVE_DATA_ENGINE
     private var nativePushQueue = NativeForegroundSyncPolicy.PushQueue()
-    private var hasPendingPush: Bool { nativePushQueue.hasPendingPush }
+    private var nativeDurablePushPending: Bool {
+        get {
+            guard let id = account?.id else { return false }
+            return UserDefaults.standard.bool(forKey: "vortx.sync.pendingNativePush." + id)
+        }
+        set {
+            guard let id = account?.id else { return }
+            UserDefaults.standard.set(newValue, forKey: "vortx.sync.pendingNativePush." + id)
+        }
+    }
+    private var hasPendingPush: Bool { nativePushQueue.hasPendingPush || nativeDurablePushPending }
     private var activeSyncDown: (id: UUID, capture: CredentialScopeRegistry.Capture)?
 #else
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
@@ -3335,6 +3349,15 @@ final class VortXSyncManager: ObservableObject {
         guard isCurrent(capture), ProfileStore.shared.activeID == profileID else { throw VortxNativeError.superseded }
         applyNativeGlobals(merged["nativeHostPreferences"]!)
         try publishNativeWebsiteOutcome(merged["profileEditResults"]!, capture: capture)
+        guard let joinedNative = merged["nativeSync"], let joinedHost = merged["nativeHostPreferences"] else {
+            throw VortxNativeError.invalidResponse
+        }
+        if NativeForegroundSyncPolicy.requiresCausalRepublish(pulledNative: remote, pulledHost: hostRemote,
+                                                              joinedNative: joinedNative, joinedHost: joinedHost) {
+            // A legacy epoch writer can replace these siblings with an older carrier. The local
+            // checkpoint retains the join; repair via fresh pull/base+1, preserving legacy siblings.
+            nativeMutationDidCommit(credentialCapture: capture)
+        }
     }
 #endif
 
@@ -4708,6 +4731,7 @@ final class VortXSyncManager: ObservableObject {
             nativePushQueue = .init()
         }
         nativePushQueue.request()
+        nativeDurablePushPending = true
         // Do not cancel an executing upload for a later local edit. Its captured generation
         // will ACK only itself; the same worker exports the newer checkpoint next.
         guard pendingSync == nil else { return }
@@ -4729,7 +4753,10 @@ final class VortXSyncManager: ObservableObject {
                 let accepted = await self.syncUp()
                 guard self.isCurrent(capture), self.pendingSyncID == workerID else { return }
                 self.nativePushQueue.acknowledge(generation, accepted: accepted)
-                if !self.nativePushQueue.hasPendingPush { return }
+                if !self.nativePushQueue.hasPendingPush {
+                    self.nativeDurablePushPending = false
+                    return
+                }
                 // Keep durable edits pending while backgrounded; foreground catch-up resumes
                 // their worker. An offline active device retries without fabricating a sync badge.
                 if !self.realtimeActive { return }

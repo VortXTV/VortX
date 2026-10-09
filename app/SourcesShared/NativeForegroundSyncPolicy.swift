@@ -6,6 +6,14 @@ enum NativeForegroundSyncPolicy {
     static func shouldPullBroadcast(version: Int, lastAcknowledgedVersion: Int, ownerIsCurrent: Bool) -> Bool {
         ownerIsCurrent && version > lastAcknowledgedVersion
     }
+
+    /// Compare only authenticated, successfully joined exported carriers. NativeSync contains
+    /// causal provenance, not device-local selectors/rolling counters; do not strip its fields.
+    /// Structural values avoid JSON key-order/encoding noise. An equal join must not echo-upload.
+    static func requiresCausalRepublish(pulledNative: VortxJSON?, pulledHost: VortxJSON?,
+                                        joinedNative: VortxJSON, joinedHost: VortxJSON) -> Bool {
+        joinedNative != pulledNative || joinedHost != pulledHost
+    }
     /// A transport ACK covers only the edit generation captured before that upload. A failure
     /// or an edit accepted while the request suspends must remain queued for another export.
     struct PushQueue: Equatable {

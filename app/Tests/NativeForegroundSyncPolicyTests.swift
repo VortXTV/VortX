@@ -83,6 +83,7 @@ enum NativeForegroundSyncPolicyTests {
         print("PASS failed transport/newer checkpoint edit remains pending; exact dirty stamp survives older ACK")
 
         try await twoDeviceColdHydration()
+        try causalRollbackRepair()
         try productionWiring()
     }
 
@@ -181,6 +182,8 @@ enum NativeForegroundSyncPolicyTests {
         precondition(ack < version)
         precondition(manager.contains("nativeAccountDocumentCommitted = true"))
         precondition(manager.contains("self.nativePushQueue.acknowledge(generation, accepted: accepted)"))
+        precondition(manager.contains("vortx.sync.pendingNativePush."))
+        precondition(manager.contains("NativeForegroundSyncPolicy.requiresCausalRepublish(pulledNative: remote, pulledHost: hostRemote"))
         precondition(manager.contains("activeSyncDown?.capture != capture, activeSyncUp?.capture != capture"))
         precondition(manager.contains("self?.drainNativeMutationPush()"))
         precondition(manager.contains("self.ws === task, self.wsCapture == capture, self.isCurrent(capture) else { return }"))
@@ -198,5 +201,54 @@ enum NativeForegroundSyncPolicyTests {
         let badgeWrites = manager.components(separatedBy: "stampSyncSuccess()").count - 1
         precondition(badgeWrites == 3) // declaration + cloud accepted push + committed pull; no fake heartbeat.
         print("PASS production wiring keeps account ACK after commit, serializes native transport, drains explicit mutations, refreshes Home, foreground ensures resident session, honest badge")
+    }
+
+    /// Synthetic increasing-version cloud, with the real host CRDT and opaque native join receipts.
+    /// Exercises the manager's repair admission; it does not reimplement private native merge rules.
+    @MainActor
+    static func causalRollbackRepair() throws {
+        let scope = VortxAccountScope(account: "fixture.account", ownerProfileID: "00000000-0000-0000-0000-00000000A11C")
+        var localA = try VortxNativeHostPreferences(scope: scope, actor: "00000000-0000-0000-0000-000000000001")
+        let staleHost = try localA.document
+        let staleNative: VortxJSON = .object(["causalFacts": .object([:])])
+        let joinedNative: VortxJSON = .object(["causalFacts": .object(["Naruto:recent": .integer(2), "Naruto:S2E34:progress": .integer(3)])])
+        try localA.edit(profileID: nil, fields: [HomeRailStore.hiddenKey: .array([.string("collectionsHub")])], scope: scope)
+        let freshHost = try localA.document
+        var cloudVersion = 18
+        var cloudNative = joinedNative
+        var cloudHost = freshHost
+        let legacySibling = Data("retained-legacy-website-settings".utf8)
+        let cloudLegacy = legacySibling
+        // Old TV read v17 before A's facts, then its epoch-stamped PUT wins over v18.
+        let oldTVVersion = 1000
+        precondition(oldTVVersion > cloudVersion)
+        cloudVersion = oldTVVersion; cloudNative = staleNative; cloudHost = staleHost
+        try localA.merge(cloudHost, scope: scope)
+        let joinedHost = try localA.document
+        precondition(joinedHost == freshHost)
+        var queue = NativeForegroundSyncPolicy.PushQueue()
+        if NativeForegroundSyncPolicy.requiresCausalRepublish(pulledNative: cloudNative, pulledHost: cloudHost,
+                                                               joinedNative: joinedNative, joinedHost: joinedHost) { queue.request() }
+        precondition(queue.hasPendingPush)
+        let sentGeneration = queue.generation
+        // Fresh-pull merge keeps legacy siblings, then uses the current server base + 1.
+        let repairVersion = cloudVersion + 1
+        cloudVersion = repairVersion; cloudNative = joinedNative; cloudHost = joinedHost
+        queue.acknowledge(sentGeneration, accepted: true)
+        precondition(!queue.hasPendingPush && cloudVersion == 1001 && cloudLegacy == legacySibling)
+        var coldC = try VortxNativeHostPreferences(scope: scope, actor: "00000000-0000-0000-0000-000000000003")
+        try coldC.merge(cloudHost, scope: scope)
+        precondition(coldC.local.document == localA.local.document)
+        precondition(cloudNative["causalFacts"]?["Naruto:recent"] == .integer(2))
+        let coldHost = try coldC.document
+        precondition(!NativeForegroundSyncPolicy.requiresCausalRepublish(pulledNative: cloudNative, pulledHost: cloudHost,
+                                                                        joinedNative: joinedNative, joinedHost: coldHost))
+        // Dictionary key order is not a fact. A host-only causal difference still needs repair.
+        let reorderedNative: VortxJSON = .object(["causalFacts": .object(["Naruto:S2E34:progress": .integer(3), "Naruto:recent": .integer(2)])])
+        precondition(!NativeForegroundSyncPolicy.requiresCausalRepublish(pulledNative: reorderedNative, pulledHost: joinedHost,
+                                                                        joinedNative: joinedNative, joinedHost: joinedHost))
+        precondition(NativeForegroundSyncPolicy.requiresCausalRepublish(pulledNative: joinedNative, pulledHost: staleHost,
+                                                                       joinedNative: joinedNative, joinedHost: joinedHost))
+        print("PASS A new fact -> old-TV stale epoch -> warm causal join/repair -> cold C; legacy siblings preserved and equal joins never echo")
     }
 }
