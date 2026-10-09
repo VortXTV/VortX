@@ -483,11 +483,14 @@ final class VortXSyncManager: ObservableObject {
     private func applyNativeGlobals(_ host: VortxJSON) {
         guard case .object(let fields) = host["globals"]?["fields"] else { return }
         withRemoteApplySuppressed {
+            var appliedHomeRailLayout = false
             for (key, register) in fields where dirtySettings[key] == nil {
                 guard let value = register["value"], VortxNativeHostPreferences.validGlobal(key, value: value) else { continue }
                 if value == .null { UserDefaults.standard.removeObject(forKey: key) }
                 else if let data = try? JSONEncoder().encode(value), let object = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed) { UserDefaults.standard.set(object, forKey: key) }
+                if key == HomeRailStore.orderKey || key == HomeRailStore.hiddenKey { appliedHomeRailLayout = true }
             }
+            if appliedHomeRailLayout { HomeRailPreferences.shared.reloadFromDefaults() }
         }
     }
     private func nativeBackupSeen(capture: CredentialScopeRegistry.Capture) -> Bool {
@@ -828,6 +831,7 @@ final class VortXSyncManager: ObservableObject {
                   let material = archive["legacyImportMaterial"] as? [String: Any] else { throw VortxNativeError.invalidSnapshot }
             try VortxNativeSession.validateLegacyCompatibility(scope: recovery.scope, ownerName: ownerName,
                 snapshot: recovery.state, nativeSync: nil, material: JSONSerialization.data(withJSONObject: material), abi: VortxCABI())
+            let resourceRestore = CoreBridge.shared.captureNativeResourceRestore(capture: capture, profileID: selectedProfile)
             await CoreBridge.shared.closeNativeSession()
             guard isCurrent(capture), !Task.isCancelled, nativeCheckpointGeneration == generation,
                   ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
@@ -851,12 +855,31 @@ final class VortXSyncManager: ObservableObject {
                       ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
                 applyNativeGlobals(acceptedHost)
                 try publishNativeWebsiteOutcome(websiteOutcome, capture: capture)
-                nativeCheckpointStatus = "mounted_offline"; return true
+                nativeCheckpointStatus = "mounted_offline"
+                CoreBridge.shared.replayNativeResourceRestore(resourceRestore, target: CoreBridge.shared.captureNativePlaybackTarget())
+                return true
             } catch { await session.close(); throw error }
         } catch {
             if isCurrent(capture), nativeCheckpointGeneration == generation { nativeCheckpointStatus = "offline_checkpoint_unavailable" }
             return false
         }
+    }
+
+    /// Routine foreground hydration keeps a certified current session and its resource selections.
+    @MainActor
+    @discardableResult
+    private func ensureNativeCheckpoint(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
+        let capture = suppliedCapture ?? credentialAuthority.capture()
+        let profileID = ProfileStore.shared.activeID
+        return await NativeForegroundSyncPolicy.ensureSession(isCurrent: {
+            self.isCurrent(capture) && ProfileStore.shared.activeID == profileID
+        }, hasCertifiedSession: {
+            CoreBridge.shared.hasCertifiedNativeSession(capture: capture, profileID: profileID)
+        }, settleResident: {
+            await CoreBridge.shared.settleResidentNativeSession(capture: capture)
+        }, restore: {
+            await self.restoreNativeCheckpoint(credentialCapture: capture)
+        })
     }
 
     /// The key never leaves this account owner. Only an absent checkpoint permits a complete
@@ -959,6 +982,8 @@ final class VortXSyncManager: ObservableObject {
                 // Keep an already validated session visible while authentication/source parsing
                 // is pending or fails. Only retire it once the replacement has passed preflight.
                 stage = "session_replacement"
+                let resourceRestore = CoreBridge.shared.captureNativeResourceRestore(capture: capture,
+                                                                                     profileID: selectedProfile)
                 await CoreBridge.shared.closeNativeSession()
                 guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
                       ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
@@ -1015,6 +1040,7 @@ final class VortXSyncManager: ObservableObject {
                     // and adopting an existing remote carrier must not create an echo push.
                     if didImportLegacy || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty { self.requestSyncSoon() }
                     self.nativeCheckpointStatus = "mounted"
+                    CoreBridge.shared.replayNativeResourceRestore(resourceRestore, target: CoreBridge.shared.captureNativePlaybackTarget())
                     DiagnosticsLog.log("native-profiles", "restore result=mounted")
                     return true
                 } catch { await session.close(); throw error }
@@ -1230,6 +1256,24 @@ final class VortXSyncManager: ObservableObject {
         if noteLocalSettingsChange() { requestSyncSoon() }
     }
     private var pendingLocalRosterPush: CredentialScopeRegistry.Capture?
+#if VORTX_NATIVE_DATA_ENGINE
+    private var pendingNativeMutationPush: CredentialScopeRegistry.Capture?
+
+    /// Stronger than a defaults notification: a kernel mutation was committed to its checkpoint.
+    /// A remote projection's notification-suppression turn must not drop this upload admission.
+    func nativeMutationDidCommit(credentialCapture capture: CredentialScopeRegistry.Capture) {
+        guard isSignedIn, isCurrent(capture) else { return }
+        if isApplyingRemote { pendingNativeMutationPush = capture }
+        else { requestSyncSoon() }
+    }
+
+    private func drainNativeMutationPush() {
+        guard !isApplyingRemote, let capture = pendingNativeMutationPush else { return }
+        pendingNativeMutationPush = nil
+        guard isSignedIn, isCurrent(capture) else { return }
+        requestSyncSoon()
+    }
+#endif
 
     /// Explicit local persistence is stronger evidence than a queued defaults notification.
     /// The caller excludes housekeeping and remote profile-edit application.
@@ -1280,7 +1324,11 @@ final class VortXSyncManager: ObservableObject {
     /// value (local wins) rides up and the confirmed push clears the dirty mark. Debounced via requestSyncSoon so
     /// it coalesces with any other pending change. No-op when there is nothing unpushed.
     private func flushDirtySettingsIfNeeded() {
+#if VORTX_NATIVE_DATA_ENGINE
+        guard isSignedIn, hasPendingPush || !dirtySettings.isEmpty || pendingAddonOrderIntent != nil else { return }
+#else
         guard isSignedIn, !dirtySettings.isEmpty || pendingAddonOrderIntent != nil else { return }
+#endif
         requestSyncSoon()
     }
     private var pendingAddonOrderIntent: AddonOrderIntent? {
@@ -1371,7 +1419,13 @@ final class VortXSyncManager: ObservableObject {
         applyInAppAddonOrder(AddonOrderSyncPolicy.replacing(
             Self.appliedAddonOrder, oldURL: oldTransportURL, newURL: newTransportURL))
     }
+#if VORTX_NATIVE_DATA_ENGINE
+    private var nativePushQueue = NativeForegroundSyncPolicy.PushQueue()
+    private var hasPendingPush: Bool { nativePushQueue.hasPendingPush }
+    private var activeSyncDown: (id: UUID, capture: CredentialScopeRegistry.Capture)?
+#else
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
+#endif
     private struct PendingDebridApply: Equatable {
         let capture: CredentialScopeRegistry.Capture
         let version: Int
@@ -1486,13 +1540,18 @@ final class VortXSyncManager: ObservableObject {
     /// The live SyncRoom socket; nil whenever disconnected. Receives {"type":"updated","version":N}
     /// pushes from other devices and triggers a pull within ~1s.
     private var ws: URLSessionWebSocketTask?
+    private var wsCapture: CredentialScopeRegistry.Capture?
     private var wsBackoff: TimeInterval = 1          // reconnect delay, doubled per failure (capped)
     private var wsReconnect: Task<Void, Never>?      // pending reconnect attempt
     private var wsKeepAlive: Task<Void, Never>?      // periodic "ping" so the room never idles us out
     private var pollTask: Task<Void, Never>?         // while-active fallback poll
     private var realtimeActive = false               // true between startRealtime() and stopRealtime()
     private let wsMaxBackoff: TimeInterval = 30
-    private let pollIntervalNanos: UInt64 = 10_000_000_000   // 10s fallback poll while active
+#if VORTX_NATIVE_DATA_ENGINE
+    private let pollIntervalNanos: UInt64 = 3_000_000_000    // bounded native fallback while active
+#else
+    private let pollIntervalNanos: UInt64 = 10_000_000_000
+#endif
     private let keepAliveNanos: UInt64 = 30_000_000_000      // 30s ping to hold the room open
 
     private init() {
@@ -2120,7 +2179,8 @@ final class VortXSyncManager: ObservableObject {
         reloadLastSyncStamp()   // a re-sign-in to a known account restores its persisted "last synced"
         // A fresh sign-in is a foreground action, so open the real-time channel immediately (if the app
         // is active it would also be opened by scenePhase, but adopting here covers the in-place sign-in
-        // flow where the scene never re-activates). Idempotent: startRealtime() no-ops if already live.
+        // flow where the scene never re-activates). Even same-account re-sign-in replaces the bearer.
+        stopRealtime()
         startRealtime()
         // ONE interactive sign-in must restore everything: hydrate the engine from the account's owned
         // add-ons + recover the owner library HERE, at the single chokepoint every sign-in entry point
@@ -2369,7 +2429,10 @@ final class VortXSyncManager: ObservableObject {
         if code == 404 { return .empty }                                  // no backup yet
         // request() returns code 0 for a thrown URLSession error (offline / DNS / TLS / timeout) and 5xx is a
         // server fault: both are transient, and both are exactly the "silently returns false" case of #145.
-        guard code == 200 else { return .failed(retryable: code == 0 || code >= 500) }
+        guard code == 200 else {
+            DiagnosticsLog.log("sync", "operation=pull result=failed httpStatus=\(code)")
+            return .failed(retryable: code == 0 || code >= 500)
+        }
         guard let json else { return .failed(retryable: false) }
         if json["document"] is NSNull, Self.documentVersion(json["version"]) == 0 { return .empty }
         guard let docStr = json["document"] as? String, !docStr.isEmpty else { return .failed(retryable: false) }
@@ -2380,7 +2443,10 @@ final class VortXSyncManager: ObservableObject {
         // A doc we cannot open is NOT an empty account. Refusing it (rather than falling through to a nil that
         // reads as "nothing there") is what keeps a decrypt-miss / ratchet refusal from being pushed over.
         guard let pt = openSyncDocument(docStr, version: version),
-              let obj = try? Self.decodeDecryptedSyncDocument(pt) else { return .failed(retryable: false) }
+              let obj = try? Self.decodeDecryptedSyncDocument(pt) else {
+            DiagnosticsLog.log("sync", "operation=pull result=failed reason=document_authentication_or_decode")
+            return .failed(retryable: false)
+        }
 #if VORTX_NATIVE_DATA_ENGINE
         guard rememberNativeBackup(capture: capture) else { return .failed(retryable: false) }
 #endif
@@ -2934,6 +3000,12 @@ final class VortXSyncManager: ObservableObject {
             requestSyncSoon()
             return false
         }
+#if VORTX_NATIVE_DATA_ENGINE
+        if activeSyncDown?.capture == capture {
+            requestSyncSoon()
+            return false
+        }
+#endif
         let operationID = UUID()
         activeSyncUp = (operationID, capture)
         defer { if activeSyncUp?.id == operationID { activeSyncUp = nil } }
@@ -3037,7 +3109,10 @@ final class VortXSyncManager: ObservableObject {
             doc["nativeProviderCredentials"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(providers.document))
             doc["apiKeys"] = try mirrorNativeProviderKeys(providers, original: doc["apiKeys"])
             applyNativeGlobals(merged["nativeHostPreferences"]!)
-        } catch { return nil }
+        } catch {
+            DiagnosticsLog.log("sync", "operation=native_sync_export result=failed reason=\(VortxNativeError.diagnosticCode(error))")
+            return nil
+        }
         // Never rewrite the legacy migration baseline from native/profile/overlay mirrors. Until
         // a versioned bidirectional adapter exists, native exports only its own accepted carrier.
         return DerivedSyncDoc(document: doc, baseRevision: baseRevision)
@@ -3241,6 +3316,28 @@ final class VortXSyncManager: ObservableObject {
         return await task.value
     }
 
+#if VORTX_NATIVE_DATA_ENGINE
+    /// A mount alone cannot acknowledge a pulled document. Merge both carriers against its exact
+    /// current profile/credential receipt, durably commit, and publish the accepted host projections.
+    private func commitNativePulledDocument(_ doc: [String: Any], capture: CredentialScopeRegistry.Capture) async throws {
+        let profileID = ProfileStore.shared.activeID
+        guard isCurrent(capture), CoreBridge.shared.hasCertifiedNativeSession(capture: capture, profileID: profileID) else {
+            throw VortxNativeError.superseded
+        }
+        let prepared = try await prepareNativeLegacyMaterial(doc, capture: capture)
+        guard isCurrent(capture), ProfileStore.shared.activeID == profileID,
+              CoreBridge.shared.hasCertifiedNativeSession(capture: capture, profileID: profileID) else { throw VortxNativeError.superseded }
+        let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+        let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
+        let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture,
+            legacyMaterial: prepared.material, websiteEvents: Self.nativeWebsiteEvents(doc), websiteAddonEvents: Self.nativeWebsiteAddonEvents(doc),
+            legacyWatchlists: nativeLegacyWatchlists(doc), sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
+        guard isCurrent(capture), ProfileStore.shared.activeID == profileID else { throw VortxNativeError.superseded }
+        applyNativeGlobals(merged["nativeHostPreferences"]!)
+        try publishNativeWebsiteOutcome(merged["profileEditResults"]!, capture: capture)
+    }
+#endif
+
     /// Pull the account's profiles + settings (and metadata keys) and apply them locally. True if anything
     /// was restored.
     /// Pull the account's profiles + settings and apply them locally. Version-aware so it only applies
@@ -3251,6 +3348,14 @@ final class VortXSyncManager: ObservableObject {
     func syncDown(force: Bool = false, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture) else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        // One pulled document may commit at a time, and a pull may not project an older host
+        // document over an in-flight export. A refused operation leaves its ACK/version untouched.
+        guard activeSyncDown?.capture != capture, activeSyncUp?.capture != capture else { return false }
+        let pullID = UUID()
+        activeSyncDown = (pullID, capture)
+        defer { if activeSyncDown?.id == pullID { activeSyncDown = nil } }
+#endif
         // PENDING-EDIT GUARD. When a GENUINE local edit is queued (a settings toggle, a profile delete: the
         // observer armed hasPendingPush), defer this pull until that edit's debounced push lands. Without it an
         // interleaved pull re-applies the account's pre-edit value and the change the user just made flips back
@@ -3317,21 +3422,14 @@ final class VortXSyncManager: ObservableObject {
         }
         var doc = pulled.doc
 #if VORTX_NATIVE_DATA_ENGINE
+        var nativeAccountDocumentCommitted = false
         let nativeProviderApplySnapshot: VortxNativeProviderCredentials.Document
         guard await settleNativeProviderJournal(capture: capture), isCurrent(capture) else { return false }
         do {
             var providers = try mergedNativeProviderState(doc, capture: capture)
-            let prepared = try await prepareNativeLegacyMaterial(doc, capture: capture)
-            guard isCurrent(capture) else { return false }
-            let material = prepared.material
-            if CoreBridge.shared.hasNativeSession {
-                let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
-                let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
-                let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture, legacyMaterial: material,
-                    websiteEvents: Self.nativeWebsiteEvents(doc), websiteAddonEvents: Self.nativeWebsiteAddonEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc), sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
-                guard isCurrent(capture) else { return false }
-                applyNativeGlobals(merged["nativeHostPreferences"]!)
-                try publishNativeWebsiteOutcome(merged["profileEditResults"]!, capture: capture)
+            if CoreBridge.shared.hasCertifiedNativeSession(capture: capture, profileID: ProfileStore.shared.activeID) {
+                try await commitNativePulledDocument(doc, capture: capture)
+                nativeAccountDocumentCommitted = true
             }
             providers = try persistMergedNativeProviders(providers, capture: capture)
             let mirrored = try mirrorNativeProviderKeys(providers, original: doc["apiKeys"])
@@ -3354,7 +3452,10 @@ final class VortXSyncManager: ObservableObject {
             // Empty strings are a local secure-store apply instruction, never emitted on wire.
             for (key, event) in providers.local.document.fields where event.value == .null { keys[key] = "" }
             doc["apiKeys"] = keys
-        } catch { return false }
+        } catch {
+            DiagnosticsLog.log("sync", "operation=native_pull_prepare result=failed reason=\(VortxNativeError.diagnosticCode(error))")
+            return false
+        }
 #endif
         var restored = false
         var restoredSettings = false
@@ -3854,6 +3955,20 @@ final class VortXSyncManager: ObservableObject {
             }
             return false
         }
+#if VORTX_NATIVE_DATA_ENGINE
+        guard await NativeForegroundSyncPolicy.mayAcknowledgeDocument(
+            nativeDocumentCommitted: nativeAccountDocumentCommitted,
+            isCurrent: { self.isCurrent(capture) },
+            ensureSession: { await self.ensureNativeCheckpoint(credentialCapture: capture) },
+            commitDocument: {
+                do { try await self.commitNativePulledDocument(pulled.doc, capture: capture); return true }
+                catch {
+                    DiagnosticsLog.log("sync", "operation=native_pull_commit result=failed reason=\(VortxNativeError.diagnosticCode(error))")
+                    return false
+                }
+            }
+        ) else { return false }
+#endif
         withRemoteApplySuppressed {
             guard isCurrent(capture) else { return }
             pendingProviderApply = nil
@@ -3895,7 +4010,7 @@ final class VortXSyncManager: ObservableObject {
     /// "engine account library empty AND the account owns one" so it runs at most once per fresh install.
     func hydrateEngineFromOwnedAddons(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async {
 #if VORTX_NATIVE_DATA_ENGINE
-        _ = await restoreNativeCheckpoint(credentialCapture: suppliedCapture)
+        _ = await ensureNativeCheckpoint(credentialCapture: suppliedCapture)
 #else
         let capture = suppliedCapture ?? credentialAuthority.capture()
         guard isSignedIn, isCurrent(capture) else { return }
@@ -4571,6 +4686,10 @@ final class VortXSyncManager: ObservableObject {
     /// Auto-sync: a debounced push, called whenever a setting / profile / key changes. Coalesces a burst
     /// of edits into one push a couple of seconds later, so every change propagates without spamming.
     private var pendingSync: Task<Void, Never>?
+#if VORTX_NATIVE_DATA_ENGINE
+    private var pendingSyncCapture: CredentialScopeRegistry.Capture?
+    private var pendingSyncID: UUID?
+#endif
     func requestSyncSoon() {
         guard isSignedIn else { return }
         // Universal "do not schedule a push from this write" gate. While syncDown is applying a remote pull
@@ -4580,6 +4699,43 @@ final class VortXSyncManager: ObservableObject {
         // debrid keys (DebridKeys.setKey) call requestSyncSoon() DIRECTLY, bypassing the observer, so the gate
         // must live here too to cover every call path. A genuine user edit never runs inside the apply window.
         guard !isApplyingRemote else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        let capture = credentialAuthority.capture()
+        guard isCurrent(capture) else { return }
+        if pendingSyncCapture != capture {
+            pendingSync?.cancel()
+            pendingSync = nil
+            nativePushQueue = .init()
+        }
+        nativePushQueue.request()
+        // Do not cancel an executing upload for a later local edit. Its captured generation
+        // will ACK only itself; the same worker exports the newer checkpoint next.
+        guard pendingSync == nil else { return }
+        let workerID = UUID()
+        pendingSyncCapture = capture
+        pendingSyncID = workerID
+        pendingSync = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.pendingSyncID == workerID {
+                    self.pendingSync = nil
+                    self.pendingSyncID = nil
+                }
+            }
+            while self.isSignedIn, self.isCurrent(capture), !Task.isCancelled {
+                do { try await Task.sleep(nanoseconds: 2_500_000_000) } catch { return }
+                guard self.isCurrent(capture), self.pendingSyncID == workerID else { return }
+                let generation = self.nativePushQueue.generation
+                let accepted = await self.syncUp()
+                guard self.isCurrent(capture), self.pendingSyncID == workerID else { return }
+                self.nativePushQueue.acknowledge(generation, accepted: accepted)
+                if !self.nativePushQueue.hasPendingPush { return }
+                // Keep durable edits pending while backgrounded; foreground catch-up resumes
+                // their worker. An offline active device retries without fabricating a sync badge.
+                if !self.realtimeActive { return }
+            }
+        }
+#else
         hasPendingPush = true
         pendingSync?.cancel()
         pendingSync = Task { [weak self] in
@@ -4594,6 +4750,7 @@ final class VortXSyncManager: ObservableObject {
             if Task.isCancelled { return }
             self?.hasPendingPush = false
         }
+#endif
     }
 
     /// Run a SYNCHRONOUS block of UserDefaults writes that should NOT arm an auto-push: applying a remote
@@ -4618,6 +4775,9 @@ final class VortXSyncManager: ObservableObject {
             self?.refreshSettingsShadow()
             self?.isApplyingRemote = false
             self?.drainLocalRosterPush()
+#if VORTX_NATIVE_DATA_ENGINE
+            self?.drainNativeMutationPush()
+#endif
         }
     }
 
@@ -4639,7 +4799,12 @@ final class VortXSyncManager: ObservableObject {
     /// Called on scene .active and on sign-in. Fail-soft and idempotent: no-op when signed out or
     /// already running, and a missing/failed WebSocket never breaks the existing foreground pull.
     func startRealtime() {
-        guard isSignedIn, !realtimeActive else { return }
+        guard isSignedIn else { return }
+        let capture = credentialAuthority.capture()
+        if realtimeActive {
+            guard wsCapture != capture else { return }
+            stopRealtime()
+        }
         realtimeActive = true
         wsBackoff = 1
         connectWebSocket()
@@ -4651,11 +4816,18 @@ final class VortXSyncManager: ObservableObject {
         // survives an app delete, so restore() adopts the session while UserDefaults comes back empty. That is
         // the device the old code let push its near-empty local domain over the account. It is a no-op once the
         // gate is open, and the routine catch-up below then costs one cheap version-guarded pull.
+        let profileID = ProfileStore.shared.activeID
         Task {
-            await self.restoreAccountDocIfNeeded()
-            await self.syncDown()
+            await self.restoreAccountDocIfNeeded(credentialCapture: capture)
+            guard self.isCurrent(capture), ProfileStore.shared.activeID == profileID else { return }
+            await self.syncDown(credentialCapture: capture)
+            guard self.isCurrent(capture), ProfileStore.shared.activeID == profileID else { return }
 #if VORTX_NATIVE_DATA_ENGINE
-            _ = await self.restoreNativeCheckpoint()
+            _ = await self.ensureNativeCheckpoint(credentialCapture: capture)
+            guard self.isCurrent(capture), ProfileStore.shared.activeID == profileID else { return }
+            // Generic native edits are checkpoint-durable, not UserDefaults dirty keys. A process
+            // death after checkpoint commit but before cloud ACK must get another export on resume.
+            self.nativeMutationDidCommit(credentialCapture: capture)
 #endif
             // A settings change from a PREVIOUS session whose debounced push never landed (relaunch, offline, or a
             // crash before the 2.5s push) is still marked dirty and survived the pull above untouched. Arm a push
@@ -4673,9 +4845,11 @@ final class VortXSyncManager: ObservableObject {
         pollTask?.cancel(); pollTask = nil
         ws?.cancel(with: .goingAway, reason: nil)
         ws = nil
+        wsCapture = nil
     }
 
     private func connectWebSocket() {
+        let capture = credentialAuthority.capture()
         guard realtimeActive, isSignedIn, let token,
               // https -> wss for the SyncRoom upgrade endpoint.
               let url = URL(string: base.replacingOccurrences(of: "https://", with: "wss://") + "/v1/sync/connect")
@@ -4684,6 +4858,7 @@ final class VortXSyncManager: ObservableObject {
         req.setValue("Bearer " + token, forHTTPHeaderField: "authorization")
         let task = URLSession.shared.webSocketTask(with: req)
         ws = task
+        wsCapture = capture
         task.resume()
         startKeepAlive()
         receiveNext()
@@ -4692,13 +4867,13 @@ final class VortXSyncManager: ObservableObject {
     /// One receive at a time, re-armed after each message. A failure means the socket dropped: schedule a
     /// backoff reconnect (the while-active poll keeps changes flowing in the meantime).
     private func receiveNext() {
-        guard let task = ws else { return }
+        guard let task = ws, let capture = wsCapture, isCurrent(capture) else { return }
         task.receive { [weak self] result in
             Task { @MainActor in
-                guard let self, self.ws === task else { return }   // ignore a stale socket's late callback
+                guard let self, self.ws === task, self.wsCapture == capture, self.isCurrent(capture) else { return }
                 switch result {
                 case .success(let message):
-                    self.handle(message)
+                    self.handle(message, credentialCapture: capture)
                     self.wsBackoff = 1   // a clean message means the link is healthy; reset backoff
                     self.receiveNext()
                 case .failure:
@@ -4708,7 +4883,7 @@ final class VortXSyncManager: ObservableObject {
         }
     }
 
-    private func handle(_ message: URLSessionWebSocketTask.Message) {
+    private func handle(_ message: URLSessionWebSocketTask.Message, credentialCapture capture: CredentialScopeRegistry.Capture) {
         let text: String?
         switch message {
         case .string(let s): text = s
@@ -4721,12 +4896,14 @@ final class VortXSyncManager: ObservableObject {
         // Only pull when the broadcast version is genuinely newer than what we hold. This is the same
         // version guard syncDown() enforces, checked up front so our own push echo (and the keep-alive
         // pong) never triggers a redundant pull or a feedback loop with requestSyncSoon.
-        let version = (obj["version"] as? Int) ?? Int(obj["version"] as? Double ?? 0)
-        guard version > lastSyncedVersion else { return }
-        Task { await syncDown() }   // syncDown re-checks the guard, so this stays idempotent
+        guard let version = Self.documentVersion(obj["version"]),
+              NativeForegroundSyncPolicy.shouldPullBroadcast(version: version, lastAcknowledgedVersion: lastSyncedVersion,
+                                                            ownerIsCurrent: isCurrent(capture)) else { return }
+        Task { await syncDown(credentialCapture: capture) }
     }
 
     private func scheduleReconnect() {
+        guard let capture = wsCapture, isCurrent(capture) else { return }
         ws?.cancel(with: .abnormalClosure, reason: nil)
         ws = nil
         wsKeepAlive?.cancel(); wsKeepAlive = nil
@@ -4737,34 +4914,43 @@ final class VortXSyncManager: ObservableObject {
         wsReconnect = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             if Task.isCancelled { return }
-            await MainActor.run { self?.connectWebSocket() }
+            guard let self, self.isCurrent(capture), self.realtimeActive else { return }
+            self.connectWebSocket()
         }
     }
 
     /// Periodic "ping" so an idle room (Hibernation API) keeps our socket; the worker replies "pong".
     private func startKeepAlive() {
+        guard let task = ws, let capture = wsCapture else { return }
         wsKeepAlive?.cancel()
         wsKeepAlive = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: self?.keepAliveNanos ?? 30_000_000_000)
                 if Task.isCancelled { return }
-                guard let self, let task = self.ws else { return }
+                guard let self, self.ws === task, self.wsCapture == capture, self.isCurrent(capture) else { return }
                 task.send(.string("ping")) { [weak self] error in
-                    if error != nil { Task { @MainActor in self?.scheduleReconnect() } }
+                    if error != nil {
+                        Task { @MainActor in
+                            guard let self, self.ws === task, self.wsCapture == capture, self.isCurrent(capture) else { return }
+                            self.scheduleReconnect()
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Lightweight fallback: while active, pull every ~10s so changes propagate near-real-time even if the
+    /// Lightweight fallback: while active, pull every ~3s (native) / ~10s (legacy), even if the
     /// WebSocket is unavailable. Cheap (the version guard skips no-op pulls) and cancelled on background.
     private func startPoll() {
+        let capture = credentialAuthority.capture()
         pollTask?.cancel()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: self?.pollIntervalNanos ?? 10_000_000_000)
+                try? await Task.sleep(nanoseconds: self?.pollIntervalNanos ?? 3_000_000_000)
                 if Task.isCancelled { return }
-                await self?.syncDown()   // guarded: applies only versions newer than ours, skips while a push is queued
+                guard let self, self.isCurrent(capture) else { return }
+                await self.syncDown(credentialCapture: capture)
             }
         }
     }

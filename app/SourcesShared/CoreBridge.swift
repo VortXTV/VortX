@@ -27,6 +27,7 @@ final class CoreSearchPublicationFence: @unchecked Sendable {
     }
     func accepts(_ token: UUID) -> Bool { lock.withLock { generation == token } }
     func invalidate() { lock.withLock { generation = UUID() } }
+    var activeQuery: String? { lock.withLock { query.count >= 2 ? query : nil } }
 }
 
 /// A queued board snapshot can predate a page request. Only the appended terminal page may
@@ -67,6 +68,66 @@ final class CoreBridge: ObservableObject {
     private var nativeFacade: VortxNativeCoreFacade? { nativeFacadeLock.withLock { nativeFacadeStorage } }
     var nativeRegistryBinding: VortxNativeCoreFacade.RegistryBinding? { nativeFacade?.registryBinding }
     var hasNativeSession: Bool { nativeFacade?.isAvailable == true }
+    @MainActor
+    func hasCertifiedNativeSession(capture: CredentialScopeRegistry.Capture, profileID: UUID?) -> Bool {
+        nativeFacadeLock.withLock {
+            guard let binding = currentNativePlaybackBinding() else { return false }
+            return binding.credential == capture && binding.profileID == profileID
+        }
+    }
+    @MainActor
+    func settleResidentNativeSession(capture: CredentialScopeRegistry.Capture) async {
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              let facade = nativeFacadeLock.withLock({ nativeCredentialCapture == capture ? nativeFacadeStorage : nil }),
+              facade.isAvailable else { return }
+        await facade.settled()
+        guard CredentialScopeRegistry.shared.isCurrent(capture),
+              nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeCredentialCapture == capture }) else { return }
+        // The facade FIFO can settle before the user operation's MainActor continuation publishes
+        // its roster epoch. Certify that accepted snapshot now, not the temporarily stale projection.
+        try? refreshNativeProfiles()
+    }
+    struct NativeResourceRestoreReceipt {
+        let credential: CredentialScopeRegistry.Capture
+        let profileID: UUID
+        let intent: NativeForegroundSyncPolicy.ResourceIntent
+    }
+    private struct NativeResourceIntentScope: Equatable {
+        let credential: CredentialScopeRegistry.Capture
+        let profileID: UUID?
+    }
+    private var nativeSearchRequestScope: NativeResourceIntentScope?
+    @MainActor
+    func captureNativeResourceRestore(capture: CredentialScopeRegistry.Capture,
+                                      profileID: UUID?) -> NativeResourceRestoreReceipt? {
+        guard CredentialScopeRegistry.shared.isCurrent(capture), ProfileStore.shared.activeID == profileID, let profileID else { return nil }
+        let scope = NativeResourceIntentScope(credential: capture, profileID: profileID)
+        let searchScope = nativeFacadeLock.withLock { nativeSearchRequestScope }
+        let metadata = metaLoadTargetLock.withLock { (nativeMetaRequestAction, nativeMetaRequestGeneration, nativeMetaRequestScope) }
+        return .init(credential: capture, profileID: profileID,
+                     intent: .init(searchQuery: searchLoaded && searchScope == scope ? searchPublication.activeQuery : nil,
+                                   metadataAction: metadata.2 == scope ? metadata.0 : nil, metadataGeneration: metadata.1))
+    }
+    @MainActor
+    func replayNativeResourceRestore(_ receipt: NativeResourceRestoreReceipt?, target: PlaybackMutationTarget) {
+        guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }),
+              PlaybackMutationOwnershipPolicy.allowsNative(target, binding: binding) else { return }
+        let scope = NativeResourceIntentScope(credential: binding.credential, profileID: binding.profileID)
+        let oldIntent = receipt.flatMap { $0.credential == binding.credential && $0.profileID == binding.profileID ? $0.intent : nil }
+            ?? .init(searchQuery: nil, metadataAction: nil, metadataGeneration: UUID())
+        let searchScope = nativeFacadeLock.withLock { nativeSearchRequestScope }
+        // A request made between close and install is newer than the held receipt, but was not
+        // dispatchable. Replay it only under its own original owner/profile, including a cold mount.
+        if let query = oldIntent.searchToReplay(currentQuery: searchPublication.activeQuery,
+                                               hasPendingSearch: searchLoaded, pendingScopeIsCurrent: searchScope == scope) { search(query) }
+        let metadata = metaLoadTargetLock.withLock { (nativeMetaRequestAction, nativeMetaRequestGeneration, nativeMetaRequestScope) }
+        if let data = oldIntent.metadataToReplay(currentAction: metadata.0, currentGeneration: metadata.1,
+                                                 pendingScopeIsCurrent: metadata.2 == scope),
+           let action = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            guard nativePlaybackTargetIsCurrent(target) else { return }
+            dispatch(action: action, field: "meta_details")
+        }
+    }
     func nativePlaybackSnapshot() -> VortxJSON? {
         guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }),
               let (facade, _) = nativePlaybackBinding(.native(binding)), let data = facade.stateData("native_playback") else { return nil }
@@ -165,13 +226,20 @@ final class CoreBridge: ObservableObject {
               positionSeconds * 1000 < Double(UInt64.max), durationSeconds * 1000 < Double(UInt64.max) else {
             DiagnosticsLog.log("native-playback", "operation=report_progress result=rejected reason=invalid_time"); return
         }
+        let isEpisodic = EpisodePlaybackIdentity.isEpisodicContext(type: meta.type, season: meta.season,
+                                                                 episode: meta.episode, videoID: meta.videoId)
+        let identity = NativeForegroundSyncPolicy.progressIdentity(isEpisodic: isEpisodic,
+                                                                   libraryID: meta.libraryId, videoID: meta.videoId)
+        guard identity != .reject else {
+            DiagnosticsLog.log("native-playback", "operation=report_progress result=rejected reason=episode_identity_unavailable"); return
+        }
         var action: [String: VortxJSON] = ["type": .string("report_progress"), "metaId": .string(meta.libraryId),
                                           "name": .string(meta.name), "positionMs": .unsigned(UInt64(positionSeconds * 1000)),
                                           "durationMs": .unsigned(UInt64(durationSeconds * 1000)),
                                           "metadata": .object(["type": .string(meta.type), "poster": meta.poster.map(VortxJSON.string) ?? .null])]
-        if meta.usesSeriesLifecycle { action["videoId"] = .string(meta.videoId) }
+        if case .episode(let videoID) = identity { action["videoId"] = .string(videoID) }
         let accepted = facade.dispatchForProfile(.object(action), profileID: profile.uuidString, expectedAccountGeneration: epoch)
-        DiagnosticsLog.log("native-playback", "operation=report_progress admitted=\(accepted) positionMs=\(UInt64(positionSeconds * 1000)) durationMs=\(UInt64(durationSeconds * 1000)) episode=\(meta.usesSeriesLifecycle)")
+        DiagnosticsLog.log("native-playback", "operation=report_progress admitted=\(accepted) positionMs=\(UInt64(positionSeconds * 1000)) durationMs=\(UInt64(durationSeconds * 1000)) episode=\(isEpisodic)")
     }
     private func nativeWatchedIntent(id: String, videoID: String? = nil, name: String, type: String,
                                      poster: String?, watched: Bool, target: PlaybackMutationTarget? = nil) {
@@ -613,7 +681,7 @@ final class CoreBridge: ObservableObject {
         let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry, mutationAccepted: {
             Task { @MainActor in
                 guard CredentialScopeRegistry.shared.isCurrent(capture) else { return }
-                VortXSyncManager.shared.requestSyncSoon()
+                VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: capture)
             }
         }) { [weak self] fields in
             guard CredentialScopeRegistry.shared.isCurrent(capture),
@@ -670,7 +738,10 @@ final class CoreBridge: ObservableObject {
         AddonMetaGate.publish(false)
         boardCatalogTotal = 0; boardPageInFlight = false; boardRowPageInFlight = [:]; boardRowExhausted = []
         deferredBoardRowPages = []; deferredBoardRangeDepth = nil
-        metaLoadTargetLock.withLock { requestedMetaLoadTarget = nil }
+        metaLoadTargetLock.withLock {
+            requestedMetaLoadTarget = nil
+            nativeMetaRequestAction = nil
+        }
         pendingEpisodeWatched = [:]; refindRequest = nil; cancelAppleCWMetaRefresh()
         invalidateNZBIndexerResults(); streamsEpoch &+= 1
         changedFields = ["native_state", "ctx", "library", "continue_watching_preview", "board", "search", "discover", "meta_details"]
@@ -689,6 +760,11 @@ final class CoreBridge: ObservableObject {
     @Published private(set) var metaDetails: CoreMetaDetails?
     private let metaLoadTargetLock = NSLock()
     private var requestedMetaLoadTarget: MetaLoadTarget?
+#if VORTX_NATIVE_DATA_ENGINE
+    private var nativeMetaRequestAction: Data?
+    private var nativeMetaRequestGeneration = UUID()
+    private var nativeMetaRequestScope: NativeResourceIntentScope?
+#endif
     /// Synchronous request identity; do not mistake the coalesced previous payload for current ownership.
     var currentMetaLoadTarget: MetaLoadTarget? {
         metaLoadTargetLock.withLock { requestedMetaLoadTarget }
@@ -2458,6 +2534,11 @@ final class CoreBridge: ObservableObject {
     /// extra). Results land in `searchResults`, flattened and de-duplicated into one grid.
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+#if VORTX_NATIVE_DATA_ENGINE
+        nativeFacadeLock.withLock {
+            nativeSearchRequestScope = .init(credential: CredentialScopeRegistry.shared.capture(), profileID: ProfileStore.shared.activeID)
+        }
+#endif
         prepareSearch(trimmed)
         let token = searchPublication.prepare(trimmed).token
         setSearchLoading(trimmed.count >= 2, token: token)
@@ -5162,9 +5243,21 @@ final class CoreBridge: ObservableObject {
            let model = args["args"] as? [String: Any], let meta = model["metaPath"] as? [String: Any],
            let id = meta["id"] as? String {
             let streamID = (model["streamPath"] as? [String: Any])?["id"] as? String
-            metaLoadTargetLock.withLock { requestedMetaLoadTarget = MetaLoadTarget(metaID: id, streamID: streamID) }
+            metaLoadTargetLock.withLock {
+                requestedMetaLoadTarget = MetaLoadTarget(metaID: id, streamID: streamID)
+#if VORTX_NATIVE_DATA_ENGINE
+                nativeMetaRequestAction = try? JSONSerialization.data(withJSONObject: action)
+                nativeMetaRequestGeneration = UUID()
+                nativeMetaRequestScope = .init(credential: CredentialScopeRegistry.shared.capture(), profileID: ProfileStore.shared.activeID)
+#endif
+            }
         } else if topLevelAction == "Unload", field == "meta_details" || field == nil {
-            metaLoadTargetLock.withLock { requestedMetaLoadTarget = nil }
+            metaLoadTargetLock.withLock {
+                requestedMetaLoadTarget = nil
+#if VORTX_NATIVE_DATA_ENGINE
+                nativeMetaRequestAction = nil; nativeMetaRequestGeneration = UUID()
+#endif
+            }
         }
         // [engine] narrate every dispatched action (its name + the field it targets) so the log shows
         // what we asked the engine to do. Gated + autoclosure: shipping builds build no string.
