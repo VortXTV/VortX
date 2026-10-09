@@ -88,8 +88,10 @@ progress with unknown viewing dates and known aliases are preserved. It passed 1
 checks against seven failing baseline cases; complete Linux/macOS native CI and matching
 shipping-source pins are now accepted. Fresh SDK/app packages and device proof remain pending.
 The reproduced blocked-HTTP/rapid-seek path now has a reviewed interruption and MKV-cues
-retry repair with seven actual Mac-arm64 native controls passing. Its top-level HTTP(S) GET
-scope does not establish HLS/curl, full-vendor/app shipping, provider or hardware acceptance.
+retry repair with seven actual Mac-arm64 native controls passing again from the assembled
+player package. All nine Apple slices were rebuilt and byte-verified; the reviewed internal
+vendor package is published and selected by default. This is not an app release, Android AAR
+repair, HLS/curl, provider or hardware acceptance.
 Fresh final
 SDK/optimized whole-app rebuilding, actual package versions, signing, provenance/feeds and
 physical device/provider acceptance remain pending. Infuse watched-return, mpv PiP and broader
