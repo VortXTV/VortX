@@ -50,7 +50,13 @@ struct VortxNativeHostPreferences: Sendable {
             try Self.validate(value.document, scope: scope)
             try VortxNativeProfileEditHost.validateJournal(value)
             try VortxNativeWebsiteAddonEdits.validateJournal(value)
-            if let archive = value.authenticatedSourceArchive { try VortxNativeBootstrapArchive.validate(archive) }
+            if let archive = value.authenticatedSourceArchive {
+                try VortxNativeBootstrapArchive.validate(archive)
+                let source = try JSONDecoder().decode(VortxJSON.self, from: archive)
+                let pending = try source["hostDocument"]?[VortxLegacyMembershipReceiptArchive.key].map { try JSONEncoder().encode($0) }
+                _ = try VortxLegacyMembershipReceiptArchive.merging(nil, with: pending,
+                    scope: scope.account, ownerProfileID: scope.ownerProfileID)
+            }
             // The installation supplies its own keychain actor. Never adopt a restored actor.
             value.actor = actor; value.counter = max(value.counter, Self.maximum(value.document)); local = value
         } else { local = Local(actor: actor, counter: 0, document: Document(schemaVersion: 1, scope: scope.account, ownerProfileId: scope.ownerProfileID)) }
@@ -63,11 +69,13 @@ struct VortxNativeHostPreferences: Sendable {
         guard case .object(let sources) = incoming["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
         var retained: [String: VortxJSON] = [:]
         var pending: VortxJSON?
+        var pendingMembership: Data?
         if let prior = local.authenticatedSourceArchive {
             let old = try JSONDecoder().decode(VortxJSON.self, from: prior)
             guard case .object(let values) = old["hostDocument"]?["ownAccountSources"] else { throw VortxNativeError.invalidSnapshot }
             retained = values
             pending = old["hostDocument"]?["ownAccountOverlayPending"]
+            pendingMembership = try old["hostDocument"]?[VortxLegacyMembershipReceiptArchive.key].map { try JSONEncoder().encode($0) }
         }
         for (id, source) in sources { retained[id] = source }
         if let incomingPending = incoming["hostDocument"]?["ownAccountOverlayPending"] {
@@ -76,6 +84,11 @@ struct VortxNativeHostPreferences: Sendable {
         }
         var documentFields: [String: VortxJSON] = ["ownAccountSources": .object(retained)]
         if let pending { documentFields["ownAccountOverlayPending"] = pending }
+        let incomingMembership = try incoming["hostDocument"]?[VortxLegacyMembershipReceiptArchive.key].map { try JSONEncoder().encode($0) }
+        if let membership = try VortxLegacyMembershipReceiptArchive.merging(pendingMembership, with: incomingMembership,
+                scope: local.document.scope, ownerProfileID: local.document.ownerProfileId) {
+            documentFields[VortxLegacyMembershipReceiptArchive.key] = try JSONDecoder().decode(VortxJSON.self, from: membership)
+        }
         let document = try JSONEncoder().encode(VortxJSON.object(documentFields))
         let merged = try VortxNativeBootstrapArchive.encode(document: document)
         let scope = VortxAccountScope(account: local.document.scope, ownerProfileID: local.document.ownerProfileId)

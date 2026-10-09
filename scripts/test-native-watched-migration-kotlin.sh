@@ -30,6 +30,7 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android/engine"
     -no-stdlib -no-reflect -jvm-target 17 -module-name app -Xfriend-paths="$app_classes" -classpath "$test_cp" \
     "$source_dir/LegacyWatchedBitfieldDecoder.kt" "$source_dir/LegacyWatchedBitfieldMigrationEvidence.kt" \
     "$source_dir/NativeWatchedMigrationProducer.kt" "$source_dir/NativeLegacyMaterial.kt" \
+    "$source_dir/NativeAccountCoordinator.kt" "$source_dir/NativeMigrationPreflight.kt" \
     "$test_source/LegacyWatchedBitfieldDecoderTest.kt" "$test_source/LegacyWatchedBitfieldMigrationEvidenceTest.kt" \
     "$test_source/NativeLegacyMaterialTest.kt" "$test_source/NativeWatchedMigrationProducerTest.kt" -d "$test_dir/classes"
 cd "$repo_root/android/app"

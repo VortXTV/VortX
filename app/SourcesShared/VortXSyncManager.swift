@@ -717,17 +717,24 @@ final class VortXSyncManager: ObservableObject {
             nativeWatchedMigrationPending = try VortxNativeWatchedArchive.pendingProfileIDs(pendingArchive)
             throw VortxNativeWatchedArchive.Failure.pending
         }
-        let material = try VortxLegacyBootstrapMaterial.encode(document: documentBytes,
+        let preparation = try VortxLegacyBootstrapMaterial.prepare(document: documentBytes,
             roster: roster.profiles, ownerProfileID: owner.id, rosterModifiedSeconds: roster.modified,
             deferProfileEdits: true, ownAccountSources: sources, retainedOwnAccountBaseline: retainedBaseline,
             retainedOwnAccountSourceEnvelopes: envelopes, retainedOwnAccountSlotBaselines: retainedSlots,
             deferredOwnAccountOverlays: deferred, accountID: capture.namespace, watchedEvidence: watched.rows)
+        // Historical orphan receipts are not permission to fetch/reinstall an add-on or guess a
+        // removed title's type. Retain them atomically with this account's encrypted checkpoint.
+        // Native exports continue to preserve every original legacy cloud carrier unchanged.
+        let preparedArchive = try VortxLegacyMembershipReceiptArchive.appending(preparation.pendingMembershipReceipts,
+            to: archive, scope: scope.account, ownerProfileID: scope.ownerProfileID,
+            sourceDocumentSHA256: SHA256.hash(data: documentBytes).map { String(format: "%02x", $0) }.joined())
+        DiagnosticsLog.log("native-profiles", "prepare result=ready pending_membership_receipts=\(preparation.pendingCount)")
         nativeOwnAccountResyncUnavailable = unavailable
         for source in sources {
             guard let binding = captured.first(where: { $0.profileID == source.profileID }) else { throw VortxNativeError.invalidSnapshot }
             try CoreBridge.stageNativeCredential(token: binding.token, source: source, transactionID: nil, capture: capture, authority: authority)
         }
-        return .init(material: material, authority: authority, sourceArchive: archive)
+        return .init(material: preparation.material, authority: authority, sourceArchive: preparedArchive)
     }
     private static func nativeWebsiteEvents(_ document: [String: Any]) throws -> [VortxJSON] {
         let carrier = try document["profileEditEvents"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }

@@ -4,6 +4,14 @@ import Foundation
 struct ProfilePickerLayout {
     let width: CGFloat
     let largeText: Bool
+    let isPhone: Bool
+
+    init(width: CGFloat, largeText: Bool, isPhone: Bool = false) {
+        self.width = width
+        self.largeText = largeText
+        self.isPhone = isPhone
+    }
+
     var isWide: Bool { width >= 700 }
     var horizontalInset: CGFloat { isWide ? 48 : 24 }
     var spacing: CGFloat { isWide ? 28 : 18 }

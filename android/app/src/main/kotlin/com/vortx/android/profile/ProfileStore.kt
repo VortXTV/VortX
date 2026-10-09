@@ -912,6 +912,9 @@ class ProfileStore private constructor(context: Context) {
      * device's active selection (selection is per-device). Mirrors Apple `reloadFromDefaults`.
      */
     fun reloadFromDefaults() = ContinueWatchingOwnerGate.serialized {
+        if (refreshNativeProfilesForReload(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+                refreshNativeProjection()
+            }) return@serialized
         val list = prefs.getString(LIST_KEY, null)?.let { UserProfile.decodeRoster(it) }
             ?: return@serialized
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {

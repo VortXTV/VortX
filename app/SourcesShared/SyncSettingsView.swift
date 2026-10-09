@@ -21,6 +21,7 @@ struct SyncSettingsView: View {
     @State private var showConflict = false       // account already has data: ask which side to keep
     @State private var syncing = false
     @State private var syncNote: String?          // signed-in status line: the tri-state retry surface
+    @State private var showQRSignIn = false
 
     var body: some View {
         ScrollView {
@@ -40,6 +41,10 @@ struct SyncSettingsView: View {
             .frame(maxWidth: 720, alignment: .leading)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .sheet(isPresented: $showQRSignIn) {
+            qrSignInSheet
+                .environmentObject(sync)
+        }
         .alert("Sync conflict", isPresented: $showConflict) {
             // "Merge both" is the recommended/default: it unions the rosters so NO profile is lost.
             // The other two force one side, but even "Use account's data" still keeps local-only
@@ -96,6 +101,10 @@ struct SyncSettingsView: View {
             Text("Optional. A free, end-to-end-encrypted account keeps your profiles, settings, and library safe across devices.")
                 .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
 
+            Button("Sign in with QR code") { showQRSignIn = true }
+                .buttonStyle(ChipButtonStyle())
+                .disabled(working)
+
             HStack(spacing: Theme.Space.sm) {
                 ForEach(Mode.allCases, id: \.self) { m in
                     Button(m.rawValue) { mode = m; message = nil; needsTotp = false }
@@ -120,6 +129,30 @@ struct SyncSettingsView: View {
                 .buttonStyle(PrimaryActionStyle())
                 .disabled(working || !canSubmit)
         }
+    }
+
+    // Present the shared joiner directly: iOSSignInView pushes this screen for its email path,
+    // so routing back through that view would create a recursive sign-in navigation flow.
+    private var qrSignInSheet: some View {
+        ScrollView {
+            VStack(spacing: Theme.Space.lg) {
+                HStack {
+                    Text("Sign in to VortX").font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                    Spacer()
+                    // In-content dismissal also works on Mac without touching the window toolbar.
+                    Button("Cancel") { showQRSignIn = false }
+                        .buttonStyle(ChipButtonStyle())
+                }
+                VortXAccountJoinerView(onSignedIn: { showQRSignIn = false })
+                    .frame(maxWidth: .infinity)
+            }
+            .padding(Theme.Space.lg)
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #if os(macOS)
+        .frame(minWidth: 480, minHeight: 520)
+        #endif
     }
 
     private var actionLabel: String {
@@ -243,6 +276,7 @@ struct SyncSettingsView: View {
         email = ""; username = ""; password = ""; totp = ""; recoveryCodeInput = ""
         needsTotp = false; message = nil; failed = false; newRecoveryCode = nil; mode = .signIn
         syncNote = nil
+        showQRSignIn = false
     }
 
     // MARK: Field helpers (cross-platform)

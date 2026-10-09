@@ -14,6 +14,10 @@ enum ProfilePickerLayoutTests {
         }
         precondition(ProfilePickerLayout(width: 393, largeText: false).columns == 3)
         precondition(ProfilePickerLayout(width: 393, largeText: true).columns == 2)
+        precondition(ProfilePickerLayout(width: 393, largeText: false, isPhone: true).isPhone,
+                     "Phone picker retains its established placement policy")
+        precondition(!ProfilePickerLayout(width: 834, largeText: false, isPhone: false).isPhone,
+                     "iPad/TV/Mac picker selects the centered placement policy")
         let source = try String(contentsOfFile: "app/SourcesShared/ProfilesView.swift", encoding: .utf8)
         let picker = source.components(separatedBy: "/// Centered 4-digit gate")[0]
         precondition(picker.contains("LazyVGrid(columns:"))
@@ -25,6 +29,10 @@ enum ProfilePickerLayoutTests {
         precondition(picker.contains("if !nativeSync.isSignedIn"))
         precondition(picker.contains("Button(\"Sign in\") { accountHelpNeeded = true }"))
         precondition(picker.contains(".disabled(!nativeSync.isSignedIn)"))
+        precondition(picker.contains("isPhone: profilePickerIsPhone"))
+        precondition(picker.contains("Spacer(minLength: max(40, geometry.size.height * 0.34)"))
+        precondition(picker.contains(".padding(.bottom, layout.isPhone ? 32 : 0)"))
+        precondition(picker.contains("alignment: layout.isPhone ? .bottom : .center"))
         let lockedEditor = source.components(separatedBy: "private var lockedPanel: some View")[1]
             .components(separatedBy: "private var canSave: Bool")[0]
         precondition(lockedEditor.contains("ViewThatFits(in: .horizontal)"))
@@ -35,6 +43,12 @@ enum ProfilePickerLayoutTests {
             .components(separatedBy: "private struct ProfileAvatarTile")[0]
         precondition(artwork.contains("AddonClient.cinemeta"))
         precondition(!artwork.contains("CoreBridge") && !artwork.contains("ProfileStore"))
+        precondition(artwork.contains("guard movie == nil, !Task.isCancelled else { return }"))
+        precondition(artwork.contains("prewarmNext(after: index)"))
+        precondition(artwork.contains("PosterImageLoader.cached(url, maxPixel: Self.artworkMaxPixel)"))
+        precondition(artwork.contains("readyIDs.remove(candidate.id)"))
+        precondition(artwork.components(separatedBy: "guard rotationToken == token, !Task.isCancelled else { return }").count - 1 >= 2,
+                     "rotation rechecks generation after prewarm and each candidate load")
         print("PASS profile picker: phone/tablet/Mac/TV grid bounds, large text, PIN-preserving Edit, public-only artwork, no migration paragraphs")
     }
 }
