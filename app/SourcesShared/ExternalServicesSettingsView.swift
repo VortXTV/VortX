@@ -133,16 +133,7 @@ private struct TraktConnectCard: View {
                             TraktPlaybackShadow.shared.reset()
                         }
                     }
-                Toggle("Use Trakt for Continue Watching", isOn: $traktContinueWatching)
-                    .tint(Theme.Palette.accent)
-                    .onChange(of: traktContinueWatching) { on in
-                        if on {
-                            TraktPlaybackShadow.shared.refreshNow()
-                        } else if !resumeSuggestion {
-                            TraktPlaybackShadow.shared.reset()
-                        }
-                    }
-                Text("When selected, the owner profile's Home rail follows paused items from Trakt. VortX stays visible until the first complete Trakt snapshot arrives.")
+                Text("Choose Local / VortX, Trakt, or SIMKL and the range in Settings → Appearance → Continue Watching. The selected service owns only the read-only Home rail.")
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textSecondary)
                 // Adds an "I'm watching this" action to detail pages, for a cinema or someone else's TV.
@@ -330,7 +321,10 @@ private struct SIMKLConnectCard: View {
                 // detail page shows "SIMKL rating · N" for titles already rated on SIMKL. Gated downstream on the
                 // ratings toggle; no-op when it is off.
                 SIMKLRatingsStore.shared.refreshNow()
-                await MainActor.run { connected = true; pin = nil; qr = nil; status = "" }
+                await MainActor.run {
+                    connected = true; pin = nil; qr = nil; status = ""
+                    HomeContinueWatchingSelection.refreshCurrent()
+                }
             } catch is CancellationError {
                 return
             } catch {

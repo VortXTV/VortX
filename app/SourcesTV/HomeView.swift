@@ -3,6 +3,8 @@ import SwiftUI
 /// Native tvOS Home, driven by the **stremio-core** engine (via `CoreBridge`): a "Continue Watching"
 /// rail plus every catalog of every installed addon, on the StremioX design system (Theme.swift).
 struct HomeView: View {
+    var isActive: Bool = true
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
@@ -20,7 +22,8 @@ struct HomeView: View {
     @ObservedObject private var imported = ImportedCatalogs.shared   // user-imported list catalogs, rendered as Home rows
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
     private var showCollectionsHub: Bool { catalogPrefs.showCollectionsHome }
-    @AppStorage(ExternalSyncToggle.traktContinueWatching) private var useTraktContinueWatching = false
+    @AppStorage(ContinueWatchingPreferences.sourceKey) private var continueWatchingSource = "local"
+    @AppStorage(ContinueWatchingPreferences.windowKey) private var continueWatchingWindow = "20"
     @State private var traktContinueWatchingRevision = 0
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
@@ -29,10 +32,11 @@ struct HomeView: View {
 
     /// The owner profile rides the account's Continue Watching; overlay profiles ride their own
     /// private synced history.
-    private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
+    private var continueWatchingSnapshot: HomeContinueWatchingSelection.Snapshot {
         _ = traktContinueWatchingRevision
-        return HomeContinueWatchingSelection.current(core: core, profiles: profiles).selection
+        return HomeContinueWatchingSelection.current(core: core, profiles: profiles)
     }
+    private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection { continueWatchingSnapshot.selection }
 
     private var continueWatching: [CoreCWItem] { continueWatchingSelection.items }
 
@@ -95,7 +99,8 @@ struct HomeView: View {
     /// `body` so the change-handler chain applied over it (see `homeChangeHandlers`) type-checks
     /// as its own expression.
     private var homeShell: some View {
-        NavigationStack {
+        let renderedContinueWatching = continueWatchingSnapshot
+        return NavigationStack {
             ZStack {
                 // The living backdrop: whichever poster is focused fills the screen with its
                 // artwork and details. Pure presentation, never focusable, so pressing up from
@@ -132,7 +137,7 @@ struct HomeView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
                         Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Home tab -> scroll here
-                        if !continueWatching.isEmpty {
+                        if !renderedContinueWatching.selection.items.isEmpty {
                             // The long-press menu is safe on every profile now: Details is pure
                             // navigation, and the dismiss routes into the overlay profile's own
                             // history inside CoreBridge.removeFromLibrary.
@@ -141,17 +146,24 @@ struct HomeView: View {
                             // poster-wall option never reshapes it. It is PINNED first (not part of
                             // HomeRailPreferences), so "Customize Home" never moves or hides it.
                             CoreContinueWatchingRow(
-                                items: continueWatching,
+                                items: renderedContinueWatching.selection.items,
                                 // Private remote rows never seed generic hero enrichment, trailer, or
                                 // artwork caches. The rail remains actionable and visibly sourced.
-                                focusModel: continueWatchingSelection.source == .trakt ? nil : focusModel,
+                                focusModel: renderedContinueWatching.selection.source.isPrivate ? nil : focusModel,
                                 // A Trakt row is read-only here. Its local-engine dismiss would delete the
                                 // wrong store, and remote playback deletion is outside this feature's scope.
-                                menu: continueWatchingSelection.source == .trakt
+                                menu: renderedContinueWatching.selection.source.isPrivate
                                     ? .none
                                     : .continueWatching,
-                                traktSessionID: continueWatchingSelection.sessionID
+                                traktSessionID: renderedContinueWatching.selection.sessionID,
+                                intent: renderedContinueWatching.intent,
+                                displayProgress: renderedContinueWatching.selection.displayProgress,
+                                captions: renderedContinueWatching.selection.captions
                             )
+                        }
+                        if let status = renderedContinueWatching.selection.status {
+                            Text(status).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                                .padding(.horizontal, Theme.Space.screenEdge)
                         }
                         // Every other Home section renders in the user's arranged order, minus the hidden ones
                         // (HomeRailPreferences). Default order + nothing hidden == today's Home exactly, so this
@@ -192,11 +204,17 @@ struct HomeView: View {
         homeShell
         .onAppear {
             configureMetaSources()
-            TraktPlaybackShadow.shared.refreshIfStale()
+            if isActive, scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
             seed()
             refreshTopPicks()
             refreshReleaseCalendar()
             if showCollectionsHub { collectionsHub.load() }
+        }
+        .onChange(of: isActive) { active in
+            if active, scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active, isActive { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
         }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
@@ -216,11 +234,19 @@ struct HomeView: View {
         .onChange(of: BecauseYouWatchedModel.observationSignature(items: profiles.cwItems)) { _ in
             seed(); refreshTopPicks()
         }
-        .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
-        .onChange(of: useTraktContinueWatching) { on in
-            if on { TraktPlaybackShadow.shared.refreshNow() }
+        .onChange(of: profiles.activeID) { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles); seed(); refreshTopPicks() }
+        .onChange(of: continueWatchingSource) { _ in
+            HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             seed()
             refreshTopPicks()
+        }
+        .onChange(of: continueWatchingWindow) { _ in seed() }
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingPreferences.changedNote)) { _ in
+            HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
+            traktContinueWatchingRevision &+= 1; seed()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SIMKLContinueWatchingShadow.changedNote)) { _ in
+            traktContinueWatchingRevision &+= 1; seed()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in
             traktContinueWatchingRevision &+= 1
@@ -688,6 +714,7 @@ struct CWDetailTarget: Identifiable, Hashable {
     let resumeSeconds: Double?
     let videoID: String?
     let traktSessionID: TraktSessionID?
+    var intent: HomeContinueWatchingSelection.Intent? = nil
 }
 
 /// "Continue Watching" rail from the engine (`continue_watching_preview`), newest first, with a
@@ -697,50 +724,69 @@ struct CoreContinueWatchingRow: View {
     var focusModel: FocusedItemModel? = nil
     var menu: PosterMenu = .continueWatching   // .none on overlay-profile rails (engine menu doesn't apply)
     var traktSessionID: TraktSessionID?
+    var intent: HomeContinueWatchingSelection.Intent? = nil
+    var displayProgress: [String: Double] = [:]
+    var captions: [String: String] = [:]
     @EnvironmentObject private var theme: ThemeManager   // observe so the rail's cards repaint on a theme change
     @EnvironmentObject private var presenter: PlayerPresenter
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var core: CoreBridge
     @State private var detailTarget: CWDetailTarget?
+    @State private var unavailableContinueWatching: String?
     @State private var resumeHoardTask: Task<Void, Never>?
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             RailHeader(
-                eyebrow: traktSessionID == nil
+                eyebrow: intent?.source.isPrivate != true && traktSessionID == nil
                     ? String(localized: "Pick up where you left off")
-                    : String(localized: "From Trakt"),
+                    : "From \(intent?.source.label ?? "Trakt")",
                 title: String(localized: "Continue Watching")
             )
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
+                        VStack(alignment: .leading) {
                         PosterCard(title: item.name, poster: item.poster,
-                                   type: item.type, id: item.id, progress: item.progress,
+                                   type: item.type, id: item.id, progress: displayProgress[item.id] ?? item.progress,
                                    resumeSeconds: item.resumeSeconds,
                                    menu: menu,
-                                   privateArtwork: traktSessionID != nil,
-                                   onFocus: focusModel.map { model in
-                                       { model.focus(item.focusedHero) }
-                                   },
+                                   privateArtwork: intent?.source.isPrivate == true || traktSessionID != nil,
+                                   onFocus: Self.permitsHeroEnrichment(source: intent?.source, traktSessionID: traktSessionID)
+                                       ? focusModel.map { model in
+                                           {
+                                               guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
+                                               model.focus(item.focusedHero)
+                                           }
+                                       } : nil,
                                    directPlay: directResume(item),
                                    onDetails: {
+                                       guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
                                        guard traktSessionID == nil
                                                 || TraktAuth.storedSessionID == traktSessionID else { return }
+                                       if let reason = intent?.unavailableReason(id: item.id, type: item.type, videoID: item.state.videoId) {
+                                           unavailableContinueWatching = reason
+                                           return
+                                       }
                                        detailTarget = CWDetailTarget(
                                            id: item.id,
                                            type: item.type,
                                             resumeSeconds: item.resumeSeconds,
                                             videoID: item.state.videoId,
-                                           traktSessionID: traktSessionID
+                                           traktSessionID: traktSessionID,
+                                           intent: intent
                                        )
                                    })
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(
-                                traktSessionID == nil
+                                intent?.source.isPrivate != true && traktSessionID == nil
                                     ? item.name
-                                    : "\(item.name), From Trakt"
+                                    : "\(item.name), From \(intent?.source.label ?? "Trakt")"
                             )
+                        if let caption = captions[item.id] {
+                            Text(caption).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                        }
+                        }
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
@@ -748,15 +794,19 @@ struct CoreContinueWatchingRow: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .alert("Playback unavailable", isPresented: Binding(get: { unavailableContinueWatching != nil }, set: { if !$0 { unavailableContinueWatching = nil } })) {
+            Button("OK", role: .cancel) { unavailableContinueWatching = nil }
+        } message: { Text(unavailableContinueWatching ?? "") }
         .navigationDestination(item: $detailTarget) {
-            if $0.traktSessionID == nil
-                || TraktAuth.storedSessionID == $0.traktSessionID {
+            if $0.intent?.permitsDetails(id: $0.id, type: $0.type, videoID: $0.videoID) != false,
+               $0.traktSessionID == nil || TraktAuth.storedSessionID == $0.traktSessionID {
                 DetailView(
                     type: $0.type,
                     id: $0.id,
                     initialResumeSeconds: $0.resumeSeconds,
                     initialVideoID: $0.videoID,
-                    initialTraktSessionID: $0.traktSessionID
+                    initialTraktSessionID: $0.traktSessionID,
+                    initialContinueWatchingIntent: $0.intent
                 )
             }
         }
@@ -766,11 +816,20 @@ struct CoreContinueWatchingRow: View {
         }
     }
 
+    /// Focus stays native and usable, but private history never enters the generic
+    /// hero metadata fetch/cache path, even if another caller supplies a focus model.
+    static func permitsHeroEnrichment(source: ContinueWatchingService?, traktSessionID: TraktSessionID?) -> Bool {
+        source?.isPrivate != true && traktSessionID == nil
+    }
+
     /// Continue Watching resumes the exact link that was playing last time, straight
     /// into the player, instead of routing through the detail page and re-resolving
     /// sources. Falls back to the detail page when no remembered link fits: never
     /// played here, or the engine moved the series on to a different episode.
     private func directResume(_ item: CoreCWItem) -> (() -> Void)? {
+        // SIMKL supplies percentages/next-episode identity, not a truthful seconds offset.
+        // Resolve its captured target through Detail; never borrow this device's last stream.
+        guard intent?.source != .simkl else { return nil }
         let pid = profiles.activeID
         guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
             LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
@@ -791,6 +850,7 @@ struct CoreContinueWatchingRow: View {
         }
         LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
         return {
+            guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
             guard traktSessionID == nil
                     || TraktAuth.storedSessionID == traktSessionID else { return }
             let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
@@ -830,6 +890,7 @@ struct CoreContinueWatchingRow: View {
             Task { @MainActor in
                 let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
                 let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
+                guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
                 guard traktSessionID == nil
                         || TraktAuth.storedSessionID == traktSessionID else { return }
                 let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
@@ -851,6 +912,7 @@ struct CoreContinueWatchingRow: View {
                                     streamType: requestType, streamId: entry.videoId)
                     let eps = await prefetchEpisodes(bridge, itemID: item.id,
                                                      usesSeriesLifecycle: usesSeriesLifecycle)
+                    guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
                     guard traktSessionID == nil
                             || TraktAuth.storedSessionID == traktSessionID else { return }
                     let groups = bridge.streamGroups(forStreamId: entry.videoId)
@@ -892,6 +954,7 @@ struct CoreContinueWatchingRow: View {
                 }
                 let eps = await prefetchEpisodes(bridge, itemID: item.id,
                                                  usesSeriesLifecycle: usesSeriesLifecycle)
+                guard intent?.isCurrent(core: core, profiles: profiles) != false else { return }
                 guard traktSessionID == nil
                         || TraktAuth.storedSessionID == traktSessionID else { return }
                 let groups = bridge.streamGroups(forStreamId: entry.videoId)

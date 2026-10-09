@@ -959,6 +959,7 @@ private struct iOSCWDetailTarget: Hashable {
     let resumeSeconds: Double?
     let videoID: String?
     let traktSessionID: TraktSessionID?
+    let intent: HomeContinueWatchingSelection.Intent
 }
 
 /// A quick-view Watch intent. Detail owns authoritative metadata/source settlement; this value only says
@@ -969,17 +970,21 @@ struct CinemaDetailTarget: Hashable {
     let autoPlay: Bool
 }
 
-private struct iOSCWProducerProvenance: Sendable {
+private struct iOSCWProducerProvenance: @unchecked Sendable {
     let source: TraktPlaybackShadow.ContinueWatchingSource
     let traktSessionID: TraktSessionID?
+    let intent: HomeContinueWatchingSelection.Intent
 
     func isCurrent(traktSessionID currentSessionID: TraktSessionID?) -> Bool {
+        guard intent.isCurrent() else { return false }
         switch source {
         case .local:
             return traktSessionID == nil
         case .trakt:
             guard let traktSessionID else { return false }
             return currentSessionID == traktSessionID
+        case .simkl:
+            return intent.simklSessionID != nil && SIMKLAuth.storedSessionID == intent.simklSessionID
         }
     }
 }
@@ -987,12 +992,14 @@ private struct iOSCWProducerProvenance: Sendable {
 private struct iOSCWRenderSnapshot {
     let items: [RailItem]
     let provenance: iOSCWProducerProvenance
+    let status: String?
 }
 
 struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     var onBrowse: (() -> Void)? = nil
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
@@ -1014,9 +1021,11 @@ struct iOSHomeView: View {
     @ObservedObject private var railPrefs = HomeRailPreferences.shared   // user's Home row order + hidden set (Continue Watching stays pinned first)
     @ObservedObject private var homeCatalogPrefs = CatalogPreferences.shared
     private var showCollectionsHub: Bool { homeCatalogPrefs.showCollectionsHome }
-    @AppStorage(ExternalSyncToggle.traktContinueWatching) private var useTraktContinueWatching = false
+    @AppStorage(ContinueWatchingPreferences.sourceKey) private var continueWatchingSource = "local"
+    @AppStorage(ContinueWatchingPreferences.windowKey) private var continueWatchingWindow = "20"
     @State private var traktContinueWatchingRevision = 0
     @State private var path = NavigationPath()
+    @State private var unavailableContinueWatching: String?
     @State private var showCustomizeHome = false   // presents the Home rows reorder/hide editor
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
@@ -1037,20 +1046,23 @@ struct iOSHomeView: View {
     /// carry their in-progress `video_id` so a direct resume can confirm the remembered link
     /// still matches the episode the engine is parked on. The owner profile rides the account's
     /// engine history; an overlay profile rides its own private synced overlay (never the account).
-    private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
+    private var continueWatchingSnapshot: HomeContinueWatchingSelection.Snapshot {
         _ = traktContinueWatchingRevision
-        return HomeContinueWatchingSelection.current(core: core, profiles: profiles).selection
+        return HomeContinueWatchingSelection.current(core: core, profiles: profiles)
     }
 
     private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot {
-        let selection = continueWatchingSelection
+        let snapshot = continueWatchingSnapshot
+        let selection = snapshot.selection
         let residentCatalog = core.boardRows.flatMap(\.items)
         let items = selection.items.map {
             // Remote private history keeps its own bounded snapshot. Local history can reuse public
             // metadata already resident in the catalog/detail; drawing a shelf never fetches anything.
-            if selection.source == .trakt {
-                return RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress,
-                                cwVideoId: $0.state.videoId, resumeSeconds: $0.resumeSeconds)
+            if selection.source.isPrivate {
+                return RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster,
+                                progress: selection.displayProgress[$0.id] ?? $0.progress,
+                                cwVideoId: $0.state.videoId, caption: selection.captions[$0.id],
+                                resumeSeconds: $0.resumeSeconds)
             }
             return cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta)
         }
@@ -1058,8 +1070,10 @@ struct iOSHomeView: View {
             items: items,
             provenance: iOSCWProducerProvenance(
                 source: selection.source,
-                traktSessionID: selection.sessionID
-            )
+                traktSessionID: selection.sessionID,
+                intent: snapshot.intent
+            ),
+            status: selection.status
         )
     }
 
@@ -1073,7 +1087,7 @@ struct iOSHomeView: View {
     private var allRailItems: [RailItem] {
         // A remote Trakt row stays keyboard-focusable, but never enters the generic hero enrichment pool.
         let continueWatching = continueWatchingRenderSnapshot
-        var out = continueWatching.provenance.source == .trakt ? [] : continueWatching.items
+        var out = continueWatching.provenance.source.isPrivate ? [] : continueWatching.items
         out += topPicks.items.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         out += core.boardRows.flatMap { $0.items }.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
@@ -1230,8 +1244,8 @@ struct iOSHomeView: View {
                         // the exact last-played stream straight into the player (#11), falling back to opening
                         // detail when no remembered link fits. Long-press offers "Remove from Continue Watching".
                         homeRail(PosterRail(title: String(localized: "Continue Watching"),
-                                            eyebrow: renderedContinueWatching.provenance.source == .trakt
-                                                ? String(localized: "From Trakt")
+                                            eyebrow: renderedContinueWatching.provenance.source.isPrivate
+                                                ? "From \(renderedContinueWatching.provenance.source.label)"
                                                 : String(localized: "Pick up where you left off"),
                                             items: renderedContinueWatching.items,
                                             onTap: {
@@ -1243,7 +1257,7 @@ struct iOSHomeView: View {
                                             // Trakt-sourced rows are read-only. Their dismiss action targets
                                             // the local engine, not Trakt, so omit it until remote delete is
                                             // separately designed and authorized.
-                                            menu: renderedContinueWatching.provenance.source == .trakt
+                                            menu: renderedContinueWatching.provenance.source.isPrivate
                                                 ? .none
                                                 : .continueWatching,
                                             onDetails: {
@@ -1254,9 +1268,12 @@ struct iOSHomeView: View {
                                                 path.append(target)
                                             },
                                             accessibilityProvenance:
-                                                renderedContinueWatching.provenance.source == .trakt
-                                                ? String(localized: "From Trakt")
+                                                renderedContinueWatching.provenance.source.isPrivate
+                                                ? "From \(renderedContinueWatching.provenance.source.label)"
                                                 : nil))
+                    }
+                    if let status = renderedContinueWatching.status {
+                        Text(status).font(.caption).foregroundStyle(.secondary).padding(.horizontal, Theme.Space.md)
                     }
                     // Every other Home section renders in the user's arranged order, minus the hidden ones
                     // (HomeRailPreferences). Default order + nothing hidden == today's Home exactly, so this is
@@ -1346,6 +1363,9 @@ struct iOSHomeView: View {
             #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .sheet(isPresented: $showCustomizeHome) { HomeRailEditorView() }
+            .alert("Playback unavailable", isPresented: Binding(get: { unavailableContinueWatching != nil }, set: { if !$0 { unavailableContinueWatching = nil } })) {
+                Button("OK", role: .cancel) { unavailableContinueWatching = nil }
+            } message: { Text(unavailableContinueWatching ?? "") }
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 // Thread the hub card's already-resolved art so the detail hero never blanks while (or if)
                 // Cinemeta meta is nil for a new/unreleased title.
@@ -1353,7 +1373,7 @@ struct iOSHomeView: View {
                               seedBackdrop: item.backdrop, seedLogo: item.logo)
             }
             .navigationDestination(for: iOSCWDetailTarget.self) { target in
-                if target.traktSessionID == nil
+                if target.intent.permitsDetails(id: target.item.id, type: target.item.type, videoID: target.videoID), target.traktSessionID == nil
                     || TraktAuth.storedSessionID == target.traktSessionID {
                     iOSDetailView(
                         id: target.item.id,
@@ -1363,7 +1383,8 @@ struct iOSHomeView: View {
                         seedLogo: target.item.logo,
                         initialResumeSeconds: target.resumeSeconds,
                         initialVideoID: target.videoID,
-                        initialTraktSessionID: target.traktSessionID
+                        initialTraktSessionID: target.traktSessionID,
+                        initialContinueWatchingIntent: target.intent
                     )
                 }
             }
@@ -1395,7 +1416,13 @@ struct iOSHomeView: View {
         // Hidden tabs stay mounted (opacity-switched) and never hit onDisappear, so quiet the ambient
         // hero rotation while this is not the visible tab and re-arm it on return (#24 main-thread work).
         .onChange(of: isActive) { active in
-            if active { hero.seed(heroCandidates, reduceMotion: reduceMotion) } else { hero.stop() }
+            if active {
+                if scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
+                hero.seed(heroCandidates, reduceMotion: reduceMotion)
+            } else { hero.stop() }
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active, isActive { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
         }
         // Reseed the pool as content arrives; the model ignores no-op reseeds so rotation isn't reset
         // by routine engine re-emits.
@@ -1406,7 +1433,7 @@ struct iOSHomeView: View {
             // so a signed-in session (board already loaded at bootstrap) isn't re-fetched.
             if core.boardRows.isEmpty { core.loadBoard() }
             FeaturedHeroModel.configureMetaSources(core.addons)
-            TraktPlaybackShadow.shared.refreshIfStale()
+            if isActive, scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             refreshTopPicks()
             refreshReleaseCalendar()
@@ -1464,11 +1491,22 @@ struct iOSHomeView: View {
         .onChange(of: BecauseYouWatchedModel.observationSignature(items: profiles.cwItems)) { _ in
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
         }
-        .onChange(of: profiles.activeID) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
-        .onChange(of: useTraktContinueWatching) { on in
-            if on { TraktPlaybackShadow.shared.refreshNow() }
+        .onChange(of: profiles.activeID) { _ in
+            HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        }
+        .onChange(of: continueWatchingSource) { _ in
+            HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
             refreshTopPicks()
+        }
+        .onChange(of: continueWatchingWindow) { _ in traktContinueWatchingRevision &+= 1 }
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingPreferences.changedNote)) { _ in
+            HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
+            traktContinueWatchingRevision &+= 1
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SIMKLContinueWatchingShadow.changedNote)) { _ in
+            traktContinueWatchingRevision &+= 1
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in
             traktContinueWatchingRevision &+= 1
@@ -1890,6 +1928,14 @@ struct iOSHomeView: View {
     ) {
         hero.noteInteraction()
         guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
+        if let reason = provenance.intent.unavailableReason(id: item.id, type: item.type, videoID: item.cwVideoId) {
+            unavailableContinueWatching = reason
+            return
+        }
+        if provenance.source == .simkl {
+            if let target = cwDetailTarget(for: item, provenance: provenance) { path.append(target) }
+            return
+        }
         // Computing the resume offset may await the account, so resolve the direct-resume launch in a
         // Task; fall back to opening detail when no remembered link fits.
         Task {
@@ -1925,11 +1971,17 @@ struct iOSHomeView: View {
         provenance: iOSCWProducerProvenance
     ) -> iOSCWDetailTarget? {
         guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return nil }
+        if let reason = provenance.intent.unavailableReason(id: item.id, type: item.type, videoID: item.cwVideoId) {
+            unavailableContinueWatching = reason
+            return nil
+        }
+        guard provenance.intent.permitsDetails(id: item.id, type: item.type, videoID: item.cwVideoId) else { return nil }
         return iOSCWDetailTarget(
             item: FeaturedHeroItem.from(rail: item),
             resumeSeconds: item.resumeSeconds,
             videoID: item.cwVideoId,
-            traktSessionID: provenance.traktSessionID
+            traktSessionID: provenance.traktSessionID,
+            intent: provenance.intent
         )
     }
 

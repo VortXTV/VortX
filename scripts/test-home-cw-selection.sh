@@ -11,6 +11,10 @@ cw_inputs=(
     app/SourcesShared/TraktScrobbleProgressPolicy.swift
     app/SourcesShared/TraktArtworkPolicy.swift
     app/SourcesShared/TraktContinueWatchingFold.swift
+    app/SourcesShared/ContinueWatchingPreferences.swift
+    app/SourcesShared/ProfileDiscoveryPreferences.swift
+    app/SourcesShared/SIMKLContinueWatching.swift
+    app/SourcesShared/SIMKLContinueWatchingShadow.swift
     app/SourcesShared/TraktPlaybackShadow.swift
     app/SourcesShared/HomeContinueWatchingSelection.swift
     app/Tests/HomeContinueWatchingSelectionTests.swift

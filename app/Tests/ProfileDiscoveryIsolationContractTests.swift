@@ -4,6 +4,7 @@
 //
 //   xcrun swiftc -warnings-as-errors \
 //     app/SourcesShared/TabBarPrefs.swift \
+//     app/SourcesShared/ContinueWatchingPreferences.swift \
 //     app/SourcesShared/ProfileDiscoveryPreferences.swift \
 //     app/Tests/ProfileDiscoveryIsolationContractTests.swift \
 //     -o /tmp/profile-discovery-isolation-contract && \

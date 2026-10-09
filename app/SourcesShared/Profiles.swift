@@ -205,6 +205,14 @@ final class ProfileStore: ObservableObject {
     private var nativeProjectionTarget: PlaybackMutationTarget?
     private var nativePublishedPlayback: UserProfile.PlaybackPrefs?
     private var nativePublishedDiscovery: ProfileDiscoveryPreferences?
+    private let continueWatchingLegacyAccount = CredentialScopeRegistry.shared.capture()
+    private struct ContinueWatchingMigrationWitness {
+        let profileID: UUID
+        let target: PlaybackMutationTarget
+        let session: TraktSessionID
+    }
+    private var continueWatchingMigration: ContinueWatchingMigrationWitness?
+    private var continueWatchingMigrationInFlight = false
     static var nativePlaybackProjectionKeys: Set<String> {
         [TrackPreferences.Key.audio, TrackPreferences.Key.subtitle, TrackPreferences.Key.forced,
          SubtitleStyle.Key.font, SubtitleStyle.Key.size, SubtitleStyle.Key.color, SubtitleStyle.Key.background,
@@ -235,9 +243,39 @@ final class ProfileStore: ObservableObject {
         guard incoming.contains(where: { $0.id == selected }) else { return }
         let target = projectionTarget ?? CoreBridge.shared.captureNativePlaybackTarget()
         let sameInstallation = nativeProjectionTarget == target && activeID == selected
+        if !sameInstallation { ContinueWatchingPreferences.retireSelection() }
         // A same-session sync publication may run before a queued UI preference save. Preserve
         // its captured flat values until that transaction acknowledges; real switches still reset.
         let incomingActive = incoming.first { $0.id == selected }
+        // Capture BEFORE resetting the active projection. An outgoing viewer's global toggle is
+        // never evidence for the incoming profile. The native target is the acknowledged account
+        // installation, not an inferred owner/default credential slot.
+        if let witness = continueWatchingMigration,
+           witness.profileID != selected || witness.target != target || TraktAuth.storedSessionID != witness.session {
+            continueWatchingMigration = nil; continueWatchingMigrationInFlight = false
+        }
+        if continueWatchingMigration == nil,
+           CredentialScopeRegistry.shared.isMigrationEligible(continueWatchingLegacyAccount),
+           CredentialScopeRegistry.shared.isCurrent(continueWatchingLegacyAccount),
+           nativeProjectionTarget == nil || nativeProjectionTarget == target,
+           activeID == selected, let previous = active, previous.usesEngineHistory,
+           incomingActive?.usesEngineHistory == true,
+           previous.discovery?.continueWatchingSource == nil,
+           incomingActive?.discovery?.continueWatchingSource == nil,
+           UserDefaults.standard.object(forKey: ContinueWatchingPreferences.sourceKey) == nil,
+           UserDefaults.standard.bool(forKey: ExternalSyncToggle.traktContinueWatching),
+           target.stillOwnsCurrentContext(core: .shared),
+           let session = TraktAuth.storedSessionID {
+            continueWatchingMigration = .init(profileID: selected, target: target, session: session)
+        }
+        if let witness = continueWatchingMigration,
+           witness.profileID == selected, witness.target == target,
+           witness.target.stillOwnsCurrentContext(core: .shared), TraktAuth.storedSessionID == witness.session,
+           incomingActive?.discovery?.continueWatchingSource == "trakt" {
+            // This incoming projection is checkpoint-acknowledged. Admit just the qualified
+            // migration fields before dirty-value comparison; never replace another queued edit.
+            ProfileDiscoveryPreferencesStore.applyContinueWatching(incomingActive?.discovery, resetUnset: true)
+        }
         let flatPlayback = currentPlaybackPrefs(), flatDiscovery = currentDiscoveryPrefs()
         let pendingPlayback = sameInstallation && nativePublishedPlayback != flatPlayback && incomingActive?.playback != flatPlayback
         let pendingDiscovery = sameInstallation && nativePublishedDiscovery != flatDiscovery && incomingActive?.discovery != flatDiscovery
@@ -253,6 +291,34 @@ final class ProfileStore: ObservableObject {
                 if !pendingDiscovery { self.nativePublishedDiscovery = self.currentDiscoveryPrefs() }
                 SourcePreferences.shared.reload(); SourcePinStore.shared.reload()
             }
+            migrateContinueWatchingIfQualified(active)
+        }
+    }
+    private func migrateContinueWatchingIfQualified(_ profile: UserProfile) {
+        guard let witness = continueWatchingMigration else { return }
+        guard profile.discovery?.continueWatchingSource == nil else {
+            continueWatchingMigration = nil; return
+        }
+        guard !continueWatchingMigrationInFlight, profile.id == witness.profileID,
+              profile.usesEngineHistory, witness.target.stillOwnsCurrentContext(core: .shared),
+              TraktAuth.storedSessionID == witness.session else { return }
+        continueWatchingMigrationInFlight = true
+        var migrated = profile
+        var discovery = profile.discovery ?? ProfileDiscoveryPreferences()
+        discovery.continueWatchingSource = ContinueWatchingService.trakt.rawValue
+        discovery.continueWatchingWindow = discovery.continueWatchingWindow ?? ContinueWatchingWindow.twenty.rawValue
+        migrated.discovery = discovery
+        Task { @MainActor in
+            guard self.activeID == witness.profileID,
+                  self.continueWatchingMigration?.target == witness.target,
+                  witness.target.stillOwnsCurrentContext(core: .shared),
+                  TraktAuth.storedSessionID == witness.session else {
+                self.continueWatchingMigrationInFlight = false; return
+            }
+            // Publication comes only from saveNative's existing checkpoint-acknowledged projection.
+            // On failure retain this exact witness for a later same-installation retry.
+            _ = await self.saveNative(migrated, creating: false, target: witness.target)
+            self.continueWatchingMigrationInFlight = false
         }
     }
     @MainActor
@@ -1257,6 +1323,9 @@ final class ProfileStore: ObservableObject {
     /// and provider caller already reads. A true profile switch clears every missing field so a
     /// new profile starts clean, while sync folds leave unknown old-roster fields untouched.
     private func applyDiscovery(_ profile: UserProfile, resetUnset: Bool = false) {
+        #if !VORTX_NATIVE_DATA_ENGINE
+        if resetUnset { ContinueWatchingPreferences.retireSelection() }
+        #endif
         let p = profile.discovery
         ProfileDiscoveryPreferencesStore.apply(p, resetUnset: resetUnset)
         // The singleton views cache their @Published copies, and the hub holds region/provider
@@ -1271,25 +1340,36 @@ final class ProfileStore: ObservableObject {
             CatalogPreferences.shared.reloadFromDefaults()
             CollectionsHubModel.shared.reloadFromProfilePreferences()
             CoreBridge.shared.rebuildBoardRows()
+            NotificationCenter.default.post(name: ContinueWatchingPreferences.changedNote, object: nil)
         }
     }
 
     /// Fold an active viewer's already-applied discovery choices into its synced roster record.
     /// This intentionally persists without applying again: the flat keys are the source of truth
     /// for the live viewer at capture time, so a second reload would needlessly cancel hub work.
-    func captureDiscovery() {
+    func captureDiscovery(continueWatchingEdited: Bool = false) {
         guard let activeID,
               let index = profiles.firstIndex(where: { $0.id == activeID }) else { return }
-        let now = currentDiscoveryPrefs()
+        var now = currentDiscoveryPrefs()
+#if VORTX_NATIVE_DATA_ENGINE
+        if continueWatchingEdited { continueWatchingMigration = nil }
+        else if let witness = continueWatchingMigration,
+                witness.profileID == activeID, witness.target.stillOwnsCurrentContext(core: .shared),
+                TraktAuth.storedSessionID == witness.session {
+            // Keep the qualified old choice in this same durable edit, not the temporary Local
+            // projection used while migration waits. Its acknowledged projection admits it later.
+            now.continueWatchingSource = "trakt"
+        }
+#endif
         guard profiles[index].discovery != now else { return }
 #if VORTX_NATIVE_DATA_ENGINE
         var profile = profiles[index]
         profile.discovery = now
         update(profile)
-        return
-#endif
+#else
         profiles[index].discovery = now
         persist()
+#endif
     }
 
     // MARK: Persistence
@@ -1825,7 +1905,8 @@ final class ProfileStore: ObservableObject {
             let item = CoreCWItem(id: metaId, type: entry.type, name: entry.name, poster: entry.poster,
                                   state: CoreLibState(timeOffset: Double(entry.timeOffsetMs),
                                                       duration: Double(entry.durationMs),
-                                                      videoId: entry.videoId))
+                                                      videoId: entry.videoId,
+                                                      lastWatched: entry.lastWatched))
             dated.append((entry.lastWatched, item))
         }
         let ordered = dated.sorted {
@@ -1844,7 +1925,7 @@ final class ProfileStore: ObservableObject {
                     && $0.item.state.duration.isFinite && $0.item.state.duration > 0
             )
         }
-        return unique.prefix(30).map(\.item)
+        return unique.map(\.item) // the selected range is applied once by HomeContinueWatchingSelection
     }
 
     /// The active overlay profile's full Library: EVERY title it has watched, newest first. Unlike

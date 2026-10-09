@@ -1871,6 +1871,7 @@ struct iOSSettingsView: View {
 
     @ViewBuilder private var appearanceSection: some View {
         Section {
+            ContinueWatchingSettingsView()
             Toggle("Quick view", isOn: $quickViewEnabled)
             Text("Open compact details before entering a full title page. Applies to catalog cards across Home and Discover.")
                 .font(.caption)

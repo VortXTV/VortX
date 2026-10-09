@@ -108,7 +108,10 @@ enum TopShelfSnapshotWriter {
         let snapshot = HomeContinueWatchingSelection.current(core: CoreBridge.shared, profiles: profiles)
         let selection = snapshot.selection
         let context = snapshot.context
-        let pending = items(from: selection.items, source: selection.source)
+        let pending = items(from: selection.items, source: selection.source, displayProgress: selection.displayProgress)
+        guard snapshot.intent.isCurrent() else {
+            cancelWarm(clearArtwork: true); publish([]); return
+        }
         // Keep the warm identity exactly aligned with the queue above. Raw Trakt state can still carry
         // finished, removed, or temporary seeds; those rows never render and must not consume one of the
         // bounded eight private-image requests.
@@ -117,6 +120,9 @@ enum TopShelfSnapshotWriter {
                 EpisodePlaybackIdentity.usesSeriesLifecycle(type: $0.type) || !$0.isFinished
             }
             .filter { $0.removed != true && $0.temp != true }
+            // Every system shelf item is actionable. Unsupported SIMKL cards remain visible in
+            // Home with an explicit unavailable action, never as a broken generic deep link.
+            .filter { selection.source != .simkl || SIMKLContinueWatchingFold.unavailableReason(id: $0.id, type: $0.type, videoID: $0.state.videoId) == nil }
             .prefix(TopShelfSnapshot.maxItems)
             .map { WarmCandidate(id: $0.id, type: $0.type, poster: $0.poster) })
 
@@ -192,7 +198,8 @@ enum TopShelfSnapshotWriter {
     /// third-party joined URL can never escape into the system Top Shelf.
     static func items(
         from cw: [CoreCWItem],
-        source: TraktPlaybackShadow.ContinueWatchingSource
+        source: TraktPlaybackShadow.ContinueWatchingSource,
+        displayProgress: [String: Double] = [:]
     ) -> [TopShelfSnapshot.Item] {
         cw.lazy
             // The rail's own prune rule. `CoreBridge` already applies `isFinished` before publishing
@@ -205,6 +212,7 @@ enum TopShelfSnapshotWriter {
             // Removed / temp entries are not "in the library" (see CoreCWItem), so they have no
             // business on the Home screen even while the engine still carries them in the bucket.
             .filter { $0.removed != true && $0.temp != true }
+            .filter { source != .simkl || SIMKLContinueWatchingFold.unavailableReason(id: $0.id, type: $0.type, videoID: $0.state.videoId) == nil }
             .prefix(TopShelfSnapshot.maxItems)
             .map {
                 TopShelfSnapshot.Item(
@@ -212,7 +220,7 @@ enum TopShelfSnapshotWriter {
                     type: $0.type,
                     title: $0.name,
                     poster: shelfPoster($0.poster, source: source),
-                    progress: shelfProgress($0.progress)
+                    progress: shelfProgress(displayProgress[$0.id] ?? $0.progress)
                 )
             }
     }
@@ -270,6 +278,12 @@ enum TopShelfSnapshotWriter {
     private static func installAuthBoundaryObserver() {
         guard !authBoundaryInstalled else { return }
         authBoundaryInstalled = true
+        SIMKLAuthBoundary.observe(key: "simkl-top-shelf") { emittedSessionID in
+            Task { @MainActor in
+                guard SIMKLAuth.storedSessionID == emittedSessionID else { return }
+                if lastPublishedSelectionSource == .simkl { clear(); publishCurrent() }
+            }
+        }
         TraktAuthBoundary.observe(key: "trakt-top-shelf") { emittedSessionID in
             // The auth boundary is synchronous and may be announced from a credential worker. Hop to
             // the main actor before touching the generation/task state or notifying TVServices. The

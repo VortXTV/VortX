@@ -950,6 +950,7 @@ struct SettingsView: View {
 
     private var appearanceSection: some View {
         section("Appearance") {
+            ContinueWatchingSettingsView()
             ThemeAccentPicker(selection: $theme.accentID).focusSection()
             ThemeBackgroundPicker(oled: $theme.oled).focusSection()
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")

@@ -6,7 +6,7 @@ import Foundation
 ///
 /// SIMKL has NO live scrobble, so this exposes only watched-on-finish history and watchlist
 /// (plan-to-watch). An actor so the shared instance is callable from anywhere without external locking.
-actor SIMKLService {
+actor SIMKLService: SIMKLContinueWatchingTransport {
     static let shared = SIMKLService(auth: .shared)
 
     private let auth: SIMKLAuth
@@ -198,10 +198,17 @@ actor SIMKLService {
 
     /// An authenticated GET against the data API, carrying the same required query items + headers every
     /// SIMKL request needs (S-4 / S-5).
-    private func read(path: String, expectedSession: SIMKLSessionID) async throws -> Data {
+    nonisolated func continueWatchingSessionIsCurrent(_ session: SIMKLSessionID) -> Bool {
+        SIMKLAuth.storedSessionID == session
+    }
+    func continueWatchingRead(path: String, query: [String: String], session: SIMKLSessionID) async throws -> Data {
+        guard ["/sync/activities", "/sync/playback", "/sync/all-items/movies", "/sync/all-items/shows", "/sync/all-items/anime"].contains(path) else { throw SIMKLError.badURL }
+        return try await read(path: path, expectedSession: session, query: query)
+    }
+    private func read(path: String, expectedSession: SIMKLSessionID, query: [String: String] = [:]) async throws -> Data {
         let token = try await auth.validToken(for: expectedSession)
         guard var components = URLComponents(string: SIMKLAuth.apiBase + path) else { throw SIMKLError.badURL }
-        components.queryItems = SIMKLAuth.requiredQueryItems
+        components.queryItems = SIMKLAuth.requiredQueryItems + query.keys.sorted().map { URLQueryItem(name: $0, value: query[$0]) }
         guard let url = components.url else { throw SIMKLError.badURL }
         var request = URLRequest(url: url)
         request.httpMethod = "GET"

@@ -51,6 +51,11 @@ struct HomeContinueWatchingSelectionTests {
         core.library = CoreLibrary(catalog: [item("tmdb:movie:42", poster: "https://catalog.invalid/cached.jpg")])
         ProfileStore.shared.activeID = profileA
         ProfileStore.shared.activeUsesEngineHistory = eligible
+        UserDefaults.standard.reset()
+        UserDefaults.standard.set("trakt", forKey: ContinueWatchingPreferences.sourceKey)
+        UserDefaults.standard.set("20", forKey: ContinueWatchingPreferences.windowKey)
+        ProfileStore.shared.active = .init(id: profileA, usesEngineHistory: eligible,
+            discovery: .init(continueWatchingSource: "trakt", continueWatchingWindow: "20"))
         ProfileStore.shared.cwItems = [item("legacy-overlay")]
         ExternalSyncToggle.enabled = true
         TraktAuth.storedSessionID = sessionA
@@ -105,13 +110,18 @@ struct HomeContinueWatchingSelectionTests {
         let core = configure()
         let loaded = shadow()
         ExternalSyncToggle.enabled = false
+        UserDefaults.standard.set("local", forKey: ContinueWatchingPreferences.sourceKey)
+        ProfileStore.shared.active?.discovery?.continueWatchingSource = "local"
         require(selected(core, loaded).selection.items.map(\.id) == ["native-local"], "toggle-off retains native local fallback")
         ExternalSyncToggle.enabled = true
+        UserDefaults.standard.set("trakt", forKey: ContinueWatchingPreferences.sourceKey)
+        ProfileStore.shared.active?.discovery?.continueWatchingSource = "trakt"
         TraktAuth.storedSessionID = nil
-        require(selected(core, loaded).selection.source == .local, "no certified Trakt session falls back locally")
+        require(selected(core, loaded).selection.source == .trakt && selected(core, loaded).selection.items.isEmpty,
+                "explicit Trakt without certified session is truthfully unavailable, not a disguised local rail")
         TraktAuth.storedSessionID = sessionA
         let first = selected(core, shadow(hasSnapshot: false)).selection
-        require(first.source == .local && first.items.map(\.id) == ["native-local"], "first unsuccessful snapshot retains native local fallback")
+        require(first.source == .trakt && first.items.isEmpty && first.status != nil, "first unsuccessful snapshot remains explicitly loading")
         let empty = selected(core, shadow(empty: true)).selection
         require(empty.source == .trakt && empty.items.isEmpty && empty.sessionID == sessionA, "successful empty Trakt snapshot stays truthfully empty")
     }
@@ -157,7 +167,7 @@ struct HomeContinueWatchingSelectionTests {
         let loaded = shadow()
         TraktAuth.storedSessionID = sessionB
         let result = selected(core, loaded).selection
-        require(result.source == .local && result.items.map(\.id) == ["native-local"], "replacement Trakt session cannot read the prior account snapshot")
+        require(result.source == .trakt && result.items.isEmpty, "replacement Trakt session cannot read the prior account snapshot")
     }
 
     private static func legacySharedProfileKeepsOverlay() {
@@ -181,8 +191,10 @@ struct HomeContinueWatchingSelectionTests {
         require(!commitAllowed(), "late Top Shelf profile switch is denied with the same Trakt session")
         ProfileStore.shared.activeID = profileA
         ExternalSyncToggle.enabled = false
+        UserDefaults.standard.set("local", forKey: ContinueWatchingPreferences.sourceKey)
         require(!commitAllowed(), "late Top Shelf toggle-off is denied before reseed")
         ExternalSyncToggle.enabled = true
+        UserDefaults.standard.set("trakt", forKey: ContinueWatchingPreferences.sourceKey)
         TraktAuth.storedSessionID = sessionB
         require(!commitAllowed(), "late Top Shelf replacement Trakt session is denied")
     }
@@ -192,7 +204,7 @@ struct HomeContinueWatchingSelectionTests {
         let tv = read("app/SourcesTV/HomeView.swift")
         let ios = read("app/SourcesiOS/iOSRootView.swift")
         let shelf = read("app/SourcesTV/TopShelfSnapshotWriter.swift")
-        let call = "HomeContinueWatchingSelection.current(core: core, profiles: profiles).selection"
+        let call = "HomeContinueWatchingSelection.current(core: core, profiles: profiles)"
         require(tv.contains(call) && ios.contains(call), "TV and iOS/macOS consume the production shared selector")
         require(shelf.contains("HomeContinueWatchingSelection.current(core: CoreBridge.shared, profiles: profiles)"), "Top Shelf consumes the production shared selector")
         require(shelf.components(separatedBy: "HomeContinueWatchingSelection.permitsPrivateArtworkCommit(").count == 3,

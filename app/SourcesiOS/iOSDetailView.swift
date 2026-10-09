@@ -416,6 +416,7 @@ struct iOSDetailView: View {
     var initialResumeSeconds: Double? = nil
     var initialVideoID: String? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     @State private var resumeHintOpenedAt = Date()
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
@@ -450,12 +451,14 @@ struct iOSDetailView: View {
     /// A remote Continue Watching offer remains readable only while its exact Trakt credential session is
     /// current. Detail views can stay mounted across sign-out, so this check belongs at every use site.
     private var validInitialResumeSeconds: Double? {
+        guard initialContinueWatchingIntent?.isCurrent() != false else { return nil }
         guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialResumeSeconds
     }
 
     private var validInitialVideoID: String? {
+        guard initialContinueWatchingIntent?.isCurrent() != false else { return nil }
         guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialVideoID
@@ -1018,6 +1021,7 @@ struct iOSDetailView: View {
                                 ? validInitialResumeSeconds
                                 : nil,
                             initialTraktSessionID: initialTraktSessionID,
+                            initialContinueWatchingIntent: initialContinueWatchingIntent,
                             autoPlayOnAppear: true
                         ),
                         isActive: Binding(
@@ -2186,7 +2190,8 @@ struct iOSDetailView: View {
                         iOSEpisodeStreams(meta: m, video: primary.video, season: primary.video.season ?? 1,
                               seasonEpisodes: sortedEpisodes(m.videos ?? []),
                               initialStartAtSeconds: primaryResumeSeconds,
-                              initialTraktSessionID: initialTraktSessionID)
+                              initialTraktSessionID: initialTraktSessionID,
+                              initialContinueWatchingIntent: initialContinueWatchingIntent)
                     } label: {
                         Label(primaryEpisodeLabel(primary.video, isResume: primary.isResume,
                                                   resumeSeconds: primaryResumeSeconds),
@@ -3303,7 +3308,8 @@ struct iOSDetailView: View {
                 if let quickWatchScope {
                     guard quickWatchScopeIsCurrent(quickWatchScope) else { return }
                 }
-                guard let admittedResume = initialResumeGate.admit(
+                guard initialContinueWatchingIntent?.isCurrent() != false,
+                      let admittedResume = initialResumeGate.admit(
                     resumeProposal,
                     currentSessionID: TraktAuth.storedSessionID
                 ) else { return }
@@ -3350,7 +3356,8 @@ struct iOSDetailView: View {
             if let quickWatchScope {
                 guard quickWatchScopeIsCurrent(quickWatchScope) else { return }
             }
-            guard let admittedResume = initialResumeGate.admit(
+            guard initialContinueWatchingIntent?.isCurrent() != false,
+                  let admittedResume = initialResumeGate.admit(
                 resumeProposal,
                 currentSessionID: TraktAuth.storedSessionID
             ) else { return }
@@ -3403,7 +3410,8 @@ struct iOSDetailView: View {
         if let quickWatchScope {
             guard quickWatchScopeIsCurrent(quickWatchScope) else { return }
         }
-        guard let admittedResume = initialResumeGate.admit(
+        guard initialContinueWatchingIntent?.isCurrent() != false,
+              let admittedResume = initialResumeGate.admit(
             resumeProposal,
             currentSessionID: TraktAuth.storedSessionID
         ) else { return }
@@ -3464,7 +3472,8 @@ struct iOSDetailView: View {
             fromStart: false,
             resumeSuggestion: nil
         )
-        guard let admittedResume = initialResumeGate.admit(
+        guard initialContinueWatchingIntent?.isCurrent() != false,
+              let admittedResume = initialResumeGate.admit(
             resumeProposal,
             currentSessionID: TraktAuth.storedSessionID
         ) else { return }
@@ -3913,7 +3922,8 @@ struct iOSDetailView: View {
                                   initialStartAtSeconds: v.id == validInitialVideoID
                                       ? validInitialResumeSeconds
                                       : nil,
-                                  initialTraktSessionID: initialTraktSessionID)
+                                  initialTraktSessionID: initialTraktSessionID,
+                                  initialContinueWatchingIntent: initialContinueWatchingIntent)
             } label: {
                 episodeRowLabel(v, isWatched: isWatched, progress: progress, cardWidth: cardWidth)
             }
@@ -4572,6 +4582,7 @@ struct iOSEpisodeStreams: View {
     let seasonEpisodes: [CoreVideo]   // ALL episodes across seasons, ordered (season, episode), for in-player Next/Prev/list + auto-advance ACROSS the season boundary (so the last episode of a season rolls into the next season's first)
     var initialStartAtSeconds: Double? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     /// Set only by the Cinema quick-view route. It reuses this page's settled ranked Watch command; the
     /// ordinary episode-detail route remains source-list-first unless Smart Source Selection is enabled.
     var autoPlayOnAppear: Bool = false
@@ -5305,7 +5316,8 @@ struct iOSEpisodeStreams: View {
         )
         guard presentation == nil,
               episodeTargetIsCurrent(target, generation: targetGeneration, quickWatchScope: quickWatchScope) else { return }
-        guard let admittedResume = initialStartGate.admit(
+        guard initialContinueWatchingIntent?.isCurrent() != false,
+              let admittedResume = initialStartGate.admit(
             resumeProposal,
             currentSessionID: TraktAuth.storedSessionID
         ) else { return }
@@ -5366,7 +5378,8 @@ struct iOSEpisodeStreams: View {
             )
             guard presentation == nil,
                   episodeTargetIsCurrent(target, generation: targetGeneration, quickWatchScope: quickWatchScope) else { return }
-            guard let admittedResume = initialStartGate.admit(
+            guard initialContinueWatchingIntent?.isCurrent() != false,
+                  let admittedResume = initialStartGate.admit(
                 resumeProposal,
                 currentSessionID: TraktAuth.storedSessionID
             ) else { return }

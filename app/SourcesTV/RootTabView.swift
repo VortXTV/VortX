@@ -353,7 +353,7 @@ struct RootTabView: View {
 
     var body: some View {
         TabView(selection: selectionBinding) {
-            HomeView().id(resetTokens[0])
+            HomeView(isActive: selection == 0).id(resetTokens[0])
                 .tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
             // Discover / Live / Library / Search are the hideable tabs (#117): each drops out of the
             // TabView entirely when its Settings > Tab bar toggle hides it, and the matching .onChange

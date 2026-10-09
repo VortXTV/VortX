@@ -30,6 +30,7 @@ struct DetailView: View {
     var initialResumeSeconds: Double? = nil
     var initialVideoID: String? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     @State private var resumeHintOpenedAt = Date()
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
@@ -115,12 +116,14 @@ struct DetailView: View {
     /// Navigation-carried Trakt state is private to the credential session that created it. Revalidate at
     /// every use because the detail page can remain mounted across sign-out or an account replacement.
     private var validInitialResumeSeconds: Double? {
+        guard initialContinueWatchingIntent?.isCurrent() != false else { return nil }
         guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialResumeSeconds
     }
 
     private var validInitialVideoID: String? {
+        guard initialContinueWatchingIntent?.isCurrent() != false else { return nil }
         guard newerPlaybackVideoID == nil else { return nil }
         guard initialTraktSessionID == nil || TraktAuth.storedSessionID == initialTraktSessionID else { return nil }
         return initialVideoID
@@ -1134,6 +1137,7 @@ struct DetailView: View {
                                                identityRoles: sourceIndexRoles,
                                                initialStartAtSeconds: validInitialResumeSeconds,
                                                initialTraktSessionID: initialTraktSessionID,
+                                               initialContinueWatchingIntent: initialContinueWatchingIntent,
                                                secondaryAction: hasFullTrailer(m) ? AnyView(trailerChip(m)) : nil,
                                                onDetailMove: { direction, region in
                                                    handleDetailMove(direction, from: region, using: proxy)
@@ -1385,7 +1389,8 @@ struct DetailView: View {
                                                            season: primaryEpisode.season ?? 0,
                                                            episodes: orderedEpisodes,
                                                            initialStartAtSeconds: primaryResumeSeconds,
-                                                           initialTraktSessionID: initialTraktSessionID)   // ALL seasons ordered → auto-advance crosses the season boundary
+                                                           initialTraktSessionID: initialTraktSessionID,
+                                                           initialContinueWatchingIntent: initialContinueWatchingIntent)   // ALL seasons ordered → auto-advance crosses the season boundary
                                     } label: {
                                         Label(primaryEpisodeLabel(primaryEpisode, isResume: primaryIsResume,
                                                                   resumeSeconds: primaryResumeSeconds),
@@ -2279,6 +2284,7 @@ struct CoreEpisodeStreams: View {
     var episodes: [CoreVideo] = []
     var initialStartAtSeconds: Double? = nil
     var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
@@ -2302,7 +2308,8 @@ struct CoreEpisodeStreams: View {
         season: Int,
         episodes: [CoreVideo] = [],
         initialStartAtSeconds: Double? = nil,
-        initialTraktSessionID: TraktSessionID? = nil
+        initialTraktSessionID: TraktSessionID? = nil,
+        initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     ) {
         self.meta = meta
         self.video = video
@@ -2310,6 +2317,7 @@ struct CoreEpisodeStreams: View {
         self.episodes = episodes
         self.initialStartAtSeconds = initialStartAtSeconds
         self.initialTraktSessionID = initialTraktSessionID
+        self.initialContinueWatchingIntent = initialContinueWatchingIntent
         _currentVideo = State(initialValue: video)
     }
 
@@ -2411,6 +2419,7 @@ struct CoreEpisodeStreams: View {
                                    ),
                                    initialStartAtSeconds: initialStartAtSeconds,
                                    initialTraktSessionID: initialTraktSessionID,
+                                   initialContinueWatchingIntent: initialContinueWatchingIntent,
                                    onDetailMove: { direction, region in
                                        guard direction == .up,
                                              TVDetailActionFocusPolicy.destination(
@@ -2589,6 +2598,7 @@ struct CoreStreamList: View {
     var initialStartAtSeconds: Double? = nil
     /// Exact Trakt session that owns `initialStartAtSeconds`. nil means the offset is local, not remote.
     var initialTraktSessionID: TraktSessionID? = nil
+    var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
     /// Optional detail action supplied by the mounting page (the movie trailer). It joins the secondary
     /// row so every action remains in one of the two semantic focus sections instead of forming a stray
     /// third row above the source controls. `AnyView` keeps this view's generic surface unchanged for the
@@ -3381,6 +3391,7 @@ struct CoreStreamList: View {
     private var isEpisodePlayback: Bool { episodeStreamId != nil }
 
     private func targetIsCurrent(videoID: String?, generation: Int) -> Bool {
+        guard initialContinueWatchingIntent?.isCurrent() != false else { return false }
         if let episodeTargetIsCurrent {
             return episodeTargetIsCurrent(videoID, generation)
         }

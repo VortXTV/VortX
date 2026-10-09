@@ -1,8 +1,34 @@
 import Foundation
 
+// Shadow Foundation's persistence API with RAM only. These executable fixtures cannot
+// edit the installed app's UserDefaults, Keychain, credentials, or watch-history cache.
+final class UserDefaults {
+    static let standard = UserDefaults()
+    private var values: [String: Any] = [:]
+    func set(_ value: Any?, forKey key: String) { values[key] = value }
+    func object(forKey key: String) -> Any? { values[key] }
+    func string(forKey key: String) -> String? { values[key] as? String }
+    func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
+    func stringArray(forKey key: String) -> [String]? { values[key] as? [String] }
+    func array(forKey key: String) -> [Any]? { values[key] as? [Any] }
+    func data(forKey key: String) -> Data? { values[key] as? Data }
+    func removeObject(forKey key: String) { values.removeValue(forKey: key) }
+    func reset() { values = [:] }
+}
+enum TabBarPrefs {
+    static let hideLive = "fixture.hideLive", hideDiscover = "fixture.hideDiscover"
+    static let hideLibrary = "fixture.hideLibrary", hideSearch = "fixture.hideSearch"
+}
+
 // Isolated fixtures for the production selector/shadow. No live Keychain, cache path,
 // account, native library, or provider transport is linked into this executable.
-enum CredentialScopeRegistry {
+final class CredentialScopeRegistry {
+    static let shared = CredentialScopeRegistry()
+    var generation: UInt64 = 1
+    var eligible = true
+    func capture() -> Capture { .init(namespace: "inert-account", generation: generation) }
+    func isCurrent(_ value: Capture) -> Bool { value == capture() }
+    func isMigrationEligible(_ value: Capture) -> Bool { eligible && isCurrent(value) }
     struct Capture: Hashable, Sendable {
         let namespace: String
         let generation: UInt64
@@ -36,6 +62,14 @@ final class ProfileStore {
     var activeID: UUID?
     var activeUsesEngineHistory = true
     var cwItems: [CoreCWItem] = []
+    var active: UserProfile?
+}
+struct UserProfile {
+    struct PlaybackPrefs: Equatable {}
+    let id: UUID
+    var usesEngineHistory: Bool = true
+    var discovery: ProfileDiscoveryPreferences? = nil
+    var playback: PlaybackPrefs? = nil
 }
 
 struct CoreLibrary { let catalog: [CoreCWItem] }
@@ -46,11 +80,21 @@ struct CoreCWItem {
     let poster: String?
     let state: CoreLibState
     var resumeSeconds: Double { state.timeOffset / 1000 }
+    var progress: Double { state.duration > 0 ? state.timeOffset / state.duration : 0 }
+    var isFinished: Bool { progress >= 0.95 }
+    var removed: Bool? { nil }
+    var temp: Bool? { nil }
+}
+enum EpisodePlaybackIdentity { static func usesSeriesLifecycle(type: String) -> Bool { type == "series" } }
+enum TopShelfSnapshot {
+    static let maxItems = 8
+    struct Item { let id: String; let type: String; let title: String; let poster: String?; let progress: Double }
 }
 struct CoreLibState {
     let timeOffset: Double
     let duration: Double
     let videoId: String?
+    var lastWatched: String? = nil
 }
 struct PlaybackMeta {
     let libraryId: String
@@ -60,7 +104,7 @@ struct PlaybackMeta {
 }
 
 enum ExternalSyncToggle {
-    static let traktContinueWatching = "fixture.trakt.continueWatching"
+    static let traktContinueWatching = "vortx.trakt.continueWatching"
     static let traktResumeSuggestion = "fixture.trakt.resumeSuggestion"
     static var enabled = true
     static func isOn(_ key: String, default defaultOn: Bool = true) -> Bool { enabled }
@@ -111,7 +155,41 @@ struct TraktPlaybackCacheStorage {
     }
     func reset() throws {}
     func save(_ snapshot: TraktPlaybackCacheSnapshot) throws {
-        fatalError("Offline CW fixture must not author a playback snapshot")
+        Self.snapshot = snapshot // RAM only, not the production cache/storage implementation
     }
 }
 enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} }
+
+struct SIMKLSessionID: RawRepresentable, Codable, Hashable, Sendable { let rawValue: String }
+enum SIMKLError: Error { case decoding, sessionChanged, badURL, fixture }
+enum SIMKLAuth {
+    static var isConfigured = true
+    static var storedSessionID: SIMKLSessionID?
+    static let apiBase = "https://api.simkl.com"
+    static let clientID = "inert-client", userAgent = "inert-fixture"
+    static let requiredQueryItems = [URLQueryItem(name: "extended", value: "full")]
+}
+enum SIMKLAuthBoundary {
+    private static var observers: [String: (SIMKLSessionID?) -> Void] = [:]
+    static func observe(key: String, _ callback: @escaping (SIMKLSessionID?) -> Void) { observers[key] = callback }
+    static func emit(_ session: SIMKLSessionID?) { observers.values.forEach { $0(session) } }
+}
+// Implements the real reader's transport seam, returning only explicit fixture bytes.
+actor SIMKLService: SIMKLContinueWatchingTransport {
+    static let shared = SIMKLService()
+    struct Request: Equatable { let path: String; let query: [String: String] }
+    var requests: [Request] = []
+    private var responses: [String: Data] = [:]
+    private var failure: String?
+    func configure(_ responses: [String: String], failure: String? = nil) {
+        self.responses = responses.mapValues { Data($0.utf8) }; self.failure = failure; requests = []
+    }
+    nonisolated func continueWatchingSessionIsCurrent(_ session: SIMKLSessionID) -> Bool { SIMKLAuth.storedSessionID == session }
+    func continueWatchingRead(path: String, query: [String: String], session: SIMKLSessionID) async throws -> Data {
+        guard continueWatchingSessionIsCurrent(session) else { throw SIMKLError.sessionChanged }
+        requests.append(.init(path: path, query: query))
+        if path == failure { throw SIMKLError.fixture }
+        guard let data = responses[path] else { fatalError("Unscripted fixture transport leg: \(path)") }
+        return data
+    }
+}
