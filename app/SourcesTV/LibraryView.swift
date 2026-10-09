@@ -174,9 +174,9 @@ struct LibraryView: View {
                 switch destination {
                 case .downloads:
                     ScrollView {
-                        if downloads.records.isEmpty {
-                            hint("Completed downloads appear here for offline playback on this Apple TV.")
-                        } else { TVDownloadsView() }
+                        // Keep queue capacity and the manager's empty guidance reachable before the
+                        // first download, not only after the store already contains a record.
+                        TVDownloadsView()
                     }
                     .navigationTitle("Downloads")
                 case .watchlist: watchlistDestination
