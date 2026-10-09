@@ -4,6 +4,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -49,7 +51,7 @@ import kotlinx.coroutines.CancellationException
  * Lightweight, presentation-only title view. Actions delegate to the shell's existing detail/watchlist
  * owners: it never resolves a stream or fabricates an item URL itself.
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun CinemaQuickViewScreen(
     item: MetaItem,
@@ -106,33 +108,46 @@ fun CinemaQuickViewScreen(
             item.description?.takeIf { it.isNotBlank() }?.let {
                 Text(it, style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary), maxLines = 4, overflow = TextOverflow.Ellipsis)
             }
-            PrimaryButton(text = "Watch", onClick = onWatch, leadingIcon = VortXIcons.playFill)
-            Chip(
-                label = if (inWatchlist) "Remove from Watchlist" else "Watchlist",
-                selected = inWatchlist,
-                enabled = !togglingWatchlist,
-                leadingIcon = VortXIcons.bookmark,
-                onClick = {
-                    // Capture immutable account/profile authority in the click, not in a delayed Task.
-                    val intent = try { watchlistStore.captureToggle(item) } catch (_: Exception) {
-                        watchlistMessage = "Could not update Watchlist. Try again."
-                        return@Chip
-                    }
-                    togglingWatchlist = true
-                    scope.launch {
-                        try {
-                            val nowWatchlisted = watchlistStore.toggle(intent)
-                            watchlistMessage = if (nowWatchlisted) "Added to Watchlist" else "Removed from Watchlist"
-                        } catch (error: Exception) {
-                            if (error is CancellationException) throw error
+        }
+        // Reserve the initial viewport for the real actions, independent of artwork/copy height. The
+        // secondary controls wrap at compact widths and large text sizes rather than clipping Details.
+        Column(
+            modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth().align(Alignment.CenterHorizontally)
+                .padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
+            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+        ) {
+            PrimaryButton(text = "Watch", onClick = onWatch, modifier = Modifier.fillMaxWidth(), leadingIcon = VortXIcons.playFill)
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+            ) {
+                Chip(
+                    label = if (inWatchlist) "Remove from Watchlist" else "Watchlist",
+                    selected = inWatchlist,
+                    enabled = !togglingWatchlist,
+                    leadingIcon = VortXIcons.bookmark,
+                    onClick = {
+                        // Capture immutable account/profile authority in the click, not in a delayed Task.
+                        val intent = try { watchlistStore.captureToggle(item) } catch (_: Exception) {
                             watchlistMessage = "Could not update Watchlist. Try again."
-                        } finally {
-                            togglingWatchlist = false
+                            return@Chip
                         }
-                    }
-                },
-            )
-            Chip(label = "Details", selected = false, leadingIcon = VortXIcons.moreHoriz, onClick = onDetails)
+                        togglingWatchlist = true
+                        scope.launch {
+                            try {
+                                val nowWatchlisted = watchlistStore.toggle(intent)
+                                watchlistMessage = if (nowWatchlisted) "Added to Watchlist" else "Removed from Watchlist"
+                            } catch (error: Exception) {
+                                if (error is CancellationException) throw error
+                                watchlistMessage = "Could not update Watchlist. Try again."
+                            } finally {
+                                togglingWatchlist = false
+                            }
+                        }
+                    },
+                )
+                Chip(label = "Details", selected = false, leadingIcon = VortXIcons.moreHoriz, onClick = onDetails)
+            }
             watchlistMessage?.let { Text(it, style = VortXTheme.type.label.copy(color = VortXTheme.colors.accent)) }
         }
     }

@@ -112,6 +112,11 @@ import com.vortx.android.ui.components.cinemaCardFacts
 import com.vortx.android.ui.components.DefaultEpisodeThumb
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.CinemaEpisodeCard
+import com.vortx.android.ui.components.CinemaSourceItem
+import com.vortx.android.ui.components.cinemaSourceGroupKey
+import com.vortx.android.ui.components.cinemaSourceSelectedGroupKey
+import com.vortx.android.ui.components.cinemaSourceTabs
+import com.vortx.android.ui.components.cinemaSourceWindow
 import com.vortx.android.ui.components.PosterArt
 import com.vortx.android.ui.components.PosterCard
 import com.vortx.android.ui.components.PrimaryButton
@@ -1728,18 +1733,24 @@ private fun SourcesSection(
     onPlayWithEngine: (StreamSource, PlayerEngineRouter.Override) -> Unit,
     onDownload: (StreamSource) -> Unit,
 ) {
-    // The row whose long-press opened the pin menu (null = closed). Keyed by the stream id so the menu
+    // The row whose long-press opened the pin menu (null = closed). Keyed by transport + stream id so the menu
     // anchors to its own row and a recompose from a pin write closes it cleanly.
     var pinMenuFor by remember { mutableStateOf<String?>(null) }
-    // DET-2 grouped/collapsible source list state: the per-add-on filter ("All" = null), the remembered
+    // Grouped/collapsible source list state: the selected add-on jump ("All" = null), the remembered
     // collapsed add-on set, the render window (grown by "Show more"), and the two-level Quality menu.
-    var sourceFilter by remember { mutableStateOf<String?>(null) }
+    var jumpGroupKey by remember { mutableStateOf<String?>(null) }
     var sourceJumpRevision by remember { mutableStateOf(0) }
     var collapsed by remember { mutableStateOf(emptySet<String>()) }
     var renderLimit by remember { mutableStateOf(SOURCE_WINDOW_INITIAL) }
     var qualityOpen by remember { mutableStateOf(false) }
     var qualityTier by remember { mutableStateOf<String?>(null) }
     var audioOpen by remember { mutableStateOf(false) }
+    val sourceListAnchor = remember { BringIntoViewRequester() }
+    fun requestSourceJump(key: String?) {
+        if (key != null) collapsed = collapsed - key
+        jumpGroupKey = key
+        sourceJumpRevision += 1
+    }
     val clipboard = LocalClipboardManager.current
     // Compact source rows (SET-10, Apple `vortx.streams.compactLabels`). Read live off SharedPreferences so
     // returning from the Sources settings screen recomposes this and reflects the new density immediately;
@@ -1755,22 +1766,25 @@ private fun SourcesSection(
             is UiState.Success -> {
                 val groups = state.data
                 val total = groups.sumOf { it.streams.size }
-                val effectiveSourceFilter = sourceFilter?.takeIf { addon -> groups.any { it.addon == addon } }
-                val filteredGroups = groups.filter { effectiveSourceFilter == null || it.addon == effectiveSourceFilter }
-                val sourceAnchors = remember(groups.map { it.addon }) {
-                    groups.associate { it.addon to BringIntoViewRequester() }
+                val sourceTabs = cinemaSourceTabs(groups)
+                val groupKeys = sourceTabs.map { it.key }
+                val effectiveJumpGroupKey = cinemaSourceSelectedGroupKey(groups, jumpGroupKey)
+                val sourceAnchors = remember(groupKeys) {
+                    groupKeys.associateWith { BringIntoViewRequester() }
                 }
-                // A selected add-on is an actual jump into its source section as well as the established
-                // filter. The parent LazyColumn owns the scroll, and the incoming/user order is retained.
-                LaunchedEffect(effectiveSourceFilter, sourceJumpRevision) {
-                    effectiveSourceFilter?.let { sourceAnchors[it]?.bringIntoView() }
+                // The parent LazyColumn owns scrolling. Keep the captured transport selection while
+                // asynchronous results add/reorder sections, and cancel a superseded jump effect.
+                LaunchedEffect(effectiveJumpGroupKey, sourceJumpRevision, groupKeys) {
+                    if (sourceJumpRevision == 0) return@LaunchedEffect
+                    if (jumpGroupKey == null) sourceListAnchor.bringIntoView()
+                    else effectiveJumpGroupKey?.let { sourceAnchors[it]?.bringIntoView() }
                 }
-                val availableAudioLanguages = detailAudioLanguageOptions(filteredGroups)
+                val availableAudioLanguages = detailAudioLanguageOptions(groups)
                 // Header + the "Re-find" escape hatch: re-query the add-ons fresh so an expired/dead source
                 // (or an empty result) is replaced. All the work lives in [DetailViewModel.refreshSources];
                 // this only calls [onRefresh]. Disabled mid-resolve so a re-find can't race an in-flight play.
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().bringIntoViewRequester(sourceListAnchor),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -1784,27 +1798,23 @@ private fun SourcesSection(
                     )
                 }
                 if (total > 0) {
-                    // Per-add-on filter chips ("All (N)" + one per group), only when there is more than one
-                    // add-on to filter between (Apple's `filterBar`, shown for groups.count > 1).
-                    if (groups.size > 1) {
+                    // Ordered jump tabs keep all neighboring sections visible. A repeated display name
+                    // cannot select/collapse another transport, and All explicitly returns to the start.
+                    if (sourceTabs.size > 1) {
                         Row(
                             modifier = Modifier.horizontalScroll(rememberScrollState()),
                             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
                         ) {
                             Chip(
                                 label = "All ($total)",
-                                selected = effectiveSourceFilter == null,
-                                onClick = { sourceFilter = null },
+                                selected = effectiveJumpGroupKey == null,
+                                onClick = { requestSourceJump(null) },
                             )
-                            groups.forEach { group ->
+                            sourceTabs.forEach { tab ->
                                 Chip(
-                                    label = "${group.addon} (${group.streams.size})",
-                                    selected = effectiveSourceFilter == group.addon,
-                                    onClick = {
-                                        collapsed = collapsed - group.addon
-                                        sourceFilter = group.addon
-                                        sourceJumpRevision += 1
-                                    },
+                                    label = "${tab.addon} (${tab.count})",
+                                    selected = effectiveJumpGroupKey == tab.key,
+                                    onClick = { requestSourceJump(tab.key) },
                                 )
                             }
                         }
@@ -1826,9 +1836,9 @@ private fun SourcesSection(
                         // flavour variants inside it (Dolby Vision · Remux, HDR · Atmos, …). A second nested
                         // DropdownMenu is the Compose idiom for the tvOS two-step quality dialog. Plays the
                         // chosen variant straight through [onPlay]. Hidden until at least one tier resolves.
-                        // Quality choices are built from the active add-on filter, so a visible option always
-                        // maps to a source the viewer can actually play in the selected provider scope.
-                        val tiers = StreamRanking.tiers(filteredGroups)
+                        // Quality choices still map only to actual ranked sources. A jump is navigation,
+                        // not an upstream audio/quality filter or a replacement source-resolution path.
+                        val tiers = StreamRanking.tiers(groups)
                         if (tiers.isNotEmpty()) {
                             Box {
                                 Chip(
@@ -1858,7 +1868,7 @@ private fun SourcesSection(
                                         onClick = { qualityTier = null },
                                     )
                                     if (activeTier != null) {
-                                        StreamRanking.variantOptions(filteredGroups, activeTier).forEach { (label, source) ->
+                                        StreamRanking.variantOptions(groups, activeTier).forEach { (label, source) ->
                                             DropdownMenuItem(
                                                 text = { Text(label) },
                                                 onClick = {
@@ -1906,7 +1916,7 @@ private fun SourcesSection(
                         }
                         // Copy every playable (direct / debrid / HLS) link for pasting into a debrid panel or
                         // another player; shown only when at least one source carries a copyable URL.
-                        val links = copyableSourceLinks(filteredGroups)
+                        val links = copyableSourceLinks(groups)
                         if (links.isNotEmpty()) {
                             Chip(
                                 label = "Copy all links",
@@ -1927,44 +1937,38 @@ private fun SourcesSection(
                 if (total == 0) {
                     Text("No sources yet -- your add-ons may still be answering.", style = VortXTheme.type.body)
                 }
-                // DET-2 grouped, collapsible, windowed list. One tappable header per add-on (name + count +
-                // chevron, remembered collapsed set) with its rows beneath, filtered by the active chip. The
-                // window caps how many rows are built at once (a popular title returns thousands); "Show more"
-                // grows it. Collapsed groups emit a header only and spend no budget (Apple's `windowedPlan`).
-                // Groups + streams are already ranked best-first by the assembly; sort reorders WITHIN a group.
-                val filtered = filteredGroups
-                var budget = renderLimit
-                var shownRows = 0
-                val anchoredAddons = HashSet<String>()
-                filtered.forEach { group ->
-                    val isCollapsed = group.addon in collapsed
-                    // Labels can repeat across transports. Jump to the first matching section, whose
-                    // sources get the render budget first, rather than scrolling through every duplicate.
-                    val sourceAnchor = sourceAnchors[group.addon]?.takeIf { anchoredAddons.add(group.addon) }
-                    SourceGroupHeader(
-                        addon = group.addon,
-                        count = group.streams.size,
-                        collapsed = isCollapsed,
-                        onToggle = {
-                            collapsed = if (isCollapsed) collapsed - group.addon else collapsed + group.addon
-                        },
-                        modifier = sourceAnchor?.let { Modifier.bringIntoViewRequester(it) } ?: Modifier,
-                    )
-                    if (!isCollapsed && budget > 0) {
-                        val sorted = sortedStreamsInGroup(group.streams, sort)
-                        val take = minOf(sorted.size, budget)
-                        budget -= take
-                        shownRows += take
-                        sorted.take(take).forEach { source ->
-                            val pinned = pin.resolved?.let { SourcePinStore.matches(source, group.addon, it) } == true
+                // Every section survives the bounded render window; a selected late section receives
+                // one nearby window without instantiating all preceding rows. Sorting stays within groups.
+                val sourceItems = cinemaSourceWindow(groups, collapsed, renderLimit, effectiveJumpGroupKey) {
+                    sortedStreamsInGroup(it, sort)
+                }
+                val shownRows = sourceItems.count { it is CinemaSourceItem.Row }
+                sourceItems.forEach { entry ->
+                    when (entry) {
+                        is CinemaSourceItem.Header -> SourceGroupHeader(
+                            addon = entry.addon,
+                            count = entry.count,
+                            collapsed = entry.collapsed,
+                            onToggle = {
+                                collapsed = if (entry.collapsed) collapsed - entry.key else collapsed + entry.key
+                            },
+                            // One provider may have separate embedded + stream sections. Only the first
+                            // owns its jump anchor; every original section and source order is preserved.
+                            modifier = sourceAnchors[entry.key]?.takeIf { entry.firstProviderSection }
+                                ?.let { Modifier.bringIntoViewRequester(it) } ?: Modifier,
+                        )
+                        is CinemaSourceItem.Row -> {
+                            val source = entry.source
+                            val menuKey = "${entry.groupKey}|${source.id}"
+                            val pinned = pin.resolved?.let { SourcePinStore.matches(source, entry.addon, it) } == true
                             StreamRowWithPinMenu(
                                 source = source,
                                 pinned = pinned,
                                 resolving = resolving,
                                 pin = pin,
                                 entryNoun = entryNoun,
-                                menuOpen = pinMenuFor == source.id,
-                                onOpenMenu = { pinMenuFor = source.id },
+                                menuOpen = pinMenuFor == menuKey,
+                                onOpenMenu = { pinMenuFor = menuKey },
                                 onDismissMenu = { pinMenuFor = null },
                                 onPlay = onPlay,
                                 onPlayWithEngine = onPlayWithEngine,
@@ -1977,8 +1981,10 @@ private fun SourcesSection(
                         }
                     }
                 }
-                // "Show more · N more" when the window hides rows in the currently-expanded, filtered groups.
-                val expandableTotal = filtered.filter { it.addon !in collapsed }.sumOf { it.streams.size }
+                // Show more grows the global window without altering section order or upstream filters.
+                val expandableTotal = groups.mapIndexed { index, group ->
+                    if (cinemaSourceGroupKey(group, index) in collapsed) 0 else group.streams.size
+                }.sum()
                 if (shownRows < expandableTotal) {
                     Chip(
                         label = "Show more · ${expandableTotal - shownRows} more",

@@ -1579,7 +1579,7 @@ fun VortXApp(
                                 catalogBrowseTarget = HomeCatalogTarget(catalog.id, catalog.title)
                             },
                             onCatalogItem = onCinemaItem,
-                            onQuickView = { item -> quickViewItem = item },
+                            onQuickView = if (cinemaQuickView) { { item -> quickViewItem = item } } else null,
                         )
                     }
                 }
