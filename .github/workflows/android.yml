@@ -115,7 +115,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: a722eef43f80bd82226215cf460bba2e02869777
+          ref: 7e3e68be5bf2b11c65d158c1823be94bd1608d1b
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -124,7 +124,7 @@ jobs:
         run: |
           set -euo pipefail
           vortx_sha="$(git -C _vortx_core_src rev-parse HEAD^{commit})"
-          test "$vortx_sha" = "a722eef43f80bd82226215cf460bba2e02869777" \
+          test "$vortx_sha" = "7e3e68be5bf2b11c65d158c1823be94bd1608d1b" \
             || { echo "::error::vortx-core checkout does not match the reviewed private pin"; exit 1; }
           stremio_sha="$(git -C core rev-parse HEAD^{commit})"
           test "$stremio_sha" = "31c66611822043e089f5819ad232a5df93975873" \

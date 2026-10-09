@@ -51,8 +51,8 @@ resource-host/server JNI and ELF architecture, and compares packaged bytes with
 fresh staged bytes after the same pinned strip normalization. The verifier's
 default two-engine mode remains a comparison contract, not the native workflow gate.
 
-At public source `ab00559c1286e209b067d79f41b892fc045459ce`, both Android workflows
-pin `VortXTV/vortx-core` to `a722eef43f80bd82226215cf460bba2e02869777`. They also
+Both Android workflows now pin `VortXTV/vortx-core` to
+`7e3e68be5bf2b11c65d158c1823be94bd1608d1b`. They also
 retain a `VortXTV/stremiox-core` checkout at
 `31c66611822043e089f5819ad232a5df93975873` for comparison/tooling; checkout presence
 does not mean it is built or packaged in native variants. These exact source pins
