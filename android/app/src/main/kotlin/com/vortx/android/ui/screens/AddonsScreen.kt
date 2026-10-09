@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -33,6 +34,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -84,6 +86,8 @@ fun AddonsScreen(
     modifier: Modifier = Modifier,
     onDiscover: () -> Unit = {},
     onInstallByQr: () -> Unit = {},
+    /** The root shell has already reserved the system inset and persistent navigation. */
+    embedded: Boolean = false,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val urlInput by viewModel.urlInput.collectAsStateWithLifecycle()
@@ -137,6 +141,7 @@ fun AddonsScreen(
 
     Column(modifier = modifier.fillMaxSize()) {
         TopAppBar(
+            windowInsets = if (embedded) WindowInsets(0, 0, 0, 0) else TopAppBarDefaults.windowInsets,
             title = { Text(if (reorderMode) "Reorder Add-ons" else "Add-ons", style = VortXTheme.type.screenTitle) },
             navigationIcon = {
                 IconButton(onClick = { if (reorderMode) reorderMode = false else onBack() }) {

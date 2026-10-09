@@ -6,7 +6,7 @@ import com.vortx.android.profile.ProfileStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** The four hideable phone tabs. Home and Settings intentionally have no key or setter. */
+/** The four hideable phone tabs. Home, Add-ons and Settings have no hide key or setter. */
 class TabBarPrefs(context: Context) {
     data class State(
         val hideDiscover: Boolean,
@@ -63,11 +63,12 @@ internal enum class TabSlot {
     LIVE,
     LIBRARY,
     SEARCH,
+    ADDONS,
     SETTINGS,
 }
 
 internal fun TabBarPrefs.State.isVisible(tab: TabSlot): Boolean = when (tab) {
-    TabSlot.HOME, TabSlot.SETTINGS -> true
+    TabSlot.HOME, TabSlot.ADDONS, TabSlot.SETTINGS -> true
     TabSlot.DISCOVER -> !hideDiscover
     TabSlot.LIVE -> !hideLive
     TabSlot.LIBRARY -> !hideLibrary

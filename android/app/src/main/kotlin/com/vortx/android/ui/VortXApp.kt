@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -21,8 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -48,6 +48,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -94,6 +95,9 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.components.Wordmark
+import com.vortx.android.ui.components.CinemaNavigationItem
+import com.vortx.android.ui.components.CinemaTopNavigation
+import com.vortx.android.ui.components.CinemaBottomNavigation
 import com.vortx.android.ui.gallery.GalleryScreen
 import com.vortx.android.ui.prefs.AppearancePrefs
 import com.vortx.android.ui.prefs.HomeDiscoverPreferences
@@ -204,10 +208,11 @@ private enum class Tab(
     LIVE("Live TV", VortXIcons.live, TabSlot.LIVE),
     LIBRARY("Library", VortXIcons.library, TabSlot.LIBRARY),
     SEARCH("Search", VortXIcons.search, TabSlot.SEARCH),
+    ADDONS("Add-ons", VortXIcons.addon, TabSlot.ADDONS),
     SETTINGS("Settings", VortXIcons.settings, TabSlot.SETTINGS),
 }
 
-/// The whole app: a five-tab shell matching the iOS and Apple TV structure, with a detail overlay.
+/// One adaptive Cinema route owner: tablet top navigation, compact phone bottom navigation and overflow.
 /// [repo] defaults to the offline preview source; the real stremio-core engine is injected here (from
 /// `VortXApplication`), with no change to any screen; every screen consumes a ViewModel, and every
 /// ViewModel depends only on [CatalogRepository] (or, for the account screen, [AuthRepository]).
@@ -1459,55 +1464,45 @@ fun VortXApp(
 
         val factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext)
         val authState by accountVm.authState.collectAsStateWithLifecycle()
+        val configuration = LocalConfiguration.current
+        val topNavigation = cinemaUsesTopNavigation(configuration.screenWidthDp, configuration.screenHeightDp)
+        val navigationItems = visibleTabs.map { CinemaNavigationItem(it.slot, it.label, it.icon) }
+        val selectShellTab: (TabSlot) -> Unit = { slot ->
+            val next = Tab.entries.firstOrNull { it.slot == slot } ?: Tab.HOME
+            if (next == tab) {
+                openDetail(null)
+                when (next) {
+                    Tab.SEARCH -> searchReselect++
+                    Tab.DISCOVER -> discoverReselect++
+                    Tab.HOME -> if (homeMode == CinemaHomeMode.BROWSE) discoverReselect++
+                    else -> Unit
+                }
+            } else savedTabName = next.name
+        }
         BackHandler(enabled = mergeHomeDiscover && tab == Tab.HOME && homeMode == CinemaHomeMode.BROWSE) {
             savedHomeModeName = CinemaHomeMode.FEATURED.name
         }
         Scaffold(
             topBar = {
-                // The top bar reads as VortX glass: the stock opaque Material3 container is made transparent
-                // and the flush glass strip renders behind it. Title / items / behavior are unchanged.
-                TopAppBar(
-                    title = {
-                        if (tab == Tab.HOME) Wordmark() else Text(tab.label, style = VortXTheme.type.screenTitle)
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = Color.Transparent,
-                        scrolledContainerColor = Color.Transparent,
-                    ),
-                    modifier = Modifier.vortxGlassStrip(),
-                )
+                if (topNavigation) {
+                    CinemaTopNavigation(navigationItems, tab.slot, selectShellTab,
+                        onProfiles = { showProfiles = true }, modifier = Modifier.statusBarsPadding())
+                } else if (tab != Tab.ADDONS) {
+                    // Add-ons owns its title/reorder/back header; do not draw a second one above it.
+                    TopAppBar(
+                        title = { if (tab == Tab.HOME) Wordmark() else Text(tab.label, style = VortXTheme.type.screenTitle) },
+                        actions = { IconButton(onClick = { showProfiles = true }) {
+                            Icon(VortXIcons.profiles, contentDescription = "Switch or manage profiles")
+                        } },
+                        colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent,
+                            scrolledContainerColor = Color.Transparent),
+                        modifier = Modifier.vortxGlassStrip(),
+                    )
+                }
             },
             bottomBar = {
-                // The bottom nav bar reads as VortX glass too: transparent M3 container plus zero tonal
-                // overlay, with the flush glass strip behind. Every tab item stays exactly as it was.
-                NavigationBar(
-                    containerColor = Color.Transparent,
-                    tonalElevation = 0.dp,
-                    modifier = Modifier.vortxGlassStrip(),
-                ) {
-                    visibleTabs.forEach { t ->
-                        NavigationBarItem(
-                            selected = t == tab,
-                            // SD-6: re-tapping the ALREADY-active Search/Discover tab pops any open detail
-                            // (back to root) and scrolls that screen to the top (Apple's active-tab re-tap).
-                            onClick = {
-                                if (t == tab) {
-                                    openDetail(null)
-                                    when (t) {
-                                        Tab.SEARCH -> searchReselect++
-                                        Tab.DISCOVER -> discoverReselect++
-                                        Tab.HOME -> if (homeMode == CinemaHomeMode.BROWSE) discoverReselect++
-                                        else -> Unit
-                                    }
-                                } else {
-                                    savedTabName = t.name
-                                }
-                            },
-                            icon = { Icon(t.icon, contentDescription = t.label) },
-                            label = { Text(t.label) },
-                        )
-                    }
-                }
+                if (!topNavigation) CinemaBottomNavigation(navigationItems, tab.slot, selectShellTab,
+                    onProfiles = { showProfiles = true })
             },
             // OFFLINE SURFACE (audit 12 cross-cut): the phone shell had no offline chip; the TV shell did
             // (TvConnectivity). The pill floats just above the bottom bar whenever the default network
@@ -1611,6 +1606,14 @@ fun VortXApp(
                             onDebridLibraryClick = { showDebridLibrary = true },
                         )
                     },
+                )
+                Tab.ADDONS -> AddonsScreen(
+                    viewModel = viewModel<AddonsViewModel>(factory = StremioXViewModelFactory(repo = repo)),
+                    onBack = { savedTabName = Tab.HOME.name },
+                    modifier = content,
+                    onDiscover = { showAddonStore = true },
+                    onInstallByQr = { showAddonPairing = true },
+                    embedded = true,
                 )
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,
