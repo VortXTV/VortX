@@ -57,6 +57,20 @@ class CinemaExpandedLayoutContractTest {
         assertTrue(detail.contains("state = detailListState"))
         assertTrue(detail.contains("item(key = \"detail-sources\")"))
     }
+    @Test fun `Sources index includes each always mounted item including personal rating controls`() {
+        val detail = source("ui/screens/DetailScreen.kt")
+        val beforeSources = detail.substringAfter("is UiState.Success -> LazyColumn(")
+            .substringBefore("item(key = \"detail-sources\")")
+        for (key in listOf("detail-hero", "detail-actions", "detail-personal-rating")) {
+            assertEquals("Exactly one mounted $key slot", 1,
+                Regex(Regex.escape("item(key = \"$key\")")).findAll(beforeSources).count())
+        }
+        val personalRating = beforeSources.substringAfter("item(key = \"detail-personal-rating\")")
+            .substringBefore("// DET financials")
+        assertTrue(personalRating.contains("PersonalRatingActions("))
+        assertTrue(source("ui/components/CinemaDetailLayoutPolicy.kt").contains(
+            "3 + listOf(pickedReason, ratings, financials, releaseDates).count { it }"))
+    }
     @Test fun `phone hero uses measured available viewport and real optional synopsis`() {
         val detail = source("ui/screens/DetailScreen.kt")
         assertTrue(detail.contains("val viewportHeight = maxHeight"))

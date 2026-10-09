@@ -502,8 +502,8 @@ fun DetailScreen(
                 state = detailListState,
                 verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
             ) {
-                item { Backdrop(m.data, viewportHeight) }
-                item {
+                item(key = "detail-hero") { Backdrop(m.data, viewportHeight) }
+                item(key = "detail-actions") {
                     ActionsCluster(
                         m = m.data,
                         primaryEpisode = viewModel.primaryEpisode(),
@@ -554,7 +554,7 @@ fun DetailScreen(
                         )
                     }
                 }
-                item {
+                item(key = "detail-personal-rating") {
                     PersonalRatingActions(
                         detail = m.data, tv = false,
                         modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),

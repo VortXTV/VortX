@@ -50,6 +50,8 @@ struct SettingsView: View {
     @AppStorage(TabBarPrefs.hideDiscover) private var hideDiscoverTab = false
     @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
     @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
+    @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
+    @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
     // Top Shelf mirror of Continue Watching (the tvOS Home screen row). The writer reads this same key,
     // and the change handler below republishes so a toggle takes effect without waiting for a re-seed.
     @AppStorage(TopShelfSnapshotWriter.showKey) private var topShelfCW = TopShelfSnapshotWriter.showDefault
@@ -951,6 +953,14 @@ struct SettingsView: View {
     private var appearanceSection: some View {
         section("Appearance") {
             ContinueWatchingSettingsView()
+            choiceRow(String(localized: "Quick view"), [("1", "On"), ("0", "Off")],
+                      selection: Binding(get: { quickViewEnabled ? "1" : "0" }, set: { quickViewEnabled = ($0 == "1") }))
+            Text("Open compact details before entering a full title page. Applies to catalog cards across Home and Discover.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Combine Discover & Search"), [("1", "On"), ("0", "Off")],
+                      selection: Binding(get: { mergeDiscoverSearch ? "1" : "0" }, set: { mergeDiscoverSearch = ($0 == "1") }))
+            Text("Put Search inside Discover. Turn this off to restore the separate Search tab.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             ThemeAccentPicker(selection: $theme.accentID).focusSection()
             ThemeBackgroundPicker(oled: $theme.oled).focusSection()
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")
@@ -1674,6 +1684,7 @@ private enum SettingsSearchSection: CaseIterable {
                               "seek anywhere", "pair a mac"]
         case .tabBar: return ["tab", "discover tab", "live tv tab", "library tab", "search tab"]
         case .appearance: return ["accent", "background", "oled", "app language", "language",
+                                  "quick view", "combine discover", "combine search", "merge discover", "merge search",
                                   "cinematic catalog cards", "hide poster labels", "poster style",
                                   "collections on home", "collections on discover", "refresh collections",
                                   "streaming services", "discover & region", "budget & box office", "spoiler",

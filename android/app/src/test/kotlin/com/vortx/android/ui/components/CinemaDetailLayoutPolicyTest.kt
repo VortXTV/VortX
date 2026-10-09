@@ -21,7 +21,7 @@ class CinemaDetailLayoutPolicyTest {
     @Test fun `Sources jump index matches every optional fact combination`() {
         for (mask in 0 until 16) {
             val flags = (0 until 4).map { mask and (1 shl it) != 0 }
-            assertEquals(2 + flags.count { it }, cinemaDetailSourceSectionIndex(flags[0], flags[1], flags[2], flags[3]))
+            assertEquals(3 + flags.count { it }, cinemaDetailSourceSectionIndex(flags[0], flags[1], flags[2], flags[3]))
         }
     }
 }

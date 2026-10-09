@@ -77,6 +77,7 @@ fun TvSeasonEpisodeSection(
     onSelectEpisode: (String) -> Unit,
     onToggleWatched: (Episode, Boolean) -> Unit,
     onMarkSeasonWatched: (Int, Boolean) -> Unit,
+    onMarkSeriesWatched: (Boolean) -> Unit,
 ) {
     val seasons = remember(detail.videos) {
         detail.videos.map { it.season }.distinct().sorted()
@@ -96,6 +97,7 @@ fun TvSeasonEpisodeSection(
         runCatching { episodeFocusRequesters[index].requestFocus() }
     }
     val seasonAllWatched = episodes.isNotEmpty() && episodes.all { it.id in detail.watchedVideoIds }
+    val seriesAllWatched = detail.videos.isNotEmpty() && detail.videos.all { it.id in detail.watchedVideoIds }
 
     Column(
         modifier = Modifier
@@ -127,12 +129,20 @@ fun TvSeasonEpisodeSection(
 
         // Bulk mark-the-season control (mirrors the phone SeasonSelector's season-level toggle).
         if (episodes.isNotEmpty()) {
-            Row(modifier = Modifier.padding(horizontal = TvDimens.edge)) {
+            Row(
+                modifier = Modifier.padding(horizontal = TvDimens.edge),
+                horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+            ) {
                 TvFilterChip(
                     label = if (seasonAllWatched) "Mark season unwatched" else "Mark season watched",
                     selected = false,
                     onClick = { onMarkSeasonWatched(activeSeason, !seasonAllWatched) },
                     modifier = if (seasons.size <= 1) Modifier.focusRequester(seasonFocus) else Modifier,
+                )
+                TvFilterChip(
+                    label = if (seriesAllWatched) "Mark series unwatched" else "Mark series watched",
+                    selected = false,
+                    onClick = { onMarkSeriesWatched(!seriesAllWatched) },
                 )
             }
         }

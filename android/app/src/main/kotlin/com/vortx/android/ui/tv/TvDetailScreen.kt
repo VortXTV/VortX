@@ -126,6 +126,9 @@ fun TvDetailScreen(
     onPlay: (Playable, MetaDetail, PlayerEngineRouter.Override) -> Unit,
     modifier: Modifier = Modifier,
     onOpenTitle: (MetaItem) -> Unit = {},
+    /** Explicit one-shot Watch from QuickView; ordinary detail visits remain manual. */
+    autoWatch: Boolean = false,
+    onAutoWatchConsumed: () -> Unit = {},
 ) {
     val metaState by viewModel.meta.collectAsStateWithLifecycle()
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
@@ -137,12 +140,23 @@ fun TvDetailScreen(
     }
     var pendingLaunchEnginePreference by remember { mutableStateOf(launchEnginePreference) }
     val beginPlayback: (() -> Unit) -> Unit = { action ->
+        if (autoWatch) onAutoWatchConsumed()
         pendingLaunchEnginePreference = launchEnginePreference
         action()
     }
     val beginPlaybackWithEngine: (PlayerEngineRouter.Override, () -> Unit) -> Unit = { engine, action ->
+        if (autoWatch) onAutoWatchConsumed()
         pendingLaunchEnginePreference = engine
         action()
+    }
+
+    // Consume before dispatch. Arriving groups, recomposition and returning from playback must not
+    // launch again; a manual source/player choice above also retires the pending QuickView request.
+    LaunchedEffect(autoWatch, metaState, streamsState, playback) {
+        if (!autoWatch || playback is Playback.Resolving || metaState !is UiState.Success || viewModel.bestSource() == null) {
+            return@LaunchedEffect
+        }
+        beginPlayback { viewModel.playBest() }
     }
 
     BackHandler { onBack() }
@@ -566,6 +580,7 @@ private fun TvDetailContent(
                     },
                     onToggleWatched = viewModel::setVideoWatched,
                     onMarkSeasonWatched = viewModel::setSeasonWatched,
+                    onMarkSeriesWatched = viewModel::setWatched,
                 )
             }
 

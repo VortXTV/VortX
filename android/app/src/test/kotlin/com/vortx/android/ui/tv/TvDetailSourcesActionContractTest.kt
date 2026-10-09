@@ -39,6 +39,30 @@ class TvDetailSourcesActionContractTest {
         assertTrue(!source.contains("TvError(meta.message, onRetry = onBack)"))
     }
 
+    @Test
+    fun `explicit QuickView Watch waits for a ranked source and consumes before dispatch`() {
+        val source = readSource()
+        assertTrue(source.contains("autoWatch: Boolean = false"))
+        val begin = source.substringAfter("val beginPlayback: (() -> Unit) -> Unit = { action ->")
+            .substringBefore("val beginPlaybackWithEngine")
+        assertTrue(begin.indexOf("onAutoWatchConsumed()") in 0 until begin.indexOf("action()"))
+        val automatic = source.substringAfter("LaunchedEffect(autoWatch, metaState, streamsState, playback)")
+            .substringBefore("BackHandler")
+        assertTrue(automatic.contains("!autoWatch"))
+        assertTrue(automatic.contains("playback is Playback.Resolving"))
+        assertTrue(automatic.contains("metaState !is UiState.Success"))
+        assertTrue(automatic.contains("viewModel.bestSource() == null"))
+        assertTrue(automatic.contains("beginPlayback { viewModel.playBest() }"))
+    }
+
+    @Test
+    fun `manual source and engine choices also retire pending QuickView Watch`() {
+        val source = readSource()
+        val engine = source.substringAfter("val beginPlaybackWithEngine:")
+            .substringBefore("LaunchedEffect(autoWatch")
+        assertTrue(engine.indexOf("onAutoWatchConsumed()") in 0 until engine.indexOf("action()"))
+    }
+
     private fun readSource(): String {
         val candidates = listOf(
             File("src/main/kotlin/com/vortx/android/ui/tv/TvDetailScreen.kt"),

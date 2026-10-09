@@ -15,6 +15,20 @@ class TvDetailEpisodeFocusContractTest {
         assertTrue(source.contains("focusRestoreRevision"))
     }
 
+    @Test
+    fun `whole series watched action uses complete inventory rather than active season`() {
+        val source = readSource()
+        assertTrue(source.contains("detail.videos.isNotEmpty() && detail.videos.all { it.id in detail.watchedVideoIds }"))
+        assertTrue(source.contains("onMarkSeriesWatched(!seriesAllWatched)"))
+        assertTrue(source.contains("\"Mark series unwatched\" else \"Mark series watched\""))
+        val detail = listOf(
+            File("src/main/kotlin/com/vortx/android/ui/tv/TvDetailScreen.kt"),
+            File("app/src/main/kotlin/com/vortx/android/ui/tv/TvDetailScreen.kt"),
+            File("android/app/src/main/kotlin/com/vortx/android/ui/tv/TvDetailScreen.kt"),
+        ).first(File::isFile).readText()
+        assertTrue(detail.contains("onMarkSeriesWatched = viewModel::setWatched"))
+    }
+
     private fun readSource(): String {
         val candidates = listOf(
             File("src/main/kotlin/com/vortx/android/ui/tv/TvDetailSections.kt"),

@@ -7,6 +7,6 @@ internal fun cinemaDetailHeroHeightDp(widthDp: Float, viewportHeightDp: Float): 
     return maxOf(360f, viewportHeightDp * if (portraitPhone) 0.78f else 0.60f)
 }
 
-/** Two always-present hero/action items, then exactly the optional fact items before Sources. */
+/** Hero, actions and personal-rating items are always mounted before Sources, plus optional facts. */
 internal fun cinemaDetailSourceSectionIndex(pickedReason: Boolean, ratings: Boolean, financials: Boolean, releaseDates: Boolean): Int =
-    2 + listOf(pickedReason, ratings, financials, releaseDates).count { it }
+    3 + listOf(pickedReason, ratings, financials, releaseDates).count { it }
