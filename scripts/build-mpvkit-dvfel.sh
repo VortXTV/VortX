@@ -71,6 +71,8 @@
 #                                     creates and so must be applied after it.
 #   scripts/mpv-coreaudio-hotplug-lifecycle.patch patches MPV's native CoreAudio init-failure
 #                                     cleanup. Installed as 0005; no mpv version/audio policy bump.
+#   scripts/mpv-http-seek-interrupt.patch interrupts obsolete HTTP I/O for an accepted seek
+#                                     and reopens only that source at its exact byte offset (0006).
 # Everything not listed above still comes from upstream MPVKit's own prebuilt zips at the versions
 # the MPVKit 1.0.0 base already used.
 #
@@ -176,7 +178,7 @@ else
     [ -z "$line" ] && continue
     case "$line" in
       ' M Package.swift'|'M Package.swift'|' M Sources/BuildScripts/XCFrameworkBuild/main.swift'|'M Sources/BuildScripts/XCFrameworkBuild/main.swift') ;;
-      '?? .build/'*|'?? dist/'*|'?? Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch'|'?? Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch') ;;
+      '?? .build/'*|'?? dist/'*|'?? Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch'|'?? Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch'|'?? Sources/BuildScripts/patch/libmpv/0006-http-seek-interrupt.patch') ;;
       *) fail "existing MPVKit checkout has unexpected dirty state: $line" ;;
     esac
   done <<< "$STATUS"
@@ -214,6 +216,8 @@ copy_exact "$REPO/scripts/mpv-moltenvk-resize.patch" \
   "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0004-moltenvk-context-check-events-resize.patch"
 copy_exact "$REPO/scripts/mpv-coreaudio-hotplug-lifecycle.patch" \
   "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0005-coreaudio-hotplug-lifecycle.patch"
+copy_exact "$REPO/scripts/mpv-http-seek-interrupt.patch" \
+  "$MPVKIT_DIR/Sources/BuildScripts/patch/libmpv/0006-http-seek-interrupt.patch"
 
 # A prior interrupted experiment installed this retired VortX-only FFmpeg patch as an untracked
 # file. Do not delete or overwrite it implicitly; fail with an actionable path instead.

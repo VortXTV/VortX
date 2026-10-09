@@ -1,0 +1,372 @@
+--- a/stream/stream.h
++++ b/stream/stream.h
+@@ -20,6 +20,7 @@
+ 
+ #include "common/msg.h"
+ #include <stdbool.h>
++#include <stdatomic.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include <inttypes.h>
+@@ -170,6 +171,14 @@
+ 
+     struct mp_cancel *cancel;   // cancellation notification
+ 
++    // Only an opted-in backend may recover from a superseded I/O operation.
++    // requested_io_epoch is written under the demux lock; the owner thread
++    // alone updates active_io_epoch/recover_io and touches backend state.
++    bool seek_interruptible;
++    atomic_uint_fast64_t requested_io_epoch;
++    uint64_t active_io_epoch;
++    bool recover_io;
++
+     // Read statistic for fill_buffer calls. All bytes read by fill_buffer() are
+     // added to this. The user can reset this as needed.
+     uint64_t total_unbuffered_read_bytes;
+@@ -230,6 +239,9 @@
+ int stream_peek(stream_t *s, int forward_size);
+ int stream_read_peek(stream_t *s, void *buf, int buf_size);
+ void stream_drop_buffers(stream_t *s);
++void stream_request_seek_interrupt(stream_t *s);
++void stream_begin_io(stream_t *s);
++bool stream_io_interrupted(stream_t *s);
+ int64_t stream_get_size(stream_t *s);
+ 
+ struct mpv_global;
+--- a/stream/stream.c
++++ b/stream/stream.c
+@@ -354,6 +354,7 @@
+     }
+ 
+     stream_t *s = talloc_zero(NULL, stream_t);
++    atomic_init(&s->requested_io_epoch, 0);
+     s->global = args->global;
+     struct stream_opts *opts = mp_get_config_group(s, s->global, &stream_conf);
+     if (flags & STREAM_SILENT) {
+@@ -498,6 +499,29 @@
+     return s;
+ }
+ 
++// Called under the demux lock, including before dropping it for blocking I/O.
++// Never reset s->cancel: stop/source retirement must remain permanently latched.
++void stream_request_seek_interrupt(stream_t *s)
++{
++    if (s && s->seek_interruptible)
++        atomic_fetch_add(&s->requested_io_epoch, 1);
++}
++
++bool stream_io_interrupted(stream_t *s)
++{
++    return s && s->seek_interruptible &&
++           atomic_load(&s->requested_io_epoch) != s->active_io_epoch;
++}
++
++void stream_begin_io(stream_t *s)
++{
++    if (!s || !s->seek_interruptible)
++        return;
++    s->active_io_epoch = atomic_load(&s->requested_io_epoch);
++    if (s->recover_io)
++        stream_drop_buffers(s);
++}
++
+ // Read function bypassing the local stream buffer. This will not write into
+ // s->buffer, but into buf[0..len] instead.
+ // Returns 0 on error or EOF, and length of bytes read on success.
+@@ -704,7 +728,7 @@
+ // Seek function bypassing the local stream buffer.
+ static bool stream_seek_unbuffered(stream_t *s, int64_t newpos)
+ {
+-    if (newpos != s->pos) {
++    if (newpos != s->pos || s->recover_io) {
+         MP_VERBOSE(s, "stream level seek from %" PRId64 " to %" PRId64 "\n",
+                    s->pos, newpos);
+ 
+@@ -741,6 +765,11 @@
+         MP_ERR(s, "Invalid seek to negative position %lld!\n", (long long)pos);
+         pos = 0;
+     }
++
++    // A cancelled HTTP AVIO cannot satisfy a same-offset/short seek by
++    // retaining its socket or poisoned EOF/error state.
++    if (s->recover_io)
++        return stream_seek_unbuffered(s, pos);
+ 
+     if (pos <= s->pos) {
+         int64_t x = pos - (s->pos - (int)s->buf_end);
+--- a/demux/demux.c
++++ b/demux/demux.c
+@@ -2356,6 +2356,7 @@
+     in->reading = true;
+     in->after_seek = false;
+     in->after_seek_to_start = false;
++    stream_begin_io(in->d_thread->stream);
+     mp_mutex_unlock(&in->lock);
+ 
+     struct demuxer *demux = in->d_thread;
+@@ -2538,6 +2539,7 @@
+     if (in->recorder)
+         mp_recorder_mark_discontinuity(in->recorder);
+ 
++    stream_begin_io(in->d_thread->stream);
+     mp_mutex_unlock(&in->lock);
+ 
+     MP_VERBOSE(in, "execute seek (to %f flags %d)\n", pts, flags);
+@@ -3973,6 +3975,11 @@
+         in->seek_pts = seek_pts;
+     }
+ 
++    // Cache-only cursor changes need no transport interruption. A queued
++    // low-level seek supersedes any blocking read/seek on this source only.
++    if (in->seeking)
++        stream_request_seek_interrupt(in->d_thread->stream);
++
+     for (int n = 0; n < in->num_streams; n++) {
+         struct demux_stream *ds = in->streams[n]->ds;
+ 
+--- a/stream/stream_lavf.c
++++ b/stream/stream_lavf.c
+@@ -54,16 +54,82 @@
+ static int open_f(stream_t *stream);
+ static struct mp_tags *read_icy(stream_t *stream);
+ 
++struct lavf_priv {
++    AVIOContext *avio;
++    // Original source options, captured before avio_open2 consumes the dict.
++    // Do not reread globals: a later load may already have changed its headers.
++    AVDictionary *reopen_opts;
++    char *reopen_url;
++};
++
++static int interrupt_cb(void *ctx);
++
++static bool reopen_at(stream_t *s, int64_t offset)
++{
++    struct lavf_priv *p = s->priv;
++    AVIOContext *candidate = NULL;
++    AVDictionary *options = NULL;
++    uint8_t *cookies = NULL;
++    bool ok = false;
++
++    if (!s->seek_interruptible || offset < 0 ||
++        mp_cancel_test(s->cancel) || stream_io_interrupted(s))
++        return false;
++
++    // HTTP exports cookies learned during redirects/authentication. Keep that
++    // source-local state, but never substitute another source's global options.
++    if (av_opt_get(p->avio, "cookies", AV_OPT_SEARCH_CHILDREN, &cookies) < 0)
++        goto done;
++    if (cookies && cookies[0] &&
++        av_dict_set(&p->reopen_opts, "cookies", (char *)cookies, 0) < 0)
++        goto done;
++    if (av_dict_copy(&options, p->reopen_opts, 0) < 0 ||
++        av_dict_set_int(&options, "offset", offset, 0) < 0)
++        goto done;
++
++    AVIOInterruptCB cb = {.callback = interrupt_cb, .opaque = s};
++    if (avio_open2(&candidate, p->reopen_url, AVIO_FLAG_READ, &cb, &options) < 0)
++        goto done;
++    if (!(candidate->seekable & AVIO_SEEKABLE_NORMAL))
++        goto done;
++
++    // The HTTP offset option positions the protocol, not the AVIO buffer.
++    // Align with a real public-API seek, without the AVIO short-read shortcut.
++    int direct = candidate->direct;
++    candidate->direct = 1;
++    int64_t position = avio_seek(candidate, offset, SEEK_SET);
++    candidate->direct = direct;
++    if (position != offset || avio_tell(candidate) != offset || candidate->error ||
++        mp_cancel_test(s->cancel) || stream_io_interrupted(s))
++        goto done;
++
++    avio_closep(&p->avio);
++    p->avio = candidate;
++    candidate = NULL;
++    s->recover_io = false;
++    ok = true;
++done:
++    avio_closep(&candidate);
++    av_dict_free(&options);
++    av_free(cookies);
++    return ok;
++}
++
+ static int fill_buffer(stream_t *s, void *buffer, int max_len)
+ {
+-    AVIOContext *avio = s->priv;
+-    int r = avio_read_partial(avio, buffer, max_len);
++    struct lavf_priv *p = s->priv;
++    if (s->recover_io && !reopen_at(s, s->pos))
++        return -1;
++    int r = avio_read_partial(p->avio, buffer, max_len);
++    if (stream_io_interrupted(s))
++        s->recover_io = true;
+     return (r <= 0) ? -1 : r;
+ }
+ 
+ static int write_buffer(stream_t *s, void *buffer, int len)
+ {
+-    AVIOContext *avio = s->priv;
++    struct lavf_priv *p = s->priv;
++    AVIOContext *avio = p->avio;
+     avio_write(avio, buffer, len);
+     avio_flush(avio);
+     if (avio->error)
+@@ -73,22 +139,28 @@
+ 
+ static int seek(stream_t *s, int64_t newpos)
+ {
+-    AVIOContext *avio = s->priv;
+-    if (avio_seek(avio, newpos, SEEK_SET) < 0) {
++    struct lavf_priv *p = s->priv;
++    if (s->recover_io)
++        return reopen_at(s, newpos);
++    int64_t result = avio_seek(p->avio, newpos, SEEK_SET);
++    if (stream_io_interrupted(s)) {
++        s->recover_io = true;
+         return 0;
+     }
+-    return 1;
++    return result == newpos;
+ }
+ 
+ static int64_t get_size(stream_t *s)
+ {
+-    AVIOContext *avio = s->priv;
++    struct lavf_priv *p = s->priv;
++    AVIOContext *avio = p->avio;
+     return avio_size(avio);
+ }
+ 
+ static void close_f(stream_t *stream)
+ {
+-    AVIOContext *avio = stream->priv;
++    struct lavf_priv *p = stream->priv;
++    AVIOContext *avio = p->avio;
+     /* NOTE: As of 2011 write streams must be manually flushed before close.
+      * Currently write_buffer() always flushes them after writing.
+      * avio_close() could return an error, but we have no way to return that
+@@ -96,11 +168,13 @@
+      */
+     if (avio)
+         avio_close(avio);
++    av_dict_free(&p->reopen_opts);
+ }
+ 
+ static int control(stream_t *s, int cmd, void *arg)
+ {
+-    AVIOContext *avio = s->priv;
++    struct lavf_priv *p = s->priv;
++    AVIOContext *avio = p->avio;
+     switch(cmd) {
+     case STREAM_CTRL_AVSEEK: {
+         struct stream_avseek *c = arg;
+@@ -148,7 +222,7 @@
+ static int interrupt_cb(void *ctx)
+ {
+     struct stream *stream = ctx;
+-    return mp_cancel_test(stream->cancel);
++    return mp_cancel_test(stream->cancel) || stream_io_interrupted(stream);
+ }
+ 
+ static const char * const prefix[] = { "lavf://", "ffmpeg://" };
+@@ -330,6 +404,7 @@
+ 
+ static int open_f(stream_t *stream)
+ {
++    struct lavf_priv *p = talloc_zero(stream, struct lavf_priv);
+     AVIOContext *avio = NULL;
+     int res = STREAM_ERROR;
+     AVDictionary *dict = NULL;
+@@ -395,6 +470,18 @@
+         av_dict_set(&dict, "timeout", "0", 0);
+     }
+ 
++    AVDictionaryEntry *method = av_dict_get(dict, "method", NULL, 0);
++    bool recoverable = flags == AVIO_FLAG_READ &&
++        (strncmp(filename, "http://", 7) == 0 ||
++         strncmp(filename, "https://", 8) == 0) &&
++        !av_dict_get(dict, "post_data", NULL, 0) &&
++        (!method || strcmp(method->value, "GET") == 0);
++    if (recoverable) {
++        p->reopen_url = talloc_strdup(p, filename);
++        if (av_dict_copy(&p->reopen_opts, dict, 0) < 0)
++            goto out;
++    }
++
+     int err = avio_open2(&avio, filename, flags, &cb, &dict);
+     if (err < 0) {
+         if (err == AVERROR_PROTOCOL_NOT_FOUND)
+@@ -413,8 +500,10 @@
+         }
+     }
+ 
+-    stream->priv = avio;
++    p->avio = avio;
++    stream->priv = p;
+     stream->seekable = avio->seekable & AVIO_SEEKABLE_NORMAL;
++    stream->seek_interruptible = recoverable && stream->seekable;
+     stream->seek = stream->seekable ? seek : NULL;
+     stream->fill_buffer = fill_buffer;
+     stream->write_buffer = write_buffer;
+@@ -428,6 +517,8 @@
+     res = STREAM_OK;
+ 
+ out:
++    if (res != STREAM_OK)
++        av_dict_free(&p->reopen_opts);
+     av_dict_free(&dict);
+     talloc_free(temp);
+     return res;
+@@ -435,7 +526,8 @@
+ 
+ static struct mp_tags *read_icy(stream_t *s)
+ {
+-    AVIOContext *avio = s->priv;
++    struct lavf_priv *p = s->priv;
++    AVIOContext *avio = p->avio;
+ 
+     if (!avio->av_class)
+         return NULL;
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -1082,6 +1082,12 @@
+     struct ebml_parse_ctx parse_ctx = {demuxer->log};
+     if (ebml_read_element(s, &parse_ctx, &cues, &ebml_cues_desc) < 0)
+         return -1;
++    // ebml_read_element may parse a short read and still return success.
++    // Never commit an incomplete index from an obsolete I/O epoch.
++    if (stream_io_interrupted(s)) {
++        talloc_free(parse_ctx.talloc_ctx);
++        return -1;
++    }
+ 
+     for (int i = 0; i < cues.n_cue_point; i++) {
+         struct ebml_cue_point *cuepoint = &cues.cue_point[i];
+@@ -1521,8 +1527,16 @@
+     for (int n = 0; n < mkv_d->num_headers; n++) {
+         struct header_elem *elem = &mkv_d->headers[n];
+ 
+-        if (elem->id == MATROSKA_ID_CUES)
++        if (elem->id == MATROSKA_ID_CUES && !elem->parsed) {
+             read_deferred_element(demuxer, elem);
++            // read_deferred_element marks the header parsed before seeking.
++            // A superseded seek is not a malformed header: let the latest
++            // epoch retry Cues instead of permanently falling back to a scan.
++            if (stream_io_interrupted(demuxer->stream)) {
++                elem->parsed = false;
++                return;
++            }
++        }
+     }
+ }
+ 
+@@ -3465,6 +3479,8 @@
+     struct stream *s = demuxer->stream;
+ 
+     read_deferred_cues(demuxer);
++    if (stream_io_interrupted(s))
++        return -1;
+ 
+     if (mkv_d->index_complete)
+         return 0;
