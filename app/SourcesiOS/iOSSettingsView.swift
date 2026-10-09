@@ -232,6 +232,28 @@ struct iOSSettingsView: View {
             : EdgeInsets(top: 14, leading: 18, bottom: 14, trailing: 18)
     }
 
+    /// Padding keeps text readable; this is the actual space between row cards. The old form only inset
+    /// the background shape, so neighbouring rounded boxes still touched even with generous row padding.
+    private var settingsRowSpacing: CGFloat {
+        usesWideSettingsLayout ? Theme.Space.sm : Theme.Space.xs
+    }
+
+    /// Wide surfaces can carry a little more of the active profile hue; the phone stays restrained so the
+    /// compact form remains dark and scannable instead of becoming a column of coloured slabs.
+    private var settingsTintAlpha: Double {
+        usesWideSettingsLayout ? 0.10 : 0.08
+    }
+
+    /// macOS Form does not expose `listRowSpacing`; keep its wide-column card breathing room with the
+    /// clipped background inset while iPhone/iPad use the real iOS row-spacing API above.
+    private var settingsCardVerticalInset: CGFloat {
+        #if os(macOS)
+        return Theme.Space.xs / 2
+        #else
+        return 0
+        #endif
+    }
+
     var body: some View {
         NavigationStack {
             #if os(macOS)
@@ -280,6 +302,9 @@ struct iOSSettingsView: View {
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .listRowInsets(settingsRowInsets)
+            #if os(iOS)
+            .listRowSpacing(settingsRowSpacing)
+            #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .frame(maxWidth: usesWideSettingsLayout ? 1120 : .infinity, alignment: .center)
             .padding(.horizontal, usesWideSettingsLayout ? Theme.Space.sm : 0)
@@ -459,9 +484,13 @@ struct iOSSettingsView: View {
     /// grouped-list platter when a new section is added.
     private func styledSettingsSection<Content: View>(_ content: Content) -> some View {
         content
-            .listRowBackground(Color.clear.vortxGlassListRow(
-                in: RoundedRectangle(cornerRadius: settingsCardRadius, style: .continuous))
-                .padding(.vertical, 4))
+            .listRowBackground(Color.clear.vortxGlassTintedSurface(
+                in: RoundedRectangle(cornerRadius: settingsCardRadius, style: .continuous),
+                fillAlpha: VortXGlass.cardFillAlpha,
+                tint: Theme.Palette.accent,
+                tintAlpha: settingsTintAlpha,
+                shadow: .flat)
+                .padding(.vertical, settingsCardVerticalInset))
             .listRowInsets(settingsRowInsets)
             .listRowSeparator(.hidden)
     }

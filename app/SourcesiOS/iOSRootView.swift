@@ -2241,7 +2241,7 @@ struct iOSLibraryView: View {
                 // the existing value route / local filters: nothing here creates a second data source.
                 VStack(spacing: Theme.Space.sm) {
                     NavigationLink(value: LibraryRoute.downloads) {
-                        CinemaLibraryEntryCard(
+                        iOSLibraryHubCard(
                             title: "Downloads",
                             subtitle: downloads.records.isEmpty
                                 ? "Saved episodes available offline appear here."
@@ -2252,15 +2252,15 @@ struct iOSLibraryView: View {
                     }
                     .buttonStyle(.plain)
                     NavigationLink(value: LibraryRoute.watchlist) {
-                        CinemaLibraryEntryCard(title: "Watchlist", subtitle: "Titles bookmarked to watch later", systemImage: "bookmark.fill")
+                        iOSLibraryHubCard(title: "Watchlist", subtitle: "Titles bookmarked to watch later", systemImage: "bookmark.fill")
                     }
                     .buttonStyle(.plain)
                     Button {
                         segment = .all
                         activeFilters = [.watched]
                     } label: {
-                        CinemaLibraryEntryCard(title: "Previously Watched", subtitle: "Titles marked watched in this profile",
-                                               systemImage: "checkmark.circle.fill")
+                        iOSLibraryHubCard(title: "Previously Watched", subtitle: "Titles marked watched in this profile",
+                                          systemImage: "checkmark.circle.fill")
                     }
                     .buttonStyle(.plain)
                 }
@@ -2561,6 +2561,60 @@ struct iOSLibraryView: View {
         }
     }
 }
+
+#if !os(tvOS)
+/// The three Library doorway cards are intentionally local to the Library surface: their routes remain
+/// owned by `iOSLibraryView`, while this presentation keeps the profile accent inside the same dark glass
+/// material used by Settings. It does not change card actions or introduce a second library source.
+private struct iOSLibraryHubCard: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    var badge: String? = nil
+
+    var body: some View {
+        HStack(spacing: Theme.Space.md) {
+            Image(systemName: systemImage)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Theme.Palette.accent)
+                .frame(width: 52, height: 52)
+                .vortxGlassTintedSurface(
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous),
+                    fillAlpha: VortXGlass.pillFillAlpha,
+                    tint: Theme.Palette.accent,
+                    tintAlpha: VortXGlass.cinemaTintAlpha * 0.8,
+                    shadow: .flat)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(subtitle)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            if let badge {
+                Text(badge)
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.accent)
+            }
+            Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.Palette.textTertiary)
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+        .vortxGlassTintedSurface(
+            in: RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous),
+            fillAlpha: VortXGlass.cardFillAlpha,
+            tint: Theme.Palette.accent,
+            tintAlpha: VortXGlass.cinemaTintAlpha,
+            shadow: .card)
+        .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous))
+    }
+}
+#endif
 
 #if !os(tvOS)
 /// The offline-downloads section shown at the top of the Library tab (#30). Lists every download with

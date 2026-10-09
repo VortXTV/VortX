@@ -83,6 +83,9 @@ enum VortXGlass {
     /// Inline scroll-column cards / rows: the same warm fill a touch lighter than a floating pill, since
     /// these sit ON the canvas rather than floating high over content.
     static let cardFillAlpha = 0.50
+    /// Ambient accent wash for profile-themed settings and Library surfaces. Below the selected-chip tint so
+    /// these surfaces never read as solid accent controls or focus glows.
+    static let cinemaTintAlpha = 0.10
     /// The focused / selected state of a glass row: a small alpha lift over `cardFillAlpha` so the row
     /// brightens under focus the way the old opaque surface1 -> surface2 step did, with the ember ring
     /// carrying the rest of the focus signal on top.
@@ -323,6 +326,11 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
     /// (and the blur) but BELOW the content. Kept nil for plain glass; the chip passes its ember here so the
     /// selection cue reads on top of the glass instead of being buried beneath the frost + warm fill.
     var activeFill: Color? = nil
+    /// An ambient profile-accent wash for a surface that should feel individually themed without reading as
+    /// a selected control. Kept separate from `activeFill`: ambient surfaces stay quiet and never inherit
+    /// the stronger selection semantics used by chips and focused navigation.
+    var accentTint: Color? = nil
+    var accentTintAlpha: Double = 0
     /// Tight small circular control (disc): forward to `blurLayer` so the blur is a shape-clipped material
     /// on every OS, never `glassEffect` (which would draw an un-clipped halo around the disc). Default off.
     var hugsTightly: Bool = false
@@ -358,6 +366,9 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
                 // tvOS cheap path: an OPAQUE warm base (no glassEffect, no material blur), with the
                 // active / selected tint riding on top exactly as it does on the glass path.
                 shape.fill(resolvedOpaqueTVFill)
+                if let accentTint {
+                    shape.fill(accentTint.opacity(accentTintAlpha))
+                }
                 if let activeFill {
                     shape.fill(activeFill)
                 }
@@ -367,6 +378,11 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
                 // VortX chrome. Skipped under Reduce Transparency, where `blurLayer` is already an opaque warm fill.
                 if !reduceTransparency {
                     shape.fill(VortXGlass.fill(fillAlpha, tone: tone))
+                }
+                // Ambient profile tint remains present in the opaque Reduce Transparency fallback as a
+                // low-alpha wash, preserving the themed surface without introducing an accent slab.
+                if let accentTint {
+                    shape.fill(accentTint.opacity(accentTintAlpha))
                 }
                 // The active / selected ember tint sits ON TOP of the warm fill and the blur, but still inside
                 // the background (so it stays below the content). Rendered in both modes so the selection cue
@@ -477,6 +493,31 @@ extension View {
         vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous),
                     fillAlpha: VortXGlass.cardFillAlpha,
                     shadow: .card)
+    }
+
+    /// A quiet profile-accent wash over the shared glass surface. This is intentionally distinct from
+    /// `vortxGlassActive` / `activeFill`: Settings rows and Library doorway cards are ambient surfaces, not
+    /// selected controls, so they get a restrained tint with the normal glass edge and no accent glow.
+    /// The helper is shape-generic so list rows can keep their clipped, flat shadow while Cinema cards keep
+    /// their raised card shadow.
+    func vortxGlassTintedSurface<S: InsettableShape>(
+        in shape: S,
+        fillAlpha: Double = VortXGlass.cardFillAlpha,
+        tint: Color = Theme.Palette.accent,
+        tintAlpha: Double = VortXGlass.cinemaTintAlpha,
+        highlight: Double = 0.14,
+        shadow: VortXGlass.Shadow = .flat,
+        tone: VortXGlass.Tone = .lift
+    ) -> some View {
+        modifier(VortXGlassModifier(
+            shape: shape,
+            fillAlpha: fillAlpha,
+            highlightTop: highlight,
+            shadow: shadow,
+            accentTint: tint,
+            accentTintAlpha: tintAlpha,
+            tone: tone
+        ))
     }
 
     /// Apply the VortX glass material in `shape`. Renders the same warm glass on every OS / platform and
