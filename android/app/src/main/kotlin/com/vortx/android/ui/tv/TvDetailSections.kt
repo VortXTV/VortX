@@ -42,6 +42,7 @@ import coil3.compose.AsyncImage
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
+import com.vortx.android.ui.components.FallbackArtwork
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.ui.screens.PersonScreen
@@ -69,6 +70,7 @@ fun TvSeasonEpisodeSection(
     detail: MetaDetail,
     selectedSeason: Int?,
     selectedEpisodeId: String?,
+    acceptedSelectedQualityLabels: List<String> = emptyList(),
     focusRestoreEpisodeId: String? = null,
     focusRestoreRevision: Int = 0,
     onSelectSeason: (Int) -> Unit,
@@ -145,6 +147,8 @@ fun TvSeasonEpisodeSection(
                     episode = episode,
                     watched = watched,
                     isCurrent = episode.id == selectedEpisodeId,
+                    facts = tvEpisodeFacts(episode.id, selectedEpisodeId, detail.runtime, acceptedSelectedQualityLabels),
+                    artwork = tvEpisodeArtwork(episode, detail),
                     onSelect = { onSelectEpisode(episode.id) },
                     onToggleWatched = { onToggleWatched(episode, !watched) },
                     focusRequester = episodeFocusRequesters[index],
@@ -165,6 +169,8 @@ private fun TvEpisodeCard(
     episode: Episode,
     watched: Boolean,
     isCurrent: Boolean,
+    facts: String?,
+    artwork: List<String>,
     onSelect: () -> Unit,
     onToggleWatched: () -> Unit,
     focusRequester: FocusRequester,
@@ -204,14 +210,7 @@ private fun TvEpisodeCard(
                         .clip(VortXShapes.card)
                         .background(colors.surface2),
                 ) {
-                    if (!episode.thumbnail.isNullOrBlank()) {
-                        AsyncImage(
-                            model = episode.thumbnail,
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize(),
-                        )
-                    }
+                    FallbackArtwork(urls = artwork, contentDescription = null, modifier = Modifier.fillMaxSize())
                     if (watched) {
                         Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
                         Icon(
@@ -249,6 +248,10 @@ private fun TvEpisodeCard(
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.padding(top = 2.dp),
                     )
+                    facts?.let {
+                        Text(text = it, style = VortXTheme.type.label.copy(color = colors.textSecondary),
+                            maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp))
+                    }
                     episode.overview?.takeIf { it.isNotBlank() }?.let {
                         Text(
                             text = it,

@@ -45,6 +45,7 @@ import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.components.PosterCardMenu
 import com.vortx.android.ui.components.PosterQuickActionMenu
 import com.vortx.android.ui.components.cinemaCardFacts
+import com.vortx.android.ui.components.cinemaPosterMenu
 import com.vortx.android.ui.search.SearchResultSection
 import com.vortx.android.ui.search.searchResultItemKey
 import com.vortx.android.ui.search.searchResultSectionHeaderKey
@@ -70,12 +71,13 @@ internal fun TvCinemaCard(
 ) {
     val colors = VortXTheme.colors
     val appContext = LocalContext.current.applicationContext
-    var menuOpen by remember(item.type, item.id) { mutableStateOf(false) }
+    val menu = cinemaPosterMenu(item, continueWatching)
+    var menuOpen by remember(item.type, item.id, item.continueWatchingPermit, menu) { mutableStateOf(false) }
     Box(modifier = modifier.then(if (width == null) Modifier.fillMaxWidth() else Modifier.width(width))) {
-        if (continueWatching) {
+        if (menu != PosterCardMenu.NONE) {
             PosterQuickActionMenu(
                 item = item,
-                menu = PosterCardMenu.CONTINUE_WATCHING,
+                menu = menu,
                 expanded = menuOpen,
                 onDismiss = { menuOpen = false },
                 onDetails = onClick,
@@ -85,7 +87,7 @@ internal fun TvCinemaCard(
         }
         Surface(
             onClick = onClick,
-            onLongClick = if (continueWatching) ({ menuOpen = true }) else null,
+            onLongClick = if (menu != PosterCardMenu.NONE) ({ menuOpen = true }) else null,
             modifier = Modifier
                 .fillMaxWidth()
                 .semantics { contentDescription = listOfNotNull(item.name, cinemaCardFacts(item), item.resumeLabel).joinToString(". ") }

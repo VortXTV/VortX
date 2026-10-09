@@ -18,10 +18,8 @@ import kotlinx.coroutines.flow.asStateFlow
  * settings carriage. These are presentation preferences, not credentials, so they live in the shared
  * [android.content.SharedPreferences] file the rest of the flat settings use.
  *
- * ANDROID DIVERGENCE (documented): `landscapeCards` defaults to FALSE here, where Apple's absent-key default
- * is true. Android has always shipped the portrait 2:3 catalog card; defaulting the toggle off keeps that
- * stable look and lets a user opt into the cinematic 16:9 landscape card, rather than silently re-laying out
- * every rail on first launch. An explicit value set on any platform still syncs across on the same key.
+ * Fresh Cinema installations match Apple's wide-card default. Existing explicit portrait/wide choices
+ * remain authoritative on the same sync key; reading a default never persists a migration override.
  */
 object PosterStylePreferences {
 
@@ -66,7 +64,7 @@ object PosterStylePreferences {
     data class State(
         val width: WidthPreset = WidthPreset.DEFAULT,
         val radius: RadiusPreset = RadiusPreset.DEFAULT,
-        val landscape: Boolean = false,
+        val landscape: Boolean = true,
         val hideLabels: Boolean = false,
     )
 
@@ -87,7 +85,7 @@ object PosterStylePreferences {
         return State(
             width = WidthPreset.fromWire(p.getString(WIDTH_KEY, null)),
             radius = RadiusPreset.fromWire(p.getString(RADIUS_KEY, null)),
-            landscape = p.getBoolean(LANDSCAPE_KEY, false),
+            landscape = p.getBoolean(LANDSCAPE_KEY, true),
             hideLabels = p.getBoolean(HIDE_LABELS_KEY, false),
         )
     }

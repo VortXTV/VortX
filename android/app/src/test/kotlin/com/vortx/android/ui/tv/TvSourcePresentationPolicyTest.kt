@@ -2,6 +2,14 @@ package com.vortx.android.ui.tv
 
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
+import com.vortx.android.engine.EngineState
+import com.vortx.android.engine.VortxResourceAddon
+import com.vortx.android.engine.VortxResourceGroup
+import com.vortx.android.engine.VortxResourceProjection
+import com.vortx.android.engine.VortxResourceRequest
+import com.vortx.android.engine.VortxResourceSnapshot
+import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -93,6 +101,54 @@ class TvSourcePresentationPolicyTest {
         assertEquals(listOf("Z-2", "Z-1", "Z-0", "A-2", "A-1", "A-0"), window.filterIsInstance<TvSourceItem.Row>().map { it.source.id })
     }
 
+    @Test fun `actual embedded and streamed provider sections have one tab anchor and total target budget`() {
+        val groups = projectedEmbeddedAndStreamGroups()
+        assertEquals(3, groups.size)
+        assertEquals(groups[1].base, groups[2].base)
+        val target = tvSourceGroupKey(groups[1], 1)
+        assertEquals(listOf(120, 120), tvSourceTabs(groups).map { it.count })
+        val window = tvSourceWindow(groups, emptySet(), 40, target)
+        val headers = window.filterIsInstance<TvSourceItem.Header>()
+        val rows = window.filterIsInstance<TvSourceItem.Row>()
+        assertEquals(groups.map { it.addon }, headers.map { it.addon })
+        assertEquals(1, headers.count { it.key == target && it.firstProviderSection })
+        assertEquals(80, rows.size)
+        assertEquals(40, rows.count { it.groupKey == target })
+        assertEquals(window.size, window.mapIndexed(::tvSourceItemKey).distinct().size)
+        assertEquals(groups.flatMap { it.streams }, tvSourceWindow(groups, emptySet(), 240, target).filterIsInstance<TvSourceItem.Row>().map { it.source })
+    }
+    @Test fun `provider collapse and delayed embedded arrival do not alias or reorder targets`() {
+        val groups = projectedEmbeddedAndStreamGroups()
+        val target = tvSourceGroupKey(groups[2], 2)
+        assertEquals(target, tvSourceTabs(listOf(groups[0], groups[2])).last().key)
+        assertEquals(target, tvSourceTabs(groups).last().key)
+        val window = tvSourceWindow(groups, setOf(target), 40, target)
+        assertEquals(2, window.filterIsInstance<TvSourceItem.Header>().count { it.key == target && it.collapsed })
+        assertFalse(window.filterIsInstance<TvSourceItem.Row>().any { it.groupKey == target })
+    }
+    @Test fun `blank base ordinal keys match actual TV tabs and list sections`() {
+        val groups = listOf(group("Unknown first", 2), group("Unknown second", 2))
+        assertEquals(groups.mapIndexed { index, group -> tvSourceGroupKey(group, index) }, tvSourceTabs(groups).map { it.key })
+    }
+    private fun projectedEmbeddedAndStreamGroups(): List<StreamGroup> {
+        val video = "fixture:1:2"
+        val registry = listOf(VortxResourceAddon("first", "https://first.invalid/manifest.json"),
+            VortxResourceAddon("shared", "https://shared.invalid/manifest.json"))
+        val urls = registry.associate { it.id to it.transportUrl }
+        fun streams(prefix: String, count: Int) = JSONArray().also { array ->
+            repeat(count) { i -> array.put(JSONObject().put("name", "$prefix $i").put("url", "https://media.invalid/$prefix/$i.mp4")) }
+        }
+        fun embedded(addon: String, prefix: String, count: Int) = VortxResourceGroup(addon, "ready", JSONObject().put("meta",
+            JSONObject().put("id", "fixture").put("type", "series").put("videos", JSONArray().put(JSONObject().put("id", video)
+                .put("streams", streams(prefix, count))))).toString(), null)
+        val metaRequest = VortxResourceRequest(VortxResourceRequest.Resource.META, "series", "fixture")
+        val streamRequest = VortxResourceRequest(VortxResourceRequest.Resource.STREAM, "series", video)
+        val meta = VortxResourceSnapshot("owner", "meta", 1, metaRequest,
+            listOf(embedded("first", "first-embedded", 120), embedded("shared", "shared-embedded", 30)), urls)
+        val streamed = VortxResourceSnapshot("owner", "streams", 2, streamRequest,
+            listOf(VortxResourceGroup("shared", "ready", JSONObject().put("streams", streams("shared-streamed", 90)).toString(), null)), urls)
+        return EngineState.parseStreamGroups(VortxResourceProjection.metaDetails(meta, streamed, streamRequest, registry), video)
+    }
     private fun group(name: String, count: Int, base: String = "") = StreamGroup(
         addon = name,
         streams = (0 until count).map { StreamSource("$name-$it", name, "Source $it") },

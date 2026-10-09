@@ -548,6 +548,7 @@ private fun TvDetailContent(
                     detail = detail,
                     selectedSeason = selectedSeason,
                     selectedEpisodeId = selectedEpisodeId,
+                    acceptedSelectedQualityLabels = selectedEpisodeId?.let(viewModel::selectedEpisodeQualityLabels).orEmpty(),
                     focusRestoreEpisodeId = focusRestoreEpisodeId,
                     focusRestoreRevision = focusRestoreRevision,
                     onSelectSeason = viewModel::selectSeason,

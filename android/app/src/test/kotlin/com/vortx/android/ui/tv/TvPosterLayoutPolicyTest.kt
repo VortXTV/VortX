@@ -29,8 +29,9 @@ class TvPosterLayoutPolicyTest {
     }
 
     @Test
-    fun `portrait default preserves labels and portrait ratio`() {
-        val layout = TvPosterLayoutPolicy.layout(PosterStylePreferences.State())
+    fun `fresh Cinema default is wide and explicit portrait preserves labels and ratio`() {
+        assertEquals(16f / 9f, TvPosterLayoutPolicy.layout(PosterStylePreferences.State()).aspectRatio)
+        val layout = TvPosterLayoutPolicy.layout(PosterStylePreferences.State(landscape = false))
 
         assertEquals(168.dp, layout.width)
         assertEquals(16.dp, layout.cornerRadius)

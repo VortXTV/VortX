@@ -42,6 +42,7 @@ import androidx.compose.ui.graphics.toArgb
 import com.vortx.android.VortXApplication
 import com.vortx.android.data.CatalogRepository
 import com.vortx.android.model.MetaItem
+import com.vortx.android.library.WatchlistStore
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXMotion
 import com.vortx.android.ui.theme.VortXShapes
@@ -51,6 +52,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 
 enum class PosterCardMenu {
     NONE,
@@ -240,33 +242,62 @@ internal fun PosterQuickActionMenu(
     onQuickView: (() -> Unit)? = null,
     repository: () -> CatalogRepository?,
 ) {
-    fun fire(action: suspend (CatalogRepository) -> Unit) {
-        val repo = repository() ?: return
-        posterActionScope.launch { runCatching { action(repo) } }
-        onDismiss()
+    val context = LocalContext.current.applicationContext
+    val store = if (menu == PosterCardMenu.CATALOG) remember(context) { runCatching { WatchlistStore.shared(context) }.getOrNull() } else null
+    val watchlist = store?.items?.collectAsStateWithLifecycle()?.value.orEmpty()
+    var busy by remember(item.type, item.id) { mutableStateOf(false) }
+    var actionMessage by remember(item.type, item.id) { mutableStateOf<String?>(null) }
+    val repo = if (expanded && menu == PosterCardMenu.CATALOG) repository() else null
+    val watchlistReady = expanded && store != null && runCatching { store.captureToggle(item) }.isSuccess
+    val watchedReady = repo != null && repo.continueWatchingOwner().profileId != "native-unavailable"
+    val actions = posterCatalogActions(item, onQuickView != null, watchlistReady, watchedReady)
+    fun launchAction(action: suspend () -> Unit) {
+        busy = true
+        actionMessage = null
+        posterActionScope.launch {
+            try {
+                action()
+                onDismiss()
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                actionMessage = "Could not save this change. Try again."
+            } finally { busy = false }
+        }
     }
     DropdownMenu(expanded = expanded, onDismissRequest = onDismiss) {
         when (menu) {
             PosterCardMenu.NONE -> Unit
             PosterCardMenu.CATALOG -> {
-                onQuickView?.let { quickView ->
+                if (PosterCatalogAction.QUICK_VIEW in actions) onQuickView?.let { quickView ->
                     DropdownMenuItem(
                         text = { Text("Quick view") },
                         onClick = { onDismiss(); quickView() },
                     )
                 }
-                DropdownMenuItem(
-                    text = { Text("Add to Library") },
-                    onClick = { fire { it.addToLibrary(item) } },
+                if (PosterCatalogAction.WATCHLIST in actions) DropdownMenuItem(
+                    text = { Text(if (watchlist.any { it.id == item.id && it.type == item.type }) "Remove from Watchlist" else "Add to Watchlist") },
+                    enabled = !busy,
+                    onClick = {
+                        val action = try { capturePosterAction({ checkNotNull(store).captureToggle(item) }) { intent -> checkNotNull(store).toggle(intent) } }
+                        catch (_: Exception) { actionMessage = "Watchlist is unavailable. Try again."; return@DropdownMenuItem }
+                        launchAction { action(); Unit }
+                    },
                 )
-                DropdownMenuItem(
-                    text = { Text("Mark as Watched") },
-                    onClick = { fire { it.setCatalogWatched(item, true) } },
-                )
-                DropdownMenuItem(
-                    text = { Text("Mark as Unwatched") },
-                    onClick = { fire { it.setCatalogWatched(item, false) } },
-                )
+                for (watched in listOf(true, false)) {
+                    val kind = if (watched) PosterCatalogAction.MARK_WATCHED else PosterCatalogAction.MARK_UNWATCHED
+                    if (kind in actions) DropdownMenuItem(
+                        text = { Text(if (watched) "Mark as Watched" else "Mark as Unwatched") },
+                        enabled = !busy,
+                        onClick = {
+                            val capturedRepo = checkNotNull(repo)
+                            val action = capturePosterAction(capturedRepo::continueWatchingOwner) { owner ->
+                                capturedRepo.setCatalogWatched(item, watched, owner).getOrThrow()
+                            }
+                            launchAction(action)
+                        },
+                    )
+                }
+                actionMessage?.let { message -> DropdownMenuItem(text = { Text(message) }, enabled = false, onClick = {}) }
             }
             PosterCardMenu.CONTINUE_WATCHING -> {
                 onDetails?.let { details ->

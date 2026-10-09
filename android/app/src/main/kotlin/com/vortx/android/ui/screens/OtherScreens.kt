@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -34,6 +35,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,6 +54,10 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import com.vortx.android.ui.components.LocalCinemaControlLayout
+import com.vortx.android.ui.components.cinemaControlLayout
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.BuildConfig
 import com.vortx.android.R
@@ -663,12 +669,17 @@ fun SettingsScreen(
     // profile switcher shows the profile just picked. Falls back to "Default" before ProfileStore is up.
     val activeProfile = ProfileStore.sharedOrNull()?.active
     val profilesValue = activeProfile?.let { if (it.isKids) "${it.name}  ·  Kids" else it.name } ?: "Default"
+    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
+    val layout = cinemaControlLayout(maxWidth.value)
+    CompositionLocalProvider(LocalCinemaControlLayout provides layout) {
     Column(
-        modifier = modifier
+        modifier = Modifier
+            .align(Alignment.TopCenter)
+            .widthIn(max = layout.maxContentWidthDp.dp)
             .fillMaxSize()
             .verticalScroll(settingsScrollState)
             .padding(VortXTheme.spacing.edge),
-        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+        verticalArrangement = Arrangement.spacedBy(if (layout.spacious) 12.dp else VortXTheme.spacing.xs),
     ) {
         // The passive "update available" banner (sideloaded Android has no store channel). Renders nothing
         // when up to date or when the user dismissed this build; tapping it opens the install channel.
@@ -762,6 +773,8 @@ fun SettingsScreen(
             SettingRow(VortXIcons.checkmarkCircle, "Design gallery", "Debug", onClick = onOpenGallery)
         }
     }
+    }
+    }
 }
 
 @Composable
@@ -773,23 +786,28 @@ private fun SettingRow(
     modifier: Modifier = Modifier,
 ) {
     val colors = VortXTheme.colors
+    val layout = LocalCinemaControlLayout.current
     Row(
         modifier = modifier
             .fillMaxWidth()
             .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
-            // Settings is the compact touch control surface: a direct, high-contrast card edge makes
-            // entries easy to scan without turning the page into a stack of floating shadows.
+            // Phone controls stay compact; regular-width tablets gain a spacious readable card.
             .vortxGlass(
                 shape = VortXShapes.card,
                 fillAlpha = VortXGlass.cardFillAlpha,
                 shadow = VortXGlass.Shadow.flat,
             )
-            .padding(horizontal = VortXTheme.spacing.md, vertical = VortXTheme.spacing.sm),
+            .padding(horizontal = if (layout.spacious) 24.dp else VortXTheme.spacing.md,
+                vertical = if (layout.spacious) 20.dp else VortXTheme.spacing.sm),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(icon, contentDescription = null, tint = colors.accent)
-        Text(title, style = VortXTheme.type.cardTitle, modifier = Modifier.fillMaxWidth(0.6f))
-        Text(value, style = VortXTheme.type.label.copy(color = colors.textSecondary))
+        Icon(icon, contentDescription = null, tint = colors.accent,
+            modifier = Modifier.size(if (layout.spacious) 32.dp else 24.dp))
+        Text(title, style = VortXTheme.type.cardTitle, modifier = Modifier.weight(1f))
+        Text(value, style = VortXTheme.type.label.copy(color = colors.textSecondary),
+            modifier = Modifier.widthIn(max = if (layout.spacious) 400.dp else 140.dp),
+            textAlign = TextAlign.End, maxLines = 2, overflow = TextOverflow.Ellipsis)
     }
 }
 
