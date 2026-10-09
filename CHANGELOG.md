@@ -22,6 +22,7 @@ metadata deadline and exact-item decoding window; typed mpv cache statistics and
 reanchor recovery; complete typed request-header fields admitted before source replacement;
 immutable configured Safari User-Agent restoration instead of leaking a first source's custom identity;
 source-time external-caption refresh while paused; real mpv subtitle backgrounds;
+bounded HLS startup reservation that avoids parking before the initial playlist is ready;
 native NNTP article concurrency and seek cancellation; retained Apple Trakt Continue Watching
 read choice; scoped Android native NNTP provider/mirror routing; and fresh FFmpeg 9 /
 Apple SecureTransport MPV build inputs with the Mac CoreAudio lifecycle repair.
@@ -40,7 +41,8 @@ back the selected mpv library; the successful load-command result is modeled, wi
 network, app, audio or decoder proof. The complete local continuity runner passed all seven
 cohorts after a stale test assertion was strengthened to bind batch resolution and retry to the
 same captured-owner-filtered candidate list; production fallback behavior was unchanged.
-Fresh CI on the subsequently pushed exact source remains pending. Earlier Apple/Android
+The exact reviewed source-contract CI passed, including the HLS startup regression.
+Earlier Apple/Android
 pre-User-Agent candidate runs are diagnostic only, not acceptance of this repair or final packages.
 The separate encrypted Swift/Kotlin carrier fixture uses real native sessions, but its manual conflict
 recovery is not production-manager retry proof. Both watched/Watchlist hosts and native
@@ -73,6 +75,20 @@ Five exact shipping-input pin files and focused source contracts are integrated;
 SDK-archive comparison was skipped pending new bytes, so no final SDK/app/package acceptance
 is claimed. Older baseline package readbacks have bounded acceptance only;
 the Apple UTF-8 smoke-readback failure has a source repair, not final launch/package acceptance.
+The integrated HLS startup repair passed 39 startup, 16 seek and 86 producer-policy checks;
+the original startup baseline passed 23 checks but failed 13 real assertions. Its temporary
+288 MiB startup reservation borrows unused history space, then returns to the unchanged
+160 MiB producer ceiling / 136 MiB resume line, without extending readiness timing or
+raising the 1 GiB physical cap. Typed native Apple provenance plists repair a later
+pre-launch package rejection; fresh artifact/whole-app gates still need acceptance.
+A reviewed private Continue Watching follow-up retains the full resumable inventory beyond
+30 titles, including unsaved titles and cold reopening; explicit rewinds to zero, positive
+progress with unknown viewing dates and known aliases are preserved. It passed 177 focused
+checks against seven failing baseline cases, but complete
+native CI and shipping-input acceptance remain pending. It is not final SDK or device proof.
+The reproduced blocked-HTTP/rapid-seek path now has a reviewed interruption and MKV-cues
+retry repair with seven actual Mac-arm64 native controls passing. Its top-level HTTP(S) GET
+scope does not establish HLS/curl, full-vendor/app shipping, provider or hardware acceptance.
 Fresh final
 SDK/optimized whole-app rebuilding, actual package versions, signing, provenance/feeds and
 physical device/provider acceptance remain pending. Infuse watched-return, mpv PiP and broader
