@@ -132,20 +132,18 @@ struct SearchView: View {
     private func resultRow(title: String, items: [CoreMeta]) -> some View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             Text(title).sectionTitleStyle()
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(alignment: .top, spacing: Theme.Space.lg) {
-                    ForEach(items) { item in
-                        PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                                   menu: .catalog)
-                            .simultaneousGesture(TapGesture().onEnded { _ in saveToHistory(query) })
-                    }
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(TVGridMetrics.landscapeCellWidth),
+                                                        spacing: Theme.Space.lg),
+                                     count: TVGridMetrics.landscapeColumns),
+                      alignment: .leading, spacing: Theme.Space.lg) {
+                ForEach(items) { item in
+                    TVCinemaCard(presentation: .meta(item), width: TVGridMetrics.landscapeCellWidth,
+                                 menu: .catalog)
+                        .simultaneousGesture(TapGesture().onEnded { _ in saveToHistory(query) })
                 }
-                .padding(.horizontal, Theme.Space.screenEdge)
-                .padding(.vertical, Theme.Space.lg)
             }
-            // Cancel the parent VStack's screenEdge padding so the ScrollView reaches the screen
-            // edge and its clip region starts there rather than at the first card's left edge.
-            .padding(.horizontal, -Theme.Space.screenEdge)
+            .padding(.vertical, Theme.Space.md)
+            .focusSection()
         }
     }
 

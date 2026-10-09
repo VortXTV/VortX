@@ -702,6 +702,9 @@ struct PosterCard: View {
     var onFocus: (() -> Void)? = nil   // browse pages report focus to drive the hero backdrop
     var directPlay: (() -> Void)? = nil   // Continue Watching: resume the same link straight into the player
     var onDetails: (() -> Void)? = nil    // Continue Watching: open the full detail page from the long-press menu
+    /// An opt-in label for the Cinema catalog/search/CW footprint. Navigation and native long-press
+    /// actions continue through this same card owner, including its retained catalog preview.
+    var cinemaPresentation: TVCinemaCardPresentation? = nil
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized title/poster override
@@ -750,8 +753,17 @@ struct PosterCard: View {
         }
     }
 
-    private var cardLabel: some View {
-        legacyCardLabel
+    @ViewBuilder private var cardLabel: some View {
+        if let cinemaPresentation {
+            TVCinemaCardLabel(presentation: cinemaPresentation, title: displayTitle, poster: displayPoster,
+                              width: landscapeWidth ?? kLandscapeCardWidth,
+                              radius: catalogPrefs.posterRadius.radius, progress: progress,
+                              resumeSeconds: resumeSeconds, isWatched: isWatched, privateArtwork: privateArtwork)
+                .background { if let onFocus { FocusReporter(onFocus: onFocus) } }
+                .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        } else {
+            legacyCardLabel
+        }
     }
 
     private var legacyCardLabel: some View {
@@ -868,6 +880,159 @@ struct PosterCard: View {
             } label: {
                 Label("Remove from Library", systemImage: "trash")
             }
+        }
+    }
+}
+
+/// Wide artwork and real preview facts, using PosterCard's existing navigation, native catalog
+/// actions, direct resume and context-menu interaction region. Every surface passes an exact width.
+struct TVCinemaCard: View {
+    let presentation: TVCinemaCardPresentation
+    var width: CGFloat = kLandscapeCardWidth
+    var progress: Double? = nil
+    var resumeSeconds: Double? = nil
+    var isWatched = false
+    var menu: PosterMenu = .catalog
+    var privateArtwork = false
+    var onFocus: (() -> Void)? = nil
+    var directPlay: (() -> Void)? = nil
+    var onDetails: (() -> Void)? = nil
+
+    var body: some View {
+        PosterCard(title: presentation.title, poster: presentation.poster, type: presentation.type,
+                   id: presentation.id, progress: progress, resumeSeconds: resumeSeconds,
+                   isWatched: isWatched, landscapeWidth: width, menu: menu, privateArtwork: privateArtwork,
+                   onFocus: onFocus, directPlay: directPlay, onDetails: onDetails,
+                   cinemaPresentation: presentation)
+    }
+}
+
+extension CoreCWItem {
+    var tvCinemaPresentation: TVCinemaCardPresentation {
+        .init(id: id, type: type, title: name, poster: poster)
+    }
+}
+
+/// A presentation-only label: the artwork loader reads supplied URLs, without metadata, ratings,
+/// source discovery, or a second provider owner. Missing body/facts retain the shared card geometry.
+private struct TVCinemaCardLabel: View {
+    let presentation: TVCinemaCardPresentation
+    let title: String
+    let poster: String?
+    let width: CGFloat
+    let radius: CGFloat
+    let progress: Double?
+    let resumeSeconds: Double?
+    let isWatched: Bool
+    let privateArtwork: Bool
+    @EnvironmentObject private var theme: ThemeManager
+
+    private var factsText: Text {
+        presentation.facts.enumerated().reduce(Text("")) { result, entry in
+            let separator = entry.offset == 0 ? Text("") : Text("  ·  ")
+            switch entry.element {
+            case .text(let value): return result + separator + Text(value)
+            case .rating(let value): return result + separator + Text(Image(systemName: "star.fill")) + Text(" \(value)")
+            }
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            TVCinemaArtwork(background: presentation.background, poster: poster,
+                            width: width, radius: radius, privateArtwork: privateArtwork)
+                .overlay(alignment: .bottom) {
+                    if !isWatched, let progress, progress.isFinite, progress > 0.01 {
+                        ProgressStripe(value: progress).padding(Theme.Space.xs)
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if let resumeSeconds, let timecode = resumeTimecode(resumeSeconds) {
+                        Text(timecode).font(Theme.Typography.eyebrow.monospacedDigit())
+                            .foregroundStyle(.white).padding(.horizontal, 8).padding(.vertical, 3)
+                            .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.badgeFillAlpha, shadow: .flat)
+                            .padding(Theme.Space.sm).accessibilityLabel("Resumes at \(timecode)")
+                    }
+                }
+                .overlay(alignment: .topTrailing) {
+                    if isWatched {
+                        Image(systemName: "checkmark.circle.fill").font(.title2)
+                            .foregroundStyle(Theme.Palette.accent).padding(8).shadow(radius: 3)
+                            .accessibilityLabel("Watched")
+                    }
+                }
+                .opacity(isWatched ? 0.55 : 1)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1)
+                factsText.font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(1, reservesSpace: true)
+                Text(presentation.bodyText).font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary).lineLimit(2, reservesSpace: true)
+            }
+            .frame(width: width, alignment: .leading)
+        }
+        .frame(width: width, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityValue([isWatched ? "Watched" : nil,
+                             resumeSeconds.flatMap(resumeTimecode).map { "Resumes at \($0)" }]
+            .compactMap { $0 }.joined(separator: ". "))
+    }
+}
+
+/// Check the actual image aspect before filling a wide card; some add-ons label a portrait URL as
+/// background. Portrait fallback is fit over a blurred copy, preserving the title's complete artwork.
+private struct TVCinemaArtwork: View {
+    let background: String?
+    let poster: String?
+    let width: CGFloat
+    let radius: CGFloat
+    let privateArtwork: Bool
+    @State private var image: UIImage?
+    @State private var loadedIdentity: [String]?
+    @State private var failed = false
+
+    private var identity: [String] { [background ?? "", poster ?? "", privateArtwork ? "private" : "public"] }
+    private var warmImage: UIImage? {
+        [background, poster].compactMap { $0 }.compactMap { URL(string: $0) }
+            .compactMap { PosterImageLoader.cached($0) }.first
+    }
+
+    var body: some View {
+        Group {
+            if let image = (loadedIdentity == identity ? image : nil) ?? warmImage {
+                if TVCinemaArtworkPolicy.fillsFrame(pixelWidth: Double(image.size.width), pixelHeight: Double(image.size.height)) {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+                        .frame(width: width, height: (width * 9 / 16).rounded()).clipped()
+                } else {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill).blur(radius: 26).opacity(0.55)
+                        .frame(width: width, height: (width * 9 / 16).rounded()).clipped()
+                        .overlay(Color.black.opacity(0.35))
+                        .overlay(Image(uiImage: image).resizable().aspectRatio(contentMode: .fit)
+                            .frame(width: width, height: (width * 9 / 16).rounded()))
+                }
+            } else {
+                Theme.Palette.surface2.overlay {
+                    if failed || privateArtwork {
+                        Image(systemName: "film").font(.system(size: 40)).foregroundStyle(Theme.Palette.textTertiary)
+                    } else { ProgressView().tint(Theme.Palette.textTertiary) }
+                }
+            }
+        }
+        .frame(width: width, height: (width * 9 / 16).rounded())
+        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
+        .task(id: identity) {
+            image = nil; loadedIdentity = nil; failed = false
+            for raw in [background, poster].compactMap({ $0 }) where !raw.isEmpty {
+                if privateArtwork && !TraktArtworkPolicy.isFirstPartyArtwork(raw) { continue }
+                if let loaded = await PosterImageLoader.load(raw, maxPixel: 1280) {
+                    guard !Task.isCancelled else { return }
+                    image = loaded; loadedIdentity = identity; return
+                }
+                guard !Task.isCancelled else { return }
+            }
+            failed = true
         }
     }
 }
