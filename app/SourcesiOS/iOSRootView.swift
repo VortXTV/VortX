@@ -2167,6 +2167,9 @@ struct iOSLibraryView: View {
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
+    @AppStorage(ContinueWatchingPreferences.sourceKey) private var continueWatchingSource = "local"
+    @AppStorage(ContinueWatchingPreferences.windowKey) private var continueWatchingWindow = "20"
+    @State private var serviceHistoryRevision = 0
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
     @State private var downloadPlayer: iOSPlayerLaunch?            // play-from-local cover
@@ -2177,6 +2180,7 @@ struct iOSLibraryView: View {
         case downloads
         case queue        // the download-queue manager (reorder / pause / concurrency), pushed from Downloads
         case watchlist
+        case history
     }
 
     #if !os(tvOS)
@@ -2215,15 +2219,25 @@ struct iOSLibraryView: View {
 
     /// The Library's compact Continue Watching shelf uses the same owner/profile source and the same
     /// direct-resume primitive as Home. It is a second entry point, not a second history model.
-    private var libraryContinueWatchingItems: [RailItem] {
-        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory
-            ? core.continueWatching
-            : profiles.cwItems
+    private var libraryContinueWatchingSnapshot: iOSCWRenderSnapshot {
+        _ = serviceHistoryRevision
+        let snapshot = LibraryLandingSnapshot.current(core: core, profiles: profiles).continueWatching
+        let selection = snapshot.selection
         let residentCatalog = core.boardRows.flatMap(\.items)
-        return source.map { cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta) }
+        let items = selection.items.map { item in
+            if selection.source.isPrivate {
+                return RailItem(id: item.id, type: item.type, name: item.name, poster: item.poster,
+                    progress: selection.displayProgress[item.id] ?? item.progress, cwVideoId: item.state.videoId,
+                    caption: selection.captions[item.id], resumeSeconds: item.resumeSeconds)
+            }
+            return cinemaHistoryRailItem(item, catalog: residentCatalog, residentMeta: core.metaDetails?.meta)
+        }
+        return .init(items: items, provenance: .init(source: selection.source,
+            traktSessionID: selection.sessionID, intent: snapshot.intent), status: selection.status)
     }
 
     var body: some View {
+        let renderedContinueWatching = libraryContinueWatchingSnapshot
         NavigationStack(path: $path) {
             ScrollView {
                 Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Library tab -> scroll here
@@ -2246,11 +2260,8 @@ struct iOSLibraryView: View {
                         CinemaLibraryEntryCard(title: "Watchlist", subtitle: "Titles bookmarked to watch later", systemImage: "bookmark.fill")
                     }
                     .buttonStyle(.plain)
-                    Button {
-                        segment = .all
-                        activeFilters = [.watched]
-                    } label: {
-                        CinemaLibraryEntryCard(title: "Previously Watched", subtitle: "Titles marked watched in this profile",
+                    NavigationLink(value: LibraryRoute.history) {
+                        CinemaLibraryEntryCard(title: "Previously Watched", subtitle: "Playback history for this profile",
                                                systemImage: "checkmark.circle.fill")
                     }
                     .buttonStyle(.plain)
@@ -2258,10 +2269,21 @@ struct iOSLibraryView: View {
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.bottom, Theme.Space.lg)
                 #endif
-                if !libraryContinueWatchingItems.isEmpty {
-                    PosterRail(title: "Continue Watching", eyebrow: "Pick up where you left off",
-                               items: libraryContinueWatchingItems, onTap: resumeLibraryContinueWatching,
-                               menu: .continueWatching, onDetails: { path.append(FeaturedHeroItem.from(rail: $0)) })
+                if !renderedContinueWatching.items.isEmpty {
+                    PosterRail(title: "Continue Watching",
+                               eyebrow: renderedContinueWatching.provenance.source.isPrivate
+                                    ? "From \(renderedContinueWatching.provenance.source.label)"
+                                    : "Pick up where you left off",
+                               items: renderedContinueWatching.items,
+                               onTap: { resumeLibraryContinueWatching($0, provenance: renderedContinueWatching.provenance) },
+                               menu: renderedContinueWatching.provenance.source.isPrivate ? .none : .continueWatching,
+                               onDetails: { openLibraryContinueWatchingDetails($0, provenance: renderedContinueWatching.provenance) },
+                               accessibilityProvenance: renderedContinueWatching.provenance.source.isPrivate
+                                    ? "From \(renderedContinueWatching.provenance.source.label)" : nil)
+                }
+                if let status = renderedContinueWatching.status {
+                    Text(status).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                        .padding(.horizontal, Theme.Space.md)
                 }
                 // The owner profile's Library is the account library (engine), with its type/sort filter
                 // chips; an overlay profile's Library is its own private watch overlay, with no engine
@@ -2327,13 +2349,47 @@ struct iOSLibraryView: View {
                               seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
                               autoPlayOnAppear: target.autoPlay)
             }
+            .navigationDestination(for: iOSLibraryHistoryDetailTarget.self) { target in
+                if target.context.isCurrent(core: core, profiles: profiles) {
+                    iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                        seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                        autoPlayOnAppear: target.autoPlay,
+                        initialResumeSeconds: target.resumeSeconds, initialVideoID: target.videoID)
+                }
+            }
+            .navigationDestination(for: iOSCWDetailTarget.self) { target in
+                if target.intent.permitsDetails(id: target.item.id, type: target.item.type, videoID: target.videoID) {
+                    iOSDetailView(id: target.item.id, type: target.item.type, title: target.item.name,
+                        seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
+                        initialResumeSeconds: target.resumeSeconds, initialVideoID: target.videoID,
+                        initialTraktSessionID: target.traktSessionID, initialContinueWatchingIntent: target.intent)
+                }
+            }
             #if !os(tvOS)
             // Value-routed Downloads push (#25): the pill appends `LibraryRoute.downloads`.
             .navigationDestination(for: LibraryRoute.self) { route in
                 switch route {
                 case .downloads: iOSDownloadsScreen()
                 case .queue: DownloadQueueView()
-                case .watchlist: CinemaWatchlist(onOpen: handleTap, onWatch: watchFromQuickView)
+                case .watchlist:
+                    let context = LibraryLandingSnapshot.current(core: core, profiles: profiles).context
+                    if context.isCurrent(core: core, profiles: profiles) {
+                        CinemaWatchlist(
+                            onOpen: { openLibraryWatchlist($0, context: context, autoPlay: false) },
+                            onWatch: { openLibraryWatchlist($0, context: context, autoPlay: true) }
+                        )
+                        .id(context)
+                    } else {
+                        ContentUnavailableViewCompat(title: "Watchlist", systemImage: "bookmark",
+                            message: "Waiting for this profile's acknowledged watchlist…")
+                    }
+                case .history: iOSPreviouslyWatchedView { entry, context in
+                    let item = cinemaHistoryRailItem(entry.item, catalog: core.boardRows.flatMap(\.items),
+                                                     residentMeta: core.metaDetails?.meta)
+                    guard context.isCurrent(core: core, profiles: profiles) else { return }
+                    path.append(iOSLibraryHistoryDetailTarget(item: .from(rail: item),
+                        resumeSeconds: item.resumeSeconds, videoID: entry.item.state.videoId, context: context))
+                }
                 }
             }
             .iOSPlayerCover($downloadPlayer, account: account, core: core)
@@ -2378,6 +2434,10 @@ struct iOSLibraryView: View {
         // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
         .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
         .onDisappear { hero.stop() }
+        .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in serviceHistoryRevision &+= 1 }
+        .onReceive(NotificationCenter.default.publisher(for: SIMKLContinueWatchingShadow.changedNote)) { _ in serviceHistoryRevision &+= 1 }
+        .onChange(of: continueWatchingSource) { _ in HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
+        .onChange(of: continueWatchingWindow) { _ in HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
     }
 
     /// Tapping a card opens its detail (decoupled hero, #53); it only quiets the billboard rotation.
@@ -2391,19 +2451,41 @@ struct iOSLibraryView: View {
         path.append(CinemaDetailTarget(item: FeaturedHeroItem.from(rail: item), autoPlay: true))
     }
 
-    private func resumeLibraryContinueWatching(_ item: RailItem) {
+    private func openLibraryWatchlist(_ item: RailItem, context: LibraryLandingSnapshot.Context, autoPlay: Bool) {
+        guard context.isCurrent(core: core, profiles: profiles) else { return }
+        hero.noteInteraction()
+        path.append(iOSLibraryHistoryDetailTarget(item: .from(rail: item), resumeSeconds: nil,
+            videoID: nil, context: context, autoPlay: autoPlay))
+    }
+
+    private func resumeLibraryContinueWatching(_ item: RailItem, provenance: iOSCWProducerProvenance) {
+        guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
         hero.noteInteraction()
         #if !os(tvOS)
+        if provenance.source == .simkl {
+            openLibraryContinueWatchingDetails(item, provenance: provenance)
+            return
+        }
         Task {
-            if let launch = await iOSDirectResume(for: item, core: core, account: account, expectedTraktSession: nil) {
+            guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) else { return }
+            if let launch = await iOSDirectResume(for: item, core: core, account: account,
+                expectedTraktSession: provenance.traktSessionID, expectedIntent: provenance.intent),
+               provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID) {
                 downloadPlayer = launch
             } else {
-                path.append(FeaturedHeroItem.from(rail: item))
+                openLibraryContinueWatchingDetails(item, provenance: provenance)
             }
         }
         #else
         path.append(FeaturedHeroItem.from(rail: item))
         #endif
+    }
+
+    private func openLibraryContinueWatchingDetails(_ item: RailItem, provenance: iOSCWProducerProvenance) {
+        guard provenance.isCurrent(traktSessionID: TraktAuth.storedSessionID),
+              provenance.intent.permitsDetails(id: item.id, type: item.type, videoID: item.cwVideoId) else { return }
+        path.append(iOSCWDetailTarget(item: .from(rail: item), resumeSeconds: item.resumeSeconds,
+            videoID: item.cwVideoId, traktSessionID: provenance.traktSessionID, intent: provenance.intent))
     }
 
     /// The engine's SORT chip row (#15), mirroring the tvOS `LibraryView.sortChips`: each chip carries
@@ -2550,6 +2632,73 @@ struct iOSLibraryView: View {
             HStack(spacing: Theme.Space.sm) { content() }
                 .padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.xs)
         }
+    }
+}
+
+private struct iOSLibraryHistoryDetailTarget: Hashable {
+    let item: FeaturedHeroItem
+    let resumeSeconds: Double?
+    let videoID: String?
+    let context: LibraryLandingSnapshot.Context
+    var autoPlay: Bool = false
+}
+
+/// History uses episode identities from the profile's playback projection, independent of saved titles.
+private struct iOSPreviouslyWatchedView: View {
+    let onOpen: (LibraryLandingSnapshot.Entry, LibraryLandingSnapshot.Context) -> Void
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var profiles: ProfileStore
+    @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var prefs = CatalogPreferences.shared
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    private var columns: [GridItem] {
+        #if os(iOS)
+        let compact = sizeClass == .compact
+        #else
+        let compact = false
+        #endif
+        return [GridItem(.adaptive(minimum: iOSPillMetrics.gridPosterWidth(preset: prefs.posterWidth, compact: compact)),
+                         spacing: Theme.Space.sm, alignment: .center)]
+    }
+
+    var body: some View {
+        let snapshot = LibraryLandingSnapshot.current(core: core, profiles: profiles)
+        ScrollView {
+            if let history = snapshot.history {
+                if history.isEmpty {
+                    ContentUnavailableViewCompat(title: "Previously Watched", systemImage: "checkmark.circle",
+                        message: "Playback history for this profile appears here, including titles outside your watchlist.")
+                        .frame(minHeight: 360)
+                } else {
+                    LazyVGrid(columns: columns, spacing: Theme.Space.md) {
+                        ForEach(history) { entry in
+                            let item = cinemaHistoryRailItem(entry.item, catalog: core.boardRows.flatMap(\.items),
+                                                             residentMeta: core.metaDetails?.meta)
+                            Button { onOpen(entry, snapshot.context) } label: {
+                                PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster,
+                                    fallbackArt: item.background, caption: item.caption ?? entry.episodeCaption, imdbRating: item.imdbRating,
+                                    releaseInfo: item.releaseInfo, progress: item.progress, isWatched: entry.item.isWatched)
+                            }
+                            .buttonStyle(CardFocusStyle(scale: 1.04))
+                            .accessibilityLabel([item.name, item.caption ?? entry.episodeCaption].compactMap { $0 }.joined(separator: ", "))
+                            .accessibilityHint("Opens watched episode details")
+                        }
+                    }
+                    .padding(Theme.Space.md)
+                }
+            } else {
+                ContentUnavailableViewCompat(title: "Previously Watched", systemImage: "clock",
+                    message: "Waiting for this profile's acknowledged playback history…")
+                    .frame(minHeight: 360)
+            }
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #if os(iOS)
+        .navigationTitle("Previously Watched")
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .macBackAffordance()
     }
 }
 
@@ -4026,7 +4175,12 @@ extension View {
 @MainActor
 private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                              account: StremioAccount,
-                             expectedTraktSession: TraktSessionID?) async -> iOSPlayerLaunch? {
+                             expectedTraktSession: TraktSessionID?,
+                             expectedIntent: HomeContinueWatchingSelection.Intent? = nil) async -> iOSPlayerLaunch? {
+    // The Library passes the intent captured when the card was rendered, before scheduling this Task.
+    // Never let a same-profile reopen substitute its new native/account epoch for that original intent.
+    let intentIsCurrent = { expectedIntent?.isCurrent(core: core, profiles: .shared) != false }
+    guard intentIsCurrent() else { return nil }
     guard expectedTraktSession == nil
             || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     let pid = ProfileStore.shared.activeID
@@ -4076,7 +4230,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // entry carries debrid provenance; a non-debrid entry returns the stored url unchanged (refreshed == false),
     // so torrent / plain-direct resumes are byte-identical to before.
     let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
-    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+    guard intentIsCurrent(), (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
           ProfileStore.shared.activeID == pid,
           account.credentialBoundaryGeneration == accountBoundary else { return nil }
     let playURL = refreshed ? resolvedURL : url
@@ -4104,6 +4258,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // triangle on most CW torrent resumes). POST /{hash}/create with reachable trackers first; /create is
     // idempotent, so an already-warm engine is untouched. Only loopback torrents (debrid/direct skip it).
     if entry.torrent == true, let hash = url.pathComponents.dropFirst().first, hash.count == 40 {
+        guard intentIsCurrent() else { return nil }
         StremioServer.primeTorrent(hash: hash.lowercased())
     }
     let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
@@ -4119,7 +4274,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         resume = engine
     } else {
         resume = await account.resumeOffset(for: meta)
-        guard expectedTraktSession == nil
+        guard intentIsCurrent(), expectedTraktSession == nil
                 || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
     }
     // For a MOVIE, kick off loading the title's streams in the background so a stale stored link (debrid URLs
@@ -4129,6 +4284,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     // (Series loads its episode streams below; this gives movies the same hop-on-failure safety net.)
     if !usesSeriesLifecycle,
        (core.metaDetails?.meta?.id != item.id || core.streamGroups(forStreamId: entry.videoId).isEmpty) {
+        guard intentIsCurrent() else { return nil }
         core.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
     }
     // For a series, give the player the full all-season episode list + a resolver so the CW resume has the same
@@ -4150,10 +4306,12 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         // the HTTP/HLS add-on shape, #122) must not force a redundant re-dispatch here.
         let hasEpStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == entry.videoId } ?? false
         if core.metaDetails?.meta?.id != item.id || (core.metaDetails?.meta?.videos?.isEmpty ?? true) || !hasEpStreams {
+            guard intentIsCurrent() else { return nil }
             core.loadMeta(type: "series", id: item.id, streamType: "series", streamId: entry.videoId)
             for _ in 0 ..< 6 {
                 if core.metaDetails?.meta?.id == item.id, !(core.metaDetails?.meta?.videos?.isEmpty ?? true) { break }
                 try? await Task.sleep(for: .milliseconds(250))
+                guard intentIsCurrent() else { return nil }
             }
         }
         let season = entry.season ?? 1
@@ -4162,7 +4320,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         // supplies only a CoreVideo admitted by its request-owned authoritative refresh, so a later S2E1 cannot
         // be rejected merely because this direct-resume snapshot was mounted before that backfill arrived.
         loadEpisodeWithMetadata = { video in
-            guard expectedTraktSession == nil
+            guard intentIsCurrent(), expectedTraktSession == nil
                     || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
             let resolved = await iOSResolveEpisodeStream(
                 videoId: video.id,
@@ -4177,7 +4335,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                 core: core,
                 account: account
             )
-            guard expectedTraktSession == nil
+            guard intentIsCurrent(), expectedTraktSession == nil
                     || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
             return resolved
         }
@@ -4191,7 +4349,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                 )
             }
             loadEpisode = { vid in
-                guard expectedTraktSession == nil
+                guard intentIsCurrent(), expectedTraktSession == nil
                         || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
                 let resolved = await iOSResolveEpisodeStream(
                     videoId: vid,
@@ -4206,7 +4364,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                     core: core,
                     account: account
                 )
-                guard expectedTraktSession == nil
+                guard intentIsCurrent(), expectedTraktSession == nil
                         || TraktAuth.storedSessionID == expectedTraktSession else { return nil }
                 return resolved
             }
@@ -4221,6 +4379,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             let valid = {
                 ProfileStore.shared.activeID == pid
                     && account.credentialBoundaryGeneration == accountBoundary
+                    && intentIsCurrent()
                     && (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession)
             }
             let context = iOSNextEpisodePreparationContext(
@@ -4241,13 +4400,18 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                     return (navigation.videos ?? []).orderedBySeasonEpisode
                 },
                 resumeOffset: { playbackMeta in
+                    guard intentIsCurrent() else { return 0 }
                     if let engine = core.engineResumeSeconds(for: playbackMeta) { return engine }
-                    return await account.resumeOffset(for: playbackMeta)
+                    let offset = await account.resumeOffset(for: playbackMeta)
+                    guard intentIsCurrent() else { return 0 }
+                    return offset
                 },
                 isCurrent: valid
             )
             guard valid() else { return nil }
-            return await preparer.warm(request, context: context)
+            let prepared = await preparer.warm(request, context: context)
+            guard intentIsCurrent() else { return nil }
+            return prepared
         }
     }
     if hasEpisodicPhysicalIdentity {
@@ -4272,6 +4436,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         }()
         launchSource = source
         if let source {
+            guard intentIsCurrent() else { return nil }
             let base = iOSEngineAddonBase(for: source, in: groups)
             let succeeded = core.loadEnginePlayer(
                 for: source, videoId: entry.videoId, base: base,
@@ -4282,7 +4447,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             )
         }
     }
-    guard (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
+    guard intentIsCurrent(), (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession),
           ProfileStore.shared.activeID == pid,
           account.credentialBoundaryGeneration == accountBoundary else { return nil }
     return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,
