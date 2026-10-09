@@ -31,6 +31,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -51,6 +52,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.focus.FocusRequester
@@ -67,6 +69,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil3.compose.AsyncImage
 import com.vortx.android.ui.components.FallbackArtwork
+import com.vortx.android.ui.components.cinemaDetailHeroHeightDp
+import com.vortx.android.ui.components.cinemaDetailSourceSectionIndex
 import com.vortx.android.ui.components.TraktManualCheckInAction
 import com.vortx.android.VortXApplication
 import com.vortx.android.catalog.AddonSimilarClient
@@ -458,6 +462,18 @@ fun DetailScreen(
 
     val resolving = playback is Playback.Resolving
     var sourcesOpen by remember { mutableStateOf(false) }
+    var sourceJumpPending by remember { mutableStateOf(false) }
+    val detailListState = rememberLazyListState()
+    val pickReason = (streamsState as? UiState.Success)?.let { viewModel.bestSource() }?.let { StreamRanking.pickReason(it) }
+    val financialText = financials?.let { FinancialsClient.financialsText(it) }
+    val releaseText = releaseDates?.let { ReleaseDatesClient.releaseDatesText(it) }
+    val sourceSectionIndex = cinemaDetailSourceSectionIndex(pickReason != null, ratings != null, financialText != null, releaseText != null)
+    LaunchedEffect(sourcesOpen, sourceJumpPending, sourceSectionIndex) {
+        if (sourcesOpen && sourceJumpPending && metaState is UiState.Success) {
+            detailListState.animateScrollToItem(sourceSectionIndex)
+            sourceJumpPending = false
+        }
+    }
 
     // Quick View deliberately delegates to the ordinary ranked source path. The request is consumed before
     // dispatch so recomposition, an arriving source group, or returning from the player cannot launch twice.
@@ -467,7 +483,8 @@ fun DetailScreen(
         beginPlayback { viewModel.playBest() }
     }
 
-    Box(modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
+    BoxWithConstraints(modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
+        val viewportHeight = maxHeight
         when (val m = metaState) {
             // A non-`tt` catalog id that neither an add-on nor the one-shot recovery could resolve sits in
             // Loading with [metaUnavailable] set: show the terminal "Details unavailable" page (Try Again
@@ -482,9 +499,10 @@ fun DetailScreen(
             is UiState.Error -> ErrorState(m.message, onRetry = viewModel::retryMeta, modifier = Modifier.fillMaxSize())
             is UiState.Success -> LazyColumn(
                 modifier = Modifier.fillMaxSize(),
+                state = detailListState,
                 verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
             ) {
-                item { Backdrop(m.data) }
+                item { Backdrop(m.data, viewportHeight) }
                 item {
                     ActionsCluster(
                         m = m.data,
@@ -498,7 +516,7 @@ fun DetailScreen(
                         onWatch = { beginPlayback { viewModel.playBest() } },
                         playFromStartEnabled = viewModel.resumeAvailable() && !resolving,
                         onPlayFromStart = { beginPlayback { viewModel.playBest(fromStart = true) } },
-                        onToggleSources = { sourcesOpen = !sourcesOpen },
+                        onToggleSources = { sourcesOpen = !sourcesOpen; sourceJumpPending = sourcesOpen },
                         onToggleLibrary = viewModel::toggleLibrary,
                         watchlisted = watchlisted,
                         onToggleWatchlist = viewModel::toggleWatchlist,
@@ -516,9 +534,6 @@ fun DetailScreen(
                 // DET-8: the one-line rationale for the auto-picked source (#16), shown once under the hero
                 // actions when the ranker chose the best stream for a decisive reason (instant-from-cache,
                 // preferred source type, or a Smart-Source prefer chip) the per-row tags don't convey.
-                val pickReason = (streamsState as? UiState.Success)
-                    ?.let { viewModel.bestSource() }
-                    ?.let { StreamRanking.pickReason(it) }
                 if (pickReason != null) {
                     item {
                         Text(
@@ -547,14 +562,14 @@ fun DetailScreen(
                 }
                 // DET financials (MOVIES ONLY, gated on the "Show budget & box office" setting) + theatrical
                 // / digital release dates: compact fact lines under the ratings.
-                financials?.let { FinancialsClient.financialsText(it) }?.let { text ->
+                financialText?.let { text ->
                     item { DetailFactLine(text) }
                 }
-                releaseDates?.let { ReleaseDatesClient.releaseDatesText(it) }?.let { text ->
+                releaseText?.let { text ->
                     item { DetailFactLine(text) }
                 }
                 if (sourcesOpen) {
-                    item {
+                    item(key = "detail-sources") {
                         SurfaceCard(modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
                             SourcesSection(
                                 state = streamsState,
@@ -845,28 +860,16 @@ private fun DetailSkeleton(title: String) {
 /// (readability against the content column below) plus a leading horizontal fade (readability behind
 /// the bottom-left title block) -- with the title/logo + single-line meta row anchored bottom-left.
 @Composable
-private fun Backdrop(m: MetaDetail) {
+private fun Backdrop(m: MetaDetail, viewportHeight: Dp) {
     val colors = VortXTheme.colors
-    // BoxWithConstraints + an explicitly computed height, NOT `.heightIn(max = 260.dp).aspectRatio(...)`
-    // -- that combination is the actual bug behind the tablet "synopsis painted over the hero"
-    // report (Tab S11 Ultra, both a movie and a series). `fillMaxWidth()` forces this Box's width
-    // constraints to be FIXED (min == max == the available width). Compose's `aspectRatio` solver can
-    // only honor a fixed width by deriving height = width / ratio; when that derived height exceeds
-    // the `heightIn` cap on any width above ~462dp (i.e. virtually every tablet, in EITHER
-    // orientation, not just a short landscape viewport) none of its four solve attempts (max-width,
-    // max-height, min-width, min-height) satisfy both the fixed width AND the capped height
-    // simultaneously, so it silently falls back to `IntSize(constraints.minWidth, constraints.minHeight)`
-    // -- a width-only, ZERO-HEIGHT box. The LazyColumn item collapses to 0dp, so `ActionsCluster` and
-    // the synopsis start rendering at the very top of the screen while the hero's own (unclipped, per
-    // Compose's no-implicit-clip default) title/backdrop content still draws at its natural size --
-    // the visual overlap. Computing the height ourselves from the ACTUAL measured width sidesteps the
-    // solver entirely: it is always well-defined, always <= the 260dp cap, and the content column
-    // below can never start before the hero's real bottom edge, at any width or orientation.
+    // Use the measured available viewport, not screen/device classification. An explicit height keeps
+    // the previous fixed-width + capped-aspect zero-height bug closed on tablets and split windows.
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(heroHeight(maxWidth)),
+                .height(cinemaDetailHeroHeightDp(maxWidth.value, viewportHeight.value).dp)
+                .clipToBounds(),
         ) {
             // Route the backdrop through the artwork router: ERDB bakes ratings/quality onto backdrops when
             // active, otherwise the original add-on/metahub backdrop (or the poster) is used unchanged.
@@ -933,6 +936,10 @@ private fun Backdrop(m: MetaDetail) {
             ) {
                 DetailTitle(m)
                 MetaRow(m)
+                m.description?.takeIf(String::isNotBlank)?.let { synopsis ->
+                    Text(synopsis, style = VortXTheme.type.body.copy(color = colors.textSecondary),
+                        maxLines = 3, overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 640.dp))
+                }
             }
         }
     }

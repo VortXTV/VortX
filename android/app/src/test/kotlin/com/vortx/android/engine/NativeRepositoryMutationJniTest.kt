@@ -180,7 +180,8 @@ class NativeRepositoryMutationJniTest {
             assertTrue(transport.entered!!.await(10, TimeUnit.SECONDS))
             try {
                 val before = store.commits
-                repository.setCatalogWatched(MetaItem("series", MediaType.SERIES, "Card"), true).getOrThrow()
+                val capturedOwner = repository.continueWatchingOwner()
+                repository.setCatalogWatched(MetaItem("series", MediaType.SERIES, "Card"), true, capturedOwner).getOrThrow()
                 assertEquals(before + 1, store.commits)
                 assertEquals(setOf("opaque-one", "opaque-two", "opaque-three"), watched(session))
                 val detail = repository.setSeasonWatched(MediaType.SERIES, "series", 1, false).getOrThrow()
@@ -233,6 +234,40 @@ class NativeRepositoryMutationJniTest {
             session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"guest"}""")))
             val before = store.value; transport.release!!.countDown()
             assertTrue(pending.await().isFailure); assertEquals(before, store.value); assertTrue(watched(session).isEmpty())
+        }
+    }
+
+    @Test fun `queued catalog event cannot adopt a profile owner after an ABA switch`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            install(session); session.dispatch(listOf(JSONObject("""{"type":"add_profile","id":"guest","name":"Guest"}""")))
+            val repository = NativeCatalogRepository { session }
+            val captured = repository.continueWatchingOwner()
+            session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"guest"}""")))
+            session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"owner"}""")))
+            val before = store.value; val calls = transport.calls
+            assertTrue(repository.setCatalogWatched(MetaItem("series", MediaType.SERIES, "Card"), true, captured).isFailure)
+            assertEquals(calls, transport.calls)
+            assertEquals(before, store.value)
+            assertTrue(watched(session).isEmpty())
+        }
+    }
+
+    @Test fun `captured catalog event rejects profile retirement after metadata await`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            install(session); session.dispatch(listOf(JSONObject("""{"type":"add_profile","id":"guest","name":"Guest"}""")))
+            val repository = NativeCatalogRepository { session }
+            val captured = repository.continueWatchingOwner()
+            transport.delayedId = "series"; transport.entered = CountDownLatch(1); transport.release = CountDownLatch(1)
+            val pending = async(Dispatchers.IO) { repository.setCatalogWatched(MetaItem("series", MediaType.SERIES, "Card"), true, captured) }
+            assertTrue(transport.entered!!.await(10, TimeUnit.SECONDS))
+            session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"guest"}""")))
+            val before = store.value
+            transport.release!!.countDown()
+            assertTrue(pending.await().isFailure)
+            assertEquals(before, store.value)
+            assertTrue(watched(session).isEmpty())
         }
     }
 

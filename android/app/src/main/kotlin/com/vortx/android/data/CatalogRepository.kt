@@ -320,6 +320,12 @@ interface CatalogRepository {
     /// the card/discover use case. Default no-op for the offline preview.
     suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean): Result<Unit> = Result.success(Unit)
 
+    /** Card event authority captured before async work. Native implementations dispatch atomically. */
+    suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean, expectedOwner: ContinueWatchingOwner): Result<Unit> {
+        if (continueWatchingOwner() != expectedOwner) return Result.failure(IllegalStateException("Watch profile changed. Try again."))
+        return setCatalogWatched(item, isWatched)
+    }
+
     /// Full-text search across every add-on the user has installed.
     suspend fun search(query: String): Result<List<MetaItem>>
 

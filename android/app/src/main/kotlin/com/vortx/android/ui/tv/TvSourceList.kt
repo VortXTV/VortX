@@ -156,7 +156,8 @@ private fun TvSourceListContent(
     var qualityOpen by remember { mutableStateOf(false) }
     var qualityTier by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
-    val groupKeys = groups.mapIndexed { index, group -> tvSourceGroupKey(group, index) }
+    val sourceTabs = tvSourceTabs(groups)
+    val groupKeys = sourceTabs.map { it.key }
     val groupFocus = remember(groupKeys) { groupKeys.associateWith { FocusRequester() } }
     fun acceptFocus() { focusRevision++ }
     fun requestJump(key: String?) {
@@ -189,7 +190,7 @@ private fun TvSourceListContent(
     }.sum()
     val hasMore = shownRows < expandableTotal
     val prefixCount = 1 + (if (best != null) 1 else 0) + (if (failure != null) 1 else 0) + (if (downloadNotice != null) 1 else 0)
-    LaunchedEffect(jumpRevision, groupKeys) {
+    LaunchedEffect(jumpRevision, groupKeys, items, prefixCount) {
         val lease = jumpLease ?: return@LaunchedEffect
         if (!lease.stillOwns(jumpRevision, focusRevision, groupKeys)) return@LaunchedEffect
         val key = lease.groupKey
@@ -221,15 +222,15 @@ private fun TvSourceListContent(
         )
         // These tabs scroll to a section in the complete ordered list; selecting an add-on never filters
         // away its neighbors or changes the user's installed add-on order.
-        if (groups.size > 1) {
+        if (sourceTabs.size > 1) {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs)) {
                 item(key = "sources-all") {
                     TvFilterChip("All ($total)", jumpGroupKey == null, onClick = { requestJump(null) }, modifier = Modifier.onFocusChanged { if (it.isFocused) acceptFocus() })
                 }
-                itemsIndexed(groups, key = { index, group -> tvSourceGroupKey(group, index) }) { index, group ->
-                    val key = tvSourceGroupKey(group, index)
+                itemsIndexed(sourceTabs, key = { _, tab -> tab.key }) { _, tab ->
+                    val key = tab.key
                     TvFilterChip(
-                        label = "${group.addon} (${group.streams.size})",
+                        label = "${tab.addon} (${tab.count})",
                         selected = jumpGroupKey == key,
                         onClick = { requestJump(key) },
                         modifier = Modifier.onFocusChanged { if (it.isFocused) acceptFocus() },
@@ -282,7 +283,7 @@ private fun TvSourceListContent(
                     count = entry.count,
                     collapsed = entry.collapsed,
                     modifier = Modifier
-                        .then(groupFocus[entry.key]?.let { Modifier.focusRequester(it) } ?: Modifier)
+                        .then(groupFocus[entry.key]?.takeIf { entry.firstProviderSection }?.let { Modifier.focusRequester(it) } ?: Modifier)
                         .onFocusChanged { if (it.isFocused) acceptFocus() },
                     onToggle = {
                         collapsed = if (entry.collapsed) collapsed - entry.key else collapsed + entry.key
@@ -693,11 +694,6 @@ private fun tvSortedStreamsInGroup(streams: List<StreamSource>, sort: String): L
 
 /// A stable LazyColumn key for a rendered [TvSourceItem]: position-prefixed so a decorated / duplicate source
 /// id can never collide, header vs row disambiguated by kind.
-private fun tvSourceItemKey(index: Int, item: TvSourceItem): String = when (item) {
-    is TvSourceItem.Header -> "h-${item.key}"
-    is TvSourceItem.Row -> "r-${item.groupKey}-$index-${item.source.id}"
-}
-
 /// The sort ids/labels, the SAME lowercase persistence keys the phone `defaultSourceSort` stores, so the TV
 /// list opens the way the user last left it and a change written here is read back on the phone.
 private val TV_SOURCE_SORT_OPTIONS: List<Pair<String, String>> = listOf(

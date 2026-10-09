@@ -498,8 +498,12 @@ internal class NativeCatalogRepository(
         requireWatchIdentity(read, target.type, target.id)
         session.dispatch(listOf(action("remove_from_continue_watching").put("metaId", target.id)), read.owner); Unit
     }
-    override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean) = attempt {
-        val session = session(); val read = session.read(); requireWatchIdentity(read, item.type, item.id)
+    override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean) =
+        setCatalogWatched(item, isWatched, continueWatchingOwner())
+    override suspend fun setCatalogWatched(item: MetaItem, isWatched: Boolean, expectedOwner: ContinueWatchingOwner) = attempt {
+        val session = session(); val read = session.read()
+        check(owner(read.owner) == expectedOwner) { "Watch account or profile changed. Try again." }
+        requireWatchIdentity(read, item.type, item.id)
         if (item.type == MediaType.SERIES) {
             mutateWatchInventory(session, read, item.type, item.id, isWatched) { it.videos.map(Episode::id) }
         } else dispatchWatched(session, read, MetaDetail(item.id, item.type, item.name, poster = item.poster), null, isWatched)

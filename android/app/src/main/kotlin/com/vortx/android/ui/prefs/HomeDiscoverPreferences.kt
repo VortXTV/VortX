@@ -96,7 +96,7 @@ class HomeDiscoverPreferences(context: Context) {
      * Continue Watching is deliberately excluded at the caller: it must keep its direct-resume route.
      */
     var cinemaQuickView: Boolean
-        get() = prefs.getBoolean(KEY_CINEMA_QUICK_VIEW, false)
+        get() = prefs.getBoolean(KEY_CINEMA_QUICK_VIEW, true)
         set(value) { prefs.edit().putBoolean(KEY_CINEMA_QUICK_VIEW, value).apply() }
 
     var showFinancials: Boolean

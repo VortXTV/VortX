@@ -6,6 +6,7 @@ import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -66,6 +68,7 @@ import com.vortx.android.ui.components.Chip
 import com.vortx.android.ui.components.EmptyState
 import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.SurfaceCard
+import com.vortx.android.ui.components.cinemaControlLayout
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
@@ -139,7 +142,9 @@ fun AddonsScreen(
     var reorderMode by remember { mutableStateOf(false) }
     val installed = (state as? UiState.Success)?.data.orEmpty()
 
-    Column(modifier = modifier.fillMaxSize()) {
+    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
+    val layout = cinemaControlLayout(maxWidth.value)
+    Column(modifier = Modifier.align(Alignment.TopCenter).widthIn(max = layout.maxContentWidthDp.dp).fillMaxSize()) {
         TopAppBar(
             windowInsets = if (embedded) WindowInsets(0, 0, 0, 0) else TopAppBarDefaults.windowInsets,
             title = { Text(if (reorderMode) "Reorder Add-ons" else "Add-ons", style = VortXTheme.type.screenTitle) },
@@ -168,7 +173,7 @@ fun AddonsScreen(
         }
         LazyColumn(
             contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.md),
-            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
+            verticalArrangement = Arrangement.spacedBy(layout.cardGapDp.dp),
             modifier = Modifier.fillMaxSize(),
         ) {
             item {
@@ -182,7 +187,7 @@ fun AddonsScreen(
             item {
                 SurfaceCard(modifier = Modifier.fillMaxWidth()) {
                     Column(
-                        modifier = Modifier.padding(VortXTheme.spacing.md),
+                        modifier = Modifier.padding(layout.cardPaddingDp.dp),
                         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
                     ) {
                         Text("Install an add-on", style = VortXTheme.type.cardTitle)
@@ -235,7 +240,7 @@ fun AddonsScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clickable(onClick = onDiscover)
-                            .padding(VortXTheme.spacing.md),
+                            .padding(layout.cardPaddingDp.dp),
                         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -273,12 +278,14 @@ fun AddonsScreen(
                                 onRemove = { viewModel.remove(addon) },
                                 onConfigure = { addon.configureUrl?.let { openInBrowser(context, it) } },
                                 onChangeUrl = { changeUrlAddon = addon },
+                                spacious = layout.spacious,
                             )
                         }
                     }
                 }
             }
         }
+    }
     }
 }
 
@@ -291,6 +298,7 @@ private fun AddonRow(
     onRemove: () -> Unit,
     onConfigure: () -> Unit,
     onChangeUrl: () -> Unit,
+    spacious: Boolean = false,
 ) {
     val colors = VortXTheme.colors
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
@@ -298,15 +306,15 @@ private fun AddonRow(
         // chips never steal width from the name/detail column, so a narrow phone wraps them instead of
         // clipping Remove off the edge.
         Column(
-            modifier = Modifier.padding(VortXTheme.spacing.md),
-            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+            modifier = Modifier.padding(if (spacious) 24.dp else VortXTheme.spacing.md),
+            verticalArrangement = Arrangement.spacedBy(if (spacious) 16.dp else VortXTheme.spacing.sm),
         ) {
             Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
                 // Info block dims when the add-on is turned OFF for this profile, so the state reads at
                 // a glance even before the eye icon does.
                 Box(
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(if (spacious) 64.dp else 48.dp)
                         .alpha(if (addon.isDisabled) 0.45f else 1f),
                     contentAlignment = Alignment.Center,
                 ) {
