@@ -24,7 +24,8 @@ immutable configured Safari User-Agent restoration instead of leaking a first so
 source-time external-caption refresh while paused; real mpv subtitle backgrounds;
 bounded HLS startup reservation that avoids parking before the initial playlist is ready;
 native NNTP article concurrency and seek cancellation; retained Apple Trakt Continue Watching
-read choice; scoped Android native NNTP provider/mirror routing; and fresh FFmpeg 9 /
+read choice; integrated per-profile Local/Trakt/SIMKL Continue Watching source and range
+selection; scoped Android native NNTP provider/mirror routing; and fresh FFmpeg 9 /
 Apple SecureTransport MPV build inputs with the Mac CoreAudio lifecycle repair.
 
 Existing Beta 21 player controls, integrations, downloads, catalog/source workflows and
@@ -84,8 +85,8 @@ pre-launch package rejection; fresh artifact/whole-app gates still need acceptan
 A reviewed private Continue Watching follow-up retains the full resumable inventory beyond
 30 titles, including unsaved titles and cold reopening; explicit rewinds to zero, positive
 progress with unknown viewing dates and known aliases are preserved. It passed 177 focused
-checks against seven failing baseline cases, but complete
-native CI and shipping-input acceptance remain pending. It is not final SDK or device proof.
+checks against seven failing baseline cases; complete Linux/macOS native CI and matching
+shipping-source pins are now accepted. Fresh SDK/app packages and device proof remain pending.
 The reproduced blocked-HTTP/rapid-seek path now has a reviewed interruption and MKV-cues
 retry repair with seven actual Mac-arm64 native controls passing. Its top-level HTTP(S) GET
 scope does not establish HLS/curl, full-vendor/app shipping, provider or hardware acceptance.
