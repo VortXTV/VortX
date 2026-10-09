@@ -159,6 +159,7 @@ private final class CatalogPublications: @unchecked Sendable {
 private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Sendable {
     private let lock = NSLock()
     private let gates: [String: DispatchSemaphore]
+    private let holdFirstOnly: Bool
     private var requests: [String] = []
     private var budgets: [UInt64] = []
     private var bodyLimits: [UInt64] = []
@@ -166,7 +167,10 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
     private var active = 0
     private var peak = 0
     private var metaActive = 0, metaPeak = 0, streamActive = 0, streamPeak = 0
-    init(held: [String]) { gates = Dictionary(uniqueKeysWithValues: held.map { ($0, DispatchSemaphore(value: 0)) }) }
+    init(held: [String], holdFirstOnly: Bool = false) {
+        gates = Dictionary(uniqueKeysWithValues: held.map { ($0, DispatchSemaphore(value: 0)) })
+        self.holdFirstOnly = holdFirstOnly
+    }
     var started: [String] { lock.withLock { requests } }
     var requestBudgets: [UInt64] { lock.withLock { budgets } }
     var requestBodyLimits: [UInt64] { lock.withLock { bodyLimits } }
@@ -186,25 +190,26 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         let budget = try input["budgetMs"]!.decode(UInt64.self)
         let bodyLimit = try input["maxResponseBytes"]!.decode(UInt64.self)
         let totalLimit = try input["maxTotalResponseBytes"]!.decode(UInt64.self)
-        lock.withLock {
+        let attempt = lock.withLock {
             requests.append(key); budgets.append(budget); bodyLimits.append(bodyLimit); totalLimits.append(totalLimit)
             active += 1; peak = max(peak, active)
             if request.resource == .meta { metaActive += 1; metaPeak = max(metaPeak, metaActive) }
             else { streamActive += 1; streamPeak = max(streamPeak, streamActive) }
+            return requests.filter { $0 == key }.count
         }
         defer { lock.withLock {
             active -= 1
             if request.resource == .meta { metaActive -= 1 } else { streamActive -= 1 }
         } }
-        if let gate = gates[key] { precondition(gate.wait(timeout: .now() + 10) == .success, "unreleased detail leg") }
+        if let gate = gates[key], !holdFirstOnly || attempt == 1 { precondition(gate.wait(timeout: .now() + 10) == .success, "unreleased detail leg") }
         // Cancellation deliberately ignored: session/publication fences must reject late output.
         if request.resource == .stream && addonID == "source6" { throw VortxNativeError.unavailable }
         let content: VortxJSON
         if request.resource == .meta {
-            content = .object(["meta": .object(["id": .string(request.id), "type": .string(request.type), "name": .string("Fixture")])])
+            content = .object(["meta": .object(["id": .string(request.id), "type": .string(request.type), "name": .string("Fixture \(attempt)")])])
         } else if addonID == "source7" {
             content = .object(["streams": .array([.string("malformed")])])
-        } else { content = .object(["streams": .array([.object(["url": .string("https://fixture.invalid/video.mp4")])])]) }
+        } else { content = .object(["streams": .array([.object(["url": .string("https://fixture.invalid/video.mp4?attempt=\(attempt)")])])]) }
         let groups: [VortxJSON] = request.resource == .stream && addonID == "source8" ? [] : [
             .object(["addonId": .string(addonID), "status": .string("ready"), "content": content])]
         return String(decoding: try JSONEncoder().encode(VortxJSON.object(["kind": .string("resource_result"),
@@ -286,6 +291,29 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
                 "streamPath": try VortxResourceProjection.path(.init(resource: .stream, type: "series", id: "new:1:1"))])))
             await target.shutdown()
         }
+        // Identical A paths are not identical ownership: late first-A output must not
+        // overwrite the second A after A -> B -> A, even when transport ignores cancel.
+        let abaTransport = DetailFanoutTransport(held: ["A/meta/source0", "A:1:1/stream/source0"], holdFirstOnly: true)
+        let abaSession = try VortxNativeSession(scope: .init(account: "details-aba", ownerProfileID: "owner"),
+            ownerName: "Owner", abi: SessionABI(), store: SessionStore(), transport: abaTransport, allowNewAccount: true)
+        let notifications = MutationCounter()
+        let aba = try await VortxNativeCoreFacade.create(session: abaSession, registry: [registry[0]], changed: { fields in
+            if fields.contains("meta_details") { notifications.increment() }
+        })
+        try load(aba, "A"); try await eventually { abaTransport.started.count == 2 }
+        check(notifications.value == 1) // facade initial and session initial are one value
+        let firstA = Task { await aba.settled() }; await Task.yield()
+        try load(aba, "B"); await aba.settled()
+        check(notifications.value == 4) // initial + two terminal legs, no duplicate final
+        try load(aba, "A"); await aba.settled()
+        let acceptedA = state(aba)
+        check(acceptedA?["metaItems"]?.array?.first?["content"]?["content"]?["name"] == .string("Fixture 2"))
+        check(acceptedA?["streams"]?.array?.first?["content"]?["content"]?.array?.first?["url"] == .string("https://fixture.invalid/video.mp4?attempt=2"))
+        check(notifications.value == 7)
+        abaTransport.release("A/meta/source0"); abaTransport.release("A:1:1/stream/source0")
+        await firstA.value; await aba.settled()
+        check(state(aba) == acceptedA && notifications.value == 7)
+        await aba.shutdown()
         for boundary in ["profile", "resources", "owner", "cancel"] {
             let held = DetailFanoutTransport(held: ["old/meta/source0", "old:1:1/stream/source0"])
             let scoped = try VortxNativeSession(scope: .init(account: "details-boundary-" + boundary, ownerProfileID: "owner"),

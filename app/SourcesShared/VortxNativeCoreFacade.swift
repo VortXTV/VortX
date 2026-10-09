@@ -228,9 +228,14 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func publish(_ fields: [String: VortxJSON], field: String, ticket: UUID) {
         lock.lock()
         guard !closed, generations[field] == ticket else { lock.unlock(); return }
+        var changedFields: [String] = []
         fields.forEach {
-            values[$0.key] = $0.key == "meta_details" ? metaWithPlayback($0.value, library: values["library"]?["catalog"]?.array ?? []) : $0.value
-        }; lock.unlock(); changed(Array(fields.keys))
+            let projected = $0.key == "meta_details" ? metaWithPlayback($0.value, library: values["library"]?["catalog"]?.array ?? []) : $0.value
+            if values[$0.key] != projected { changedFields.append($0.key) }
+            values[$0.key] = projected
+        }
+        lock.unlock()
+        if !changedFields.isEmpty { changed(changedFields.sorted()) }
     }
     private func enqueue(_ field: String, initial: VortxJSON? = nil, operation: @escaping @Sendable () async throws -> [String: VortxJSON]) -> Bool {
         enqueue(field, initial: initial) { _ in try await operation() }
@@ -316,8 +321,12 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 // resolves own/share-primary before new-profile resource loads can be admitted.
                 let replacement = resourceChanged ? try? await session.resourceRegistry() : nil
                 if resourceChanged { await session.invalidateResources() }
-                let publishedFields = try self.lock.withLock { () -> [String: VortxJSON]? in
+                let publication = try self.lock.withLock { () -> (fields: [String: VortxJSON], changed: [String])? in
                     guard !self.closed else { return nil }
+                    // Compare against the acknowledged cache before a resource identity change
+                    // clears it. Progress and unchanged sync reads must not synthesize ctx events.
+                    let previousValues = self.values
+                    let identityChanged = self.resourceIdentity(previousValues["native_state"]) != self.resourceIdentity(state)
                     let accountChanged = self.accountIdentity(self.values["native_state"]) != self.accountIdentity(state)
                     if accountChanged { self.accountEpoch = UUID() }
                     if accountChanged || self.values["native_state"]?["activeProfileId"] != state["activeProfileId"] {
@@ -326,7 +335,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     self.failure = nil
                     self.playback = playback
                     self.sourceArchive = sourceArchive
-                    if self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) {
+                    if identityChanged {
                         self.invalidateResourcePublications(); self.registryGeneration = UUID()
                         if let replacement { self.registry = replacement; self.resourceRegistryValid = true }
                         else { self.failure = "registry_unavailable" }
@@ -336,16 +345,21 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     fields["native_host_preferences"] = host
                     fields["native_website_edits"] = website
                     fields["native_own_overlay_pending"] = ownPending
-                    fields.forEach { self.values[$0.key] = $0.value }; return fields
+                    var changedFields = Set(fields.compactMap { previousValues[$0.key] != $0.value ? $0.key : nil })
+                    // Two profiles may have identical add-on descriptors but different resource
+                    // ownership. Their identity transition still requires one fenced ctx event.
+                    if identityChanged { changedFields.insert("ctx") }
+                    fields.forEach { self.values[$0.key] = $0.value }
+                    return (fields, changedFields.sorted())
                 }
                 // FIFO intents each publish their acknowledged state before the next task executes.
                 // A later get_state must not hide the profile transition's accepted state.
                 if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 }; transitionReleased = true }
-                if let publishedFields { self.changed(Array(publishedFields.keys)) }
-                guard publishedFields != nil, let document = state["nativeSync"] else { throw VortxNativeError.closed }
+                if let publication, !publication.changed.isEmpty { self.changed(publication.changed) }
+                guard publication != nil, let document = state["nativeSync"] else { throw VortxNativeError.closed }
                 if ["report_progress", "mark_watched", "reset_watched"].contains(type) {
                     let count = playback["continueWatching"]?.array?.count ?? 0
-                    let saved = publishedFields?["library"]?["catalog"]?.array?.count ?? 0
+                    let saved = publication?.fields["library"]?["catalog"]?.array?.count ?? 0
                     NSLog("[VortXNative] mutation=%@ result=acknowledged continueWatching=%ld savedLibrary=%ld", type, count, saved)
                 }
                 if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) || !hostEdits.isEmpty || websiteChanged { self.mutationAccepted() }
