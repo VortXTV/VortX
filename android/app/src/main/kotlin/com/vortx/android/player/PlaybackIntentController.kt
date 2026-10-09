@@ -1,5 +1,8 @@
 package com.vortx.android.player
 
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+
 /** Reasons playback must remain paused independently of the viewer's PLAY/PAUSE choice. */
 internal enum class PlaybackBlocker {
     BACKGROUND,
@@ -70,6 +73,23 @@ internal class PlaybackIntentController(
         apply()
     }
 
+    /** Preparation may configure a private candidate, but only publication may route user commands to it. */
+    fun applyTo(candidate: PlayerEngine, blockForBackground: Boolean) {
+        val candidateState = synchronized(this) {
+            val blockers = if (blockForBackground) state.blockers + PlaybackBlocker.BACKGROUND
+                else state.blockers - PlaybackBlocker.BACKGROUND
+            state.copy(blockers = blockers)
+        }
+        // Never mutate the shared blocker or command the bound engine from a background constructor.
+        // Native candidate calls also stay outside the intent monitor so they cannot block viewer input.
+        if (candidateState.shouldPlay) candidate.play() else candidate.pause()
+    }
+
+    @Synchronized
+    fun unbindIfCurrent(retired: PlayerEngine) {
+        if (engine === retired) engine = null
+    }
+
     @Synchronized
     fun userPlay() = update(state.copy(userWantsPlay = true))
 
@@ -120,6 +140,7 @@ internal fun prepareAndLoadEngine(
     lifecycleStarted: () -> Boolean,
     pausePlaybackInBackground: () -> Boolean,
     playbackIntent: PlaybackIntentController,
+    bindForCommands: Boolean = true,
     refreshAudioRoute: () -> Unit = {},
 ) {
     reconcileEngineLifecycle(
@@ -128,6 +149,7 @@ internal fun prepareAndLoadEngine(
         pausePlaybackInBackground(),
         playbackIntent,
         refreshAudioRoute,
+        bindForCommands,
     )
     engine.load(playable)
     // Async/non-cancellable construction can cross START/STOP. The post-load sample is authoritative.
@@ -137,6 +159,7 @@ internal fun prepareAndLoadEngine(
         pausePlaybackInBackground(),
         playbackIntent,
         refreshAudioRoute,
+        bindForCommands,
     )
 }
 
@@ -146,17 +169,20 @@ internal fun reconcileEngineLifecycle(
     pausePlaybackInBackground: Boolean,
     playbackIntent: PlaybackIntentController,
     refreshAudioRoute: () -> Unit = {},
+    bindForCommands: Boolean = true,
 ) {
     val blockForBackground = !lifecycleStarted && pausePlaybackInBackground
-    playbackIntent.setBlocked(PlaybackBlocker.BACKGROUND, blockForBackground)
-    playbackIntent.bind(engine)
+    if (bindForCommands) {
+        playbackIntent.setBlocked(PlaybackBlocker.BACKGROUND, blockForBackground)
+        playbackIntent.bind(engine)
+    } else playbackIntent.applyTo(engine, blockForBackground)
     if (lifecycleStarted) {
         refreshAudioRoute()
         engine.onEnterForeground()
     } else {
         engine.onEnterBackground()
     }
-    playbackIntent.bind(engine)
+    if (bindForCommands) playbackIntent.bind(engine) else playbackIntent.applyTo(engine, blockForBackground)
 }
 
 /**
@@ -173,6 +199,7 @@ internal suspend fun reconcileAndPublishEngine(
     publish: (PlayerEngine) -> Unit,
 ) {
     beforePublication()
+    currentCoroutineContext().ensureActive()
     reconcileEngineLifecycle(
         engine = engine,
         lifecycleStarted = lifecycleStarted(),
