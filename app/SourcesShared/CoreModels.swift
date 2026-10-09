@@ -299,19 +299,51 @@ struct CoreMeta: Decodable, Identifiable {
     let background: String?
     let description: String?
     let releaseInfo: String?
+    /// Authored preview runtime only. Sparse catalogs omit it; malformed optional runtime must not
+    /// discard an otherwise valid title or invent a duration from its identity.
+    let runtime: String?
+    private let authoredImdbRating: String?
+    private let authoredGenres: [String]?
     /// Rating + genres live in `links` in the engine's catalog-preview serialization (category "imdb"
     /// carries the rating in its name; category "Genres" carries each genre), NOT as top-level fields.
-    /// The engine never emits a top-level `imdbRating`/`genres` for a preview, so the old stored
-    /// properties decoded nil every time and the featured hero never showed a rating. Read them from
-    /// `links` instead, the same place CoreMetaItem (the full detail meta) reads them.
+    /// The legacy engine uses links; the native resource path retains the provider's original
+    /// top-level fields. Keep links precedence, with lenient authored fallback for native previews.
     let links: [CoreLink]?
 
+    private enum CodingKeys: String, CodingKey {
+        case id, type, name, poster, posterShape, logo, background, description, releaseInfo, runtime, links, imdbRating, genres
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        type = try values.decode(String.self, forKey: .type)
+        name = try values.decode(String.self, forKey: .name)
+        poster = try values.decodeIfPresent(String.self, forKey: .poster)
+        posterShape = try values.decodeIfPresent(String.self, forKey: .posterShape)
+        logo = try values.decodeIfPresent(String.self, forKey: .logo)
+        background = try values.decodeIfPresent(String.self, forKey: .background)
+        description = try values.decodeIfPresent(String.self, forKey: .description)
+        releaseInfo = try values.decodeIfPresent(String.self, forKey: .releaseInfo)
+        runtime = Self.authoredString(values, key: .runtime)
+        authoredImdbRating = Self.authoredString(values, key: .imdbRating)
+        authoredGenres = try? values.decode([String].self, forKey: .genres)
+        links = try values.decodeIfPresent([CoreLink].self, forKey: .links)
+    }
+
+    private static func authoredString(_ values: KeyedDecodingContainer<CodingKeys>, key: CodingKeys) -> String? {
+        if let authored = try? values.decode(String.self, forKey: key) { return authored }
+        if let authored = try? values.decode(Int.self, forKey: key) { return String(authored) }
+        if let authored = try? values.decode(Double.self, forKey: key), authored.isFinite { return String(authored) }
+        return nil
+    }
+
     var imdbRating: String? {
-        (links ?? []).first { $0.category.caseInsensitiveCompare("imdb") == .orderedSame }?.name
+        (links ?? []).first { $0.category.caseInsensitiveCompare("imdb") == .orderedSame }?.name ?? authoredImdbRating
     }
     var genres: [String]? {
         let g = (links ?? []).filter { ["genre", "genres"].contains($0.category.lowercased()) }.map(\.name)
-        return g.isEmpty ? nil : g
+        return g.isEmpty ? authoredGenres : g
     }
 }
 

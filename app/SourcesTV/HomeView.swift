@@ -26,6 +26,7 @@ struct HomeView: View {
     @AppStorage(ContinueWatchingPreferences.windowKey) private var continueWatchingWindow = "20"
     @State private var traktContinueWatchingRevision = 0
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
+    @State private var catalogBrowseTarget: TVCatalogBrowseTarget?
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared   // #105: rails vs poster-wall Home layout
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -191,6 +192,8 @@ struct HomeView: View {
                     .ignoresSafeArea()   // absolute top-left, clear of the hero title below
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            // Register outside the lazy rail container so See All stays available as rows recycle.
+            .navigationDestination(item: $catalogBrowseTarget) { TVCatalogBrowseView(target: $0) }
         }
     }
 
@@ -453,8 +456,8 @@ struct HomeView: View {
                 upcomingMoviesSection
             }
         case .addonCatalogs:
-            // Each add-on catalog as a rail (or poster-wall). Per-catalog order/hiding is owned by
-            // CatalogPreferences; this section moves the whole block. Vertical pagination stays attached.
+            // Cinema catalogs keep one horizontal row; See All owns the separately paged grid.
+            // Per-catalog order/hiding and vertical catalog-window pagination keep their existing owners.
             ForEach(core.boardRows) { row in
                 boardSection(row)
             }
@@ -482,18 +485,10 @@ struct HomeView: View {
         }
     }
 
-    /// One engine board catalog section (rail or poster-wall), with the vertical board-widening trigger on
-    /// the LAST populated section. Unchanged from the previous inline `ForEach(core.boardRows)` body; see the
-    /// long note there (kept below) for why the `.onAppear` sits at the section level for both layouts.
+    /// One horizontal engine board row, with the existing board-window widening trigger retained.
     @ViewBuilder
     private func boardSection(_ row: CoreBoardRow) -> some View {
-        Group {
-            if catalogPrefs.homeLayout == .wall {
-                CoreCatalogWallSection(row: row, focusModel: focusModel)
-            } else {
-                CoreCatalogRowView(row: row, focusModel: focusModel)
-            }
-        }
+        CoreCatalogRowView(row: row, focusModel: focusModel, onSeeAll: { catalogBrowseTarget = $0 })
         // Vertical board widening (mirrors iOS Home): when the LAST populated board section appears, load the
         // next window of Home catalogs. At the SECTION level so it fires in BOTH the rail and wall layouts;
         // repeats are gated inside CoreBridge.loadBoardNextPage (boardHasNextPage + boardPageInFlight).
@@ -747,8 +742,8 @@ struct CoreContinueWatchingRow: View {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
                         VStack(alignment: .leading) {
-                        PosterCard(title: item.name, poster: item.poster,
-                                   type: item.type, id: item.id, progress: displayProgress[item.id] ?? item.progress,
+                        TVCinemaCard(presentation: item.tvCinemaPresentation,
+                                   progress: displayProgress[item.id] ?? item.progress,
                                    resumeSeconds: item.resumeSeconds,
                                    menu: menu,
                                    privateArtwork: intent?.source.isPrivate == true || traktSessionID != nil,
@@ -1041,26 +1036,43 @@ struct CoreContinueWatchingRow: View {
 struct CoreCatalogRowView: View {
     let row: CoreBoardRow
     var focusModel: FocusedItemModel? = nil
+    let onSeeAll: (TVCatalogBrowseTarget) -> Void
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var core: CoreBridge   // for per-row horizontal pagination (#95)
+    @EnvironmentObject private var account: StremioAccount
     // Watched check + dim on catalog covers (#111): one shared per-profile id set, O(1) per card.
     @ObservedObject private var watchedIndex = WatchedIndex.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            RailHeader(title: row.title)
+            HStack(spacing: Theme.Space.md) {
+                Text(row.title).sectionTitleStyle()
+                Spacer()
+                Button {
+                    if let target = core.captureTVCatalogBrowse(row: row,
+                        accountBoundaryGeneration: account.credentialBoundaryGeneration) { onSeeAll(target) }
+                } label: { Label("See All", systemImage: "chevron.right") }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .accessibilityLabel("See all \(row.title)")
+            }
+            .padding(.horizontal, Theme.Space.screenEdge)
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(row.items) { item in
-                        PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                                   isWatched: watchedIndex.ids.contains(item.id),
-                                   menu: .catalog,
-                                   onFocus: focusModel.map { model in
-                                       { model.focus(item.focusedHero) }
-                                   })
+                        TVCinemaCard(presentation: .meta(item), isWatched: watchedIndex.ids.contains(item.id),
+                                     menu: .catalog, onFocus: focusModel.map { model in
+                                         { model.focus(item.focusedHero) }
+                                     })
                             // #95: horizontal infinite scroll. The last card asks the engine for this
                             // catalog's next page, so a Home row keeps loading instead of capping at ~20.
-                            .onAppear { if item.id == row.items.last?.id { core.loadBoardRowNextPage(engineIndex: row.engineIndex) } }
+                            .onAppear {
+                                if item.id == row.items.last?.id,
+                                   let target = core.captureTVCatalogBrowse(row: row,
+                                       accountBoundaryGeneration: account.credentialBoundaryGeneration) {
+                                    core.pageTVCatalogBrowse(target,
+                                        accountBoundaryGeneration: account.credentialBoundaryGeneration)
+                                }
+                            }
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
