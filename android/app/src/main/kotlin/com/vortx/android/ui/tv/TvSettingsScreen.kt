@@ -121,22 +121,8 @@ import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 /// [TrackPreferencesStore], and [PlaybackBehaviorSettings]. A couch change and a phone change therefore
 /// write the SAME value in `vortx_settings`. There are no TV-only settings keys.
 ///
-/// PROFILE SWITCHING (this round): the roster is now focusable and switchable from the couch. Tapping a
-/// profile calls [ProfileStore.select], which applies its theme/filters, fires the engine reload +
-/// Home-rebuild seams, and swaps in that profile's private watch overlay -- the account library is never
-/// touched (`EngineStremioRepository.overlayProfiles()` gates every watch path: the never-poison split). A
-/// PIN-gated profile prompts for its PIN through a 10-foot numeric keypad before switching, so a Kids profile
-/// cannot walk into a locked parent profile from the remote. [ProfileStore] exposes plain main-thread fields
-/// (Apple's `@Published` analogue, no Flow), so this screen bumps a local counter after a switch to re-read
-/// `profiles` / `activeID`.
-///
-/// SCOPE, honestly: this ships the primary 10-foot toggles a viewer changes from the couch plus profile
-/// SWITCHING. Creating / renaming / deleting a profile stays on the phone/tablet app for now (text entry is a
-/// touch job); add-ons and debrid API keys have their own nested TV routes, while the remaining deep phone-only surfaces
-/// (Account sign-in, Integrations, Media servers, advanced subtitle styling, Sources ranking,
-/// Downloads, Library transfer) are named at the foot of the list rather than reproduced. Binding a profile
-/// to its own separate account is not wired on Android yet, so a
-/// [ProfileStore.select] returning `SwitchAccount` / `NeedsSignIn` is surfaced as a note.
+/// Profiles opens the shared native account editor through a TV focus wrapper. Selection, PIN checks,
+/// streaming-account setup and edits retain that editor's captured account/profile authority.
 @Composable
 fun TvSettingsScreen(
     repo: CatalogRepository,
@@ -162,11 +148,15 @@ fun TvSettingsScreen(
     LaunchedEffect(appContext) { SkipConfig.init(appContext) }
     var skipProvider by remember { mutableStateOf(SkipConfig.provider) }
     var route by remember { mutableStateOf(TvSettingsRoute.ROOT) }
+    val transferPending by (syncManager?.transferPending?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf(false) })
     val settingsListState = rememberLazyListState()
     val debridServicesFocus = remember { FocusRequester() }
     val addonsFocus = remember { FocusRequester() }
     var restoreFocusTarget by remember { mutableStateOf<TvDebridFocusTarget?>(null) }
     var restoreAddonsFocus by remember { mutableStateOf(false) }
+    val profilesFocus = remember { FocusRequester() }
+    var restoreProfilesFocus by remember { mutableStateOf(false) }
 
     // Seed each control from its store once; write through on every change. There is no reactive prefs stream
     // in these modules and none is needed -- the values are read at player load, so a write-through keeps the
@@ -200,15 +190,14 @@ fun TvSettingsScreen(
     var settingsQuery by remember { mutableStateOf("") }
 
     val store = ProfileStore.sharedOrNull()
-    // Bumped after a switch to force a fresh read of the plain (non-observable) store fields.
-    var refresh by remember { mutableStateOf(0) }
-    val roster = remember(refresh) { store?.profiles ?: emptyList() }
-    val activeId = remember(refresh) { store?.activeID }
-    val debridAccountIdentity = remember(refresh) {
-        store?.activeKeychainAccount ?: ProfileStore.PRIMARY_TOKEN_ACCOUNT
+    val activeProfile by (store?.activeProfile?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf<UserProfile?>(null) })
+    val debridAccountIdentity = store?.activeKeychainAccount ?: ProfileStore.PRIMARY_TOKEN_ACCOUNT
+
+    if (route == TvSettingsRoute.PROFILES) {
+        TvProfilesScreen(onBack = { route = route.back(); restoreProfilesFocus = true }, modifier = modifier)
+        return
     }
-    var pinTarget by remember { mutableStateOf<UserProfile?>(null) }
-    var status by remember { mutableStateOf<String?>(null) }
 
     fun returnToSettingsRoot() {
         route = route.back()
@@ -416,7 +405,7 @@ fun TvSettingsScreen(
         // BackupExportView / BackupImportView. Built from the SAME sync manager the Account route uses.
         BackHandler { route = TvSettingsRoute.ROOT }
         val vortxVm: VortXAccountViewModel? = if (syncManager != null) {
-            viewModel(factory = StremioXViewModelFactory(repo = repo, syncManager = syncManager))
+            viewModel(key = "tv-backup-transfer", factory = StremioXViewModelFactory(repo = repo, syncManager = syncManager))
         } else {
             null
         }
@@ -434,21 +423,6 @@ fun TvSettingsScreen(
         return
     }
 
-    fun commitSwitch(profile: UserProfile) {
-        if (store == null) return
-        status = null
-        when (store.select(profile)) {
-            ProfileStore.SwitchOutcome.SameAccount -> Unit
-            is ProfileStore.SwitchOutcome.SwitchAccount ->
-                status = "Now watching as ${profile.name}. Per-profile sign-in isn't wired on Android yet, " +
-                    "so this profile keeps the current session."
-            ProfileStore.SwitchOutcome.NeedsSignIn ->
-                status = "Now watching as ${profile.name}. This profile has its own account; per-profile " +
-                    "sign-in isn't available on Android yet."
-        }
-        refresh++
-    }
-
     // A section renders when the search field is blank, or when the query matches any of the section's terms
     // (its title plus the labels a viewer might type). Case-insensitive substring; trimmed. Keeps the couch
     // search dumb-simple and never hides a section the query names.
@@ -463,28 +437,25 @@ fun TvSettingsScreen(
             contentPadding = PaddingValues(TvDimens.edge),
             verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
         ) {
-            item { TvProfileHeader(store?.active) }
+            item { TvProfileHeader(activeProfile) }
+
+            if (transferPending) item {
+                TvSettingsSection("Account transfer needs your choice") {
+                    TvSettingsNavigationRow(label = "Continue Backup & Restore",
+                        detail = "Automatic sync is paused. Choose which saved data to use, or open Account to sign out.",
+                        onClick = { route = TvSettingsRoute.BACKUP })
+                }
+            }
 
             item {
                 TvSettingsSearchField(query = settingsQuery, onQueryChange = { settingsQuery = it })
             }
 
-            if (roster.isNotEmpty() && show("who's watching", "profile", "switch profile", "kids")) {
+            if (show("who's watching", "profile", "switch profile", "kids")) {
                 item {
                     TvSettingsSection("Who's watching") {
-                        roster.forEach { profile ->
-                            TvProfileRow(
-                                profile = profile,
-                                isActive = profile.id == activeId,
-                                onClick = {
-                                    when {
-                                        profile.id == activeId -> Unit          // already active
-                                        profile.hasPin -> pinTarget = profile    // gate the switch on the PIN
-                                        else -> commitSwitch(profile)
-                                    }
-                                },
-                            )
-                        }
+                        TvSettingsNavigationRow(label = "Profiles", detail = "Switch, create or edit profiles and manage their streaming accounts.",
+                            onClick = { route = TvSettingsRoute.PROFILES }, focusRequester = profilesFocus)
                     }
                 }
             }
@@ -567,16 +538,6 @@ fun TvSettingsScreen(
                             // Turning it off clears the rows now; turning it on lets the next CW update publish.
                             if (!next) WatchNextPublisher.clearOwnedRows(appContext)
                         },
-                    )
-                }
-            }
-
-            status?.let { message ->
-                item {
-                    Text(
-                        text = message,
-                        style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = VortXTheme.spacing.xs),
                     )
                 }
             }
@@ -956,12 +917,13 @@ fun TvSettingsScreen(
             if (trimmedQuery.isEmpty()) item { TvSettingsFootnote() }
         }
 
-        pinTarget?.let { target ->
-            TvPinGate(
-                profile = target,
-                onUnlock = { pinTarget = null; commitSwitch(target) },
-                onCancel = { pinTarget = null },
-            )
+    }
+
+    LaunchedEffect(restoreProfilesFocus) {
+        if (restoreProfilesFocus) {
+            withFrameNanos { }
+            profilesFocus.requestFocus()
+            restoreProfilesFocus = false
         }
     }
 
@@ -1001,6 +963,7 @@ internal enum class TvSettingsRoute {
     WHATS_NEW,
     CUSTOMIZE_HOME,
     ACCOUNT,
+    PROFILES,
     IMPORT_STREMIO,
     INTEGRATIONS,
     METADATA,
@@ -1338,10 +1301,12 @@ private fun TvSettingsSearchField(query: String, onQueryChange: (String) -> Unit
 /// store. Unlock only enables at 4 digits.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvPinGate(profile: UserProfile, onUnlock: () -> Unit, onCancel: () -> Unit) {
+internal fun TvPinGate(profile: UserProfile, onUnlock: () -> Unit, onCancel: () -> Unit) {
     val colors = VortXTheme.colors
     var input by remember { mutableStateOf("") }
     var wrong by remember { mutableStateOf(false) }
+    val firstDigit = remember { FocusRequester() }
+    LaunchedEffect(Unit) { withFrameNanos { }; firstDigit.requestFocus() }
     Box(
         modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.78f)),
         contentAlignment = Alignment.Center,
@@ -1365,7 +1330,7 @@ private fun TvPinGate(profile: UserProfile, onUnlock: () -> Unit, onCancel: () -
             rows.forEach { row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
                     row.forEach { digit ->
-                        TvKeypadKey(label = digit, onClick = {
+                        TvKeypadKey(label = digit, focusRequester = firstDigit.takeIf { digit == "1" }, onClick = {
                             if (input.length < 4) { input += digit; wrong = false }
                         })
                     }
@@ -1390,12 +1355,14 @@ private fun TvPinGate(profile: UserProfile, onUnlock: () -> Unit, onCancel: () -
 /// non-focusable/inert surface so the D-pad skips it until it becomes usable.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvKeypadKey(label: String, onClick: () -> Unit, enabled: Boolean = true, wide: Boolean = false) {
+private fun TvKeypadKey(label: String, onClick: () -> Unit, enabled: Boolean = true, wide: Boolean = false,
+    focusRequester: FocusRequester? = null) {
     val colors = VortXTheme.colors
     Surface(
         onClick = onClick,
         enabled = enabled,
-        modifier = if (wide) Modifier.fillMaxWidth() else Modifier.size(width = 76.dp, height = 56.dp),
+        modifier = (if (wide) Modifier.fillMaxWidth() else Modifier.size(width = 76.dp, height = 56.dp))
+            .then(if (focusRequester != null) Modifier.focusRequester(focusRequester) else Modifier),
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = if (enabled) colors.surface2 else colors.surface1,
@@ -1425,8 +1392,7 @@ private fun TvKeypadKey(label: String, onClick: () -> Unit, enabled: Boolean = t
 @Composable
 private fun TvSettingsFootnote() {
     Text(
-        text = "Creating, renaming, and deleting profiles, plus media servers, source ranking, " +
-            "downloads, and library transfer, are managed in the VortX phone and tablet app.",
+        text = "Use Profiles to switch or edit who's watching. Backup & Restore transfers saved data through your VortX account.",
         style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
         modifier = Modifier.fillMaxWidth().padding(top = VortXTheme.spacing.sm),
     )

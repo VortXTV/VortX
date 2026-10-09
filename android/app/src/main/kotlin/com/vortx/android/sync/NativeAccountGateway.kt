@@ -8,6 +8,13 @@ internal data class NativeAccountExport(val nativeSync: JSONObject, val roster: 
     val rawRoster: JSONArray = JSONArray(roster.map { it.encode() }), val hostProfileSyncPending: Boolean = false,
     val hostPreferences: JSONObject? = null, val hostSettingsBaseline: Any? = null)
 
+/** Exact transfer admission, used only for the accepted native writer's synchronous UI projection. */
+internal fun interface NativeTransferProjection {
+    fun publish(projection: () -> Unit): Boolean
+    /** No transition exemption: foreign ownership changes invalidate the operation even in a commit. */
+    fun commit(mutation: () -> Unit): Boolean = false
+}
+
 /** Only called with a successfully authenticated/decrypted document under a captured session lease.
  * Credentials and the account data key never cross this boundary. */
 internal interface NativeAccountGateway {
@@ -17,6 +24,12 @@ internal interface NativeAccountGateway {
     /** Called only after an authenticated 404 with no prior backup evidence. */
     suspend fun prepareEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean): JSONObject? = null
     suspend fun applyDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean): Boolean
+    suspend fun reopenTransferCheckpoint(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
+        projection: NativeTransferProjection): Boolean = reopenCheckpoint(account, isCurrent)
+    suspend fun prepareTransferEmptyAccount(account: SessionOwnerSnapshot.Account, isCurrent: () -> Boolean,
+        projection: NativeTransferProjection): JSONObject? = prepareEmptyAccount(account, isCurrent)
+    suspend fun applyTransferDocument(account: SessionOwnerSnapshot.Account, document: JSONObject, isCurrent: () -> Boolean,
+        projection: NativeTransferProjection): Boolean = applyDocument(account, document, isCurrent)
     fun exportDocument(account: SessionOwnerSnapshot.Account): NativeAccountExport?
     fun recordGlobalPreferences(account: SessionOwnerSnapshot.Account, changes: JSONObject): Boolean = false
     fun acknowledgeHostPreferences(account: SessionOwnerSnapshot.Account, document: JSONObject): Boolean = false
