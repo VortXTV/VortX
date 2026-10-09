@@ -256,6 +256,23 @@ interface CatalogRepository {
     /// `ctx.profile.addons`.
     suspend fun installedAddons(): Result<List<InstalledAddon>>
 
+    /** Read-only availability; shared profiles may customize visibility/order, not membership. */
+    fun addonManagementAccess(): AddonManagementAccess = AddonManagementAccess(continueWatchingOwner(), true)
+
+    /** Owner/descriptor admission is captured by the caller before confirmation or dispatcher IO.
+     * Successful receipts carry the post-action owner (native registry writes advance its revision).
+     * Switchable production repositories must implement these; never fall back to a mutable owner. */
+    suspend fun installAddon(url: String, target: AddonManagementTarget): Result<ContinueWatchingOwner> =
+        Result.failure(UnsupportedOperationException("Owned add-on installation is unavailable."))
+    suspend fun removeAddon(target: AddonManagementTarget): Result<ContinueWatchingOwner> =
+        Result.failure(UnsupportedOperationException("Owned add-on removal is unavailable."))
+    suspend fun changeAddonUrl(target: AddonManagementTarget, newUrl: String): Result<ContinueWatchingOwner> =
+        Result.failure(UnsupportedOperationException("Owned add-on replacement is unavailable."))
+    suspend fun setAddonDisabled(target: AddonManagementTarget, disabled: Boolean): Result<ContinueWatchingOwner> =
+        Result.failure(UnsupportedOperationException("Owned add-on visibility is unavailable."))
+    suspend fun applyAddonOrder(target: AddonManagementTarget, transportUrls: List<String>): Result<ContinueWatchingOwner> =
+        Result.failure(UnsupportedOperationException("Owned add-on ordering is unavailable."))
+
     /// Canonicalize a pasted add-on URL to the exact transport URL the engine keys add-ons by (trim +
     /// scheme check + `/manifest.json` suffix), mirroring Apple `CoreBridge.normalizedAddonURL`. Null for
     /// anything that isn't a plausible http(s) URL. The Add-ons screen compares this against the installed
@@ -645,6 +662,18 @@ class PreviewCatalogRepository(
         delay(latencyMs)
         return Result.success(previewAddons.toList())
     }
+
+    // The explicit offline fixture has a constant local owner, unlike either production repository.
+    private suspend fun previewAddonMutation(target: AddonManagementTarget, action: suspend () -> Result<Unit>): Result<ContinueWatchingOwner> = runCatching {
+        requireCurrentAddonTarget(target, continueWatchingOwner(), previewAddons)
+        action().getOrThrow()
+        continueWatchingOwner()
+    }
+    override suspend fun installAddon(url: String, target: AddonManagementTarget) = previewAddonMutation(target) { installAddon(url) }
+    override suspend fun removeAddon(target: AddonManagementTarget) = previewAddonMutation(target) { removeAddon(requireNotNull(target.addon)) }
+    override suspend fun changeAddonUrl(target: AddonManagementTarget, newUrl: String) = previewAddonMutation(target) { changeAddonUrl(requireNotNull(target.addon), newUrl) }
+    override suspend fun setAddonDisabled(target: AddonManagementTarget, disabled: Boolean) = previewAddonMutation(target) { setAddonDisabled(requireNotNull(target.addon).transportUrl, disabled) }
+    override suspend fun applyAddonOrder(target: AddonManagementTarget, transportUrls: List<String>) = previewAddonMutation(target) { applyAddonOrder(transportUrls) }
 
     override suspend fun installAddon(url: String): Result<Unit> {
         delay(latencyMs)

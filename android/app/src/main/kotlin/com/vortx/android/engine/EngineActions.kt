@@ -168,12 +168,14 @@ object EngineActions {
     /// add-on from its already-fetched manifest. [manifestJson] is the raw `manifest.json` body; the
     /// caller (repository layer) is responsible for fetching + validating it first (mirrors Apple
     /// `CoreBridge.installAddon`, which fetches client-side because the engine has no HTTP-fetch action
-    /// for a bare URL). `flags.official`/`flags.protected` are always false for a user-installed add-on.
-    fun installAddon(transportUrl: String, manifestJson: JSONObject): String {
+    /// for a bare URL). New user installs always default to untrusted flags. Owned updates may pass
+    /// flags copied only from the exact admitted installed descriptor, never from the fetched manifest.
+    fun installAddon(transportUrl: String, manifestJson: JSONObject, descriptorFlags: JSONObject? = null): String {
         val descriptor = JSONObject()
             .put("transportUrl", transportUrl)
             .put("manifest", manifestJson)
-            .put("flags", JSONObject().put("official", false).put("protected", false))
+            .put("flags", descriptorFlags?.let { JSONObject(it.toString()) }
+                ?: JSONObject().put("official", false).put("protected", false))
         return ctxEnvelope(action("InstallAddon", descriptor))
     }
 

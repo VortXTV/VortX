@@ -3,9 +3,13 @@ package com.vortx.android.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.AddonManagementTarget
+import com.vortx.android.data.ContinueWatchingOwner
+import com.vortx.android.data.requireCurrentAddonTarget
 import com.vortx.android.engine.AddonHealth
 import com.vortx.android.engine.AddonHealthStore
 import com.vortx.android.model.InstalledAddon
+import com.vortx.android.model.AddonOrder
 import com.vortx.android.ui.UiState
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
@@ -25,6 +29,16 @@ class AddonsViewModel(
 ) : ViewModel() {
     private val _state = MutableStateFlow<UiState<List<InstalledAddon>>>(UiState.Loading)
     val state: StateFlow<UiState<List<InstalledAddon>>> = _state.asStateFlow()
+    private val _managementAccess = MutableStateFlow(repo.addonManagementAccess())
+    val managementAccess = _managementAccess.asStateFlow()
+    private var loadedOwner: ContinueWatchingOwner? = null
+    private var loadGeneration = 0L
+    private val _mutating = MutableStateFlow(false)
+    val mutating = _mutating.asStateFlow()
+    private val _actionMessage = MutableStateFlow<Pair<String, Boolean>?>(null)
+    val actionMessage = _actionMessage.asStateFlow()
+    private val _removeDone = MutableStateFlow(0)
+    val removeDone = _removeDone.asStateFlow()
 
     val health = healthStore.status
 
@@ -49,6 +63,19 @@ class AddonsViewModel(
     private var pendingHealthUrls: List<String>? = null
     private var activeHealthUrls: List<String>? = null
     private var everLoaded = false
+
+    /** The raw URL awaiting explicit Update confirmation, with its original item/owner beside it. */
+    private val _pendingUpdate = MutableStateFlow<String?>(null)
+    val pendingUpdate: StateFlow<String?> = _pendingUpdate.asStateFlow()
+    private var pendingUpdateTarget: AddonManagementTarget? = null
+    /** Failed replacement keeps the dialog open; successful replacement advances the done token. */
+    private val _changeUrlMessage = MutableStateFlow<Pair<String, Boolean>?>(null)
+    val changeUrlMessage: StateFlow<Pair<String, Boolean>?> = _changeUrlMessage.asStateFlow()
+    private val _changingUrl = MutableStateFlow(false)
+    val changingUrl: StateFlow<Boolean> = _changingUrl.asStateFlow()
+    private val _changeUrlDone = MutableStateFlow(0)
+    val changeUrlDone: StateFlow<Int> = _changeUrlDone.asStateFlow()
+    private var changeUrlOwner: ContinueWatchingOwner? = null
 
     /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): re-reads the installed list on every
     /// ctx change (an install/remove from this screen, but also a sign-in pulling in the account's own
@@ -81,10 +108,24 @@ class AddonsViewModel(
     }
 
     fun load(showLoading: Boolean = true) {
+        val generation = ++loadGeneration
+        val access = repo.addonManagementAccess()
+        if (_managementAccess.value.owner != access.owner) {
+            cancelUpdate()
+            _installMessage.value = null
+            _changeUrlMessage.value = null
+            _actionMessage.value = null
+            loadedOwner = null
+            _state.value = UiState.Loading
+        }
+        _managementAccess.value = access
         viewModelScope.launch {
             if (showLoading) _state.value = UiState.Loading
-            repo.installedAddons().fold(
+            val result = repo.installedAddons()
+            if (generation != loadGeneration || repo.continueWatchingOwner() != access.owner) return@launch
+            result.fold(
                 onSuccess = {
+                    loadedOwner = access.owner
                     _state.value = UiState.Success(it)
                     probeHealth(it)
                 },
@@ -99,14 +140,51 @@ class AddonsViewModel(
         _installMessage.value = null
     }
 
-    /// The raw URL awaiting an Update-if-installed confirm, or null when no dialog is showing (SRC-8, Apple
-    /// `AddonsView.showUpdateConfirm`). The screen renders a confirm dialog whenever this is non-null.
-    private val _pendingUpdate = MutableStateFlow<String?>(null)
-    val pendingUpdate: StateFlow<String?> = _pendingUpdate.asStateFlow()
+    /** Snapshot the rendered item and full native/account/profile token before opening a dialog. */
+    fun captureManagementTarget(
+        addon: InstalledAddon? = null,
+        expectedRenderedOwner: ContinueWatchingOwner? = null,
+    ): AddonManagementTarget? {
+        val owner = loadedOwner
+        val installed = (_state.value as? UiState.Success)?.data
+        if (owner == null || installed == null || owner != repo.continueWatchingOwner() ||
+            (expectedRenderedOwner != null && owner != expectedRenderedOwner)) {
+            _actionMessage.value = "Add-on account or profile changed. Reload installed add-ons." to true
+            load(showLoading = false)
+            return null
+        }
+        val target = AddonManagementTarget(owner, addon)
+        if (runCatching { requireCurrentAddonTarget(target, repo.continueWatchingOwner(), installed) }.isFailure) {
+            _actionMessage.value = "Add-on changed or was removed. Reload installed add-ons." to true
+            load(showLoading = false)
+            return null
+        }
+        return target
+    }
 
-    fun install() {
+    private fun current(target: AddonManagementTarget): Boolean = runCatching {
+        requireCurrentAddonTarget(target, repo.continueWatchingOwner(), (_state.value as? UiState.Success)?.data.orEmpty())
+    }.isSuccess
+
+    private fun acceptReceipt(receipt: ContinueWatchingOwner): Boolean {
+        val access = repo.addonManagementAccess()
+        if (access.owner != receipt) return false
+        _managementAccess.value = access
+        return true
+    }
+
+    fun install() = installForOwner(null)
+
+    fun install(expectedRenderedOwner: ContinueWatchingOwner) = installForOwner(expectedRenderedOwner)
+
+    private fun installForOwner(expectedRenderedOwner: ContinueWatchingOwner?) {
         val url = _urlInput.value.trim()
-        if (url.isEmpty() || _installing.value) return
+        if (url.isEmpty() || _mutating.value) return
+        val target = captureManagementTarget(expectedRenderedOwner = expectedRenderedOwner) ?: return
+        if (!_managementAccess.value.canManageInstalled) {
+            _installMessage.value = (_managementAccess.value.reason ?: "Change installed add-ons from the owner profile.") to true
+            return
+        }
         // A pasted /configure PAGE is not an installable manifest (it mints a per-user manifest only after
         // sign-in + debrid key). Guide the user to finish configuration rather than installing a dead copy
         // (Apple `AddonsView.install`'s Beta 17 guard). The repository repeats this as a backstop; here it
@@ -121,63 +199,80 @@ class AddonsViewModel(
         // simply installs, byte-identical to the previous behavior.
         val normalized = repo.normalizedAddonUrl(url)
         val installed = (state.value as? UiState.Success)?.data.orEmpty()
-        if (normalized != null && installed.any { it.transportUrl == normalized }) {
+        val existing = normalized?.let { key -> installed.singleOrNull { AddonOrder.normalize(it.transportUrl) == AddonOrder.normalize(key) } }
+        if (existing != null) {
+            pendingUpdateTarget = target.copy(addon = existing)
             _pendingUpdate.value = url
             return
         }
-        runInstall(url, replacingExisting = false)
+        runInstall(url, target, replacingExisting = false)
     }
 
     /// Confirm the Update-if-installed dialog: re-install the pending URL and report "Updated." on success.
     fun confirmUpdate() {
         val url = _pendingUpdate.value ?: return
+        val target = pendingUpdateTarget ?: return
         _pendingUpdate.value = null
-        runInstall(url, replacingExisting = true)
+        pendingUpdateTarget = null
+        runInstall(url, target, replacingExisting = true)
     }
 
     /// Dismiss the Update-if-installed dialog, leaving the add-on and the typed URL untouched.
     fun cancelUpdate() {
         _pendingUpdate.value = null
+        pendingUpdateTarget = null
     }
 
-    private fun runInstall(url: String, replacingExisting: Boolean) {
-        if (_installing.value) return
+    private fun runInstall(url: String, target: AddonManagementTarget, replacingExisting: Boolean) {
+        if (_mutating.value) return
+        if (!current(target)) {
+            _installMessage.value = "Add-on changed or was removed. Reopen Update." to true
+            load(showLoading = false)
+            return
+        }
+        _mutating.value = true
+        _installing.value = true
         viewModelScope.launch {
-            _installing.value = true
-            repo.installAddon(url).fold(
-                onSuccess = {
+            try { repo.installAddon(url, target).fold(
+                onSuccess = { receipt -> if (acceptReceipt(receipt)) {
                     _installMessage.value = (if (replacingExisting) "Updated." else "Installed.") to false
-                    _urlInput.value = ""
-                    load()
-                },
-                onFailure = { _installMessage.value = (it.message ?: "Couldn't install that add-on.") to true },
-            )
-            _installing.value = false
+                    if (_urlInput.value.trim() == url) _urlInput.value = ""
+                    load(showLoading = false)
+                } },
+                onFailure = { if (repo.continueWatchingOwner() == target.owner) _installMessage.value = (it.message ?: "Couldn't install that add-on.") to true },
+            ) } finally { _installing.value = false; _mutating.value = false }
         }
     }
 
     fun remove(addon: InstalledAddon) {
+        captureManagementTarget(addon)?.let(::remove)
+    }
+
+    fun onRemoveOpen() { _actionMessage.value = null }
+
+    fun remove(target: AddonManagementTarget) {
+        if (_mutating.value) return
+        _mutating.value = true
+        _actionMessage.value = null
         viewModelScope.launch {
-            repo.removeAddon(addon)
-            load()
+            try { repo.removeAddon(target).fold(
+                onSuccess = { receipt -> if (acceptReceipt(receipt)) {
+                    _actionMessage.value = "Removed." to false
+                    _removeDone.value += 1
+                    load(showLoading = false)
+                } },
+                onFailure = { if (repo.continueWatchingOwner() == target.owner) _actionMessage.value = (it.message ?: "Couldn't remove that add-on.") to true },
+            ) } finally { _mutating.value = false }
         }
     }
 
-    /// The Change-URL sheet's live outcome, or null while it is idle. `first` = user-facing text,
-    /// `second` = true when the swap FAILED (the sheet stays open so the user can correct the URL);
-    /// a success clears it and the sheet dismisses. Mirrors Apple `EditAddonURLView.message`.
-    private val _changeUrlMessage = MutableStateFlow<Pair<String, Boolean>?>(null)
-    val changeUrlMessage: StateFlow<Pair<String, Boolean>?> = _changeUrlMessage.asStateFlow()
-
-    private val _changingUrl = MutableStateFlow(false)
-    val changingUrl: StateFlow<Boolean> = _changingUrl.asStateFlow()
-
-    /// Signals the Change-URL sheet to dismiss after a successful swap. The screen collects this and
-    /// closes its sheet; a plain incrementing token avoids a stale re-dismiss on recomposition.
-    private val _changeUrlDone = MutableStateFlow(0)
-    val changeUrlDone: StateFlow<Int> = _changeUrlDone.asStateFlow()
-
     fun onChangeUrlOpen() {
+        changeUrlOwner = loadedOwner
+        _changeUrlMessage.value = null
+    }
+
+    fun onChangeUrlOpen(target: AddonManagementTarget) {
+        changeUrlOwner = target.owner
         _changeUrlMessage.value = null
     }
 
@@ -185,19 +280,25 @@ class AddonsViewModel(
     /// first, then drop the old without tombstoning. On success the sheet dismisses; on failure it stays
     /// open with the error so the user can fix the URL.
     fun changeAddonUrl(addon: InstalledAddon, newUrl: String) {
+        val owner = changeUrlOwner ?: loadedOwner ?: return
+        changeAddonUrl(AddonManagementTarget(owner, addon), newUrl)
+    }
+
+    fun changeAddonUrl(target: AddonManagementTarget, newUrl: String) {
+        val addon = target.addon ?: return
         val trimmed = newUrl.trim()
-        if (trimmed.isEmpty() || trimmed == addon.transportUrl || _changingUrl.value) return
+        if (trimmed.isEmpty() || trimmed == addon.transportUrl || _mutating.value) return
+        _mutating.value = true
+        _changingUrl.value = true
+        _changeUrlMessage.value = null
         viewModelScope.launch {
-            _changingUrl.value = true
-            _changeUrlMessage.value = null
-            repo.changeAddonUrl(addon, trimmed).fold(
-                onSuccess = {
+            try { repo.changeAddonUrl(target, trimmed).fold(
+                onSuccess = { receipt -> if (acceptReceipt(receipt)) {
                     _changeUrlDone.value += 1
-                    load()
-                },
-                onFailure = { _changeUrlMessage.value = (it.message ?: "Couldn't change that add-on's URL.") to true },
-            )
-            _changingUrl.value = false
+                    load(showLoading = false)
+                } },
+                onFailure = { if (repo.continueWatchingOwner() == target.owner) _changeUrlMessage.value = (it.message ?: "Couldn't change that add-on's URL.") to true },
+            ) } finally { _changingUrl.value = false; _mutating.value = false }
         }
     }
 
@@ -267,20 +368,40 @@ class AddonsViewModel(
     /// `AddonsView.swift:424` -> `profiles.toggleAddon`). A local per-profile overlay, never an
     /// engine/account change; the repository excludes disabled add-ons from Home rows + source
     /// groups. The silent reload re-stamps [InstalledAddon.isDisabled] so the icon flips at once.
-    fun toggleAddon(addon: InstalledAddon) {
+    fun toggleAddon(addon: InstalledAddon) = toggleAddonForOwner(addon, null)
+
+    fun toggleAddon(addon: InstalledAddon, expectedRenderedOwner: ContinueWatchingOwner) =
+        toggleAddonForOwner(addon, expectedRenderedOwner)
+
+    private fun toggleAddonForOwner(addon: InstalledAddon, expectedRenderedOwner: ContinueWatchingOwner?) {
+        if (_mutating.value) return
+        val target = captureManagementTarget(addon, expectedRenderedOwner) ?: return
+        _mutating.value = true
         viewModelScope.launch {
-            repo.setAddonDisabled(addon.transportUrl, !addon.isDisabled)
-            load(showLoading = false)
+            try { repo.setAddonDisabled(target, !addon.isDisabled).fold(
+                onSuccess = { receipt -> if (acceptReceipt(receipt)) load(showLoading = false) },
+                onFailure = { if (repo.continueWatchingOwner() == target.owner) _actionMessage.value = (it.message ?: "Couldn't change visibility.") to true },
+            ) } finally { _mutating.value = false }
         }
     }
 
     /// Persist a new add-on PRIORITY order from the reorder list's drop (Apple
     /// `AddonsView.swift:476 .onMove` -> `applyInAppAddonOrder`): each drop applies immediately, so
     /// leaving reorder mode needs no separate save step.
-    fun applyOrder(transportUrls: List<String>) {
+    fun applyOrder(transportUrls: List<String>) = applyOrderForOwner(transportUrls, null)
+
+    fun applyOrder(transportUrls: List<String>, expectedRenderedOwner: ContinueWatchingOwner) =
+        applyOrderForOwner(transportUrls, expectedRenderedOwner)
+
+    private fun applyOrderForOwner(transportUrls: List<String>, expectedRenderedOwner: ContinueWatchingOwner?) {
+        if (_mutating.value) return
+        val target = captureManagementTarget(expectedRenderedOwner = expectedRenderedOwner) ?: return
+        _mutating.value = true
         viewModelScope.launch {
-            repo.applyAddonOrder(transportUrls)
-            load(showLoading = false)
+            try { repo.applyAddonOrder(target, transportUrls).fold(
+                onSuccess = { receipt -> if (acceptReceipt(receipt)) load(showLoading = false) },
+                onFailure = { if (repo.continueWatchingOwner() == target.owner) _actionMessage.value = (it.message ?: "Couldn't change priority.") to true },
+            ) } finally { _mutating.value = false }
         }
     }
 }

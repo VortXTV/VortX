@@ -257,6 +257,14 @@ internal object VortxAndroidCheckpointKey {
 internal data class VortxNativeOwner(val scope: VortxAccountScope, val profileID: String, val revision: Long)
 internal data class VortxNativeRead(val owner: VortxNativeOwner, val state: JSONObject)
 
+/** A dispatch fills this once with its immutable committed owner, before any mutation notification.
+ * It has no external callback, IO, or failure path inside the session's commit monitor. */
+internal class VortxCommittedOwnerReceipt {
+    var owner: VortxNativeOwner? = null
+        private set
+    internal fun capture(value: VortxNativeOwner) { owner = value }
+}
+
 /** One immutable account. Every mutation is clone/apply/commit/readback/swap under one monitor. */
 internal class VortxNativeSession private constructor(
     val scope: VortxAccountScope,
@@ -579,7 +587,8 @@ internal class VortxNativeSession private constructor(
                               baselineHostProfiles: JSONObject? = null,
                               verifyCandidate: ((VortxNativeRuntime) -> Unit)? = null,
                               beforeCommit: () -> Unit = {}, profileFieldChanges: JSONObject? = null,
-                              legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap()): List<String> = owned(owner) {
+                              legacyWatchlists: Map<String, List<com.vortx.android.library.WatchlistEntry>> = emptyMap(),
+                              committedOwnerReceipt: VortxCommittedOwnerReceipt? = null): List<String> = owned(owner) {
         actions.forEach(scope::rejectCredentials)
         scope.rejectCredentials(hostProfiles)
         scope.rejectCredentials(hostArchive)
@@ -640,6 +649,7 @@ internal class VortxNativeSession private constructor(
             if (hostChanged || profileOrRegistryChanged || state.getString("activeProfileId") != owner.profileID || actions.any {
                     it.getString("type") in setOf("patch_profile", "delete_profile", "install_addon", "remove_addon", "reorder_addons")
                 }) invalidate()
+            committedOwnerReceipt?.capture(VortxNativeOwner(scope, state.getString("activeProfileId"), revision))
             changes.value += 1
             if (notifyMutation) onMutation()
             results

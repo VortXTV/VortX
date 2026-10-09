@@ -8,6 +8,9 @@ import com.vortx.android.data.AddonPrefsStore
 import com.vortx.android.data.AddonTombstones
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.AddonManagementAccess
+import com.vortx.android.data.AddonManagementTarget
+import com.vortx.android.data.requireCurrentAddonTarget
 import com.vortx.android.data.ContinueWatchingDismissal
 import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.data.ContinueWatchingSnapshot
@@ -2339,12 +2342,89 @@ class EngineStremioRepository(
         installAddonOwned(captureAddonMutation(), url)
     }
 
+    override fun addonManagementAccess(): AddonManagementAccess {
+        val owner = continueWatchingOwner()
+        return AddonManagementAccess(owner, owner.usesEngineHistory,
+            if (owner.usesEngineHistory) null else "Shared profiles customize visibility and order. Change installed add-ons from the owner profile.")
+    }
+
+    private fun validateAddonTarget(admission: OwnerAddonMutationAdmission, target: AddonManagementTarget,
+        installUrl: String? = null) = admission.mutate { owner ->
+        val installed = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField()))
+        requireCurrentAddonTarget(target, owner, installed)
+        if (installUrl != null) {
+            val normalized = requireNotNull(normalizedAddonUrl(installUrl)) { "Enter a valid add-on URL (https://…/manifest.json)." }
+            val existing = installed.singleOrNull { AddonOrder.normalize(it.transportUrl) == AddonOrder.normalize(normalized) }
+            check(existing == null || target.addon?.transportUrl == existing.transportUrl) { "This endpoint is now installed. Reload and confirm Update." }
+        }
+    }
+    private fun requireAddonMembershipOwner(target: AddonManagementTarget) {
+        check(target.owner.usesEngineHistory) { "Change installed add-ons from the owner profile." }
+    }
+    override suspend fun installAddon(url: String, target: AddonManagementTarget): Result<ContinueWatchingOwner> = runCatchingPreservingCancellation {
+        requireAddonMembershipOwner(target)
+        val admission = captureAddonMutation()
+        target.addon?.let { check(AddonOrder.normalize(it.transportUrl) == AddonOrder.normalize(requireNotNull(normalizedAddonUrl(url)))) { "Update endpoint changed." } }
+        val flags = target.addon?.let { JSONObject(it.rawDescriptorJson).getJSONObject("flags") }
+        installAddonOwned(admission, url, descriptorFlags = flags) { validateAddonTarget(admission, target, url) }
+        admission.mutate { it }
+    }
+    override suspend fun removeAddon(target: AddonManagementTarget): Result<ContinueWatchingOwner> = runCatchingPreservingCancellation {
+        requireAddonMembershipOwner(target)
+        val admission = captureAddonMutation(); val addon = requireNotNull(target.addon)
+        check(!addon.isProtected) { "Managed add-ons cannot be removed." }
+        admission.mutate {
+            validateAddonTarget(admission, target)
+            StremioCoreNative.dispatch(EngineActions.uninstallAddon(addon.rawDescriptorJson))
+            check(EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField())).none { it.transportUrl == addon.transportUrl }) {
+                "Couldn't confirm add-on removal."
+            }
+            addonTombstones.tombstone(addon.transportUrl); requestAddonTombstoneSync()
+        }
+        admission.mutate { it }
+    }
+    override suspend fun changeAddonUrl(target: AddonManagementTarget, newUrl: String): Result<ContinueWatchingOwner> = runCatchingPreservingCancellation {
+        requireAddonMembershipOwner(target)
+        val admission = captureAddonMutation(); val addon = requireNotNull(target.addon)
+        check(!addon.isProtected && !addon.isOfficial) { "Managed or official add-ons cannot change endpoint." }
+        installAddonOwned(admission, newUrl) { validateAddonTarget(admission, target, newUrl) }
+        if (normalizedAddonUrl(newUrl)?.let(AddonOrder::normalize) != AddonOrder.normalize(addon.transportUrl)) admission.mutate {
+            validateAddonTarget(admission, target)
+            StremioCoreNative.dispatch(EngineActions.uninstallAddon(addon.rawDescriptorJson))
+        }
+        admission.mutate { it }
+    }
+    override suspend fun setAddonDisabled(target: AddonManagementTarget, disabled: Boolean): Result<ContinueWatchingOwner> = runCatchingPreservingCancellation {
+        val admission = captureAddonMutation(); val addon = requireNotNull(target.addon)
+        check(!addon.isProtected) { "Managed add-ons cannot be disabled." }
+        admission.mutate {
+            validateAddonTarget(admission, target)
+            addonPrefs.setDisabled(addon.transportUrl, disabled)
+            changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+        }
+        admission.mutate { it }
+    }
+    override suspend fun applyAddonOrder(target: AddonManagementTarget, transportUrls: List<String>): Result<ContinueWatchingOwner> = runCatchingPreservingCancellation {
+        val admission = captureAddonMutation()
+        admission.mutate {
+            validateAddonTarget(admission, target)
+            val current = EngineState.parseInstalledAddons(StremioCoreNative.getState(EngineActions.ctxField())).map { it.transportUrl }.toSet()
+            check(transportUrls.size == current.size && transportUrls.toSet() == current) { "Installed add-ons changed. Reload their order." }
+            val changed = addonPrefs.setAppliedOrder(transportUrls)
+            changedFields.tryEmit(setOf(EngineActions.FIELD_CTX))
+            if (changed) (appContext as? VortXApplication)?.syncManager?.onLocalAddonOrderChanged()
+        }
+        admission.mutate { it }
+    }
+
     private fun captureAddonMutation(): OwnerAddonMutationAdmission {
         val sync = (appContext as? VortXApplication)?.syncManager
         return OwnerAddonMutationAdmission.capture(historyOwnerFence, sync?.captureLocalLibraryMutationAdmission(), sync?.captureAddonPublicationLease())
     }
 
-    private suspend fun installAddonOwned(admission: OwnerAddonMutationAdmission, url: String) {
+    private suspend fun installAddonOwned(admission: OwnerAddonMutationAdmission, url: String,
+        descriptorFlags: JSONObject? = null, validateTarget: (() -> Unit)? = null) {
+        validateTarget?.invoke()
         performOwnedAddonInstall(capture = { admission }, fetch = {
         // A /configure PAGE is not an installable manifest (it mints a per-user manifest only after sign-in +
         // debrid key). Refuse it here at the install boundary with configuration guidance, mirroring Apple
@@ -2363,16 +2443,18 @@ class EngineStremioRepository(
             ?: throw IllegalStateException("That URL did not return a valid add-on manifest.")
         normalized to manifest
         }, install = { captured, (normalized, manifest) -> captured.mutate { owner ->
+        // A manifest fetched for a removed/changed item cannot resurrect it at completion.
+        validateTarget?.invoke()
         val expected = requireNotNull(VortXSyncDoc.addonDescriptor(JSONObject().put("transportUrl", normalized).put("manifest", manifest)
-            .put("flags", JSONObject().put("official", false).put("protected", false))))
+            .put("flags", descriptorFlags ?: JSONObject().put("official", false).put("protected", false))))
         val native = NativeLibraryOwner(owner.principal.takeUnless { it == "signed-out" })
         val publication = captured.publication
         if (publication != null) {
             check(publication.install(native, expected, ::accountAddonSnapshotLocked) {
-                StremioCoreNative.dispatch(EngineActions.installAddon(normalized, manifest))
+                StremioCoreNative.dispatch(EngineActions.installAddon(normalized, manifest, descriptorFlags))
             }) { "Couldn't confirm the installed add-on for this account." }
         } else {
-            StremioCoreNative.dispatch(EngineActions.installAddon(normalized, manifest))
+            StremioCoreNative.dispatch(EngineActions.installAddon(normalized, manifest, descriptorFlags))
             check(accountAddonSnapshotLocked().singleOrNull { AddonPublicationProofs.matchesInstalled(expected, it) } != null) {
                 "Couldn't confirm the installed add-on."
             }

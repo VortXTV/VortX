@@ -580,7 +580,11 @@ internal class NativeCatalogRepository(
     override suspend fun installedAddons() = attempt {
         val session = session(); val read = session.read()
         val disabled = NativeAddonPreferences.disabled(read)
-        val ctx = JSONObject().put("profile", JSONObject().put("addons", JSONArray(addonDescriptors(read))))
+        val order = NativeAddonPreferences.order(read)
+        val descriptors = addonDescriptors(read).let { addons -> if (order == null) addons else addons.sortedBy {
+            order.indexOf(AddonOrder.normalize(it.getString("transportUrl"))).let { index -> if (index < 0) Int.MAX_VALUE else index }
+        } }
+        val ctx = JSONObject().put("profile", JSONObject().put("addons", JSONArray(descriptors)))
         session.owned(read.owner) { EngineState.parseInstalledAddons(ctx.toString()).map { it.copy(isDisabled = AddonOrder.normalize(it.transportUrl) in disabled) } }
     }
     override fun normalizedAddonUrl(raw: String): String? = runCatching {
@@ -588,25 +592,96 @@ internal class NativeCatalogRepository(
         val path = uri.rawPath.trimEnd('/').let { if (it.endsWith("/manifest.json")) it else "$it/manifest.json" }
         URI("${uri.scheme.lowercase()}://${uri.rawAuthority.lowercase()}$path").toASCIIString()
     }.getOrNull()
+    override fun addonManagementAccess(): AddonManagementAccess = runCatching {
+        val read = session().read()
+        val allowed = addonOwner(read) == read.owner.profileID
+        AddonManagementAccess(owner(read.owner), allowed,
+            if (allowed) null else "Shared profiles customize visibility and order. Install, replace or remove add-ons from the owner profile.")
+    }.getOrElse { AddonManagementAccess(unavailableOwner, false, "Add-on account is unavailable. Reopen the account.") }
+
+    private suspend fun ownedAddonAttempt(target: AddonManagementTarget,
+        operation: suspend (VortxNativeSession, VortxNativeRead) -> VortxNativeOwner): Result<ContinueWatchingOwner> = attempt {
+        val session = session(); val read = session.read()
+        // Check the user-captured token AFTER entering IO, before fetching a manifest or dispatching.
+        check(owner(read.owner) == target.owner) { "Add-on account or profile changed. Reopen this action." }
+        requireCurrentAddonTarget(target, owner(read.owner), EngineState.parseInstalledAddons(
+            JSONObject().put("profile", JSONObject().put("addons", JSONArray(addonDescriptors(read)))).toString()))
+        val receipt = operation(session, read)
+        check(receipt.scope == read.owner.scope && receipt.profileID == read.owner.profileID) { "Add-on owner changed before confirmation." }
+        owner(receipt)
+    }
+
+    override suspend fun installAddon(url: String, target: AddonManagementTarget) = ownedAddonAttempt(target) { session, read ->
+        val normalized = requireNotNull(normalizedAddonUrl(url)) { "Enter a valid add-on URL (https://…/manifest.json)." }
+        if (target.addon == null) check(addonDescriptors(read).none { AddonOrder.normalize(it.getString("transportUrl")) == AddonOrder.normalize(normalized) }) {
+            "This add-on is now installed. Reload and confirm Update."
+        } else check(AddonOrder.normalize(target.addon.transportUrl) == AddonOrder.normalize(normalized)) { "Update endpoint changed." }
+        installAddonAt(session, read, url, target.addon)
+    }
+    override suspend fun removeAddon(target: AddonManagementTarget) = ownedAddonAttempt(target) { session, read ->
+        val addon = requireNotNull(target.addon)
+        check(!addon.isProtected) { "Managed add-ons cannot be removed." }
+        removeAddonAt(session, read, addon)
+    }
+    override suspend fun changeAddonUrl(target: AddonManagementTarget, newUrl: String) = ownedAddonAttempt(target) { session, read ->
+        changeAddonUrlAt(session, read, requireNotNull(target.addon), newUrl)
+    }
+    override suspend fun setAddonDisabled(target: AddonManagementTarget, disabled: Boolean) = ownedAddonAttempt(target) { session, read ->
+        val addon = requireNotNull(target.addon)
+        check(!addon.isProtected) { "Managed add-ons cannot be disabled." }
+        setAddonDisabledAt(session, read, addon.transportUrl, disabled)
+    }
+    override suspend fun applyAddonOrder(target: AddonManagementTarget, transportUrls: List<String>) = ownedAddonAttempt(target) { session, read ->
+        val current = addonDescriptors(read).map { it.getString("transportUrl") }.toSet()
+        check(transportUrls.size == current.size && transportUrls.toSet() == current) { "Installed add-ons changed. Reload their order." }
+        applyAddonOrderAt(session, read, transportUrls)
+    }
     override suspend fun installAddon(url: String) = attempt {
-        val session = session(); val read = session.read(); val normalized = requireNotNull(normalizedAddonUrl(url))
+        val session = session(); installAddonAt(session, session.read(), url); Unit
+    }
+    private suspend fun installAddonAt(session: VortxNativeSession, read: VortxNativeRead, url: String, existing: InstalledAddon? = null): VortxNativeOwner {
+        check(!AddonConfiguration.isConfigurationPageUrl(url)) { AddonConfiguration.NEEDS_CONFIGURATION_MESSAGE }
+        val normalized = requireNotNull(normalizedAddonUrl(url)) { "Enter a valid add-on URL (https://…/manifest.json)." }
         check(addonOwner(read) == read.owner.profileID) { "Shared profiles customize visibility; install add-ons from the owner profile" }
         val addon = VortxResourceAddon(normalized, normalized)
         val response = session.load("install", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.MANIFEST, "", "") to listOf(addon))).single()
         requireSettled(response)
         val manifest = response.groups.single().items(VortxResourceRequest.Resource.MANIFEST).single()
-        session.publish("install", read.owner, listOf(response)) {
+        val flags = existing?.let { JSONObject(it.rawDescriptorJson).getJSONObject("flags") }
+            ?: JSONObject().put("official", false).put("protected", false)
+        val receipt = VortxCommittedOwnerReceipt()
+        return session.publish("install", read.owner, listOf(response)) {
             session.dispatch(listOf(action("install_addon").put("profileId", addonOwner(read)).put("addon", JSONObject().put("transportUrl", normalized)
-                .put("manifest", manifest).put("flags", JSONObject().put("official", false).put("protected", false)))), read.owner)
-        }; Unit
+                .put("manifest", manifest).put("flags", flags))), read.owner, verifyCandidate = { candidate ->
+                val accepted = JSONObject(candidate.resolve(JSONObject().put("kind", "installed_addons").put("profileId", addonOwner(read)).toString()))
+                    .getJSONArray("addons").objects().single { AddonOrder.normalize(it.getString("transportUrl")) == AddonOrder.normalize(normalized) }
+                check(NativeHostPreferences.equal(accepted.getJSONObject("manifest"), manifest) && NativeHostPreferences.equal(accepted.getJSONObject("flags"), flags)) {
+                    "Native add-on installation receipt mismatch"
+                }
+            }, committedOwnerReceipt = receipt)
+            requireNotNull(receipt.owner) { "Native add-on commit receipt unavailable" }
+        }
     }
     override suspend fun removeAddon(addon: InstalledAddon) = attempt {
-        val session = session(); val read = session.read()
+        val session = session(); removeAddonAt(session, session.read(), addon); Unit
+    }
+    private fun removeAddonAt(session: VortxNativeSession, read: VortxNativeRead, addon: InstalledAddon): VortxNativeOwner {
         check(addonOwner(read) == read.owner.profileID) { "Shared profiles customize visibility; remove add-ons from the owner profile" }
-        session.dispatch(listOf(action("remove_addon").put("profileId", addonOwner(read)).put("transportUrl", addon.transportUrl)), read.owner); Unit
+        val receipt = VortxCommittedOwnerReceipt()
+        return session.owned(read.owner) {
+        session.dispatch(listOf(action("remove_addon").put("profileId", addonOwner(read)).put("transportUrl", addon.transportUrl)), read.owner, verifyCandidate = { candidate ->
+            val installed = JSONObject(candidate.resolve(JSONObject().put("kind", "installed_addons").put("profileId", addonOwner(read)).toString())).getJSONArray("addons").objects()
+            check(installed.none { AddonOrder.normalize(it.getString("transportUrl")) == AddonOrder.normalize(addon.transportUrl) }) { "Native add-on removal receipt mismatch" }
+        }, committedOwnerReceipt = receipt)
+        requireNotNull(receipt.owner) { "Native add-on commit receipt unavailable" }
+        }
     }
     override suspend fun changeAddonUrl(oldAddon: InstalledAddon, newUrl: String) = attempt {
-        val session = session(); val read = session.read(); val bucket = addonOwner(read)
+        val session = session(); changeAddonUrlAt(session, session.read(), oldAddon, newUrl); Unit
+    }
+    private suspend fun changeAddonUrlAt(session: VortxNativeSession, read: VortxNativeRead, oldAddon: InstalledAddon, newUrl: String): VortxNativeOwner {
+        check(!AddonConfiguration.isConfigurationPageUrl(newUrl)) { AddonConfiguration.NEEDS_CONFIGURATION_MESSAGE }
+        val bucket = addonOwner(read)
         check(bucket == read.owner.profileID) { "Shared profiles cannot replace account add-ons" }
         val before = addonDescriptors(read)
         val oldKey = AddonOrder.normalize(oldAddon.transportUrl)
@@ -627,6 +702,7 @@ internal class NativeCatalogRepository(
         val replacement = JSONObject(current.toString()).put("transportUrl", target).put("manifest", manifest)
         val order = before.map { if (AddonOrder.normalize(it.getString("transportUrl")) == oldKey) target else it.getString("transportUrl") }
         val host = NativeAddonPreferences.replacingHost(read, bucket, oldKey, targetKey)
+        val receipt = VortxCommittedOwnerReceipt()
         val actions = mutableListOf<JSONObject>()
         // A same-member spelling change must remove the previous value before installing its new
         // descriptor, otherwise the membership register may retain the old spelling on equal clocks.
@@ -643,7 +719,7 @@ internal class NativeCatalogRepository(
                     JSONObject().put("field", "disabledAddons").put("value", JSONArray(disabled.map { if (AddonOrder.normalize(it) == oldKey) targetKey else it }.distinct()))))
             }
         }
-        session.publish("addon-replacement", read.owner, listOf(response)) {
+        return session.publish("addon-replacement", read.owner, listOf(response)) {
             session.dispatch(actions, read.owner, host, verifyCandidate = { candidate ->
                 val query = JSONObject(candidate.resolve(JSONObject().put("kind", "installed_addons").put("profileId", bucket).toString()))
                 check(query.getString("kind") == "installed_addons") { "Native replacement receipt unavailable" }
@@ -655,11 +731,15 @@ internal class NativeCatalogRepository(
                 before.filterNot { AddonOrder.normalize(it.getString("transportUrl")) == oldKey }.forEach { unchanged ->
                     check(installed.any { NativeHostPreferences.equal(it, unchanged) }) { "Unrelated add-on changed during replacement" }
                 }
-            })
-        }; Unit
+            }, committedOwnerReceipt = receipt)
+            requireNotNull(receipt.owner) { "Native add-on commit receipt unavailable" }
+        }
     }
     override suspend fun setAddonDisabled(transportUrl: String, disabled: Boolean) = attempt {
-        val session = session(); val read = session.read(); val values = NativeAddonPreferences.disabled(read).toMutableSet()
+        val session = session(); setAddonDisabledAt(session, session.read(), transportUrl, disabled); Unit
+    }
+    private fun setAddonDisabledAt(session: VortxNativeSession, read: VortxNativeRead, transportUrl: String, disabled: Boolean): VortxNativeOwner {
+        val values = NativeAddonPreferences.disabled(read).toMutableSet()
         if (disabled) values.add(AddonOrder.normalize(transportUrl)) else values.remove(AddonOrder.normalize(transportUrl))
         val host = read.state.getJSONObject("hostProfilePreferences")
         val raw = host.optJSONObject(read.owner.profileID) ?: NativeProfileAccess.projection(read).profiles.single { it.id == read.owner.profileID }.encode()
@@ -667,13 +747,23 @@ internal class NativeCatalogRepository(
         prefs.put("disabledAddonURLsOverride", JSONArray(values.toList()))
         raw.put("disabledAddons", JSONArray(values.toList()))
         host.put(read.owner.profileID, raw).put("modifiedSeconds", maxOf(System.currentTimeMillis() / 1000.0, host.optDouble("modifiedSeconds", 0.0) + 0.001))
-        session.dispatch(listOf(action("patch_profile").put("id", read.owner.profileID).put("edits", JSONArray().put(JSONObject().put("field", "disabledAddons").put("value", JSONArray(values.toList()))))), read.owner, host); Unit
+        val receipt = VortxCommittedOwnerReceipt()
+        return session.owned(read.owner) {
+            session.dispatch(listOf(action("patch_profile").put("id", read.owner.profileID).put("edits", JSONArray().put(JSONObject().put("field", "disabledAddons").put("value", JSONArray(values.toList()))))), read.owner, host, committedOwnerReceipt = receipt)
+            requireNotNull(receipt.owner) { "Native add-on commit receipt unavailable" }
+        }
     }
     override suspend fun applyAddonOrder(transportUrls: List<String>) = attempt {
-        val session = session(); val read = session.read()
+        val session = session(); applyAddonOrderAt(session, session.read(), transportUrls); Unit
+    }
+    private fun applyAddonOrderAt(session: VortxNativeSession, read: VortxNativeRead, transportUrls: List<String>): VortxNativeOwner {
         val shared = read.owner.profileID != addonOwner(read)
         val actions = if (shared) emptyList() else listOf(action("reorder_addons").put("profileId", addonOwner(read)).put("transportUrls", JSONArray(transportUrls)))
-        session.dispatch(actions, read.owner, NativeAddonPreferences.reorderedHost(read, transportUrls, shared)); Unit
+        val receipt = VortxCommittedOwnerReceipt()
+        return session.owned(read.owner) {
+            session.dispatch(actions, read.owner, NativeAddonPreferences.reorderedHost(read, transportUrls, shared), committedOwnerReceipt = receipt)
+            requireNotNull(receipt.owner) { "Native add-on commit receipt unavailable" }
+        }
     }
     suspend fun profiles(): Result<String> = attempt { session().read().state.getJSONObject("roster").toString() }
     fun watchStatsSnapshot(): NativeWatchStatsSnapshot {
