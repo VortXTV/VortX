@@ -43,7 +43,8 @@ function provenance(data = evidence(), handoff = resume, overrides = {}) {
 gh() {
   case "\${*: -1}" in
     repos/VortXTV/VortX/git/ref/heads/main) jq -r . "$RUNNER_TEMP/main.json" ;;
-    repos/VortXTV/VortX/compare/${sha}...${code}) command cat "$RUNNER_TEMP/comparison.json" ;;
+    repos/VortXTV/VortX/compare/${handoff.sourceCommit ?? sha}...${code}) command cat "$RUNNER_TEMP/comparison.json" ;;
+    repos/VortXTV/VortX/compare/${data.run.head_sha}...${code}) command cat "$RUNNER_TEMP/workflowComparison.json" ;;
     repos/VortXTV/VortX/actions/runs/123) command cat "$RUNNER_TEMP/latest.json" ;;
     repos/VortXTV/VortX/actions/runs/123/attempts/2) command cat "$RUNNER_TEMP/run.json" ;;
     repos/VortXTV/VortX/actions/runs/123/attempts/2/jobs?per_page=100) jq '[{jobs:.}]' "$RUNNER_TEMP/jobs.json" ;;
@@ -54,7 +55,9 @@ gh() {
 }
 ${script('Validate immutable handoff provenance before coordinator resume')}`], {
       encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: dir, GITHUB_OUTPUT: join(dir, 'outputs'), GITHUB_REF: 'refs/heads/main', GITHUB_SHA: code,
-        GITHUB_EVENT_NAME: 'workflow_dispatch', GH_REPO: 'VortXTV/VortX', TAG: tag, RESUME_HANDOFF: typeof handoff === 'string' ? handoff : JSON.stringify(handoff), ...overrides }
+        GITHUB_EVENT_NAME: 'workflow_dispatch', GH_REPO: 'VortXTV/VortX', TAG: tag, RECOVERY_SOURCE: '', COMPLETED_BUILD_SOURCE: code,
+        GITHUB_RUN_ID: '789', GITHUB_RUN_ATTEMPT: '1', GITHUB_REF_NAME: tag, COMPLETED_APPS_ID: '456', COMPLETED_FEED_ID: '457', RELEASE_ID_INPUT: '',
+        RESUME_HANDOFF: typeof handoff === 'string' ? handoff : JSON.stringify(handoff), ...overrides }
     });
     let outputs = '';
     try { outputs = readFileSync(join(dir, 'outputs'), 'utf8'); } catch {}
@@ -67,9 +70,13 @@ test('actual protected coordinator condition admits only native successful tag b
   const expression = job.split('    if: >-\n')[1].trim().replaceAll('needs.build-tvos.result', 'result');
   const condition = new Function('github', 'inputs', 'result', 'cancelled', 'always', 'format', `return (${expression});`);
   const allowed = (result, ref, handoff = '', extra = {}, event = 'workflow_dispatch', cancelled = false) =>
-    condition({ event_name: event, ref }, { resume_handoff: handoff, release_tag: tag, tvos_test_only: false, native_only: true, ...extra }, result,
+    condition({ event_name: event, ref }, { recovery_source_commit: '', resume_handoff: handoff, release_tag: tag, tvos_test_only: false, native_only: true, ...extra }, result,
       () => cancelled, () => true, (_, value) => `refs/tags/${value}`);
   assert(allowed('success', `refs/tags/${tag}`));
+  assert(allowed('success', 'refs/heads/main', '', { recovery_source_commit: '844782d29a93ae51991bfadc639d50bc3619d40b' }));
+  assert(!allowed('success', 'refs/heads/main'));
+  assert(!allowed('success', 'refs/heads/feature', '', { recovery_source_commit: '844782d29a93ae51991bfadc639d50bc3619d40b' }));
+  assert(!allowed('skipped', 'refs/heads/main', '{}', { recovery_source_commit: '844782d29a93ae51991bfadc639d50bc3619d40b' }));
   for (const result of ['failure', 'cancelled', 'skipped']) assert(!allowed(result, `refs/tags/${tag}`));
   assert(allowed('skipped', 'refs/heads/main', '{}'));
   // A resume skips build-tvos and therefore must reject comparison mode independently of that
@@ -92,14 +99,12 @@ test('actual protected coordinator condition admits only native successful tag b
   assert.match(coordinator, /environment: release-approval/);
   assert.doesNotMatch(coordinator, /actions\/checkout|\b(?:bash|node|python3?) scripts\//);
   assert.doesNotMatch(coordinator, /(?:^|\n)\s*(?:export )?GITHUB_SHA=/);
-  for (const [name, key, path] of [['apps', 'apps_id', 'out'], ['feed', 'feed_id', 'feed-artifact']]) {
-    const download = step(`Download only the approved original ${name} artifact`);
-    assert(download.includes(`artifact-ids: \${{ steps.handoff.outputs.${key} }}`));
-    assert(download.includes('run-id: ${{ steps.handoff.outputs.run_id }}'));
-    assert(download.includes('merge-multiple: true'));
-    assert(download.includes(`path: ${path}`));
-    assert(!download.includes('\n          name:'));
-  }
+  const download = step('Download and authenticate immutable handoff archives');
+  for (const key of ['apps_id', 'feed_id', 'build_run_id', 'build_attempt', 'build_workflow_sha', 'build_branch'])
+    assert(download.includes(`\${{ steps.handoff.outputs.${key} }}`));
+  assert.doesNotMatch(coordinator, /uses: actions\/download-artifact/);
+  assert(workflow.indexOf('- name: Download and authenticate immutable handoff archives') <
+    workflow.indexOf('- name: Bind the draft release, tag commit, and monotonic source before any write'));
 });
 
 test('executable provenance accepts coordinator-only failure and keeps code/build commits separate', () => {
@@ -115,7 +120,40 @@ test('executable provenance accepts coordinator-only failure and keeps code/buil
   assert.equal(provenance(successful).status, 0);
   const normal = provenance(evidence(), '');
   assert.equal(normal.status, 0);
-  assert.equal(normal.outputs, `build_source_sha=${code}\n`);
+  assert.equal(normal.outputs, `build_source_sha=${code}\nbuild_workflow_sha=${code}\nbuild_run_id=789\nbuild_attempt=1\nbuild_branch=${tag}\napps_id=456\nfeed_id=457\n`);
+});
+
+test('recovery resume authenticates workflow execution independently of the unchanged Beta 1 source', () => {
+  const source = '844782d29a93ae51991bfadc639d50bc3619d40b', workflowSha = 'b'.repeat(40);
+  const data = evidence();
+  for (const run of [data.run, data.latest]) { run.head_sha = workflowSha; run.head_branch = 'main'; }
+  for (const job of data.jobs) job.head_sha = workflowSha;
+  for (const artifact of [data.apps, data.feed]) { artifact.workflow_run.head_sha = workflowSha; artifact.workflow_run.head_branch = 'main'; }
+  data.comparison.merge_base_commit.sha = source;
+  data.workflowComparison = { status: 'ahead', merge_base_commit: { sha: workflowSha } };
+  data.jobs[0].steps.push(upload('Validate immutable Beta 1 source recovery'), upload('Verify immutable recovered source checkout'));
+  const input = { ...resume, sourceCommit: source };
+  const env = { TAG: 'v0.5.0-beta.1', RELEASE_ID_INPUT: '407572242' };
+  const valid = provenance(data, input, env);
+  assert.equal(valid.status, 0, valid.stderr);
+  assert(valid.outputs.includes(`build_source_sha=${source}\n`));
+  assert(valid.outputs.includes(`build_workflow_sha=${workflowSha}\n`));
+  for (const [name, mutate] of Object.entries({
+    'unreviewed workflow': e => { e.workflowComparison.status = 'diverged'; },
+    'wrong workflow ancestor': e => { e.workflowComparison.merge_base_commit.sha = source; },
+    'missing recovery admission': e => { e.jobs[0].steps.pop(); },
+    'skipped recovery admission': e => { e.jobs[0].steps.at(-2).conclusion = 'skipped'; },
+    'mismatched workflow artifact': e => { e.apps.workflow_run.head_sha = source; },
+    'wrong job source identity': e => { e.jobs[0].head_sha = source; },
+    'arbitrary branch': e => { e.run.head_branch = 'feature'; }
+  })) {
+    const bad = structuredClone(data); mutate(bad);
+    const result = provenance(bad, input, env);
+    assert.notEqual(result.status, 0, name);
+    assert.equal(result.outputs, '', name);
+  }
+  assert.notEqual(provenance(data, input, { ...env, RELEASE_ID_INPUT: '407572243' }).status, 0);
+  assert.notEqual(provenance(data, input, { ...env, TAG: tag }).status, 0);
 });
 
 for (const [name, mutate] of Object.entries({
@@ -247,7 +285,7 @@ gh() {
   esac
 }
 ${prefix.replaceAll('feed-artifact/', `${feedDir}/`)}`], { encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: dir,
-      GH_REPO: 'VortXTV/VortX', TAG: tag, BUILD_SOURCE_SHA: sha, GITHUB_SHA: code, EXPECTED_BUILD: '254', RELEASE_ID_INPUT: '42', APPLE_ONLY_INPUT: 'false' } });
+      GH_REPO: 'VortXTV/VortX', TAG: tag, BUILD_SOURCE_SHA: sha, BUILD_WORKFLOW_SHA: sha, GITHUB_SHA: code, EXPECTED_BUILD: '254', RELEASE_ID_INPUT: '42', APPLE_ONLY_INPUT: 'false' } });
   };
   const result = check(); assert.equal(result.status, 0, result.stderr);
   for (const invalid of [{ sourceCommit: code }, { schemaVersion: 1 }, { build: 253 }, { tag: 'v0.4.0-beta.17' }, { releaseId: '43' },

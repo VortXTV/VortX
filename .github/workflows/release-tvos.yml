@@ -78,6 +78,11 @@ on:
         required: false
         type: string
         default: ""
+      recovery_source_commit:
+        description: "Main-only packaging recovery of immutable v0.5.0-beta.1 (844782d29a93ae51991bfadc639d50bc3619d40b), draft 407572242. Cannot combine with a resume or player override."
+        required: false
+        type: string
+        default: ""
 
 # Workflow-wide default is READ-ONLY: repo-controlled build code (scripts/*, app/scripts/*,
 # the xcodegen'd build phases) must never hold blanket write authority. Two narrowly scoped
@@ -90,6 +95,10 @@ permissions:
 jobs:
   build-tvos:
     if: github.event_name != 'release' && inputs.resume_handoff == ''
+    outputs:
+      source_sha: ${{ env.BUILD_SOURCE_SHA }}
+      apps_id: ${{ steps.apps_handoff.outputs.artifact-id }}
+      feed_id: ${{ steps.feed_handoff.outputs.artifact-id }}
     # Environment gate for the token-bearing build job (trust boundary): the `engine-ci` environment
     # carries explicit deployment protection policies for branch and tag build refs. A run started
     # from any other ref blocks before any build step executes, keeping ENGINE_REPO_TOKEN unreachable
@@ -115,6 +124,7 @@ jobs:
       # Push events have no dispatch inputs. One effective value selects the native project AND
       # every native input/app/archive proof; an explicit dispatch false remains a comparison lane.
       VORTX_NATIVE_ONLY: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only }}
+      BUILD_SOURCE_SHA: ${{ inputs.recovery_source_commit || github.sha }}
     # GitHub-owned actions are SHA-pinned too (a mutable tag -- even on an actions/* repo -- can be
     # repointed, and this job holds ENGINE_REPO_TOKEN + the release secrets). Each pin carries the
     # tag it resolved from.
@@ -122,6 +132,88 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Validate immutable Beta 1 source recovery
+        id: recovery
+        if: inputs.recovery_source_commit != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+          RELEASE_ID: ${{ inputs.release_id }}
+          RESUME_HANDOFF: ${{ inputs.resume_handoff }}
+          TVOS_TEST_ONLY: ${{ inputs.tvos_test_only }}
+          MPVKIT_URL: ${{ inputs.mpvkit_artifacts_url }}
+          MPVKIT_SHA: ${{ inputs.mpvkit_artifacts_sha256 }}
+        run: |
+          set -euo pipefail
+          [ "$GH_REPO" = VortXTV/VortX ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" = refs/heads/main ] || exit 1
+          [ "$(gh api --jq '.object.sha' -- "repos/$GH_REPO/git/ref/heads/main")" = "$GITHUB_SHA" ] || { echo '::error::recovery must execute current main'; exit 1; }
+          [ "$BUILD_SOURCE_SHA" = 844782d29a93ae51991bfadc639d50bc3619d40b ] && [ "$TAG" = v0.5.0-beta.1 ] && [ "$RELEASE_ID" = 407572242 ] || exit 1
+          [ "$VORTX_NATIVE_ONLY" = true ] && [ "$TVOS_TEST_ONLY" != true ] && [ -z "$RESUME_HANDOFF" ] && [ -z "$MPVKIT_URL$MPVKIT_SHA" ] || exit 1
+          # These assignments belong to the executing workflow, not the historical source
+          # checkout. A future main pin bump must disable this one-cut recovery fail-closed.
+          NATIVE_PIN="$(awk '/^      - name: Fetch vortx-core / {step=1; next} step && /^      - / {exit} step && /^          ref:/ {print $2}' .github/workflows/release-tvos.yml)"
+          PLAYER_PINS="$(awk '/^      - name: Fetch the MPVKit-DVFEL artifacts / {step=1; next} step && /^      - / {exit} step && /^          (URL|EXPECTED)=/ {sub(/^          /, ""); print}' .github/workflows/release-tvos.yml)"
+          [ "$NATIVE_PIN" = 7e3e68be5bf2b11c65d158c1823be94bd1608d1b ] || exit 1
+          [ "$PLAYER_PINS" = 'EXPECTED="737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1"
+          URL="https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip"' ] || exit 1
+          gh api -- "repos/$GH_REPO/compare/$BUILD_SOURCE_SHA...$GITHUB_SHA" | jq -e --arg source "$BUILD_SOURCE_SHA" '
+            (.status == "ahead" or .status == "identical") and .merge_base_commit.sha == $source' >/dev/null
+          REF_JSON="$(gh api -- "repos/$GH_REPO/git/ref/tags/$TAG")"
+          TAG_SHA="$(jq -er '.object.sha' <<<"$REF_JSON")"; TAG_TYPE="$(jq -er '.object.type' <<<"$REF_JSON")"
+          HOPS=0
+          while [ "$TAG_TYPE" = tag ]; do
+            HOPS=$((HOPS + 1)); [ "$HOPS" -le 5 ] || exit 1
+            REF_JSON="$(gh api -- "repos/$GH_REPO/git/tags/$TAG_SHA")"
+            TAG_SHA="$(jq -er '.object.sha' <<<"$REF_JSON")"; TAG_TYPE="$(jq -er '.object.type' <<<"$REF_JSON")"
+          done
+          [ "$TAG_TYPE" = commit ] && [ "$TAG_SHA" = "$BUILD_SOURCE_SHA" ] || { echo '::error::immutable Beta 1 tag changed'; exit 1; }
+          gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" | jq -e --arg tag "$TAG" --argjson id "$RELEASE_ID" '
+            .id == $id and .tag_name == $tag and .draft == true and
+            (if ((.body // "" | gsub("\r"; "") | split("\n")) | index("<!-- vortx-channel: latest-beta -->")) != null
+             then .prerelease == false else .prerelease == true end)' >/dev/null
+
+      - name: Preserve the workflow revision's native acceptance tool
+        id: tooling
+        run: |
+          set -euo pipefail
+          # Acceptance tooling follows the reviewed workflow; compiled sources remain untouched.
+          NATIVE_PACKAGE_VERIFIER_DIR="$(mktemp -d "$RUNNER_TEMP/native-acceptance.XXXXXXXX")"
+          cp scripts/verify-native-apple-package.py "$NATIVE_PACKAGE_VERIFIER_DIR/verify-native-apple-package.py"
+          shasum -a 256 "$NATIVE_PACKAGE_VERIFIER_DIR/verify-native-apple-package.py"
+          echo "NATIVE_PACKAGE_VERIFIER_DIR=$NATIVE_PACKAGE_VERIFIER_DIR" >> "$GITHUB_ENV"
+          echo "verifier_sha256=$(shasum -a 256 "$NATIVE_PACKAGE_VERIFIER_DIR/verify-native-apple-package.py" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the immutable recovered app source
+        if: inputs.recovery_source_commit != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Verify immutable recovered source checkout
+        if: inputs.recovery_source_commit != ''
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$BUILD_SOURCE_SHA" ] && [ -z "$(git status --porcelain)" ] || exit 1
+          # Recovery is only packaging orchestration: retain the exact private and vendor pins.
+          grep -Fq 'ref: 7e3e68be5bf2b11c65d158c1823be94bd1608d1b' .github/workflows/release-tvos.yml
+          grep -Fq 'vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip' .github/workflows/release-tvos.yml
+
+      - name: Bind native acceptance tooling to workflow and source provenance
+        env:
+          VERIFIER_SHA256: ${{ steps.tooling.outputs.verifier_sha256 }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$BUILD_SOURCE_SHA" ] || exit 1
+          [ "$(shasum -a 256 "$NATIVE_PACKAGE_VERIFIER_DIR/verify-native-apple-package.py" | awk '{print $1}')" = "$VERIFIER_SHA256" ] || exit 1
+          mkdir -p out
+          jq -n --arg source "$BUILD_SOURCE_SHA" --arg workflow "$GITHUB_SHA" --arg verifier "$VERIFIER_SHA256" \
+            --arg tag "$TAG" --argjson run "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            '{schemaVersion:1,sourceCommit:$source,workflowCommit:$workflow,verifierSha256:$verifier,tag:$tag,runId:$run,attempt:$attempt}' \
+            > out/native-workflow-provenance.json
 
       - name: Constrain legacy comparison to artifact-only builds
         if: env.VORTX_NATIVE_ONLY != 'true'
@@ -503,7 +595,7 @@ jobs:
           if [ "$TVOS_TEST_ONLY" != true ]; then
             SNAPSHOT_ARGS+=(--mac-server app/Vendor/vortx-streaming-server)
           fi
-          python3 scripts/verify-native-apple-package.py snapshot "${SNAPSHOT_ARGS[@]}"
+          python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py snapshot "${SNAPSHOT_ARGS[@]}"
 
       - name: Check shared server settings at the iOS 16 deployment target
         if: inputs.tvos_test_only != true
@@ -682,7 +774,7 @@ jobs:
             exit 1
           fi
           if [ "$NATIVE_ONLY" = true ]; then
-            python3 scripts/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
               --app "$SIM_APP" --platform tvos-sim \
               --link-map "$SMOKE_DERIVED/Build/Intermediates.noindex/VortX.build/Release-appletvsimulator/VortXTV.build/VortXTV-arm64.map" \
               --receipt out/native-tvos-simulator.json
@@ -824,7 +916,7 @@ jobs:
             exit 1
           fi
           if [ "$NATIVE_ONLY" = true ]; then
-            python3 scripts/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
               --app app/build/ci-ios-sim/Build/Products/Release-iphonesimulator/VortXiOSNative.app --platform ios-sim \
               --link-map app/build/ci-ios-sim/Build/Intermediates.noindex/VortX.build/Release-iphonesimulator/VortXiOSNative.build/VortXiOSNative-arm64.map \
               --receipt out/native-ios-simulator.json
@@ -850,26 +942,36 @@ jobs:
             SIMKL_CLIENT_ID="${{ secrets.SIMKL_CLIENT_ID }}" \
             SIMKL_CLIENT_SECRET="${{ secrets.SIMKL_CLIENT_SECRET }}" build
 
+      - name: Final-sign macOS before native app acceptance
+        if: inputs.tvos_test_only != true
+        run: |
+          set -euo pipefail
+          # Signing can change normalized Mach-O load commands as well as signature blobs.
+          # The accepted receipt must describe this final app; no later step may re-sign it.
+          MAC_APP="app/build/ci-mac/Build/Products/Release/VortX.app"
+          codesign --force --deep --sign - "$MAC_APP"
+          codesign --verify --deep --strict "$MAC_APP"
+
       - name: Verify exact native app selection and linked inputs
         if: env.VORTX_NATIVE_ONLY == 'true'
         env:
           TVOS_TEST_ONLY: ${{ inputs.tvos_test_only }}
         run: |
           set -euo pipefail
-          python3 scripts/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
+          python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
             --app app/build/ci/Build/Products/Release-appletvos/VortXTV.app --platform tvos \
             --link-map app/build/ci/Build/Intermediates.noindex/VortX.build/Release-appletvos/VortXTV.build/VortXTV-arm64.map \
             --receipt out/native-tvos.json
           if [ "$TVOS_TEST_ONLY" != true ]; then
-            python3 scripts/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
               --app app/build/ci-lite/Build/Products/Release-appletvos/VortXTVLite.app --platform tvos \
               --link-map app/build/ci-lite/Build/Intermediates.noindex/VortX.build/Release-appletvos/VortXTVLite.build/VortXTVLite-arm64.map \
               --receipt out/native-tvos-lite.json
-            python3 scripts/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
               --app app/build/ci-ios/Build/Products/Release-iphoneos/VortXiOSNative.app --platform ios \
               --link-map app/build/ci-ios/Build/Intermediates.noindex/VortX.build/Release-iphoneos/VortXiOSNative.build/VortXiOSNative-arm64.map \
               --receipt out/native-ios.json
-            python3 scripts/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify --manifest out/native-build-inputs.json \
               --app app/build/ci-mac/Build/Products/Release/VortX.app --platform macos \
               --link-map app/build/ci-mac/Build/Intermediates.noindex/VortX.build/Release/VortXMac.build/VortX-arm64.map \
               --receipt out/native-macos.json
@@ -1022,7 +1124,7 @@ jobs:
             exit 1
           fi
           VAULT="${SYMBOL_VAULT_REPO:-VortXTV/vortx-symbols}"
-          SHORT_SHA="$(printf '%s' "$GITHUB_SHA" | cut -c1-12)"
+          SHORT_SHA="$(printf '%s' "$BUILD_SOURCE_SHA" | cut -c1-12)"
           # Exactly the five shipped-binary dSYMs (VortXTV, VortXTVLite, VortXTopShelf, VortXiOSNative,
           # VortX/mac). Missing any is a hard failure once the token exists: never retain fewer symbol
           # sets than the release ships.
@@ -1041,7 +1143,7 @@ jobs:
           for d in "${DSYMS[@]}"; do cp -R "$d" "$STAGE/"; done
           BUNDLE="$RUNNER_TEMP/VortX-$TAG-$SHORT_SHA-dSYMs.zip"
           ( cd "$STAGE" && zip -qry "$BUNDLE" . )
-          echo "retaining ${#DSYMS[@]} dSYMs to private vault $VAULT, keyed by $TAG @ $GITHUB_SHA"
+          echo "retaining ${#DSYMS[@]} dSYMs to private vault $VAULT, keyed by $TAG @ $BUILD_SOURCE_SHA"
           # Private vault only. A per-key prerelease in the PRIVATE repo carries the bundle; tag AND
           # commit are encoded in the vault release tag, the asset name, and the notes, so a retained
           # symbol set is unambiguously addressable by (release tag, built commit).
@@ -1050,7 +1152,7 @@ jobs:
           if ! gh release view -R "$VAULT" -- "$VAULT_TAG" >/dev/null 2>&1; then
             gh release create -R "$VAULT" --prerelease \
               --title "VortX symbols $TAG ($SHORT_SHA)" \
-              --notes "Private dSYMs for $TAG at $GITHUB_SHA. Internal symbolication only; not for distribution." \
+              --notes "Private dSYMs for $TAG at $BUILD_SOURCE_SHA. Internal symbolication only; not for distribution." \
               -- "$VAULT_TAG" \
               || { echo "::error::could not create private symbols release $VAULT_TAG in $VAULT"; exit 1; }
           fi
@@ -1068,7 +1170,7 @@ jobs:
           (cd out/full && zip -qry ../VortX-tvOS-ci.ipa Payload)
           unzip -tqq out/VortX-tvOS-ci.ipa
           if [ "$NATIVE_ONLY" = true ]; then
-            python3 scripts/verify-native-apple-package.py verify-archive --app-receipt out/native-tvos.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify-archive --app-receipt out/native-tvos.json \
               --artifact out/VortX-tvOS-ci.ipa --platform tvos --receipt out/native-package-tvos.json
           fi
           shasum -a 256 out/VortX-tvOS-ci.ipa | tee out/SHA256SUMS-ci.txt
@@ -1101,27 +1203,21 @@ jobs:
           rm -f /tmp/mpvkit.zip
           rm -rf app/Vendor/MPVKit-DVFEL/artifacts
           df -h / | tail -1
-          # macOS: an UNSIGNED arm64 app shows "damaged and can't be opened", so ad-hoc sign it
-          # (every nested binary gets a valid signature, so the kernel will run it), then package it as
-          # a drag-to-install .dmg holding the app plus an /Applications symlink. We can't notarize
-          # without an Apple Developer ID, so a downloaded build is still quarantined; the release notes
-          # give the one-time right-click-Open / xattr fix.
+          # Package the already signed and accepted Mac app without mutating it.
           MAC_APP="app/build/ci-mac/Build/Products/Release/VortX.app"
-          codesign --force --deep --sign - "$MAC_APP"
           codesign --verify --deep --strict "$MAC_APP"
-          codesign -dv "$MAC_APP" 2>&1 | sed -n '1,3p' || true
           DMG_STAGE="$(mktemp -d)"
           mv "$MAC_APP" "$DMG_STAGE/"
           ln -s /Applications "$DMG_STAGE/Applications"
           bash scripts/package-macos-dmg.sh "$DMG_STAGE" out/VortX-macOS-ci.dmg
           if [ "$NATIVE_ONLY" = true ]; then
-            python3 scripts/verify-native-apple-package.py verify-archive --app-receipt out/native-tvos.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify-archive --app-receipt out/native-tvos.json \
               --artifact out/VortX-tvOS-ci.ipa --platform tvos --receipt out/native-package-tvos.json
-            python3 scripts/verify-native-apple-package.py verify-archive --app-receipt out/native-tvos-lite.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify-archive --app-receipt out/native-tvos-lite.json \
               --artifact out/VortX-tvOS-lite-ci.ipa --platform tvos --receipt out/native-package-tvos-lite.json
-            python3 scripts/verify-native-apple-package.py verify-archive --app-receipt out/native-ios.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify-archive --app-receipt out/native-ios.json \
               --artifact out/VortX-iOS-ci.ipa --platform ios --receipt out/native-package-ios.json
-            python3 scripts/verify-native-apple-package.py verify-archive --app-receipt out/native-macos.json \
+            python3 "$NATIVE_PACKAGE_VERIFIER_DIR"/verify-native-apple-package.py verify-archive --app-receipt out/native-macos.json \
               --artifact out/VortX-macOS-ci.dmg --platform macos --receipt out/native-package-macos.json
           fi
           shasum -a 256 out/VortX-tvOS-ci.ipa out/VortX-tvOS-lite-ci.ipa out/VortX-iOS-ci.ipa out/VortX-macOS-ci.dmg | tee out/SHA256SUMS-ci.txt
@@ -1130,7 +1226,7 @@ jobs:
       # authority. The later release-write job receives only these bytes and never executes a
       # repository script or checks out a mutable branch with contents:write.
       - name: Build the content-addressed release feed artifact
-        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && github.ref == format('refs/tags/{0}', inputs.release_tag)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != '' && (github.ref == format('refs/tags/{0}', inputs.release_tag) || steps.recovery.conclusion == 'success')
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
           ALTSTORE_NOTE: ${{ inputs.altstore_note }}
@@ -1172,17 +1268,18 @@ jobs:
             "out/VortX-macOS-$TAG-ci.dmg" > out/SHA256SUMS-ci.txt
           rm -rf feed-artifact
           node scripts/release-feed.mjs build-artifact \
-            --tag "$TAG" --build "$BUILD" --source-commit "$GITHUB_SHA" \
+            --tag "$TAG" --build "$BUILD" --source-commit "$BUILD_SOURCE_SHA" \
             --source-template altstore/source.json --output feed-artifact \
             --ios-file "out/VortX-iOS-$TAG-ci.ipa" --tvos-file "out/VortX-tvOS-$TAG-ci.ipa" \
             --tvos-lite-file "out/VortX-tvOS-lite-$TAG-ci.ipa" --mac-file "out/VortX-macOS-$TAG-ci.dmg" \
             --checksum-file out/SHA256SUMS-ci.txt --date "$(date -u +%F)" \
             --prerelease "$IS_PRERELEASE" \
             --name "$RELEASE_NAME" --note "${ALTSTORE_NOTE:-$RELEASE_BODY}" --release-id "$RELEASE_ID"
-          jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" --arg id "$RELEASE_ID" '.tag == $tag and .sourceCommit == $commit and (.releaseId | tostring) == $id and .android == null' feed-artifact/manifest.json >/dev/null
+          jq -e --arg tag "$TAG" --arg commit "$BUILD_SOURCE_SHA" --arg id "$RELEASE_ID" '.tag == $tag and .sourceCommit == $commit and (.releaseId | tostring) == $id and .android == null' feed-artifact/manifest.json >/dev/null
           test -s feed-artifact/source.json -a -s feed-artifact/appcast.json -a -s feed-artifact/manifest.json -a -s feed-artifact/SHA256SUMS-ci.txt
 
       - name: Upload the immutable app handoff
+        id: apps_handoff
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1201,6 +1298,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload the immutable feed handoff
+        id: feed_handoff
         if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -1217,8 +1315,9 @@ jobs:
     if: >-
       always() && !cancelled() && github.event_name == 'workflow_dispatch' &&
       inputs.release_tag != '' && inputs.tvos_test_only != true && inputs.native_only == true && (
-        (inputs.resume_handoff == '' && needs.build-tvos.result == 'success' && github.ref == format('refs/tags/{0}', inputs.release_tag)) ||
-        (inputs.resume_handoff != '' && needs.build-tvos.result == 'skipped' && github.ref == 'refs/heads/main')
+        (inputs.resume_handoff == '' && needs.build-tvos.result == 'success' &&
+          (github.ref == format('refs/tags/{0}', inputs.release_tag) || (github.ref == 'refs/heads/main' && inputs.recovery_source_commit != ''))) ||
+        (inputs.resume_handoff != '' && inputs.recovery_source_commit == '' && needs.build-tvos.result == 'skipped' && github.ref == 'refs/heads/main')
       )
     concurrency:
       group: vortx-release-${{ inputs.release_tag }}
@@ -1239,15 +1338,29 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ inputs.release_tag }}
           RESUME_HANDOFF: ${{ inputs.resume_handoff }}
+          RECOVERY_SOURCE: ${{ inputs.recovery_source_commit }}
+          COMPLETED_BUILD_SOURCE: ${{ needs.build-tvos.outputs.source_sha }}
+          COMPLETED_APPS_ID: ${{ needs.build-tvos.outputs.apps_id }}
+          COMPLETED_FEED_ID: ${{ needs.build-tvos.outputs.feed_id }}
+          RELEASE_ID_INPUT: ${{ inputs.release_id }}
         run: |
           set -euo pipefail
           if [ -z "$RESUME_HANDOFF" ]; then
-            echo "build_source_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            [[ "$COMPLETED_BUILD_SOURCE" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            [[ "$COMPLETED_APPS_ID" =~ ^[1-9][0-9]*$ ]] && [[ "$COMPLETED_FEED_ID" =~ ^[1-9][0-9]*$ ]] && [ "$COMPLETED_APPS_ID" != "$COMPLETED_FEED_ID" ] || exit 1
+            echo "build_source_sha=$COMPLETED_BUILD_SOURCE" >> "$GITHUB_OUTPUT"
+            echo "build_workflow_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "build_run_id=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "build_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+            echo "build_branch=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "apps_id=$COMPLETED_APPS_ID" >> "$GITHUB_OUTPUT"
+            echo "feed_id=$COMPLETED_FEED_ID" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # GITHUB_SHA remains the reviewed coordinator code commit. Artifact provenance is a
           # separate value, accepted only after GitHub's original attempt and job evidence agree.
           [ "$GITHUB_REF" = refs/heads/main ] && [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || exit 1
+          [ -z "$RECOVERY_SOURCE" ] || exit 1
           [ "$(gh api --jq '.object.sha' -- "repos/$GH_REPO/git/ref/heads/main")" = "$GITHUB_SHA" ] || { echo '::error::resume must execute current main'; exit 1; }
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || exit 1
           jq -e '
@@ -1266,19 +1379,37 @@ jobs:
             (.status == "ahead" or .status == "identical") and .merge_base_commit.sha == $source' >/dev/null
           gh api -- "repos/$GH_REPO/actions/runs/$RUN_ID" > "$RUNNER_TEMP/source-latest-run.json"
           gh api -- "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT" > "$RUNNER_TEMP/source-run.json"
+          BUILD_WORKFLOW_SHA="$(jq -er '.head_sha' "$RUNNER_TEMP/source-run.json")"
+          BUILD_BRANCH="$(jq -er '.head_branch' "$RUNNER_TEMP/source-run.json")"
+          RECOVERED=false
+          if [ "$BUILD_BRANCH" = main ]; then
+            # Accept only this reviewed one-cut recovery, authenticated by GitHub job evidence
+            # below. The caller's sourceCommit never supplies the workflow execution identity.
+            [ "$BUILD_SOURCE_SHA" = 844782d29a93ae51991bfadc639d50bc3619d40b ] && [ "$TAG" = v0.5.0-beta.1 ] && [ "$RELEASE_ID_INPUT" = 407572242 ] || exit 1
+            [[ "$BUILD_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            gh api -- "repos/$GH_REPO/compare/$BUILD_WORKFLOW_SHA...$GITHUB_SHA" | jq -e --arg source "$BUILD_WORKFLOW_SHA" '
+              (.status == "ahead" or .status == "identical") and .merge_base_commit.sha == $source' >/dev/null
+            RECOVERED=true
+          else
+            [ "$BUILD_WORKFLOW_SHA" = "$BUILD_SOURCE_SHA" ] && [ "$BUILD_BRANCH" = "$TAG" ] || exit 1
+          fi
           for RECORD in "$RUNNER_TEMP/source-latest-run.json" "$RUNNER_TEMP/source-run.json"; do
-            jq -e --arg repo "$GH_REPO" --arg sha "$BUILD_SOURCE_SHA" --arg tag "$TAG" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" '
+            jq -e --arg repo "$GH_REPO" --arg sha "$BUILD_WORKFLOW_SHA" --arg branch "$BUILD_BRANCH" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" '
               .id == $run and .run_attempt == $attempt and .repository.full_name == $repo and .head_repository.full_name == $repo and
               (.repository.id | type == "number" and . > 0) and .head_repository.id == .repository.id and
-              .path == ".github/workflows/release-tvos.yml" and .event == "workflow_dispatch" and .head_sha == $sha and .head_branch == $tag and
+              .path == ".github/workflows/release-tvos.yml" and .event == "workflow_dispatch" and .head_sha == $sha and .head_branch == $branch and
               .status == "completed" and (.conclusion == "success" or .conclusion == "failure")' "$RECORD" >/dev/null
           done
           # Paginate before flattening: a missing build or a truncated job list never implies success.
           gh api --paginate --slurp -- "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" | jq '[.[].jobs[]]' > "$RUNNER_TEMP/source-jobs.json"
-          jq -e --arg sha "$BUILD_SOURCE_SHA" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" --slurpfile source "$RUNNER_TEMP/source-run.json" '
+          jq -e --arg sha "$BUILD_WORKFLOW_SHA" --argjson recovered "$RECOVERED" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" --slurpfile source "$RUNNER_TEMP/source-run.json" '
             all(.[]; .run_id == $run and .run_attempt == $attempt and .head_sha == $sha and .status == "completed") and
             ([.[] | select(.name == "build-tvos" and .conclusion == "success")] | length == 1) and
             ([.[] | select(.name == "build-tvos")] | length == 1) and
+            (if $recovered then
+              ([.[] | select(.name == "build-tvos") | .steps[] | select(.name == "Validate immutable Beta 1 source recovery" and .status == "completed" and .conclusion == "success")] | length == 1) and
+              ([.[] | select(.name == "build-tvos") | .steps[] | select(.name == "Verify immutable recovered source checkout" and .status == "completed" and .conclusion == "success")] | length == 1)
+             else true end) and
             ([.[] | select(.name == "attach-release")] | length == 1) and
             ([.[] | select(.name == "attach-release") | .steps[] | select(.name == "Attach only exact draft assets and create the authenticated staged receipt" and .status == "completed" and .conclusion == "success")] | length == 1) and
             (if $source[0].conclusion == "failure" then
@@ -1301,6 +1432,10 @@ jobs:
           done
           {
             echo "build_source_sha=$BUILD_SOURCE_SHA"
+            echo "build_workflow_sha=$BUILD_WORKFLOW_SHA"
+            echo "build_run_id=$RUN_ID"
+            echo "build_attempt=$ATTEMPT"
+            echo "build_branch=$BUILD_BRANCH"
             echo "expected_build=$(jq -r '.build' <<<"$RESUME_HANDOFF")"
             echo "run_id=$RUN_ID"
             echo "apps_id=$APPS_ID"
@@ -1308,39 +1443,125 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Reviewed coordinator $GITHUB_SHA resumes source $BUILD_SOURCE_SHA from run $RUN_ID attempt $ATTEMPT"
 
-      - name: Download the built apps
-        if: inputs.resume_handoff == ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: VortX-tvOS-ci
-          path: out
+      - name: Download and authenticate immutable handoff archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag }}
+          APPS_ID: ${{ steps.handoff.outputs.apps_id }}
+          FEED_ID: ${{ steps.handoff.outputs.feed_id }}
+          BUILD_RUN_ID: ${{ steps.handoff.outputs.build_run_id }}
+          BUILD_ATTEMPT: ${{ steps.handoff.outputs.build_attempt }}
+          BUILD_WORKFLOW_SHA: ${{ steps.handoff.outputs.build_workflow_sha }}
+          BUILD_BRANCH: ${{ steps.handoff.outputs.build_branch }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [ "$GH_REPO" = VortXTV/VortX ] || exit 1
+          for VALUE in "$APPS_ID" "$FEED_ID" "$BUILD_RUN_ID" "$BUILD_ATTEMPT"; do
+            [[ "$VALUE" =~ ^[1-9][0-9]{0,15}$ ]] && [ "$VALUE" -lt 9007199254740992 ] || exit 1
+          done
+          [ "$APPS_ID" != "$FEED_ID" ] && [[ "$BUILD_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          HANDOFF_DIR="$(mktemp -d "$RUNNER_TEMP/verified-handoff.XXXXXXXX")"
+          export HANDOFF_DIR
+          # Recheck the latest attempt before selecting bytes, including direct build handoffs.
+          gh api -- "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID" > "$HANDOFF_DIR/run.json"
+          jq -e --arg repo "$GH_REPO" --arg sha "$BUILD_WORKFLOW_SHA" --arg branch "$BUILD_BRANCH" --argjson run "$BUILD_RUN_ID" --argjson attempt "$BUILD_ATTEMPT" '
+            .id == $run and .run_attempt == $attempt and .repository.full_name == $repo and .head_repository.full_name == $repo and
+            (.repository.id | type == "number" and . > 0) and .head_repository.id == .repository.id and
+            .path == ".github/workflows/release-tvos.yml" and .event == "workflow_dispatch" and .head_sha == $sha and .head_branch == $branch' "$HANDOFF_DIR/run.json" >/dev/null
+          gh api --paginate --slurp -- "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID/attempts/$BUILD_ATTEMPT/jobs?per_page=100" | jq '[.[].jobs[]]' > "$HANDOFF_DIR/jobs.json"
+          jq -e --arg sha "$BUILD_WORKFLOW_SHA" --argjson run "$BUILD_RUN_ID" --argjson attempt "$BUILD_ATTEMPT" '
+            [.[] | select(.name == "build-tvos")] | length == 1 and
+            all(.[]; .run_id == $run and .run_attempt == $attempt and .head_sha == $sha and .status == "completed" and .conclusion == "success")' "$HANDOFF_DIR/jobs.json" >/dev/null
+          for SPEC in "$APPS_ID|VortX-tvOS-ci|Upload the immutable app handoff" "$FEED_ID|VortX-release-feed|Upload the immutable feed handoff"; do
+            ID="${SPEC%%|*}"; REST="${SPEC#*|}"; NAME="${REST%%|*}"; UPLOAD_STEP="${REST#*|}"
+            gh api -- "repos/$GH_REPO/actions/artifacts/$ID" > "$HANDOFF_DIR/$ID.json"
+            jq -e --argjson id "$ID" --arg name "$NAME" --arg step "$UPLOAD_STEP" --slurpfile source "$HANDOFF_DIR/run.json" --slurpfile jobs "$HANDOFF_DIR/jobs.json" '
+              . as $artifact | $source[0] as $run |
+              .id == $id and .name == $name and .expired == false and .size_in_bytes > 0 and .size_in_bytes <= 5368709120 and
+              (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+              .workflow_run.id == $run.id and .workflow_run.head_sha == $run.head_sha and .workflow_run.head_branch == $run.head_branch and
+              .workflow_run.repository_id == $run.repository.id and .workflow_run.head_repository_id == $run.head_repository.id and
+              ([$jobs[0][] | select(.name == "build-tvos") | .steps[] | select(.name == $step and .conclusion == "success" and .status == "completed") |
+                select(.started_at <= $artifact.created_at and .completed_at >= $artifact.created_at)] | length == 1)' "$HANDOFF_DIR/$ID.json" >/dev/null
+            # Download the exact authenticated ID. Do not consume actions/download-artifact's
+            # extraction: its digest mismatch is warning-only. These ZIP bytes are checked below.
+            gh api -- "repos/$GH_REPO/actions/artifacts/$ID/zip" > "$HANDOFF_DIR/$ID.zip"
+          done
+          python3 - <<'PY'
+          import hashlib, json, os, re, shutil, stat, tempfile, zipfile
+          from contextlib import ExitStack
+          from pathlib import Path
 
-      - name: Download the immutable feed artifact
-        if: inputs.resume_handoff == ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: VortX-release-feed
-          path: feed-artifact
-
-      - name: Download only the approved original apps artifact
-        if: inputs.resume_handoff != ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          artifact-ids: ${{ steps.handoff.outputs.apps_id }}
-          run-id: ${{ steps.handoff.outputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          merge-multiple: true
-          path: out
-
-      - name: Download only the approved original feed artifact
-        if: inputs.resume_handoff != ''
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          artifact-ids: ${{ steps.handoff.outputs.feed_id }}
-          run-id: ${{ steps.handoff.outputs.run_id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          merge-multiple: true
-          path: feed-artifact
+          root = Path(os.environ["HANDOFF_DIR"]).resolve(strict=True)
+          workspace = Path.cwd().resolve(strict=True)
+          tag = os.environ["TAG"]
+          if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?", tag):
+              raise SystemExit("invalid handoff tag")
+          app_files = {f"VortX-{platform}-{tag}-ci.{suffix}" for platform, suffix in
+                       (("tvOS", "ipa"), ("tvOS-lite", "ipa"), ("iOS", "ipa"), ("macOS", "dmg"))}
+          app_files.add("SHA256SUMS-ci.txt")
+          feed_files = {"source.json", "appcast.json", "manifest.json", "SHA256SUMS-ci.txt"}
+          specs = ((os.environ["APPS_ID"], "out", app_files), (os.environ["FEED_ID"], "feed-artifact", feed_files))
+          with ExitStack() as stack:
+              accepted = []
+              # Authenticate BOTH complete archives before extracting any member. Hash and read
+              # from the same open regular-file descriptors; no second download or path swap.
+              for artifact_id, destination, required in specs:
+                  descriptor = os.open(root / f"{artifact_id}.zip", os.O_RDONLY | os.O_NOFOLLOW)
+                  stream = stack.enter_context(os.fdopen(descriptor, "rb"))
+                  info = os.fstat(stream.fileno())
+                  if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 5 * 1024**3:
+                      raise SystemExit("invalid artifact archive size/type")
+                  expected = json.loads((root / f"{artifact_id}.json").read_text())["digest"]
+                  if not re.fullmatch(r"sha256:[0-9a-f]{64}", expected):
+                      raise SystemExit("missing or invalid authenticated artifact digest")
+                  digest = hashlib.sha256()
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(block)
+                  if "sha256:" + digest.hexdigest() != expected:
+                      raise SystemExit(f"artifact {artifact_id} ZIP digest mismatch")
+                  stream.seek(0)
+                  archive = stack.enter_context(zipfile.ZipFile(stream))
+                  members = archive.infolist()
+                  names = set()
+                  if not 1 <= len(members) <= 64 or sum(item.file_size for item in members) > 5 * 1024**3:
+                      raise SystemExit("artifact archive exceeds extraction limits")
+                  for item in members:
+                      name = item.filename
+                      kind = stat.S_IFMT(item.external_attr >> 16)
+                      # Handoffs contain flat files only. Reject all directories, links, special
+                      # files, duplicate names and unsafe paths before creating an output tree.
+                      if (not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", name) or name in (".", "..") or
+                          name != item.orig_filename or name in names or item.is_dir() or
+                          kind not in (0, stat.S_IFREG) or item.flag_bits & 1 or not 0 < item.file_size <= 1024**3):
+                          raise SystemExit("unsafe artifact archive member")
+                      if name not in required and not (destination == "out" and re.fullmatch(r"native-[A-Za-z0-9_-]+\.json", name)):
+                          raise SystemExit("unexpected artifact archive member")
+                      names.add(name)
+                  if not required.issubset(names):
+                      raise SystemExit("artifact archive lacks required handoff files")
+                  target = workspace / destination
+                  if target.exists() or target.is_symlink():
+                      raise SystemExit("handoff destination already exists")
+                  accepted.append((archive, members, target))
+              # Only workflow-owned inline code extracts these bytes; artifact content is data.
+              with tempfile.TemporaryDirectory(prefix="accepted-handoff-", dir=workspace) as staging:
+                  staged = []
+                  for archive, members, target in accepted:
+                      directory = Path(staging) / target.name
+                      directory.mkdir(mode=0o700)
+                      for item in members:
+                          with archive.open(item) as source, (directory / item.filename).open("xb") as output:
+                              shutil.copyfileobj(source, output, 1024 * 1024)
+                          if (directory / item.filename).stat().st_size != item.file_size:
+                              raise SystemExit("artifact archive member size mismatch")
+                      staged.append((directory, target))
+                  for directory, target in staged:
+                      directory.rename(target)
+          print("PASS: both authenticated artifact ZIPs extracted after exact digest and containment checks")
+          PY
 
       - name: Bind the draft release, tag commit, and monotonic source before any write
         id: identity
@@ -1351,6 +1572,9 @@ jobs:
           RELEASE_ID_INPUT: ${{ inputs.release_id }}
           APPLE_ONLY_INPUT: ${{ inputs.apple_only }}
           BUILD_SOURCE_SHA: ${{ steps.handoff.outputs.build_source_sha }}
+          BUILD_WORKFLOW_SHA: ${{ steps.handoff.outputs.build_workflow_sha }}
+          BUILD_RUN_ID: ${{ steps.handoff.outputs.build_run_id }}
+          BUILD_ATTEMPT: ${{ steps.handoff.outputs.build_attempt }}
           EXPECTED_BUILD: ${{ steps.handoff.outputs.expected_build }}
         run: |
           set -euo pipefail
@@ -1360,6 +1584,15 @@ jobs:
             exit 1
           fi
           MANIFEST=feed-artifact/manifest.json
+          if [ "$BUILD_WORKFLOW_SHA" != "$BUILD_SOURCE_SHA" ]; then
+            # Bind the retained acceptance tool to immutable repository bytes, not a JSON claim.
+            gh api -- "repos/$GH_REPO/contents/scripts/verify-native-apple-package.py?ref=$BUILD_WORKFLOW_SHA" | jq -er '.content' | tr -d '\n' | base64 --decode > "$RUNNER_TEMP/accepted-verifier.py"
+            VERIFIER_SHA="$(shasum -a 256 "$RUNNER_TEMP/accepted-verifier.py" | awk '{print $1}')"
+            jq -e --arg source "$BUILD_SOURCE_SHA" --arg workflow "$BUILD_WORKFLOW_SHA" --arg verifier "$VERIFIER_SHA" --arg tag "$TAG" \
+              --argjson run "$BUILD_RUN_ID" --argjson attempt "$BUILD_ATTEMPT" '
+              .schemaVersion == 1 and .sourceCommit == $source and .workflowCommit == $workflow and .verifierSha256 == $verifier and
+              .tag == $tag and .runId == $run and .attempt == $attempt' out/native-workflow-provenance.json >/dev/null
+          fi
           jq -e --arg tag "$TAG" --arg commit "$BUILD_SOURCE_SHA" \
             '.schemaVersion == 2 and .tag == $tag and (.sourceCommit | ascii_downcase) == ($commit | ascii_downcase) and .android == null' "$MANIFEST" >/dev/null
           BUILD="$(jq -er '.build' "$MANIFEST")"
