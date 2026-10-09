@@ -144,7 +144,18 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 { if (syncManager === manager) manager.sessionOwnerSnapshot() else com.vortx.android.sync.SessionOwnerSnapshot.UnknownOrUnavailable(0) },
                 manager::captureLocalLibraryMutationAdmission) }
         },
-        withReclaimLifecycle = { action -> DownloadManager.withWatchedReclaimAdmission(this, action) }) {
+        withReclaimLifecycle = { action -> DownloadManager.withWatchedReclaimAdmission(this, action) },
+        nzbSourceAggregator = run {
+            val keys = DebridKeys(this)
+            com.vortx.android.engine.NzbSourceAggregator(
+                com.vortx.android.nzb.NzbIndexerStore(
+                    this,
+                    keys::ownerToken,
+                    { ProfileStore.sharedOrNull()?.active?.id },
+                    keys::mutateCurrentOwner,
+                ),
+            )
+        }) {
         nativeAccounts.session().also { it.read() }
     } }
 
