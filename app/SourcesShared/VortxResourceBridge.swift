@@ -99,6 +99,18 @@ struct VortxResourceSnapshot: Sendable {
     let sourceURLs: [String: String]
 }
 
+/// Bounds retained normalized result content across singleton calls. This intentionally does
+/// not claim to measure consumed wire bytes (the ABI does not return that receipt).
+struct VortxResourceContentBudget {
+    private(set) var usedBytes = 0
+    private let limit = 33_554_432
+    mutating func claim(_ content: VortxJSON) throws -> Bool {
+        let bytes = try JSONEncoder().encode(content).count
+        guard bytes <= limit - usedBytes else { return false }
+        usedBytes += bytes; return true
+    }
+}
+
 protocol VortxResourceCancellation: AnyObject, Sendable { func cancel() }
 protocol VortxResourceTransport: Sendable {
     func makeCancellation() throws -> any VortxResourceCancellation
@@ -114,6 +126,7 @@ final class VortxResourceBridge: @unchecked Sendable {
     private struct WireRequest: Encodable {
         let requestId: String; let generation: UInt64; let request: VortxResourceRequest
         let addons: [VortxResourceAddon]; let budgetMs: UInt64; let maxResponseBytes: UInt64
+        let maxTotalResponseBytes: UInt64
     }
     private struct WireResult: Decodable {
         let kind: String; let requestId: String; let generation: UInt64
@@ -162,15 +175,18 @@ final class VortxResourceBridge: @unchecked Sendable {
     }
 
     func load(ownerID: String, request: VortxResourceRequest, addons: [VortxResourceAddon],
-              budgetMs: UInt64 = 5000, maxResponseBytes: UInt64 = 8_388_608) async throws -> VortxResourceSnapshot {
+              budgetMs: UInt64 = 5000, maxResponseBytes: UInt64 = 8_388_608,
+              maxTotalResponseBytes: UInt64 = 33_554_432) async throws -> VortxResourceSnapshot {
         guard !ownerID.isEmpty, Set(addons.map(\.id)).count == addons.count,
               addons.allSatisfy({ !$0.id.isEmpty }), request.extra.allSatisfy({ $0.count == 2 }),
-              (1...60_000).contains(budgetMs), (1...33_554_432).contains(maxResponseBytes)
+              (1...60_000).contains(budgetMs), (1...33_554_432).contains(maxResponseBytes),
+              (1...67_108_864).contains(maxTotalResponseBytes)
         else { throw VortxNativeError.invalidResponse }
         let token = try transport.makeCancellation()
         let lease = try begin(owner: ownerID, token: token)
         let wire = WireRequest(requestId: lease.id, generation: lease.generation, request: request,
-                               addons: addons, budgetMs: budgetMs, maxResponseBytes: maxResponseBytes)
+                               addons: addons, budgetMs: budgetMs, maxResponseBytes: maxResponseBytes,
+                               maxTotalResponseBytes: maxTotalResponseBytes)
         let json = String(decoding: try JSONEncoder().encode(wire), as: UTF8.self)
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()

@@ -72,6 +72,14 @@ private final class FixtureTransport: VortxResourceTransport, @unchecked Sendabl
 @main enum VortxNativeBridgeTests {
     static func check(_ value: Bool) { precondition(value) }
     static func main() async throws {
+        var streamBudget = VortxResourceContentBudget(), metaBudget = VortxResourceContentBudget()
+        let large: VortxJSON = .object(["streams": .array([.object(["description": .string(String(repeating: "x", count: 8_388_608 - 1024))])])])
+        for _ in 0..<4 { check(try streamBudget.claim(large)) } // preserve near8MiB individual providers
+        let beforeOverflow = streamBudget.usedBytes
+        check(try !streamBudget.claim(large))
+        check(streamBudget.usedBytes == beforeOverflow && streamBudget.usedBytes <= 33_554_432)
+        check(try streamBudget.claim(.object(["streams": .array([])]))) // overflow leaves peers' remaining capacity intact
+        check(try metaBudget.claim(large)) // metadata has its own incumbent32MiB resource budget
         let abi = FakeRuntime()
         let runtime = try VortxNativeRuntime(abi: abi, ownerID: "account/profile-a", ownerName: "A")
         _ = try runtime.dispatch("{}", now: 1)

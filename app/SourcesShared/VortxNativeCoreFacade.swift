@@ -778,7 +778,11 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 "selected": .object(["metaPath": (try? VortxResourceProjection.path(request)) ?? .null, "streamPath": (try? stream.map(VortxResourceProjection.path)) ?? .null]),
                 "metaItems": .array(addons.compactMap { try? loadingEntry($0, request) }),
                 "streams": .array(stream.map { path in addons.compactMap { try? loadingEntry($0, path) } } ?? []), "metaStreams": .array([])])
-            return enqueue(field, initial: loading) { [self] in [field: try await session.loadMeta(request: request, stream: stream, addons: addons)] }
+            guard let profile = string(values["native_state"]?["activeProfileId"]) else { return fail("missing_profile") }
+            return enqueue(field, initial: loading) { [self] publish in
+                [field: try await session.loadMeta(request: request, stream: stream, addons: addons,
+                    expectedProfileID: profile, onUpdate: publish)]
+            }
         }
         if name == "Load", model == "CatalogWithFilters", field == "discover" {
             let supplied = action["args"]?["args"]?["request"]
