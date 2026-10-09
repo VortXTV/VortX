@@ -69,6 +69,9 @@ struct ProfilePickerView: View {
     @State private var accountHelpNeeded = false
     @StateObject private var profileAction = ProfileMutationPresentation()
     @StateObject private var artwork = ProfilePickerArtwork.shared
+    #if VORTX_NATIVE_DATA_ENGINE
+    @ObservedObject private var nativeSync = VortXSyncManager.shared
+    #endif
 
     var body: some View {
         ZStack {
@@ -93,6 +96,16 @@ struct ProfilePickerView: View {
                                 .foregroundStyle(.white)
                                 .multilineTextAlignment(.center)
                                 .accessibilityAddTraits(.isHeader)
+                            #if VORTX_NATIVE_DATA_ENGINE
+                            if !nativeSync.isSignedIn {
+                                Text("Sign in to your VortX account to load your profiles.")
+                                    .font(.callout).foregroundStyle(.white)
+                                    .multilineTextAlignment(.center)
+                                Button("Sign in") { accountHelpNeeded = true }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(theme.accent)
+                            }
+                            #endif
                             if profileAction.isRunning {
                                 ProgressView("Opening profile…").tint(.white).foregroundStyle(.white)
                             }
@@ -109,6 +122,9 @@ struct ProfilePickerView: View {
                                 #endif
                             }
                             profileGrid(layout: layout)
+                                #if VORTX_NATIVE_DATA_ENGINE
+                                .disabled(!nativeSync.isSignedIn)
+                                #endif
                         }
                         .padding(.horizontal, layout.horizontalInset)
                         .padding(.bottom, 32)

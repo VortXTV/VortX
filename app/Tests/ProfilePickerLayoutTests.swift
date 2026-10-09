@@ -22,6 +22,9 @@ enum ProfilePickerLayoutTests {
         precondition(picker.contains(".disabled(pinTarget != nil || profileAction.isRunning)"))
         precondition(!picker.contains("nativeUnsupportedSettings"))
         precondition(!picker.contains("Reconnect the owner's Stremio account"))
+        precondition(picker.contains("if !nativeSync.isSignedIn"))
+        precondition(picker.contains("Button(\"Sign in\") { accountHelpNeeded = true }"))
+        precondition(picker.contains(".disabled(!nativeSync.isSignedIn)"))
         let lockedEditor = source.components(separatedBy: "private var lockedPanel: some View")[1]
             .components(separatedBy: "private var canSave: Bool")[0]
         precondition(lockedEditor.contains("ViewThatFits(in: .horizontal)"))

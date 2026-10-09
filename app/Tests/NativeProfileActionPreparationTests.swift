@@ -65,6 +65,13 @@ enum NativeProfileActionPreparationTests {
         precondition(admission.contains("guard case .native(nil) = admission.target else { return }"))
         precondition(admission.contains("await facade.settled()"))
         precondition(admission.contains("restoreNativeCheckpoint(credentialCapture: admission.credential)"))
-        print("PASS profile readiness: 18 delayed mount cases, acknowledged fast path, cancellation, original owner/profile fences, no stale-target upgrade")
+        let sync = try String(contentsOfFile: "app/SourcesShared/VortXSyncManager.swift", encoding: .utf8)
+        let beforeRestore = sync.components(separatedBy: "func restoreNativeCheckpoint(")[1]
+            .components(separatedBy: "if let pending = nativeCheckpointTask")[0]
+        precondition(beforeRestore.contains("guard isSignedIn, isCurrent(capture), case .account = capture.scope else"))
+        precondition(beforeRestore.contains("restore result=not_started reason=account_not_ready"))
+        precondition(!beforeRestore.contains("VortxNativeSession("))
+        precondition(!beforeRestore.contains("installNativeSession("))
+        print("PASS profile readiness: 18 delayed mount cases, acknowledged fast path, cancellation, original owner/profile and authenticated mount fences, no stale-target upgrade")
     }
 }
