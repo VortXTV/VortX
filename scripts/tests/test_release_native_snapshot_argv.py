@@ -35,7 +35,7 @@ class NativeSnapshotArgumentsTests(unittest.TestCase):
         environment.update(
             TVOS_TEST_ONLY=test_only,
             VORTX_ENGINE_SOURCE_REVISION="synthetic revision with spaces",
-            NATIVE_PACKAGE_VERIFIER="/accepted workflow/verify-native-apple-package.py",
+            NATIVE_PACKAGE_VERIFIER_DIR="/accepted workflow",
         )
         result = subprocess.run(
             [
@@ -59,7 +59,7 @@ class NativeSnapshotArgumentsTests(unittest.TestCase):
         }
         if include_server:
             expected["--mac-server"] = "app/Vendor/vortx-streaming-server"
-        self.assertEqual(arguments[:2], [environment["NATIVE_PACKAGE_VERIFIER"], "snapshot"])
+        self.assertEqual(arguments[:2], [environment["NATIVE_PACKAGE_VERIFIER_DIR"] + "/verify-native-apple-package.py", "snapshot"])
         remainder = arguments[2:]
         self.assertEqual(len(remainder), len(expected) * 2)
         self.assertEqual(dict(zip(remainder[::2], remainder[1::2])), expected)

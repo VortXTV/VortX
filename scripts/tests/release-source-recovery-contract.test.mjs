@@ -87,7 +87,7 @@ test('signing precedes first native app acceptance and packaging contains no sig
 codesign() { printf 'codesign:%s\\n' "$*"; }
 ${script(signing)}
 python3() { printf 'accept:%s\\n' "$*"; }
-${script(acceptance)}`], { encoding: 'utf8', env: { ...process.env, TVOS_TEST_ONLY: 'false', NATIVE_PACKAGE_VERIFIER: '/reviewed verifier.py' } });
+${script(acceptance)}`], { encoding: 'utf8', env: { ...process.env, TVOS_TEST_ONLY: 'false', NATIVE_PACKAGE_VERIFIER_DIR: '/reviewed verifier' } });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /^codesign:--force --deep --sign - .*VortX.app\ncodesign:--verify --deep --strict .*VortX.app\naccept:/);
   assert(result.stdout.includes('--receipt out/native-macos.json'));
@@ -109,6 +109,26 @@ test('recovery preserves only the verifier outside the source checkout and retai
   assert.match(step('Bind the draft release, tag commit, and monotonic source before any write'), /TAG_SHA" = "\$BUILD_SOURCE_SHA/);
   assert.doesNotMatch(workflow, /(?:^|\n)\s*(?:export )?GITHUB_SHA=/);
 });
+
+test('verifier location is created at step runtime and exported with the exact accepted tool bytes', () => fixture(dir => {
+  const jobEnvironment = workflow.match(/^    env:\n([\s\S]*?)^    steps:/m)?.[1];
+  assert(jobEnvironment, 'build job environment exists');
+  assert.doesNotMatch(jobEnvironment, /\b(?:runner|env|steps)\./, 'runner/step contexts are unavailable in job-level env');
+  mkdirSync(join(dir, 'scripts'));
+  const bytes = '# fixture verifier bytes retained without execution\n';
+  writeFileSync(join(dir, 'scripts/verify-native-apple-package.py'), bytes);
+  const result = spawnSync('/bin/bash', ['-c', script("Preserve the workflow revision's native acceptance tool")], {
+    cwd: dir, encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: dir, GITHUB_ENV: join(dir, 'environment'), GITHUB_OUTPUT: join(dir, 'outputs') }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const exported = readFileSync(join(dir, 'environment'), 'utf8').trim();
+  assert(exported.startsWith(`NATIVE_PACKAGE_VERIFIER_DIR=${dir}/native-acceptance.`));
+  const verifierDirectory = exported.split('=', 2)[1];
+  assert.equal(readFileSync(join(verifierDirectory, 'verify-native-apple-package.py'), 'utf8'), bytes);
+  assert.equal(readFileSync(join(dir, 'outputs'), 'utf8'), `verifier_sha256=${createHash('sha256').update(bytes).digest('hex')}\n`);
+  assert.match(step('Capture exact native SDK and player inputs before app compilation'),
+    /python3 "\$NATIVE_PACKAGE_VERIFIER_DIR"\/verify-native-apple-package\.py snapshot/);
+}));
 
 test('coordinator checks the recovered verifier against GitHub workflow bytes and exact run provenance', () => fixture(dir => {
   mkdirSync(join(dir, 'out'));
