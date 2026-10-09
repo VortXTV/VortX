@@ -20,6 +20,7 @@ preparation; actual selected-audio continuity; regular-episode defaults that pre
 specials; pause and accepted resume/seek targets across replacement; a separate native-DV
 metadata deadline and exact-item decoding window; typed mpv cache statistics and owned bounded
 reanchor recovery; complete typed request-header fields admitted before source replacement;
+immutable configured Safari User-Agent restoration instead of leaking a first source's custom identity;
 source-time external-caption refresh while paused; real mpv subtitle backgrounds;
 native NNTP article concurrency and seek cancellation; retained Apple Trakt Continue Watching
 read choice; scoped Android native NNTP provider/mirror routing; and fresh FFmpeg 9 /
@@ -32,8 +33,16 @@ Apple suites and 194 Android checks with zero skips. Earlier native Mac Debug co
 528 combined Android tests passed. Fresh silent AVPlayer and overlapping
 mpv seek fixtures passed, as did Apple's 18 paired-base production-sync checks and Android's
 40 native / 52 explicit legacy manager checks. Header admission passed 33 actual extracted
-checks; paused caption-clock handling passed 14 actual-method checks plus recovery. The separate
-encrypted Swift/Kotlin carrier fixture uses real native sessions, but its manual conflict
+checks; paused caption-clock handling passed 14 actual-method checks plus recovery. User-Agent
+isolation passed 35 actual native-property checks against seven original
+wrong-default failures. It extracts actual controller setup/header/provenance code and reads
+back the selected mpv library; the successful load-command result is modeled, with no media,
+network, app, audio or decoder proof. The complete local continuity runner passed all seven
+cohorts after a stale test assertion was strengthened to bind batch resolution and retry to the
+same captured-owner-filtered candidate list; production fallback behavior was unchanged.
+Fresh CI on the subsequently pushed exact source remains pending. Earlier Apple/Android
+pre-User-Agent candidate runs are diagnostic only, not acceptance of this repair or final packages.
+The separate encrypted Swift/Kotlin carrier fixture uses real native sessions, but its manual conflict
 recovery is not production-manager retry proof. Both watched/Watchlist hosts and native
 shipping selection and reviewed DV pre-attachment/mpv cache-map repairs are integrated.
 The website's final native projection/edit/optional-manifest source passed independent review,
