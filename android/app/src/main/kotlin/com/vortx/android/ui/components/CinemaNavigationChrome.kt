@@ -72,11 +72,12 @@ internal fun CinemaTopNavigation(
 internal fun CinemaBottomNavigation(
     items: List<CinemaNavigationItem>, selected: TabSlot, onSelect: (TabSlot) -> Unit,
     onProfiles: () -> Unit, modifier: Modifier = Modifier,
+    initialMoreOpen: Boolean = false,
 ) {
     val plan = cinemaCompactNavigation(items.map { it.slot })
     val primary = plan.primary.mapNotNull { slot -> items.firstOrNull { it.slot == slot } }
     val overflow = plan.overflow.mapNotNull { slot -> items.firstOrNull { it.slot == slot } }
-    var moreOpen by rememberSaveable { mutableStateOf(false) }
+    var moreOpen by rememberSaveable { mutableStateOf(initialMoreOpen) }
     Box(modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp),
         contentAlignment = Alignment.Center) {
         Row(Modifier.widthIn(max = 600.dp).fillMaxWidth()
