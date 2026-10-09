@@ -4,10 +4,15 @@ import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.data.StreamLoadUpdate
 import com.vortx.android.nzb.NzbIndexerClient
+import com.vortx.android.nzb.NzbIndexerConfig
 import com.vortx.android.nzb.NzbIndexerStore
 import com.vortx.android.nzb.NzbRelease
 import com.vortx.android.nzb.NzbSearch
+import com.vortx.android.debrid.DebridOwnerScope
+import com.vortx.android.model.MediaType
+import com.vortx.android.model.MetaDetail
 import kotlinx.coroutines.async
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
@@ -22,26 +27,44 @@ import kotlin.coroutines.coroutineContext
  * availability. A search result is not a cache/readiness assertion.
  */
 internal class NzbSourceAggregator(
-    private val store: NzbIndexerStore,
-    private val client: NzbIndexerClient = NzbIndexerClient(),
+    private val captureScope: () -> NzbIndexerStore.Scope?,
+    private val readScope: (NzbIndexerStore.Scope) -> NzbIndexerStore.Read,
+    private val keyFor: (String, NzbIndexerStore.Scope) -> String?,
+    private val scopeCurrent: (NzbIndexerStore.Scope) -> Boolean,
+    private val searchReleases: suspend (NzbIndexerConfig, String, NzbSearch) -> Result<List<NzbRelease>>,
 ) {
-    suspend fun aggregate(search: NzbSearch): NzbSourceAggregation = coroutineScope {
-        val scope = store.captureScope() ?: return@coroutineScope NzbSourceAggregation.empty()
-        val document = (store.read(scope) as? NzbIndexerStore.Read.Ready)?.document
+    constructor(store: NzbIndexerStore, client: NzbIndexerClient = NzbIndexerClient()) :
+        this(store::captureScope, store::read, store::keyFor, store::isCurrent, client::search)
+
+    /** Native callers capture once, before resource suspension; a null scope must never retarget. */
+    fun captureNativeScope(owner: VortxNativeOwner): NzbIndexerStore.Scope? =
+        captureScope()?.takeIf { nativeNzbScopeMatches(it, owner) && scopeCurrent(it) }
+
+    suspend fun aggregate(search: NzbSearch): NzbSourceAggregation = aggregate(search, captureScope())
+
+    suspend fun aggregate(search: NzbSearch, capturedScope: NzbIndexerStore.Scope?): NzbSourceAggregation = coroutineScope {
+        val scope = capturedScope ?: return@coroutineScope NzbSourceAggregation.empty()
+        val document = (readScope(scope) as? NzbIndexerStore.Read.Ready)?.document
             ?: return@coroutineScope NzbSourceAggregation.empty()
         val revision = document.revision
         val admission = NzbSearchAdmission(scope, revision)
         val indexed = document.indexers.filter { it.enabled }.map { config ->
             async {
-                val key = store.keyFor(config.id, scope) ?: return@async null
-                val releases = client.search(config, key, search).getOrNull() ?: return@async null
-                config to releases
+                try {
+                    val key = keyFor(config.id, scope) ?: return@async null
+                    val releases = searchReleases(config, key, search).getOrNull() ?: return@async null
+                    config to releases
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    null
+                }
             }
         }.awaitAll().filterNotNull()
         coroutineContext.ensureActive()
         // A late result cannot admit across account/profile/config mutations.
-        val current = (store.read(scope) as? NzbIndexerStore.Read.Ready)?.document
-        if (!admission.accepts(store.isCurrent(scope), current?.revision, coroutineContext.isActive)) {
+        val current = (readScope(scope) as? NzbIndexerStore.Read.Ready)?.document
+        if (!admission.accepts(scopeCurrent(scope), current?.revision, coroutineContext.isActive)) {
             return@coroutineScope NzbSourceAggregation.empty(admission)
         }
         NzbSourceAggregation(
@@ -61,8 +84,8 @@ internal class NzbSourceAggregator(
     /** Re-check immediately before the terminal update reaches a visible/prewarm consumer. */
     fun isAdmitted(result: NzbSourceAggregation, coroutineActive: Boolean = true): Boolean {
         val admission = result.admission ?: return result.groups.isEmpty()
-        val current = (store.read(admission.scope) as? NzbIndexerStore.Read.Ready)?.document
-        return admission.accepts(store.isCurrent(admission.scope), current?.revision, coroutineActive)
+        val current = (readScope(admission.scope) as? NzbIndexerStore.Read.Ready)?.document
+        return admission.accepts(scopeCurrent(admission.scope), current?.revision, coroutineActive)
     }
 
     private fun NzbRelease.toStream(indexerId: String, indexerName: String): StreamSource {
@@ -89,6 +112,32 @@ internal class NzbSourceAggregator(
     }
 
     private companion object { const val BASE = "nzbindexer:" }
+}
+
+/** Native account namespaces are authenticated VortX account IDs, not the currently selected streaming UID. */
+internal fun nativeNzbScopeMatches(scope: NzbIndexerStore.Scope, owner: VortxNativeOwner): Boolean {
+    val account = scope.owner.scope as? DebridOwnerScope.Account ?: return false
+    return scope.profileId == owner.profileID && owner.scope.accountID == "account.${account.id.lowercase()}"
+}
+
+/** Only an identity-matching, approved detail and exact selected episode can authorize a direct query. */
+internal fun nativeNzbSearch(detail: MetaDetail?, type: MediaType, id: String, episodeId: String?): NzbSearch? {
+    if (detail == null || detail.id != id || detail.type != type || detail.name.isBlank()) return null
+    val imdb = id.takeIf { NzbSearch.imdbDigits(it) != NzbSearch.INVALID_IMDB }
+    val search = when (type) {
+        MediaType.MOVIE -> {
+            if (episodeId != null && episodeId != id) return null
+            NzbSearch(detail.name, movieImdbId = imdb, year = detail.releaseInfo?.let {
+                Regex("\\b(18|19|20)\\d{2}\\b").find(it)?.value?.toIntOrNull()
+            })
+        }
+        MediaType.SERIES -> {
+            val episode = detail.videos.singleOrNull { it.id == episodeId } ?: return null
+            NzbSearch(detail.name, seriesImdbId = imdb, season = episode.season, episode = episode.episode)
+        }
+        else -> return null
+    }
+    return search.takeIf(NzbSearch::isValid)
 }
 
 /** A direct-source result carries the exact scope/config receipt which authorized its groups. */

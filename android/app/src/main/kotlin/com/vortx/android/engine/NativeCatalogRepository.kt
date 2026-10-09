@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -33,6 +34,7 @@ internal class NativeCatalogRepository(
     private val signOutAccount: (suspend () -> Unit)? = null,
     private val captureReclaimAdmission: ((VortxNativeSession, VortxNativeOwner) -> ((() -> Boolean) -> Boolean)?)? = null,
     private val withReclaimLifecycle: ((() -> Boolean) -> Boolean) = { action -> action() },
+    private val nzbSourceAggregator: NzbSourceAggregator? = null,
     private val sessionProvider: () -> VortxNativeSession,
 ) : CatalogRepository, AuthRepository {
     private data class CatalogSpec(val addon: VortxResourceAddon, val catalog: JSONObject) {
@@ -374,6 +376,9 @@ internal class NativeCatalogRepository(
     }
     override suspend fun streams(type: MediaType, id: String, episodeId: String?, rememberedQuality: String?, wantedAddon: String?, forceRefresh: Boolean): Result<List<StreamGroup>> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)
+        // Capture the direct-source owner/profile before native resource loading can suspend. Passing
+        // this exact nullable scope later prevents a profile/account switch from retargeting the query.
+        val indexerScope = nzbSourceAggregator?.captureNativeScope(read.owner)
         val stream = VortxResourceRequest(VortxResourceRequest.Resource.STREAM, type.id, episodeId ?: id)
         val pages = session.load("streams", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons, stream to addons))
         val metaPage = policyPage(pages[0], read, "streams", pages)
@@ -384,12 +389,23 @@ internal class NativeCatalogRepository(
             episodeId != null && detail.videos.any { it.id == episodeId }
         } else episodeId == null || episodeId == id) { "Stream identity is not in approved metadata" }
         val rawGroups = EngineState.parseStreamGroups(VortxResourceProjection.metaDetails(metaPage, pages[1], stream, addons), episodeId ?: id)
-        val groups = if (parental(read)) rawGroups.map { group -> group.copy(streams = group.streams.filter {
-            StreamRanking.passesUserFilters(it, com.vortx.android.sources.SourcePrefsSnapshot.DEFAULT.copy(isKids = true))
-        }) } else rawGroups
-        if (groups.none { it.streams.isNotEmpty() }) requireSettled(pages[1])
         val selectedEpisode = detail?.videos?.find { it.id == episodeId }
+        val search = nativeNzbSearch(detail, type, id, episodeId)
+        val direct = if (search != null && indexerScope != null) {
+            try { nzbSourceAggregator!!.aggregate(search, indexerScope) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { NzbSourceAggregation.empty() } // An indexer failure never erases working addons.
+        } else NzbSourceAggregation.empty()
+        val coroutine = currentCoroutineContext()
         session.publish("streams", read.owner, pages) {
+            coroutine.ensureActive()
+            check(sessionProvider() === session) { "Native account changed" }
+            val indexerGroups = if (nzbSourceAggregator?.isAdmitted(direct, coroutine.isActive) == true) direct.groups else emptyList()
+            val combined = mergeNzbGroups(rawGroups, indexerGroups)
+            val groups = if (parental(read)) combined.map { group -> group.copy(streams = group.streams.filter {
+                StreamRanking.passesUserFilters(it, com.vortx.android.sources.SourcePrefsSnapshot.DEFAULT.copy(isKids = true))
+            }) } else combined
+            if (groups.none { it.streams.isNotEmpty() }) requireSettled(pages[1])
             synchronized(this) {
                 if (detail != null) detailCache[type to id] = read.owner to detail
                 sourceBindings.clear()
@@ -771,12 +787,32 @@ internal class NativeCatalogRepository(
     }
     private suspend fun resolveOwned(session: VortxNativeSession, read: VortxNativeRead, source: StreamSource, episode: Episode?, binding: SourceBinding? = null): Playable {
         val sequence = resolveSequence.incrementAndGet()
-        val playable = playbackResolver.resolve(source, episode)
+        val sourceToken = source.nativePlaybackToken
+        val resolutionCoroutine = currentCoroutineContext()
+        // The resolver may await local preparation. Its retirement probe uses the same captured
+        // owner and selection checks as final admission, without capturing a newer session/owner.
+        fun requireCurrent() {
+            resolutionCoroutine.ensureActive()
+            check(sessionProvider() === session && resolveSequence.get() == sequence) { "Native playback superseded" }
+            if (binding != null) synchronized(this) { check(sourceBindings[sourceToken] === binding) { "Native source selection expired" } }
+        }
+        val playable = try {
+            playbackResolver.resolve(source, episode,
+                isCurrent = { try { session.owned(read.owner) { requireCurrent(); true } } catch (_: Exception) { false } },
+                // A handed-off lease outlives its resolve Job and later source loads/prewarm.
+                // Its durable account/profile/binding authority is the exact captured native owner.
+                playbackIsCurrent = { try { sessionProvider() === session && session.accepts(read.owner) } catch (_: Exception) { false } })
+        } catch (cancelled: CancellationException) {
+            // Resolver retirement is a handled stale selection, not cancellation of its caller.
+            // A genuinely cancelled caller or a still-current resolver cancellation stays terminal.
+            resolutionCoroutine.ensureActive()
+            session.owned(read.owner) { requireCurrent() }
+            throw cancelled
+        }
         try {
             currentCoroutineContext().ensureActive()
             return session.owned(read.owner) {
-                check(sessionProvider() === session && resolveSequence.get() == sequence) { "Native playback superseded" }
-                if (binding != null) synchronized(this) { check(sourceBindings[source.nativePlaybackToken] === binding) { "Native source selection expired" } }
+                requireCurrent()
                 if (binding == null) playable else {
                     val resume = session.resolve(JSONObject().put("kind", "resume_point").put("id", binding.context.videoId), read.owner)
                     check(resume.getString("kind") == "resume_point") { "Native resume projection unavailable" }
