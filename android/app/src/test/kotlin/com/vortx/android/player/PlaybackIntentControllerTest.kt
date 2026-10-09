@@ -4,6 +4,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -238,6 +240,76 @@ class PlaybackIntentControllerTest {
         assertFalse(subject.snapshot().shouldPlay)
         assertEquals("pause", engine.actions.last())
         assertTrue("resource hook precedes publication", "background" in engine.actions)
+    }
+
+    @Test fun `private candidate preparation cannot rebind commands from the published successor`() {
+        val stale = RecordingEngine()
+        val successor = RecordingEngine()
+        val subject = PlaybackIntentController()
+        subject.bind(successor)
+        subject.userPause()
+        prepareAndLoadEngine(stale,
+            com.vortx.android.model.Playable("https://example.invalid/video.mkv", "Video"),
+            { true }, { true }, subject, bindForCommands = false)
+        val staleActions = stale.actions.toList()
+
+        subject.userPlay()
+        subject.userPause()
+
+        assertEquals(staleActions, stale.actions)
+        assertEquals(listOf("play", "pause"), successor.actions.takeLast(2))
+        assertEquals("pause", stale.actions.last())
+    }
+
+    @Test fun `retiring an old engine cannot unbind its successor`() {
+        val stale = RecordingEngine()
+        val successor = RecordingEngine()
+        val subject = PlaybackIntentController()
+        subject.bind(stale)
+        subject.bind(successor)
+        subject.unbindIfCurrent(stale)
+        subject.userPause()
+        assertEquals("pause", successor.actions.last())
+        subject.unbindIfCurrent(successor)
+        val actions = successor.actions.toList()
+        subject.userPlay()
+        assertEquals(actions, successor.actions)
+    }
+
+    @Test fun `private background candidate cannot pause a live foreground successor`() {
+        val successor = RecordingEngine()
+        val candidate = RecordingEngine()
+        val subject = PlaybackIntentController()
+        subject.bind(successor)
+        val before = successor.actions.toList()
+        prepareAndLoadEngine(candidate,
+            com.vortx.android.model.Playable("https://example.invalid/video.mkv", "Video"),
+            { false }, { true }, subject, bindForCommands = false)
+
+        assertTrue(subject.snapshot().shouldPlay)
+        assertEquals(before, successor.actions)
+        assertEquals("pause", candidate.actions.last())
+        assertTrue("background" in candidate.actions)
+    }
+
+    @Test fun `cancellation at publication boundary never binds or exposes a prepared engine`() = runBlocking {
+        val successor = RecordingEngine()
+        val candidate = RecordingEngine()
+        val subject = PlaybackIntentController()
+        subject.bind(successor)
+        var published = false
+        val job = launch {
+            reconcileAndPublishEngine(candidate, { true }, { true }, subject,
+                beforePublication = { currentCoroutineContext().cancel() },
+                publish = { published = true })
+        }
+        job.join()
+        assertTrue(job.isCancelled)
+        assertFalse(published)
+        assertTrue(candidate.actions.isEmpty())
+        subject.userPause()
+        assertEquals("pause", successor.actions.last())
+        Unit
     }
 
     private class RecordingEngine : PlayerEngine {

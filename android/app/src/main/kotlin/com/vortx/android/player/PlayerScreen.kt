@@ -91,11 +91,8 @@ import com.vortx.android.trickplay.CommunityTrickplay
 import com.vortx.android.trickplay.TrickplaySession
 import com.vortx.android.ui.theme.vortxGlassProminent
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
@@ -444,109 +441,65 @@ fun PlayerScreen(
     // Until the engine lands, the composition shows the connecting state below (the same spinner the
     // chrome shows pre-first-frame), never a dead black frame.
     //
-    // Ownership is race-free via [engineHolder]: the built engine is set inside the build block (no
-    // suspension point between create and set), and every release path -- the keyed dispose below, the
-    // lifecycle ON_DESTROY, and the "composition left while still building" tail -- claims it with ONE
-    // atomic getAndSet(null), so exactly one release ever runs no matter how teardown races the build.
-    val engineHolder = remember(playbackSessionKey, forceExoPlayer, enginePreference) { AtomicReference<PlayerEngine?>(null) }
-    // This gate deliberately spans source and episode replacements inside one mounted player. Each
-    // generation registers its immutable host callback below; a release from an old generation must
-    // never be forwarded through a latest-value callback to the new generation's reclaim coordinator.
-    val resourceReleaseGate = remember(outerPlaybackSessionId) {
-        PlayerResourceReleaseGate()
-    }
+    // Construction is owned before a decoder exists. A canceled dispatcher return cannot skip cleanup,
+    // and disposal never releases an engine that a non-cancellable constructor is still preparing.
+    val resourceReleaseGate = remember(outerPlaybackSessionId) { PlayerResourceReleaseGate() }
     DisposableEffect(resourceReleaseGate, playbackSessionKey) {
         resourceReleaseGate.registerReleaseCallback(playbackSessionKey, onResourcesReleased)
         onDispose { }
     }
-    fun releaseBoundEngine() {
-        engineHolder.getAndSet(null)?.let { engine ->
-            engine.release()
-            resourceReleaseGate.decoderReleased()
-        }
+    val engineHolder = remember(playbackSessionKey, forceExoPlayer, enginePreference) {
+        PlayerEngineBuildOwner(resourceReleaseGate::decoderBound, resourceReleaseGate::decoderReleased,
+            playbackIntent::unbindIfCurrent)
     }
+    fun releaseBoundEngine() = engineHolder.close()
+    DisposableEffect(engineHolder) { onDispose { releaseBoundEngine() } }
+    // These effects must exist while Connecting too; an unpublished/failed decoder is not a lease owner.
+    DisposableEffect(resourceReleaseGate, currentPlayable.playbackLease) {
+        val leaseOwner = PlayerPlaybackLeaseOwner(currentPlayable.playbackLease,
+            resourceReleaseGate::leaseBound, resourceReleaseGate::leaseReleased)
+        onDispose { runCatching { leaseOwner.close() } }
+    }
+    DisposableEffect(resourceReleaseGate) { onDispose { resourceReleaseGate.sessionDisposed() } }
     var builtEngine by remember(playbackSessionKey, forceExoPlayer, enginePreference) { mutableStateOf<PlayerEngine?>(null) }
+    var engineBuildFailed by remember(playbackSessionKey, forceExoPlayer, enginePreference) { mutableStateOf(false) }
     LaunchedEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
-        // A user engine switch resumes at the live position; every other rebuild loads the source at its
-        // own resume point. Consume the pending resume once so a later surface-fail rebuild is unaffected.
         val resumeAt = engineSwitchResumeMs[0]
         engineSwitchResumeMs[0] = -1L
         val playableForEngine =
             if (resumeAt >= 0L) currentPlayable.copy(startPositionMs = resumeAt) else currentPlayable
         val wantsMpv = !forceExoPlayer &&
             PlayerEngineRouter.choose(currentPlayable, enginePreference) == PlayerEngineRouter.Engine.MPV
-        val engine: PlayerEngine = if (wantsMpv) {
-            // NonCancellable: a half-initialized native mpv context must never be abandoned mid-build
-            // (cancellation would leak it un-releasable); the block always completes, and the isActive
-            // check below hands a build that lost its composition straight to release.
-            withContext(Dispatchers.Default + NonCancellable) {
-                MpvEngineFactory.create(context)?.also {
-                    engineHolder.set(it)
-                    resourceReleaseGate.decoderBound()
-                    prepareAndLoadEngine(
-                        it,
-                        playableForEngine,
-                        lifecycleStarted = {
-                            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-                        },
+        try {
+            val engine = engineHolder.build(
+                createBackground = if (wantsMpv) ({ MpvEngineFactory.create(context) }) else null,
+                // The existing MPV-unavailable fallback stays on main, as required by Media3's looper.
+                createForeground = { ExoPlayerEngine(context) },
+                prepare = { candidate ->
+                    prepareAndLoadEngine(candidate, playableForEngine,
+                        lifecycleStarted = { lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) },
                         pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
                         playbackIntent = playbackIntent,
-                    ) {
-                        if (it.audioOutputModeAvailable) it.setAudioOutputMode(audioOutputMode)
-                    }
-                }
-            } ?: ExoPlayerEngine(context).also {
-                // Fail-soft fallback (mpv unavailable), on the main thread per the Media3 contract.
-                engineHolder.set(it)
-                resourceReleaseGate.decoderBound()
-                prepareAndLoadEngine(
-                    it,
-                    playableForEngine,
-                    lifecycleStarted = {
-                        lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-                    },
-                    pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
-                    playbackIntent = playbackIntent,
-                )
-            }
-        } else {
-            ExoPlayerEngine(context).also {
-                engineHolder.set(it)
-                resourceReleaseGate.decoderBound()
-                prepareAndLoadEngine(
-                    it,
-                    playableForEngine,
-                    lifecycleStarted = {
-                        lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-                    },
-                    pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
-                    playbackIntent = playbackIntent,
-                )
-            }
-        }
-        if (!isActive) {
-            // The player left composition while the engine was still initializing; the dispose below
-            // may already have run (and found the holder empty), so this tail owns the release.
+                        bindForCommands = false,
+                        refreshAudioRoute = { if (candidate.audioOutputModeAvailable) candidate.setAudioOutputMode(audioOutputMode) })
+                },
+            ) ?: return@LaunchedEffect
+            // Only a live, completely prepared main-thread publication may take command authority.
+            reconcileAndPublishEngine(
+                engine = engine,
+                lifecycleStarted = { lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED) },
+                pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
+                playbackIntent = playbackIntent,
+                refreshAudioRoute = { if (engine.audioOutputModeAvailable) engine.setAudioOutputMode(audioOutputMode) },
+                publish = { builtEngine = it },
+            )
+        } catch (cancelled: CancellationException) {
             releaseBoundEngine()
-            return@LaunchedEffect
+            throw cancelled
+        } catch (_: Exception) {
+            releaseBoundEngine()
+            engineBuildFailed = true
         }
-        // withContext above may have returned after ON_STOP. This is the final main-thread publication
-        // gate: re-sample lifecycle now, apply resources + transport intent, then expose the engine.
-        reconcileAndPublishEngine(
-            engine = engine,
-            lifecycleStarted = {
-                lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
-            },
-            pausePlaybackInBackground = { !KeepPlayingBackgroundSetting.isEnabled(context) },
-            playbackIntent = playbackIntent,
-            refreshAudioRoute = {
-                if (engine.audioOutputModeAvailable) engine.setAudioOutputMode(audioOutputMode)
-            },
-            publish = { builtEngine = it },
-        )
-    }
-    DisposableEffect(playbackSessionKey, forceExoPlayer, enginePreference) {
-        onDispose { releaseBoundEngine() }
     }
 
     // PLAYER ORIENTATION LOCK + IMMERSIVE MODE. A video player presents landscape: request sensor
@@ -592,13 +545,15 @@ fun PlayerScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                CircularProgressIndicator(color = emberAccent, modifier = Modifier.size(44.dp))
+                if (!engineBuildFailed) CircularProgressIndicator(color = emberAccent, modifier = Modifier.size(44.dp))
                 Text(
-                    text = "Connecting...",
+                    text = if (engineBuildFailed) "Unable to start playback" else "Connecting...",
                     color = Color.White.copy(alpha = 0.85f),
                     fontWeight = FontWeight.Medium,
                     fontSize = 13.sp,
                 )
+                if (engineBuildFailed) Text("Back to sources", color = Color.White,
+                    modifier = Modifier.clickable(role = Role.Button, onClick = ::exitPlayer).focusable())
             }
         }
         return
@@ -1506,19 +1461,6 @@ fun PlayerScreen(
     // session state, never the engine that is being released alongside it.
     DisposableEffect(playbackSessionKey) {
         onDispose { trickplay.finishAndFlush() }
-    }
-    // A final proof is scoped to the mounted player, not an accepted source/episode replacement.
-    // The gate still waits for every decoder and lease counted by the entire outer session.
-    DisposableEffect(outerPlaybackSessionId) {
-        onDispose { resourceReleaseGate.sessionDisposed() }
-    }
-    // A replacement, back navigation, profile change, or composition teardown releases a native NZB producer.
-    DisposableEffect(currentPlayable.playbackLease) {
-        currentPlayable.playbackLease?.let { resourceReleaseGate.leaseBound() }
-        onDispose {
-            runCatching { currentPlayable.playbackLease?.close() }
-            resourceReleaseGate.leaseReleased()
-        }
     }
 
     // When playback reaches its natural end, hand the ended signal to the host: the phone shell's Up

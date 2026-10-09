@@ -22,6 +22,38 @@ class PlayerTvExitContractTest {
     }
 
     @Test
+    fun `Connecting owns decoder lease and outer release before its early return`() {
+        val screen = source("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
+        val connecting = screen.indexOf("if (engine == null)")
+        assertTrue(connecting > 0)
+        for (required in listOf(
+            "PlayerEngineBuildOwner(",
+            "DisposableEffect(engineHolder)",
+            "PlayerPlaybackLeaseOwner(currentPlayable.playbackLease",
+            "onDispose { resourceReleaseGate.sessionDisposed() }",
+            "BackHandler(enabled = !playerExitRequested)",
+        )) {
+            assertTrue("$required must be mounted during Connecting", screen.indexOf(required) in 0 until connecting)
+        }
+        assertTrue(screen.contains("val engine = engineHolder.build("))
+        assertTrue(screen.contains("bindForCommands = false"))
+        assertTrue(screen.contains("reconcileAndPublishEngine("))
+        assertFalse(screen.contains("engineHolder.set("))
+        assertFalse(screen.contains("withContext(Dispatchers.Default + NonCancellable)"))
+    }
+
+    @Test
+    fun `construction failure is terminal and keeps a Back action without a retry timer`() {
+        val screen = source("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
+        assertTrue(screen.contains("catch (cancelled: CancellationException)"))
+        assertTrue(screen.contains("throw cancelled"))
+        assertTrue(screen.contains("engineBuildFailed = true"))
+        assertTrue(screen.contains("if (!engineBuildFailed) CircularProgressIndicator"))
+        assertTrue(screen.contains("if (engineBuildFailed) \"Unable to start playback\""))
+        assertTrue(screen.contains("onClick = ::exitPlayer).focusable()"))
+    }
+
+    @Test
     fun `original orientation survives in-player retry and Up Next session replacement`() {
         val screen = source("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt")
 
