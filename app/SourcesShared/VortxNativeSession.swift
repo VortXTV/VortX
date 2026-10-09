@@ -1103,8 +1103,24 @@ actor VortxNativeSession {
         let name = screen.rawValue
         let (bridge, ticket, capturedEpoch, profile) = try begin(name)
         do {
-            let result = try await bridge.load(ownerID: profile, request: request, addons: addons)
-            guard current(name, ticket, capturedEpoch), bridge.accepts(result) else { throw VortxNativeError.superseded }
+            let result: VortxResourceSnapshot
+            do {
+                let received = try await bridge.load(ownerID: profile, request: request, addons: addons)
+                guard current(name, ticket, capturedEpoch), bridge.accepts(received) else { throw VortxNativeError.superseded }
+                result = received
+            } catch {
+                try Task.checkCancellation()
+                guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+                if case VortxNativeError.superseded = error { throw error }
+                guard append else { throw error }
+                // A failed page settles only its requested catalog. Keep prior pages and peers;
+                // never replace the entire board with a generic operation-error envelope.
+                let category = error is VortxNativeError ? VortxNativeError.diagnosticCode(error) : "transport_failed"
+                NSLog("[VortXNative] resource=catalog result=failed category=%@", category)
+                result = .init(ownerID: profile, requestID: UUID().uuidString, generation: 0, request: request,
+                    groups: addons.map { .init(addonId: $0.id, status: .error, content: nil, error: .init(code: "native_catalog_failed")) },
+                    sourceURLs: Dictionary(addons.map { ($0.id, $0.transportUrl) }, uniquingKeysWith: { first, _ in first }))
+            }
             var accepted = append ? pages[name] ?? [] : []
             // A cancelled host publication can leave its already accepted page in this actor.
             // Retrying the identical source/path replaces that page instead of duplicating it.

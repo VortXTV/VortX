@@ -8,12 +8,14 @@ import CryptoKit
     static func shortUnwatchedEpisode() throws {
         let runtime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: "short-play-owner", ownerName: "Fixture")
         defer { runtime.close() }
+        check(try runtime.dispatch(#"{"type":"bind_sync_scope","scope":"short-play-fixture"}"#, now: 1000).contains("\"ok\":true"))
         let action = #"{"type":"report_progress","metaId":"fresh-series","videoId":"fresh-series:1:1","name":"Fresh series","positionMs":1000,"durationMs":1375000,"metadata":{"type":"series"}}"#
         check(try runtime.dispatch(action, now: 1001).contains("\"ok\":true"))
         func verify(_ candidate: VortxNativeRuntime) throws {
             let state = try JSONDecoder().decode(VortxJSON.self, from: Data(candidate.stateJSON().utf8))
             let response = try candidate.resolve(#"{"kind":"profile_playback","profileId":"short-play-owner"}"#)
             let playback = try JSONDecoder().decode(VortxJSON.self, from: Data(response.utf8))
+            check(playback["kind"] == .string("profile_playback"))
             let row = playback["continueWatching"]?.array?.first { $0["metaId"] == .string("fresh-series") }
             check(row?["videoId"] == .string("fresh-series:1:1") && row?["offsetMs"] == .integer(1000))
             check(row?["durationMs"] == .integer(1375000) && row?["watched"] == .bool(false))

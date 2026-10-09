@@ -29,6 +29,16 @@ final class CoreSearchPublicationFence: @unchecked Sendable {
     func invalidate() { lock.withLock { generation = UUID() } }
 }
 
+/// A queued board snapshot can predate a page request. Only the appended terminal page may
+/// settle that request; an older Ready snapshot must not mark the row exhausted.
+struct CoreBoardPageRequest {
+    let itemCount: Int
+    let pageCount: Int
+    func acceptsSettlement(pageCount observedPageCount: Int, isLoading: Bool) -> Bool {
+        observedPageCount > pageCount && !isLoading
+    }
+}
+
 /// Bridges the native Rust **stremio-core** engine (StremioXCore.xcframework) to Swift.
 ///
 /// The engine owns catalogs, library, Continue-Watching, meta and streams, the same way the official
@@ -659,7 +669,7 @@ final class CoreBridge: ObservableObject {
         addons = []; rawAddonsByUrl = [:]; manifestPreviewCache = [:]
         AddonMetaGate.publish(false)
         boardCatalogTotal = 0; boardPageInFlight = false; boardRowPageInFlight = [:]; boardRowExhausted = []
-        deferredBoardRowPages = []; deferredBoardRangeStep = nil
+        deferredBoardRowPages = []; deferredBoardRangeDepth = nil
         metaLoadTargetLock.withLock { requestedMetaLoadTarget = nil }
         pendingEpisodeWatched = [:]; refindRequest = nil; cancelAppleCWMetaRefresh()
         invalidateNZBIndexerResults(); streamsEpoch &+= 1
@@ -2097,7 +2107,7 @@ final class CoreBridge: ObservableObject {
         boardPageInFlight = false
         boardRowPageInFlight = [:]   // catalogs reload from page 1, so engine indices reset (#95)
         boardRowExhausted = []
-        deferredBoardRowPages = []; deferredBoardRangeStep = nil
+        deferredBoardRowPages = []; deferredBoardRangeDepth = nil
         dispatch(action: ["action": "Load",
                           "args": ["model": "CatalogsWithExtra",
                                    "args": ["type": NSNull(), "extra": []]]],
@@ -2120,10 +2130,10 @@ final class CoreBridge: ObservableObject {
     /// to ONE catalog, which we drive per row on horizontal scroll. Keyed by the engine catalog index
     /// (stable across LoadNextPage + board widening; carried on `CoreBoardRow.engineIndex`). Both maps are
     /// touched only on the main queue (mirrors `boardPageInFlight`).
-    private var boardRowPageInFlight: [Int: Int] = [:]   // engineIndex -> item count when the load was dispatched
+    private var boardRowPageInFlight: [Int: CoreBoardPageRequest] = [:] // counts at dispatch, not at callback time
     private var boardRowExhausted: Set<Int> = []          // engine indices whose last settled load added nothing
     private var deferredBoardRowPages: Set<Int> = []
-    private var deferredBoardRangeStep: Int?
+    private var deferredBoardRangeDepth: Int?
 
     /// True while the requested range has not covered the engine's raw catalog count. The visible
     /// `boardRows` count is intentionally irrelevant: hidden, disabled, empty, and failed rows are
@@ -2140,11 +2150,20 @@ final class CoreBridge: ObservableObject {
     /// Home was permanently capped at its first 30 catalogs.
     func loadBoardNextPage(step: Int = 30) {
         guard boardHasNextPage, !boardPageInFlight else { return }
+        widenBoardRange(to: boardRowsLoaded + step)
+    }
+
+    /// Every non-restart widening shares the row-page fence, including late order hydration
+    /// and the Live tab. Keep an absolute maximum so coalesced requests cannot lose depth.
+    private func widenBoardRange(to needed: Int) {
+        guard needed > boardRowsLoaded else { return }
 #if VORTX_NATIVE_DATA_ENGINE
-        if !boardRowPageInFlight.isEmpty { deferredBoardRangeStep = step; return }
+        if !boardRowPageInFlight.isEmpty {
+            deferredBoardRangeDepth = max(deferredBoardRangeDepth ?? 0, needed); return
+        }
 #endif
         boardPageInFlight = true
-        boardRowsLoaded += step
+        boardRowsLoaded = needed
         dispatch(action: ["action": "CatalogsWithExtra",
                           "args": ["action": "LoadRange", "args": ["start": 0, "end": boardRowsLoaded]]],
                  field: "board")
@@ -2163,15 +2182,19 @@ final class CoreBridge: ObservableObject {
         if !boardRowPageInFlight.isEmpty || board.catalogs.joined().contains(where: { $0.content?.isLoading == true }) {
             deferredBoardRowPages.insert(engineIndex); return
         }
-#endif
-        boardRowPageInFlight[engineIndex] = count
-        let accepted = dispatch(action: ["action": "CatalogsWithExtra",
+        guard let nativeFacade, !enginePublicationBlocked else { return }
+        switch nativeFacade.dispatchCatalogPage(field: "board", index: engineIndex) {
+        case .started(let itemCount, let pageCount):
+            boardRowPageInFlight[engineIndex] = CoreBoardPageRequest(itemCount: itemCount, pageCount: pageCount)
+        case .busy: deferredBoardRowPages.insert(engineIndex)
+        case .exhausted: boardRowExhausted.insert(engineIndex)
+        case .rejected: break
+        }
+#else
+        boardRowPageInFlight[engineIndex] = CoreBoardPageRequest(itemCount: count, pageCount: board.catalogs[engineIndex].count)
+        dispatch(action: ["action": "CatalogsWithExtra",
                           "args": ["action": "LoadNextPage", "args": engineIndex]],
                  field: "board")
-#if VORTX_NATIVE_DATA_ENGINE
-        if !accepted { boardRowPageInFlight[engineIndex] = nil; deferredBoardRowPages.insert(engineIndex) }
-#else
-        _ = accepted
 #endif
     }
 
@@ -2181,23 +2204,29 @@ final class CoreBridge: ObservableObject {
     /// loads, mirroring `discoverExhausted`). Main-queue only; takes the board decoded off-main by the caller.
     private func reconcileBoardRowPagination(_ board: CoreBoardState?) {
         guard let board else { return }
-        for (index, dispatchedCount) in boardRowPageInFlight {
+        for (index, request) in boardRowPageInFlight {
             guard index < board.catalogs.count else { boardRowPageInFlight[index] = nil; continue }
             let pages = board.catalogs[index]
+#if VORTX_NATIVE_DATA_ENGINE
+            guard request.acceptsSettlement(pageCount: pages.count, isLoading: pages.contains(where: { $0.content?.isLoading == true })) else { continue }
+#endif
             if pages.contains(where: { $0.content?.isLoading == true }) { continue }   // still settling; wait
             let count = pages.compactMap { $0.content?.ready }.flatMap { $0 }.count
             boardRowPageInFlight[index] = nil
-            if count <= dispatchedCount { boardRowExhausted.insert(index) }
+            if count <= request.itemCount { boardRowExhausted.insert(index) }
         }
 #if VORTX_NATIVE_DATA_ENGINE
         guard boardRowPageInFlight.isEmpty, !board.catalogs.joined().contains(where: { $0.content?.isLoading == true }) else { return }
-        if let step = deferredBoardRangeStep {
-            deferredBoardRangeStep = nil; loadBoardNextPage(step: step)
-        } else {
-            deferredBoardRowPages = deferredBoardRowPages.filter { $0 < board.catalogs.count && !boardRowExhausted.contains($0) }
-            if let index = deferredBoardRowPages.min() {
-                deferredBoardRowPages.remove(index); loadBoardRowNextPage(engineIndex: index)
-            }
+        if let depth = deferredBoardRangeDepth {
+            deferredBoardRangeDepth = nil
+            if depth > boardRowsLoaded { widenBoardRange(to: depth); return }
+        }
+        deferredBoardRowPages = deferredBoardRowPages.filter { $0 < board.catalogs.count && !boardRowExhausted.contains($0) }
+        for index in deferredBoardRowPages.sorted() {
+            deferredBoardRowPages.remove(index); loadBoardRowNextPage(engineIndex: index)
+            // Exhausted/rejected admissions emit no callback. Drain them now so a later
+            // pageable row cannot remain queued forever behind an unsupported catalog.
+            if !boardRowPageInFlight.isEmpty || deferredBoardRowPages.contains(index) { break }
         }
 #endif
     }
@@ -2227,13 +2256,7 @@ final class CoreBridge: ObservableObject {
             engineCatalogTotal: boardCatalogTotal,
             installedCatalogTotal: installedCatalogTotal
         )
-        if needed > boardRowsLoaded {
-            boardRowsLoaded = needed
-            boardPageInFlight = true
-            dispatch(action: ["action": "CatalogsWithExtra",
-                              "args": ["action": "LoadRange", "args": ["start": 0, "end": needed]]],
-                     field: "board")
-        }
+        widenBoardRange(to: needed)
     }
 
     /// Ensure the Live tab can see EVERY installed add-on's live catalogs. The Live surface filters the
@@ -2256,11 +2279,7 @@ final class CoreBridge: ObservableObject {
             loadBoard(rows: max(needed, 30))
             return
         }
-        guard needed > boardRowsLoaded else { return }   // already wide enough
-        boardRowsLoaded = needed
-        dispatch(action: ["action": "CatalogsWithExtra",
-                          "args": ["action": "LoadRange", "args": ["start": 0, "end": needed]]],
-                 field: "board")
+        widenBoardRange(to: needed)
     }
 
     // MARK: Discover / Library

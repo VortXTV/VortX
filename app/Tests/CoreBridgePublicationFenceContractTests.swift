@@ -362,11 +362,22 @@ check(watchlistTarget.contains("CredentialScopeRegistry.shared.isCurrent(capture
         && !watchlistTarget.contains("nativePlaybackBinding(target)"),
       "watchlist preparation and acknowledgement retain stable credential/session/profile ownership through unrelated busy sync")
 let rowPagination = section(bridge, from: "func loadBoardRowNextPage(engineIndex:", until: "/// Apply a catalog presentation-order change")
-check(appearsBefore("deferredBoardRowPages.insert(engineIndex); return", "boardRowPageInFlight[engineIndex] = count", in: rowPagination)
-        && rowPagination.contains("if !accepted { boardRowPageInFlight[engineIndex] = nil")
+check(appearsBefore("deferredBoardRowPages.insert(engineIndex); return", "boardRowPageInFlight[engineIndex] = CoreBoardPageRequest", in: rowPagination)
+        && rowPagination.contains("case .busy: deferredBoardRowPages.insert(engineIndex)")
+        && rowPagination.contains("case .exhausted: boardRowExhausted.insert(engineIndex)")
+        && rowPagination.contains("for index in deferredBoardRowPages.sorted()")
+        && rowPagination.contains("if !boardRowPageInFlight.isEmpty || deferredBoardRowPages.contains(index) { break }")
         && rowPagination.contains("deferredBoardRowPages.remove(index); loadBoardRowNextPage(engineIndex: index)")
         && rowPagination.contains("!board.catalogs.joined().contains(where: { $0.content?.isLoading == true })"),
       "native row pagination waits for the active range/page without a stuck latch and retries after settlement")
+check(rowPagination.contains("CoreBoardPageRequest(itemCount: itemCount, pageCount: pageCount)")
+        && appearsBefore("guard request.acceptsSettlement(pageCount: pages.count", "boardRowPageInFlight[index] = nil\n            if count <= request.itemCount", in: rowPagination),
+      "native row pagination ignores queued snapshots predating the appended page before retiring its latch")
+let widening = section(bridge, from: "private func widenBoardRange", until: "// MARK: Discover / Library")
+check(widening.contains("deferredBoardRangeDepth = max(deferredBoardRangeDepth ?? 0, needed); return")
+        && widening.components(separatedBy: "widenBoardRange(to: needed)").count == 3
+        && widening.contains("if depth > boardRowsLoaded { widenBoardRange(to: depth); return }"),
+      "native order and Live widening coalesce absolute depth behind the same active row page fence")
 check(event.contains("guard let self, self.publicationStillCurrent(publicationToken) else { return }\n                    guard fingerprint != self.discoverPublishedFingerprint")
                 && event.contains("self.discoverPublishedFingerprint = fingerprint"),
               "Discover fingerprint mutation is main-gated by the captured publication token")

@@ -19,6 +19,14 @@ import Foundation
         let owner = fence.prepare("owner query").token
         fence.invalidate()
         precondition(!fence.accepts(owner) && fence.capture(query: "owner query") != owner)
+        let page = CoreBoardPageRequest(itemCount: 20, pageCount: 1)
+        precondition(!page.acceptsSettlement(pageCount: 1, isLoading: false)) // queued old Ready board
+        precondition(!page.acceptsSettlement(pageCount: 2, isLoading: true)) // appended pending page
+        precondition(page.acceptsSettlement(pageCount: 2, isLoading: false)) // Ready or Err terminal page
+        let nextPage = CoreBoardPageRequest(itemCount: 40, pageCount: 2)
+        precondition(!nextPage.acceptsSettlement(pageCount: 2, isLoading: false)) // previous completion cannot settle next
+        precondition(nextPage.acceptsSettlement(pageCount: 3, isLoading: false)) // empty terminal page still settles
         print("PASS search publication: trim, debounce gap, stale query, ABA, cleared/short text and owner reset")
+        print("PASS board pagination: old queued snapshot, pending appended page, terminal page and subsequent request")
     }
 }

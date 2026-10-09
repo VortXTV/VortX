@@ -139,7 +139,7 @@ private final class CatalogFanoutTransport: VortxResourceTransport, @unchecked S
         lock.withLock { requests.append(key); tokens[key] = cancellation as? Token; active += 1; peak = max(peak, active) }
         defer { lock.withLock { active -= 1 } }
         if let gate = gates[key] { precondition(gate.wait(timeout: .now() + 10) == .success, "unreleased catalog \(key)") }
-        if request.id == "failure" { throw VortxNativeError.unavailable }
+        if request.id == "failure" || (request.id == "fifth" && skip != nil) { throw VortxNativeError.unavailable }
         let meta: VortxJSON = .object(["id": .string(key), "name": .string(key), "type": .string(request.type)])
         let groups: [VortxJSON] = [.object(["addonId": input["addons"]!.array!.first!["id"]!, "status": .string("ready"),
             "content": .object(["metas": .array([meta])])])]
@@ -167,12 +167,12 @@ private final class CatalogPublications: @unchecked Sendable {
     }
     static func catalogFanoutTests() async throws {
         let ids = ["slow", "failure", "fast", "fourth", "fifth", "sixth", "unrequested"]
-        let transport = CatalogFanoutTransport(held: ids.prefix(6).map { "first/" + $0 })
+        let transport = CatalogFanoutTransport(held: ids.prefix(6).map { "first/" + $0 } + ["first/fast/skip1"])
         let session = try VortxNativeSession(scope: .init(account: "catalog-fanout", ownerProfileID: "owner"),
             ownerName: "Owner", abi: SessionABI(), store: SessionStore(), transport: transport, allowNewAccount: true)
         let registry = ids.map { id in VortxResourceAddon(id: "source-" + id, transportUrl: "https://\(id).fixture/manifest.json",
             manifest: .object(["catalogs": .array([.object(["id": .string(id), "type": .string("movie"),
-                "extraSupported": .array([.string("search"), .string("skip")])])])])) }
+                "extraSupported": .array(id == "fourth" ? [.string("search")] : [.string("search"), .string("skip")])])])])) }
         let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry, changed: { _ in })
         func state() -> VortxJSON? { facade.stateData("board").flatMap { try? JSONDecoder().decode(VortxJSON.self, from: $0) } }
         func rows() -> [VortxJSON] { state()?["catalogs"]?.array ?? [] }
@@ -197,6 +197,7 @@ private final class CatalogPublications: @unchecked Sendable {
         let horizontalPage = Data(#"{"action":"CatalogsWithExtra","args":{"action":"LoadNextPage","args":2}}"#.utf8)
         check(!facade.dispatch(data: horizontalPage, field: "board"))
         check(facade.lastFailure == "catalog_range_loading" && !transport.wasCancelled("first/slow"))
+        check(facade.dispatchCatalogPage(field: "board", index: 2) == .busy)
         check(rows().count == ids.count && rows()[6].array?.first?["content"] == .null)
         transport.release("first/failure")
         try await eventually { status(1) == .string("Err") && transport.started.count == 6 }
@@ -208,11 +209,25 @@ private final class CatalogPublications: @unchecked Sendable {
         check(rows().enumerated().allSatisfy { index, row in row.array?.first?["request"]?["path"]?["id"] == .string(ids[index]) })
         check(state()?["selected"]?["extra"] == .array([.array([.string("search"), .string("first")])]))
         try range(0, 5); await facade.settled(); check(transport.started.count == 6) // settled rows are reused
-        check(facade.dispatch(data: horizontalPage, field: "board")) // deferred UI request can now retry
+        check(facade.dispatchCatalogPage(field: "board", index: 3) == .exhausted) // no skip support: no global latch
+        check(transport.started.count == 6)
+        check(facade.dispatchCatalogPage(field: "board", index: 2) == .started(itemCount: 1, pageCount: 1))
+        try await eventually { transport.started.contains("first/fast/skip1") }
+        check(rows()[2].array?.count == 2 && rows()[2].array?.last?["content"]?["type"] == .string("Loading"))
+        transport.release("first/fast/skip1")
         await facade.settled()
         check(rows()[2].array?.count == 2 && status(0) == .string("Ready"))
         check(!rows().contains { $0.array?.contains { $0["content"]?["type"] == .string("Loading") } == true })
         try range(6, 6); await facade.settled(); check(transport.started.count == 8 && status(6) == .string("Ready"))
+        check(facade.dispatchCatalogPage(field: "board", index: 4) == .started(itemCount: 1, pageCount: 1))
+        await facade.settled()
+        check(rows()[4].array?.count == 2 && rows()[4].array?.last?["content"]?["type"] == .string("Err"))
+        check(rows().count == ids.count && rows()[2].array?.count == 2 && status(0) == .string("Ready"))
+        check(facade.dispatchCatalogPage(field: "board", index: 4) == .exhausted)
+        check(facade.dispatchCatalogPage(field: "board", index: 5) == .started(itemCount: 1, pageCount: 1))
+        await facade.settled()
+        check(rows()[5].array?.last?["content"]?["type"] == .string("Ready"))
+        check(rows()[4].array?.last?["content"]?["type"] == .string("Err")) // peer paging retains failure receipt
         try load("range"); try range(2, 2); await facade.settled()
         check(transport.started.filter { $0.hasPrefix("range/") } == ["range/fast"])
         check(status(2) == .string("Ready") && rows()[0].array?.first?["content"] == .null)

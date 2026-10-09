@@ -112,6 +112,27 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return dispatch(data: data, field: field)
         }
     }
+    enum CatalogPageAdmission: Equatable {
+        case started(itemCount: Int, pageCount: Int)
+        case busy, exhausted, rejected
+    }
+    /// Atomically distinguish a started page from an exhausted no-op. A Boolean dispatch result
+    /// cannot tell the UI whether it should retain its latch, retry after settlement, or stop.
+    func dispatchCatalogPage(field: String, index: Int) -> CatalogPageAdmission {
+        lock.withLock {
+            guard !closed, resourceRegistryValid, ["board", "search"].contains(field),
+                  let rows = values[field]?["catalogs"]?.array, rows.indices.contains(index) else { return .rejected }
+            guard pendingProfileTransitions == 0,
+                  !rows.contains(where: { $0.array?.contains { $0["content"]?["type"] == .string("Loading") } == true }) else { return .busy }
+            let pages = rows[index].array ?? []
+            guard nextCatalogPage(pages) != nil else { return .exhausted }
+            let action: VortxJSON = .object(["action": .string("CatalogsWithExtra"), "args": .object([
+                "action": .string("LoadNextPage"), "args": .integer(Int64(index))])])
+            guard let data = try? JSONEncoder().encode(action), dispatch(data: data, field: field) else { return .rejected }
+            let itemCount = pages.reduce(0) { $0 + ($1["content"]?["content"]?.array?.count ?? 0) }
+            return .started(itemCount: itemCount, pageCount: pages.count)
+        }
+    }
 
     static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
                        mutationAccepted: @escaping @Sendable () -> Void = {},

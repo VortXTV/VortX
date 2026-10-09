@@ -23,6 +23,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
 {
     printf '%s\n' 'import Foundation'
     sed -n '/^final class CoreSearchPublicationFence:/,/^}$/p' app/SourcesShared/CoreBridge.swift
+    sed -n '/^struct CoreBoardPageRequest {/,/^}$/p' app/SourcesShared/CoreBridge.swift
 } > "$native_test_dir/SearchPublication.swift"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   "$native_test_dir/SearchPublication.swift" app/Tests/CoreSearchPublicationFenceTests.swift \
