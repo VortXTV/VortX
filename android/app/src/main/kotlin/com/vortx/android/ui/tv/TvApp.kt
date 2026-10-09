@@ -95,6 +95,7 @@ fun TvApp(
 
         // The title currently open in Detail; null = the Home browse wall.
         var detail by remember { mutableStateOf<MetaItem?>(null) }
+        var quickWatchSelection by remember { mutableStateOf<TvQuickViewSelection?>(null) }
         var unavailableContinueWatching by remember { mutableStateOf<String?>(null) }
         unavailableContinueWatching?.let { message ->
             androidx.compose.material3.AlertDialog(onDismissRequest = { unavailableContinueWatching = null },
@@ -114,6 +115,8 @@ fun TvApp(
         // The browse destination belongs above the player overlay. Returning from a cloud or link play must
         // recreate the same Search surface rather than a fresh HOME shell.
         var shellDestination by remember { mutableStateOf(TvDestination.HOME) }
+        // Browse belongs to the retained shell route, including while detail or player replaces its UI.
+        var shellHomeBrowseSelected by remember { mutableStateOf(false) }
         var searchFocusRestoreSignal by remember { mutableStateOf(0) }
         val automaticEngineFor: (Playable) -> PlayerEngineRouter.Override = { candidate ->
             PlayerLaunchPolicy.effectivePreference(
@@ -130,6 +133,7 @@ fun TvApp(
             playingMeta = null
             autoAdvanceStreak[0] = 0
             detailGeneration += 1
+            quickWatchSelection = null
             detail = target.toMetaItem()
         }
 
@@ -193,7 +197,8 @@ fun TvApp(
             // so the lease fence must lose authority before any late resolver callback can publish.
             playerVm?.abandonPlaybackRoute()
             playing = null
-            if (shellDestination == TvDestination.SEARCH) searchFocusRestoreSignal++
+            // The merged Discover owner consumes this same focus signal after link/cloud playback.
+            searchFocusRestoreSignal++
         }
         if (playable != null) {
             // The player is a separate early-return branch, so it must enter the TV Material scope here
@@ -452,6 +457,7 @@ fun TvApp(
                         title = current.name,
                         onBack = {
                             detailVm.abandonPlaybackRoute()
+                            quickWatchSelection = null
                             detail = null
                         },
                         onPlay = { resolved, loadedMeta, requestedEngine ->
@@ -470,9 +476,12 @@ fun TvApp(
                         // title and opens it as a fresh detail, reusing the SAME detail slot the browse wall
                         // uses -- the couch analogue of the phone actor -> film walk.
                         onOpenTitle = {
+                            quickWatchSelection = null
                             detailGeneration += 1
                             detail = it
                         },
+                        autoWatch = tvQuickWatchMatchesDetail(quickWatchSelection, current, repo.continueWatchingOwner()),
+                        onAutoWatchConsumed = { quickWatchSelection = null },
                     )
                 }
             } else {
@@ -485,15 +494,25 @@ fun TvApp(
                     auth = auth,
                     destination = shellDestination,
                     onDestinationChange = { shellDestination = it },
+                    homeBrowseSelected = shellHomeBrowseSelected,
+                    onHomeBrowseSelectedChange = { shellHomeBrowseSelected = it },
                     searchFocusRestoreSignal = searchFocusRestoreSignal,
                     onRestoreSearchFocus = { searchFocusRestoreSignal++ },
                     onItem = {
+                        quickWatchSelection = null
                         if (it.continueWatchingAdmission?.isCurrent() != false) {
                             if (it.continueWatchingUnavailableMessage != null) unavailableContinueWatching = "${it.name}\n\n${it.continueWatchingUnavailableMessage}"
                             else {
                                 detailGeneration += 1
                                 detail = it
                             }
+                        }
+                    },
+                    onWatchItem = { item, owner ->
+                        if (owner == repo.continueWatchingOwner()) {
+                            quickWatchSelection = TvQuickViewSelection(item, owner)
+                            detailGeneration += 1
+                            detail = item
                         }
                     },
                     // A finished download plays straight into the shared player slot (no detail page), the same

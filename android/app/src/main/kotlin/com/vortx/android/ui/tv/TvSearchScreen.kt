@@ -1,5 +1,6 @@
 package com.vortx.android.ui.tv
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
@@ -10,18 +11,24 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.ImeAction
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.search.searchEmptyMessage
 import com.vortx.android.ui.search.textResourceId
+import com.vortx.android.ui.search.isSearchQueryEligible
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.SearchViewModel
@@ -44,6 +51,9 @@ fun TvSearchScreen(
     modifier: Modifier = Modifier,
     signedIn: Boolean = true,
     restoreQuickActionsFocusSignal: Int = 0,
+    // The Discover owner supplies its existing browse underneath the same field/recents/results.
+    browseContent: (@Composable (Modifier) -> Unit)? = null,
+    reselectSignal: Int = 0,
 ) {
     val searchState by viewModel.screenState.collectAsStateWithLifecycle()
     val history by viewModel.history.collectAsStateWithLifecycle()
@@ -51,6 +61,17 @@ fun TvSearchScreen(
     val query = searchState.query
     val state = searchState.content
     val colors = VortXTheme.colors
+    val fieldFocus = remember { FocusRequester() }
+    val initialReselect = remember { reselectSignal }
+    LaunchedEffect(reselectSignal) {
+        if (browseContent != null && reselectSignal != initialReselect) {
+            viewModel.onQueryChange("")
+            withFrameNanos { }
+            runCatching { fieldFocus.requestFocus() }
+        }
+    }
+    // First Back restores Discover browse; the shell owns the next Back to Home/Featured.
+    BackHandler(enabled = signedIn && browseContent != null && query.isNotBlank()) { viewModel.onQueryChange("") }
 
     // SD-8: a signed-out set sees a sign-in prompt, not empty add-on results.
     if (!signedIn) {
@@ -75,14 +96,20 @@ fun TvSearchScreen(
             leadingIcon = { Icon(VortXIcons.search, contentDescription = null, tint = colors.textSecondary) },
             placeholder = { Text("Search movies, series, channels", style = VortXTheme.type.body) },
             singleLine = true,
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+            keyboardActions = KeyboardActions(onSearch = { viewModel.submitQuery() }),
             textStyle = VortXTheme.type.body,
             colors = OutlinedTextFieldDefaults.colors(
                 focusedBorderColor = colors.accent,
                 unfocusedBorderColor = colors.hairline,
                 cursorColor = colors.accent,
             ),
-            modifier = Modifier.fillMaxWidth().padding(horizontal = TvDimens.edge),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = TvDimens.edge).focusRequester(fieldFocus),
         )
+        if (query.isNotEmpty()) {
+            TvFilterChip("Clear search", selected = false, onClick = { viewModel.onQueryChange("") },
+                modifier = Modifier.padding(horizontal = TvDimens.edge))
+        }
 
         if (query.isBlank() && history.isNotEmpty()) {
             // A trailing "Clear" chip (empty value) alongside the recents, matching the phone's recents row.
@@ -104,7 +131,9 @@ fun TvSearchScreen(
             )
         }
 
-        when (val s = state) {
+        if (browseContent != null && !isSearchQueryEligible(query)) {
+            browseContent(Modifier.weight(1f))
+        } else when (val s = state) {
             is UiState.Loading -> TvEmpty("Searching your add-ons…")
             // No retry affordance: the flow re-runs on the next query change, so a bare message (not a Retry
             // card) is the honest state, matching the phone's ErrorState(message) here.
@@ -117,6 +146,7 @@ fun TvSearchScreen(
                     else -> stringResource(message.textResourceId)
                 },
                 sectioned = true,
+                modifier = Modifier.weight(1f),
             )
         }
     }

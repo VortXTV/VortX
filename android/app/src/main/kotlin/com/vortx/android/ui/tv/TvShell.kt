@@ -21,6 +21,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
@@ -40,6 +41,7 @@ import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.data.AuthRepository
 import com.vortx.android.data.CatalogRepository
+import com.vortx.android.data.ContinueWatchingOwner
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.home.HomeRailSurface
 import com.vortx.android.iptv.LiveViewModel
@@ -98,8 +100,12 @@ fun TvShell(
     repo: CatalogRepository,
     auth: AuthRepository,
     onItem: (MetaItem) -> Unit,
+    // Watch carries the preview's immutable owner into the existing detail Watch entry point.
+    onWatchItem: (MetaItem, ContinueWatchingOwner) -> Unit,
     destination: TvDestination,
     onDestinationChange: (TvDestination) -> Unit,
+    homeBrowseSelected: Boolean,
+    onHomeBrowseSelectedChange: (Boolean) -> Unit,
     searchFocusRestoreSignal: Int,
     onRestoreSearchFocus: () -> Unit,
     modifier: Modifier = Modifier,
@@ -115,16 +121,17 @@ fun TvShell(
     var reselectSignal by remember { mutableStateOf(0) }
     var showPlayLinkSheet by remember { mutableStateOf(false) }
     var showDebridLibrary by remember { mutableStateOf(false) }
+    var quickViewSelection by remember { mutableStateOf<TvQuickViewSelection?>(null) }
+    var searchActionsRestoreSignal by remember { mutableStateOf(0) }
     var libraryRoute by remember { mutableStateOf(TvLibraryRoute.LANDING) }
     var libraryReturnRoute by remember { mutableStateOf(TvLibraryRoute.DOWNLOADS) }
     var libraryRestoreFocusSignal by remember { mutableStateOf(0) }
     val libraryEntryFocus = remember {
         listOf(TvLibraryRoute.DOWNLOADS, TvLibraryRoute.WATCHLIST, TvLibraryRoute.HISTORY).associateWith { FocusRequester() }
     }
-    var homeBrowseSelected by remember { mutableStateOf(false) }
     val debridKeys = remember(appContext) { DebridKeys(appContext) }
     val debridLibraryFocus = remember { FocusRequester() }
-    val modalVisible = showPlayLinkSheet || showDebridLibrary
+    val modalVisible = showPlayLinkSheet || showDebridLibrary || quickViewSelection != null
     fun openLibraryRoute(route: TvLibraryRoute) {
         libraryReturnRoute = route
         libraryRoute = route
@@ -143,7 +150,8 @@ fun TvShell(
     fun dismissSearchOverlay() {
         showPlayLinkSheet = false
         showDebridLibrary = false
-        if (destination == TvDestination.SEARCH) onRestoreSearchFocus()
+        searchActionsRestoreSignal++
+        onRestoreSearchFocus()
     }
 
     // Every rail tab (except the always-present Home + Settings) honors the SAME cross-platform "Show <tab>"
@@ -155,36 +163,54 @@ fun TvShell(
     val hiddenTabs by tabBarPrefs.state.collectAsStateWithLifecycle()
     val homePreferences = remember(appContext) { HomeDiscoverPreferences(appContext) }
     var mergeHomeDiscover by remember(homePreferences) { mutableStateOf(homePreferences.mergeHomeDiscover) }
+    var mergeDiscoverSearch by remember(homePreferences) { mutableStateOf(homePreferences.mergeDiscoverSearch) }
+    var cinemaQuickView by remember(homePreferences) { mutableStateOf(homePreferences.cinemaQuickView) }
+    val currentDestination by rememberUpdatedState(destination)
+    val currentHomeBrowseSelected by rememberUpdatedState(homeBrowseSelected)
+    val changeDestination by rememberUpdatedState(onDestinationChange)
+    val changeHomeBrowse by rememberUpdatedState(onHomeBrowseSelectedChange)
     DisposableEffect(homePreferences) {
-        val stop = homePreferences.observeChanges { mergeHomeDiscover = homePreferences.mergeHomeDiscover }
+        val stop = homePreferences.observeChanges {
+            val route = tvCinemaRouteAfterPreferencesChange(
+                TvCinemaRoute(currentDestination, currentHomeBrowseSelected), mergeHomeDiscover, tabBarPrefs.state.value,
+                homePreferences.mergeHomeDiscover, homePreferences.mergeDiscoverSearch,
+            )
+            mergeHomeDiscover = homePreferences.mergeHomeDiscover
+            mergeDiscoverSearch = homePreferences.mergeDiscoverSearch
+            cinemaQuickView = homePreferences.cinemaQuickView
+            changeHomeBrowse(route.homeBrowseSelected)
+            if (route.destination != currentDestination) changeDestination(route.destination)
+        }
         onDispose { stop() }
     }
-    val destinations = remember(hiddenTabs, mergeHomeDiscover) {
-        TvDestination.entries.filter { dest ->
-            when (dest) {
-                TvDestination.DISCOVER -> !mergeHomeDiscover && !hiddenTabs.hideDiscover
-                TvDestination.LIVE -> !hiddenTabs.hideLive
-                TvDestination.LIBRARY -> !hiddenTabs.hideLibrary
-                TvDestination.SEARCH -> !hiddenTabs.hideSearch
-                TvDestination.HOME, TvDestination.DOWNLOADS, TvDestination.ADDONS, TvDestination.SETTINGS -> true
-            }
-        }
+    val destinations = remember(hiddenTabs, mergeHomeDiscover, mergeDiscoverSearch) {
+        tvCinemaDestinations(hiddenTabs, mergeHomeDiscover, mergeDiscoverSearch)
     }
-    LaunchedEffect(destinations, destination, mergeHomeDiscover, hiddenTabs.hideDiscover) {
-        // A legacy Discover route is translated to the visible Browse mode before the removed rail entry
-        // heals to Home. A hidden Discover preference also hides Browse and heals to Featured.
-        if (destination == TvDestination.DISCOVER && mergeHomeDiscover) {
-            homeBrowseSelected = !hiddenTabs.hideDiscover
-        }
-        if (!mergeHomeDiscover || hiddenTabs.hideDiscover) homeBrowseSelected = false
-        if (destination !in destinations) onDestinationChange(TvDestination.HOME)
+    LaunchedEffect(destinations, destination, mergeHomeDiscover, mergeDiscoverSearch, hiddenTabs.hideDiscover) {
+        val route = tvCinemaRoute(destination, homeBrowseSelected, hiddenTabs, mergeHomeDiscover, mergeDiscoverSearch)
+        if (route.homeBrowseSelected != homeBrowseSelected) onHomeBrowseSelectedChange(route.homeBrowseSelected)
+        if (route.destination != destination) onDestinationChange(route.destination)
     }
+    LaunchedEffect(destination, cinemaQuickView) {
+        quickViewSelection = null
+    }
+    val onCatalogItem: (MetaItem) -> Unit = { item ->
+        if (tvCatalogOpensQuickView(item, cinemaQuickView)) {
+            quickViewSelection = TvQuickViewSelection(item, repo.continueWatchingOwner())
+        } else onItem(item)
+    }
+    val watchlistStore = remember(appContext) { WatchlistStore.shared(appContext) }
 
     // Match the touch shell: either authenticated account admits Search and Discover.
     val authState by auth.authState.collectAsStateWithLifecycle()
     val vortxSession by (syncManager?.sessionUiState?.collectAsStateWithLifecycle()
         ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) })
     val signedIn = tvBrowseSignedIn(authState, vortxSession)
+    val activeProfile by (com.vortx.android.profile.ProfileStore.sharedOrNull()?.activeProfile?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf<com.vortx.android.profile.UserProfile?>(null) })
+    LaunchedEffect(authState, vortxSession, activeProfile?.id) {
+        if (quickViewSelection?.owner?.let { it != repo.continueWatchingOwner() } == true) quickViewSelection = null
+    }
     val transferPending by (syncManager?.transferPending?.collectAsStateWithLifecycle()
         ?: remember { mutableStateOf(false) })
 
@@ -194,7 +220,7 @@ fun TvShell(
     // ABOVE this shell with its own BackHandler, so this one is inert underneath it -- the existing
     // Home -> Detail -> Play back stack is unchanged.
     BackHandler(enabled = destination != TvDestination.HOME) { onDestinationChange(TvDestination.HOME) }
-    BackHandler(enabled = destination == TvDestination.HOME && homeBrowseSelected) { homeBrowseSelected = false }
+    BackHandler(enabled = destination == TvDestination.HOME && homeBrowseSelected) { onHomeBrowseSelectedChange(false) }
     BackHandler(enabled = destination == TvDestination.LIBRARY && libraryRoute != TvLibraryRoute.LANDING, onBack = ::closeLibraryRoute)
 
     // One factory for the shell, carrying the app Context so SearchViewModel's history store resolves --
@@ -205,6 +231,23 @@ fun TvShell(
         appContext = appContext,
         homeSurface = HomeRailSurface.TV,
     )
+
+    @Composable
+    fun DiscoverContent(contentModifier: Modifier = Modifier) {
+        val discoverViewModel = viewModel<DiscoverViewModel>(factory = factory)
+        if (mergeDiscoverSearch) {
+            TvSearchScreen(
+                viewModel = viewModel<SearchViewModel>(factory = factory), onItem = onCatalogItem,
+                onPlayLinkClick = { showPlayLinkSheet = true }, onDebridLibraryClick = { showDebridLibrary = true },
+                signedIn = signedIn, modifier = contentModifier,
+                restoreQuickActionsFocusSignal = searchFocusRestoreSignal + searchActionsRestoreSignal,
+                reselectSignal = reselectSignal,
+                browseContent = { browseModifier ->
+                    TvDiscoverScreen(discoverViewModel, onCatalogItem, modifier = browseModifier, signedIn = signedIn, reselectSignal = reselectSignal)
+                },
+            )
+        } else TvDiscoverScreen(discoverViewModel, onCatalogItem, modifier = contentModifier, signedIn = signedIn, reselectSignal = reselectSignal)
+    }
 
     Box(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
         Row(
@@ -237,23 +280,17 @@ fun TvShell(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.sm),
                             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
                         ) {
-                            TvFilterChip("Featured", selected = !homeBrowseSelected, onClick = { homeBrowseSelected = false })
-                            TvFilterChip("Browse", selected = homeBrowseSelected, onClick = { homeBrowseSelected = true })
+                            TvFilterChip("Featured", selected = !homeBrowseSelected, onClick = { onHomeBrowseSelectedChange(false) })
+                            TvFilterChip("Browse", selected = homeBrowseSelected, onClick = { onHomeBrowseSelectedChange(true) })
                         }
                     }
                     if (mergeHomeDiscover && homeBrowseSelected && !hiddenTabs.hideDiscover) {
-                        TvDiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), signedIn = signedIn, reselectSignal = reselectSignal)
+                        DiscoverContent(Modifier.weight(1f))
                     } else {
-                        TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onItem, modifier = Modifier.weight(1f), reselectSignal = reselectSignal)
+                        TvHomeScreen(viewModel<HomeViewModel>(factory = factory), onCatalogItem, modifier = Modifier.weight(1f), reselectSignal = reselectSignal)
                     }
                 }
-                TvDestination.DISCOVER ->
-                    TvDiscoverScreen(
-                        viewModel<DiscoverViewModel>(factory = factory),
-                        onItem,
-                        signedIn = signedIn,
-                        reselectSignal = reselectSignal,
-                    )
+                TvDestination.DISCOVER -> DiscoverContent()
                 TvDestination.LIVE ->
                     TvLiveScreen(viewModel<LiveViewModel>(factory = factory), onItem)
                 TvDestination.LIBRARY -> {
@@ -294,13 +331,13 @@ fun TvShell(
                 TvDestination.SEARCH ->
                     TvSearchScreen(
                         viewModel = viewModel<SearchViewModel>(factory = factory),
-                        onItem = onItem,
+                        onItem = onCatalogItem,
                         onPlayLinkClick = {
                             showPlayLinkSheet = true
                         },
                         onDebridLibraryClick = { showDebridLibrary = true },
                         signedIn = signedIn,
-                        restoreQuickActionsFocusSignal = searchFocusRestoreSignal,
+                        restoreQuickActionsFocusSignal = searchFocusRestoreSignal + searchActionsRestoreSignal,
                     )
                 TvDestination.ADDONS ->
                     TvAddonsDestination(
@@ -351,6 +388,11 @@ fun TvShell(
                 initialFocusRequester = debridLibraryFocus,
                 tvMode = true,
             )
+        }
+        quickViewSelection?.let { selection ->
+            val close = { quickViewSelection = null }
+            val actions = TvQuickViewActions(selection, watchlistStore, repo::continueWatchingOwner, close, onWatchItem, onItem)
+            TvQuickViewDialog(selection.item, watchlistStore, actions, onClose = close)
         }
     }
 }
