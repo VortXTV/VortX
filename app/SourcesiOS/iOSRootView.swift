@@ -4295,7 +4295,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         if let source {
             let base = iOSEngineAddonBase(for: source, in: groups)
             let succeeded = core.loadEnginePlayer(
-                for: source, videoId: entry.videoId, base: base,
+                for: source, videoId: entry.videoId, libraryId: item.id, base: base,
                 resolvedURL: explicitDebridRef?.url
             )
             enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(

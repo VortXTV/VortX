@@ -4328,28 +4328,27 @@ final class CoreBridge: ObservableObject {
     /// progress tick and watched mark lands on the wrong episode (or un-advances the one MarkVideoAsWatched just
     /// moved). This overload CONSTRUCTS the stream request from `videoId` (+ the add-on `base` carried from the
     /// preload) and serialises the already-resolved `stream`, so the engine attributes to THIS episode from the
-    /// first tick. The meta request is still read from the resident `meta_details` (series-stable across a binge).
+    /// first tick. Native attribution constructs the exact title request as well: unrelated detail/search
+    /// work is allowed to replace the resident metadata slot while an isolated binge request is resolving.
     /// Returns true when the Player was dispatched; the caller uses that to set its progress-attribution gate.
     @discardableResult
-    func loadEnginePlayer(for stream: CoreStream, videoId: String, base: String?,
+    func loadEnginePlayer(for stream: CoreStream, videoId: String, libraryId: String? = nil, base: String?,
                           resolvedURL: URL? = nil) -> Bool {
-        guard let data = stateData("meta_details"),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        let object = stateData("meta_details").flatMap {
+            (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
+        } ?? [:]
         let metaItems = object["metaItems"] as? [[String: Any]] ?? []
-        guard let metaRequest = (metaItems.first { ($0["content"] as? [String: Any])?["type"] as? String == "Ready" }
-                                 ?? metaItems.first)?["request"] else {
-            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (meta request missing); engine progress will not re-point")
-            return false
-        }
-        // The add-on base for the stream request: the preload-carried base first, else any resident stream
-        // group's base, else the meta's own base. The base does not drive video_id attribution (path.id does),
-        // but the engine's Player wants a well-formed ResourceRequest, so give it the truest base available.
+        let residentMetaRequest = (metaItems.first { ($0["content"] as? [String: Any])?["type"] as? String == "Ready" }
+                                    ?? metaItems.first)?["request"] as? [String: Any]
         let residentBase = (object["streams"] as? [[String: Any]])?
             .compactMap { ($0["request"] as? [String: Any])?["base"] as? String }.first
-        guard let effectiveBase = base ?? residentBase ?? (metaRequest as? [String: Any])?["base"] as? String else {
-            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (no add-on base); engine progress will not re-point")
+        guard let binding = EpisodeEngineBindingRequest.build(libraryID: libraryId,
+            native: usesNativeProfileState, sourceBase: base,
+            residentMetaRequest: residentMetaRequest, residentSourceBase: residentBase) else {
+            DiagnosticsLog.log("cw", "loadEnginePlayer(videoId:) no-op (exact title request unavailable); engine progress will not re-point")
             return false
         }
+        let metaRequest = binding.metaRequest, effectiveBase = binding.sourceBase
         // A stream the engine cannot deserialise (e.g. a usenet/nzb source that only carried name+description,
         // no url / ytId / infoHash / sources / externalUrl) would be dropped engine-side while the caller still
         // opens the attribution gate for videoId (a FALSE re-point confirmation). Degrade to nil exactly like
@@ -4394,8 +4393,7 @@ final class CoreBridge: ObservableObject {
             "metaRequest": metaRequest,
             "subtitlesPath": NSNull(),
         ]
-        dispatch(action: ["action": "Load", "args": ["model": "Player", "args": selected]], field: "player")
-        return true
+        return dispatch(action: ["action": "Load", "args": ["model": "Player", "args": selected]], field: "player")
     }
 
     /// Serialise a resolved `CoreStream` back to the engine's raw stream shape. `StreamSource` is untagged +

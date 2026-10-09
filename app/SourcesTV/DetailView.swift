@@ -3432,7 +3432,7 @@ struct CoreStreamList: View {
             return nil
         }
         let succeeded = core.loadEnginePlayer(
-            for: stream, videoId: videoID, base: addonBase(for: stream, in: groups),
+            for: stream, videoId: videoID, libraryId: metaRequestID, base: addonBase(for: stream, in: groups),
             resolvedURL: resolvedURL
         )
         return EpisodePlaybackIdentity.boundVideoID(

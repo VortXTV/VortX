@@ -13,5 +13,9 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
     app/SourcesShared/EpisodeReturnIdentityPolicy.swift app/SourcesShared/PlaybackNavigationOwner.swift \
     app/Tests/PlaybackNavigationOwnerTests.swift -o "$layout_test_dir/navigation-owner"
 "$layout_test_dir/navigation-owner"
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+    app/SourcesShared/EpisodeEngineBindingRequest.swift app/Tests/EpisodeEngineBindingRequestTests.swift \
+    -o "$layout_test_dir/engine-binding"
+"$layout_test_dir/engine-binding"
 swift app/Tests/MacSettingsShellContractTests.swift
 swift app/Tests/CinemaNativePresentationContractTests.swift

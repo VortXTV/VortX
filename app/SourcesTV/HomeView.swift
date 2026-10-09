@@ -919,7 +919,7 @@ struct CoreContinueWatchingRow: View {
                     let source = resumeSource(entry: entry, url: resolvedURL, groups: groups,
                                               forceDirect: true)
                     let engineVideoID = source.flatMap {
-                        bindResumeEngine(bridge, source: $0, entry: entry,
+                        bindResumeEngine(bridge, source: $0, entry: entry, libraryID: item.id,
                                          hasEpisodicPhysicalIdentity: hasEpisodicPhysicalIdentity,
                                          groups: groups, resolvedURL: resolvedURL)
                     }
@@ -960,7 +960,7 @@ struct CoreContinueWatchingRow: View {
                 let groups = bridge.streamGroups(forStreamId: entry.videoId)
                 let source = resumeSource(entry: entry, url: resolvedURL, groups: groups)
                 let engineVideoID = source.flatMap {
-                    bindResumeEngine(bridge, source: $0, entry: entry,
+                    bindResumeEngine(bridge, source: $0, entry: entry, libraryID: item.id,
                                      hasEpisodicPhysicalIdentity: hasEpisodicPhysicalIdentity,
                                      groups: groups, resolvedURL: nil)
                 }
@@ -1002,7 +1002,7 @@ struct CoreContinueWatchingRow: View {
     }
 
     private func bindResumeEngine(_ bridge: CoreBridge, source: CoreStream,
-                                  entry: LastStreamStore.Entry,
+                                  entry: LastStreamStore.Entry, libraryID: String,
                                   hasEpisodicPhysicalIdentity: Bool,
                                   groups: [CoreStreamSourceGroup], resolvedURL: URL?) -> String? {
         guard hasEpisodicPhysicalIdentity else {
@@ -1012,7 +1012,7 @@ struct CoreContinueWatchingRow: View {
         let rawBase = groups.first(where: { $0.streams.contains(source) })?.id
         let base = rawBase.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
         let succeeded = bridge.loadEnginePlayer(
-            for: source, videoId: entry.videoId, base: base, resolvedURL: resolvedURL
+            for: source, videoId: entry.videoId, libraryId: libraryID, base: base, resolvedURL: resolvedURL
         )
         return EpisodePlaybackIdentity.boundVideoID(
             requestedVideoID: entry.videoId, bindingSucceeded: succeeded

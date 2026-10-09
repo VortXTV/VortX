@@ -238,11 +238,13 @@ private final class NativeFieldNotifications: @unchecked Sendable {
         catch VortxNativeError.superseded {}
         try dispatch(["action": "Ctx", "args": ["action": "AddToLibrary", "args": ["id": "tt-fixture", "type": "series", "name": "Fixture"]]], field: "ctx")
         await facade.settled(); check(try field("library")["catalog"]?.array?.count == 1)
+        let beforeAmbiguousProgress = try field("native_state")["libraries"]?["fixture-owner"]
         try dispatch(["action": "Vortx", "args": ["type": "add_profile", "id": "kid", "name": "Kid"]], field: "native_state")
         try dispatch(["action": "Vortx", "args": ["type": "report_progress", "metaId": "tt-fixture", "name": "Fixture", "positionMs": 120000, "durationMs": 1200000]], field: "native_state")
         await facade.settled()
         check(try field("native_state")["roster"]?["profiles"]?["kid"] != nil)
-        check(try field("native_state")["libraries"]?["fixture-owner"]?["resume"]?["tt-fixture"] != nil)
+        check(try field("native_state")["libraries"]?["fixture-owner"]?["resume"]?["tt-fixture"] == nil)
+        check(try field("native_state")["libraries"]?["fixture-owner"] == beforeAmbiguousProgress)
         let selected: [String: Any] = ["metaRequest": ["base": addon.transportUrl, "path": metaPath],
                                       "streamRequest": ["base": addon.transportUrl, "path": streamPath],
                                       "stream": ["url": "https://media.example/selected.m3u8"]]
