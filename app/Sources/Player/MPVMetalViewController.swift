@@ -914,7 +914,7 @@ final class MPVMetalViewController: PlatformViewController {
         // web player fetched them with the browser UA, so present a Safari-like UA here. Also
         // follow HTTP redirects to the final CDN file (debrid resolvers 30x to it).
         checkError(mpv_set_option_string(mpv, "user-agent",
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"))
+            defaultUserAgent))
         checkError(mpv_set_option_string(mpv, "network-timeout", "30"))
         // Reconnect on dropped/stalled HTTP (debrid CDNs sometimes reset mid-stream); without this
         // a hiccup looks like an infinite buffer. Followed by hard failure → MPV_EVENT_END_FILE.
@@ -1458,9 +1458,9 @@ final class MPVMetalViewController: PlatformViewController {
         #endif
     }
 
-    /// mpv's stock User-Agent, captured once so a stream with custom headers can never leak
-    /// its UA into the next stream.
-    private lazy var defaultUserAgent = getString("user-agent") ?? ""
+    /// The app's immutable setup User-Agent, also restored when a source omits its own identity.
+    /// A lazy native-property read can capture the FIRST source's custom UA on a later default load.
+    private let defaultUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
     func configureResumeOrigin(seconds: Double) {
         loadTokenLock.lock(); defer { loadTokenLock.unlock() }
