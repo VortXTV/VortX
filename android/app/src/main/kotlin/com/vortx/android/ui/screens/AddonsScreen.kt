@@ -60,6 +60,7 @@ import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
 import com.vortx.android.R
+import com.vortx.android.data.AddonManagementTarget
 import com.vortx.android.engine.AddonHealth
 import com.vortx.android.engine.AddonHealthStore
 import com.vortx.android.model.InstalledAddon
@@ -98,6 +99,10 @@ fun AddonsScreen(
     val installMessage by viewModel.installMessage.collectAsStateWithLifecycle()
     val health by viewModel.health.collectAsStateWithLifecycle()
     val pendingUpdate by viewModel.pendingUpdate.collectAsStateWithLifecycle()
+    val access by viewModel.managementAccess.collectAsStateWithLifecycle()
+    // A delegated State read inside a retained callback could adopt a later profile. Capture the
+    // owner that rendered this row as a plain value before creating any dialog-opening callback.
+    val renderedOwner = access.owner
     val colors = VortXTheme.colors
     val context = LocalContext.current
 
@@ -105,13 +110,13 @@ fun AddonsScreen(
         viewModel.onScreenEntry()
     }
 
-    // Change-URL sheet state (Apple `EditAddonURLView`): the add-on being edited, or null when closed.
-    var changeUrlAddon by remember { mutableStateOf<InstalledAddon?>(null) }
-    changeUrlAddon?.let { addon ->
+    // Keep the exact tap-time owner and descriptor through dialog effects and suspended submission.
+    var changeUrlTarget by remember { mutableStateOf<AddonManagementTarget?>(null) }
+    changeUrlTarget?.let { target ->
         ChangeAddonUrlDialog(
-            addon = addon,
+            target = target,
             viewModel = viewModel,
-            onDismiss = { changeUrlAddon = null },
+            onDismiss = { changeUrlTarget = null },
         )
     }
 
@@ -277,7 +282,11 @@ fun AddonsScreen(
                                 onToggle = { viewModel.toggleAddon(addon) },
                                 onRemove = { viewModel.remove(addon) },
                                 onConfigure = { addon.configureUrl?.let { openInBrowser(context, it) } },
-                                onChangeUrl = { changeUrlAddon = addon },
+                                onChangeUrl = {
+                                    capturePhoneAddonChangeUrlTarget(viewModel, addon, renderedOwner)?.let {
+                                        changeUrlTarget = it
+                                    }
+                                },
                                 spacious = layout.spacious,
                             )
                         }
@@ -402,18 +411,19 @@ private fun openInBrowser(context: android.content.Context, url: String) {
 /// tombstoning; on success this dismisses, on failure it shows the error inline.
 @Composable
 private fun ChangeAddonUrlDialog(
-    addon: InstalledAddon,
+    target: AddonManagementTarget,
     viewModel: AddonsViewModel,
     onDismiss: () -> Unit,
 ) {
+    val addon = requireNotNull(target.addon)
     val colors = VortXTheme.colors
     val changing by viewModel.changingUrl.collectAsStateWithLifecycle()
     val message by viewModel.changeUrlMessage.collectAsStateWithLifecycle()
     val doneToken by viewModel.changeUrlDone.collectAsStateWithLifecycle()
-    var url by remember { mutableStateOf(addon.transportUrl) }
-    var submittedToken by remember { mutableStateOf(doneToken) }
+    var url by remember(target) { mutableStateOf(addon.transportUrl) }
+    var submittedToken by remember(target) { mutableStateOf(doneToken) }
 
-    LaunchedEffect(addon.transportUrl) { viewModel.onChangeUrlOpen() }
+    LaunchedEffect(target) { viewModel.onChangeUrlOpen(target) }
     // A successful swap bumps changeUrlDone; close the sheet once when that happens.
     LaunchedEffect(doneToken) {
         if (doneToken != submittedToken) {
@@ -452,7 +462,7 @@ private fun ChangeAddonUrlDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { viewModel.changeAddonUrl(addon, url) },
+                onClick = { viewModel.changeAddonUrl(target, url) },
                 enabled = !changing && url.isNotBlank() && url.trim() != addon.transportUrl,
             ) {
                 Text(if (changing) "Updating…" else "Update", color = colors.accent)
