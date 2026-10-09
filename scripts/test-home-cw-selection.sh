@@ -50,8 +50,8 @@ if "$cw_build_dir/baseline" > "$cw_build_dir/baseline.log" 2>&1; then
     printf '%s\n' 'FAIL: reviewed baseline unexpectedly retained native Trakt selection'
     exit 1
 fi
-rg -F 'FAIL: native TV retains the selected Trakt source' "$cw_build_dir/baseline.log"
-rg -F 'FAIL: native iOS/macOS retains the selected Trakt source' "$cw_build_dir/baseline.log"
+grep -F 'FAIL: native TV retains the selected Trakt source' "$cw_build_dir/baseline.log"
+grep -F 'FAIL: native iOS/macOS retains the selected Trakt source' "$cw_build_dir/baseline.log"
 printf '%s\n' "Verified RED baseline: $cw_baseline_ref"
 
 swiftc -parse-as-library "${cw_inputs[@]}" -o "$cw_build_dir/selection"

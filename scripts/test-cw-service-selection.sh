@@ -127,7 +127,7 @@ if "$cw_build_dir/baseline" > "$cw_build_dir/baseline.log" 2>&1; then
     printf '%s\n' 'FAIL: actual parent unexpectedly supports selected SIMKL'
     exit 1
 fi
-rg -F 'FAIL: actual parent selector supports selected SIMKL' "$cw_build_dir/baseline.log"
+grep -F 'FAIL: actual parent selector supports selected SIMKL' "$cw_build_dir/baseline.log"
 swiftc -parse-as-library -D VORTX_NATIVE_DATA_ENGINE -D CW_SERVICE_FIXTURE "${cw_inputs[@]}" -o "$cw_build_dir/services"
 "$cw_build_dir/services" | tee "$cw_build_dir/services.log"
 printf '%s\n' "Actual parent RED and candidate receipts: $cw_build_dir"
