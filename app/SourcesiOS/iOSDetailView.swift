@@ -2621,7 +2621,10 @@ struct iOSDetailView: View {
         #if os(tvOS)
         return nil
         #else
-        return { stream, url in Task { await downloadStream(stream, url: url) } }
+        return { stream, url in
+            let owner = NativeDownloadOwner()
+            Task { await downloadStream(stream, url: url, owner: owner) }
+        }
         #endif
     }
 
@@ -3482,8 +3485,11 @@ struct iOSDetailView: View {
     /// (cached-debrid direct link preferred, else the source's `playableURL`), builds the same
     /// `PlaybackMeta`, and hands both to `DownloadManager`. Device-local only; writes nothing to the
     /// account / libraryItem docs.
-    private func downloadStream(_ stream: CoreStream, url: URL) async {
-        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream)
+    private func downloadStream(_ stream: CoreStream, url: URL, owner: NativeDownloadOwner) async {
+        guard owner.allows(stream) else { return }
+        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream)
+        guard owner.allows(stream) else { ref?.nativeUsenetLease?.close(); return }
+        let resolved = ref?.url
         // A raw torrent downloads through the loopback server, which must be told to /create the torrent
         // first. The play path primes it (primePlayback) but the download path never did, so a torrent
         // row's download hit a server with no such torrent and failed instantly (#21).
@@ -3499,8 +3505,9 @@ struct iOSDetailView: View {
         guard let mediaURL = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
             isUsenet: stream.isUsenet, resolvedURL: resolved, fallbackURL: url
         ) else { return }
-        DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: mediaURL,
-                                        sourceName: stream.name, qualityText: StreamRanking.signature(stream))
+        await DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: mediaURL,
+                                        sourceName: stream.name, qualityText: StreamRanking.signature(stream),
+                                        nativeUsenetLease: ref?.nativeUsenetLease, nativeOwner: owner)
     }
 
     /// Present the pre-download quality picker for the MOVIE (#30 follow-up): hands the picker the SAME
@@ -5423,24 +5430,35 @@ struct iOSEpisodeStreams: View {
     /// Per-row offline-download handler for the EPISODE source list (nil on tvOS). Resolves the URL the
     /// same way `play` does and queues a download for THIS episode, with the episode's `PlaybackMeta`.
     private var episodeDownloadHandler: ((CoreStream, URL) -> Void)? {
-        { stream, url in Task { await downloadStream(stream, url: url) } }
+        { stream, url in
+            let owner = NativeDownloadOwner()
+            Task { await downloadStream(stream, url: url, owner: owner) }
+        }
     }
 
     private var episodeDownloadWithAddonHandler: ((CoreStream, URL, String) -> Void)? {
-        { stream, url, addon in Task { await downloadStream(stream, url: url, sourceAddon: addon) } }
+        { stream, url, addon in
+            let owner = NativeDownloadOwner()
+            Task { await downloadStream(stream, url: url, sourceAddon: addon, owner: owner) }
+        }
     }
 
     /// Queue an offline download of a chosen episode source. Resolves the URL exactly as `play` does
     /// (cached-debrid direct preferred, else `stream.playableURL`) and builds the same series-typed
     /// `PlaybackMeta`, so play-from-local records progress against the right episode. Device-local only.
-    private func downloadStream(_ stream: CoreStream, url: URL, sourceAddon: String? = nil) async {
+    private func downloadStream(_ stream: CoreStream, url: URL, sourceAddon: String? = nil,
+                                owner: NativeDownloadOwner) async {
+        guard owner.allows(stream) else { return }
         let target = shownVideo
         let targetGeneration = episodeTargetGeneration
         let ep = debridHint(for: target)
         // A download is not a tap: keep the unconditional (non-cache-gated) resolve so it still resolves a
         // debrid direct link for an uncached-but-servable pick, exactly as before this play-path change.
         let (ref, isTorrent) = await playbackRef(for: stream, episode: ep, cacheGated: false)
-        guard episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
+        guard episodeTargetIsCurrent(target, generation: targetGeneration), owner.allows(stream) else {
+            ref?.nativeUsenetLease?.close()
+            return
+        }
         // A raw torrent downloads through the loopback server, which must be told to /create the torrent
         // first; the play path primes it, the download path didn't, so the row's download died (#21).
         if isTorrent {
@@ -5456,8 +5474,9 @@ struct iOSEpisodeStreams: View {
         ) else { return }
         guard episodeTargetIsCurrent(target, generation: targetGeneration) else { return }
         let priorIDs = Set(DownloadStore.shared.records.map(\.id))
-        let record = DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: resolvedURL,
-                                                    sourceName: stream.name, qualityText: StreamRanking.signature(stream))
+        let record = await DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: resolvedURL,
+                                                    sourceName: stream.name, qualityText: StreamRanking.signature(stream),
+                                                    nativeUsenetLease: ref?.nativeUsenetLease, nativeOwner: owner)
         if !priorIDs.contains(record.id), let stored = DownloadStore.shared.record(id: record.id), stored.state != .failed, let sourceAddon {
             SeriesSourceSticky.record(seriesKey: meta.id, addon: sourceAddon,
                                       bingeGroup: stream.behaviorHints?.bingeGroup)

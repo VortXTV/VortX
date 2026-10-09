@@ -92,6 +92,24 @@ enum DownloadSourceClassifier {
     }
 }
 
+/// Resolution/fallback intent belongs to the caller that requested the download, including retries
+/// after its view disappeared. It must not acquire a successor profile's native NNTP authority.
+@MainActor
+struct NativeDownloadOwner {
+    private let target = PlaybackMutationTarget.capture(core: CoreBridge.shared)
+    private let nativeSelected = StremioServer.nativeTransportSelected
+
+    var isCurrent: Bool {
+        guard nativeSelected || StremioServer.nativeTransportSelected else { return true }
+        guard nativeSelected == StremioServer.nativeTransportSelected else { return false }
+        return !Task.isCancelled && target.stillOwnsCurrentContext(core: CoreBridge.shared)
+    }
+
+    func allows(_ stream: CoreStream) -> Bool {
+        !stream.isUsenet || isCurrent
+    }
+}
+
 /// The file-writing core for offline downloads. ONE download = GET an http(s) URL to a local file. There
 /// are TWO transport MODES, picked by `stream.isTorrent`, sharing this one core:
 ///
@@ -155,6 +173,17 @@ final class DownloadManager: NSObject, ObservableObject {
     private var taskForRecord: [UUID: URLSessionDownloadTask] = [:]
     private var recordForTask: [String: UUID] = [:]
 
+    /// Native NZB URLs and operation authority are process-local resources, owned by one accepted row.
+    /// Queueing/pausing keeps them alive; terminal transitions explicitly retire that exact operation.
+    private struct NativeSource {
+        let url: URL
+        let lease: UsenetNodeClient.OperationLease
+        let owner: NativeDownloadOwner
+    }
+    private var nativeSources: [UUID: NativeSource] = [:]
+    static let nativeSourceMarker = "vortx-native-usenet:reselect-required"
+    private static let nativeSourceExpired = "This native download source is no longer available. Select the source again to download."
+
     /// A session-namespaced task key. The foreground (torrent) and background (debrid) byte sessions both start
     /// taskIdentifiers at 1, so a bare-Int `recordForTask` / `destinations` collided: a CONCURRENT torrent +
     /// debrid download with equal identifiers mis-routed progress ticks AND moved a finished temp file into the
@@ -166,6 +195,7 @@ final class DownloadManager: NSObject, ObservableObject {
     }
     /// Resume data captured on pause / recoverable failure, so resume() can continue instead of restart.
     private var resumeData: [UUID: Data] = [:]
+    private var pauseGenerations: [UUID: UUID] = [:]
 
     /// Admission remains closed while any selected background-session reconciliation callback is outstanding.
     /// The pure coordinator combines overlapping reconnect calls into one counter and opens only at zero.
@@ -308,14 +338,27 @@ final class DownloadManager: NSObject, ObservableObject {
     /// record. No-ops to the existing record if this exact video is already downloaded / downloading.
     @discardableResult
     func download(stream: CoreStream, meta: PlaybackMeta, resolvedURL: URL,
-                  sourceName: String?, qualityText: String?) -> DownloadRecord {
+                  sourceName: String?, qualityText: String?,
+                  nativeUsenetLease: UsenetNodeClient.OperationLease? = nil,
+                  nativeOwner: NativeDownloadOwner? = nil,
+                  requiresNativeOwner: Bool = false) async -> DownloadRecord {
+        var nativeAdmissionFailed = requiresNativeOwner && nativeOwner?.isCurrent != true
+        if let nativeUsenetLease {
+            do { try await nativeUsenetLease.validateOwner() }
+            catch { nativeAdmissionFailed = true }
+            // Recheck the original caller synchronously after the async lease validation hop.
+            if nativeOwner?.isCurrent != true { nativeUsenetLease.close(); nativeAdmissionFailed = true }
+        }
         if let existing = store.records.first(where: { $0.videoId == meta.videoId && $0.state != .failed }) {
-            if existing.state == .paused { resume(id: existing.id) }
+            // A repeated tap resolves a fresh operation. Never close the already accepted operation if
+            // a caller happens to hand the same reference back, and never replace its owner with this tap.
+            if nativeSources[existing.id]?.lease !== nativeUsenetLease { nativeUsenetLease?.close() }
+            if existing.state == .paused, !nativeAdmissionFailed { resume(id: existing.id) }
             return DownloadSchedulerCoordinator.postMutationValue(existing) { self.store.record(id: existing.id) }
         }
 
         let id = UUID()
-        let initialClassification: DownloadSourceClassification = stream.isTorrent
+        let initialClassification: DownloadSourceClassification = stream.isTorrent || nativeUsenetLease != nil
             ? .byte
             : DownloadSourceClassifier.classify(
                 url: resolvedURL,
@@ -329,9 +372,22 @@ final class DownloadManager: NSObject, ObservableObject {
             id: id, contentId: meta.libraryId, videoId: meta.videoId, type: meta.type,
             name: meta.name, poster: meta.poster, season: meta.season, episode: meta.episode,
             sourceName: sourceName, qualityText: qualityText, isTorrent: stream.isTorrent,
-            headers: stream.requestHeaders, remoteURL: resolvedURL.absoluteString,
-            localFilename: localFilename, state: .queued)
+            headers: nativeUsenetLease == nil ? stream.requestHeaders : nil,
+            remoteURL: nativeUsenetLease == nil ? resolvedURL.absoluteString : Self.nativeSourceMarker,
+            localFilename: localFilename,
+            state: nativeAdmissionFailed ? .failed : .queued,
+            errorText: nativeAdmissionFailed ? Self.nativeSourceExpired : nil)
+        if let nativeUsenetLease, let nativeOwner, !nativeAdmissionFailed {
+            nativeSources[id] = NativeSource(url: resolvedURL, lease: nativeUsenetLease, owner: nativeOwner)
+            nativeUsenetLease.onClose { [weak self] in
+                Task { @MainActor [weak self] in self?.nativeSourceDidClose(id: id) }
+            }
+        }
         store.upsert(record)
+        if nativeAdmissionFailed || nativeUsenetLease?.isClosed == true {
+            failNativeSource(id: id)
+            return store.record(id: id) ?? record
+        }
         appendToQueueOrder(record.id)
 
         // Defensive: iOS does not auto-create Application Support. Create the destination before any
@@ -361,11 +417,15 @@ final class DownloadManager: NSObject, ObservableObject {
             }
             return
         }
+        let pauseGeneration = UUID()
+        pauseGenerations[id] = pauseGeneration
+        store.update(id: id) { $0.state = .paused; $0.taskIdentifier = nil }
         task.cancel(byProducingResumeData: { [weak self] data in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.pauseGenerations[id] == pauseGeneration,
+                      self.store.record(id: id)?.state == .paused else { return }
+                self.pauseGenerations[id] = nil
                 if let data { self.resumeData[id] = data }
-                self.store.update(id: id) { $0.state = .paused }
             }
         })
         clearTask(id: id)
@@ -373,6 +433,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     func resume(id: UUID) {
         guard store.record(id: id) != nil else { return }
+        pauseGenerations[id] = nil
         store.update(id: id) { $0.state = .queued; $0.errorText = nil; $0.taskIdentifier = nil }
         appendToQueueOrder(id)
         fillAvailableSlots()
@@ -385,6 +446,8 @@ final class DownloadManager: NSObject, ObservableObject {
         cancelAssetTask(id: id)
         #endif
         clearTask(id: id, drainQueue: false)
+        releaseNativeSource(id: id)
+        pauseGenerations[id] = nil
         resumeData[id] = nil
         unlockedSaveFailures[id] = nil
         awaitingUnlockRetry.remove(id)
@@ -517,15 +580,17 @@ final class DownloadManager: NSObject, ObservableObject {
                 $0.state = .failed
                 $0.errorText = "Not enough storage to save this download. Free up space and try again."
             }
+            releaseNativeSource(id: record.id)
             return .rejected
         }
-        let session = record.isTorrent ? foregroundSession : backgroundSession
+        let foreground = record.isTorrent || nativeSources[record.id] != nil
+        let session = foreground ? foregroundSession : backgroundSession
         let task: URLSessionDownloadTask
         if let data = resumeData[record.id] {
             task = session.downloadTask(withResumeData: data)
             resumeData[record.id] = nil
         } else {
-            task = makeTask(on: session, url: url, headers: record.headers)
+            task = makeTask(on: session, url: url, headers: nativeSources[record.id] == nil ? record.headers : nil)
         }
         store.update(id: record.id) { $0.state = .downloading; $0.errorText = nil }
         bind(task: task, to: record.id, on: session)
@@ -533,7 +598,13 @@ final class DownloadManager: NSObject, ObservableObject {
         // the matching note in resume(): this is how the off-main delegate recovers the destination after a
         // relaunch empties the in-memory maps.
         task.taskDescription = record.localFilename
-        destinations.set(store.fileURL(for: record), for: Self.taskKey(session, task.taskIdentifier))
+        let destination = store.fileURL(for: record)
+        // A cancelled native delegate may already be moving its temp file off-main. Give that exact
+        // task a staging path; only its still-current MainActor finalizer may install the canonical file.
+        let taskDestination = nativeSources[record.id] == nil ? destination
+            : destination.deletingLastPathComponent()
+                .appendingPathComponent(".native-\(record.id.uuidString)-\(task.taskIdentifier).partial")
+        destinations.set(taskDestination, for: Self.taskKey(session, task.taskIdentifier))
         // Apply the CompleteUntilFirstUserAuthentication protection class to the Downloads dir BEFORE the
         // background daemon stages its temp file. Without this, a transfer that COMPLETES while the device is
         // locked (an overnight / backgrounded multi-GB download) cannot create the file and fails with -3000
@@ -545,7 +616,7 @@ final class DownloadManager: NSObject, ObservableObject {
         // (START here, then either the save outcome in didFinishDownloadingTo or the -3000 branch in
         // didCompleteWithError). Before this the download subsystem logged only via NSLog, invisible in the
         // log users actually attach, which is why #132 could not be diagnosed from two rounds of reports.
-        logDownload("START id=\(record.id.uuidString) host=\(url.host ?? "?") torrent=\(record.isTorrent) session=\(record.isTorrent ? "fg" : "bg")")
+        logDownload("START id=\(record.id.uuidString) host=\(url.host ?? "?") torrent=\(record.isTorrent) session=\(foreground ? "fg" : "bg")")
         task.resume()
         return .started
     }
@@ -662,12 +733,10 @@ final class DownloadManager: NSObject, ObservableObject {
     }
 
     private func clearTask(id: UUID, drainQueue: Bool = true) {
-        if let task = taskForRecord[id] {
-            let tid = task.taskIdentifier
-            for s in [foregroundSession, backgroundSession] {
-                recordForTask[Self.taskKey(s, tid)] = nil
-                destinations.remove(Self.taskKey(s, tid))
-            }
+        // Identical task identifiers exist in both sessions. Clear only this record's exact bindings.
+        for key in recordForTask.compactMap({ $0.value == id ? $0.key : nil }) {
+            recordForTask[key] = nil
+            destinations.remove(key)
         }
         taskForRecord[id] = nil
         lastProgressPush[id] = nil
@@ -675,6 +744,29 @@ final class DownloadManager: NSObject, ObservableObject {
         endForegroundAssertionIfIdle()
         pruneQueueOrder()
         if drainQueue { fillAvailableSlots() }
+    }
+
+    private func releaseNativeSource(id: UUID) {
+        let source = nativeSources.removeValue(forKey: id)
+        if source != nil { resumeData[id] = nil }
+        source?.lease.close()
+    }
+
+    private func nativeSourceDidClose(id: UUID) {
+        guard nativeSources[id]?.lease.isClosed == true else { return }
+        failNativeSource(id: id)
+        fillAvailableSlots()
+    }
+
+    private func failNativeSource(id: UUID) {
+        taskForRecord[id]?.cancel()
+        clearTask(id: id, drainQueue: false)
+        releaseNativeSource(id: id)
+        pauseGenerations[id] = nil
+        resumeData[id] = nil
+        awaitingUnlockRetry.remove(id)
+        unlockedSaveFailures[id] = nil
+        store.update(id: id) { $0.state = .failed; $0.errorText = Self.nativeSourceExpired }
     }
 
     // MARK: Concurrency queue
@@ -700,8 +792,14 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private func startQueued(_ record: DownloadRecord) -> DownloadStartDisposition {
         guard record.state == .queued else { return .deferred }
-        guard let url = URL(string: record.remoteURL) else {
+        if record.remoteURL == Self.nativeSourceMarker,
+           nativeSources[record.id]?.lease.isClosed != false || nativeSources[record.id]?.owner.isCurrent != true {
+            failNativeSource(id: record.id)
+            return .rejected
+        }
+        guard let url = nativeSources[record.id]?.url ?? URL(string: record.remoteURL) else {
             store.update(id: record.id) { $0.state = .failed; $0.errorText = "Invalid source URL" }
+            releaseNativeSource(id: record.id)
             return .rejected
         }
         if transport(for: record) == .hls {
@@ -955,7 +1053,10 @@ final class DownloadManager: NSObject, ObservableObject {
     /// (`taskDescription`) against the stored records' `localFilename`. Without this, a download that
     /// completed while the app was suspended saved its file but its row stayed stuck on "Downloading".
     private func recoverRecordID(for task: URLSessionTask, on session: URLSession, filename: String?) -> UUID? {
-        if let id = recordForTask[Self.taskKey(session, task.taskIdentifier)] { return id }
+        if let id = recordForTask[Self.taskKey(session, task.taskIdentifier)], taskForRecord[id] === task { return id }
+        // Foreground tasks cannot survive relaunch. A filename fallback here would revive a cancelled
+        // native/torrent task and let its late callback corrupt a resumed task with the same record id.
+        guard session.configuration.identifier == Self.backgroundSessionIdentifier else { return nil }
         guard let filename else { return nil }
         return store.records.first { $0.localFilename == filename }?.id
     }
@@ -963,7 +1064,7 @@ final class DownloadManager: NSObject, ObservableObject {
     // MARK: Foreground assertion (torrent mode only)
 
     private func beginForegroundAssertionIfNeeded(for record: DownloadRecord) {
-        guard record.isTorrent else { return }
+        guard record.isTorrent || nativeSources[record.id] != nil else { return }
         #if canImport(UIKit)
         guard bgTask == .invalid else { return }
         bgTask = UIApplication.shared.beginBackgroundTask(withName: "vortx.download.torrent") { [weak self] in
@@ -977,7 +1078,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// End the assertion once no torrent download is still active.
     private func endForegroundAssertionIfIdle() {
         let torrentActive = taskForRecord.keys.contains { id in
-            store.record(id: id)?.isTorrent == true
+            store.record(id: id)?.isTorrent == true || nativeSources[id] != nil
         }
         if !torrentActive { endForegroundAssertion() }
     }
@@ -1164,7 +1265,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // (`taskDescription`, which the background session serializes). This is the iOS "cannot create file"
         // fix: a ~2 GB file guarantees a suspend mid-download, and the old code then had `dest == nil`.
         let dest = destinations.url(for: Self.taskKey(session, downloadTask.taskIdentifier))
-            ?? downloadTask.taskDescription.map { DownloadStore.fileURL(forFilename: $0) }
+            ?? (session.configuration.identifier == Self.backgroundSessionIdentifier
+                ? downloadTask.taskDescription.map { DownloadStore.fileURL(forFilename: $0) } : nil)
         // The source size BEFORE any move (the temp is gone after a successful move). 0 bytes here means the
         // SOURCE returned nothing - usually a torrent with no running server / no debrid, or a dead link - not
         // a save bug. Captured so a "cannot create file" is actually diagnosable.
@@ -1187,8 +1289,9 @@ extension DownloadManager: URLSessionDownloadDelegate {
             }
         }
         var failed = (dest == nil) || (moveError != nil)
+        let nativeSave = dest?.lastPathComponent.hasPrefix(".native-") == true
         var failureText: String? = failed
-            ? (moveError.map { "\(String(localized: "Save failed:")) \(Self.downloadFailureDetail($0)) [src \(srcBytes)B]" }
+            ? (moveError.map { "\(String(localized: "Save failed:")) \(nativeSave ? Self.nativeDownloadFailureDetail($0) : Self.downloadFailureDetail($0)) [src \(srcBytes)B]" }
                ?? String(localized: "Could not save the download: no destination for the file"))
             : nil
         // Content sniff: an add-on that hands back an HLS playlist or a web embed page (e.g. ok.ru) yields a
@@ -1203,20 +1306,41 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // (where `recordForTask` is empty), by matching it against the stored `localFilename`.
         let taskFilename = downloadTask.taskDescription
         Task { @MainActor [weak self] in
-            defer { Self.finishBackgroundEventWork(barrier) }
+            let nativeStaging = dest?.lastPathComponent.hasPrefix(".native-") == true ? dest : nil
+            defer {
+                if let nativeStaging { try? FileManager.default.removeItem(at: nativeStaging) }
+                Self.finishBackgroundEventWork(barrier)
+            }
             guard let self, let id = self.recoverRecordID(for: downloadTask, on: session, filename: taskFilename) else { return }
+            if let source = self.nativeSources[id], source.lease.isClosed || !source.owner.isCurrent {
+                self.failNativeSource(id: id)
+                self.fillAvailableSlots()
+                return
+            }
+            var finalFailed = failed
+            var finalFailureText = failureText
+            if let nativeStaging, !finalFailed, let record = self.store.record(id: id) {
+                let canonical = self.store.fileURL(for: record)
+                do {
+                    try? FileManager.default.removeItem(at: canonical)
+                    try FileManager.default.moveItem(at: nativeStaging, to: canonical)
+                } catch {
+                    finalFailed = true
+                    finalFailureText = "\(String(localized: "Save failed:")) \(Self.nativeDownloadFailureDetail(error))"
+                }
+            }
             // Record the save OUTCOME in the exportable diagnostic log. Previously only the
             // didCompleteWithError (-3000 daemon) path logged; an app-side MOVE failure here (dest nil, or a
             // moveItem/copyItem error, e.g. a locked-device destination) surfaced only in the record's
             // errorText and was invisible in the log users attach, undercutting the "the next build records
             // the exact save error" promise. Now every save path lands in the log in one shot.
-            self.logDownload(failed
-                ? "save FAILED id=\(id.uuidString) \(failureText ?? "no destination")"
+            self.logDownload(finalFailed
+                ? "save FAILED id=\(id.uuidString) \(finalFailureText ?? "no destination")"
                 : "save OK id=\(id.uuidString) bytes=\(srcBytes)")
             self.store.update(id: id) {
-                if failed {
+                if finalFailed {
                     $0.state = .failed
-                    $0.errorText = failureText ?? String(localized: "Could not save downloaded file")
+                    $0.errorText = finalFailureText ?? String(localized: "Could not save downloaded file")
                 } else {
                     $0.state = .completed
                     $0.bytesDone = max($0.bytesDone, $0.bytesTotal)
@@ -1224,6 +1348,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 }
             }
             self.unlockedSaveFailures[id] = nil   // terminal outcome: drop the -3000 retry tally
+            self.releaseNativeSource(id: id)
             self.clearTask(id: id)
         }
     }
@@ -1247,9 +1372,11 @@ extension DownloadManager: URLSessionDownloadDelegate {
             defer { Self.finishBackgroundEventWork(barrier) }
             guard let self, let id = self.recoverRecordID(for: task, on: session, filename: taskFilename) else { return }
             // A deliberate pause cancels the task; pause() already recorded `.paused` + resume data.
-            if (error as NSError).code == NSURLErrorCancelled { return }
+            if (error as NSError).code == NSURLErrorCancelled, self.nativeSources[id] == nil { return }
             if let resume { self.resumeData[id] = resume }
             let ns = error as NSError
+            let nativeFailure = self.nativeSources[id] != nil
+            let detail = nativeFailure ? Self.nativeDownloadFailureDetail(error) : Self.downloadFailureDetail(error)
             // NSURLErrorCannotCreateFile (-3000) on a byte download: the finished file could not be created.
             // With ample free space this is NOT out-of-space. It is handled under a BOUNDED recovery policy
             // (DownloadFailureClassifier), so #132's "100% then couldn't save" recovers instead of dead-ending,
@@ -1285,12 +1412,12 @@ extension DownloadManager: URLSessionDownloadDelegate {
                         $0.state = .paused
                         $0.errorText = String(localized: "Waiting to finish saving. It will retry automatically when you unlock your device or reopen the app.")
                     }
-                    self.logDownload("-3000 parked for unlock/foreground retry id=\(id.uuidString) unlocked=\(unlocked) attempts=\(attempts) detail=\(Self.downloadFailureDetail(error))")
+                    self.logDownload("-3000 parked for unlock/foreground retry id=\(id.uuidString) unlocked=\(unlocked) attempts=\(attempts) detail=\(detail)")
                     return
                 case .selfHealRestart:
                     self.resumeData[id] = nil
                     self.clearTask(id: id, drainQueue: false)
-                    self.logDownload("-3000 self-heal requeued id=\(id.uuidString) attempts=\(attempts) detail=\(Self.downloadFailureDetail(error))")
+                    self.logDownload("-3000 self-heal requeued id=\(id.uuidString) attempts=\(attempts) detail=\(detail)")
                     self.store.update(id: id) { $0.state = .queued; $0.errorText = nil }
                     self.prependToQueueOrder(id)
                     self.fillAvailableSlots()
@@ -1304,13 +1431,19 @@ extension DownloadManager: URLSessionDownloadDelegate {
             // DIAGNOSTIC: the owner hit NSURLErrorCannotCreateFile (-3000) with ~200 GB free and a ~1 GB file,
             // so this is NOT out of space. Log the FULL error (domain/code/userInfo) so the true cause is
             // visible on-device, and surface the real domain/code instead of a wrong "storage" message.
-            self.logDownload("task FAILED id=\(id.uuidString) code=\(ns.code) domain=\(ns.domain) desc=\(ns.localizedDescription) detail=\(Self.downloadFailureDetail(error)) userInfo=\(ns.userInfo)")
+            if nativeFailure {
+                // NSError descriptions/userInfo may embed the operation URL capability or resume data.
+                self.logDownload("native task FAILED id=\(id.uuidString) detail=\(detail)")
+            } else {
+                self.logDownload("task FAILED id=\(id.uuidString) code=\(ns.code) domain=\(ns.domain) desc=\(ns.localizedDescription) detail=\(detail) userInfo=\(ns.userInfo)")
+            }
             self.store.update(id: id) {
                 $0.state = .failed
                 // Localize only the human prefix; the posix/path detail after it stays as-is (diagnostic).
-                $0.errorText = "\(String(localized: "Couldn't save this download:")) \(Self.downloadFailureDetail(error))"
+                $0.errorText = "\(String(localized: "Couldn't save this download:")) \(detail)"
             }
             self.unlockedSaveFailures[id] = nil   // terminal outcome: drop the -3000 retry tally
+            self.releaseNativeSource(id: id)
             self.clearTask(id: id)
         }
     }
@@ -1412,6 +1545,20 @@ extension DownloadManager: URLSessionDownloadDelegate {
             if let upath = under.userInfo[NSFilePathErrorKey] as? String { parts.append("upath=\(upath)") }
         }
         return parts.joined(separator: " | ")
+    }
+
+    /// Native operation URLs are transient capabilities. Keep their error metadata out of the index
+    /// and both diagnostic sinks, including descriptions, paths, resume data, and nested error URLs.
+    nonisolated static func nativeDownloadFailureDetail(_ error: Error) -> String {
+        let ns = error as NSError
+        let knownDomains = [NSURLErrorDomain, NSCocoaErrorDomain, NSPOSIXErrorDomain]
+        let domain = knownDomains.contains(ns.domain) ? ns.domain : "download"
+        var detail = "\(domain) \(ns.code)"
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError,
+           underlying.domain == NSPOSIXErrorDomain {
+            detail += " | posix \(underlying.code)"
+        }
+        return detail
     }
 
     /// iOS has finished delivering every queued event for this background session (after relaunching the

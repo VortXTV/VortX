@@ -231,6 +231,8 @@ final class DownloadPickCoordinator: ObservableObject {
         let remaining: [CoreStream]
         let meta: PlaybackMeta
         let episode: DebridEpisode?
+        let owner: NativeDownloadOwner
+        let requiresNativeOwner: Bool
     }
     private var chains: [UUID: Chain] = [:]
     private var observer: AnyCancellable?
@@ -252,8 +254,9 @@ final class DownloadPickCoordinator: ObservableObject {
     func startDownload(chosen: CoreStream, rankedCandidates: [CoreStream],
                        meta: PlaybackMeta, episode: DebridEpisode?) {
         let fallbacks = rankedCandidates.filter { !sameSource($0, chosen) }
+        let owner = NativeDownloadOwner()
         Task { @MainActor [weak self] in
-            await self?.launch([chosen] + fallbacks, meta: meta, episode: episode, replacing: nil)
+            await self?.launch([chosen] + fallbacks, meta: meta, episode: episode, replacing: nil, owner: owner)
         }
     }
 
@@ -275,33 +278,43 @@ final class DownloadPickCoordinator: ObservableObject {
     /// later byte-transfer failure all advance to the next candidate; if nothing can be queued the original
     /// `.failed` row (if any) stands as the honest outcome.
     private func launch(_ candidates: [CoreStream], meta: PlaybackMeta,
-                        episode: DebridEpisode?, replacing failedID: UUID?) async {
+                        episode: DebridEpisode?, replacing failedID: UUID?, owner: NativeDownloadOwner,
+                        requiresNativeOwner: Bool = false) async {
         var queue = candidates
+        var nativeOrigin = requiresNativeOwner
         while let head = queue.first {
             queue.removeFirst()
+            guard (!nativeOrigin || owner.isCurrent), owner.allows(head) else { return }
             // Resolve a cached-debrid direct link when possible; a raw torrent must have its loopback stream
             // /created first, exactly as the manual + batch download paths do (#21).
             let isEpisode = episode != nil || EpisodePlaybackIdentity.isEpisodicContext(
                 type: meta.type, season: meta.season, episode: meta.episode,
                 videoID: meta.videoId
             )
-            let resolved: URL?
+            let ref: DebridPlaybackRef?
             if isEpisode, head.url == nil, episode == nil {
-                resolved = nil
+                ref = nil
             } else {
-                resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: head, episode: episode)
+                ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: head, episode: episode)
             }
+            nativeOrigin = nativeOrigin || ref?.nativeUsenetLease != nil
+            guard (!nativeOrigin || owner.isCurrent), owner.allows(head) else { ref?.nativeUsenetLease?.close(); return }
+            let resolved = ref?.url
             guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
                 isUsenet: head.isUsenet, resolvedURL: resolved,
                 fallbackURL: head.playableURL(isEpisode: isEpisode)
             ) else { continue }
             if resolved == nil, head.isTorrent { _ = prepareTorrentStream(head) }
-            let record = DownloadManager.shared.download(stream: head, meta: meta, resolvedURL: url,
+            let record = await DownloadManager.shared.download(stream: head, meta: meta, resolvedURL: url,
                                                          sourceName: head.name,
-                                                         qualityText: StreamRanking.signature(head))
+                                                         qualityText: StreamRanking.signature(head),
+                                                         nativeUsenetLease: ref?.nativeUsenetLease, nativeOwner: owner,
+                                                         requiresNativeOwner: nativeOrigin)
+            guard !nativeOrigin || owner.isCurrent else { return }
             // download() can refuse synchronously (an HLS source on a device that can't save HLS, or a storage
             // shortfall): that record is born `.failed`. Discard it and try the next candidate.
             if DownloadStore.shared.record(id: record.id)?.state == .failed {
+                guard owner.allows(head) else { return }
                 DownloadManager.shared.cancel(id: record.id)
                 continue
             }
@@ -313,7 +326,10 @@ final class DownloadPickCoordinator: ObservableObject {
                 }
             }
             // Arm whatever ranked candidates remain as this download's automatic next-best swaps.
-            if !queue.isEmpty { chains[record.id] = Chain(remaining: queue, meta: meta, episode: episode) }
+            if !queue.isEmpty {
+                chains[record.id] = Chain(remaining: queue, meta: meta, episode: episode, owner: owner,
+                                         requiresNativeOwner: nativeOrigin)
+            }
             return
         }
         // Nothing in the list could be queued. A prior `.failed` row (`failedID`) is left in place as the
@@ -334,7 +350,10 @@ final class DownloadPickCoordinator: ObservableObject {
                 chains[id] = nil   // consume BEFORE swapping so a still-failing alternate can never re-arm
                 let remaining = chain.remaining, meta = chain.meta, episode = chain.episode
                 Task { @MainActor [weak self] in
-                    await self?.launch(remaining, meta: meta, episode: episode, replacing: id)
+                    // An owner-retired native row must stay visible; no automatic successor-profile retry.
+                    guard !chain.requiresNativeOwner || chain.owner.isCurrent else { return }
+                    await self?.launch(remaining, meta: meta, episode: episode, replacing: id, owner: chain.owner,
+                                       requiresNativeOwner: chain.requiresNativeOwner)
                 }
             case .completed:
                 chains[id] = nil   // succeeded: the armed swaps are no longer needed

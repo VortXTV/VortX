@@ -3093,7 +3093,8 @@ struct CoreStreamList: View {
                     }
                     if actionRows.showsDownload, let best {
                         downloadChip(ready: watchReady) {
-                            requestDownload { Task { await downloadBest(best) } }
+                            let owner = NativeDownloadOwner()
+                            requestDownload { Task { await downloadBest(best, owner: owner) } }
                         }
                     }
                     WatchlistChip()
@@ -3341,28 +3342,30 @@ struct CoreStreamList: View {
     /// the URL EXACTLY as `playResolving` does (cached-debrid direct link preferred, else the source's
     /// `playableURL`) and hands the SAME `PlaybackMeta` this list carries to `DownloadManager`. Device-local
     /// only; writes nothing to the account / libraryItem docs. No-op without a `meta` or a playable URL.
-    @MainActor private func downloadBest(_ best: CoreStream) async {
+    @MainActor private func downloadBest(_ best: CoreStream, owner: NativeDownloadOwner) async {
+        guard owner.allows(best) else { return }
         let targetVideoID = episodeStreamId
         let targetGeneration = episodeTargetGeneration
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
         guard let pm = meta else { return }
         let hint = downloadEpisode(pm)
-        let resolved: URL?
+        let ref: DebridPlaybackRef?
         if episodeStreamId != nil, best.url == nil, hint == nil {
-            resolved = nil
+            ref = nil
         } else {
-            resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: best, episode: hint)
+            ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: best, episode: hint)
             guard targetIsCurrent(
                 videoID: targetVideoID, generation: targetGeneration
-            ) else { return }
+            ), owner.allows(best) else { ref?.nativeUsenetLease?.close(); return }
         }
         guard let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
-            isUsenet: best.isUsenet, resolvedURL: resolved,
+            isUsenet: best.isUsenet, resolvedURL: ref?.url,
             fallbackURL: best.playableURL(isEpisode: episodeStreamId != nil)
         ) else { return }
         guard targetIsCurrent(videoID: targetVideoID, generation: targetGeneration) else { return }
-        DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
-                                        sourceName: best.name, qualityText: StreamRanking.signature(best))
+        await DownloadManager.shared.download(stream: best, meta: pm, resolvedURL: url,
+                                        sourceName: best.name, qualityText: StreamRanking.signature(best),
+                                        nativeUsenetLease: ref?.nativeUsenetLease, nativeOwner: owner)
     }
 
     /// The episode context for a debrid resolve, so a series episode resolves to the right file inside a
