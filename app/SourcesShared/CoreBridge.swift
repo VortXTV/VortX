@@ -393,6 +393,15 @@ final class CoreBridge: ObservableObject {
         guard let facade = nativeFacade else { return { true } }
         return facade.captureSourceFence()
     }
+    @MainActor func captureNativeEpisodeSourceRegistry() -> (data: Data, isCurrent: @MainActor () -> Bool)? {
+        guard let target = captureNativeWatchlistTarget(),
+              let registry = target.facade.captureEpisodeSourceRegistry(),
+              nativeWatchlistTargetIsCurrent(target), registry.isCurrent() else { return nil }
+        return (registry.data, { [weak self] in
+            guard let self else { return false }
+            return self.nativeWatchlistTargetIsCurrent(target) && registry.isCurrent()
+        })
+    }
     @MainActor func nativeWatchlist() throws -> [VortxNativeWatchlist.Entry] {
         guard let facade = nativeFacade, let snapshot = facade.profileSnapshot(),
               case .string(let id) = snapshot.state["activeProfileId"], let profile = UUID(uuidString: id),

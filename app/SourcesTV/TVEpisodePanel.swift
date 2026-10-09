@@ -172,14 +172,14 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     let budget = EpisodeResolutionBudget.current
         ?? EpisodeResolutionBudget(episodeID: v.id, origin: .manual, now: ProcessInfo.processInfo.systemUptime)
     guard budget.episodeID == v.id else { return nil }
-    let owner = EpisodeSourceOwner(account: account)
+    let owner = EpisodeSourceOwner(core: core, account: account)
     let choice = SeriesSourceSticky.snapshot(for: seriesId)
     func admitted() -> Bool {
         owner.isCurrent && SeriesSourceSticky.admits(choice)
     }
     guard let groups = await EpisodeSourceCollection.collect(seriesID: seriesId, videoID: v.id,
         season: v.season, episode: v.episode, title: seriesName,
-        sources: owner.sources, wantedAddon: choice.addon,
+        sources: owner.sources(for: v.id), wantedAddon: choice.addon,
         deadline: budget.startedAt + SourceSettlementPolicy.maximumWait,
         isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
@@ -229,7 +229,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     let rawBase = groups.first(where: { $0.streams.contains(stream) })?.id
     let base = rawBase.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
     let bindingSucceeded = core.loadEnginePlayer(
-        for: stream, videoId: v.id, base: base, resolvedURL: selected.ref?.url
+        for: stream, videoId: v.id, libraryId: seriesId, base: base, resolvedURL: selected.ref?.url
     )
     let engineVideoID = EpisodePlaybackIdentity.boundVideoID(
         requestedVideoID: v.id, bindingSucceeded: bindingSucceeded

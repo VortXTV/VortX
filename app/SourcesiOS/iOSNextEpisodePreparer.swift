@@ -70,11 +70,12 @@ final class iOSNextEpisodePreparer: ObservableObject {
               let video = context.videos().first(where: { $0.id == request.episodeID }) else { return nil }
         let choice = SeriesSourceSticky.snapshot(for: context.seriesID)
         let sticky = choice.source
+        let sourceOwner = EpisodeSourceOwner(legacySources: context.sources, legacyIsCurrent: context.isCurrent)
         func admitted() -> Bool {
-            !Task.isCancelled && context.isCurrent() && SeriesSourceSticky.admits(choice)
+            sourceOwner.isCurrent && context.isCurrent() && SeriesSourceSticky.admits(choice)
         }
         guard admitted() else { return nil }
-        async let rawGroups = warmFetchEpisodeSourceGroups(sources: context.sources, request: request,
+        async let rawGroups = warmFetchEpisodeSourceGroups(sources: sourceOwner.sources(for: video.id), request: request,
                                                            wantedAddon: sticky.addon)
         let targetSeason = video.season ?? context.defaultSeason
         let targetEpisode = video.episode
@@ -92,7 +93,7 @@ final class iOSNextEpisodePreparer: ObservableObject {
         defer { clear(target: target, mediaTarget: mediaTarget) }
         let auxiliary = await awaitAuxiliarySettlement(target: target, mediaTarget: mediaTarget,
                                                        deadline: min(request.deadline, ProcessInfo.processInfo.systemUptime + NextEpisodePreparationBudget.addonFetchBudget),
-                                                       isCurrent: context.isCurrent)
+                                                       isCurrent: admitted)
         guard admitted() else { return nil }
         var groups = await rawGroups
         guard admitted() else { return nil }

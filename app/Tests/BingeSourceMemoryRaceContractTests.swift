@@ -437,7 +437,7 @@ enum BingeSourceMemoryRaceContractTests {
         let callerSource = callerPaths.compactMap { try? String(contentsOfFile: $0, encoding: .utf8) }
             .joined(separator: "\n")
         let collector = (try? String(contentsOfFile: "app/SourcesShared/EpisodeSourceCollection.swift", encoding: .utf8)) ?? ""
-        expect(callerSource.components(separatedBy: "EpisodeSourceCollection.collect(").count - 1 == 6
+        expect(callerSource.components(separatedBy: "EpisodeSourceCollection.collect(").count - 1 == 7
                && collector.contains("deadlineExpired: ProcessInfo.processInfo.systemUptime >= deadline"),
                "caller clock: episode/CW/refind collection uses an owned absolute settlement deadline")
         expect(!callerSource.contains("secondsSinceFirstPlayable"),

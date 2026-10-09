@@ -718,6 +718,7 @@ struct TVPlayerView: View {
     @State private var exhaustedURLs: Set<URL> = []    // sources already given up on for this video
     @State private var sourceHops = 0                  // automatic source switches so far for this video
     @State private var refinding = false               // a terminal-failure "Re-find sources" is in flight
+    @State private var episodeRefindAttempt: UUID?
     @State private var refindTask: Task<Void, Never>? = nil   // bounded settle-then-retry after a re-find
     @State private var emptySourceRecoveryTask: Task<Void, Never>?
     @State private var emptySourceRecoveryOwner: EmptySourceRecoveryOwner<PlayerLoadToken>?
@@ -941,6 +942,7 @@ struct TVPlayerView: View {
     // Next-episode preparation: settle, rank, and warm the source before the transition. The one live player
     // still mounts and decodes it at admission.
     @State private var preloaded: PreloadedEpisode?
+    @State private var preloadedSourceOwner: EpisodeSourceOwner?
     @State private var preloadPolicy = NextEpisodePreloadPolicy()
     @State private var preloadTask: Task<Void, Never>?
     @State private var preloadTorrentLease: NextEpisodeTorrentPreparationLease?
@@ -3788,6 +3790,8 @@ struct TVPlayerView: View {
     private var sourceTargetMeta: PlaybackMeta? { pendingAdvance?.meta ?? curMeta }
     @State private var isolatedEpisodeSources: [String: [CoreStreamSourceGroup]] = [:]
     @State private var isolatedEpisodeSourceOwner: EpisodeSourceOwner?
+    @State private var directResumeSourceTask: Task<Void, Never>?
+    @State private var directResumeSourceGeneration = UUID()
 
     private func retainEpisodeSources(_ groups: [CoreStreamSourceGroup], videoID: String, owner: EpisodeSourceOwner) {
         guard owner.isCurrent else { return }
@@ -3856,7 +3860,7 @@ struct TVPlayerView: View {
             return meta.videoId
         }
         let succeeded = core.loadEnginePlayer(
-            for: stream, videoId: meta.videoId,
+            for: stream, videoId: meta.videoId, libraryId: meta.libraryId,
             base: engineAddonBase(for: stream, groups: groups), resolvedURL: resolvedURL
         )
         return EpisodePlaybackIdentity.boundVideoID(
@@ -4828,6 +4832,7 @@ struct TVPlayerView: View {
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         guard refindEnabled, !isTrailer, let m = curMeta else { retryPlaybackByUser(); return }
         refindTask?.cancel()
+        episodeRefindAttempt = nil
         sourceHops = 0
         exhaustedURLs = []
         loadErrorMsg = ""
@@ -4835,20 +4840,34 @@ struct TVPlayerView: View {
         withAnimation { loadFailed = false }
         DiagnosticsLog.log("player", "re-find sources requested (\(m.type):\(VXProbeRedaction.identityToken(m.videoId)))")
         if isEpisodePlaybackContext {
-            let owner = EpisodeSourceOwner(account: account)
+            let owner = EpisodeSourceOwner(core: core, account: account)
+            let attempt = UUID()
+            episodeRefindAttempt = attempt
             let generation = sourceSwitchGeneration
             let episodeGeneration = episodeSwitchGeneration
             let choice = SeriesSourceSticky.snapshot(for: m.libraryId)
             let deadline = ProcessInfo.processInfo.systemUptime + SourceSettlementPolicy.maximumWait
             refindTask = Task { @MainActor in
+                defer {
+                    let action = EpisodeRefindCompletionPolicy.action(attempt: attempt, active: episodeRefindAttempt,
+                        sameMediaGeneration: sourceSwitchGeneration == generation && episodeSwitchGeneration == episodeGeneration,
+                        sameTarget: curMeta?.videoId == m.videoId, exited: leftPlayback, cancelled: Task.isCancelled)
+                    if action != .ignore {
+                        episodeRefindAttempt = nil
+                        let abandoned = refinding
+                        refinding = false
+                        if abandoned && action == .restoreFailure { presentTerminalLoadFailure() }
+                    }
+                }
                 func admitted() -> Bool {
                     owner.isCurrent && !leftPlayback && refinding && curMeta?.videoId == m.videoId
+                        && episodeRefindAttempt == attempt
                         && sourceSwitchGeneration == generation && episodeSwitchGeneration == episodeGeneration
                         && SeriesSourceSticky.admits(choice)
                 }
                 guard let groups = await EpisodeSourceCollection.collect(seriesID: m.libraryId, videoID: m.videoId,
                     season: m.season, episode: m.episode, title: m.name,
-                    sources: owner.sources, wantedAddon: choice.addon, deadline: deadline,
+                    sources: owner.sources(for: m.videoId), wantedAddon: choice.addon, deadline: deadline,
                     isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
                 retainEpisodeSources(groups, videoID: m.videoId, owner: owner)
                 refinding = false
@@ -8980,9 +8999,30 @@ struct TVPlayerView: View {
     /// still contain a covered detail page, so it is never read as authority here.
     private func hydrateDirectResumeMetadataForPlayerUI() {
         guard startedFromResume, let current = curMeta else { return }
-        // Sources and the in-player title panel retain their ordinary direct-resume hydration for movies
-        // and series. Episode inventory deliberately does not consume this shared slot; the fenced method
-        // below separately certifies a same-title response before changing Next/Prev navigation.
+        if isEpisodePlaybackContext {
+            directResumeSourceTask?.cancel()
+            let generation = UUID()
+            directResumeSourceGeneration = generation
+            let owner = EpisodeSourceOwner(core: core, account: account)
+            let mediaGeneration = sourceSwitchGeneration, episodeGeneration = episodeSwitchGeneration
+            let choice = SeriesSourceSticky.snapshot(for: current.libraryId)
+            let deadline = ProcessInfo.processInfo.systemUptime + SourceSettlementPolicy.maximumWait
+            directResumeSourceTask = Task { @MainActor in
+                func admitted() -> Bool {
+                    owner.isCurrent && !leftPlayback && directResumeSourceGeneration == generation
+                        && sourceSwitchGeneration == mediaGeneration && episodeSwitchGeneration == episodeGeneration
+                        && sourceTargetMeta?.videoId == current.videoId && SeriesSourceSticky.admits(choice)
+                }
+                guard let groups = await EpisodeSourceCollection.collect(seriesID: current.libraryId, videoID: current.videoId,
+                    season: current.season, episode: current.episode, title: current.name,
+                    sources: owner.sources(for: current.videoId), wantedAddon: choice.addon, deadline: deadline,
+                    isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
+                if !groups.isEmpty { retainEpisodeSources(groups, videoID: current.videoId, owner: owner) }
+            }
+            return
+        }
+        // Movie source hydration is unchanged. Series inventory remains the separate request-owned
+        // authoritative refresh below, never this shared detail slot.
         core.loadMeta(
             type: current.type, id: current.libraryId,
             streamType: current.type, streamId: current.videoId
@@ -9518,7 +9558,7 @@ struct TVPlayerView: View {
         resumeIsMidPlayRecovery = false
         if let stream = source.stream {
             let succeeded = core.loadEnginePlayer(
-                for: stream, videoId: pending.meta.videoId,
+                for: stream, videoId: pending.meta.videoId, libraryId: pending.meta.libraryId,
                 base: source.engineAddonBase, resolvedURL: source.debridRef?.url
             )
             enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
@@ -9639,7 +9679,8 @@ struct TVPlayerView: View {
         let rejectedStreams = languageRejectedStreams
         incomingEpisodeChoice = choice
         manualSourceToRemember = nil
-        let preparedEpisode = preloaded?.episodeID == v.id && preloaded?.choice == choice ? preloaded : nil
+        let preparedEpisode = preloaded?.episodeID == v.id && preloaded?.choice == choice
+            && preloadedSourceOwner?.isCurrent == true ? preloaded : nil
         // The old episode's producer and ranged warm read no longer own the player. Preserve only the engine
         // behind the exact prepared target being consumed below; every stale completion is generation-fenced.
         if preparedEpisode != nil {
@@ -9695,7 +9736,7 @@ struct TVPlayerView: View {
         )
         let resolutionBudget = EpisodeResolutionBudget(episodeID: v.id,
             origin: retryingAudio ? .languageRecovery : origin, now: ProcessInfo.processInfo.systemUptime)
-        let sourceOwner = EpisodeSourceOwner(account: account)
+        let sourceOwner = EpisodeSourceOwner(core: core, account: account)
         armEpisodeResolutionDeadline(owner: resolutionOwner, budget: resolutionBudget)
         DiagnosticsLog.log("binge", "episode resolve begin target=\(VXProbeRedaction.identityToken(v.id)) origin=\(resolutionBudget.origin.rawValue) budget=\(Int(Self.episodeResolutionDeadlineSeconds))s prepared=\(preparedEpisode != nil)")
         showInfo = true; selected = .play; flashControls()
@@ -9803,7 +9844,7 @@ struct TVPlayerView: View {
                     closeTorrent(hash: oldHash)
                 }
                 let succeeded = core.loadEnginePlayer(
-                    for: pre.stream, videoId: v.id, base: base,
+                    for: pre.stream, videoId: v.id, libraryId: m.libraryId, base: base,
                     resolvedURL: pre.debridRef?.url
                 )
                 enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
@@ -9827,7 +9868,7 @@ struct TVPlayerView: View {
                 }
                 if let groups = await EpisodeSourceCollection.collect(seriesID: m.libraryId, videoID: v.id,
                     season: v.season, episode: v.episode, title: m.name,
-                    sources: sourceOwner.sources, wantedAddon: choice?.addon,
+                    sources: sourceOwner.sources(for: v.id), wantedAddon: choice?.addon,
                     deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
                     isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: preparedSourcesCurrent),
                    preparedSourcesCurrent(), !groups.isEmpty {
@@ -9851,7 +9892,7 @@ struct TVPlayerView: View {
             let wantedAddon = choice?.addon
             guard let groups = await EpisodeSourceCollection.collect(seriesID: m.libraryId, videoID: v.id,
                 season: v.season, episode: v.episode, title: m.name,
-                sources: sourceOwner.sources, wantedAddon: wantedAddon,
+                sources: sourceOwner.sources(for: v.id), wantedAddon: wantedAddon,
                 deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
                 isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
             retainEpisodeSources(groups, videoID: v.id, owner: sourceOwner)
@@ -9961,7 +10002,7 @@ struct TVPlayerView: View {
                     }
                     invalidateLocalTrickplayCapture()
                     let succeeded = core.loadEnginePlayer(
-                        for: s, videoId: v.id,
+                        for: s, videoId: v.id, libraryId: m.libraryId,
                         base: engineAddonBase(for: s, groups: groups),
                         resolvedURL: selected.ref?.url
                     )
@@ -10105,6 +10146,8 @@ struct TVPlayerView: View {
     private func preloadNextIfNeeded() {
         guard !switchingEpisode, !leftPlayback,
               let i = episodeIndex, i + 1 < allEpisodes.count else { return }
+        let sourceOwner = EpisodeSourceOwner(core: core, account: account)
+        guard sourceOwner.isCurrent else { return }
         let next = allEpisodes[i + 1]
         var preloadTarget = NextEpisodePreloadPolicy.Target(
             episodeID: next.id, generation: preloadGeneration
@@ -10120,7 +10163,7 @@ struct TVPlayerView: View {
             now: ProcessInfo.processInfo.systemUptime
         ) else { return }
 
-        let sources = account.streamSources
+        let sources = sourceOwner.sources(for: next.id)
         // Snapshot the main-actor @State continuity hints here (on the main actor) so the background
         // Task never reads them off-main; the heavy fetch + ranking stays off-main and only the @State
         // writes hop back to the main actor.
@@ -10167,6 +10210,7 @@ struct TVPlayerView: View {
         // replacing its task so its URLSession and debrid work do not continue in parallel.
         preloadTask?.cancel()
         preloadTask = Task(priority: .utility) { @MainActor in
+            guard sourceOwner.isCurrent, SeriesSourceSticky.admits(choice), preloadPolicy.accepts(attempt) else { return }
             async let rawGroups = Self.fetchPreloadSourceGroups(
                 sources: sources,
                 attemptSequence: attempt.sequence,
@@ -10183,9 +10227,9 @@ struct TVPlayerView: View {
                         + NextEpisodePreloadPolicy.addonFetchBudget
                 )
             )
-            guard !Task.isCancelled, SeriesSourceSticky.admits(choice), preloadPolicy.accepts(attempt) else { return }
+            guard sourceOwner.isCurrent, SeriesSourceSticky.admits(choice), preloadPolicy.accepts(attempt) else { return }
             let fetchedRawGroups = await rawGroups
-            guard !Task.isCancelled, SeriesSourceSticky.admits(choice), preloadPolicy.accepts(attempt) else { return }
+            guard sourceOwner.isCurrent, SeriesSourceSticky.admits(choice), preloadPolicy.accepts(attempt) else { return }
             let torboxAuthorization = SourceIndexIdentity.mergeAuthorization(
                 published: preloadTorboxSearch.publishedTarget, page: target
             )
@@ -10234,7 +10278,7 @@ struct TVPlayerView: View {
                 debridCachedHashes: debridCachedHashes,
                 attemptDeadline: attempt.deadline
             )
-            guard !Task.isCancelled, choice == continuityChoice else { return }
+            guard sourceOwner.isCurrent, choice == continuityChoice else { return }
             let completion = preloadPolicy.complete(
                 attempt,
                 success: selected != nil,
@@ -10280,6 +10324,7 @@ struct TVPlayerView: View {
                     choice: choice,
                     preparedRemux: nil
                 )
+                preloadedSourceOwner = sourceOwner
                 plog.info("preload ready: \(StreamRanking.qualityLabel(best), privacy: .public) for \(episodeToken, privacy: .public)")
             } else {
                 plog.info("preload found nothing for \(episodeToken, privacy: .public); state=\(String(describing: completion), privacy: .public)")
@@ -10867,6 +10912,8 @@ struct TVPlayerView: View {
         cancelEmptySourceRecovery()
         refreshPlaybackIdleTimer()
         refindTask?.cancel(); refindTask = nil; refinding = false   // a settling re-find must not retry into a left player
+        directResumeSourceTask?.cancel(); directResumeSourceTask = nil
+        directResumeSourceGeneration = UUID()
         flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer pressing Back immediately
         invalidateEpisodeResolution()
         eofFrozenAtTerminal = false; terminalAdvanceDeadlineTask?.cancel(); terminalAdvanceDeadlineTask = nil

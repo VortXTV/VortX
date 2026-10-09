@@ -479,12 +479,16 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
             store: store, transport: SessionTransport(), allowNewAccount: true)
         let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], changed: { _ in })
         let binding = facade.watchlistBinding!
+        let sourceRegistry = facade.captureEpisodeSourceRegistry()!
+        let capturedInventory = try JSONDecoder().decode(VortxJSON.self, from: sourceRegistry.data)
+        check(sourceRegistry.isCurrent() && capturedInventory == .array([]))
         let entry = VortxNativeWatchlist.Entry(id: "tt-busy", type: "movie", name: "Queued title", poster: nil, addedAt: 123)
         store.blockNextWrite()
         let pending = Task { try await facade.mutateProfiles([], hostEdits: [.init(profileID: profile.uuidString, fields: ["avatar": .string("moon")])],
             expectedProfileID: profile.uuidString, expectedAccountGeneration: binding.accountGeneration) }
         await withCheckedContinuation { done in DispatchQueue.global().async { precondition(store.entered.wait(timeout: .now() + 5) == .success); done.resume() } }
         check(facade.registryBinding == nil && facade.watchlistBinding == binding)
+        check(sourceRegistry.isCurrent() && facade.captureEpisodeSourceRegistry()?.isCurrent() == true)
         let add = Task { try await facade.setWatchlist(entry, present: true, expected: binding) }
         store.release.signal(); try await pending.value
         check(try await add.value)
@@ -500,21 +504,30 @@ private final class DetailFanoutTransport: VortxResourceTransport, @unchecked Se
         store.release.signal(); try await later.value
         check(try await !remove.value)
         check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: profile).isEmpty)
+        check(sourceRegistry.isCurrent()) // unrelated busy/acknowledged host and watchlist writes do not retire resource authority
+        try await facade.rebindRegistry([], expected: facade.registryBinding!)
+        check(!sourceRegistry.isCurrent()) // even same descriptors cannot revive an earlier registry receipt
+        let beforeABA = facade.captureEpisodeSourceRegistry()!
         func switchTo(_ id: String) throws {
             let action: VortxJSON = .object(["action": .string("Vortx"), "args": .object(["type": .string("switch_profile"), "id": .string(id)])])
             check(facade.dispatch(data: try JSONEncoder().encode(action), field: "native_state"))
         }
         try switchTo("kid"); await facade.settled(); try switchTo(profile.uuidString); await facade.settled()
         check(facade.watchlistBinding != binding && facade.watchlistBinding?.accountGeneration == binding.accountGeneration)
+        check(!beforeABA.isCurrent())
         do { _ = try await facade.setWatchlist(entry, present: true, expected: binding); check(false) } catch VortxNativeError.superseded {}
         let rebound = facade.watchlistBinding!
+        let beforeRebind = facade.captureEpisodeSourceRegistry()!
         var remote = try facade.profileSnapshot()!.state["nativeSync"]!.decode([String: VortxJSON].self)
         remote["accountSlots"] = .object([profile.uuidString: .object(["activeBinding": .object(["revision": .integer(1)])])])
         _ = try await facade.mergeSyncDocument(.object(remote))
         check(facade.watchlistBinding?.accountGeneration != rebound.accountGeneration)
+        check(!beforeRebind.isCurrent())
         do { _ = try await facade.setWatchlist(entry, present: true, expected: rebound); check(false) } catch VortxNativeError.superseded {}
         let beforeClose = facade.watchlistBinding!
+        let sourceBeforeClose = facade.captureEpisodeSourceRegistry()!
         await facade.shutdown()
+        check(!sourceBeforeClose.isCurrent() && facade.captureEpisodeSourceRegistry() == nil)
         do { _ = try await facade.setWatchlist(entry, present: true, expected: beforeClose); check(false) } catch VortxNativeError.superseded {}
         let cold = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(), store: store, transport: SessionTransport())
         check(try VortxNativeWatchlist.entries(host: await cold.hostPreferencesDocument(), profileID: profile).isEmpty)

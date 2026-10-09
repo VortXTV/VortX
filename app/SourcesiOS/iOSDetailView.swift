@@ -165,14 +165,14 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let requiredChoice = SeriesSourceSticky.resolvingChoice
     let sticky = choice.source
     let wantedAddon = sticky.addon
-    let sourceOwner = EpisodeSourceOwner(account: account)
+    let sourceOwner = EpisodeSourceOwner(core: core, account: account)
     func admitted() -> Bool {
         sourceOwner.isCurrent && SeriesSourceSticky.admits(choice)
             && (requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice))
     }
     guard let groups = await EpisodeSourceCollection.collect(seriesID: seriesId, videoID: v.id,
         season: v.season ?? defaultSeason, episode: v.episode, title: seriesName,
-        sources: sourceOwner.sources, wantedAddon: wantedAddon,
+        sources: sourceOwner.sources(for: v.id), wantedAddon: wantedAddon,
         deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
         isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
@@ -5305,7 +5305,7 @@ struct iOSEpisodeStreams: View {
         guard presentation == nil,
               episodeTargetIsCurrent(target, generation: targetGeneration, quickWatchScope: quickWatchScope) else { return }
         let bindingSucceeded = core.loadEnginePlayer(
-            for: stream, videoId: pm.videoId,
+            for: stream, videoId: pm.videoId, libraryId: pm.libraryId,
             base: iOSEngineAddonBase(for: stream, in: core.streamGroups(forStreamId: target.id)),
             resolvedURL: ref?.url
         )
@@ -5367,7 +5367,7 @@ struct iOSEpisodeStreams: View {
             guard presentation == nil,
                   episodeTargetIsCurrent(target, generation: targetGeneration, quickWatchScope: quickWatchScope) else { return }
             let bindingSucceeded = core.loadEnginePlayer(
-                for: win.stream, videoId: pm.videoId,
+                for: win.stream, videoId: pm.videoId, libraryId: pm.libraryId,
                 base: iOSEngineAddonBase(for: win.stream, in: core.streamGroups(forStreamId: target.id)),
                 resolvedURL: win.ref.url
             )
@@ -5700,14 +5700,14 @@ struct iOSEpisodeStreams: View {
         let choice = SeriesSourceSticky.snapshot(for: meta.id)
         let sticky = choice.source
         let wantedAddon = sticky.addon
-        let sourceOwner = EpisodeSourceOwner(account: account)
+        let sourceOwner = EpisodeSourceOwner(core: core, account: account)
         func admitted() -> Bool {
             sourceOwner.isCurrent && SeriesSourceSticky.admits(choice)
         }
         guard let groups = await EpisodeSourceCollection.collect(seriesID: meta.id, videoID: v.id,
             season: v.season ?? season, episode: v.episode, title: meta.name,
             defaultVideoID: meta.behaviorHints?.defaultVideoId,
-            sources: sourceOwner.sources, wantedAddon: wantedAddon,
+            sources: sourceOwner.sources(for: v.id), wantedAddon: wantedAddon,
             deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
             isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
         // Next / Prev / list / binge preserve the chosen release when present. Keep the full filtered

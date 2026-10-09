@@ -1468,6 +1468,11 @@ struct PlayerScreen: View {
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var preparingEpisodeID: String?
     @State private var preparedEpisode: PlayerEpisodeStream?
+    @State private var preparedEpisodeSourceOwner: EpisodeSourceOwner?
+    @State private var isolatedEpisodeSources: [String: [CoreStreamSourceGroup]] = [:]
+    @State private var isolatedEpisodeSourceOwner: EpisodeSourceOwner?
+    @State private var episodeSourceHydrationTask: Task<Void, Never>?
+    @State private var episodeSourceHydrationGeneration = UUID()
     @State private var nextEpisodePreparationTask: Task<Void, Never>?
     @State private var nextEpisodePreparationGeneration = 0
     @State private var nextEpisodeAttemptPolicy = PreparedEpisodeAttemptPolicy()
@@ -4361,7 +4366,7 @@ struct PlayerScreen: View {
                 }
                 if let target = retryMeta, let source = currentStream {
                     let succeeded = core.loadEnginePlayer(
-                        for: source, videoId: target.videoId,
+                        for: source, videoId: target.videoId, libraryId: target.libraryId,
                         base: engineAddonBase(for: source), resolvedURL: fresh
                     )
                     enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
@@ -6735,7 +6740,7 @@ struct PlayerScreen: View {
         if !engineAlreadyBound, isEpisodePlaybackContext,
            let meta = pendingAdvance?.meta ?? curMeta {
             let succeeded = core.loadEnginePlayer(
-                for: stream, videoId: meta.videoId,
+                for: stream, videoId: meta.videoId, libraryId: meta.libraryId,
                 base: engineAddonBaseOverride ?? engineAddonBase(for: stream),
                 resolvedURL: debridRef?.url
             )
@@ -6848,8 +6853,13 @@ struct PlayerScreen: View {
     /// exact title/episode response before it replaces a partial navigation seed.
     private func hydrateDirectResumeMetadataForPlayerUI() {
         guard startedFromResume, let current = curMeta else { return }
-        // Keep the existing shared-meta refresh for source UI on every direct resume, including movies.
-        // Navigation inventory is admitted only by the exact request-owned series refresh below.
+        if isEpisodePlaybackContext {
+            let owner = EpisodeSourceOwner(core: core, account: account)
+            hydrateEpisodeSources(current, owner: owner)
+            return
+        }
+        // Movies retain the existing detail refresh. Series source panels and navigation inventory each
+        // have their own exact-video owner, and must never evict the covered Detail page's shared slot.
         core.loadMeta(
             type: current.type, id: current.libraryId,
             streamType: current.type, streamId: current.videoId
@@ -7291,6 +7301,8 @@ struct PlayerScreen: View {
     /// but only one active attempt, two delayed retries, and one final credits attempt can be admitted.
     private func warmNextIfNeeded() {
         guard let warm = warmNextEpisode, canNextEpisode, let i = episodeIndex else { return }
+        let sourceOwner = EpisodeSourceOwner(core: core, account: account)
+        guard sourceOwner.isCurrent else { return }
         let nextID = allEpisodeRefs[i + 1].id
         guard warmedEpisodeID != nextID, preparingEpisodeID != nextID else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -7318,10 +7330,16 @@ struct PlayerScreen: View {
         preparingEpisodeID = nextID
         DiagnosticsLog.log("binge", "next prepare trigger target=\(VXProbeRedaction.identityToken(nextID)) generation=\(generation) attempt=\(attempt.sequence) credits=\(attempt.nearCredits ? "Y" : "N")")
         nextEpisodePreparationTask = Task { @MainActor in
+            guard sourceOwner.isCurrent, SeriesSourceSticky.admits(choice) else {
+                if generation == nextEpisodePreparationGeneration, preparingEpisodeID == nextID {
+                    invalidatePreparedEpisode(reason: "source owner retired before preparation")
+                }
+                return
+            }
             let result = await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
                 await warm(request)
             }
-            guard preparingEpisodeID == nextID,
+            guard sourceOwner.isCurrent, preparingEpisodeID == nextID,
                   PreparedEpisodeRetentionPolicy.ownsCompletion(
                     capturedGeneration: generation,
                     currentGeneration: nextEpisodePreparationGeneration,
@@ -7363,6 +7381,7 @@ struct PlayerScreen: View {
             preparedEpisode?.preparedRemux?.abandon(reason: "replacement prepared episode")
             warmedEpisodeID = nextID
             preparedEpisode = result
+            preparedEpisodeSourceOwner = sourceOwner
             preparedEpisodeChoice = choice
             DiagnosticsLog.log("binge", "next prepare ready target=\(VXProbeRedaction.identityToken(nextID)) host=\(result.url.host ?? "-") generation=\(generation)")
         }
@@ -7370,7 +7389,7 @@ struct PlayerScreen: View {
 
     private func takePreparedEpisode(for videoID: String) -> PlayerEpisodeStream? {
         let choiceIsCurrent = preparedEpisodeChoice == seriesStickyKey.map { SeriesSourceSticky.currentSnapshot(for: $0) }
-        let result = choiceIsCurrent && PreparedEpisodeRetentionPolicy.consumes(
+        let result = choiceIsCurrent && preparedEpisodeSourceOwner?.isCurrent == true && PreparedEpisodeRetentionPolicy.consumes(
             requestedEpisodeID: videoID,
             preparedEpisodeID: preparedEpisode?.meta.videoId
         ) ? preparedEpisode : nil
@@ -7386,6 +7405,7 @@ struct PlayerScreen: View {
         nextEpisodePreparationTask = nil
         preparingEpisodeID = nil
         preparedEpisode = nil
+        preparedEpisodeSourceOwner = nil
         preparedEpisodeChoice = nil
         warmedEpisodeID = nil
         nextEpisodeAttemptPolicy.reset()
@@ -7403,6 +7423,7 @@ struct PlayerScreen: View {
         retirePreparedTorrentEngine(preparedEpisode?.torrentPreparationLease, reason: reason)
         preparedEpisode?.preparedRemux?.abandon(reason: reason)
         preparedEpisode = nil
+        preparedEpisodeSourceOwner = nil
         preparedEpisodeChoice = nil
         warmedEpisodeID = nil
         nextEpisodeAttemptPolicy.reset()
@@ -7508,6 +7529,9 @@ struct PlayerScreen: View {
     }
 
     private func invalidateEpisodeWorkForExit() {
+        episodeSourceHydrationTask?.cancel()
+        episodeSourceHydrationTask = nil
+        episodeSourceHydrationGeneration = UUID()
         persistenceBlockedForExit = hasUncommittedIssuedMedia
         playbackExited = true
         invalidateEpisodeResolution()
@@ -7545,7 +7569,7 @@ struct PlayerScreen: View {
         curIsTorrent = source.isTorrent
         if let stream = source.stream {
             let succeeded = core.loadEnginePlayer(
-                for: stream, videoId: pending.meta.videoId,
+                for: stream, videoId: pending.meta.videoId, libraryId: pending.meta.libraryId,
                 base: source.engineAddonBase, resolvedURL: source.debridRef?.url
             )
             enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
@@ -7654,6 +7678,8 @@ struct PlayerScreen: View {
         )
         let resolutionBudget = EpisodeResolutionBudget(episodeID: videoId,
             origin: origin ?? (autoAdvance ? .automatic : .manual), now: ProcessInfo.processInfo.systemUptime)
+        let sourceOwner = EpisodeSourceOwner(core: core, account: account)
+        let sourceReceipt = EpisodeSourceReceipt(videoID: videoId, owner: sourceOwner)
         armEpisodeResolutionDeadline(owner: resolutionOwner, budget: resolutionBudget)
         DiagnosticsLog.log("binge", "episode resolve begin target=\(VXProbeRedaction.identityToken(videoId)) origin=\(resolutionBudget.origin.rawValue) budget=\(Int(Self.episodeResolutionDeadlineSeconds))s prepared=\(retainedPreparedEpisode != nil)")
         autoRetryTask?.cancel()
@@ -7683,29 +7709,20 @@ struct PlayerScreen: View {
                     )
                 }
             }
-            guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return }
+            guard sourceOwner.isCurrent, SeriesSourceSticky.admits(choice) else { return }
             let resolved: PlayerEpisodeStream?
             if let retainedPreparedEpisode,
                preparedTorrentLeaseIsAdmissible(
                     retainedPreparedEpisode,
                     requestedEpisodeID: videoId
                ) {
-                // The retained URL/selection avoids a cold resolve, but CoreBridge still has to move its
-                // episode-scoped source owner before switchStream can bind engine attribution or fail over.
-                // This is the same identity load performed by loadEpisodeStream, without re-ranking.
-                guard let sourceIdentityTarget = PreparedEpisodeRetentionPolicy.sourceIdentityTarget(
+                guard PreparedEpisodeRetentionPolicy.sourceIdentityTarget(
                     requestedEpisodeID: videoId,
                     preparedEpisodeID: retainedPreparedEpisode.meta.videoId
-                ) else { return }
-                core.loadMeta(
-                    type: "series",
-                    id: retainedPreparedEpisode.meta.libraryId,
-                    streamType: "series",
-                    streamId: sourceIdentityTarget
-                )
+                ) != nil else { return }
                 DiagnosticsLog.log(
                     "binge",
-                    "next prepare admitted target=\(VXProbeRedaction.identityToken(videoId)); source identity advanced without reselection"
+                    "next prepare admitted target=\(VXProbeRedaction.identityToken(videoId)); owned source retained without reselection"
                 )
                 resolved = retainedPreparedEpisode
             } else {
@@ -7719,11 +7736,13 @@ struct PlayerScreen: View {
                     )
                 }
                 if let resolverRoute {
-                    resolved = await EpisodeResolutionBudget.$current.withValue(resolutionBudget) {
-                        await SeriesSourceSticky.resolveIfCurrent(choice) {
-                            await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
-                                await SeriesSourceSticky.$rejectedStreams.withValue(rejectedStreams) {
-                                    await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                    resolved = await EpisodeSourceCollection.$receipt.withValue(sourceReceipt) {
+                        await EpisodeResolutionBudget.$current.withValue(resolutionBudget) {
+                            await SeriesSourceSticky.resolveIfCurrent(choice) {
+                                await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
+                                    await SeriesSourceSticky.$rejectedStreams.withValue(rejectedStreams) {
+                                        await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                                    }
                                 }
                             }
                         }
@@ -7732,7 +7751,7 @@ struct PlayerScreen: View {
                     resolved = nil
                 }
             }
-            let resultIsCurrent = !Task.isCancelled && !playbackExited
+            let resultIsCurrent = sourceOwner.isCurrent && !playbackExited
                 && episodeGeneration == episodeSwitchGeneration
                 && mediaGeneration == resumeRetryGeneration
                 && SeriesSourceSticky.admits(choice)
@@ -7830,7 +7849,7 @@ struct PlayerScreen: View {
             // re-mints the session token, and the normal first-frame hook opens the new episode's scrobble.
             // The player command is the transaction boundary. Source state and engine attribution move only
             // after that command returns an exact active token inside switchStream.
-            guard !playbackExited,
+            guard sourceOwner.isCurrent, !playbackExited,
                   SeriesSourceSticky.admits(choice),
                   episodeGeneration == episodeSwitchGeneration,
                   mediaGeneration == resumeRetryGeneration,
@@ -7852,6 +7871,12 @@ struct PlayerScreen: View {
                 expectedPreparedRemuxOwner: expectedPreparedRemuxOwner
             )
             admissionCommandIssued = issued
+            if issued {
+                let fallback = [CoreStreamSourceGroup(id: es.engineAddonBase ?? "prepared",
+                    addon: choice?.addon ?? "", streams: [es.stream])]
+                retainEpisodeSources(sourceReceipt.groups ?? fallback, videoID: es.meta.videoId, owner: sourceOwner)
+                if sourceReceipt.groups == nil { hydrateEpisodeSources(es.meta, owner: sourceOwner) }
+            }
             if issued, resumeAfterLanguageRetry {
                 resumeAfterLanguageRetry = false
                 coordinator.player?.play()
@@ -10199,6 +10224,38 @@ struct PlayerScreen: View {
 
     // MARK: - Source switching
 
+    private func retainEpisodeSources(_ groups: [CoreStreamSourceGroup], videoID: String, owner: EpisodeSourceOwner) {
+        guard owner.isCurrent else { return }
+        isolatedEpisodeSources = isolatedEpisodeSourceOwner?.isCurrent == true
+            ? isolatedEpisodeSources.filter { $0.key == curMeta?.videoId } : [:]
+        isolatedEpisodeSources[videoID] = groups
+        isolatedEpisodeSourceOwner = owner
+    }
+
+    /// This task is deliberately separate from episode admission: prepared media issues first. A late
+    /// completion can only enrich the same mounted/pending video and media generation, never another panel.
+    private func hydrateEpisodeSources(_ target: PlaybackMeta, owner: EpisodeSourceOwner) {
+        episodeSourceHydrationTask?.cancel()
+        let generation = UUID()
+        episodeSourceHydrationGeneration = generation
+        let episodeGeneration = episodeSwitchGeneration, mediaGeneration = resumeRetryGeneration
+        let choice = SeriesSourceSticky.snapshot(for: target.libraryId)
+        let deadline = ProcessInfo.processInfo.systemUptime + SourceSettlementPolicy.maximumWait
+        episodeSourceHydrationTask = Task { @MainActor in
+            func admitted() -> Bool {
+                owner.isCurrent && !playbackExited && episodeSourceHydrationGeneration == generation
+                    && episodeSwitchGeneration == episodeGeneration && resumeRetryGeneration == mediaGeneration
+                    && (pendingAdvance?.meta ?? curMeta)?.videoId == target.videoId && SeriesSourceSticky.admits(choice)
+            }
+            guard let groups = await EpisodeSourceCollection.collect(seriesID: target.libraryId, videoID: target.videoId,
+                season: target.season, episode: target.episode, title: target.name,
+                sources: owner.sources(for: target.videoId), wantedAddon: choice.addon, deadline: deadline,
+                isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
+            // Preserve a prepared winner if alternatives are unavailable; never clear a usable selected row.
+            if !groups.isEmpty { retainEpisodeSources(groups, videoID: target.videoId, owner: owner) }
+        }
+    }
+
     /// Stream groups for the CURRENTLY playing episode / movie. Prefer the per-streamId set so a CW resume
     /// or an episode switch shows THIS episode's sources (not a stale or empty resident set), falling back
     /// to the bare resident groups for movies / before the per-id set has populated. This is what makes the
@@ -10206,6 +10263,9 @@ struct PlayerScreen: View {
     private var currentSourceGroups: [CoreStreamSourceGroup] {
         let target = pendingAdvance?.meta ?? curMeta
         if let meta = target, isEpisodePlaybackContext {
+            if let groups = isolatedEpisodeSources[meta.videoId] {
+                return isolatedEpisodeSourceOwner?.isCurrent == true ? groups : []
+            }
             return core.streamGroups(forStreamId: meta.videoId)
         }
         if let id = target?.videoId {

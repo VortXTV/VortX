@@ -174,6 +174,24 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return RegistryBinding(scope: session.scope, profileID: profile, generation: registryGeneration)
         }
     }
+    /// One atomic, active-profile resource inventory. Ordinary queued progress/sync work is not a
+    /// new owner; acknowledged registry/profile/account changes (including ABA) retire this receipt.
+    func captureEpisodeSourceRegistry() -> (data: Data, isCurrent: @Sendable () -> Bool)? {
+        lock.withLock {
+            guard !closed, resourceRegistryValid, let profile = string(values["native_state"]?["activeProfileId"]) else { return nil }
+            let generation = registryGeneration, account = accountEpoch, selection = watchlistProfileGeneration
+            let descriptors = registry.map { VortxJSON.object(["transportUrl": .string($0.transportUrl), "manifest": $0.manifest ?? .object([:])]) }
+            guard let data = try? JSONEncoder().encode(VortxJSON.array(descriptors)) else { return nil }
+            return (data, { [weak self] in
+                guard let self else { return false }
+                return self.lock.withLock {
+                    !self.closed && self.resourceRegistryValid && self.registryGeneration == generation
+                        && self.accountEpoch == account && self.watchlistProfileGeneration == selection
+                        && self.string(self.values["native_state"]?["activeProfileId"]) == profile
+                }
+            })
+        }
+    }
     /// Caller-confirmed registry replacement is bound to the accepted account/profile generation.
     /// New loads stay rejected during replacement; all previous resource publications are revoked.
     func rebindRegistry(_ replacement: [VortxResourceAddon], expected: RegistryBinding) async throws {
