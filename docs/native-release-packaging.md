@@ -6,6 +6,35 @@ physical playback, signing or publication. The retained `app/project.yml` still 
 legacy comparison project; the shipping workflow uses the native generator below. All migration,
 independent review, full-build and artifact gates remain required before publication.
 
+## Pinned shipping inputs
+
+The checkout and post-checkout equality assertion in `release-tvos.yml`, `android.yml` and
+`android-release.yml` must select one identical, reviewed native source revision. Their current
+source contract is `a722eef43f80bd82226215cf460bba2e02869777`. Updating this pin does not establish
+private CI, fresh cross-platform SDK, app, signing or release acceptance; those gates must pass
+against the final combined public source before shipping. The retained Stremio comparison pin is
+`31c66611822043e089f5819ad232a5df93975873`; native packages must not contain its engine or Node runtime.
+
+Apple shipping and secretless validation use the same fresh player archive:
+
+- URL: `https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-2/mpvkit-dvfel-artifacts-ffmpeg9-20261008.zip`
+- SHA-256: `ccccc9a3faa84276bf10625d652dd4c9eea04c6a0abdc8e26cb1b35f147514fb`
+
+The FFmpeg9/SecureTransport content and architecture/floor gates remain required after extraction.
+The retired FFmpeg8/GnuTLS digest stays explicitly rejected; an override cannot bypass that rejection.
+Only public dependency downloads have broad Cargo cache fallback. Native Apple SDK caches are
+exact-key-only and content-addressed to the fetched private source and build helper, and Android's
+private build cache prefix includes its fetched source contents. Warm artifacts still undergo ABI,
+floor, link-input and packaged-content verification; an older run's SDK or APK/IPA is not proof for
+the replacement private pin.
+
+The tagless `android.yml` candidate supplies Full and Play debug APKs plus, when signing is
+provisioned, a production-signed Full APK and Full AAB. It does not replace `android-release.yml`,
+which binds to an existing release tag and verifies production-signed Full/Play universal APKs,
+the Play AAB, normalized native payloads, signer, version, GPL boundary and retained provenance
+before draft attachment. Android cannot publish; the Apple coordinator retains the cross-platform
+draft/feed/publication gates.
+
 ## Apple
 
 `scripts/generate-native-apple-project.rb` generates `app/.native-project.yml` from the retained

@@ -11,6 +11,7 @@ readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly GRADLE_BUILD="$REPO_ROOT/android/app/build.gradle.kts"
 readonly ANDROID_CI_WF="$REPO_ROOT/.github/workflows/android.yml"
 readonly ANDROID_RELEASE_WF="$REPO_ROOT/.github/workflows/android-release.yml"
+readonly REVIEWED_NATIVE_SHA='a722eef43f80bd82226215cf460bba2e02869777'
 readonly APP_SOURCE="$REPO_ROOT/android/app/src/main/kotlin/com/vortx/android/VortXApplication.kt"
 readonly LEGACY_REPOSITORY="$REPO_ROOT/android/app/src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt"
 readonly RESOURCE_BRIDGE="$REPO_ROOT/android/app/src/main/kotlin/com/vortx/android/engine/VortxResourceBridge.kt"
@@ -80,7 +81,8 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     require_literal "$(basename "$workflow") pins stremiox-core immutably" 'repository: VortXTV/stremiox-core' "$workflow"
     require_regex "$(basename "$workflow") stremiox-core ref is a full SHA" 'ref: [0-9a-f]{40}' "$workflow"
     require_literal "$(basename "$workflow") pins vortx-core immutably" 'repository: VortXTV/vortx-core' "$workflow"
-    require_literal "$(basename "$workflow") enforces the reviewed vortx-core SHA" 'feaa0e074133137625e5e143c80715d5cb2a5ffe' "$workflow"
+    require_literal "$(basename "$workflow") enforces the reviewed vortx-core SHA" \
+        "test \"\$vortx_sha\" = \"$REVIEWED_NATIVE_SHA\"" "$workflow"
     require_literal "$(basename "$workflow") records the exact fetched Vortx source SHA" 'VORTX_ENGINE_SOURCE_SHA=$vortx_sha' "$workflow"
     require_literal "$(basename "$workflow") verifies artifacts against the source SHA" '--source-sha "$VORTX_ENGINE_SOURCE_SHA"' "$workflow"
     # rust-cache's explicit key survives its lockfile-prefix fallback. Bind that key to the
@@ -141,7 +143,7 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     vortx_pin="$(awk '/repository: VortXTV\/vortx-core/{seen=1; next} seen && /ref:/{print $2; exit}' "$workflow")"
     [[ "$stremio_pin" = "31c66611822043e089f5819ad232a5df93975873" ]] \
       || fail "$(basename "$workflow") changed the retained stremiox-core comparison pin"
-    [[ "$vortx_pin" = "feaa0e074133137625e5e143c80715d5cb2a5ffe" ]] \
+    [[ "$vortx_pin" = "$REVIEWED_NATIVE_SHA" ]] \
       || fail "$(basename "$workflow") changed the reviewed vortx-core pin"
     printf 'pin: %s stremiox-core=%s vortx-core=%s (parent approval owns replacement)\n' "$(basename "$workflow")" "$stremio_pin" "$vortx_pin"
 done
