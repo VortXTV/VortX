@@ -22,6 +22,7 @@ struct Issue164TraktContractTests {
         let provider = read(app, "SourcesShared/ExternalScrobbleProvider.swift")
         let settings = read(app, "SourcesShared/ExternalServicesSettingsView.swift")
         let shadow = read(app, "SourcesShared/TraktPlaybackShadow.swift")
+        let homeCWSelection = read(app, "SourcesShared/HomeContinueWatchingSelection.swift")
         let auth = read(app, "SourcesShared/TraktAuth.swift")
         let service = read(app, "SourcesShared/TraktService.swift")
         let syncEngine = read(app, "SourcesShared/TraktSyncEngine.swift")
@@ -71,13 +72,13 @@ struct Issue164TraktContractTests {
                 "whole playback snapshots must feed the shared fold")
         require(shadow.contains("?extended=full"),
                 "runtime-bearing Trakt rows must be requested")
-        require(tvHome.contains("continueWatchingSelection(")
-                    && tvHome.contains("fallback: core.continueWatching")
-                    && tvHome.contains("libraryItems: core.library?.catalog ?? []"),
+        require(tvHome.contains("HomeContinueWatchingSelection.current(core: core, profiles: profiles).selection")
+                    && homeCWSelection.contains("fallback: localItems")
+                    && homeCWSelection.contains("libraryItems: core.library?.catalog ?? []"),
                 "tvOS Home must consume the selected Trakt source and local catalog artwork")
-        require(iosHome.contains("continueWatchingSelection(")
-                    && iosHome.contains("fallback: core.continueWatching")
-                    && iosHome.contains("libraryItems: core.library?.catalog ?? []"),
+        require(iosHome.contains("HomeContinueWatchingSelection.current(core: core, profiles: profiles).selection")
+                    && homeCWSelection.contains("fallback: localItems")
+                    && homeCWSelection.contains("libraryItems: core.library?.catalog ?? []"),
                 "iOS and macOS Home must consume the selected Trakt source and local catalog artwork")
 
         // Blocker 2: the offset printed on a Trakt card is the direct player's start offset.
@@ -423,7 +424,7 @@ struct Issue164TraktContractTests {
         let iosHomeBody = segment(
             in: iosHome,
             from: """
-            var body: some View {
+            private var homeNavigation: some View {
                     let renderedContinueWatching = continueWatchingRenderSnapshot
             """,
             to: "private func refreshReleaseCalendar()"
@@ -479,11 +480,11 @@ struct Issue164TraktContractTests {
         let iosEpisodeContentLaunches = segment(
             in: iosDetail,
             from: "private func play(\n        _ stream: CoreStream,\n        url: URL,",
-            to: "private func autoPickAndPlayEpisode() async"
+            to: "private func autoPickAndPlayEpisode("
         )
         let iosEpisodeAutoPick = segment(
             in: iosDetail,
-            from: "private func autoPickAndPlayEpisode() async",
+            from: "private func autoPickAndPlayEpisode(",
             to: "#if !os(tvOS)"
         )
         require(iosDetail.contains("var initialResumeSeconds: Double? = nil")
@@ -497,7 +498,7 @@ struct Issue164TraktContractTests {
                     && occurrences(of: "initialStartGate.admit(", in: iosEpisodeContentLaunches) == 2
                     && occurrences(of: "currentSessionID: TraktAuth.storedSessionID", in: iosEpisodeContentLaunches) == 2
                     && occurrences(of: "presentation = .player", in: iosEpisodeContentLaunches) == 2
-                    && iosEpisodeAutoPick.contains("await playBest(candidates, labeledBest: best)")
+                    && iosEpisodeAutoPick.contains("await playBest(candidates, labeledBest: best")
                     && !iosEpisodeAutoPick.contains("presentation = .player")
                     && !iosDetail.contains("didConsumeInitialResume")
                     && !iosDetail.contains("didConsumeInitialStart"),

@@ -30,15 +30,8 @@ struct HomeView: View {
     /// The owner profile rides the account's Continue Watching; overlay profiles ride their own
     /// private synced history.
     private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
-        if core.usesNativeProfileState { return .init(items: core.continueWatching, source: .local, sessionID: nil) }
-        guard profiles.activeUsesEngineHistory else {
-            return .init(items: profiles.cwItems, source: .local, sessionID: nil)
-        }
         _ = traktContinueWatchingRevision
-        return TraktPlaybackShadow.shared.continueWatchingSelection(
-            fallback: core.continueWatching,
-            libraryItems: core.library?.catalog ?? []
-        )
+        return HomeContinueWatchingSelection.current(core: core, profiles: profiles).selection
     }
 
     private var continueWatching: [CoreCWItem] { continueWatchingSelection.items }

@@ -63,7 +63,8 @@ final class TraktPlaybackShadow {
     /// resurrect the wiped cache into the next account. Same guard as TraktSyncEngine.
     private var generation = 0
 
-    private init() {
+    /// Internal construction also lets offline fixtures exercise the real cache projection.
+    init() {
         let sessionID = TraktAuth.storedSessionID
         let cached = Self.loadCache(for: sessionID)
         progressByID = cached.progress

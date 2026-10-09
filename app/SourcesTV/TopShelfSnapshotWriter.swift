@@ -8,10 +8,9 @@ import TVServices
 /// compiled into the extension, which is what keeps the extension free of the engine models.
 ///
 /// WHY IT LIVES HERE, at the Home model layer: the shelf mirrors the SAME profile-aware Continue
-/// Watching selection Home renders. The owner profile goes through
-/// `TraktPlaybackShadow.continueWatchingSelection(fallback:libraryItems:)`, while an overlay profile
-/// stays on its own private local history. It reads the shared singletons directly, so a call site is a
-/// bare `publishCurrent()` and the profile-aware selection rule is written down ONCE, here. Nothing in
+/// Watching selection Home renders through `HomeContinueWatchingSelection`. Native profiles
+/// use their own core buckets and eligible profiles retain the saved Trakt source choice.
+/// It reads the shared singletons directly, so a call site is a bare `publishCurrent()`. Nothing in
 /// the watched / sync file set is touched.
 enum TopShelfSnapshotWriter {
 
@@ -30,6 +29,7 @@ enum TopShelfSnapshotWriter {
     @MainActor private static var publicationGeneration: UInt64 = 0
     @MainActor private static var authBoundaryInstalled = false
     @MainActor private static var lastPrivateSessionID: TraktSessionID?
+    @MainActor private static var lastPrivateContext: HomeContinueWatchingSelection.Context?
     @MainActor private static var lastPrivateArtworkInputs: [WarmCandidate]?
     @MainActor private static var lastPrivatePublished: [TopShelfSnapshot.Item]?
     @MainActor private static var lastPublishedSelectionSource: TraktPlaybackShadow.ContinueWatchingSource?
@@ -105,18 +105,9 @@ enum TopShelfSnapshotWriter {
         }
 
         let profiles = ProfileStore.shared
-        // The SAME rule Home renders by: the owner profile rides the Trakt-aware account selection,
-        // while an overlay profile rides its own private synced history. Without this an overlay
-        // profile's shelf would show the owner's titles (or the owner's Trakt rows).
-        let selection: TraktPlaybackShadow.ContinueWatchingSelection
-        if profiles.activeUsesEngineHistory {
-            selection = TraktPlaybackShadow.shared.continueWatchingSelection(
-                fallback: CoreBridge.shared.continueWatching,
-                libraryItems: CoreBridge.shared.library?.catalog ?? []
-            )
-        } else {
-            selection = .init(items: profiles.cwItems, source: .local, sessionID: nil)
-        }
+        let snapshot = HomeContinueWatchingSelection.current(core: CoreBridge.shared, profiles: profiles)
+        let selection = snapshot.selection
+        let context = snapshot.context
         let pending = items(from: selection.items, source: selection.source)
         // Keep the warm identity exactly aligned with the queue above. Raw Trakt state can still carry
         // finished, removed, or temporary seeds; those rows never render and must not consume one of the
@@ -139,6 +130,7 @@ enum TopShelfSnapshotWriter {
            let sessionID = selection.sessionID,
            TopShelfSnapshot.containerURL != nil,
            lastPublishedSelectionSource == .trakt,
+           lastPrivateContext == context,
            let previouslyPublished = lastPrivatePublished,
            !TopShelfSnapshot.PrivatePublicationPolicy.requiresWarmRestart(
                previousSessionRaw: lastPrivateSessionID?.rawValue,
@@ -165,6 +157,7 @@ enum TopShelfSnapshotWriter {
               TopShelfSnapshot.containerURL != nil else { return }
 
         lastPrivateSessionID = sessionID
+        lastPrivateContext = context
         lastPrivateArtworkInputs = sourceItems
         lastPrivatePublished = pending
         let generation = publicationGeneration
@@ -172,6 +165,7 @@ enum TopShelfSnapshotWriter {
             await warmTraktArtwork(
                 sourceItems: sourceItems,
                 sessionID: sessionID,
+                context: context,
                 generation: generation
             )
         }
@@ -318,6 +312,7 @@ enum TopShelfSnapshotWriter {
         warmTask = nil
         if clearArtwork {
             lastPrivateSessionID = nil
+            lastPrivateContext = nil
             lastPrivateArtworkInputs = nil
             lastPrivatePublished = nil
             lastPublishedSelectionSource = nil
@@ -331,6 +326,7 @@ enum TopShelfSnapshotWriter {
     private static func warmTraktArtwork(
         sourceItems: [WarmCandidate],
         sessionID: TraktSessionID,
+        context: HomeContinueWatchingSelection.Context,
         generation: UInt64
     ) async {
         var replacements: [ArtworkRowKey: String] = [:]
@@ -348,6 +344,11 @@ enum TopShelfSnapshotWriter {
             let stored: (owned: Bool, url: URL?) = await MainActor.run {
                 guard generation == publicationGeneration,
                       TraktAuth.storedSessionID == sessionID,
+                      lastPrivateContext == context,
+                      HomeContinueWatchingSelection.permitsPrivateArtworkCommit(
+                        context: context, sessionID: sessionID,
+                        core: CoreBridge.shared, profiles: ProfileStore.shared
+                      ),
                       isEnabled,
                       lastPrivateSessionID == sessionID,
                       lastPrivateArtworkInputs == sourceItems,
@@ -365,6 +366,11 @@ enum TopShelfSnapshotWriter {
         await MainActor.run {
             guard generation == publicationGeneration,
                   TraktAuth.storedSessionID == sessionID,
+                  lastPrivateContext == context,
+                  HomeContinueWatchingSelection.permitsPrivateArtworkCommit(
+                    context: context, sessionID: sessionID,
+                    core: CoreBridge.shared, profiles: ProfileStore.shared
+                  ),
                   isEnabled,
                   lastPrivateSessionID == sessionID,
                   lastPrivateArtworkInputs == sourceItems,

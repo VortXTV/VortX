@@ -1038,15 +1038,8 @@ struct iOSHomeView: View {
     /// still matches the episode the engine is parked on. The owner profile rides the account's
     /// engine history; an overlay profile rides its own private synced overlay (never the account).
     private var continueWatchingSelection: TraktPlaybackShadow.ContinueWatchingSelection {
-        if core.usesNativeProfileState { return .init(items: core.continueWatching, source: .local, sessionID: nil) }
-        if profiles.activeUsesEngineHistory {
-            _ = traktContinueWatchingRevision
-            return TraktPlaybackShadow.shared.continueWatchingSelection(
-                fallback: core.continueWatching,
-                libraryItems: core.library?.catalog ?? []
-            )
-        }
-        return .init(items: profiles.cwItems, source: .local, sessionID: nil)
+        _ = traktContinueWatchingRevision
+        return HomeContinueWatchingSelection.current(core: core, profiles: profiles).selection
     }
 
     private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot {
