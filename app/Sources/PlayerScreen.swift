@@ -408,7 +408,7 @@ private struct PlayerSeekTimelineTrack: View {
 /// These non-generic view boundaries keep each toolbar button and optional editor section's
 /// glass/conditional tree out of its parent's metadata. Keep transport ownership in PlayerScreen.
 ///
-/// Player controls intentionally own their tint and shape. SwiftUI's default macOS Button style can
+/// Player controls intentionally own their glass and shape. SwiftUI's default macOS Button style can
 /// paint a rectangular native button surface around a circular/pill label; that surface is the dark
 /// rectangle visible outside the control in the profile-accent screenshots. Keeping the presentation in
 /// one player-only modifier makes the plain-button contract explicit without changing shared browse/TV
@@ -417,11 +417,20 @@ private enum PlayerControlReduceTransparencyOverrideKey: EnvironmentKey {
     static let defaultValue: Bool? = nil
 }
 
+private enum PlayerControlContrastOverrideKey: EnvironmentKey {
+    static let defaultValue: ColorSchemeContrast? = nil
+}
+
 private extension EnvironmentValues {
     /// Testable player-only override; production callers inherit the system accessibility setting.
     var playerControlReduceTransparencyOverride: Bool? {
         get { self[PlayerControlReduceTransparencyOverrideKey.self] }
         set { self[PlayerControlReduceTransparencyOverrideKey.self] = newValue }
+    }
+
+    var playerControlContrastOverride: ColorSchemeContrast? {
+        get { self[PlayerControlContrastOverrideKey.self] }
+        set { self[PlayerControlContrastOverrideKey.self] = newValue }
     }
 }
 
@@ -432,55 +441,66 @@ private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
 
     @Environment(\.accessibilityReduceTransparency) private var systemReduceTransparency
     @Environment(\.playerControlReduceTransparencyOverride) private var reduceTransparencyOverride
+    @Environment(\.colorSchemeContrast) private var systemContrast
+    @Environment(\.playerControlContrastOverride) private var contrastOverride
     @Environment(\.isEnabled) private var isEnabled
 
     private var reduceTransparency: Bool {
         reduceTransparencyOverride ?? systemReduceTransparency
     }
 
+    private var contrast: ColorSchemeContrast { contrastOverride ?? systemContrast }
+
     func body(content: Content) -> some View {
         content
             .foregroundStyle(foreground)
-            // The chosen accent is painted INSIDE the same shape as the label. The shadow below is
-            // deliberately neutral black, so no profile hue can escape as a rectangular halo.
-            .background { shape.fill(fill) }
+            .background { surface }
             .overlay { shape.strokeBorder(border, lineWidth: 1) }
             .clipShape(shape)
             .contentShape(shape)
             .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, x: 0, y: shadowY)
     }
 
-    private var fill: Color {
-        // Reduce Transparency is a no-compositing contract here: every enabled player
-        // control must cover the moving video with an opaque profile-accent face.
-        guard isEnabled else { return Theme.Palette.surface1 }
-        if reduceTransparency || prominent { return Theme.Palette.accent }
-        let alpha = active ? 0.28 : 0.17
-        return Theme.Palette.accent.opacity(alpha)
+    /// Keep the material inside the exact disc/pill silhouette. A fixed neutral veil protects white
+    /// glyphs over bright video; only a selected setting adds a small accent cue over that glass.
+    @ViewBuilder private var surface: some View {
+        ZStack {
+            if reduceTransparency || contrast == .increased || !isEnabled {
+                shape.fill(neutral)
+            } else {
+                shape.fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, .dark)
+                shape.fill(neutral.opacity(prominent ? 0.62 : 0.66))
+            }
+            if active && isEnabled {
+                shape.fill(Theme.Palette.accent.opacity(0.16))
+            }
+        }
+        .clipShape(shape)
     }
+
+    // Player chrome floats over arbitrary video, so it must not inherit profile-tinted app surfaces.
+    private var neutral: Color { Color(.sRGB, white: 0.08, opacity: 1) }
 
     private var foreground: Color {
-        guard isEnabled else { return Theme.Palette.textTertiary }
-        return (prominent || reduceTransparency) ? Theme.Palette.onAccent : Theme.Palette.accent
+        isEnabled ? .white : .white.opacity(contrast == .increased ? 0.65 : 0.45)
     }
 
-    private var border: Color {
-        guard isEnabled else { return Theme.Palette.hairline }
-        if reduceTransparency {
-            return prominent ? Theme.Palette.accentBright : Theme.Palette.accent
-        }
-        return prominent
-            ? Theme.Palette.accentBright.opacity(0.50)
-            : Theme.Palette.accent.opacity(active ? 0.78 : 0.55)
+    private var border: LinearGradient {
+        let top = contrast == .increased ? 0.48 : prominent ? 0.26 : 0.18
+        let tint: Color = active && isEnabled ? Theme.Palette.accent : .white
+        return LinearGradient(colors: [tint.opacity(active && isEnabled ? 0.72 : top),
+                                       tint.opacity(active && isEnabled ? 0.32 : top * 0.28)],
+                              startPoint: .top, endPoint: .bottom)
     }
 
-    private var shadowOpacity: Double { isEnabled ? (prominent ? 0.30 : 0.28) : 0.18 }
-    private var shadowRadius: CGFloat { prominent ? 6 : 4 }
-    private var shadowY: CGFloat { prominent ? 3 : 2 }
+    private var shadowOpacity: Double { isEnabled ? 0.20 : 0.10 }
+    private var shadowRadius: CGFloat { prominent ? 5 : 3 }
+    private var shadowY: CGFloat { 2 }
 }
 
 private extension View {
-    /// Player-only shape-first tinting. Callers still decide the visual size/tap target before the modifier.
+    /// Player-only neutral glass. Callers still decide the visual size/tap target before the modifier.
     func playerControlSurface<S: InsettableShape>(in shape: S,
                                                    prominent: Bool = false,
                                                    active: Bool = false) -> some View {
@@ -2164,7 +2184,7 @@ struct PlayerScreen: View {
                         Button { leavePlayback() } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 17, weight: .bold))
-                                // Escape-hatch close uses the same player accent surface as the visible
+                                // Escape-hatch close uses the same player glass surface as the visible
                                 // top-bar close; its cancel shortcut and action remain unchanged.
                                 .frame(width: 44, height: 44)
                                 .playerControlSurface(in: Circle())
@@ -8257,8 +8277,8 @@ struct PlayerScreen: View {
             }
         }
         // NO GlassEffectContainer here (the old .glassChromeCluster() wrap). Two reasons: (1) the controls
-        // are shape-clipped player accent surfaces with black-only shadows, so there are no glass panes to
-        // merge and the container would only produce the "one continuous blurred slab" over-blur; (2) on OS 26 a
+        // use individually clipped materials, so merging them would only produce a continuous blurred slab;
+        // (2) on OS 26 a
         // GlassEffectContainer renders interactive descendants with its own monochrome/vibrancy treatment,
         // which visually suppressed the volume Slider's ember accent tint (volumeControl lives in this bar).
         // Dropping the container restores the slider's .tint(Theme.Palette.accent) minimum track.
@@ -8314,8 +8334,8 @@ struct PlayerScreen: View {
             Button { Haptics.tap(); viewerToggle(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
                     .font(.system(size: 50))
-                    // The inner 84pt accent face is purely visual; the outer 100pt frame keeps the original
-                    // tap target. The player surface clips the accent to the Circle and owns a black-only
+                    // The inner 84pt glass face is purely visual; the outer 100pt frame keeps the original
+                    // tap target. The player surface clips its material to the Circle and owns a black-only
                     // depth shadow, so AppKit cannot add a rectangular button patch around it.
                     .frame(width: 84, height: 84)
                     .playerControlSurface(in: Circle(), prominent: true)
@@ -8367,7 +8387,7 @@ struct PlayerScreen: View {
         } label: {
             Image(systemName: icon).font(.system(size: 30, weight: .semibold))
                 .frame(width: 54, height: 54)
-                // Inner 54pt accent surface; outer 60pt frame retains the existing tap target.
+                // Inner 54pt glass surface; outer 60pt frame retains the existing tap target.
                 .playerControlSurface(in: Circle())
                 .frame(width: 60, height: 60)
                 .contentShape(Circle())
@@ -8864,7 +8884,7 @@ struct PlayerScreen: View {
         Button(action: action) {
             Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
                 .frame(width: 44, height: 44)
-                // The accent stays inside the Circle; this helper is shared by every legacy top-bar
+                // The material stays inside the Circle; this helper is shared by every legacy top-bar
                 // action, including macOS, where an unstyled Button would otherwise paint a square.
                 .playerControlSurface(in: Circle())
         }
@@ -10990,7 +11010,7 @@ struct AirPlayRoutePickerButton: View {
         AirPlayPickerRepresentable()
             .frame(width: 44, height: 44)
             // Keep AVRoutePickerView as the native interaction surface, but give its clear wrapper the
-            // same player-owned accent face as sibling controls. The accent is clipped to the Circle;
+            // same player-owned glass face as sibling controls. The material is clipped to the Circle;
             // the route picker behavior and VoiceOver label remain native.
             .playerControlSurface(in: Circle())
             .accessibilityLabel("AirPlay")

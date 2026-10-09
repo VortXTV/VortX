@@ -67,7 +67,7 @@ test("executable probe extracts production factories and editor bodies with actu
     }
 });
 
-test("accent-control regression compiles the extracted modifier and renders its opaque branches", () => {
+test("player-glass regression compiles the extracted modifier and renders accessibility and selection states", () => {
     const runner = fs.readFileSync(path.join(__dirname, "../scripts/test-apple-player-accent-controls.sh"), "utf8");
     const harness = fs.readFileSync(path.join(__dirname, "../app/Tests/PlayerAccentControlsReduceTransparencyTests.swift"), "utf8");
     for (const productionInput of ["PlayerControlReduceTransparencyOverrideKey",
@@ -76,7 +76,8 @@ test("accent-control regression compiles the extracted modifier and renders its 
         assert(runner.includes(productionInput), `accent probe must compile ${productionInput}`);
     }
     for (const runtimeProbe of ["NSHostingView", "cacheDisplay(in: host.bounds, to: bitmap)",
-        "accent.alpha >= 0.98", "disabled surface must remain visually distinct"] ) {
+        "reducedBright.alpha >= 0.98", "white controls must keep 4.5:1 contrast",
+        "selected settings must retain an accent cue", "disabled controls must dim their white glyph"] ) {
         assert(harness.includes(runtimeProbe), `accent probe must render ${runtimeProbe}`);
     }
 });
@@ -133,34 +134,32 @@ test("decorative layers preserve order, identities and non-interactive hit testi
     }
 });
 
-test("player controls opt out of native button chrome and confine profile accent to their shape", () => {
+test("player controls use neutral clipped glass and reserve profile accent for selected settings", () => {
     const surface = section("private struct PlayerControlSurfaceModifier", "private struct PlayerControlButton:");
     for (const contract of [
         "@Environment(\\.accessibilityReduceTransparency)",
+        "@Environment(\\.colorSchemeContrast)",
         "@Environment(\\.isEnabled)",
-        ".background { shape.fill(fill) }",
+        ".background { surface }",
         ".overlay { shape.strokeBorder(border, lineWidth: 1) }",
         ".clipShape(shape)",
         ".contentShape(shape)",
         ".shadow(color: .black.opacity(shadowOpacity)",
-        "Theme.Palette.accent.opacity",
-        "guard isEnabled else { return Theme.Palette.surface1 }",
-        "if reduceTransparency || prominent { return Theme.Palette.accent }",
-        "let alpha = active ? 0.28 : 0.17",
-        "return (prominent || reduceTransparency) ? Theme.Palette.onAccent : Theme.Palette.accent",
-        "guard isEnabled else { return Theme.Palette.textTertiary }",
-        "guard isEnabled else { return Theme.Palette.hairline }"
+        "shape.fill(.ultraThinMaterial)",
+        "if reduceTransparency || contrast == .increased || !isEnabled",
+        "shape.fill(neutral)",
+        "if active && isEnabled",
+        "shape.fill(Theme.Palette.accent.opacity(0.16))",
+        "Color(.sRGB, white: 0.08, opacity: 1)",
+        "isEnabled ? .white : .white.opacity",
+        "active && isEnabled ? Theme.Palette.accent : .white"
     ]) {
         assert(surface.includes(contract), `player surface contract: ${contract}`);
     }
-    assert(!surface.includes("reduceTransparency ? 0.32"),
-        "Reduce Transparency must not leave secondary surfaces translucent over video");
-    assert(!surface.includes("accent.opacity(0.32)"),
-        "Reduce Transparency must not use a translucent accent fill");
+    assert(!surface.includes("Theme.Palette.onAccent"), "playback glyphs must remain white on neutral glass");
+    assert(!surface.includes("return Theme.Palette.accent"), "prominent transport must not become a solid accent disc");
     assert(!surface.includes("shadow(color: Theme.Palette.accent"),
         "player surface must never cast an accent-colored outer shadow");
-    assert(surface.includes("(prominent || reduceTransparency) ? Theme.Palette.onAccent : Theme.Palette.accent"),
-        "solid primary face and Reduce Transparency secondary ink must use the profile-aware palette");
 
     const controls = [
         ["toolbar control", section("private struct PlayerControlButton:", "private struct PlayerTransportToolbar:")],
@@ -182,7 +181,7 @@ test("player controls opt out of native button chrome and confine profile accent
     ];
     for (const body of primaryFaces) {
         assert(body.includes("playerControlSurface(in: Circle(), prominent: true)"),
-            "play/pause must be a solid profile-accent face");
+            "play/pause must retain the player-owned prominent glass surface");
     }
 
     const panelClose = section("private func selectionSheet(_ p: Panel)", "@ViewBuilder private func panelRow");
@@ -191,7 +190,7 @@ test("player controls opt out of native button chrome and confine profile accent
     assert(panelRows.includes(".buttonStyle(.plain)"), "selection-panel rows must not inherit AppKit chrome");
     assert(source.includes("struct AirPlayRoutePickerButton: View"), "native AirPlay wrapper remains present");
     assert(source.includes(".playerControlSurface(in: Circle())\n            .accessibilityLabel(\"AirPlay\")"),
-        "AirPlay wrapper keeps the player accent surface without replacing AVRoutePickerView");
+        "AirPlay wrapper keeps the player glass surface without replacing AVRoutePickerView");
     assert(source.includes("private struct AVPlayerPictureInPictureButton: View"),
         "native PiP wrapper remains present");
 });

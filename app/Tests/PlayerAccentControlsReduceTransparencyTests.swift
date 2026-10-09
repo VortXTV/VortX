@@ -9,24 +9,40 @@ import AppKit
 private struct AccentProbe: View {
     let reduceTransparency: Bool
     let disabled: Bool
+    var active = false
+    var prominent = false
+    var contrast: ColorSchemeContrast = .standard
+    var glyph = false
 
     var body: some View {
-        Color.clear
-            .frame(width: 120, height: 56)
-            .playerControlSurface(in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        ZStack {
+            if glyph {
+                Image(systemName: "plus").font(.system(size: 24, weight: .bold))
+            }
+        }
+            .frame(width: prominent ? 56 : 120, height: 56)
+            .playerControlSurface(in: RoundedRectangle(cornerRadius: prominent ? 28 : 12, style: .continuous),
+                                  prominent: prominent, active: active)
             .disabled(disabled)
             .environment(\.playerControlReduceTransparencyOverride, reduceTransparency)
+            .environment(\.playerControlContrastOverride, contrast)
     }
 }
 
 private struct ProbeCanvas: View {
-    let reduceTransparency: Bool
-    let disabled: Bool
+    var reduceTransparency = false
+    var disabled = false
+    var active = false
+    var prominent = false
+    var contrast: ColorSchemeContrast = .standard
+    var backdrop = Color.black
+    var glyph = false
 
     var body: some View {
         ZStack {
-            Color.black
-            AccentProbe(reduceTransparency: reduceTransparency, disabled: disabled)
+            backdrop
+            AccentProbe(reduceTransparency: reduceTransparency, disabled: disabled,
+                        active: active, prominent: prominent, contrast: contrast, glyph: glyph)
         }
         .frame(width: 180, height: 110)
     }
@@ -73,27 +89,55 @@ private func near(_ actual: CGFloat, _ expected: CGFloat, tolerance: CGFloat = 0
     abs(actual - expected) <= tolerance
 }
 
+private func neutral(_ value: (red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat)) -> Bool {
+    abs(value.red - value.green) < 0.025 && abs(value.green - value.blue) < 0.025
+}
+
+private func luminance(_ value: (red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat)) -> CGFloat {
+    func linear(_ channel: CGFloat) -> CGFloat {
+        channel <= 0.04045 ? channel / 12.92 : pow((channel + 0.055) / 1.055, 2.4)
+    }
+    return 0.2126 * linear(value.red) + 0.7152 * linear(value.green) + 0.0722 * linear(value.blue)
+}
+
 @main @MainActor
 private enum PlayerAccentControlsReduceTransparencyTests {
     static func main() {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
 
-        let accent = pixel(render(ProbeCanvas(reduceTransparency: true, disabled: false)))
-        let normal = pixel(render(ProbeCanvas(reduceTransparency: false, disabled: false)))
-        let disabled = pixel(render(ProbeCanvas(reduceTransparency: true, disabled: true)))
+        let reducedDark = pixel(render(ProbeCanvas(reduceTransparency: true)))
+        let reducedBright = pixel(render(ProbeCanvas(reduceTransparency: true, backdrop: .white)))
+        let increased = pixel(render(ProbeCanvas(contrast: .increased, backdrop: .white)))
+        let normal = pixel(render(ProbeCanvas()))
+        let bright = pixel(render(ProbeCanvas(backdrop: .white)))
+        let prominent = pixel(render(ProbeCanvas(prominent: true, backdrop: .white)))
+        let selected = pixel(render(ProbeCanvas(reduceTransparency: true, active: true)))
+        let disabled = pixel(render(ProbeCanvas(reduceTransparency: true, disabled: true, active: true)))
+        let glyph = pixel(render(ProbeCanvas(reduceTransparency: true, glyph: true)))
+        let prominentGlyph = pixel(render(ProbeCanvas(reduceTransparency: true, prominent: true, glyph: true)))
+        let disabledGlyph = pixel(render(ProbeCanvas(reduceTransparency: true, disabled: true, glyph: true)))
 
-        // These are the exact opaque RGB values in the runner's minimal Theme.Palette stub.
-        precondition(near(accent.red, 0.22) && near(accent.green, 0.58) && near(accent.blue, 0.91),
-                     "Reduce Transparency secondary fill must be opaque accent")
-        precondition(accent.alpha >= 0.98, "Reduce Transparency secondary fill must have full alpha")
-        precondition(normal.blue < accent.blue - 0.20,
-                     "normal secondary fill should remain translucent over the black canvas")
-        precondition(near(disabled.red, 0.07) && near(disabled.green, 0.08) && near(disabled.blue, 0.10),
-                     "disabled controls must retain an opaque neutral surface")
-        precondition(disabled.blue < accent.blue - 0.50,
-                     "disabled surface must remain visually distinct from enabled accent")
+        for value in [reducedDark, reducedBright, increased, normal, bright, prominent, disabled] {
+            precondition(neutral(value), "unselected player controls must remain neutral across accessibility modes")
+        }
+        precondition(near(reducedDark.red, 0.08, tolerance: 0.025), "Reduce Transparency must use the opaque neutral face")
+        precondition(near(reducedDark.red, reducedBright.red, tolerance: 0.01),
+                     "Reduce Transparency must fully cover both dark and bright video")
+        precondition(near(increased.red, reducedDark.red, tolerance: 0.01),
+                     "increased contrast must retain the solid high-contrast neutral face")
+        precondition(reducedBright.alpha >= 0.98, "Reduce Transparency face must have full alpha")
+        for value in [bright, prominent, reducedBright, increased] {
+            precondition(1.05 / (luminance(value) + 0.05) >= 4.5,
+                         "white controls must keep 4.5:1 contrast over the bright backdrop")
+        }
+        precondition(selected.blue > selected.red + 0.06, "selected settings must retain an accent cue")
+        precondition(glyph.red > 0.90 && glyph.green > 0.90 && glyph.blue > 0.90,
+                     "enabled player glyphs must render white")
+        precondition(prominentGlyph.red > 0.90 && prominentGlyph.blue > 0.90,
+                     "the main play glyph must render white rather than on-accent dark")
+        precondition(disabledGlyph.red < glyph.red - 0.20, "disabled controls must dim their white glyph")
 
-        print("PASS compiled PlayerControlSurfaceModifier offscreen Reduce Transparency/disabled render contract")
+        print("PASS compiled player glass: neutral/selected/disabled/prominent surfaces, white glyphs, Reduce Transparency and increased contrast")
     }
 }
