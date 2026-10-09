@@ -221,22 +221,46 @@ struct ProfilePickerView: View {
     }
 
     private func profileGrid(layout: ProfilePickerLayout) -> some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: layout.spacing), count: layout.columns),
-                  alignment: .center, spacing: 24) {
-            ForEach(store.profiles) { profile in
-                ProfileAvatarTile(profile: profile, isCurrent: profile.id == store.activeID,
-                                  isEditing: isEditing, side: layout.avatarSide) { pick(profile) }
-            }
-            ProfilePickerActionTile(title: "Add", symbol: "plus", side: layout.avatarSide) {
-                editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
-            }
-            ProfilePickerActionTile(title: isEditing ? "Done" : "Edit",
-                                    symbol: isEditing ? "checkmark" : "pencil", side: layout.avatarSide) {
-                isEditing.toggle()
+        Group {
+            if layout.isPhone {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: layout.spacing), count: layout.columns),
+                          alignment: .center, spacing: 24) {
+                    ForEach(0..<(store.profiles.count + 2), id: \.self) { index in
+                        profileTile(at: index, side: layout.avatarSide)
+                    }
+                }
+            } else {
+                VStack(spacing: 24) {
+                    ForEach(layout.rows(itemCount: store.profiles.count + 2), id: \.lowerBound) { row in
+                        HStack(alignment: .top, spacing: layout.spacing) {
+                            ForEach(Array(row), id: \.self) { index in
+                                profileTile(at: index, side: layout.avatarSide)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    }
+                }
             }
         }
         .padding(8)
         .profileFocusSection()
+    }
+
+    @ViewBuilder private func profileTile(at index: Int, side: CGFloat) -> some View {
+        if index < store.profiles.count {
+            let profile = store.profiles[index]
+            ProfileAvatarTile(profile: profile, isCurrent: profile.id == store.activeID,
+                              isEditing: isEditing, side: side) { pick(profile) }
+        } else if index == store.profiles.count {
+            ProfilePickerActionTile(title: "Add", symbol: "plus", side: side) {
+                editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
+            }
+        } else {
+            ProfilePickerActionTile(title: isEditing ? "Done" : "Edit",
+                                    symbol: isEditing ? "checkmark" : "pencil", side: side) {
+                isEditing.toggle()
+            }
+        }
     }
 
     private func pick(_ profile: UserProfile) {

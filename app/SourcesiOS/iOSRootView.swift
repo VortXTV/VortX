@@ -88,6 +88,8 @@ struct iOSRootView: View {
 
     @State private var tab: Tab = .home
     @State private var homeBrowse = false
+    @State private var homeHasDestination = false
+    @StateObject private var quickViewPresenter = CinemaQuickViewPresenter()
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     #if os(macOS)
@@ -197,7 +199,13 @@ struct iOSRootView: View {
             mobileCinematicShell
             #endif
         }
+        .environment(\.cinemaQuickViewPresenter, quickViewPresenter)
+        .allowsHitTesting(quickViewPresenter.presentation == nil)
+        .accessibilityHidden(quickViewPresenter.presentation != nil)
+        .overlay { CinemaQuickViewOverlay(presenter: quickViewPresenter) }
+        .onChange(of: profiles.activeID) { _ in quickViewPresenter.close() }
         .onChange(of: tab) { newTab in
+            quickViewPresenter.close()
             presentUpdateIfReady()
             // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
             VXProbeState.shared.setRoute(newTab.probeName)
@@ -269,6 +277,7 @@ struct iOSRootView: View {
         .onChange(of: launchReady) { _ in presentUpdateIfReady() }
         .onChange(of: shellVisible) { _ in presentUpdateIfReady() }
         .onChange(of: playbackGate.playerActive) { active in
+            if active { quickViewPresenter.close() }
             if !active { presentUpdateIfReady() }
         }
         .onChange(of: updates.available?.key) { _ in presentUpdateIfReady() }
@@ -400,21 +409,22 @@ struct iOSRootView: View {
     }
 
     private var unifiedHomeContent: some View {
-        VStack(spacing: 0) {
-            if !hideDiscoverTab {
+        ZStack(alignment: .topLeading) {
+            if homeBrowse, !hideDiscoverTab {
+                iOSDiscoverView(isActive: true, onNavigationDepthChanged: { homeHasDestination = $0 > 0 })
+            } else {
+                iOSHomeView(isActive: true, onBrowse: hideDiscoverTab ? nil : { homeBrowse = true },
+                            onNavigationDepthChanged: { homeHasDestination = $0 > 0 })
+            }
+            if !hideDiscoverTab, !homeHasDestination {
                 HStack(spacing: Theme.Space.xs) {
                     homeModeButton("Featured", browse: false)
-                    homeModeButton("Browse", browse: true)
-                    Spacer(minLength: 0)
+                    homeModeButton("Discover", browse: true)
                 }
+                .padding(6)
+                .vortxGlass(in: Capsule())
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.vertical, Theme.Space.xs)
-                .background(Theme.Palette.canvas)
-            }
-            if homeBrowse, !hideDiscoverTab {
-                iOSDiscoverView(isActive: true)
-            } else {
-                iOSHomeView(isActive: true, onBrowse: hideDiscoverTab ? nil : { homeBrowse = true })
             }
         }
     }
@@ -427,7 +437,7 @@ struct iOSRootView: View {
                 .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
                 .padding(.horizontal, Theme.Space.md)
                 .frame(minHeight: 44)
-                .background(selected ? Theme.Palette.accent : Theme.Palette.surface1, in: Capsule())
+                .background(selected ? Theme.Palette.accent : .clear, in: Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(selected ? [.isSelected] : [])
@@ -445,7 +455,7 @@ struct iOSRootView: View {
     /// TV-inspired desktop navigation, not a sidebar. The transparent safe-area insert keeps
     /// ordinary forms below the floating chrome; the existing hero's top bleed paints behind it.
     private var macDesktopShell: some View {
-        selectedTabContent
+        measuredTabContent
             .safeAreaInset(edge: .top, spacing: 0) { cinematicTopBar }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Palette.canvas)
@@ -525,13 +535,19 @@ struct iOSRootView: View {
             // chrome. Only hero artwork bleeds; every scrolling control has an unobscured viewport.
             VStack(spacing: 0) {
                 if topNavigation { cinematicTopBar }
-                selectedTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)
+                measuredTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)
                 if !topNavigation { bottomTabBarRow }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
     }
     #endif
+
+    private var measuredTabContent: some View {
+        GeometryReader { geometry in
+            selectedTabContent.environment(\.cinemaCardViewportWidth, geometry.size.width)
+        }
+    }
 
     private var cinematicTopBar: some View {
         HStack(spacing: Theme.Space.sm) {
@@ -999,6 +1015,7 @@ struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     var onBrowse: (() -> Void)? = nil
+    var onNavigationDepthChanged: ((Int) -> Void)? = nil
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
@@ -1212,17 +1229,7 @@ struct iOSHomeView: View {
                     // back-to-top button appears; it hides again when you return to the top (#8).
                     // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
                     Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.home, active: isActive)
-                    // Unified Home switches to the existing Discover owner, keeping its filters and
-                    // paging. Separate-tab mode retains this legacy category/deep-link destination.
-                    Group {
-                        if let onBrowse {
-                            Button(action: onBrowse) { CinemaBrowseEntry() }
-                        } else {
-                            NavigationLink(value: HubTarget.discover(.trending)) { CinemaBrowseEntry() }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, Theme.Space.md)
+                    // Discover already has either a Home switch or its own tab; no duplicate entry card.
                     #if os(macOS)
                     // macOS has no navigation-bar toolbar on Home (custom chrome), and this app's shared
                     // NSToolbar is fragile (see the Sign In toolbar note below), so the "Customize Home"
@@ -1413,6 +1420,8 @@ struct iOSHomeView: View {
         // Re-tapping the active Home tab pops any pushed detail back to root (#22); the scroll-to-top
         // above then lands on the root anchor. Switching tabs never bumps, so pushes survive switches.
         .popToRootOnBump(TabScrollKeys.home, path: $path)
+        .onChange(of: path.count) { onNavigationDepthChanged?($0) }
+        .onAppear { onNavigationDepthChanged?(path.count) }
         // Hidden tabs stay mounted (opacity-switched) and never hit onDisappear, so quiet the ambient
         // hero rotation while this is not the visible tab and re-arm it on return (#24 main-thread work).
         .onChange(of: isActive) { active in
@@ -2920,9 +2929,9 @@ struct iOSSearchView: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // per-profile recent searches (#90, ported from tvOS)
     @State private var query = ""
+    @State private var submittedSuggestion: String?
     #if os(iOS)
     @FocusState private var searchFocused: Bool
-    @State private var submittedSuggestion: String?
     #elseif os(macOS)
     @FocusState private var macInlineSearchFocused: Bool
     #endif
@@ -2948,9 +2957,7 @@ struct iOSSearchView: View {
                     // popover remains a shortcut, not a substitute for the page's primary action.
                     // Keep both out of NSToolbar: native searchable reconciliation crashed this shell.
 
-                    #if os(iOS)
                     if isTyping && !suggestionTitles.isEmpty { touchSearchSuggestions }
-                    #endif
                     if !history.isEmpty && !isTyping { historySection }
 
                     results
@@ -2980,16 +2987,17 @@ struct iOSSearchView: View {
                               seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
                               autoPlayOnAppear: target.autoPlay)
             }
+            .navigationDestination(for: HubTarget.self) { target in
+                iOSCategoryBrowse(target: target, path: $path)
+            }
             .onAppear {
                 core.loadSearchSuggestions()
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
             }
             .onChange(of: query) { value in
-                #if os(iOS)
                 let alreadySubmitted = submittedSuggestion == value
                 submittedSuggestion = nil
                 if alreadySubmitted { return }
-                #endif
                 scheduleSearch(value)
             }
             #if os(iOS)
@@ -3113,6 +3121,8 @@ struct iOSSearchView: View {
         .background(Theme.Palette.canvas)
     }
 
+    #endif
+
     private var touchSearchSuggestions: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: Theme.Space.xs) {
@@ -3138,9 +3148,12 @@ struct iOSSearchView: View {
         searchDebouncePending = false
         core.suggestSearch(value)
         core.search(value)
+        #if os(iOS)
         searchFocused = false
+        #elseif os(macOS)
+        macInlineSearchFocused = false
+        #endif
     }
-    #endif
 
     /// Playback actions live together at the top of Search. The compact phone width stacks them while
     /// iPad and Mac keep Debrid Cloud directly beside Play Link.
@@ -3172,6 +3185,7 @@ struct iOSSearchView: View {
     /// is long enough it groups the results into rail sections, falling back to a loading / no-results
     /// line. Gating at ≥2 chars stops a single-char query showing a misleading "No results".
     @ViewBuilder private var results: some View {
+        if hasSearchQuery { CinemaSearchCollections(query: query) { path.append($0) } }
         if !hasSearchQuery {
             ContentUnavailableViewCompat(title: "Search", systemImage: "magnifyingglass",
                 message: "Search across everything your add-ons cover.").frame(minHeight: 360)
@@ -3186,17 +3200,14 @@ struct iOSSearchView: View {
             // catalog actions (#14).
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(resultSections, id: \.title) { section in
-                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        Text(section.title).sectionTitleStyle().padding(.horizontal, Theme.Space.md)
-                        CinemaSearchResults(items: section.items.map {
+                    PosterRail(title: section.title, items: section.items.map {
                             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
                                      background: $0.background, description: $0.description,
                                      releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-                        }, onOpen: { item in
+                        }, onTap: { item in
                             saveToHistory(query)
                             path.append(FeaturedHeroItem.from(rail: item))
-                        }, onWatch: watchFromQuickView)
-                    }
+                        }, onWatch: watchFromQuickView, menu: .catalog, showWatchedBadges: true)
                 }
             }
         }
@@ -3206,9 +3217,11 @@ struct iOSSearchView: View {
     private var resultSections: [(title: String, items: [CoreMeta])] {
         let movies = core.searchResults.filter { $0.type == "movie" }
         let series = core.searchResults.filter { $0.type == "series" }
-        let other = core.searchResults.filter { $0.type != "series" && $0.type != "movie" }
+        let collections = core.searchResults.filter { ["collection", "collections"].contains($0.type) }
+        let other = core.searchResults.filter { !["series", "movie", "collection", "collections"].contains($0.type) }
         return [(String(localized: "Movies"), movies),
                 (String(localized: "Series"), series),
+                (String(localized: "Collections"), collections),
                 (String(localized: "Other"), other)]
             .filter { !$0.items.isEmpty }
     }
@@ -3269,12 +3282,13 @@ struct iOSSearchView: View {
     private func scheduleSearch(_ value: String) {
         searchTask?.cancel()
         let q = value.trimmingCharacters(in: .whitespaces)
+        core.prepareSearch(q)
+        core.suggestSearch(q)
         searchDebouncePending = q.count >= 2
         guard !q.isEmpty else { searchDebouncePending = false; core.search(""); return }
         searchTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
-            core.suggestSearch(q)
             core.search(q)
             searchDebouncePending = false
         }
@@ -3287,6 +3301,7 @@ struct iOSSearchView: View {
 struct iOSDiscoverView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
+    var onNavigationDepthChanged: ((Int) -> Void)? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
@@ -3425,6 +3440,8 @@ struct iOSDiscoverView: View {
         }
         // Re-tapping the active Discover tab pops a pushed detail/category browse back to root (#22).
         .popToRootOnBump(TabScrollKeys.discover, path: $path)
+        .onChange(of: path.count) { onNavigationDepthChanged?($0) }
+        .onAppear { onNavigationDepthChanged?(path.count) }
         // Keep the filtered grid full: when a page settles or the filter set changes, pull the next page
         // while too few cards match and more pages exist (loadDiscoverNextPage self-guards duplicate loads).
         .onChange(of: core.discover?.items.count ?? 0) { _ in autoFillFilteredGrid() }
@@ -3512,6 +3529,7 @@ struct iOSDiscoverView: View {
     /// Grouped Movies / Series / Other rails for the merged-mode query, reusing the same engine results +
     /// rail layout as iOSSearchView so behavior is identical whether search lives in its own tab or here.
     @ViewBuilder private var mergedSearchResults: some View {
+        CinemaSearchCollections(query: searchQuery) { path.append($0) }
         if core.searchResults.isEmpty {
             ContentUnavailableViewCompat(
                 title: (searchDebouncePending || core.searchIsLoading) ? "Searching…" : "No results",
@@ -3521,9 +3539,11 @@ struct iOSDiscoverView: View {
         } else {
             let movies = core.searchResults.filter { $0.type == "movie" }
             let series = core.searchResults.filter { $0.type == "series" }
-            let other = core.searchResults.filter { $0.type != "series" && $0.type != "movie" }
+            let collections = core.searchResults.filter { ["collection", "collections"].contains($0.type) }
+            let other = core.searchResults.filter { !["series", "movie", "collection", "collections"].contains($0.type) }
             let sections = [(String(localized: "Movies"), movies),
                             (String(localized: "Series"), series),
+                            (String(localized: "Collections"), collections),
                             (String(localized: "Other"), other)]
                 .filter { !$0.1.isEmpty }
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
@@ -3546,12 +3566,13 @@ struct iOSDiscoverView: View {
     private func scheduleMergedSearch(_ value: String) {
         searchTask?.cancel()
         let q = value.trimmingCharacters(in: .whitespaces)
+        core.prepareSearch(q)
+        core.suggestSearch(q)
         searchDebouncePending = q.count >= 2
         guard !q.isEmpty else { searchDebouncePending = false; core.search(""); return }
         searchTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
-            core.suggestSearch(q)
             core.search(q)
             searchDebouncePending = false
         }
@@ -4783,6 +4804,8 @@ struct PosterGrid: View {
     /// remains outside this component's quick-view path and therefore keeps its one-tap resume contract.
     @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
     @State private var quickViewItem: RailItem?
+    @Environment(\.cinemaQuickViewPresenter) private var quickViewPresenter
+    @Environment(\.cinemaCardViewportWidth) private var viewportWidth
     @Environment(\.horizontalSizeClass) private var hSize
     // Center the adaptive tracks so the cards distribute evenly across the available width.
     private var columns: [GridItem] {
@@ -4794,14 +4817,16 @@ struct PosterGrid: View {
         #else
         let compact = false
         #endif
-        let minTrack = iOSPillMetrics.gridPosterWidth(preset: catalogPrefs.posterWidth, compact: compact)
+        let minTrack = iOSPillMetrics.gridPosterWidth(preset: catalogPrefs.posterWidth, compact: compact,
+                                                    container: viewportWidth,
+                                                    landscape: catalogPrefs.landscapeCards && apiKeys.hasTMDB)
         return [GridItem(.adaptive(minimum: minTrack), spacing: Theme.Space.sm, alignment: .center)]
     }
     var body: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
             ForEach(items) { item in
                 Button {
-                    if shouldPresentQuickView(for: item) { quickViewItem = item }
+                    if shouldPresentQuickView(for: item) { presentQuickView(item) }
                     else { onTap(item) }
                 } label: {
                     PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
@@ -4834,6 +4859,14 @@ struct PosterGrid: View {
 
     private func shouldPresentQuickView(for item: RailItem) -> Bool {
         quickViewEnabled && menu != .continueWatching && item.cwVideoId == nil && item.resumeSeconds == nil
+    }
+
+    private func presentQuickView(_ item: RailItem) {
+        if let quickViewPresenter {
+            quickViewPresenter.present(item, onWatch: {
+                if let onWatch { onWatch(item) } else { onTap(item) }
+            }, onDetails: { onTap(item) })
+        } else { quickViewItem = item }
     }
 }
 
@@ -4905,6 +4938,7 @@ private struct PosterRailBody: View {
     /// byte-for-byte unchanged (no `.focusable`, no ring). The rail is keyed by its `title`.
     var macFocus: FocusState<MacBrowseFocus?>.Binding? = nil
     #endif
+    @Environment(\.cinemaQuickViewPresenter) private var quickViewPresenter
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
     @State private var quickViewItem: RailItem?
@@ -4953,6 +4987,7 @@ private struct PosterRailBody: View {
                         }
                     }
                     .padding(.horizontal, Theme.Space.md)
+                    .padding(.vertical, Theme.Space.xs)
                 }
                 .overlay(alignment: .leading) {
                     if showArrows && pageIndex > 0 { railArrow(forward: false) { page(by: -1, proxy) } }
@@ -4982,7 +5017,13 @@ private struct PosterRailBody: View {
             // Continue Watching carries a concrete resumed source and must never be interposed by a
             // generic preview. Catalog and Library cards can use the quick view, which routes back to
             // this exact `onTap` closure for the existing detail path.
-            if shouldPresentQuickView(for: item) { quickViewItem = item }
+            if shouldPresentQuickView(for: item) {
+                if let quickViewPresenter {
+                    quickViewPresenter.present(item, onWatch: {
+                        if let onWatch { onWatch(item) } else { onTap(item) }
+                    }, onDetails: { onTap(item) })
+                } else { quickViewItem = item }
+            }
             else { onTap(item) }
         } label: {
             Group {
@@ -5024,7 +5065,7 @@ private struct PosterRailBody: View {
             base
                 .focusable()
                 .focused(macFocus, equals: target)
-                .macFocusRing(isFocused)
+                .macCardFocus(isFocused)
                 // Only the old and new focused cells receive a changed Bool as focus walks the row.
                 .onChange(of: isFocused) { focused in
                     if focused { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(item.id, anchor: .center) } }
@@ -5399,6 +5440,7 @@ private struct CinemaPosterCardBody: View {
     let presentation: CinemaPosterCardPresentation
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @Environment(\.horizontalSizeClass) private var hSize
+    @Environment(\.cinemaCardViewportWidth) private var viewportWidth
 
     /// The title to show: the pooled localized title in the user's language when available, else the add-on's.
     private var displayName: String { presentation.displayName }
@@ -5418,7 +5460,8 @@ private struct CinemaPosterCardBody: View {
     // + cards stay in lockstep and the responsive column count recomputes from the chosen width. The height
     // follows the card's own aspect (16:9 landscape, 2:3 portrait) so posters aren't distorted.
     private var cardW: CGFloat {
-        iOSPillMetrics.gridPosterWidth(preset: presentation.width, compact: isCompactWidth)
+        iOSPillMetrics.gridPosterWidth(preset: presentation.width, compact: isCompactWidth,
+                                      container: viewportWidth, landscape: landscape)
     }
     /// True on a compact-width class (iPhone portrait), where the preset uses its narrower compact widths.
     private var isCompactWidth: Bool {
@@ -5538,6 +5581,7 @@ private struct CinemaPosterCardBody: View {
                 }
             }
             .frame(width: cardW, height: cardH)
+            .shadow(color: .black.opacity(0.28), radius: 10, y: 5)
             // The title label is hidden when the user turns off poster labels in Poster Style (default:
             // shown). The caption (Upcoming Episodes "S2E5 · Jun 30") is a functional date, not a title, so
             // it stays visible even with labels hidden.

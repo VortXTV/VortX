@@ -1,20 +1,96 @@
 import SwiftUI
 
-/// The compact, data-honest title preview used by catalog cards. It deliberately renders only fields
-/// already present on `RailItem`; the sheet is a navigation affordance, never a metadata fetcher.
+/// Window-owned presentation: a catalog row must not trap a sheet inside its scroll viewport.
+@MainActor
+final class CinemaQuickViewPresenter: ObservableObject {
+    struct Presentation {
+        let id = UUID()
+        let item: RailItem
+        let onWatch: () -> Void
+        let onDetails: () -> Void
+    }
+    @Published private(set) var presentation: Presentation?
+
+    func present(_ item: RailItem, onWatch: @escaping () -> Void, onDetails: @escaping () -> Void) {
+        presentation = Presentation(item: item, onWatch: onWatch, onDetails: onDetails)
+    }
+
+    func close() { presentation = nil }
+}
+
+private struct CinemaQuickViewPresenterKey: EnvironmentKey {
+    static let defaultValue: CinemaQuickViewPresenter? = nil
+}
+private struct CinemaCardViewportWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 0
+}
+extension EnvironmentValues {
+    var cinemaQuickViewPresenter: CinemaQuickViewPresenter? {
+        get { self[CinemaQuickViewPresenterKey.self] }
+        set { self[CinemaQuickViewPresenterKey.self] = newValue }
+    }
+    var cinemaCardViewportWidth: CGFloat {
+        get { self[CinemaCardViewportWidthKey.self] }
+        set { self[CinemaCardViewportWidthKey.self] = newValue }
+    }
+}
+
+struct CinemaQuickViewOverlay: View {
+    @ObservedObject var presenter: CinemaQuickViewPresenter
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if let presentation = presenter.presentation {
+            GeometryReader { geometry in
+                ZStack {
+                    Color.black.opacity(0.48)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture { presenter.close() }
+                        .accessibilityHidden(true)
+                    CinemaQuickView(item: presentation.item, onWatch: presentation.onWatch,
+                                    onDetails: presentation.onDetails, onClose: { presenter.close() })
+                        .id(presentation.id)
+                        .frame(width: max(1, min(820, geometry.size.width - 32)),
+                               height: max(1, min(760, geometry.size.height - 32)))
+                        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                        .vortxGlass(in: RoundedRectangle(cornerRadius: 28, style: .continuous))
+                        .shadow(color: .black.opacity(0.4), radius: 30, y: 16)
+                        .accessibilityAddTraits(.isModal)
+                }
+                .frame(width: geometry.size.width, height: geometry.size.height)
+                #if os(macOS)
+                .onExitCommand { presenter.close() }
+                #endif
+            }
+            .transition(reduceMotion ? .identity : .opacity)
+            .zIndex(100)
+        }
+    }
+}
+
+/// The title preview uses catalog data first and an isolated, identity-checked synopsis lookup when needed.
 struct CinemaQuickView: View {
     let item: RailItem
     let onWatch: () -> Void
     let onDetails: () -> Void
+    var onClose: (() -> Void)? = nil
     @State private var sheetDetent: PresentationDetent = .large
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isWatchlisted = false
     @State private var watchlistStatus: String?
+    @State private var watchlistFailure: String?
+    @State private var loadedSynopsis: String?
     @StateObject private var watchlistAction = ProfileMutationPresentation()
 
+    private var watchlistType: String? { LibraryWatchedMutationPolicy.normalizedCatalogType(item.type) }
     private var supportsWatchlist: Bool {
-        ["movie", "series"].contains(item.type) && LibraryWatchedMutationPolicy.isCanonicalCatalogID(item.id)
+        watchlistType != nil && LibraryWatchedMutationPolicy.isCanonicalCatalogID(item.id)
+    }
+    private var synopsis: String? {
+        let provided = item.description?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return provided?.isEmpty == false ? provided : loadedSynopsis
     }
 
     private var facts: [String] {
@@ -24,29 +100,52 @@ struct CinemaQuickView: View {
     }
 
     var body: some View {
-        ScrollView {
-            ViewThatFits(in: .horizontal) {
-                wideLayout
-                compactLayout
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 17, weight: .semibold))
+                        .frame(width: 44, height: 44)
+                        .vortxGlassDisc()
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Close preview")
+                .accessibilityIdentifier("cinema-quick-view-close")
+                .keyboardShortcut(.cancelAction)
             }
-            .padding(Theme.Space.md)
+            .padding(.horizontal, Theme.Space.md)
+            .padding(.top, Theme.Space.sm)
+            ScrollView {
+                ViewThatFits(in: .horizontal) {
+                    wideLayout
+                    compactLayout
+                }
+                .padding(Theme.Space.md)
+            }
         }
         .presentationDetents([.medium, .large], selection: $sheetDetent)
         .presentationDragIndicator(.visible)
-        .background(Theme.Palette.canvas.ignoresSafeArea())
+        .background(Theme.Palette.canvas.opacity(0.82))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Quick view for \(item.name)")
         .onAppear(perform: refreshWatchlist)
+        .task(id: item.type + ":" + item.id) { await loadMissingSynopsis() }
         .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in
             refreshWatchlist()
         }
         .onDisappear { watchlistAction.cancel() }
     }
 
+    private func close() {
+        if let onClose { onClose() } else { dismiss() }
+    }
+
     private var wideLayout: some View {
         HStack(alignment: .top, spacing: Theme.Space.lg) {
             artwork
                 .frame(width: 260, height: 390)
+                .clipped()
             copy
         }
         .frame(minWidth: 540, alignment: .leading)
@@ -54,7 +153,7 @@ struct CinemaQuickView: View {
 
     private var compactLayout: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
-            artwork.frame(maxWidth: .infinity).frame(height: 230)
+            artwork.frame(maxWidth: .infinity).frame(height: 230).clipped()
             copy
         }
     }
@@ -98,15 +197,16 @@ struct CinemaQuickView: View {
                     }
                 }
             }
-            if let description = item.description, !description.isEmpty {
+            if let description = synopsis, !description.isEmpty {
                 Text(description)
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: Theme.Space.sm) {
                 Button {
-                    dismiss()
+                    close()
                     onWatch()
                 } label: {
                     Label("Watch Now", systemImage: "play.fill")
@@ -119,7 +219,7 @@ struct CinemaQuickView: View {
                 Button {
                     toggleWatchlist()
                 } label: {
-                    Label(isWatchlisted ? "In Watchlist" : "Add to Watchlist",
+                    Label(watchlistAction.isRunning ? "Saving…" : (isWatchlisted ? "In Watchlist" : "Add to Watchlist"),
                           systemImage: isWatchlisted ? "bookmark.fill" : "bookmark")
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
@@ -127,6 +227,11 @@ struct CinemaQuickView: View {
                 .vortxGlass(in: Capsule(), fillAlpha: VortXGlass.pillFillAlpha, shadow: .flat)
                 .disabled(!supportsWatchlist || watchlistAction.isRunning)
                 .accessibilityHint(isWatchlisted ? "Removes this title from your watchlist" : "Saves this title to your watchlist")
+            }
+            if !supportsWatchlist {
+                Text("This add-on's title cannot be saved to Watchlist yet.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
             }
             if let watchlistStatus {
                 Text(watchlistStatus)
@@ -137,7 +242,7 @@ struct CinemaQuickView: View {
                 Text(error).font(.caption).foregroundStyle(Theme.Palette.textSecondary)
             }
             Button {
-                dismiss()
+                close()
                 onDetails()
             } label: {
                 Label("Details", systemImage: "info.circle")
@@ -153,7 +258,40 @@ struct CinemaQuickView: View {
 
     private func refreshWatchlist() {
         #if !CINEMA_UI_SMOKE_RENDERER
-        isWatchlisted = LibraryAutoAdd.isWatchlisted(item.id, type: item.type)
+        isWatchlisted = LibraryAutoAdd.isWatchlisted(item.id, type: watchlistType)
+        #endif
+    }
+
+    @MainActor
+    private func loadMissingSynopsis() async {
+        #if !CINEMA_UI_SMOKE_RENDERER
+        guard item.description?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else { return }
+        let core = CoreBridge.shared
+        let target = PlaybackMutationTarget.capture(core: core)
+        let profileID = ProfileStore.shared.activeID
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~:"))
+        guard let pathID = item.id.addingPercentEncoding(withAllowedCharacters: allowed),
+              let pathType = item.type.addingPercentEncoding(withAllowedCharacters: allowed) else { return }
+        let bases = core.addons.filter { descriptor in
+            (descriptor.manifest.resources ?? []).contains { resource in
+                resource.name == "meta"
+                    && resource.types?.contains(item.type) != false
+                    && ((resource.idPrefixes ?? descriptor.manifest.idPrefixes ?? []).isEmpty
+                        || (resource.idPrefixes ?? descriptor.manifest.idPrefixes ?? []).contains { item.id.hasPrefix($0) })
+            }
+        }.map(\.baseUrl)
+        var seen = Set<String>()
+        let urls = bases.compactMap { base -> URL? in
+            let trimmed = base.hasSuffix("/") ? String(base.dropLast()) : base
+            guard seen.insert(trimmed).inserted,
+                  let url = URL(string: "\(trimmed)/meta/\(pathType)/\(pathID).json"),
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return nil }
+            return url
+        }
+        let synopsis = await CinemaPreviewSynopsis.load(urls: urls, id: item.id, type: item.type)
+        guard !Task.isCancelled, ProfileStore.shared.activeID == profileID,
+              target.stillOwnsCurrentContext(core: core) else { return }
+        loadedSynopsis = synopsis
         #endif
     }
 
@@ -163,17 +301,43 @@ struct CinemaQuickView: View {
         preconditionFailure("Cinema UI renderer must not mutate a watchlist")
         #else
         let core = CoreBridge.shared
+        guard let type = watchlistType else { return }
+        watchlistStatus = nil
+        watchlistFailure = nil
+        #if VORTX_NATIVE_DATA_ENGINE
+        // Capture the viewer at the tap. A normal in-flight sync can make the playback target
+        // temporarily unavailable; it must not turn a watchlist action into a silent no-op.
+        let admission = core.captureNativeWatchlistActionAdmission()
+        let requestedMembership = !isWatchlisted
+        watchlistAction.start(operation: {
+            guard let target = await core.prepareNativeWatchlistActionTarget(admission) else { return false }
+            do {
+                let entry = VortxNativeWatchlist.Entry(id: item.id, type: type, name: item.name,
+                    poster: item.poster, addedAt: Date().timeIntervalSince1970)
+                let membership = try await core.setNativeWatchlist(entry, present: requestedMembership, target: target)
+                guard core.nativeWatchlistTargetIsCurrent(target) else { return false }
+                isWatchlisted = membership
+                return true
+            } catch {
+                if let failure = error as? VortxNativeWatchlist.Failure { watchlistFailure = failure.localizedDescription }
+                return false
+            }
+        }, failureMessage: {
+            watchlistFailure ?? "Couldn't save to Watchlist. Please try again."
+        }, onSuccess: {
+            watchlistStatus = isWatchlisted ? "Added to Watchlist" : "Removed from Watchlist"
+        })
+        #else
         let target = PlaybackMutationTarget.capture(core: core)
         let profileID = ProfileStore.shared.activeID
         let isCurrent = {
             ProfileStore.shared.activeID == profileID && target.stillOwnsCurrentContext(core: core)
         }
-        watchlistStatus = nil
         watchlistAction.start(operation: {
             guard isCurrent() else { return false }
             do {
                 _ = try await LibraryAutoAdd.toggleWatchlistAcknowledged(
-                    id: item.id, type: item.type, name: item.name, poster: item.poster, target: target)
+                    id: item.id, type: type, name: item.name, poster: item.poster, target: target)
                 return isCurrent()
             } catch { return false }
         }, failureMessage: {
@@ -183,6 +347,7 @@ struct CinemaQuickView: View {
             refreshWatchlist()
             watchlistStatus = isWatchlisted ? "Added to Watchlist" : "Removed from Watchlist"
         })
+        #endif
         #endif
     }
 }
@@ -357,12 +522,16 @@ struct CinemaSearchResults: View {
     var onWatch: ((RailItem) -> Void)? = nil
     @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
     @State private var quickViewItem: RailItem?
+    @Environment(\.cinemaQuickViewPresenter) private var quickViewPresenter
 
     var body: some View {
         LazyVStack(spacing: Theme.Space.md) {
             ForEach(items) { item in
                 Button {
-                    if quickViewEnabled { quickViewItem = item } else { onOpen(item) }
+                    if quickViewEnabled, let quickViewPresenter {
+                        quickViewPresenter.present(item, onWatch: { (onWatch ?? onOpen)(item) },
+                                                   onDetails: { onOpen(item) })
+                    } else if quickViewEnabled { quickViewItem = item } else { onOpen(item) }
                 } label: {
                     CinemaSearchResultCard(item: item)
                 }
@@ -392,11 +561,11 @@ private struct CinemaSearchResultCard: View {
     var body: some View {
         ViewThatFits(in: .horizontal) {
             HStack(alignment: .top, spacing: Theme.Space.md) {
-                artwork.frame(width: 260, height: 146)
+                artwork.frame(width: 260, height: 146).clipped()
                 copy
             }
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                artwork.frame(maxWidth: .infinity).frame(height: 190)
+                artwork.frame(maxWidth: .infinity).frame(height: 190).clipped()
                 copy
             }
         }

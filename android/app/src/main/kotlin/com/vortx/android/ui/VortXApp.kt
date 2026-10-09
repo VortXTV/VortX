@@ -11,8 +11,10 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -42,6 +44,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
@@ -1330,6 +1333,10 @@ fun VortXApp(
 
         quickViewItem?.let { item ->
             BackHandler { quickViewItem = null }
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = { quickViewItem = null },
+                properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false),
+            ) {
             CinemaQuickViewScreen(
                 item = item,
                 watchlistStore = com.vortx.android.library.WatchlistStore.shared(appContext),
@@ -1345,8 +1352,10 @@ fun VortXApp(
                     catalogBrowseTarget = null
                     onItem(item)
                 },
+                modifier = Modifier.widthIn(max = 840.dp).fillMaxWidth(0.94f).fillMaxHeight(0.9f)
+                    .clip(com.vortx.android.ui.theme.VortXShapes.card),
             )
-            return@VortXTheme
+            }
         }
 
         // Home's "See all" grid is a first-class touch route, backed by the same Home board row rather
@@ -1553,7 +1562,7 @@ fun VortXApp(
                             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
                         ) {
                             Chip("Featured", homeMode == CinemaHomeMode.FEATURED, onClick = { savedHomeModeName = CinemaHomeMode.FEATURED.name })
-                            Chip("Browse", homeMode == CinemaHomeMode.BROWSE, onClick = { savedHomeModeName = CinemaHomeMode.BROWSE.name })
+                            Chip("Discover", homeMode == CinemaHomeMode.BROWSE, onClick = { savedHomeModeName = CinemaHomeMode.BROWSE.name })
                         }
                     }
                     if (mergeHomeDiscover && homeMode == CinemaHomeMode.BROWSE) {

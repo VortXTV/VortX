@@ -1119,6 +1119,9 @@ struct PlayerScreen: View {
     var onProgress: (Double, Double, PlaybackMutationTarget) -> Void = { _, _, _ in }
     var onSeek: (Double, Double, PlaybackMutationTarget) -> Void = { _, _, _ in }
     var onNext: () -> Void = {}                             // advance to the next episode (legacy, non-episode callers)
+    /// Navigation-only receipt for the media this exact player load actually admitted. Persistence remains
+    /// owned by the captured playback target; a presenter must not infer the closing episode from lagging CW.
+    var onPlaybackIdentityCommitted: (PlaybackMeta) -> Void = { _ in }
     let onClose: () -> Void
 
     // CoreBridge / account are injected at the iOS app root; the player reads them for in-player source
@@ -2579,6 +2582,11 @@ struct PlayerScreen: View {
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
+        if let meta = curMeta, pendingAdvance == nil,
+           assetSanityDeferredStartToken == loadToken,
+           coordinator.player?.activeLoadToken == loadToken {
+            onPlaybackIdentityCommitted(meta)
+        }
         rememberAcceptedSeriesChoice()
         localTrickplayCaptureBreaker.reset()
         recordLastStream()
@@ -6385,7 +6393,7 @@ struct PlayerScreen: View {
         pendingAdvance?.terminal = true
         uncommittedIdentityBlocked = true
         invalidatePreparedEpisode(reason: "next episode audio mismatch")
-        if retry, goToEpisode(pending.meta.videoId, autoAdvance: true) { return false }
+        if retry, goToEpisode(pending.meta.videoId, autoAdvance: true, origin: .languageRecovery) { return false }
         loadErrorMsg = "No source with your selected audio language could be played. Choose another source or audio language."
         failedEpisodeResolutionID = pending.meta.videoId
         presentTerminalLoadFailure()
@@ -7573,7 +7581,8 @@ struct PlayerScreen: View {
     /// caller, then hot-swap the source and record against the new episode. No cover teardown - the
     /// chrome stays put and only the video reloads, the same feel as an in-player source switch.
     @discardableResult
-    private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) -> Bool {
+    private func goToEpisode(_ videoId: String, autoAdvance: Bool = false,
+                             origin: EpisodeResolutionBudget.Origin? = nil) -> Bool {
         episodeInventoryUnavailable = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         cancelDirectResumeInventoryRefresh()
@@ -7644,7 +7653,7 @@ struct PlayerScreen: View {
             videoID: videoId
         )
         let resolutionBudget = EpisodeResolutionBudget(episodeID: videoId,
-            origin: autoAdvance ? .automatic : .manual, now: ProcessInfo.processInfo.systemUptime)
+            origin: origin ?? (autoAdvance ? .automatic : .manual), now: ProcessInfo.processInfo.systemUptime)
         armEpisodeResolutionDeadline(owner: resolutionOwner, budget: resolutionBudget)
         DiagnosticsLog.log("binge", "episode resolve begin target=\(VXProbeRedaction.identityToken(videoId)) origin=\(resolutionBudget.origin.rawValue) budget=\(Int(Self.episodeResolutionDeadlineSeconds))s prepared=\(retainedPreparedEpisode != nil)")
         autoRetryTask?.cancel()

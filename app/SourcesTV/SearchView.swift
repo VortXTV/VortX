@@ -183,6 +183,8 @@ struct SearchView: View {
 
     private func scheduleSearch(_ value: String) {
         searchTask?.cancel()
+        core.prepareSearch(value)
+        core.suggestSearch(value)
         searchDebouncePending = value.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2
         searchTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(350))

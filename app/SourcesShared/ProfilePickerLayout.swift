@@ -25,4 +25,12 @@ struct ProfilePickerLayout {
         let available = min(width, 1100) - horizontalInset * 2 - 16 - spacing * CGFloat(columns - 1)
         return max(32, min(isWide ? 160 : 110, available / CGFloat(columns)))
     }
+
+    /// Center each populated row, including the last row; empty grid tracks must not shift avatars.
+    func rows(itemCount: Int) -> [Range<Int>] {
+        guard itemCount > 0 else { return [] }
+        return stride(from: 0, to: itemCount, by: columns).map {
+            $0..<min($0 + columns, itemCount)
+        }
+    }
 }

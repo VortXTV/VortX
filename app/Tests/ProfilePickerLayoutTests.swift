@@ -10,6 +10,15 @@ enum ProfilePickerLayoutTests {
                     + layout.spacing * CGFloat(layout.columns - 1) + layout.horizontalInset * 2 + 16
                 precondition(occupied <= min(width, 1100) + 0.01, "Avatar grid overflow at \(width)")
                 precondition(layout.avatarSide >= 44, "Avatar hit area too small at \(width)")
+                for count in 0...13 {
+                    let rows = layout.rows(itemCount: count)
+                    precondition(rows.flatMap { Array($0) } == Array(0..<count), "Every avatar occurs once")
+                    precondition(rows.allSatisfy { !$0.isEmpty && $0.count <= layout.columns }, "No empty grid tracks")
+                    if let row = rows.last {
+                        let rowWidth = CGFloat(row.count) * layout.avatarSide + CGFloat(row.count - 1) * layout.spacing
+                        precondition(rowWidth <= occupied, "Last populated row fits without phantom columns")
+                    }
+                }
             }
         }
         precondition(ProfilePickerLayout(width: 393, largeText: false).columns == 3)
@@ -21,6 +30,7 @@ enum ProfilePickerLayoutTests {
         let source = try String(contentsOfFile: "app/SourcesShared/ProfilesView.swift", encoding: .utf8)
         let picker = source.components(separatedBy: "/// Centered 4-digit gate")[0]
         precondition(picker.contains("LazyVGrid(columns:"))
+        precondition(picker.contains("layout.rows(itemCount:"), "Large devices center actual populated avatar rows")
         precondition(picker.contains("pinIsForEditing = isEditing"))
         precondition(picker.contains("if profile.hasPin { pinTarget = profile }"))
         precondition(picker.contains(".disabled(pinTarget != nil || profileAction.isRunning)"))

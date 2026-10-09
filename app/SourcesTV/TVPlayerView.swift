@@ -9809,7 +9809,11 @@ struct TVPlayerView: View {
                 generation: episodeGeneration, sourceGeneration: sourceGeneration,
                 videoID: v.id, choice: choice
             ) else { return }
-            core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
+            if resolutionBudget.origin == .languageRecovery {
+                core.refindSources(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
+            } else {
+                core.loadMeta(type: "series", id: m.libraryId, streamType: "series", streamId: v.id)
+            }
             // Wait for THIS episode's streams (matched by id), then take the RANKED best across
             // add-ons: either every add-on has answered or the request-owned bounded deadline expires.
             var loggedBingeSourceWait = false

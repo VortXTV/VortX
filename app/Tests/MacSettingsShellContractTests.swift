@@ -58,7 +58,7 @@ require(rootView.contains("ForEach(visibleTabs, id: \\.rawValue) { item in\n    
         "horizontal navigation uses the same visibility-filtered destinations")
 require(rootView.contains("ViewThatFits(in: .horizontal)") && rootView.contains("horizontalTabItems.fixedSize(horizontal: true, vertical: true)"),
         "wide horizontal navigation hugs its destinations with a scrolling overflow fallback")
-require(rootView.contains("if topNavigation { cinematicTopBar }\n                selectedTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)\n                if !topNavigation { bottomTabBarRow }"),
+require(rootView.contains("if topNavigation { cinematicTopBar }\n                measuredTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)\n                if !topNavigation { bottomTabBarRow }"),
         "mobile shell reserves real top/bottom chrome space outside the detail viewport")
 require(rootView.contains("ScrollView(.horizontal, showsIndicators: false)") && rootView.contains("proxy.scrollTo(item.rawValue, anchor: .center)"),
         "narrow desktop navigation scrolls selected routes into view")
