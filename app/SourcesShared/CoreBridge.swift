@@ -41,6 +41,19 @@ final class CoreBridge: ObservableObject {
               let (facade, _) = nativePlaybackBinding(.native(binding)), let data = facade.stateData("native_playback") else { return nil }
         return try? JSONDecoder().decode(VortxJSON.self, from: data)
     }
+    /// Read the complete history projection through the exact owner captured by the Library.
+    /// A malformed row must not silently turn a partial projection into a successful empty history.
+    func nativeHistorySnapshot(target: PlaybackMutationTarget) -> CoreCWPreview? {
+        guard let (facade, profile) = nativePlaybackBinding(target),
+              let playbackData = facade.stateData("native_playback"),
+              let playback = try? JSONDecoder().decode(VortxJSON.self, from: playbackData),
+              playback["profileId"] == .string(profile.uuidString), let rows = playback["history"]?.array,
+              let data = facade.stateData("native_history"),
+              let history = try? JSONDecoder().decode(CoreCWPreview.self, from: data),
+              history.items.count == rows.count,
+              nativePlaybackBinding(target)?.0 === facade else { return nil }
+        return history
+    }
     func captureNativePlaybackTarget() -> PlaybackMutationTarget {
         nativeFacadeLock.withLock { .native(currentNativePlaybackBinding()) }
     }

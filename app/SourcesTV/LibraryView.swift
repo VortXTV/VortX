@@ -83,6 +83,12 @@ struct LibraryView: View {
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
+    @State private var path = NavigationPath()
+    @AppStorage(ContinueWatchingPreferences.sourceKey) private var continueWatchingSource = "local"
+    @AppStorage(ContinueWatchingPreferences.windowKey) private var continueWatchingWindow = "20"
+    @State private var serviceHistoryRevision = 0
+    @State private var watchlistRevision = 0
+    private enum Destination: Hashable { case downloads, watchlist, history }
     /// Cinematic landscape cards (TMDB key required) are wider, so fewer per row; portrait keeps 6-up.
     private var columns: [GridItem] {
         catalogPrefs.landscapeCards && apiKeys.hasTMDB
@@ -91,7 +97,10 @@ struct LibraryView: View {
     }
 
     var body: some View {
-        NavigationStack {
+        let landing = LibraryLandingSnapshot.current(core: core, profiles: profiles)
+        let cw = landing.continueWatching
+        let _ = serviceHistoryRevision
+        NavigationStack(path: $path) {
             ZStack {
                 // The living backdrop: art owns the screen, details pinned above the strip. The
                 // title, filters, and grid all live in the bottom strip and tuck under the hero.
@@ -100,12 +109,28 @@ struct LibraryView: View {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Library tab -> scroll here
                         Text("Library").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
-                        // Offline downloads (#30): a section ABOVE the saved-titles grid, shown only when at
-                        // least one download exists. Plays from the local file with pause/resume/delete +
-                        // total storage used, and carries the storage-eviction caption. Device-local only.
-                        if !downloads.records.isEmpty {
-                            TVDownloadsView()
-                                .padding(.bottom, Theme.Space.lg)
+                        HStack(spacing: Theme.Space.md) {
+                            NavigationLink(value: Destination.downloads) {
+                                destinationCard("Downloads", subtitle: "Available offline on this Apple TV", image: "arrow.down.circle.fill")
+                            }
+                            NavigationLink(value: Destination.watchlist) {
+                                destinationCard("Watchlist", subtitle: "Titles bookmarked to watch later", image: "bookmark.fill")
+                            }
+                            NavigationLink(value: Destination.history) {
+                                destinationCard("Previously Watched", subtitle: "Playback history for this profile", image: "checkmark.circle.fill")
+                            }
+                        }
+                        .buttonStyle(CardFocusStyle())
+                        .padding(.horizontal, Theme.Space.screenEdge)
+                        if !cw.selection.items.isEmpty {
+                            CoreContinueWatchingRow(items: cw.selection.items,
+                                focusModel: cw.selection.source.isPrivate ? nil : focusModel,
+                                menu: cw.selection.source.isPrivate ? .none : .continueWatching,
+                                traktSessionID: cw.selection.sessionID, intent: cw.intent,
+                                displayProgress: cw.selection.displayProgress, captions: cw.selection.captions)
+                        }
+                        if let status = cw.selection.status {
+                            hint(status)
                         }
                         if core.usesNativeProfileState || profiles.activeUsesEngineHistory {
                             // Owner profile: the account library (engine). The client-side type segment
@@ -148,12 +173,107 @@ struct LibraryView: View {
                 .scrollToTopOnBump(TabScrollKeys.library)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            .navigationDestination(for: Destination.self) { destination in
+                switch destination {
+                case .downloads:
+                    ScrollView {
+                        if downloads.records.isEmpty {
+                            hint("Completed downloads appear here for offline playback on this Apple TV.")
+                        } else { TVDownloadsView() }
+                    }
+                    .navigationTitle("Downloads")
+                case .watchlist: watchlistDestination
+                case .history: historyDestination
+                }
+            }
+            .navigationDestination(for: TVLibraryHistoryTarget.self) { target in
+                if target.context.isCurrent(core: core, profiles: profiles) {
+                    DetailView(type: target.type, id: target.id,
+                               initialResumeSeconds: target.resumeSeconds, initialVideoID: target.videoID)
+                }
+            }
         }
+        .popToRootOnBump(TabScrollKeys.library, path: $path)
         // Reload while empty: the library syncs from the API asynchronously after sign-in, so the
         // first load can land before ctx.library is populated. Revisiting the tab refills it.
         .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() }; seed() }
         .onChange(of: core.library?.catalog.first?.id) { seed() }
         .onChange(of: profiles.activeID) { seed() }
+        .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in serviceHistoryRevision &+= 1 }
+        .onReceive(NotificationCenter.default.publisher(for: SIMKLContinueWatchingShadow.changedNote)) { _ in serviceHistoryRevision &+= 1 }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryAutoAdd.watchlistChangedNote)) { _ in watchlistRevision &+= 1 }
+        .onChange(of: continueWatchingSource) { _ in HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
+        .onChange(of: continueWatchingWindow) { _ in HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
+    }
+
+    private func destinationCard(_ title: String, subtitle: String, image: String) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            Label(title, systemImage: image).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            Text(subtitle).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, minHeight: 110, alignment: .leading)
+        .vortxCinemaCard()
+    }
+
+    private var historyDestination: some View {
+        let snapshot = LibraryLandingSnapshot.current(core: core, profiles: profiles)
+        return ScrollView {
+            if let history = snapshot.history {
+                if history.isEmpty {
+                    hint("Playback history for this profile appears here, including titles outside your watchlist.")
+                } else {
+                    LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
+                        ForEach(history) { entry in
+                            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                                PosterCard(title: entry.item.name, poster: entry.item.poster, type: entry.item.type,
+                                    id: entry.item.id, progress: entry.item.progress > 0 ? entry.item.progress : nil,
+                                    isWatched: entry.item.isWatched, width: kPosterWidth, landscapeWidth: kLandscapeCardWidth,
+                                    directPlay: { openHistory(entry, context: snapshot.context) },
+                                    onDetails: { openHistory(entry, context: snapshot.context) })
+                                if let caption = entry.episodeCaption {
+                                    Text(caption).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.lg)
+                }
+            } else { hint("Waiting for this profile's acknowledged playback history…") }
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        .navigationTitle("Previously Watched")
+    }
+
+    private var watchlistDestination: some View {
+        let _ = watchlistRevision
+        let snapshot = LibraryLandingSnapshot.current(core: core, profiles: profiles)
+        let entries = snapshot.context.isCurrent(core: core, profiles: profiles) ? LibraryAutoAdd.watchlist() : []
+        return ScrollView {
+            if entries.isEmpty { hint("Titles you bookmark to watch later appear here.") }
+            else {
+                LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
+                    ForEach(entries) { entry in
+                        PosterCard(title: entry.name ?? entry.id, poster: entry.poster, type: entry.type, id: entry.id,
+                            width: kPosterWidth, landscapeWidth: kLandscapeCardWidth,
+                            directPlay: {
+                                guard snapshot.context.isCurrent(core: core, profiles: profiles) else { return }
+                                path.append(TVLibraryHistoryTarget(id: entry.id, type: entry.type,
+                                    resumeSeconds: nil, videoID: nil, context: snapshot.context))
+                            })
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.lg)
+            }
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        .navigationTitle("Watchlist")
+    }
+
+    private func openHistory(_ entry: LibraryLandingSnapshot.Entry, context: LibraryLandingSnapshot.Context) {
+        guard context.isCurrent(core: core, profiles: profiles) else { return }
+        path.append(TVLibraryHistoryTarget(id: entry.item.id, type: entry.item.type,
+            resumeSeconds: entry.item.resumeSeconds, videoID: entry.item.state.videoId, context: context))
     }
 
     private func seed() {
@@ -316,4 +436,12 @@ struct LibraryView: View {
             .padding(.horizontal, Theme.Space.screenEdge)
             .padding(.top, Theme.Space.lg)
     }
+}
+
+private struct TVLibraryHistoryTarget: Hashable {
+    let id: String
+    let type: String
+    let resumeSeconds: Double?
+    let videoID: String?
+    let context: LibraryLandingSnapshot.Context
 }
