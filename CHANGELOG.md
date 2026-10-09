@@ -21,7 +21,8 @@ specials; pause and accepted resume/seek targets across replacement; a separate 
 metadata deadline and exact-item decoding window; typed mpv cache statistics and owned bounded
 reanchor recovery; complete typed request-header fields admitted before source replacement;
 source-time external-caption refresh while paused; real mpv subtitle backgrounds;
-native NNTP article concurrency and seek cancellation; and fresh FFmpeg 9 /
+native NNTP article concurrency and seek cancellation; retained Apple Trakt Continue Watching
+read choice; scoped Android native NNTP provider/mirror routing; and fresh FFmpeg 9 /
 Apple SecureTransport MPV build inputs with the Mac CoreAudio lifecycle repair.
 
 Existing Beta 21 player controls, integrations, downloads, catalog/source workflows and
@@ -40,15 +41,30 @@ The website's final native projection/edit/optional-manifest source passed indep
 tree, nine byte-matched JavaScript bundles and verified 19-page/seven-hash CSP content. This is
 not authenticated multi-device or live Stremio/provider/device proof. Apple's selected-runtime
 NZB eligibility repair and native seek diagnostics are integrated; the latter passed 32 actual
-property/wiring checks, not an original-freeze fix. Native Usenet still needs operation leases,
-per-job cancellation and selector/archive-original-ordinal wiring. Android's captured admission
-API is not full native routing: add-on provider/mirror retention and replacement of the old Kotlin
-route remain pending. Direct indexer wiring's first cohort exposed two old-owner retirement
-failures undergoing repair. The reviewed sixteen-provider transport repair passed 21 NNTP tests;
+property/wiring checks, not an original-freeze fix. The integrated Apple Home/Top Shelf Trakt
+choice repair passed 221 offline checks with a failing baseline; Android native routing passed
+44 Full/Play checks and preserves add-on providers/mirrors through scoped native operations.
+The secure indexer factory captures the actual active profile and fails closed on an unknown
+roster. The reviewed configured-indexer integration passed 96 checks; immutable Apple download
+consumers passed 43 checks (41 executed actual-method behavioral / two source-contract) and
+are integrated. Canonical Android passed 140/140 (70 Full and
+70 Play), all seven classes per flavor with zero failures/errors/skips, hash-bound to source and
+the retained earlier JNI input rather than freshly packaged shipping SDKs. Corrected Apple
+entry-capture producer checks passed 41 plus 99 admission and compatibility/routing checks,
+with four actual original-owner baseline failures. Its sixteen-hash immutable GO is integrated;
+the combined canonical 43 consumer / 41 producer / 99 admission run passed, with all three logs
+byte-identical to independently reviewed author results.
+The reviewed
+sixteen-provider transport repair passed 21 NNTP tests;
 its single complete-article deadline follow-up passed 29, after five of eight baseline regressions
-failed. Neither has a fresh packaged SDK yet. A subsequent Android candidate's CI succeeded but
-artifact readback is pending; Apple passed the repaired ABI gate and simulator compilation but
-failed its fail-closed launch smoke gate on UTF-8 decoding. Both use older inputs. Fresh final
+failed. The reviewed cancellable-operation follow-up passed 59 checks. Full workspace tests
+passed for the operation and RAR-directory follow-ups. The archive/lint corrections now have
+terminal full Linux/macOS native CI success across workspace/ABI/features/lint/server gates.
+Five exact shipping-input pin files and focused source contracts are integrated; the real
+SDK-archive comparison was skipped pending new bytes, so no final SDK/app/package acceptance
+is claimed. Older baseline package readbacks have bounded acceptance only;
+the Apple UTF-8 smoke-readback failure has a source repair, not final launch/package acceptance.
+Fresh final
 SDK/optimized whole-app rebuilding, actual package versions, signing, provenance/feeds and
 physical device/provider acceptance remain pending. Infuse watched-return, mpv PiP and broader
 parity/features are not claimed complete and remain part of the active overall goal. No public release,
