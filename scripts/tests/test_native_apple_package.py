@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Negative artifact cases for the production native linker-map acceptance check."""
+"""Production native input/linker proofs and real IPA extraction admission cases."""
 import importlib.util
+import stat
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("native_package", Path(__file__).parents[1] / "verify-native-apple-package.py")
 NATIVE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(NATIVE)
+TEMPORARY_DIRECTORY = tempfile.TemporaryDirectory
 
 
 class LinkMapProofTests(unittest.TestCase):
@@ -173,6 +177,105 @@ class LinkMapProofTests(unittest.TestCase):
             archive.writestr("../outside.txt", "untrusted archive path")
         with self.assertRaisesRegex(ValueError, "escapes"):
             NATIVE.verify_archive({}, artifact, "ios")
+
+
+class IPAExtractionRootTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = TEMPORARY_DIRECTORY(prefix="vortx-ipa-root-contract-")
+        self.root = Path(self.temporary.name).resolve()
+        self.app = self.root / "source" / "VortXiOSNative.app"
+        self.app.mkdir(parents=True)
+        (self.app / "resource.txt").write_bytes(b"accepted native bundle bytes")
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    @contextmanager
+    def aliased_directory(self, **_kwargs):
+        with TEMPORARY_DIRECTORY(prefix="physical-", dir=self.root) as directory:
+            alias = self.root / "extraction-alias"
+            alias.symlink_to(Path(directory).resolve(), target_is_directory=True)
+            self.assertNotEqual(alias, alias.resolve())
+            try:
+                yield str(alias)
+            finally:
+                alias.unlink()
+
+    def artifact_and_receipt(self, platform="ios"):
+        artifact = self.root / "native.ipa"
+        with NATIVE.zipfile.ZipFile(artifact, "w") as archive:
+            for path in self.app.rglob("*"):
+                name = f"Payload/{self.app.name}/{path.relative_to(self.app).as_posix()}"
+                if path.is_symlink():
+                    member = NATIVE.zipfile.ZipInfo(name)
+                    member.create_system = 3
+                    member.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    archive.writestr(member, str(path.readlink()))
+                elif path.is_file():
+                    archive.write(path, name)
+                else:
+                    archive.writestr(name + "/", b"")
+        receipt = {"schema": 1, "platform": platform, "bundlePayload": NATIVE.bundle_payload(self.app),
+                   "engineSourceRevision": "e" * 40, "bundleIdentifier": "com.stremiox.app.native",
+                   "version": "0.5.0", "build": "260"}
+        return artifact, receipt
+
+    def test_real_extractor_accepts_ordinary_ipa(self):
+        artifact, receipt = self.artifact_and_receipt()
+        result = NATIVE.verify_archive(receipt, artifact, "ios")
+        self.assertEqual(result["artifactSha256"], NATIVE.sha256(artifact))
+        self.assertEqual(result["engineSourceRevision"], receipt["engineSourceRevision"])
+
+    def test_real_extractor_accepts_aliased_root_for_ios_and_tvos(self):
+        for platform in ("ios", "tvos"):
+            with self.subTest(platform=platform):
+                artifact, receipt = self.artifact_and_receipt(platform)
+                with patch.object(NATIVE.tempfile, "TemporaryDirectory", self.aliased_directory):
+                    result = NATIVE.verify_archive(receipt, artifact, platform)
+                self.assertEqual(result["platform"], platform)
+                self.assertEqual(result["build"], "260")
+
+    def test_aliased_extraction_preserves_contained_framework_symlinks(self):
+        versions = self.app / "Frameworks" / "Lib.framework" / "Versions"
+        (versions / "A").mkdir(parents=True)
+        (versions / "A" / "Lib").write_bytes(b"accepted inert framework")
+        (versions / "Current").symlink_to("A", target_is_directory=True)
+        artifact, receipt = self.artifact_and_receipt()
+        with patch.object(NATIVE.tempfile, "TemporaryDirectory", self.aliased_directory):
+            result = NATIVE.verify_archive(receipt, artifact, "ios")
+        self.assertEqual(result["artifactSha256"], NATIVE.sha256(artifact))
+
+    def test_aliased_root_still_rejects_parent_and_absolute_paths(self):
+        for name in ("../outside.txt", "Payload/../../outside.txt", str(self.root / "outside.txt")):
+            with self.subTest(name=name):
+                artifact = self.root / "bad.ipa"
+                with NATIVE.zipfile.ZipFile(artifact, "w") as archive:
+                    archive.writestr(name, b"untrusted member")
+                with patch.object(NATIVE.tempfile, "TemporaryDirectory", self.aliased_directory):
+                    with self.assertRaisesRegex(ValueError, "escapes"):
+                        NATIVE.verify_archive({}, artifact, "ios")
+                self.assertFalse((self.root / "outside.txt").exists())
+
+    def test_aliased_root_rejects_writes_through_an_escaping_symlink(self):
+        artifact = self.root / "bad-link.ipa"
+        with NATIVE.zipfile.ZipFile(artifact, "w") as archive:
+            link = NATIVE.zipfile.ZipInfo("Payload/VortXiOSNative.app/escape")
+            link.create_system = 3
+            link.external_attr = (stat.S_IFLNK | 0o777) << 16
+            archive.writestr(link, "../../../outside")
+            archive.writestr("Payload/VortXiOSNative.app/escape/file.txt", b"untrusted write")
+        with patch.object(NATIVE.tempfile, "TemporaryDirectory", self.aliased_directory):
+            with self.assertRaisesRegex(ValueError, "escapes"):
+                NATIVE.verify_archive({}, artifact, "ios")
+        self.assertFalse((self.root / "outside").exists())
+
+    def test_aliased_root_still_rejects_changed_payload(self):
+        artifact, receipt = self.artifact_and_receipt()
+        with NATIVE.zipfile.ZipFile(artifact, "a") as archive:
+            archive.writestr(f"Payload/{self.app.name}/extra.txt", b"not accepted")
+        with patch.object(NATIVE.tempfile, "TemporaryDirectory", self.aliased_directory):
+            with self.assertRaisesRegex(ValueError, "payload differs"):
+                NATIVE.verify_archive(receipt, artifact, "ios")
 
 
 if __name__ == "__main__":

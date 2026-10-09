@@ -252,7 +252,9 @@ def verify_packaged_copy(receipt: dict, app: Path, platform: str) -> dict:
 
 def verify_archive(receipt: dict, artifact: Path, platform: str) -> dict:
     with tempfile.TemporaryDirectory(prefix="vortx-native-package-") as directory:
-        scratch = Path(directory)
+        # macOS temporary paths may use /var while resolved members use /private/var.
+        # Compare canonical paths on both sides without relaxing the containment guard.
+        scratch = Path(directory).resolve(strict=True)
         mounted = False
         if artifact.suffix == ".ipa" and platform != "macos":
             with zipfile.ZipFile(artifact) as archive:
