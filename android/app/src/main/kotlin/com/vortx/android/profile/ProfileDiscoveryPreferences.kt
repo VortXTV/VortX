@@ -32,7 +32,55 @@ data class ProfileDiscoveryPreferences(
     val hideSearchTab: Boolean? = null,
     val showCollectionsHome: Boolean? = null,
     val showCollectionsDiscover: Boolean? = null,
+    val continueWatchingSource: String? = null,
+    val continueWatchingWindow: String? = null,
 )
+
+/** Migration requires both exact acknowledged records and a passive, connected account witness. */
+internal fun eligibleLegacyContinueWatchingMigration(
+    previous: UserProfile?, incoming: UserProfile?, acknowledgedProfileID: String,
+    flatSourcePresent: Boolean, legacyEnabled: Boolean, accountAndSessionKnown: Boolean,
+): Boolean = previous != null && incoming != null && previous.id == acknowledgedProfileID && incoming.id == acknowledgedProfileID &&
+    previous.usesEngineHistory && incoming.usesEngineHistory && previous.discovery?.continueWatchingSource == null &&
+    incoming.discovery?.continueWatchingSource == null && !flatSourcePresent && legacyEnabled && accountAndSessionKnown
+
+internal fun <T> sameContinueWatchingMigrationAuthority(previousAccount: T?, currentAccount: T?, previousSession: Long?, currentSession: Long?): Boolean =
+    previousAccount != null && previousAccount == currentAccount && previousSession != null && previousSession == currentSession
+
+/** A failed checkpoint retains only this exact qualified capture; it cannot adopt another owner on retry. */
+internal class ContinueWatchingMigrationCheckpoint<T> {
+    data class Witness<T>(val profileID: String, val account: T, val traktEpoch: Long)
+    var witness: Witness<T>? = null
+        private set
+    private var pendingDiscovery: ProfileDiscoveryPreferences? = null
+    fun capture(profileID: String, account: T, epoch: Long) { pendingDiscovery = null; witness = Witness(profileID, account, epoch) }
+    fun retire() { witness = null; pendingDiscovery = null }
+    /** Retained only with this witness, so a later fresh projection cannot erase a failed local edit. */
+    fun retainDiscoveryCapture(profile: UserProfile, flat: ProfileDiscoveryPreferences) {
+        if (witness?.profileID == profile.id)
+            pendingDiscovery = pendingContinueWatchingDiscoveryCapture(profile, flat).discovery
+    }
+    fun attempt(incoming: UserProfile?, profileID: String, account: T?, epoch: Long?,
+        save: (UserProfile) -> NativeProfileGateway.Projection?, authorityIsCurrent: () -> Boolean,
+        readbackIsCurrent: (NativeProfileGateway.Projection) -> Boolean = { true }): NativeProfileGateway.Projection? {
+        val captured = witness ?: return null
+        if (incoming == null || profileID != captured.profileID || incoming.id != captured.profileID ||
+            account != captured.account || epoch != captured.traktEpoch || incoming.discovery?.continueWatchingSource != null) {
+            retire(); return null
+        }
+        val discovery = pendingDiscovery ?: incoming.discovery ?: ProfileDiscoveryPreferences()
+        val edited = incoming.copy(discovery = discovery.copy(
+            continueWatchingSource = "trakt", continueWatchingWindow = discovery.continueWatchingWindow ?: "20"))
+        val saved = runCatching { if (authorityIsCurrent()) save(edited) else null }.getOrNull()
+        if (!authorityIsCurrent()) { retire(); return null }
+        if (saved?.activeID != captured.profileID || saved.profiles.firstOrNull { it.id == captured.profileID }?.discovery != edited.discovery || !readbackIsCurrent(saved)) return null
+        if (!authorityIsCurrent()) { retire(); return null }
+        retire(); return saved
+    }
+}
+
+internal fun pendingContinueWatchingDiscoveryCapture(profile: UserProfile, flat: ProfileDiscoveryPreferences): UserProfile =
+    profile.copy(discovery = flat.copy(continueWatchingSource = null, continueWatchingWindow = profile.discovery?.continueWatchingWindow))
 
 /** Bridges a profile's snapshot to the legacy flat keys consumed by Android UI and engine code. */
 internal object ProfileDiscoveryPreferencesStore {
@@ -57,6 +105,8 @@ internal object ProfileDiscoveryPreferencesStore {
         TabBarPrefs.HIDE_SEARCH_KEY,
         SHOW_COLLECTIONS_HOME_KEY,
         SHOW_COLLECTIONS_DISCOVER_KEY,
+        com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY,
+        com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY,
     )
 
     fun capture(prefs: SharedPreferences): ProfileDiscoveryPreferences = ProfileDiscoveryPreferences(
@@ -78,10 +128,21 @@ internal object ProfileDiscoveryPreferencesStore {
         hideSearchTab = prefs.getBoolean(TabBarPrefs.HIDE_SEARCH_KEY, false),
         showCollectionsHome = prefs.getBoolean(SHOW_COLLECTIONS_HOME_KEY, true),
         showCollectionsDiscover = prefs.getBoolean(SHOW_COLLECTIONS_DISCOVER_KEY, true),
+        continueWatchingSource = prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY, "local"),
+        continueWatchingWindow = prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY, "20"),
     )
 
     fun apply(snapshot: ProfileDiscoveryPreferences?, resetUnset: Boolean, prefs: SharedPreferences) {
         val e = prefs.edit()
+        val nextSource = snapshot?.continueWatchingSource ?: if (resetUnset) "local" else prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY, null)
+        val nextWindow = snapshot?.continueWatchingWindow ?: if (resetUnset) "20" else prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY, null)
+        if (nextSource != prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY, null) ||
+            nextWindow != prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY, null))
+            com.vortx.android.home.ContinueWatchingSelectionRevision.changed()
+        listOf(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY to (snapshot?.continueWatchingSource to "local"),
+            com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY to (snapshot?.continueWatchingWindow to "20")).forEach { (key, pair) ->
+            if (pair.first != null) e.putString(key, pair.first) else if (resetUnset) e.putString(key, pair.second)
+        }
         applyStringSet(e, HIDDEN_CATALOGS_KEY, snapshot?.hiddenCatalogs, resetUnset)
         applyCsv(e, CATALOG_ORDER_KEY, snapshot?.catalogOrder, resetUnset)
         applyStringSet(e, DISCOVER_HIDDEN_CATEGORIES_KEY, snapshot?.hiddenHubCategories, resetUnset)

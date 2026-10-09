@@ -33,6 +33,23 @@ class HomeDiscoverPreferences(context: Context) {
 
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
 
+    var continueWatchingSource: String
+        get() = prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY, "local") ?: "local"
+        set(value) {
+            require(com.vortx.android.home.ContinueWatchingSource.entries.any { it.raw == value && it != com.vortx.android.home.ContinueWatchingSource.UNKNOWN })
+            com.vortx.android.home.ContinueWatchingSelectionRevision.changed()
+            prefs.edit().putString(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY, value).apply()
+            ProfileStore.sharedOrNull()?.captureDiscovery(continueWatchingEdit = true)
+        }
+    var continueWatchingWindow: String
+        get() = prefs.getString(com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY, "20") ?: "20"
+        set(value) {
+            require(com.vortx.android.home.ContinueWatchingWindow.entries.any { it.raw == value })
+            com.vortx.android.home.ContinueWatchingSelectionRevision.changed()
+            prefs.edit().putString(com.vortx.android.home.CONTINUE_WATCHING_WINDOW_KEY, value).apply()
+            ProfileStore.sharedOrNull()?.captureDiscovery(continueWatchingEdit = true)
+        }
+
     var showCuratedRails: Boolean
         get() = prefs.getBoolean(KEY_SHOW_CURATED_RAILS, true)
         set(value) { prefs.edit().putBoolean(KEY_SHOW_CURATED_RAILS, value).apply() }

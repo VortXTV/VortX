@@ -20,6 +20,16 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.coroutineContext
 
+/** Carries the captured CW capability across source assembly; tests inject inert streams and range sinks. */
+internal suspend fun <T> continueWatchingWarmAdmission(isAllowed: () -> Boolean, streams: suspend () -> T,
+    warm: suspend (T) -> Unit): Boolean {
+    if (!isAllowed()) return false
+    val groups = streams()
+    if (!isAllowed()) return false
+    warm(groups)
+    return isAllowed()
+}
+
 /**
  * WARM-THE-PICK-ON-FOCUS. Given a title's ranked sources, resolve which one WOULD play (the same
  * [StreamRanking] the app uses), and warm the connection to it ahead of the tap: open the socket
@@ -94,7 +104,9 @@ object SourceWarmer {
         repo: CatalogRepository,
         type: MediaType,
         id: String,
+        isAllowed: () -> Boolean = { true },
     ) {
+        if (!isAllowed()) return
         if (!FocusPrefetchSetting.isEnabled(context)) return
         if (type != MediaType.MOVIE) return // series lacks a resume episode id on the CW card
         val key = "cw:${type.id}:$id"
@@ -104,10 +116,11 @@ object SourceWarmer {
         scope.launch {
             try {
                 if (gen != generation.get()) return@launch
-                val groups = repo.streams(type, id).getOrNull() ?: return@launch
-                if (gen != generation.get()) return@launch
-                val target = pickWarmUrl(groups) ?: return@launch
-                warm(appContext, target, key, gen)
+                continueWatchingWarmAdmission(isAllowed = { gen == generation.get() && isAllowed() },
+                    streams = { repo.streams(type, id).getOrNull() }, warm = { groups ->
+                        val target = groups?.let(::pickWarmUrl)
+                        if (target != null) warm(appContext, target, key, gen, isAllowed)
+                    })
             } catch (e: CancellationException) {
                 throw e
             } catch (_: Throwable) {
@@ -157,19 +170,21 @@ object SourceWarmer {
     }
 
     /** Open the socket, pull the header range and the tail range, then mark [key] warmed. Best-effort. */
-    private suspend fun warm(context: Context?, url: String, key: String, gen: Long) = withContext(Dispatchers.IO) {
-        if (gen != generation.get()) return@withContext
-        val headerOk = drainRange(url, "bytes=0-${HEADER_BYTES - 1}", gen)
-        if (gen != generation.get()) return@withContext
+    private suspend fun warm(context: Context?, url: String, key: String, gen: Long, isAllowed: () -> Boolean = { true }) = withContext(Dispatchers.IO) {
+        if (gen != generation.get() || !isAllowed()) return@withContext
+        val headerOk = drainRange(url, "bytes=0-${HEADER_BYTES - 1}", gen, isAllowed)
+        if (gen != generation.get() || !isAllowed()) return@withContext
         // Only bother with the tail once the header connection succeeded (a dead link fails fast on header).
-        if (headerOk) drainRange(url, "bytes=-$TAIL_BYTES", gen)
+        if (headerOk) drainRange(url, "bytes=-$TAIL_BYTES", gen, isAllowed)
+        if (gen != generation.get() || !isAllowed()) return@withContext
         warmedAt[key] = System.currentTimeMillis()
         context?.hashCode() // keep the optional context reference meaningful without leaking it
         Log.i(TAG, "warmed pick for $key (header=$headerOk) host=${runCatching { URL(url).host }.getOrNull()}")
     }
 
     /** GET [range] with finite timeouts, read a bounded prefix, discard. Returns whether a 2xx/3xx opened. */
-    private suspend fun drainRange(url: String, range: String, gen: Long): Boolean {
+    private suspend fun drainRange(url: String, range: String, gen: Long, isAllowed: () -> Boolean = { true }): Boolean {
+        if (gen != generation.get() || !isAllowed()) return false
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = CONNECT_TIMEOUT_MS
@@ -178,6 +193,7 @@ object SourceWarmer {
             setRequestProperty("Range", range)
         }
         return try {
+            if (gen != generation.get() || !isAllowed()) return false
             val code = conn.responseCode
             if (code !in 200..299) return false
             val buf = ByteArray(READ_CHUNK)
@@ -185,7 +201,7 @@ object SourceWarmer {
                 var total = 0
                 while (total < MAX_READ_PER_RANGE) {
                     coroutineContext.ensureActive()
-                    if (gen != generation.get()) break
+                    if (gen != generation.get() || !isAllowed()) return false
                     val n = input.read(buf)
                     if (n < 0) break
                     total += n

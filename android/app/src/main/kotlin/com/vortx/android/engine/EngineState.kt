@@ -19,6 +19,7 @@ import com.vortx.android.model.MediaType
 import com.vortx.android.model.MediaRelation
 import com.vortx.android.model.MetaDetail
 import com.vortx.android.model.MetaItem
+import com.vortx.android.model.continueWatchingEpisodeFromVideoIdentity
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.profile.ContinueWatchingDedupe
@@ -259,17 +260,23 @@ internal object EngineState {
                     flaggedWatched = state?.optInt("flaggedWatched", 0) ?: 0,
                     timesWatched = state?.optInt("timesWatched", 0) ?: 0,
                 )
+            val type = MediaType.fromId(typeRaw)
+            val videoId = state?.optStringOrNull("video_id") ?: state?.optStringOrNull("videoId")
+            val preferredEpisode = continueWatchingEpisodeFromVideoIdentity(type, videoId)
+            val activity = state?.optStringOrNull("lastWatched")?.let { raw -> runCatching { Instant.parse(raw).toEpochMilli() }.getOrNull() }
+            val timeOffset = state?.optDouble("timeOffset", 0.0) ?: 0.0
+            val duration = state?.optDouble("duration", 0.0) ?: 0.0
+            val clockedRewind = activity != null && timeOffset == 0.0 && duration.isFinite() && duration > 0 && preferredEpisode != null
             val item = MetaItem(
                 id = obj.optString("_id").ifEmpty { obj.optString("id") },
-                type = MediaType.fromId(typeRaw),
+                type = type,
                 name = obj.optString("name"),
                 poster = obj.optStringOrNull("poster"),
                 progress = cwProgress(state),
-                resumeSeconds = cwResumeSeconds(state),
+                resumeSeconds = if (clockedRewind) 0.0 else cwResumeSeconds(state),
+                preferredEpisode = preferredEpisode,
+                continueWatchingActivityAtMillis = activity,
             )
-            val timeOffset = state?.optDouble("timeOffset", 0.0) ?: 0.0
-            val duration = state?.optDouble("duration", 0.0) ?: 0.0
-            val videoId = state?.optStringOrNull("video_id") ?: state?.optStringOrNull("videoId")
             val freshness = state?.optStringOrNull("lastWatched")?.let { raw ->
                 runCatching { Instant.parse(raw).toEpochMilli().toDouble() }.getOrNull()
             }
@@ -280,8 +287,8 @@ internal object EngineState {
                 type = typeRaw,
                 aliases = listOfNotNull(videoId),
                 freshness = freshness,
-                hasValidProgress = timeOffset.isFinite() && timeOffset > 0 &&
-                    duration.isFinite() && duration > 0,
+                hasValidProgress = clockedRewind || (timeOffset.isFinite() && timeOffset > 0 &&
+                    duration.isFinite() && duration > 0),
                 removed = removed || finished,
             )
         }

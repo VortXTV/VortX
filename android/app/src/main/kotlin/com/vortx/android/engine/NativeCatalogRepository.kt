@@ -22,6 +22,20 @@ import kotlinx.coroutines.isActive
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** Exact ProfilePlayback projection, including a clocked rewind at zero; never synthesizes an episode. */
+internal fun nativeContinueWatchingItem(item: JSONObject, saved: List<MetaItem>): MetaItem {
+    val id = item.getString("metaId")
+    val matches = saved.filter { it.id == id }
+    check(matches.size <= 1) { "Ambiguous native watch media identity" }
+    val type = item.optStringOrNull("type")?.let(MediaType::fromId) ?: matches.singleOrNull()?.type
+        ?: if (item.optStringOrNull("videoId")?.let { it != id } == true) MediaType.SERIES else MediaType.MOVIE
+    val offset = item.getLong("offsetMs"); val duration = item.getLong("durationMs")
+    return MetaItem(id, type, item.getString("name"), poster = item.optStringOrNull("poster") ?: matches.singleOrNull()?.poster,
+        progress = if (duration > 0) (offset.toFloat() / duration).coerceIn(0f, 1f) else 0f, resumeSeconds = offset / 1000.0,
+        preferredEpisode = continueWatchingEpisodeFromVideoIdentity(type, item.optStringOrNull("videoId")),
+        continueWatchingActivityAtMillis = item.optLong("updatedAt", 0).takeIf { it > 0 })
+}
+
 /** Actual UI repository for the explicit native compile gate. Never constructs the legacy engine.
  * The authenticated host provides the session; absence/unavailable/migration required is an error.
  * VortX authentication and complete legacy bootstrap are admitted only by the captured account host.
@@ -187,14 +201,7 @@ internal class NativeCatalogRepository(
     private fun cw(read: VortxNativeRead): List<MetaItem> {
         val saved = savedItems(read)
         return visibleLocal(playback(read).getJSONArray("continueWatching").objects().map { item ->
-            val id = item.getString("metaId")
-            val matches = saved.filter { it.id == id }
-            check(matches.size <= 1) { "Ambiguous native watch media identity" }
-            val type = item.optStringOrNull("type")?.let(MediaType::fromId) ?: matches.singleOrNull()?.type
-                ?: if (item.optStringOrNull("videoId")?.let { it != id } == true) MediaType.SERIES else MediaType.MOVIE
-            val offset = item.getLong("offsetMs"); val duration = item.getLong("durationMs")
-            MetaItem(id, type, item.getString("name"), poster = item.optStringOrNull("poster") ?: matches.singleOrNull()?.poster,
-                progress = if (duration > 0) (offset.toFloat() / duration).coerceIn(0f, 1f) else 0f, resumeSeconds = offset / 1000.0)
+            nativeContinueWatchingItem(item, saved)
         }, read)
     }
     private fun playback(read: VortxNativeRead): JSONObject = session().resolve(

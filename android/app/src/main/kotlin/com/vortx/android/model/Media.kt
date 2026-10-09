@@ -160,6 +160,16 @@ data class PreferredEpisode(
     val videoIdentity: String? = null,
 )
 
+/** Only an actual engine video identity supplies episode coordinates; sparse titles get no default. */
+internal fun continueWatchingEpisodeFromVideoIdentity(type: MediaType, videoIdentity: String?): PreferredEpisode? {
+    if (type != MediaType.SERIES || videoIdentity.isNullOrBlank()) return null
+    val parts = videoIdentity.split(':')
+    if (parts.size < 3 || parts.dropLast(2).joinToString(":").isBlank()) return null
+    val season = parts[parts.lastIndex - 1].toIntOrNull()?.takeIf { it >= 0 } ?: return null
+    val episode = parts.last().toIntOrNull()?.takeIf { it > 0 } ?: return null
+    return PreferredEpisode(season, episode, videoIdentity)
+}
+
 data class MetaItem(
     val id: String,
     val type: MediaType,
@@ -191,6 +201,12 @@ data class MetaItem(
     /// [MetaDetail.trailerYouTubeId]. Mirrors Apple's Home hero, whose `HomeHeroTrailerModel` fetches the
     /// focused item's meta to find its trailer. Null keeps the hero on its Ken Burns still backdrop.
     val trailerYouTubeId: String? = null,
+    /** Actual provider/native activity time; missing timestamps must stay unknown. */
+    val continueWatchingActivityAtMillis: Long? = null,
+    /** Opaque Home lease checked again on tap, never a credential or a persisted watch mutation. */
+    val continueWatchingPermit: String? = null,
+    val continueWatchingAdmission: com.vortx.android.home.ContinueWatchingAdmission? = null,
+    val continueWatchingUnavailableMessage: String? = null,
 ) {
     /// The formatted "resume 1:03" affordance for a Continue Watching card, or null when there is
     /// nothing to resume (mirrors Apple `CoreCWItem.resumeSeconds` -> `resumeTimecode`).
@@ -213,6 +229,7 @@ data class Catalog(
     val hasNextPage: Boolean = false,
     val pageLoading: Boolean = false,
     val type: String? = null,
+    val statusMessage: String? = null,
 )
 
 /// One episode of a series, mirroring the engine's `CoreVideo`. [season]/[episode] drive the season

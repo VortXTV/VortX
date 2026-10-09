@@ -70,4 +70,22 @@ class NativeHostPreferencesTest {
         }
         repeat(1000) { NativeHostDocument.requireCredentialFree(JSONObject().put("actor", java.util.UUID.randomUUID().toString())) }
     }
+
+    @Test fun `CW discovery source and window persist merge and project within the native profile carrier`() {
+        for (source in listOf("local", "trakt", "simkl")) for (window in listOf("last90Days", "20", "40", "60", "80", "100")) {
+            val discovery = JSONObject().put("continueWatchingSource", source).put("continueWatchingWindow", window)
+            val roster = JSONObject().put(scope.ownerProfileID, JSONObject().put("name", "Kernel viewer").put("deleted", false))
+            val edited = JSONObject(roster.toString()).also { it.getJSONObject(scope.ownerProfileID).put("discovery", discovery) }
+            val state = NativeHostPreferences.recordProfiles(scope, local(1), roster, edited)
+            val merged = NativeHostPreferences.merge(scope, local(2), state.getJSONObject("document"))
+            val projected = NativeHostPreferences.projectProfiles(merged, roster, roster)
+            NativeHostPreferences.validateProjectedProfiles(projected)
+            assertEquals(source, projected.getJSONObject(scope.ownerProfileID).getJSONObject("discovery").getString("continueWatchingSource"))
+            assertEquals(window, projected.getJSONObject(scope.ownerProfileID).getJSONObject("discovery").getString("continueWatchingWindow"))
+        }
+        for (key in listOf("continueWatchingSource", "continueWatchingWindow")) {
+            assertTrue(runCatching { NativeHostPreferences.recordProfiles(scope, local(1), JSONObject(),
+                JSONObject().put(scope.ownerProfileID, JSONObject().put("discovery", JSONObject().put(key, true)))) }.isFailure)
+        }
+    }
 }

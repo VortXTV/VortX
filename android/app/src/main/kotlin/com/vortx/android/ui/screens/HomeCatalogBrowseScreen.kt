@@ -49,7 +49,10 @@ fun HomeCatalogSnapshotBrowseScreen(
                 if (catalog == null) {
                     ErrorState("${target.title} is no longer available.")
                 } else {
-                    PosterGrid(catalog.items, onItem, emptyHint = "This catalog has no titles right now.", showMenu = !catalog.readOnly)
+                    catalog.statusMessage?.let { Text(it, style = VortXTheme.type.label, modifier = Modifier.padding(VortXTheme.spacing.edge)) }
+                    PosterGrid(catalog.items, { item ->
+                        if (catalog.id != "continue" || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
+                    }, emptyHint = catalog.statusMessage ?: "This catalog has no titles right now.", showMenu = !catalog.readOnly)
                 }
             }
         }

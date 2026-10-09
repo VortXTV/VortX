@@ -33,7 +33,8 @@ class ProfileDiscoveryPreferencesCodecTest {
                 else -> error("Unexpected preferences call ${method.name}")
             }
         } as android.content.SharedPreferences
-        val a = ProfileDiscoveryPreferences(showCollectionsHome = false, showCollectionsDiscover = true)
+        val a = ProfileDiscoveryPreferences(showCollectionsHome = false, showCollectionsDiscover = true,
+            continueWatchingSource = "trakt", continueWatchingWindow = "100")
         ProfileDiscoveryPreferencesStore.apply(a, true, prefs)
         val captured = ProfileDiscoveryPreferencesStore.capture(prefs)
         assertEquals(false, captured.showCollectionsHome)
@@ -44,6 +45,8 @@ class ProfileDiscoveryPreferencesCodecTest {
         val b = ProfileDiscoveryPreferencesStore.capture(prefs)
         assertEquals(true, b.showCollectionsHome)
         assertEquals(true, b.showCollectionsDiscover)
+        assertEquals("local", b.continueWatchingSource)
+        assertEquals("20", b.continueWatchingWindow)
         ProfileDiscoveryPreferencesStore.apply(captured, true, prefs)
         assertEquals(captured, ProfileDiscoveryPreferencesStore.capture(prefs))
     }
@@ -67,6 +70,8 @@ class ProfileDiscoveryPreferencesCodecTest {
             hideSearchTab = false,
             showCollectionsHome = false,
             showCollectionsDiscover = true,
+            continueWatchingSource = "simkl",
+            continueWatchingWindow = "last90Days",
         )
         val profile = UserProfile(name = "Viewer", avatar = "🍿", discovery = snapshot)
         val encoded = UserProfile.encodeProfile(profile)
@@ -77,8 +82,20 @@ class ProfileDiscoveryPreferencesCodecTest {
             "regionOverride", "filtersCaptured", "filtersData", "selectedProviders", "providerOrder",
             "tabVisibilityCaptured", "hideLiveTab", "hideDiscoverTab", "hideLibraryTab", "hideSearchTab",
             "showCollectionsHome", "showCollectionsDiscover",
+            "continueWatchingSource", "continueWatchingWindow",
         ).forEach { assertTrue("missing $it", discovery.has(it)) }
         assertEquals(snapshot, UserProfile.decodeProfile(encoded).discovery)
+    }
+
+    @Test fun `every service and window round trips through profile portable JSON`() {
+        for (source in listOf("local", "trakt", "simkl")) for (window in listOf("last90Days", "20", "40", "60", "80", "100")) {
+            val discovery = ProfileDiscoveryPreferences(continueWatchingSource = source, continueWatchingWindow = window)
+            val profile = UserProfile(name = "Viewer", avatar = "moon", discovery = discovery)
+            assertEquals(discovery, UserProfile.decodeRoster(UserProfile.encodeRoster(listOf(profile)))!!.single().discovery)
+        }
+        val legacy = UserProfile.decodeProfile(JSONObject().put("name", "Legacy").put("avatar", "moon").put("discovery", JSONObject()))
+        assertNull(legacy.discovery?.continueWatchingSource)
+        assertNull(legacy.discovery?.continueWatchingWindow)
     }
 
     @Test

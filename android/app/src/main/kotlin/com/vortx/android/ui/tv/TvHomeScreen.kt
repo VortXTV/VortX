@@ -89,6 +89,7 @@ fun TvHomeScreen(
     // top -- the 10-foot analogue of Apple's `scrollToTopOnBump`.
     reselectSignal: Int = 0,
 ) {
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) { viewModel.refreshContinueWatchingOnFocus() }
     val state by viewModel.state.collectAsStateWithLifecycle()
     val contentOwnerGeneration by viewModel.contentOwnerGeneration.collectAsStateWithLifecycle()
     val catalogLayout by viewModel.homeCatalogLayout.collectAsStateWithLifecycle()
@@ -128,8 +129,11 @@ fun TvHomeScreen(
                     collectionsHubHidden = hubHidden,
                     onCollection = viewModel::openCollection,
                     onRetryCollections = viewModel::retryCollectionsHub,
-                    onItem = onItem,
+                    onItem = { item ->
+                        if (item.continueWatchingPermit == null || viewModel.isContinueWatchingTapCurrent(item)) onItem(item)
+                    },
                     onRemoveFromContinueWatching = viewModel::removeFromContinueWatching,
+                    captureContinueWatchingAdmission = viewModel::captureContinueWatchingAdmission,
                     onLoadRowPage = viewModel::loadNextPage,
                     onLoadMoreRows = viewModel::loadMoreRows,
                     reselectSignal = reselectSignal,
@@ -151,6 +155,7 @@ private fun TvHomeContent(
     onRetryCollections: () -> Unit,
     onItem: (MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
+    captureContinueWatchingAdmission: (MetaItem) -> com.vortx.android.home.ContinueWatchingAdmission?,
     onLoadRowPage: (Catalog) -> Unit,
     onLoadMoreRows: () -> Unit,
     reselectSignal: Int = 0,
@@ -188,8 +193,12 @@ private fun TvHomeContent(
         mutableStateOf<TvHomeFocusRecoveryLease?>(null)
     }
     var hasReceivedFocus by remember(contentOwnerGeneration, catalogLayout) { mutableStateOf(false) }
-    val heroItem = focusState.focusedItem()
-        ?: visibleCatalogs.firstNotNullOfOrNull { it.items.firstOrNull() }
+    // Remote CW is already privately enriched behind its immutable source receipt; never send it into
+    // the generic identity-only hero cache (including same-title source/account replacements).
+    val heroItems = com.vortx.android.home.continueWatchingHeroCatalogs(visibleCatalogs).flatMap { it.items }
+    val focusedItem = focusState.focusedItem()
+    val heroItem = heroItems.firstOrNull { focusedItem != null && it.type == focusedItem.type && it.id == focusedItem.id &&
+        it.continueWatchingPermit == focusedItem.continueWatchingPermit } ?: heroItems.firstOrNull()
 
     // Seed D-pad focus on the first tile of the first row so a fresh TV entry lands somewhere actionable
     // instead of nowhere (a TV has no touch to bootstrap focus). Guarded: requestFocus throws if the node
@@ -223,7 +232,8 @@ private fun TvHomeContent(
 
     // Enrich the focused item post-focus (backdrop + clearlogo + synopsis/rating/genres + the trailer id
     // that lights the ambient trailer) through the existing engine meta route -- see TvHeroEnrichment.kt.
-    val enrichedHeroItem = rememberEnrichedHeroItem(heroItem)
+    val enrichedHeroItem = if (heroItem != null && !com.vortx.android.home.continueWatchingMayUseGenericEnrichment(heroItem))
+        heroItem else rememberEnrichedHeroItem(heroItem)
     Box(modifier = modifier.fillMaxSize().background(colors.canvas)) {
     Column(modifier = Modifier.fillMaxSize().focusProperties { canFocus = browseCatalogId == null }) {
         // Hook site: the living-backdrop cinematic hero (backdrop crossfade + Ken Burns + ambient trailer +
@@ -235,6 +245,7 @@ private fun TvHomeContent(
                 onItem = onItem,
                 onFocused = ::acceptFocus,
                 onRemoveFromContinueWatching = onRemoveFromContinueWatching,
+                captureContinueWatchingAdmission = captureContinueWatchingAdmission,
                 onLoadRowPage = onLoadRowPage,
                 onLoadMoreRows = onLoadMoreRows,
                 onBrowseCatalog = ::openCatalog,
@@ -276,6 +287,7 @@ private fun TvHomeContent(
                                 onItem = onItem,
                                 onFocused = { acceptFocus(catalog.id, it) },
                                 onRemoveFromContinueWatching = onRemoveFromContinueWatching,
+                                captureContinueWatchingAdmission = captureContinueWatchingAdmission,
                                 onEndReached = if (catalog.hasNextPage) {
                                     { onLoadRowPage(catalog) }
                                 } else {
@@ -351,6 +363,7 @@ private fun TvCatalogRow(
     onItem: (MetaItem) -> Unit,
     onFocused: (MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
+    captureContinueWatchingAdmission: (MetaItem) -> com.vortx.android.home.ContinueWatchingAdmission?,
     onEndReached: (() -> Unit)?,
     firstCardFocus: FocusRequester?,
     recovery: TvHomeFocusRecovery?,
@@ -376,16 +389,18 @@ private fun TvCatalogRow(
     val isContinueWatchingRow = remember(catalog) { posterMenuFor(catalog) == PosterCardMenu.CONTINUE_WATCHING }
     val usesContinueWatchingCard = remember(catalog) { tvIsContinueWatchingCatalog(catalog) }
     var focusedCwItem by remember { mutableStateOf<MetaItem?>(null) }
-    LaunchedEffect(focusedCwItem) {
+    LaunchedEffect(focusedCwItem, catalog.readOnly, catalog.items) {
         val item = focusedCwItem ?: return@LaunchedEffect
         if (!isContinueWatchingRow) return@LaunchedEffect
-        delay(500)
+        val admission = captureContinueWatchingAdmission(item) ?: return@LaunchedEffect
+        if (!com.vortx.android.home.continueWatchingFocusDwell(admission) { delay(500) }) return@LaunchedEffect
         val repo = (warmContext.applicationContext as? VortXApplication)?.catalogRepository ?: return@LaunchedEffect
-        SourceWarmer.warmForContinueWatching(warmContext, repo, item.type, item.id)
+        SourceWarmer.warmForContinueWatching(warmContext, repo, item.type, item.id, admission::isCurrent)
     }
 
     Column(modifier = Modifier.focusGroup()) {
         TvCatalogHeader(catalog, onSeeAll = { onBrowseCatalog(catalog, seeAllFocus) }, seeAllFocus = seeAllFocus)
+        catalog.statusMessage?.let { Text(it, style = VortXTheme.type.label, modifier = Modifier.padding(horizontal = TvDimens.edge)) }
         if (onEndReached != null && showEmptyCatalogContinuation(catalog)) {
             androidx.compose.material3.Button(onClick = onEndReached, modifier = Modifier.padding(horizontal = TvDimens.edge)) {
                 Text("Continue catalog")
@@ -446,6 +461,7 @@ private fun TvCatalogWall(
     onItem: (MetaItem) -> Unit,
     onFocused: (String, MetaItem) -> Unit,
     onRemoveFromContinueWatching: (MetaItem) -> Unit,
+    captureContinueWatchingAdmission: (MetaItem) -> com.vortx.android.home.ContinueWatchingAdmission?,
     onLoadRowPage: (Catalog) -> Unit,
     onLoadMoreRows: () -> Unit,
     onBrowseCatalog: (Catalog, FocusRequester) -> Unit,
@@ -485,6 +501,7 @@ private fun TvCatalogWall(
                         onItem = onItem,
                         onFocused = { onFocused(catalog.id, it) },
                         onRemoveFromContinueWatching = onRemoveFromContinueWatching,
+                        captureContinueWatchingAdmission = captureContinueWatchingAdmission,
                         onEndReached = if (catalog.hasNextPage) {
                             { onLoadRowPage(catalog) }
                         } else {

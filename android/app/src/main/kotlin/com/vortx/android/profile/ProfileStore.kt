@@ -109,6 +109,9 @@ class ProfileStore private constructor(context: Context) {
     private val switchListeners = mutableListOf<() -> Unit>()
     private val homeTransitionListeners = mutableListOf<() -> Unit>()
     private var applyingDiscoveryProjection = false
+    private val continueWatchingMigration = ContinueWatchingMigrationCheckpoint<com.vortx.android.sync.SessionOwnerSnapshot.Account>()
+    private var acknowledgedNativeAccount: com.vortx.android.sync.SessionOwnerSnapshot.Account? = null
+    private var acknowledgedNativeTraktEpoch: Long? = null
 
     // ---- Derived reads ----
 
@@ -151,15 +154,53 @@ class ProfileStore private constructor(context: Context) {
     internal fun clearNativeProjection() = ContinueWatchingOwnerGate.serialized {
         check(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
+            continueWatchingMigration.retire()
+            acknowledgedNativeAccount = null; acknowledgedNativeTraktEpoch = null
+            prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
             profiles = emptyList(); activeID = null; pickedThisLaunch = false
             notifyHomeTransitionListeners(); publishActiveProfile(); notifySwitchListeners()
         }
     }
     private fun applyNativeProjection(value: NativeProfileGateway.Projection, forceSettings: Boolean = false) {
-        if (!forceSettings && profiles == value.profiles && activeID == value.activeID) return
+        var acknowledged = value
+        val previous = active
+        val incoming = value.profiles.firstOrNull { it.id == value.activeID }
+        val capturedProvider = com.vortx.android.integrations.NativeProviderAccess.capture(
+            com.vortx.android.integrations.NativeProviderCredentials.GROUPS[0]) { nativeGateway?.read() }
+        val providerGuard = capturedProvider?.first?.takeIf { capturedProvider?.second == value }
+        val traktEpoch = com.vortx.android.integrations.TraktAuth.currentSessionEpoch
+        if (previous != null && (previous.id != value.activeID || acknowledgedNativeAccount != providerGuard?.owner)) {
+            continueWatchingMigration.retire()
+            prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
+        }
+        if (continueWatchingMigration.witness == null && eligibleLegacyContinueWatchingMigration(
+            previous, incoming, value.activeID,
+            prefs.contains(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY),
+            prefs.getBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false),
+            sameContinueWatchingMigrationAuthority(acknowledgedNativeAccount, providerGuard?.owner,
+                acknowledgedNativeTraktEpoch, traktEpoch),
+        )) {
+            continueWatchingMigration.capture(value.activeID, checkNotNull(providerGuard).owner, checkNotNull(traktEpoch))
+        }
+        continueWatchingMigration.attempt(incoming, value.activeID, providerGuard?.owner, traktEpoch,
+            save = { edited -> com.vortx.android.integrations.NativeProviderAccess.guarded(checkNotNull(providerGuard)) {
+                if (nativeGateway?.read() == value) checkNotNull(nativeGateway).save(edited, adding = false) else null
+            } },
+            authorityIsCurrent = { providerGuard != null && com.vortx.android.integrations.NativeProviderAccess.current(providerGuard) &&
+                com.vortx.android.integrations.TraktAuth.currentSessionEpoch == traktEpoch },
+            readbackIsCurrent = { saved -> nativeGateway?.read() == saved },
+        )?.let { saved ->
+            acknowledged = saved
+            prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
+        }
+        if (!forceSettings && profiles == acknowledged.profiles && activeID == acknowledged.activeID) {
+            acknowledgedNativeAccount = providerGuard?.owner; acknowledgedNativeTraktEpoch = traktEpoch
+            return
+        }
         ContinueWatchingOwnerGate.transition(::captureActiveProfileBinding) {
-            profiles = value.profiles; activeID = value.activeID
+            profiles = acknowledged.profiles; activeID = acknowledged.activeID
             active?.let { activateProfileState(it, resetUnset = true) }
+            acknowledgedNativeAccount = providerGuard?.owner; acknowledgedNativeTraktEpoch = traktEpoch
         }
     }
 
@@ -352,11 +393,14 @@ class ProfileStore private constructor(context: Context) {
             capturePlaybackLocked()
             captureDiscoveryLocked()
         }
-        activeID = profile.id
+        val selected = profiles.firstOrNull { it.id == profile.id } ?: profile
+        activeID = selected.id
+        continueWatchingMigration.retire()
+        prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
         pickedThisLaunch = true
         persist(touch = false)   // selection is per-device, not a roster edit
-        activateProfileState(profile, resetUnset = true)
-        val nowAccount = keychainAccount(profile)
+        activateProfileState(selected, resetUnset = true)
+        val nowAccount = keychainAccount(selected)
         if (nowAccount == before.accountSlot) return SwitchOutcome.SameAccount
         val token = tokenProvider(nowAccount)
         return if (!token.isNullOrEmpty()) SwitchOutcome.SwitchAccount(token) else SwitchOutcome.NeedsSignIn
@@ -601,8 +645,38 @@ class ProfileStore private constructor(context: Context) {
     }
 
     /** Called by active Discover/catalog setting writers after their flat-key mutation commits. */
-    fun captureDiscovery() = ContinueWatchingOwnerGate.serialized {
-        if (shouldCaptureDiscovery(applyingDiscoveryProjection)) captureDiscoveryLocked()
+    fun captureDiscovery(continueWatchingEdit: Boolean = false) = ContinueWatchingOwnerGate.serialized {
+        if (shouldCaptureDiscovery(applyingDiscoveryProjection)) {
+            if (continueWatchingEdit) continueWatchingMigration.retire()
+            captureDiscoveryLocked()
+        }
+    }
+
+    private fun capturePendingNativeContinueWatchingDiscovery(profile: UserProfile): Boolean {
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED && continueWatchingMigration.witness != null) {
+            val captured = com.vortx.android.integrations.NativeProviderAccess.capture(
+                com.vortx.android.integrations.NativeProviderCredentials.GROUPS[0]) { nativeGateway?.read() }
+            val guard = captured?.first
+            val projection = captured?.second
+            val epoch = com.vortx.android.integrations.TraktAuth.currentSessionEpoch
+            // Unrelated discovery edits join the pending legacy choice in one checkpoint. The temporary
+            // Local projection is not an explicit source edit and must never overwrite the qualified choice.
+            continueWatchingMigration.retainDiscoveryCapture(profile, ProfileDiscoveryPreferencesStore.capture(prefs))
+            continueWatchingMigration.attempt(projection?.profiles?.firstOrNull { it.id == profile.id },
+                projection?.activeID.orEmpty(), guard?.owner, epoch,
+                save = { edited -> com.vortx.android.integrations.NativeProviderAccess.guarded(checkNotNull(guard)) {
+                    if (nativeGateway?.read() == projection) checkNotNull(nativeGateway).save(edited, adding = false) else null
+                } }, authorityIsCurrent = { guard != null && acknowledgedNativeAccount == guard.owner &&
+                    com.vortx.android.integrations.NativeProviderAccess.current(guard) &&
+                    com.vortx.android.integrations.TraktAuth.currentSessionEpoch == epoch },
+                readbackIsCurrent = { saved -> nativeGateway?.read() == saved },
+            )?.let { saved ->
+                applyNativeProjection(saved, forceSettings = true)
+                prefs.edit().putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
+            }
+            return true
+        }
+        return false
     }
 
     private fun capturePlaybackLocked() {
@@ -618,7 +692,17 @@ class ProfileStore private constructor(context: Context) {
     private fun captureDiscoveryLocked() {
         if (applyingNativeAccountSettings) return
         val profile = active ?: return
-        val now = ProfileDiscoveryPreferencesStore.capture(prefs)
+        if (capturePendingNativeContinueWatchingDiscovery(profile)) return
+        val legacyKnown = !com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED &&
+            prefs.getString(ACTIVE_PROFILE_KEY, null)?.let(UserProfile::normalizeId) == profile.id &&
+            !tokenProvider(keychainAccount(profile)).isNullOrBlank() &&
+            com.vortx.android.integrations.TraktAuth.currentSessionEpoch != null
+        val migrate = eligibleLegacyContinueWatchingMigration(profile, profile, profile.id,
+            prefs.contains(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY),
+            prefs.getBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false), legacyKnown)
+        val now = ProfileDiscoveryPreferencesStore.capture(prefs).let { snapshot ->
+            if (migrate) snapshot.copy(continueWatchingSource = "trakt") else snapshot
+        }
         val idx = profiles.indexOfFirst { it.id == profile.id }
         if (idx < 0) return
         // Do not call updateLocked here. Its active-profile path reapplies playback and can overwrite
@@ -629,6 +713,8 @@ class ProfileStore private constructor(context: Context) {
             replace = { updated -> profiles = profiles.toMutableList().also { it[idx] = updated } },
             persistAndPush = { persist() },
         )
+        if (migrate) prefs.edit().putString(com.vortx.android.home.CONTINUE_WATCHING_SOURCE_KEY, "trakt")
+            .putBoolean(com.vortx.android.integrations.ScrobbleService.KEY_TRAKT_CONTINUE_WATCHING, false).apply()
     }
 
     /**

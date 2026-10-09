@@ -100,7 +100,7 @@ internal object NativeHostPreferences {
                 fields("sourceTypeOrder", ::stringArray)
             }
             "discovery" -> {
-                strings("regionOverride filtersData")
+                strings("regionOverride filtersData continueWatchingSource continueWatchingWindow")
                 bools("regionOverrideCaptured filtersCaptured tabVisibilityCaptured hideLiveTab hideDiscoverTab hideLibraryTab hideSearchTab showCollectionsHome showCollectionsDiscover")
                 fields("hiddenCatalogs catalogOrder hiddenHubCategories", ::stringArray)
                 fields("selectedProviders providerOrder") { array ->

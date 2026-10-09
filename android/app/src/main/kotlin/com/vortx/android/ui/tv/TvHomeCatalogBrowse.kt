@@ -55,7 +55,7 @@ internal fun TvHomeCatalogBrowse(
             val continueWatching = tvIsContinueWatchingCatalog(catalog)
             TvBrowseGrid(
                 items = tvHomeItems(catalog.items),
-                emptyHint = "No titles in this catalog yet.",
+                emptyHint = catalog.statusMessage ?: "No titles in this catalog yet.",
                 modifier = Modifier.weight(1f),
                 minCardWidth = if (continueWatching) 300.dp else null,
                 // Preserve a continuation even when a page is empty but another engine page exists.

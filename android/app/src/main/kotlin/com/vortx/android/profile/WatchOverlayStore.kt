@@ -64,7 +64,7 @@ class WatchOverlayStore(
     // ---- Continue Watching / Library derivation ----
 
     /**
-     * Continue Watching for the active overlay profile, newest first, capped at 30. Mirrors the account
+     * Continue Watching for the active overlay profile, newest first, complete before the selected UI window. Mirrors the account
      * rail's rules and Apple `cwItems`: a finished MOVIE leaves (its own id marked watched OR a near-end
      * offset), a series rolls forward (its keep-signal is EPISODE ids, never the series metaId).
      */
@@ -93,7 +93,7 @@ class WatchOverlayStore(
                 freshness = runCatching { Instant.parse(entry.lastWatched).toEpochMilli().toDouble() }.getOrNull(),
                 hasValidProgress = entry.timeOffsetMs > 0 && entry.durationMs > 0,
             )
-        }.take(30).map { it.item }
+        }.map { it.item }
     }
 
     /**
@@ -125,6 +125,7 @@ class WatchOverlayStore(
         poster = entry.poster,
         progress = if (entry.durationMs > 0) entry.progress.toFloat() else null,
         resumeSeconds = if (entry.timeOffsetMs > 0) entry.timeOffsetMs / 1000.0 else null,
+        continueWatchingActivityAtMillis = runCatching { Instant.parse(entry.lastWatched).toEpochMilli() }.getOrNull(),
         watched = entry.watchedVideoIds.isNotEmpty(),
     )
 

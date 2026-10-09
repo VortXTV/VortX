@@ -149,7 +149,7 @@ fun PosterRail(
     // localized-metadata resolve (item 9), a cheap no-op for English / when the feature is off.
     val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
     LaunchedEffect(catalog.items) {
-        LocalizedMetadataStore.resolve(catalog.items.map { it.id })
+        if (!catalog.readOnly) LocalizedMetadataStore.resolve(catalog.items.map { it.id })
     }
     Column(modifier = modifier) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -160,6 +160,10 @@ fun PosterRail(
                     modifier = Modifier.padding(end = VortXTheme.spacing.edge),
                 ) { androidx.compose.material3.Text("See all") }
             }
+        }
+        catalog.statusMessage?.let { message ->
+            androidx.compose.material3.Text(message, style = VortXTheme.type.label,
+                modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge))
         }
         if (onEndReached != null && showEmptyCatalogContinuation(catalog)) {
             androidx.compose.material3.TextButton(onClick = onEndReached, modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge)) {
@@ -177,7 +181,7 @@ fun PosterRail(
                 val continueWatching = catalog.id == CONTINUE_WATCHING_ROW_ID
                 PosterCard(
                     title = item.name,
-                    subtitle = cinemaCardFacts(item),
+                    subtitle = item.continueWatchingUnavailableMessage ?: cinemaCardFacts(item),
                     onClick = { onItem(item) },
                     // Continue Watching items carry a watched fraction; the card draws its accent
                     // progress track for them (null on plain catalog items = no track).

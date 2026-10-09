@@ -10,6 +10,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicLong
+import java.net.URLEncoder
+import java.net.URLDecoder
 
 /// SIMKL PIN/device auth plus encrypted token storage. Kotlin port of `app/SourcesShared/SIMKLAuth.swift`.
 /// SIMKL's model is simpler than Trakt's: a PIN flow (request a code, poll until the user authorizes) that
@@ -25,6 +27,28 @@ import java.util.concurrent.atomic.AtomicLong
 ///
 /// Credentials come from [BuildConfig.SIMKL_CLIENT_ID] (the PIN flow needs only the id; no secret). Empty
 /// ships the feature DORMANT: [isConfigured] stays false and nothing here makes a network call.
+internal fun simklReadPath(path: String, parameters: Map<String, String> = emptyMap()): String {
+    require(path.startsWith("/sync/") && '?' !in path && '#' !in path && path.none(Char::isWhitespace))
+    val allowed = setOf("date_from", "next_watch_info", "extended", "hide_watched", "limit")
+    require(parameters.keys.all(allowed::contains)) { "Unsupported SIMKL read parameter" }
+    return path + if (parameters.isEmpty()) "" else parameters.entries.joinToString("&", prefix = "?") {
+        "${it.key}=${URLEncoder.encode(it.value, "UTF-8")}" }
+}
+
+internal fun simklSessionQueryPath(path: String, requiredQuery: String): String {
+    require(path.startsWith("/") && !path.startsWith("//") && '#' !in path && path.count { it == '?' } <= 1 && path.none(Char::isWhitespace))
+    val query = path.substringAfter('?', "")
+    if ('?' in path) {
+        val keys = query.split('&').map { URLDecoder.decode(it.substringBefore('='), "UTF-8") }
+        require(keys.distinct().size == keys.size) { "Duplicate SIMKL read parameter" }
+        require(query.isNotEmpty() && query.split('&').all { part ->
+            val key = runCatching { URLDecoder.decode(part.substringBefore('='), "UTF-8") }.getOrNull()
+            '=' in part && key in setOf("date_from", "next_watch_info", "extended", "hide_watched", "limit")
+        }) { "Invalid SIMKL read query" }
+    }
+    return path + (if ('?' in path) "&" else "?") + requiredQuery
+}
+
 object SIMKLAuth {
 
     // MARK: - Configuration (build-time; empty ships a dormant, invisible feature)
@@ -200,7 +224,7 @@ object SIMKLAuth {
         if (!isSessionCurrent(expectedEpoch)) return null
         val response = IntegrationsHttp.request(
             method = "GET",
-            urlString = "$API_BASE$path?${requiredQuery()}",
+            urlString = "$API_BASE${simklSessionQueryPath(path, requiredQuery())}",
             headers = authHeaders(token),
         )
         return response.takeIf { isSessionCurrent(expectedEpoch) }

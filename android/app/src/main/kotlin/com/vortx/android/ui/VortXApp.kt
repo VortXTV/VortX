@@ -318,6 +318,9 @@ fun VortXApp(
         var savedDetailEpisodeSeason by rememberSaveable { mutableStateOf<Int?>(null) }
         var savedDetailEpisodeNumber by rememberSaveable { mutableStateOf<Int?>(null) }
         var savedDetailEpisodeIdentity by rememberSaveable { mutableStateOf<String?>(null) }
+        var liveDetailEpisode by remember { mutableStateOf<PreferredEpisode?>(null) }
+        var liveDetailAdmission by remember { mutableStateOf<com.vortx.android.home.ContinueWatchingAdmission?>(null) }
+        var unavailableContinueWatching by remember { mutableStateOf<String?>(null) }
         val savedDetailPreferredEpisode = remember(
             savedDetailEpisodeSeason,
             savedDetailEpisodeNumber,
@@ -333,26 +336,42 @@ fun VortXApp(
                 null
             }
         }
-        val detail = remember(savedDetailId, savedDetailType, savedDetailPreferredEpisode) {
+        val detail = remember(savedDetailId, savedDetailType, savedDetailPreferredEpisode, liveDetailEpisode, liveDetailAdmission) {
             val restoredType = MediaType.entries.firstOrNull { it.id == savedDetailType }
             if (restoredType != null && !savedDetailId.isNullOrEmpty()) {
                 VortXDeepLink(restoredType, savedDetailId!!).toMetaItem().copy(
-                    preferredEpisode = savedDetailPreferredEpisode,
+                    preferredEpisode = liveDetailEpisode ?: savedDetailPreferredEpisode,
+                    continueWatchingAdmission = liveDetailAdmission,
                 )
             } else {
                 null
             }
         }
         var pendingDirectResumeTarget by remember { mutableStateOf<DirectResumeTarget?>(null) }
-        val openDetail: (MetaItem?) -> Unit = { item ->
+        val openDetail: (MetaItem?) -> Unit = open@{ item ->
+            if (item?.continueWatchingAdmission?.isCurrent() == false) return@open
+            if (item?.continueWatchingUnavailableMessage != null) {
+                unavailableContinueWatching = "${item.name}\n\n${item.continueWatchingUnavailableMessage}"
+                return@open
+            }
             // Every ordinary Detail route revokes any previous one-shot direct-resume request. Direct
             // Continue Watching callers install their exact target immediately after opening it.
             pendingDirectResumeTarget = null
             savedDetailId = item?.id
             savedDetailType = item?.type?.id
-            savedDetailEpisodeSeason = item?.preferredEpisode?.season
-            savedDetailEpisodeNumber = item?.preferredEpisode?.episode
-            savedDetailEpisodeIdentity = item?.preferredEpisode?.videoIdentity
+            liveDetailAdmission = item?.continueWatchingAdmission
+            liveDetailEpisode = item?.preferredEpisode.takeIf { liveDetailAdmission != null }
+            // Remote hints are session-only. Activity restoration preserves the ordinary title route,
+            // but neither its hint nor the capability can be restored without the original authority.
+            val saveableHint = com.vortx.android.home.saveableContinueWatchingEpisode(item?.preferredEpisode, liveDetailAdmission)
+            savedDetailEpisodeSeason = saveableHint?.season
+            savedDetailEpisodeNumber = saveableHint?.episode
+            savedDetailEpisodeIdentity = saveableHint?.videoIdentity
+        }
+        unavailableContinueWatching?.let { message ->
+            androidx.compose.material3.AlertDialog(onDismissRequest = { unavailableContinueWatching = null },
+                title = { Text("Continue Watching") }, text = { Text(message) },
+                confirmButton = { androidx.compose.material3.TextButton(onClick = { unavailableContinueWatching = null }) { Text("OK") } })
         }
         var detailGeneration by remember { mutableStateOf(0L) }
         var playing by remember { mutableStateOf<Playable?>(null) }
@@ -376,7 +395,7 @@ fun VortXApp(
         val autoAdvanceStreak = remember { intArrayOf(0) }
         val detailVmOwner = rememberReplacingViewModelStoreOwner(
             detail?.let {
-                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch"
+                "${it.type}:${it.id}:${detailEpisodeRouteKey(it.preferredEpisode)}:$detailSourceEpoch:${it.continueWatchingAdmission?.let(System::identityHashCode)}"
             } ?: "no-detail:$detailSourceEpoch",
         )
         // The catalog meta of the title currently in [playing], captured at the moment play starts. This is
@@ -702,6 +721,7 @@ fun VortXApp(
                                 showForNext.id,
                                 showForNext.name,
                                 showForNext.preferredEpisode,
+                                showForNext.continueWatchingAdmission,
                             ),
                             appContext = appContext,
                         ),
@@ -1335,7 +1355,7 @@ fun VortXApp(
         catalogBrowseTarget?.let { target ->
             BackHandler { catalogBrowseTarget = null }
             val onBrowseItem: (MetaItem) -> Unit = { item ->
-                if (com.vortx.android.ui.components.cinemaCardOpensQuickView(item, cinemaQuickView)) {
+                if (target.id != "continue" && com.vortx.android.ui.components.cinemaCardOpensQuickView(item, cinemaQuickView)) {
                     quickViewItem = item
                 } else {
                     catalogBrowseTarget = null
@@ -1388,6 +1408,7 @@ fun VortXApp(
                             current.id,
                             current.name,
                             current.preferredEpisode,
+                            current.continueWatchingAdmission,
                         ),
                         appContext = appContext,
                     ),
@@ -1418,14 +1439,16 @@ fun VortXApp(
                     // DetailScreen supplies the successfully loaded MetaDetail, not the provisional
                     // deep-link MetaItem. This keeps auto-add title/poster truth tied to engine metadata.
                     onPlay = { playable, loadedMeta, requestedEngine ->
-                        playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
-                            requested = requestedEngine,
-                            playable = playable,
-                            mpvAvailable = MpvEngineFactory.isBundled,
-                        )
-                        playingMeta = loadedMeta
-                        playing = playable
-                        autoAdvanceStreak[0] = 0
+                        if (detailVm.isRouteAdmissionCurrent()) {
+                            playingEngineOverride = PlayerLaunchPolicy.effectivePreference(
+                                requested = requestedEngine,
+                                playable = playable,
+                                mpvAvailable = MpvEngineFactory.isBundled,
+                            )
+                            playingMeta = loadedMeta
+                            playing = playable
+                            autoAdvanceStreak[0] = 0
+                        } else playable.playbackLease?.close()
                     },
                     autoWatch = quickWatchIdentity == "${current.type.id}:${current.id}",
                     onAutoWatchConsumed = { quickWatchIdentity = null },
@@ -1552,7 +1575,7 @@ fun VortXApp(
                                 }
                             },
                             onBrowseCatalog = { catalog ->
-                                catalogBrowseIsClientRail = catalog.engineIndex == null && catalog.id != "continue"
+                                catalogBrowseIsClientRail = catalog.engineIndex == null
                                 catalogBrowseTarget = HomeCatalogTarget(catalog.id, catalog.title)
                             },
                             onCatalogItem = onCinemaItem,

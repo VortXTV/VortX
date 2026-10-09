@@ -366,6 +366,7 @@ class DetailViewModel(
     appContext: Context,
     private val routeName: String? = null,
     private val initialPreferredEpisode: PreferredEpisode? = null,
+    private val continueWatchingAdmission: com.vortx.android.home.ContinueWatchingAdmission? = null,
 ) : ViewModel() {
 
     private val app = appContext.applicationContext
@@ -658,7 +659,7 @@ class DetailViewModel(
             // so meta must land (above) before the sources fan-out is scoped.
             val target = detailEpisodeTargetForRoute(
                 videos = detail.videos,
-                preferredEpisode = initialPreferredEpisode,
+                preferredEpisode = detailPreferredEpisodeForAdmission(initialPreferredEpisode, continueWatchingAdmission),
                 manualEpisodeId = explicitManualEpisodeId,
             ) ?: primaryEpisodeOf(detail)?.first
             if (target != null) {
@@ -820,7 +821,7 @@ class DetailViewModel(
     }
 
     private fun canPublishPlaybackResolve(lease: PlaybackResolveFence.Lease): Boolean =
-        playbackResolveFence.accepts(lease) &&
+        isRouteAdmissionCurrent() && playbackResolveFence.accepts(lease) &&
             sourceRequestFence.accepts(lease.sourceRequest, sourceSticky.currentProfileId())
 
     private fun publishPlaybackResolve(lease: PlaybackResolveFence.Lease, state: Playback): Boolean {
@@ -881,7 +882,7 @@ class DetailViewModel(
                 detail?.let {
                     detailEpisodeTargetForRoute(
                         videos = it.videos,
-                        preferredEpisode = initialPreferredEpisode,
+                        preferredEpisode = detailPreferredEpisodeForAdmission(initialPreferredEpisode, continueWatchingAdmission),
                         manualEpisodeId = explicitManualEpisodeId,
                     )
                 }
@@ -1291,6 +1292,10 @@ class DetailViewModel(
         manualPick: Boolean,
         startPositionOverrideMs: Long?,
     ) {
+        if (!isRouteAdmissionCurrent()) {
+            _playback.value = Playback.Failed("This Continue Watching request expired. Open the title again from Home.")
+            return
+        }
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
@@ -1773,18 +1778,18 @@ class DetailViewModel(
         )
     }
 
+    fun isRouteAdmissionCurrent(): Boolean = continueWatchingAdmission?.isCurrent() != false
+
     private fun isActionOwnerCurrent(owner: DebridOwnerToken?): Boolean =
-        debridKeys.ownerToken() == owner
+        isRouteAdmissionCurrent() && debridKeys.ownerToken() == owner
 
     private suspend fun resolveForOwner(
         source: StreamSource,
         episode: Episode?,
         owner: DebridOwnerToken?,
-    ): Result<Playable> = ownerBoundResult(
-        expectedOwner = owner,
-        currentOwner = debridKeys::ownerToken,
-    ) {
-        repo.resolve(source, episode)
+    ): Result<Playable> = com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission,
+        discard = { it.playbackLease?.close() }) {
+        ownerBoundResult(expectedOwner = owner, currentOwner = debridKeys::ownerToken) { repo.resolve(source, episode) }
     }
 
     private fun currentModelEpisode(): Episode? {
@@ -1869,9 +1874,12 @@ class DetailViewModel(
 
     /** WHY audit R01: Home's first CW hero restores the persisted exact source through CWResume. */
     fun playLastStream(): Boolean {
+        if (!isRouteAdmissionCurrent()) return false
         val saved = lastStreamStore.load()?.takeIf { it.mediaId == id && it.mediaType == type } ?: return false
         viewModelScope.launch {
-            val streamState = streams.first { it !is UiState.Loading }
+            val streamState = com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission) {
+                Result.success(streams.first { it !is UiState.Loading })
+            }.getOrNull() ?: return@launch
             if (streamState !is UiState.Success) return@launch
             val owner = debridKeys.ownerToken()
             val service = saved.debridService
@@ -2503,6 +2511,9 @@ internal fun detailPrimaryEpisode(detail: MetaDetail): Pair<Episode, Boolean>? {
  * An explicit user-selected episode always wins, while a stale or malformed remote hint deliberately returns null
  * so the existing primary-episode policy remains the fallback.
  */
+internal fun detailPreferredEpisodeForAdmission(hint: PreferredEpisode?, admission: com.vortx.android.home.ContinueWatchingAdmission?): PreferredEpisode? =
+    hint.takeIf { admission?.isCurrent() != false }
+
 internal fun detailEpisodeTargetForRoute(
     videos: List<Episode>,
     preferredEpisode: PreferredEpisode?,
