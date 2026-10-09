@@ -99,8 +99,8 @@ ok "all actual direct Apple build and artifact-gate helpers have executable Git 
 # Execute only the real MPV selection prefix, stopping before its first network/download command.
 # This proves the reviewed default works with empty push/dispatch inputs, overrides are atomic,
 # and the retired digest remains rejected independently of the new EXPECTED digest.
-readonly REVIEWED_MPV_SHA='ccccc9a3faa84276bf10625d652dd4c9eea04c6a0abdc8e26cb1b35f147514fb'
-readonly REVIEWED_MPV_URL='https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-2/mpvkit-dvfel-artifacts-ffmpeg9-20261008.zip'
+readonly REVIEWED_MPV_SHA='737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1'
+readonly REVIEWED_MPV_URL='https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip'
 readonly LEGACY_MPV_SHA='6b22848743a9744dc4d61edadf6ae82eac583ea6802e2d154f4a6fbc9aa03fc1'
 mpv_selection="$(awk '
     /name: Fetch the MPVKit-DVFEL artifacts \(pinned, sha256-verified\)/ { step=1; next }
