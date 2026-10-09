@@ -186,7 +186,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: 7e3e68be5bf2b11c65d158c1823be94bd1608d1b
+          ref: 7b368f447a3dfc46bd68905acef19fa5c136240d
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -195,7 +195,7 @@ jobs:
         run: |
           set -euo pipefail
           NATIVE_REVISION="$(git -C _vortx_core_src rev-parse HEAD)"
-          [ "$NATIVE_REVISION" = 7e3e68be5bf2b11c65d158c1823be94bd1608d1b ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
+          [ "$NATIVE_REVISION" = 7b368f447a3dfc46bd68905acef19fa5c136240d ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
           echo "VORTX_ENGINE_SOURCE_REVISION=$NATIVE_REVISION" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
@@ -403,7 +403,7 @@ jobs:
           path: |
             app/Vendor/VortxEngine.xcframework
             app/Vendor/engine-prelocalize/VortxEngine
-          key: vortx-ffi-resource-host-v1-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh', 'scripts/verify-native-engine-abi.sh') }}
+          key: vortx-ffi-resource-host-v1-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/.cargo/**', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh', 'scripts/verify-native-engine-abi.sh') }}
 
       - name: Build the vortx-ffi xcframework
         if: steps.cache-ffi-xcframework.outputs.cache-hit != 'true'

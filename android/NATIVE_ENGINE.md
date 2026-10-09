@@ -52,7 +52,7 @@ fresh staged bytes after the same pinned strip normalization. The verifier's
 default two-engine mode remains a comparison contract, not the native workflow gate.
 
 Both Android workflows now pin `VortXTV/vortx-core` to
-`7e3e68be5bf2b11c65d158c1823be94bd1608d1b`. They also
+`7b368f447a3dfc46bd68905acef19fa5c136240d` for future builds. They also
 retain a `VortXTV/stremiox-core` checkout at
 `31c66611822043e089f5819ad232a5df93975873` for comparison/tooling; checkout presence
 does not mean it is built or packaged in native variants. These exact source pins
@@ -61,6 +61,11 @@ latest host's complete native server capability contract is in a freshly built,
 signed Android artifact. Compatible real SDK slices, successful CI/artifact
 readback, signing and device/runtime gates must be evidenced separately; older or
 missing capabilities fail explicitly rather than selecting the legacy engine.
+This pin has independently accepted Linux/macOS source CI (run `37907843106`);
+this is not an Android SDK, APK/AAB or device receipt. The immutable
+`v0.5.0-beta.1` source remains at `844782d29a93ae51991bfadc639d50bc3619d40b`
+with its original `7e3e68be5bf2b11c65d158c1823be94bd1608d1b` engine pin.
+No existing tag, release draft or artifact is replaced by this future-only update.
 
 `VortXSyncManager` now activates `NativeAccountCoordinator` after its captured
 account lease has authenticated/decrypted a successful backup response. Scope is
