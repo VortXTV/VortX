@@ -518,6 +518,8 @@ object VortXSyncDoc {
         minResolution = if (p.has("minResolution")) p.optInt("minResolution") else null,
         hideUnknownResolution = if (p.has("hideUnknownResolution")) p.optBoolean("hideUnknownResolution") else null,
         preferredAudioOnly = if (p.has("preferredAudioOnly")) p.optBoolean("preferredAudioOnly") else null,
+        matchConfidenceThreshold = if (p.has("matchConfidenceThreshold") && !p.isNull("matchConfidenceThreshold"))
+            p.optInt("matchConfidenceThreshold").coerceIn(0, 100) else null,
     )
 
     // ---- Write: local-state -> doc.vortx ----
@@ -654,6 +656,7 @@ object VortXSyncDoc {
         pb.minResolution?.let { put("minResolution", it) }
         pb.hideUnknownResolution?.let { put("hideUnknownResolution", it) }
         pb.preferredAudioOnly?.let { put("preferredAudioOnly", it) }
+        pb.matchConfidenceThreshold?.let { put("matchConfidenceThreshold", it.coerceIn(0, 100)) }
     }
 
     /** One overlay library item, byte-parity with Apple `vortxSummary`'s byProfile library map (t/d in SECONDS). */

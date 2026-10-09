@@ -8,6 +8,7 @@ import com.vortx.android.sources.ResolvedPin
 import com.vortx.android.sources.ProviderHealth
 import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourcePrefsSnapshot
+import com.vortx.android.sources.SourceMatchContext
 import com.vortx.android.torbox.TorBoxSearchSource
 import com.vortx.android.communityjs.CommunityJsProviderSource
 import kotlinx.coroutines.CoroutineScope
@@ -90,6 +91,7 @@ class SourceListModel(
         val sticky: SeriesSourceSticky.Preference? = null,
         val unhealthyAddons: Set<String> = emptySet(),
         val prefs: SourcePrefsSnapshot = SourcePrefsSnapshot.DEFAULT,
+        val matchContext: SourceMatchContext? = null,
         val directLinksOnly: Boolean = false, // drop unresolved raw torrents, preserve resolved direct links
         val disabledAddons: Set<String> = emptySet(), // per-profile disabled add-on labels
         val contentId: String? = null, // canonical auxiliary target id + Singularity HOARD seed
@@ -256,6 +258,7 @@ class SourceListModel(
         ctx.sticky?.bingeGroup,
         ctx.unhealthyAddons.sorted().joinToString(","),
         ctx.prefs.cacheTag,
+        ctx.matchContext?.fingerprint,
         ctx.directLinksOnly,
         ctx.disabledAddons.sorted().joinToString(","),
         ctx.contentId,
@@ -333,11 +336,11 @@ class SourceListModel(
 
             assembled = directLinkDisplayGroups(assembled, ctx.directLinksOnly)
 
-            // Install the frozen snapshot so tiers()/resolutionOptions() (which read the installed reading) and
-            // the explicit-prefs rankedGroups()/best() all rank against the SAME frozen copy, never a live
-            // store, mirroring Apple's task-local prefs binding.
-            StreamRanking.installReading(ctx.prefs)
-            val ranked = StreamRanking.rankedGroups(assembled, prefs = ctx.prefs, pin = ctx.pin)
+            // Request title evidence and preferences stay local to this assembly. Another detail's
+            // background rebuild cannot substitute its title or active-profile preferences here.
+            val ranked = StreamRanking.rankedGroups(
+                assembled, prefs = ctx.prefs, pin = ctx.pin, matchContext = ctx.matchContext,
+            )
             val best = StreamRanking.best(
                 ranked,
                 continuity = ctx.continuity,
@@ -346,9 +349,10 @@ class SourceListModel(
                 sticky = ctx.sticky,
                 providerPenalty = { addon -> addon.trim().lowercase() in ctx.unhealthyAddons },
                 prefs = ctx.prefs,
+                matchContext = ctx.matchContext,
             )
             val tiers = StreamRanking.tiers(ranked)
-            val resolutionOptions = StreamRanking.resolutionOptions(ranked)
+            val resolutionOptions = StreamRanking.resolutionOptions(ranked, prefs = ctx.prefs)
             return SourceListState(
                 groups = ranked,
                 best = best,

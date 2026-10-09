@@ -546,8 +546,27 @@ internal object EngineState {
             watchedVideoIds = parseWatchedVideoIds(root),
             trailerYouTubeId = parseTrailerYouTubeId(metaObj),
             relations = parseRelations(metaObj),
+            titleAliases = parseTitleAliases(metaObj),
         )
     }
+
+    private fun parseTitleAliases(meta: JSONObject): List<String> = buildList {
+        for (key in listOf("originalTitle", "originalName", "original_title", "original_name")) {
+            meta.optStringOrNull(key)?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it.take(2048)) }
+        }
+        for (key in listOf("aliases", "alternativeTitles")) {
+            val values = meta.optJSONArray(key) ?: continue
+            for (index in 0 until minOf(values.length(), 16)) {
+                val value = values.opt(index)
+                val title = when (value) {
+                    is String -> value
+                    is JSONObject -> value.optStringOrNull("title") ?: value.optStringOrNull("name")
+                    else -> null
+                }
+                title?.trim()?.takeIf { it.isNotEmpty() }?.let { add(it.take(2048)) }
+            }
+        }
+    }.distinct().take(16)
 
     private fun parseRelations(meta: JSONObject): List<MediaRelation> {
         val links = meta.optJSONArray("links") ?: return emptyList()

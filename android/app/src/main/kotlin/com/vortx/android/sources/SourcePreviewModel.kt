@@ -33,6 +33,7 @@ class SourcePreviewModel(
     private val debounceMs: Long = DEBOUNCE_MS,
     private val topN: Int = TOP_N,
     private val computeDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val matchContext: SourceMatchContext? = null,
 ) {
     /** One preview row: the parsed quality label, the pick reason badges, and whether it is the auto-pick. */
     data class Row(
@@ -99,8 +100,11 @@ class SourcePreviewModel(
         val groups = sample
         val inputCount = groups.sumOf { it.streams.size }
         val (computedRows, keptCount) = withContext(computeDispatcher) {
-            val ranked = StreamRanking.rankedGroups(groups, prefs = snapshot)
-            val best = StreamRanking.best(groups, prefs = snapshot)
+            val requestContext = matchContext ?: if (groups == fixtureGroups()) {
+                SourceMatchContext.create("Movie", year = 2023)
+            } else null
+            val ranked = StreamRanking.rankedGroups(groups, prefs = snapshot, matchContext = requestContext)
+            val best = StreamRanking.best(groups, prefs = snapshot, matchContext = requestContext)
             val bestId = best?.id
             // Match Apple's kept set: playable, non-trailer survivors of the filters. Android has no
             // pre-resolved playable URL for a raw torrent (it resolves at play time), so a URL is not

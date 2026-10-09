@@ -535,6 +535,7 @@ class ProfileStore private constructor(context: Context) {
             preferKeywords = prefs.getString(SourcePreferencesStore.PREFER_KEY, ""),
             avoidBehavior = prefs.getString(SourcePreferencesStore.AVOID_BEHAVIOR_KEY, "hide"),
             autoPickBest = prefs.getBoolean(SourcePreferencesStore.AUTO_PICK_BEST_KEY, false),
+            matchConfidenceThreshold = prefs.getInt(SourcePreferencesStore.MATCH_CONFIDENCE_KEY, 0).coerceIn(0, 100),
         )
     }
 
@@ -585,6 +586,8 @@ class ProfileStore private constructor(context: Context) {
         applyString(e, SourcePreferencesStore.PREFER_KEY, p?.preferKeywords, "", resetUnset)
         applyString(e, SourcePreferencesStore.AVOID_BEHAVIOR_KEY, p?.avoidBehavior, "hide", resetUnset)
         applyBool(e, SourcePreferencesStore.AUTO_PICK_BEST_KEY, p?.autoPickBest, false, resetUnset)
+        // A profile switch defaults an older roster to Off; partial sync folds retain the current value.
+        SourcePreferencesStore.applyProfileMatchConfidence(e, p?.matchConfidenceThreshold, resetUnset)
         // ---- Track languages + forced policy (audit 09 A-19): the flat keys the player's track
         // auto-selection reads. Apple's roster stores ONE code per field; Android's flat keys store
         // comma-joined lists, so a profile code writes as a one-element list. Same reset contract as the

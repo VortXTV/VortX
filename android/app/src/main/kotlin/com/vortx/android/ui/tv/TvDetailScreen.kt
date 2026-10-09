@@ -505,6 +505,7 @@ private fun TvDetailContent(
                     onSortChange = viewModel::setSourceSort,
                     audioLanguageHint = sourceAudioLanguageHint,
                     onAudioLanguageHintChange = viewModel::setSourceAudioLanguageHint,
+                    onSourceVariantOptions = viewModel::sourceVariantOptions,
                     pin = pinUi,
                     entryNoun = viewModel.pinEntryNoun,
                     onPlay = { source -> beginPlayback { viewModel.play(source) } },
