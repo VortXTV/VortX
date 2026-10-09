@@ -3,6 +3,7 @@ require 'tmpdir'
 require 'yaml'
 require 'fileutils'
 require 'open3'
+require 'json'
 
 root = File.expand_path('..', __dir__)
 app = File.join(root, 'app')
@@ -10,7 +11,28 @@ generator = File.join(__dir__, 'generate-native-apple-project.rb')
 revision = 'ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4'
 output = File.join(app, ".native-project-contract-#{Process.pid}.yml")
 legacy_bytes = File.binread(File.join(app, 'project.yml'))
+legacy_spec = YAML.safe_load(legacy_bytes, permitted_classes: [], permitted_symbols: [], aliases: false)
+native_names = %w[VortXiOSNative VortXMac VortXTV VortXTVLite]
+base_plists = native_names.to_h do |name|
+  relative = legacy_spec.dig('targets', name, 'settings', 'base', 'INFOPLIST_FILE')
+  [name, { path: relative, bytes: File.binread(File.join(app, relative)) }]
+end
+generated_plists = []
 begin
+  %w[..yml ...yml].each do |filename|
+    rejected_output = File.join(app, filename)
+    rejected_directory = File.expand_path(File.join(app, 'build', 'native-info', File.basename(filename, '.yml')))
+    protected_paths = [rejected_output] + native_names.map { |name| File.join(rejected_directory, "#{name}.plist") }
+    original_bytes = protected_paths.to_h { |path| [path, File.exist?(path) ? File.binread(path) : nil] }
+    _, rejection_error, rejection_status = Open3.capture3('ruby', generator, '--engine-revision', revision,
+      '--mpvkit', File.join(app, 'Vendor', 'MPVKit-DVFEL'), '--output', rejected_output)
+    abort "collapsed #{filename} output was accepted" if rejection_status.success?
+    abort "collapsed #{filename} output did not fail before generation" unless rejection_error.include?('non-collapsed directory name')
+    protected_paths.each do |path|
+      actual_bytes = File.exist?(path) ? File.binread(path) : nil
+      abort "rejected #{filename} output modified #{path}" unless actual_bytes == original_bytes.fetch(path)
+    end
+  end
   # The generator exercises the actual local manifest; it does not load ignored binary inputs.
   stdout, stderr, status = Open3.capture3('ruby', generator, '--engine-revision', revision,
     '--mpvkit', File.join(app, 'Vendor', 'MPVKit-DVFEL'), '--output', output)
@@ -36,6 +58,29 @@ begin
     abort "#{name} retained legacy framework" if target.fetch('dependencies').any? { |d| d.fetch('framework', '').match?(/StremioXCore|NodeMobile/) }
     abort "#{name} retained Node resources" if target.fetch('sources').any? { |s| (s.is_a?(Hash) ? s['path'] : s).match?(/server\.js|node-darwin/) }
     abort "#{name} provenance is absent" unless settings['INFOPLIST_KEY_VortXEngineSourceRevision'] == revision
+    generated_path = settings.fetch('INFOPLIST_FILE')
+    abort "#{name} still uses its provenance-free legacy plist" if generated_path == base_plists.fetch(name).fetch(:path)
+    expected_path = File.join('build', 'native-info', File.basename(output, '.yml'), "#{name}.plist")
+    abort "#{name} generated plist escaped its spec-owned directory" unless generated_path == expected_path
+    full_path = File.join(app, generated_path)
+    generated_plists << full_path
+    plist_json, plist_error, plist_status = Open3.capture3('/usr/bin/plutil', '-convert', 'json', '-o', '-', full_path)
+    abort "#{name} generated plist is invalid: #{plist_error}" unless plist_status.success?
+    plist = JSON.parse(plist_json)
+    expected_provenance = {
+      'VortXNativeDataEngine' => true,
+      'VortXNativeResourceHost' => true,
+      'VortXEngineSourceRevision' => revision,
+      'VortXNativeTransport' => name == 'VortXMac' ? 'daemon' : (name == 'VortXTVLite' ? 'none' : 'in-process')
+    }
+    expected_provenance.each do |key, value|
+      abort "#{name} emitted wrong native plist value/type for #{key}" unless plist.fetch(key, nil) == value
+    end
+    base_json, base_error, base_status = Open3.capture3('/usr/bin/plutil', '-convert', 'json', '-o', '-',
+      File.join(app, base_plists.fetch(name).fetch(:path)))
+    abort "#{name} base plist is invalid: #{base_error}" unless base_status.success?
+    abort "#{name} generated plist lost retained base properties" unless plist == JSON.parse(base_json).merge(expected_provenance)
+    abort "#{name} base plist was modified" unless File.binread(File.join(app, base_plists.fetch(name).fetch(:path))) == base_plists.fetch(name).fetch(:bytes)
     abort "#{name} omitted linker map" unless settings['LD_GENERATE_MAP_FILE']
   end
   abort 'Lite lost its transport boundary' unless spec.dig('targets', 'VortXTVLite', 'settings', 'base', 'SWIFT_ACTIVE_COMPILATION_CONDITIONS').split.include?('VORTX_NO_EMBEDDED_SERVER')
@@ -64,7 +109,10 @@ begin
   abort 'native workflow accepts old player provenance' unless workflow.include?('the old FFmpeg 8/GnuTLS package cannot supply a native release')
   abort 'release workflow lost the existing complete ABI gate' unless workflow.include?('./scripts/verify-native-engine-abi.sh apple app/Vendor/VortxEngine.xcframework resource-host')
   abort 'release workflow lost the existing aggregate artifact gate' unless workflow.include?('./scripts/verify-apple-engine-artifacts.sh')
-  puts 'PASS: native Apple project selection, dependency/resource removal, floors and required Mac server'
+  puts 'PASS: native Apple project selection, rejected collapsed output paths, four actual provenance plists, retained base properties, dependency/resource removal, floors and required Mac server'
 ensure
   FileUtils.rm_f(output)
+  generated_plists.each { |path| FileUtils.rm_f(path) }
+  generated_dir = File.join(app, 'build', 'native-info', File.basename(output, '.yml'))
+  Dir.rmdir(generated_dir) if Dir.exist?(generated_dir) && Dir.empty?(generated_dir)
 end
