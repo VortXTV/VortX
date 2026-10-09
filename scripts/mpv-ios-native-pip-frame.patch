@@ -1,0 +1,1441 @@
+diff --git a/include/mpv/vortx_apple_frame.h b/include/mpv/vortx_apple_frame.h
+new file mode 100644
+--- /dev/null
++++ b/include/mpv/vortx_apple_frame.h
+@@ -0,0 +1,96 @@
++/* VortX native-frame ABI v1. SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef MPV_VORTX_APPLE_FRAME_H
++#define MPV_VORTX_APPLE_FRAME_H
++#include <stdbool.h>
++#include <stdint.h>
++#include "client.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define MPV_VORTX_APPLE_FRAME_ABI 1
++typedef struct mpv_vortx_apple_frame_session mpv_vortx_apple_frame_session;
++
++enum mpv_vortx_apple_frame_reason {
++    MPV_VORTX_FRAME_READY = 0,
++    MPV_VORTX_FRAME_NO_SOURCE,
++    MPV_VORTX_FRAME_STALE_OWNER,
++    MPV_VORTX_FRAME_NOT_VIDEOTOOLBOX,
++    MPV_VORTX_FRAME_DOLBY_VISION,
++    MPV_VORTX_FRAME_TRANSFORM_REQUIRED,
++    MPV_VORTX_FRAME_CAPTIONS_REQUIRED,
++    MPV_VORTX_FRAME_UNSUPPORTED_COLOR,
++    MPV_VORTX_FRAME_UNSUPPORTED_TIMING,
++    MPV_VORTX_FRAME_GPU_BUSY,
++    MPV_VORTX_FRAME_CLOSED,
++};
++
++struct mpv_vortx_apple_frame {
++    uint32_t abi_version;
++    uint32_t reason;
++    uint64_t subscription;
++    uint64_t owner;
++    uint64_t file_epoch;
++    uint64_t timeline_epoch;
++    uint64_t frame_id;
++    uint64_t lease;
++    /* CVPixelBufferRef, immutable. Valid until release_frame(session, lease).
++     * Callback may create a CMSampleBuffer retaining it, but must then release
++     * this lease promptly. At most TWO native leases may be outstanding. */
++    void *pixel_buffer;
++    double media_pts;
++    double media_duration;
++    double media_rate; // actual scheduled source-seconds / host-second
++    /* Two DIFFERENT clocks: source seconds above, raw mach host ns below.
++     * A zero host deadline means a paused/redraw sample, never a clock reset. */
++    uint64_t host_deadline_ns;
++    uint64_t host_observed_ns;
++    bool paused;
++};
++
++/* Invoked outside every client/VO/transport lock. It must not call libmpv or
++ * synchronously dispatch to its UI. Copy/enqueue bounded work only. An already
++ * admitted callback may finish after detach: validate its lease again before
++ * consuming it. Receiver context is retained until that callback returns. */
++typedef void (*mpv_vortx_apple_frame_callback)(void *context,
++    mpv_vortx_apple_frame_session *session,
++    const struct mpv_vortx_apple_frame *frame);
++typedef void (*mpv_vortx_apple_frame_destroy)(void *context);
++
++/* Session references are independent of mpv_handle lifetime. Keep a reference
++ * while calling ANY session operation, including duplicate/stale releases.
++ * These operations never call libmpv, submit GPU work, or await a UI thread. */
++MPV_EXPORT void mpv_vortx_apple_frame_retain(mpv_vortx_apple_frame_session *s);
++MPV_EXPORT void mpv_vortx_apple_frame_release(mpv_vortx_apple_frame_session *s);
++MPV_EXPORT void mpv_vortx_apple_frame_detach(mpv_vortx_apple_frame_session *s,
++                                          uint64_t subscription);
++MPV_EXPORT bool mpv_vortx_apple_frame_is_current(mpv_vortx_apple_frame_session *s,
++                                              uint64_t lease);
++MPV_EXPORT void mpv_vortx_apple_frame_release_frame(mpv_vortx_apple_frame_session *s,
++                                                uint64_t lease);
++/* Subscribe only after the application's matching FILE_LOADED admission.
++ * Returns an owned session reference and a nonzero subscription on success.
++ * No frame callback may synchronously enter libmpv, including destruction. */
++MPV_EXPORT int mpv_vortx_apple_frame_subscribe(mpv_handle *mpv, uint64_t owner,
++    mpv_vortx_apple_frame_callback callback, mpv_vortx_apple_frame_destroy destroy,
++    void *context, mpv_vortx_apple_frame_session **session, uint64_t *subscription);
++/* Supply actual app lifecycle authority before initialize, and before asking
++ * to recreate GPU presentation. Serialized with core/VO transitions, including
++ * fresh VO initialization; permission alone never creates GPU state. For PiP,
++ * revoke only after a successful foreground headless acknowledgement. The host
++ * must finish this lifecycle barrier before returning from willResignActive;
++ * it is not permission to drain or destroy a GPU after entering background. */
++MPV_EXPORT void mpv_vortx_apple_frame_set_foreground(mpv_handle *mpv, bool foreground);
++/* Synchronous native acknowledgement. Run off the UI thread while foreground.
++ * Positive reason means refusal; zero confirms the requested transition.
++ * Detach cancels the owner, including a request still waiting for GPU drain.
++ * On canceled retirement resources can already be retired: restore explicitly
++ * on foreground, never infer that cancellation permits background GPU work. */
++MPV_EXPORT int mpv_vortx_apple_frame_set_headless(mpv_handle *mpv,
++    mpv_vortx_apple_frame_session *session, uint64_t subscription, bool headless);
++MPV_EXPORT int mpv_vortx_apple_frame_reason(mpv_vortx_apple_frame_session *session);
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/video/out/vortx_apple_frame.h b/video/out/vortx_apple_frame.h
+new file mode 100644
+--- /dev/null
++++ b/video/out/vortx_apple_frame.h
+@@ -0,0 +1,65 @@
++/* Internal native-frame transport. SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef VORTX_APPLE_FRAME_INTERNAL_H
++#define VORTX_APPLE_FRAME_INTERNAL_H
++#include <pthread.h>
++#include <time.h>
++#include "mpv/vortx_apple_frame.h"
++
++struct vortx_frame_stamp {
++    uint64_t file_epoch, timeline_epoch;
++};
++struct vortx_frame_buffer {
++    void *value;
++    void (*retain)(void *);
++    void (*release)(void *);
++};
++/* A separate decoder-thread gate: close FIRST, await admitted allocation
++ * calls, inspect outstanding buffers, then drain GPU on the VO thread.
++ * Never hold this mutex while GPU work or callbacks execute. */
++struct vortx_gpu_gate {
++    pthread_mutex_t lock;
++    pthread_cond_t idle;
++    unsigned in_flight;
++    bool closed;
++    uint64_t generation;
++};
++void vortx_gpu_gate_init(struct vortx_gpu_gate *g);
++void vortx_gpu_gate_destroy(struct vortx_gpu_gate *g);
++bool vortx_gpu_gate_enter(struct vortx_gpu_gate *g);
++void vortx_gpu_gate_leave(struct vortx_gpu_gate *g);
++/* Timeout leaves the gate closed; caller must explicitly restore foreground
++ * admission or continue retiring the request. It is never a drain receipt. */
++bool vortx_gpu_gate_close(struct vortx_gpu_gate *g, const struct timespec *deadline);
++void vortx_gpu_gate_reopen(struct vortx_gpu_gate *g);
++
++mpv_vortx_apple_frame_session *vortx_frame_create(void);
++/* Retires callbacks/epochs, but does NOT resume a suspended GPU. */
++void vortx_frame_close(mpv_vortx_apple_frame_session *s);
++/* Successful subscribe owns context; failed subscribe does not. */
++uint64_t vortx_frame_subscribe(mpv_vortx_apple_frame_session *s, uint64_t owner,
++    mpv_vortx_apple_frame_callback callback,
++    mpv_vortx_apple_frame_destroy destroy, void *context);
++bool vortx_frame_owner_current(mpv_vortx_apple_frame_session *s, uint64_t cookie);
++bool vortx_frame_subscribed(mpv_vortx_apple_frame_session *s);
++void vortx_frame_source(mpv_vortx_apple_frame_session *s, bool loaded);
++void vortx_frame_reset(mpv_vortx_apple_frame_session *s, uint64_t frame_cutoff);
++struct vortx_frame_stamp vortx_frame_stamp(mpv_vortx_apple_frame_session *s);
++void vortx_frame_set_foreground(mpv_vortx_apple_frame_session *s, bool foreground);
++bool vortx_frame_gpu_allowed(mpv_vortx_apple_frame_session *s);
++void vortx_frame_report(mpv_vortx_apple_frame_session *s, int reason);
++bool vortx_frame_host_deadline(uint64_t raw, int64_t local_now,
++    int64_t scheduled, bool paused, uint64_t *deadline);
++struct vortx_frame_mode_request {
++    mpv_vortx_apple_frame_session *session;
++    uint64_t subscription;
++    bool headless;
++    bool captions_required;
++    int reason;
++};
++/* Caller still owns buffer. No retain if publication is denied. Source stamp
++ * must have been attached when the core queued this frame, not at callback. */
++bool vortx_frame_publish(mpv_vortx_apple_frame_session *s,
++    struct vortx_frame_stamp stamp, uint64_t frame_id,
++    struct vortx_frame_buffer buffer, double media_pts, double media_duration, double media_rate,
++    uint64_t host_deadline_ns, uint64_t host_observed_ns, bool paused);
++#endif
+diff --git a/video/out/vortx_apple_frame.c b/video/out/vortx_apple_frame.c
+new file mode 100644
+--- /dev/null
++++ b/video/out/vortx_apple_frame.c
+@@ -0,0 +1,414 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#include <assert.h>
++#include <errno.h>
++#include <math.h>
++#include <stdatomic.h>
++#include <stdlib.h>
++#include "vortx_apple_frame.h"
++
++struct vortx_frame_receiver {
++    atomic_uint refs;
++    /* Written once before publication, immutable thereafter. */
++    uint64_t subscription;
++    uint64_t owner;
++    mpv_vortx_apple_frame_callback callback;
++    mpv_vortx_apple_frame_destroy destroy;
++    void *context;
++};
++struct vortx_frame_slot {
++    uint64_t lease, subscription, file_epoch, timeline_epoch;
++    struct vortx_frame_buffer buffer;
++};
++struct mpv_vortx_apple_frame_session {
++    atomic_uint refs;
++    pthread_mutex_t lock;
++    struct vortx_frame_receiver *receiver;
++    struct vortx_frame_slot slots[2];
++    uint64_t next_subscription, next_lease;
++    uint64_t file_epoch, timeline_epoch, cutoff, last_frame;
++    bool loaded, closed;
++    bool foreground;
++    int reason;
++};
++
++static void receiver_release(struct vortx_frame_receiver *r)
++{
++    if (r && atomic_fetch_sub_explicit(&r->refs, 1, memory_order_acq_rel) == 1) {
++        if (r->destroy)
++            r->destroy(r->context);
++        free(r);
++    }
++}
++
++mpv_vortx_apple_frame_session *vortx_frame_create(void)
++{
++    mpv_vortx_apple_frame_session *s = calloc(1, sizeof(*s));
++    if (!s)
++        return NULL;
++    atomic_init(&s->refs, 1);
++    pthread_mutex_init(&s->lock, NULL);
++    s->file_epoch = s->timeline_epoch = 1;
++    s->foreground = true;
++    s->reason = MPV_VORTX_FRAME_NO_SOURCE;
++    return s;
++}
++
++void mpv_vortx_apple_frame_retain(mpv_vortx_apple_frame_session *s)
++{
++    atomic_fetch_add_explicit(&s->refs, 1, memory_order_relaxed);
++}
++
++void mpv_vortx_apple_frame_release(mpv_vortx_apple_frame_session *s)
++{
++    if (!s || atomic_fetch_sub_explicit(&s->refs, 1, memory_order_acq_rel) != 1)
++        return;
++    /* Each outstanding lease owns a session reference, so none remain. */
++    assert(!s->slots[0].lease && !s->slots[1].lease);
++    receiver_release(s->receiver);
++    pthread_mutex_destroy(&s->lock);
++    free(s);
++}
++
++uint64_t vortx_frame_subscribe(mpv_vortx_apple_frame_session *s, uint64_t owner,
++    mpv_vortx_apple_frame_callback callback,
++    mpv_vortx_apple_frame_destroy destroy, void *context)
++{
++    if (!s || !owner || !callback)
++        return 0;
++    pthread_mutex_lock(&s->lock);
++    if (s->closed || !s->loaded || s->next_subscription == UINT64_MAX) {
++        pthread_mutex_unlock(&s->lock);
++        return 0;
++    }
++    uint64_t cookie = ++s->next_subscription;
++    struct vortx_frame_receiver *r = malloc(sizeof(*r));
++    if (!r) {
++        pthread_mutex_unlock(&s->lock);
++        return 0;
++    }
++    *r = (struct vortx_frame_receiver){
++        .subscription = cookie, .owner = owner,
++        .callback = callback, .destroy = destroy, .context = context,
++    };
++    atomic_init(&r->refs, 1);
++    struct vortx_frame_receiver *old = s->receiver;
++    s->receiver = r;
++    s->last_frame = 0;
++    pthread_mutex_unlock(&s->lock);
++    receiver_release(old);
++    return cookie;
++}
++
++void mpv_vortx_apple_frame_detach(mpv_vortx_apple_frame_session *s, uint64_t cookie)
++{
++    if (!s || !cookie)
++        return;
++    struct vortx_frame_receiver *old = NULL;
++    pthread_mutex_lock(&s->lock);
++    if (s->receiver && s->receiver->subscription == cookie) {
++        old = s->receiver;
++        s->receiver = NULL;
++    }
++    pthread_mutex_unlock(&s->lock);
++    receiver_release(old);
++}
++
++bool vortx_frame_owner_current(mpv_vortx_apple_frame_session *s, uint64_t cookie)
++{
++    if (!s)
++        return false;
++    pthread_mutex_lock(&s->lock);
++    bool current = !s->closed && s->loaded && s->receiver &&
++                   s->receiver->subscription == cookie;
++    pthread_mutex_unlock(&s->lock);
++    return current;
++}
++
++bool vortx_frame_subscribed(mpv_vortx_apple_frame_session *s)
++{
++    if (!s)
++        return false;
++    pthread_mutex_lock(&s->lock);
++    bool subscribed = !s->closed && s->loaded && s->receiver;
++    pthread_mutex_unlock(&s->lock);
++    return subscribed;
++}
++
++void vortx_frame_close(mpv_vortx_apple_frame_session *s)
++{
++    if (!s)
++        return;
++    pthread_mutex_lock(&s->lock);
++    s->closed = true;
++    s->loaded = false;
++    s->foreground = false;
++    s->reason = MPV_VORTX_FRAME_CLOSED;
++    struct vortx_frame_receiver *old = s->receiver;
++    s->receiver = NULL;
++    pthread_mutex_unlock(&s->lock);
++    receiver_release(old);
++}
++
++void vortx_frame_source(mpv_vortx_apple_frame_session *s, bool loaded)
++{
++    if (!s)
++        return;
++    struct vortx_frame_receiver *old = NULL;
++    pthread_mutex_lock(&s->lock);
++    if (!loaded) {
++        /* START/END invalidation is native and cannot be undone by reusing a
++         * host owner number, even for an A -> B -> A transition. */
++        if (s->file_epoch == UINT64_MAX) {
++            s->closed = true;
++        } else {
++            s->file_epoch++;
++        }
++        s->timeline_epoch = 1;
++        s->cutoff = s->last_frame = 0;
++        old = s->receiver;
++        s->receiver = NULL;
++    }
++    s->loaded = loaded && !s->closed;
++    s->reason = MPV_VORTX_FRAME_NO_SOURCE;
++    pthread_mutex_unlock(&s->lock);
++    receiver_release(old);
++}
++
++void vortx_frame_set_foreground(mpv_vortx_apple_frame_session *s, bool foreground)
++{
++    if (!s)
++        return;
++    pthread_mutex_lock(&s->lock);
++    s->foreground = foreground && !s->closed;
++    pthread_mutex_unlock(&s->lock);
++}
++
++bool vortx_frame_gpu_allowed(mpv_vortx_apple_frame_session *s)
++{
++    /* Allocation failure disables the new feature, not ordinary MPV. */
++    if (!s)
++        return true;
++    pthread_mutex_lock(&s->lock);
++    bool allowed = s->foreground && !s->closed;
++    pthread_mutex_unlock(&s->lock);
++    return allowed;
++}
++
++void vortx_frame_report(mpv_vortx_apple_frame_session *s, int reason)
++{
++    if (!s)
++        return;
++    pthread_mutex_lock(&s->lock);
++    if (!s->closed)
++        s->reason = reason;
++    pthread_mutex_unlock(&s->lock);
++}
++
++int mpv_vortx_apple_frame_reason(mpv_vortx_apple_frame_session *s)
++{
++    if (!s)
++        return MPV_VORTX_FRAME_NO_SOURCE;
++    pthread_mutex_lock(&s->lock);
++    int reason = s->reason;
++    pthread_mutex_unlock(&s->lock);
++    return reason;
++}
++
++bool vortx_frame_host_deadline(uint64_t raw, int64_t local_now,
++    int64_t scheduled, bool paused, uint64_t *deadline)
++{
++    if (!deadline || !raw || local_now < 0 || (uint64_t)local_now > raw)
++        return false;
++    if (paused) {
++        *deadline = 0;
++        return true;
++    }
++    if (scheduled <= 0)
++        return false;
++    // local_now must be mp_time_ns_from_raw_time(raw): the SAME sample, not
++    // a second time read. This recovers the process offset without jitter.
++    uint64_t offset = raw - (uint64_t)local_now;
++    if ((uint64_t)scheduled > UINT64_MAX - offset)
++        return false;
++    *deadline = offset + (uint64_t)scheduled;
++    return true;
++}
++
++void vortx_frame_reset(mpv_vortx_apple_frame_session *s, uint64_t cutoff)
++{
++    if (!s)
++        return;
++    pthread_mutex_lock(&s->lock);
++    if (s->timeline_epoch == UINT64_MAX) {
++        s->closed = true;
++    } else {
++        s->timeline_epoch++;
++    }
++    s->cutoff = cutoff;
++    s->last_frame = 0;
++    pthread_mutex_unlock(&s->lock);
++}
++
++struct vortx_frame_stamp vortx_frame_stamp(mpv_vortx_apple_frame_session *s)
++{
++    if (!s)
++        return (struct vortx_frame_stamp){0};
++    pthread_mutex_lock(&s->lock);
++    struct vortx_frame_stamp stamp = {s->file_epoch, s->timeline_epoch};
++    pthread_mutex_unlock(&s->lock);
++    return stamp;
++}
++
++bool mpv_vortx_apple_frame_is_current(mpv_vortx_apple_frame_session *s, uint64_t lease)
++{
++    if (!s || !lease)
++        return false;
++    bool current = false;
++    pthread_mutex_lock(&s->lock);
++    for (int n = 0; n < 2; n++) {
++        const struct vortx_frame_slot *slot = &s->slots[n];
++        if (slot->lease == lease) {
++            current = !s->closed && s->loaded && s->receiver &&
++                slot->subscription == s->receiver->subscription &&
++                slot->file_epoch == s->file_epoch &&
++                slot->timeline_epoch == s->timeline_epoch;
++            break;
++        }
++    }
++    pthread_mutex_unlock(&s->lock);
++    return current;
++}
++
++void mpv_vortx_apple_frame_release_frame(mpv_vortx_apple_frame_session *s, uint64_t lease)
++{
++    if (!s || !lease)
++        return;
++    struct vortx_frame_buffer buffer = {0};
++    pthread_mutex_lock(&s->lock);
++    for (int n = 0; n < 2; n++) {
++        if (s->slots[n].lease == lease) {
++            buffer = s->slots[n].buffer;
++            s->slots[n] = (struct vortx_frame_slot){0};
++            break;
++        }
++    }
++    pthread_mutex_unlock(&s->lock);
++    if (buffer.value) {
++        buffer.release(buffer.value);
++        mpv_vortx_apple_frame_release(s);
++    }
++}
++
++bool vortx_frame_publish(mpv_vortx_apple_frame_session *s,
++    struct vortx_frame_stamp stamp, uint64_t frame_id,
++    struct vortx_frame_buffer buffer, double pts, double duration, double rate,
++    uint64_t deadline, uint64_t observed, bool paused)
++{
++    if (!s || !buffer.value || !buffer.retain || !buffer.release ||
++        !isfinite(pts) || pts < 0 || !isfinite(duration) || duration < 0 ||
++        !isfinite(rate) || rate <= 0 ||
++        (!paused && (!deadline || !observed)))
++        return false;
++    pthread_mutex_lock(&s->lock);
++    int index = !s->slots[0].lease ? 0 : !s->slots[1].lease ? 1 : -1;
++    struct vortx_frame_receiver *r = s->receiver;
++    if (s->closed || !s->loaded || !r || index < 0 ||
++        s->next_lease == UINT64_MAX || stamp.file_epoch != s->file_epoch ||
++        stamp.timeline_epoch != s->timeline_epoch || frame_id <= s->cutoff ||
++        frame_id <= s->last_frame)
++    {
++        pthread_mutex_unlock(&s->lock);
++        return false;
++    }
++    uint64_t lease = ++s->next_lease;
++    s->reason = MPV_VORTX_FRAME_READY;
++    s->last_frame = frame_id;
++    atomic_fetch_add_explicit(&r->refs, 1, memory_order_relaxed);
++    /* One reference for the outstanding lease, another for this callback. */
++    mpv_vortx_apple_frame_retain(s);
++    mpv_vortx_apple_frame_retain(s);
++    s->slots[index] = (struct vortx_frame_slot){
++        lease, r->subscription, stamp.file_epoch, stamp.timeline_epoch, buffer,
++    };
++    struct mpv_vortx_apple_frame packet = {
++        .abi_version = MPV_VORTX_APPLE_FRAME_ABI,
++        .reason = MPV_VORTX_FRAME_READY, .subscription = r->subscription,
++        .owner = r->owner, .file_epoch = stamp.file_epoch,
++        .timeline_epoch = stamp.timeline_epoch, .frame_id = frame_id,
++        .lease = lease, .pixel_buffer = buffer.value,
++        .media_pts = pts, .media_duration = duration, .media_rate = rate,
++        .host_deadline_ns = deadline, .host_observed_ns = observed, .paused = paused,
++    };
++    pthread_mutex_unlock(&s->lock);
++    /* The VO still owns the input until publish returns. Retain and release
++     * callbacks, like receiver callbacks, must run outside transport locks. */
++    buffer.retain(buffer.value);
++    r->callback(r->context, s, &packet);
++    receiver_release(r);
++    mpv_vortx_apple_frame_release(s);
++    return true;
++}
++
++void vortx_gpu_gate_init(struct vortx_gpu_gate *g)
++{
++    *g = (struct vortx_gpu_gate){0};
++    pthread_mutex_init(&g->lock, NULL);
++    pthread_cond_init(&g->idle, NULL);
++}
++void vortx_gpu_gate_destroy(struct vortx_gpu_gate *g)
++{
++    assert(!g->in_flight);
++    pthread_cond_destroy(&g->idle);
++    pthread_mutex_destroy(&g->lock);
++}
++bool vortx_gpu_gate_enter(struct vortx_gpu_gate *g)
++{
++    pthread_mutex_lock(&g->lock);
++    bool allowed = !g->closed;
++    if (allowed)
++        g->in_flight++;
++    pthread_mutex_unlock(&g->lock);
++    return allowed;
++}
++void vortx_gpu_gate_leave(struct vortx_gpu_gate *g)
++{
++    pthread_mutex_lock(&g->lock);
++    assert(g->in_flight > 0);
++    if (!--g->in_flight)
++        pthread_cond_broadcast(&g->idle);
++    pthread_mutex_unlock(&g->lock);
++}
++bool vortx_gpu_gate_close(struct vortx_gpu_gate *g, const struct timespec *deadline)
++{
++    pthread_mutex_lock(&g->lock);
++    g->closed = true;
++    if (g->generation == UINT64_MAX) {
++        pthread_mutex_unlock(&g->lock);
++        return false;
++    }
++    uint64_t generation = ++g->generation;
++    pthread_cond_broadcast(&g->idle);
++    while (g->in_flight) {
++        if (!g->closed || g->generation != generation) {
++            pthread_mutex_unlock(&g->lock);
++            return false;
++        }
++        if (pthread_cond_timedwait(&g->idle, &g->lock, deadline) != 0) {
++            pthread_mutex_unlock(&g->lock);
++            return false;
++        }
++    }
++    bool drained = g->closed && g->generation == generation;
++    pthread_mutex_unlock(&g->lock);
++    return drained;
++}
++void vortx_gpu_gate_reopen(struct vortx_gpu_gate *g)
++{
++    pthread_mutex_lock(&g->lock);
++    if (g->generation != UINT64_MAX) {
++        g->generation++;
++        g->closed = false;
++    }
++    pthread_cond_broadcast(&g->idle);
++    pthread_mutex_unlock(&g->lock);
++}
+diff --git a/player/client.h b/player/client.h
+--- a/player/client.h
++++ b/player/client.h
+@@ -6,6 +6,10 @@
+ 
+ #include "mpv/stream_cb.h"
+ #include "misc/bstr.h"
++#include "video/out/vortx_apple_frame.h"
++struct mp_client_api;
++mpv_vortx_apple_frame_session *mp_client_vortx_frames(struct mp_client_api *api);
++
+ 
+ struct MPContext;
+ struct mpv_handle;
+diff --git a/player/client.c b/player/client.c
+--- a/player/client.c
++++ b/player/client.c
+@@ -46,6 +46,7 @@
+ #include "command.h"
+ #include "core.h"
+ #include "client.h"
++#include "video/out/vo.h"
+ 
+ /*
+  * Locking hierarchy:
+@@ -81,6 +82,7 @@
+     int num_custom_protocols;
+ 
+     struct mpv_render_context *render_context;
++    mpv_vortx_apple_frame_session *vortx_frames;
+ };
+ 
+ struct observe_property {
+@@ -155,6 +157,7 @@
+     uint64_t properties_change_ts;
+ 
+     bool fuzzy_initialized; // see scripting.c wait_loaded()
++    atomic_uint_fast64_t vortx_subscription;
+     bool is_weak;           // can not keep core alive on its own
+     struct mp_log_buffer *messages;
+     int messages_level;
+@@ -181,6 +184,7 @@
+     mpctx->clients = talloc_ptrtype(NULL, mpctx->clients);
+     *mpctx->clients = (struct mp_client_api) {
+         .mpctx = mpctx,
++        .vortx_frames = vortx_frame_create(),
+     };
+     mpctx->global->client_api = mpctx->clients;
+     mp_mutex_init(&mpctx->clients->lock);
+@@ -200,6 +204,8 @@
+     }
+ 
+     mp_mutex_destroy(&mpctx->clients->lock);
++    vortx_frame_close(mpctx->clients->vortx_frames);
++    mpv_vortx_apple_frame_release(mpctx->clients->vortx_frames);
+     talloc_free(mpctx->clients);
+     mpctx->clients = NULL;
+ }
+@@ -295,6 +301,7 @@
+         .wakeup_pipe = {-1, -1},
+     };
+     mp_mutex_init(&client->lock);
++    atomic_init(&client->vortx_subscription, 0);
+     mp_mutex_init(&client->wakeup_lock);
+     mp_cond_init(&client->wakeup);
+ 
+@@ -425,6 +432,8 @@
+ {
+     if (!ctx)
+         return;
++    mpv_vortx_apple_frame_detach(ctx->clients->vortx_frames,
++        atomic_exchange(&ctx->vortx_subscription, 0));
+ 
+     struct MPContext *mpctx = ctx->mpctx;
+     struct mp_client_api *clients = ctx->clients;
+@@ -768,6 +777,12 @@
+ {
+     struct mp_client_api *clients = mpctx->clients;
+ 
++    // Native epochs precede event delivery; UI generation flags cannot relabel
++    // an old frame. Foreground permission deliberately survives source change.
++    if (event == MPV_EVENT_START_FILE || event == MPV_EVENT_END_FILE)
++        vortx_frame_source(clients->vortx_frames, false);
++    if (event == MPV_EVENT_FILE_LOADED)
++        vortx_frame_source(clients->vortx_frames, true);
+     mp_mutex_lock(&clients->lock);
+ 
+     for (int n = 0; n < clients->num_clients; n++) {
+@@ -2198,6 +2213,66 @@
+     mpv_stream_cb_open_ro_fn open_fn;
+ };
+ 
++mpv_vortx_apple_frame_session *mp_client_vortx_frames(struct mp_client_api *api)
++{
++    return api ? api->vortx_frames : NULL;
++}
++
++int mpv_vortx_apple_frame_subscribe(mpv_handle *ctx, uint64_t owner,
++    mpv_vortx_apple_frame_callback callback, mpv_vortx_apple_frame_destroy destroy,
++    void *context, mpv_vortx_apple_frame_session **session, uint64_t *subscription)
++{
++    if (!ctx || !session || !subscription)
++        return MPV_ERROR_INVALID_PARAMETER;
++    *session = NULL;
++    *subscription = 0;
++    mpv_vortx_apple_frame_session *s = ctx->clients->vortx_frames;
++    uint64_t cookie = vortx_frame_subscribe(s, owner, callback, destroy, context);
++    if (!cookie)
++        return MPV_ERROR_PROPERTY_UNAVAILABLE;
++    uint_fast64_t previous = atomic_load(&ctx->vortx_subscription);
++    while (previous < cookie && !atomic_compare_exchange_weak(
++        &ctx->vortx_subscription, &previous, cookie)) {}
++    mpv_vortx_apple_frame_retain(s);
++    *session = s;
++    *subscription = cookie;
++    lock_core(ctx);
++    if (ctx->mpctx->video_out)
++        vo_redraw(ctx->mpctx->video_out); // seed a paused source without playing
++    unlock_core(ctx);
++    return 0;
++}
++
++void mpv_vortx_apple_frame_set_foreground(mpv_handle *ctx, bool foreground)
++{
++    if (!ctx)
++        return;
++    // The same core barrier serializes video-chain initialization and mode
++    // transitions. Revocation cannot race a half-created GPU context.
++    lock_core(ctx);
++    vortx_frame_set_foreground(ctx->clients->vortx_frames, foreground);
++    unlock_core(ctx);
++}
++
++int mpv_vortx_apple_frame_set_headless(mpv_handle *ctx,
++    mpv_vortx_apple_frame_session *session, uint64_t subscription, bool headless)
++{
++    if (!ctx || !session || session != ctx->clients->vortx_frames ||
++        !vortx_frame_owner_current(session, subscription))
++        return MPV_VORTX_FRAME_STALE_OWNER;
++    lock_core(ctx);
++    struct vortx_frame_mode_request request = {
++        .session = session, .subscription = subscription, .headless = headless,
++        .captions_required = ctx->mpctx->current_track[0][STREAM_SUB] ||
++                             ctx->mpctx->current_track[1][STREAM_SUB],
++        .reason = MPV_VORTX_FRAME_NO_SOURCE,
++    };
++    if (ctx->mpctx->video_out && vortx_frame_owner_current(session, subscription))
++        vo_control(ctx->mpctx->video_out, VOCTRL_VORTX_NATIVE_FRAME_MODE, &request);
++    unlock_core(ctx);
++    return request.reason;
++}
++
+ int mpv_stream_cb_add_ro(mpv_handle *ctx, const char *protocol, void *user_data,
+                          mpv_stream_cb_open_ro_fn open_fn)
+ {
+diff --git a/video/out/vo.h b/video/out/vo.h
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -31,6 +31,7 @@
+ #include "options/options.h"
+ #include "osdep/threads.h"
+ #include "player/clipboard/clipboard.h"
++#include "vortx_apple_frame.h"
+ 
+ enum {
+     // VO needs to redraw
+@@ -65,6 +66,7 @@
+     VOCTRL_RESUME,
+     /* signal a redraw occurred */
+     VOCTRL_REDRAW,
++    VOCTRL_VORTX_NATIVE_FRAME_MODE,
+ 
+     VOCTRL_SET_PANSCAN,
+ 
+@@ -229,6 +231,9 @@
+ };
+ 
+ struct vo_frame {
++    struct vortx_frame_stamp vortx_stamp;
++    bool vortx_captions_required;
++    double vortx_media_rate;
+     // If > 0, realtime when frame should be shown, in mp_time_ns() units.
+     // If 0, present immediately.
+     int64_t pts;
+diff --git a/video/out/vo.c b/video/out/vo.c
+--- a/video/out/vo.c
++++ b/video/out/vo.c
+@@ -39,6 +39,7 @@
+ #include "options/m_config.h"
+ #include "common/msg.h"
+ #include "common/global.h"
++#include "player/client.h"
+ #include "common/stats.h"
+ #include "video/hwdec.h"
+ #include "video/mp_image.h"
+@@ -701,6 +702,8 @@
+     talloc_free(in->frame_queued);
+     in->frame_queued = NULL;
+     in->current_frame_id += VO_MAX_REQ_FRAMES + 1;
++    vortx_frame_reset(mp_client_vortx_frames(vo->global->client_api),
++                      in->current_frame_id);
+     // don't unref current_frame; we always want to be able to redraw it
+     if (in->current_frame) {
+         in->current_frame->num_vsyncs = 0; // but reset future repeats
+@@ -880,6 +883,7 @@
+            (!in->current_frame || in->current_frame->num_vsyncs < 1));
+     in->hasframe = true;
+     frame->frame_id = ++(in->current_frame_id);
++    frame->vortx_stamp = vortx_frame_stamp(mp_client_vortx_frames(vo->global->client_api));
+     in->frame_queued = frame;
+     in->wakeup_pts = frame->display_synced
+                    ? 0 : frame->pts + MPMAX(frame->duration, 0);
+diff --git a/player/video.c b/player/video.c
+--- a/player/video.c
++++ b/player/video.c
+@@ -1228,6 +1228,9 @@
+     int req = vo_get_num_req_frames(mpctx->video_out);
+     mp_assert(req >= 1 && req <= VO_MAX_REQ_FRAMES);
+     struct vo_frame dummy = {
++        // Conservatively preserve selected captions, even during cue gaps.
++        .vortx_captions_required = mpctx->current_track[0][STREAM_SUB] ||
++                                  mpctx->current_track[1][STREAM_SUB],
+         .pts = pts,
+         .duration = -1,
+         .still = mpctx->step_frames > 0,
+@@ -1253,6 +1256,9 @@
+     shift_frames(mpctx);
+ 
+     schedule_frame(mpctx, frame);
++    // This same-frame scheduler sample includes direction. Initial raw-frame
++    // support rejects reverse rather than fabricate a forward media clock.
++    frame->vortx_media_rate = mpctx->video_speed * mpctx->play_dir;
+ 
+     mpctx->osd_force_update = true;
+     update_osd_msg(mpctx);
+diff --git a/meson.build b/meson.build
+--- a/meson.build
++++ b/meson.build
+@@ -168,6 +168,7 @@
+     ## Player
+     'player/audio.c',
+     'player/client.c',
++    'video/out/vortx_apple_frame.c',
+     'player/command.c',
+     'player/configfiles.c',
+     'player/external_files.c',
+@@ -1846,6 +1847,7 @@
+ 
+     headers = ['include/mpv/client.h', 'include/mpv/render.h',
+                'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
++    headers += ['include/mpv/vortx_apple_frame.h']
+     install_headers(headers, subdir: 'mpv')
+ 
+     # Allow projects to build with libmpv by cloning into ./subprojects/mpv
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -50,6 +50,12 @@
+ #include "gpu/video_shaders.h"
+ #include "sub/osd.h"
+ #include "gpu_next/context.h"
++#include "player/client.h"
++#include "osdep/timer.h"
++#ifdef __APPLE__
++#include <CoreVideo/CoreVideo.h>
++#endif
++
+ 
+ #if HAVE_GL && defined(PL_HAVE_OPENGL)
+ #include <libplacebo/opengl.h>
+@@ -105,6 +111,15 @@
+ };
+ 
+ struct priv {
++    mpv_vortx_apple_frame_session *vortx_frames; // core-owned, outlives VO
++    struct vortx_gpu_gate vortx_allocations;
++    bool vortx_gate_initialized, vortx_dr_initialized;
++    bool vortx_moltenvk; // immutable after initial preinit, including in wakeup
++    bool vortx_retired;
++    struct mp_image *vortx_last_image;
++    struct vo_frame vortx_last_frame;
++    int vortx_frame_reason;
++
+     struct mp_log *log;
+     struct mpv_global *global;
+     struct stats_ctx *stats;
+@@ -172,6 +187,10 @@
+ };
+ 
+ static void update_render_options(struct vo *vo);
++static int create_gpu_resources(struct vo *vo, bool restoring);
++static void destroy_gpu_resources(struct vo *vo, bool preserve_vt);
++static int vortx_frame_mode(struct vo *vo, struct vortx_frame_mode_request *request);
++static void uninit(struct vo *vo);
+ static void update_lut(struct priv *p, struct user_lut *lut);
+ 
+ struct gl_next_opts {
+@@ -272,7 +291,7 @@
+     MP_ASSERT_UNREACHABLE();
+ }
+ 
+-static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
++static struct mp_image *get_image_unguarded(struct vo *vo, int imgfmt, int w, int h,
+                                   int stride_align, int flags)
+ {
+     struct priv *p = vo->priv;
+@@ -311,6 +330,17 @@
+     mp_mutex_unlock(&p->dr_lock);
+ 
+     return mpi;
++}
++
++static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
++                                 int stride_align, int flags)
++{
++    struct priv *p = vo->priv;
++    if (!vortx_gpu_gate_enter(&p->vortx_allocations))
++        return NULL;
++    struct mp_image *image = get_image_unguarded(vo, imgfmt, w, h, stride_align, flags);
++    vortx_gpu_gate_leave(&p->vortx_allocations);
++    return image;
+ }
+ 
+ static void update_overlays(struct vo *vo, struct mp_osd_res res,
+@@ -1215,12 +1245,131 @@
+ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
+                                      const struct mp_image *mpi);
+ 
++// Eligibility describes render-equivalent pixels, not merely a VT decoder.
++// More formats require separate implementation; never silently discard DV,
++// caption overlays or a user-requested transform in order to enable PiP.
++static int vortx_frame_eligibility(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    struct mp_image *image = frame->current;
++    if (!image)
++        return MPV_VORTX_FRAME_NO_SOURCE;
++    if (!p->vortx_moltenvk || image->imgfmt != IMGFMT_VIDEOTOOLBOX)
++        return MPV_VORTX_FRAME_NOT_VIDEOTOOLBOX;
++    if (image->dovi || image->enhancement_layer ||
++        image->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION)
++        return MPV_VORTX_FRAME_DOLBY_VISION;
++    if (frame->vortx_captions_required)
++        return MPV_VORTX_FRAME_CAPTIONS_REQUIRED;
++    struct gl_video_opts *opts = p->opts_cache->opts;
++    struct mp_csp_params eq = MP_CSP_PARAMS_DEFAULTS;
++    mp_csp_equalizer_state_get(p->video_eq, &eq);
++    const struct mp_image_params *params = &image->params;
++    bool crop = params->crop.x0 || params->crop.y0 ||
++        (params->crop.x1 && params->crop.x1 != image->w) ||
++        (params->crop.y1 && params->crop.y1 != image->h);
++    if (image->film_grain || params->vflip || params->rotate || crop ||
++        params->stereo3d || params->p_w != params->p_h ||
++        (image->fields & MP_IMGFIELD_INTERLACED) ||
++        (opts->user_shaders && opts->user_shaders[0]) || opts->deband ||
++        opts->unsharp != 0 || opts->interpolation || opts->gamma != 1 ||
++        eq.brightness != 0 || eq.contrast != 1 || eq.hue != 0 ||
++        eq.saturation != 1 || eq.gamma != 1 ||
++        p->icc_profile ||
++        (opts->icc_opts && (opts->icc_opts->profile_auto ||
++            (image->icc_profile && opts->icc_opts->use_embedded) ||
++            (opts->icc_opts->profile && opts->icc_opts->profile[0]))) ||
++        p->next_opts->lut.opt || p->next_opts->image_lut.opt ||
++        p->next_opts->target_lut.opt ||
++        (p->next_opts->raw_opts && p->next_opts->raw_opts[0]))
++        return MPV_VORTX_FRAME_TRANSFORM_REQUIRED;
++    if (params->color.primaries != PL_COLOR_PRIM_BT_709 ||
++        (params->color.transfer != PL_COLOR_TRC_BT_1886 &&
++         params->color.transfer != PL_COLOR_TRC_SRGB) ||
++        params->repr.sys != PL_COLOR_SYSTEM_BT_709)
++        return MPV_VORTX_FRAME_UNSUPPORTED_COLOR;
++    if (frame->display_synced || !isfinite(frame->vortx_media_rate) ||
++        frame->vortx_media_rate <= 0 || !isfinite(image->pts) || image->pts < 0 ||
++        (!p->paused && frame->pts <= 0))
++        return MPV_VORTX_FRAME_UNSUPPORTED_TIMING;
++#ifdef __APPLE__
++    CVPixelBufferRef buffer = (CVPixelBufferRef)image->planes[3];
++    if (!buffer)
++        return MPV_VORTX_FRAME_NOT_VIDEOTOOLBOX;
++    OSType format = CVPixelBufferGetPixelFormatType(buffer);
++    if (format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange &&
++        format != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
++        return MPV_VORTX_FRAME_UNSUPPORTED_COLOR;
++    CFTypeRef primaries = CVBufferGetAttachment(buffer,
++        kCVImageBufferColorPrimariesKey, NULL);
++    CFTypeRef matrix = CVBufferGetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, NULL);
++    CFTypeRef transfer = CVBufferGetAttachment(buffer, kCVImageBufferTransferFunctionKey, NULL);
++    if (!primaries || !matrix || !transfer ||
++        !CFEqual(primaries, kCVImageBufferColorPrimaries_ITU_R_709_2) ||
++        !CFEqual(matrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2) ||
++        !CFEqual(transfer, kCVImageBufferTransferFunction_ITU_R_709_2))
++        return MPV_VORTX_FRAME_UNSUPPORTED_COLOR;
++    return MPV_VORTX_FRAME_READY;
++#else
++    return MPV_VORTX_FRAME_NOT_VIDEOTOOLBOX;
++#endif
++}
++
++#ifdef __APPLE__
++static void vortx_pixel_retain(void *buffer) { CVPixelBufferRetain(buffer); }
++static void vortx_pixel_release(void *buffer) { CVPixelBufferRelease(buffer); }
++#endif
++
++static bool vortx_deliver_frame(struct vo *vo, struct vo_frame *frame)
++{
++    struct priv *p = vo->priv;
++    if (!vortx_frame_subscribed(p->vortx_frames)) {
++        mp_image_unrefp(&p->vortx_last_image);
++        return false;
++    }
++    // CPU option snapshots are safe while GPU resources are retired. Do not
++    // call update_options: it compiles shaders/creates renderer resources.
++    if (p->vortx_retired) {
++        m_config_cache_update(p->opts_cache);
++        m_config_cache_update(p->next_opts_cache);
++    }
++    p->vortx_frame_reason = vortx_frame_eligibility(vo, frame);
++    vortx_frame_report(p->vortx_frames, p->vortx_frame_reason);
++    mp_image_setrefp(&p->vortx_last_image, frame->current);
++    p->vortx_last_frame = *frame;
++    p->vortx_last_frame.current = p->vortx_last_image;
++    if (p->vortx_frame_reason != MPV_VORTX_FRAME_READY)
++        return false;
++#ifdef __APPLE__
++    // Darwin mp_time_ns is raw mach ns minus a process offset. Capture both
++    // sides close together; apply only the scheduled deadline DELTA. Source
++    // PTS remains independent. Paused redraws intentionally have no deadline.
++    uint64_t raw = mp_raw_time_ns();
++    uint64_t deadline;
++    if (!vortx_frame_host_deadline(raw, mp_time_ns_from_raw_time(raw),
++                                   frame->pts, p->paused, &deadline)) {
++        vortx_frame_report(p->vortx_frames, MPV_VORTX_FRAME_UNSUPPORTED_TIMING);
++        return false;
++    }
++    return vortx_frame_publish(p->vortx_frames, frame->vortx_stamp, frame->frame_id,
++        (struct vortx_frame_buffer){frame->current->planes[3],
++                                   vortx_pixel_retain, vortx_pixel_release},
++        frame->current->pts, MPMAX(0, frame->approx_duration), frame->vortx_media_rate,
++        deadline, raw, p->paused);
++#else
++    return false;
++#endif
++}
++
+ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+ {
+     struct priv *p = vo->priv;
++    if (p->vortx_retired)
++        return vortx_deliver_frame(vo, frame);
+     pl_options pars = p->pars;
+     pl_gpu gpu = p->gpu;
+     update_options(vo);
++    vortx_deliver_frame(vo, frame);
+ 
+     struct pl_render_params params = pars->params;
+     const struct gl_video_opts *opts = p->opts_cache->opts;
+@@ -1662,6 +1804,8 @@
+ static void flip_page(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++    if (p->vortx_retired)
++        return;
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+ 
+     if (p->frame_pending) {
+@@ -1676,6 +1820,8 @@
+ static void get_vsync(struct vo *vo, struct vo_vsync_info *info)
+ {
+     struct priv *p = vo->priv;
++    if (p->vortx_retired)
++        return;
+     struct ra_swapchain *sw = p->ra_ctx->swapchain;
+     if (sw->fns->get_vsync)
+         sw->fns->get_vsync(sw, info);
+@@ -1686,6 +1832,8 @@
+     struct priv *p = vo->priv;
+     if (ra_hwdec_get(&p->hwdec_ctx, format))
+         return true;
++    if (p->vortx_retired)
++        return false;
+ 
+     bool supported = format_supported(vo, format, false);
+     if (!supported)
+@@ -1719,6 +1867,8 @@
+ static int reconfig(struct vo *vo, struct mp_image_params *params)
+ {
+     struct priv *p = vo->priv;
++    if (p->vortx_retired)
++        return 0; // current image eligibility is checked before delivery
+     if (!p->ra_ctx->fns->reconfig(p->ra_ctx))
+         return -1;
+ 
+@@ -2041,7 +2191,14 @@
+ {
+     struct priv *p = vo->priv;
+ 
++    if (p->vortx_retired && request == VOCTRL_SET_PANSCAN)
++        return VO_TRUE;
+     switch (request) {
++    case VOCTRL_VORTX_NATIVE_FRAME_MODE: {
++        struct vortx_frame_mode_request *mode = data;
++        mode->reason = vortx_frame_mode(vo, mode);
++        return VO_TRUE;
++    }
+     case VOCTRL_SET_PANSCAN:
+         resize(vo);
+         return VO_TRUE;
+@@ -2055,6 +2212,8 @@
+         return VO_TRUE;
+ 
+     case VOCTRL_UPDATE_RENDER_OPTS: {
++        if (p->vortx_retired)
++            return VO_TRUE; // rebuild latest snapshots only on foreground
+         update_ra_ctx_options(vo, &p->ra_ctx->opts);
+         if (p->ra_ctx->fns->update_render_opts)
+             p->ra_ctx->fns->update_render_opts(p->ra_ctx);
+@@ -2090,6 +2249,8 @@
+     }
+ 
+     case VOCTRL_SCREENSHOT:
++        if (p->vortx_retired)
++            return VO_NOTIMPL;
+         video_screenshot(vo, data);
+         return true;
+ 
+@@ -2098,11 +2259,15 @@
+         return true;
+ 
+     case VOCTRL_LOAD_HWDEC_API:
++        if (p->vortx_retired)
++            return VO_TRUE; // registry already contains the SAME VT device
+         ra_hwdec_ctx_load_fmt(&p->hwdec_ctx, vo->hwdec_devs, data);
+         return true;
+     }
+ 
+     int events = 0;
++    if (p->vortx_retired)
++        return VO_NOTIMPL;
+     int r = p->ra_ctx->fns->control(p->ra_ctx, &events, request, data);
+     if (events & VO_EVENT_ICC_PROFILE_CHANGED) {
+         if (update_auto_profile(p, &events))
+@@ -2120,6 +2285,10 @@
+ static void wakeup(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++    // MoltenVK has no backend wakeup. This immutable fast path never reads
++    // the replaceable RA pointer from this cross-thread callback.
++    if (p->vortx_moltenvk)
++        return;
+     if (p->ra_ctx && p->ra_ctx->fns->wakeup)
+         p->ra_ctx->fns->wakeup(p->ra_ctx);
+ }
+@@ -2127,7 +2296,7 @@
+ static void wait_events(struct vo *vo, int64_t until_time_ns)
+ {
+     struct priv *p = vo->priv;
+-    if (p->ra_ctx && p->ra_ctx->fns->wait_events) {
++    if (!p->vortx_retired && p->ra_ctx && p->ra_ctx->fns->wait_events) {
+         p->ra_ctx->fns->wait_events(p->ra_ctx, until_time_ns);
+     } else {
+         vo_wait_default(vo, until_time_ns);
+@@ -2324,9 +2493,11 @@
+     pl_cache_destroy(&cache->cache);
+ }
+ 
+-static void uninit(struct vo *vo)
++static void destroy_gpu_resources(struct vo *vo, bool preserve_vt)
+ {
+     struct priv *p = vo->priv;
++    if (!p->context)
++        return;
+ 
+     // Drain any in-flight uploads.
+     if (p->gpu)
+@@ -2347,22 +2518,26 @@
+         timer_pool_destroy(p->hwdec_timer);
+         ra_hwdec_mapper_free(&p->el_hwdec_mapper);
+         timer_pool_destroy(p->el_hwdec_timer);
+-        ra_hwdec_ctx_uninit(&p->hwdec_ctx);
+-        hwdec_devices_set_loader(vo->hwdec_devs, NULL, NULL);
+-        hwdec_devices_destroy(vo->hwdec_devs);
++        if (!preserve_vt) {
++            // Preserve the original ordering for every ordinary backend:
++            // hwdec driver teardown may still require a live RA/GPU context.
++            ra_hwdec_ctx_uninit(&p->hwdec_ctx);
++            hwdec_devices_set_loader(vo->hwdec_devs, NULL, NULL);
++            hwdec_devices_destroy(vo->hwdec_devs);
++            vo->hwdec_devs = NULL;
++        }
+     }
+ 
+     mp_assert(p->num_dr_buffers == 0);
+-    mp_mutex_destroy(&p->dr_lock);
+-
+-    cache_uninit(p, &p->shader_cache);
+-    cache_uninit(p, &p->icc_cache);
+-
+-    pl_lut_free(&p->next_opts->image_lut.lut);
+-    pl_lut_free(&p->next_opts->lut.lut);
+-    pl_lut_free(&p->next_opts->target_lut.lut);
+-
+-    pl_icc_close(&p->icc_profile);
++
++    // ICC and both caches borrow p->pllog. Destroy them before that log dies
++    // with the GPU context; restore reloads through new log-owned instances.
++    pl_icc_close(&p->icc_profile);
++    TA_FREEP(&p->icc_path);
++    cache_uninit(p, &p->shader_cache);
++    cache_uninit(p, &p->icc_cache);
++    TA_FREEP(&p->shader_cache.dir);
++    TA_FREEP(&p->icc_cache.dir);
+     pl_renderer_destroy(&p->rr);
+ 
+     for (int i = 0; i < VO_PASS_PERF_MAX; ++i) {
+@@ -2371,6 +2538,36 @@
+     }
+ 
+     pl_options_free(&p->pars);
++    for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
++        TA_FREEP(&p->osd_state.entries[i].parts);
++    memset(&p->osd_state, 0, sizeof(p->osd_state));
++    for (int i = 0; i < p->num_user_hooks; i++)
++        talloc_free(p->user_hooks[i].path);
++    TA_FREEP(&p->user_hooks);
++    p->num_user_hooks = 0;
++    TA_FREEP(&p->hooks);
++    TA_FREEP(&p->sub_tex);
++    p->num_sub_tex = 0;
++    p->hwdec_timer = p->el_hwdec_timer = p->sw_upload_timer = NULL;
++    memset(&p->perf_fresh, 0, sizeof(p->perf_fresh));
++    memset(&p->perf_redraw, 0, sizeof(p->perf_redraw));
++    memset(&p->hwdec_perf, 0, sizeof(p->hwdec_perf));
++    memset(&p->sw_upload_perf, 0, sizeof(p->sw_upload_perf));
++    memset(p->osd_fmt, 0, sizeof(p->osd_fmt));
++    mp_mutex_lock(&vo->params_mutex);
++    vo->target_params = NULL;
++    mp_mutex_unlock(&vo->params_mutex);
++    p->frame_pending = false;
++    p->last_id = 0;
++    p->last_pts = 0;
++    p->want_reset = true;
++    p->flush_cache = false;
++    p->is_interpolated = false;
++    // Registry and VT owner/device are NOT destroyed. Their RA pointers are
++    // dormant until explicit foreground recreation rebinds both.
++    p->hwdec_ctx.ra_ctx = NULL;
++    for (int n = 0; n < p->hwdec_ctx.num_hwdecs; n++)
++        p->hwdec_ctx.hwdecs[n]->ra_ctx = NULL;
+ 
+     p->ra_ctx = NULL;
+     p->pllog = NULL;
+@@ -2379,14 +2570,41 @@
+     gpu_ctx_destroy(&p->context);
+ }
+ 
++static void uninit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    // A retired VO has context==NULL: background terminal cleanup therefore
++    // cannot enter Vulkan/MoltenVK wait-idle or destruction paths.
++    destroy_gpu_resources(vo, false);
++    if (vo->hwdec_devs) {
++        ra_hwdec_ctx_uninit(&p->hwdec_ctx);
++        hwdec_devices_set_loader(vo->hwdec_devs, NULL, NULL);
++        hwdec_devices_destroy(vo->hwdec_devs);
++        vo->hwdec_devs = NULL;
++    }
++    if (p->vortx_dr_initialized)
++        mp_mutex_destroy(&p->dr_lock);
++    if (p->vortx_gate_initialized)
++        vortx_gpu_gate_destroy(&p->vortx_allocations);
++    mp_image_unrefp(&p->vortx_last_image);
++    if (p->next_opts) {
++        pl_lut_free(&p->next_opts->image_lut.lut);
++        pl_lut_free(&p->next_opts->lut.lut);
++        pl_lut_free(&p->next_opts->target_lut.lut);
++    }
++}
++
+ static void load_hwdec_api(void *ctx, struct hwdec_imgfmt_request *params)
+ {
+     vo_control(ctx, VOCTRL_LOAD_HWDEC_API, params);
+ }
+ 
+-static int preinit(struct vo *vo)
++static int create_gpu_resources(struct vo *vo, bool restoring)
+ {
+     struct priv *p = vo->priv;
++    if (!vortx_frame_gpu_allowed(p->vortx_frames))
++        return -1;
++    if (!restoring) {
+     p->opts_cache = m_config_cache_alloc(p, vo->global, &gl_video_conf);
+     p->next_opts_cache = m_config_cache_alloc(p, vo->global, &gl_next_conf);
+     p->next_opts = p->next_opts_cache->opts;
+@@ -2394,6 +2615,7 @@
+     p->global = vo->global;
+     p->log = vo->log;
+     p->stats = stats_ctx_create(p, vo->global, "vo/gpu-next");
++    }
+ 
+     struct gl_video_opts *gl_opts = p->opts_cache->opts;
+     struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
+@@ -2407,36 +2629,142 @@
+     p->pllog = p->context->pllog;
+     p->gpu = p->context->gpu;
+     p->sw = p->context->swapchain;
+-    p->hwdec_ctx = (struct ra_hwdec_ctx) {
+-        .log = p->log,
+-        .global = p->global,
+-        .ra_ctx = p->ra_ctx,
+-    };
++    if (restoring) {
++        if (strcmp(p->ra_ctx->fns->name, "moltenvk") ||
++            !(p->gpu->import_caps.tex & PL_HANDLE_MTL_TEX))
++            goto err_out;
++        p->hwdec_ctx.ra_ctx = p->ra_ctx;
++        for (int n = 0; n < p->hwdec_ctx.num_hwdecs; n++)
++            p->hwdec_ctx.hwdecs[n]->ra_ctx = p->ra_ctx;
++    } else {
++        p->hwdec_ctx = (struct ra_hwdec_ctx) {
++            .log = p->log, .global = p->global, .ra_ctx = p->ra_ctx,
++        };
+ 
+     vo->hwdec_devs = hwdec_devices_create();
+     hwdec_devices_set_loader(vo->hwdec_devs, load_hwdec_api, vo);
+     ra_hwdec_ctx_init(&p->hwdec_ctx, vo->hwdec_devs, gl_opts->hwdec_interop, false);
+     mp_mutex_init(&p->dr_lock);
++    p->vortx_dr_initialized = true;
++    }
+ 
+     if (gl_opts->shader_cache)
+         cache_init(vo, &p->shader_cache, 10 << 20, gl_opts->shader_cache_dir);
+     if (gl_opts->icc_opts->cache)
+         cache_init(vo, &p->icc_cache, 20 << 20, gl_opts->icc_opts->cache_dir);
+ 
+     pl_gpu_set_cache(p->gpu, p->shader_cache.cache);
+     p->rr = pl_renderer_create(p->pllog, p->gpu);
+     p->queue = pl_queue_create(p->gpu);
++    if (!p->rr || !p->queue)
++        goto err_out;
+     p->osd_fmt[SUBBITMAP_LIBASS] = pl_find_named_fmt(p->gpu, "r8");
+     p->osd_fmt[SUBBITMAP_BGRA] = pl_find_named_fmt(p->gpu, "bgra8");
+     p->osd_sync = 1;
+ 
+     p->pars = pl_options_alloc(p->pllog);
+     update_render_options(vo);
++    if (!vortx_frame_gpu_allowed(p->vortx_frames))
++        goto err_out;
+     return 0;
+ 
+ err_out:
+-    uninit(vo);
++    if (restoring)
++        destroy_gpu_resources(vo, true);
++    else
++        uninit(vo);
+     return -1;
++}
++
++static int preinit(struct vo *vo)
++{
++    struct priv *p = vo->priv;
++    p->vortx_frames = mp_client_vortx_frames(vo->global->client_api);
++    if (!vortx_frame_gpu_allowed(p->vortx_frames))
++        return -1; // even a NEW VO cannot create GPU while app is backgrounded
++    vortx_gpu_gate_init(&p->vortx_allocations);
++    p->vortx_gate_initialized = true;
++    int result = create_gpu_resources(vo, false);
++    if (result == 0)
++        p->vortx_moltenvk = !strcmp(p->ra_ctx->fns->name, "moltenvk");
++    return result;
++}
++
++static int vortx_frame_mode(struct vo *vo, struct vortx_frame_mode_request *request)
++{
++    struct priv *p = vo->priv;
++    if (request->session != p->vortx_frames ||
++        !vortx_frame_owner_current(p->vortx_frames, request->subscription))
++        return MPV_VORTX_FRAME_STALE_OWNER;
++    if (!p->vortx_moltenvk || !vortx_frame_gpu_allowed(p->vortx_frames))
++        return MPV_VORTX_FRAME_GPU_BUSY;
++    if (!request->headless) {
++        if (!p->vortx_retired)
++            return MPV_VORTX_FRAME_READY;
++        if (create_gpu_resources(vo, true) < 0)
++            return MPV_VORTX_FRAME_GPU_BUSY;
++        if (!vortx_frame_owner_current(p->vortx_frames, request->subscription) ||
++            !vortx_frame_gpu_allowed(p->vortx_frames)) {
++            destroy_gpu_resources(vo, true);
++            return MPV_VORTX_FRAME_STALE_OWNER;
++        }
++        p->vortx_retired = false;
++        if (reconfig(vo, NULL) < 0) {
++            destroy_gpu_resources(vo, true);
++            p->vortx_retired = true;
++            return MPV_VORTX_FRAME_GPU_BUSY;
++        }
++        // Reconfiguration can block in the backend while detach invalidates
++        // this request. Revalidate AFTER it, not only after context creation.
++        if (!vortx_frame_owner_current(p->vortx_frames, request->subscription) ||
++            !vortx_frame_gpu_allowed(p->vortx_frames)) {
++            destroy_gpu_resources(vo, true);
++            p->vortx_retired = true;
++            return MPV_VORTX_FRAME_STALE_OWNER;
++        }
++        vortx_gpu_gate_reopen(&p->vortx_allocations);
++        vo->want_redraw = true;
++        return MPV_VORTX_FRAME_READY;
++    }
++    if (p->vortx_retired)
++        return MPV_VORTX_FRAME_READY;
++    if (request->captions_required)
++        return MPV_VORTX_FRAME_CAPTIONS_REQUIRED;
++    // The last image may be a paused redraw from before an option change.
++    // Refresh the real render configuration while GPU resources still exist.
++    update_options(vo);
++    struct vortx_frame_stamp stamp = vortx_frame_stamp(p->vortx_frames);
++    if (!p->vortx_last_image || stamp.file_epoch != p->vortx_last_frame.vortx_stamp.file_epoch ||
++        stamp.timeline_epoch != p->vortx_last_frame.vortx_stamp.timeline_epoch)
++        return MPV_VORTX_FRAME_NO_SOURCE;
++    int reason = vortx_frame_eligibility(vo, &p->vortx_last_frame);
++    if (reason != MPV_VORTX_FRAME_READY)
++        return reason;
++    if (p->hwdec_ctx.num_hwdecs != 1 ||
++        strcmp(p->hwdec_ctx.hwdecs[0]->driver->name, "videotoolbox"))
++        return MPV_VORTX_FRAME_NOT_VIDEOTOOLBOX;
++    struct timespec deadline;
++    timespec_get(&deadline, TIME_UTC);
++    deadline.tv_nsec += 100000000; // bounded allocation drain, not a playback timeout
++    if (deadline.tv_nsec >= 1000000000) {
++        deadline.tv_sec++;
++        deadline.tv_nsec -= 1000000000;
++    }
++    bool drained = vortx_gpu_gate_close(&p->vortx_allocations, &deadline);
++    mp_mutex_lock(&p->dr_lock);
++    bool has_buffers = p->num_dr_buffers != 0;
++    mp_mutex_unlock(&p->dr_lock);
++    if (!drained || has_buffers ||
++        !vortx_frame_owner_current(p->vortx_frames, request->subscription)) {
++        vortx_gpu_gate_reopen(&p->vortx_allocations);
++        return MPV_VORTX_FRAME_GPU_BUSY;
++    }
++    if (p->frame_pending)
++        flip_page(vo); // settle acquired swapchain frame while still foreground
++    destroy_gpu_resources(vo, true); // includes terminal backend waits, BEFORE ack
++    p->vortx_retired = true;
++    return vortx_frame_owner_current(p->vortx_frames, request->subscription)
++        ? MPV_VORTX_FRAME_READY : MPV_VORTX_FRAME_STALE_OWNER;
+ }
+ 
+ static const struct pl_filter_config *map_scaler(struct priv *p,
