@@ -59,186 +59,145 @@ struct ProfilePickerView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     @State private var pinTarget: UserProfile?
+    @State private var pinIsForEditing = false
     @State private var editorProfile: UserProfile?
+    @State private var isEditing = false
     @State private var signInNeeded = false
+    @State private var accountHelpNeeded = false
     @StateObject private var profileAction = ProfileMutationPresentation()
-#if VORTX_NATIVE_DATA_ENGINE
-    @ObservedObject private var nativeSync = VortXSyncManager.shared
-#endif
-    #if !os(tvOS)
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    /// Measured width of the picker's horizontal scroll viewport (iOS + macOS), used to pin the card row's
-    /// minWidth so a short row centers instead of sitting hard-left (see the picker body below).
-    @State private var pickerRowWidth: CGFloat = 0
-    #endif
-
-    private var usesWideProfileLayout: Bool {
-        #if os(tvOS)
-        return true
-        #elseif os(macOS)
-        return true
-        #else
-        return horizontalSizeClass == .regular
-        #endif
-    }
+    @StateObject private var artwork = ProfilePickerArtwork.shared
 
     var body: some View {
         ZStack {
-            Theme.Palette.canvas.ignoresSafeArea()
-            VStack(spacing: usesWideProfileLayout ? Theme.Space.xxl : Theme.Space.md) {
-                Text("Who's watching?")
-                    .font(usesWideProfileLayout ? Theme.Typography.hero : Theme.Typography.screenTitle)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                if profileAction.isRunning { ProgressView("Opening profile…") }
-                if let error = profileAction.errorMessage {
-                    Text(error).font(Theme.Typography.label).foregroundStyle(.red)
-                }
-#if VORTX_NATIVE_DATA_ENGINE
-                if !nativeSync.nativeWatchedMigrationPending.isEmpty {
-                    Text("Watched-history migration is waiting for episode metadata from an original addon. Saved history is preserved. Existing profiles remain available; first-time setup cannot finish until this metadata can be verified.")
-                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                    Button("Retry watched-history migration") { Task { await nativeSync.retryNativeWatchedMigration() } }
-                }
-                if !nativeSync.nativeUnsupportedSettings.isEmpty {
-                    Text("Some older device settings are preserved locally but have not been synchronized by the native engine. Other supported settings can still sync; these retained values have not been marked uploaded.")
-                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                }
-                if !account.isSignedIn, let active = store.active, active.isOwner || !active.usesOwnAccount {
-                    Text("Reconnect the owner's Stremio account for external refresh. Credentials from another VortX account are not reused; saved library and watch history remain available.")
-                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                }
-                if !nativeSync.nativeOwnAccountResyncUnavailable.isEmpty {
-                    Text("Some profiles need to reconnect for external refresh. Their saved library and watch history remain available.")
-                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                }
-                if !nativeSync.nativeOwnAccountOverlayPending.isEmpty {
-                    Text(nativeSync.nativeOwnAccountOverlayUnattributed.isEmpty
-                         ? "Some older profile updates are waiting for account verification. Your current library remains available; reconnect the original independent account to review and refresh those updates."
-                         : "Some older profile updates have no verified account link and remain pending. They will not be assigned to a different account. Your current library remains available.")
-                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                }
-#endif
-                // Touch: scroll horizontally so 3+ cards (230pt each) don't overflow + clip both edges
-                // on a phone (systemic fix S1b). tvOS keeps the centered HStack for remote focus nav.
-                // macOS: the picker presents as a `.sheet`, which sizes to content; a horizontal ScrollView
-                // has no intrinsic width, so the sheet collapsed to ~one card and clipped the second avatar
-                // at the right edge (the Mac "Who's watching? cuts off the second avatar" report). The
-                // explicit `.frame` below gives the sheet a real width so a few cards fit, and this same
-                // horizontal ScrollView still scrolls when N avatars exceed it.
-                #if os(tvOS)
-                profileCards
-                #else
-                if usesWideProfileLayout {
-                // Center the row when it is narrower than the viewport so a couple of avatars sit balanced
-                // rather than pinned hard-left with trailing dead space. A flexible `maxWidth: .infinity`
-                // frame is a NO-OP along a horizontal ScrollView's unbounded scroll axis (it collapses to the
-                // row's ideal width), so real centering needs the actual viewport width: measure it via a
-                // background GeometryReader and pin the row's minWidth to it. When the avatars exceed that
-                // width the row's intrinsic width wins and it scrolls, as before.
-                ScrollView(.horizontal, showsIndicators: false) {
-                    profileCards
-                        .frame(minWidth: pickerRowWidth, alignment: .center)
-                }
-                .background(GeometryReader { proxy in
-                    Color.clear
-                        .onAppear { pickerRowWidth = proxy.size.width }
-                        .onChange(of: proxy.size.width) { newWidth in pickerRowWidth = newWidth }
-                })
-                // Belt-and-braces: let an active card's ember glow render past the scroll rectangle instead
-                // of being clipped to bounds (FINDING 8). macOS 14+ (VortXMac target), so no availability gate.
-                #if os(macOS)
-                .scrollClipDisabled()
-                #endif
-                } else {
+            GeometryReader { geometry in
+                let layout = ProfilePickerLayout(width: geometry.size.width,
+                                                 largeText: dynamicTypeSize.isAccessibilitySize || theme.textScale > 1.20)
+                ZStack {
+                    backgroundArtwork
                     ScrollView(.vertical, showsIndicators: false) {
-                        compactProfileCards
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        VStack(spacing: 24) {
+                            Spacer(minLength: max(40, geometry.size.height * (layout.isWide ? 0.20 : 0.34)))
+                            if let movie = artwork.movie {
+                                Text(movie.name)
+                                    .modifier(ProfilePickerText(size: 26, style: .title, design: .serif))
+                                    .multilineTextAlignment(.center)
+                                    .foregroundStyle(.white.opacity(0.9))
+                                    .padding(.bottom, 12)
+                                    .accessibilityHidden(true)
+                            }
+                            Text(isEditing ? "Edit profiles" : "Who's watching?")
+                                .modifier(ProfilePickerText(size: layout.isWide ? 40 : 25, style: .title2, design: .rounded))
+                                .foregroundStyle(.white)
+                                .multilineTextAlignment(.center)
+                                .accessibilityAddTraits(.isHeader)
+                            if profileAction.isRunning {
+                                ProgressView("Opening profile…").tint(.white).foregroundStyle(.white)
+                            }
+                            if let error = profileAction.errorMessage {
+                                Text(error).font(.callout).foregroundStyle(.white)
+                                    .multilineTextAlignment(.center)
+                                    .padding(12)
+                                    .background(.red.opacity(0.22), in: RoundedRectangle(cornerRadius: 16))
+                                    .accessibilityIdentifier("profile-picker-error")
+                                #if VORTX_NATIVE_DATA_ENGINE
+                                Button("Account settings") { accountHelpNeeded = true }
+                                    .buttonStyle(.bordered)
+                                    .tint(.white)
+                                #endif
+                            }
+                            profileGrid(layout: layout)
+                        }
+                        .padding(.horizontal, layout.horizontalInset)
+                        .padding(.bottom, 32)
+                        .frame(maxWidth: 1100)
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: geometry.size.height, alignment: .bottom)
                     }
+                    .disabled(pinTarget != nil || profileAction.isRunning)
+                    .accessibilityHidden(pinTarget != nil)
                 }
-                #endif
             }
-            .padding(usesWideProfileLayout ? Theme.Space.screenInset : Theme.Space.sm)
-            // macOS no longer presents this as a content-sized `.sheet` (which clipped the trailing Add
-            // Profile card at the window's right edge): it is hosted WINDOW-FILLING at the scene root by
-            // MacRootProfileCoverOverlay, so the canvas + measured-minWidth centering below fill the whole
-            // window and the horizontal ScrollView carries any overflow. No explicit frame needed.
-            // Unfocusable while the PIN gate is up, so focus must move into the gate (on a real
-            // remote, focus will not enter an overlay while anything beneath stays focusable).
-            .disabled(pinTarget != nil || profileAction.isRunning)
 
             if let target = pinTarget {
                 PinGateOverlay(profile: target,
-                               onUnlock: { commit(target) },
-                               onCancel: { pinTarget = nil })
+                               onUnlock: {
+                                   if pinIsForEditing { pinTarget = nil; editorProfile = target }
+                                   else { commit(target) }
+                               },
+                               onCancel: { pinTarget = nil; pinIsForEditing = false })
             }
         }
-        .profileCover(item: $editorProfile) { profile in
-            ProfileEditorView(original: profile)
-        }
+        .profileCover(item: $editorProfile) { ProfileEditorView(original: $0) }
         .profileCover(isPresented: $signInNeeded) {
-            // LoginView is the tvOS sign-in panel (SourcesTV); the touch UI ships iOSSignInView.
             #if os(tvOS)
             LoginView(account: account)
             #else
             iOSSignInView()
             #endif
         }
+        #if VORTX_NATIVE_DATA_ENGINE
+        .profileCover(isPresented: $accountHelpNeeded) {
+            ProfileAccountRecoveryView().environmentObject(VortXSyncManager.shared)
+        }
+        #endif
         .interactiveDismissDisabled(profileAction.isRunning)
+        .task { await artwork.load() }
         .onDisappear { profileAction.cancel() }
     }
 
-    private var profileCards: some View {
-        HStack(alignment: .top, spacing: Theme.Space.xl) {
-            ForEach(store.profiles) { profile in
-                ProfileCard(profile: profile, isCurrent: profile.id == store.activeID) {
-                    pick(profile)
-                }
-            }
-            AddProfileCard {
-                editorProfile = UserProfile(name: "", avatar: "🎬",
-                                            accentID: theme.accentID)
-            }
+    private var backgroundArtwork: some View {
+        ZStack {
+            Color.black
+            FallbackArtwork(urls: [artwork.movie?.background, artwork.movie?.poster], maxPixel: 1920)
+                .opacity(0.85)
+            LinearGradient(stops: [.init(color: .black.opacity(0.12), location: 0),
+                                   .init(color: .black.opacity(0.22), location: 0.3),
+                                   .init(color: .black.opacity(0.85), location: 0.62),
+                                   .init(color: .black, location: 0.84)],
+                           startPoint: .top, endPoint: .bottom)
         }
-        // macOS: reserve vertical headroom so activating a card keeps its ember glow (disc shadow radius 34)
-        // and the CardFocusStyle lift/shadows INSIDE the row's laid-out bounds, instead of overflowing and
-        // being clipped by the enclosing horizontal ScrollView (FINDING 8). Uniform on every card (incl. Add)
-        // so the disc tops stay aligned. tvOS/iOS keep their existing row metrics untouched.
-        #if os(macOS)
-        .padding(.vertical, Theme.Space.xl)
-        #endif
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
-    #if !os(tvOS)
-    @ViewBuilder private var compactProfileCards: some View {
-        LazyVStack(spacing: Theme.Space.sm) {
+    private func profileGrid(layout: ProfilePickerLayout) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: layout.spacing), count: layout.columns),
+                  alignment: .center, spacing: 24) {
             ForEach(store.profiles) { profile in
-                CompactProfileRow(profile: profile, isCurrent: profile.id == store.activeID) {
-                    pick(profile)
-                }
+                ProfileAvatarTile(profile: profile, isCurrent: profile.id == store.activeID,
+                                  isEditing: isEditing, side: layout.avatarSide) { pick(profile) }
             }
-            CompactAddProfileRow {
+            ProfilePickerActionTile(title: "Add", symbol: "plus", side: layout.avatarSide) {
                 editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
             }
+            ProfilePickerActionTile(title: isEditing ? "Done" : "Edit",
+                                    symbol: isEditing ? "checkmark" : "pencil", side: layout.avatarSide) {
+                isEditing.toggle()
+            }
         }
+        .padding(8)
+        .profileFocusSection()
     }
-    #endif
 
     private func pick(_ profile: UserProfile) {
-        if profile.hasPin {
-            pinTarget = profile
-        } else {
-            commit(profile)
-        }
+        // The editor already gates an inactive profile's switch. Do not ask for its PIN twice.
+        if isEditing, profile.id != store.activeID { editorProfile = profile; return }
+        pinIsForEditing = isEditing
+        if profile.hasPin { pinTarget = profile }
+        else if isEditing { editorProfile = profile }
+        else { commit(profile) }
     }
 
     private func commit(_ profile: UserProfile) {
         pinTarget = nil
         #if VORTX_NATIVE_DATA_ENGINE
-        let target = core.captureNativePlaybackTarget()
-        profileAction.start(operation: { await store.selectNative(profile, target: target) },
-                            failureMessage: { store.nativeProfileError ?? "Profile could not be opened. Please retry." },
+        let admission = core.captureNativeProfileActionAdmission()
+        profileAction.start(operation: { await store.selectNative(profile, admission: admission) },
+                            failureMessage: { store.nativeProfileError ?? "Couldn't open this profile. Tap it to try again." },
                             onSuccess: {
                                 account.reloadForActiveProfile()
                                 if core.nativeAccountMode(profileID: profile.id) == "pending_own" { signInNeeded = true }
@@ -256,8 +215,165 @@ struct ProfilePickerView: View {
         }
         #endif
     }
-
 }
+
+/// Background art is public, not a peek into the previous profile's viewing history or add-ons.
+/// One catalog and one metadata request per app launch, independent of profile opening.
+@MainActor
+private final class ProfilePickerArtwork: ObservableObject {
+    static let shared = ProfilePickerArtwork()
+    @Published private(set) var movie: MetaItem?
+    private var request: Task<MetaItem?, Never>?
+
+    func load() async {
+        if movie != nil { return }
+        if request == nil {
+            request = Task {
+                let client = AddonClient()
+                guard let titles = try? await client.catalog(base: AddonClient.cinemeta, type: "movie", id: "top", genre: "Family"),
+                      let title = titles.filter({ $0.type == "movie" && $0.id.hasPrefix("tt") && $0.poster?.isEmpty == false })
+                        .prefix(30).randomElement() else { return nil }
+                if let detail = try? await client.meta(type: "movie", id: title.id) { return detail }
+                return MetaItem(id: title.id, type: title.type, name: title.name, poster: title.poster,
+                                background: nil, description: nil, releaseInfo: nil, runtime: nil,
+                                imdbRating: nil, genres: nil, videos: nil)
+            }
+        }
+        movie = await request?.value
+    }
+}
+
+private struct ProfileAvatarTile: View {
+    let profile: UserProfile
+    let isCurrent: Bool
+    let isEditing: Bool
+    let side: CGFloat
+    let action: () -> Void
+
+    private var accent: Color {
+        ThemeManager.accents.first { $0.id == profile.accentID }?.base ?? Theme.Palette.accent
+    }
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 10) {
+                ProfileAvatarFace(profile: profile, isCurrent: isCurrent, isEditing: isEditing, side: side, accent: accent)
+                Text(profile.name).modifier(ProfilePickerText(size: 18, style: .headline))
+                    .multilineTextAlignment(.center).lineLimit(2)
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity, alignment: .top)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(ProfilePickerButtonStyle(outline: false))
+        .accessibilityLabel(isEditing ? "Edit \(profile.name)" : profile.name)
+        .accessibilityValue(profile.hasPin ? "PIN required" : (isCurrent ? "Current profile" : ""))
+        .accessibilityIdentifier("profile-tile-\(profile.id.uuidString)")
+    }
+}
+
+/// This reader is inside the Button label, where the remote's focus environment is available.
+private struct ProfileAvatarFace: View {
+    let profile: UserProfile
+    let isCurrent: Bool
+    let isEditing: Bool
+    let side: CGFloat
+    let accent: Color
+    @Environment(\.isFocused) private var focused
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            RoundedRectangle(cornerRadius: side * 0.23, style: .continuous)
+                .fill(LinearGradient(colors: [accent, accent.opacity(0.45)], startPoint: .topLeading, endPoint: .bottomTrailing))
+            Text(profile.avatar).font(.system(size: side * 0.53))
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if profile.hasPin || isEditing || isCurrent {
+                Image(systemName: isEditing ? "pencil" : (profile.hasPin ? "lock.fill" : "checkmark"))
+                    .font(.system(size: side * 0.16, weight: .bold))
+                    .padding(7).background(.black.opacity(0.7), in: Circle()).padding(6)
+            }
+        }
+        .frame(width: side, height: side)
+        .overlay(RoundedRectangle(cornerRadius: side * 0.23, style: .continuous)
+            .strokeBorder(.white.opacity(focused ? 1 : 0.15), lineWidth: focused ? 4 : 1))
+    }
+}
+
+private struct ProfilePickerText: ViewModifier {
+    @EnvironmentObject private var theme: ThemeManager
+    @ScaledMetric private var size: CGFloat
+    let design: Font.Design
+    init(size: CGFloat, style: Font.TextStyle, design: Font.Design = .rounded) {
+        _size = ScaledMetric(wrappedValue: size, relativeTo: style)
+        self.design = design
+    }
+    func body(content: Content) -> some View {
+        content.font(.system(size: size * theme.textScale, weight: .semibold, design: design))
+    }
+}
+
+private struct ProfilePickerActionTile: View {
+    let title: String
+    let symbol: String
+    let side: CGFloat
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 10) {
+                Image(systemName: symbol).font(.system(size: side * 0.40, weight: .light))
+                    .frame(width: side, height: side)
+                    .background(.white.opacity(0.14), in: RoundedRectangle(cornerRadius: side * 0.23, style: .continuous))
+                Text(title).modifier(ProfilePickerText(size: 18, style: .headline))
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity, alignment: .top)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(ProfilePickerButtonStyle())
+        .accessibilityLabel(title == "Add" ? "Add profile" : title)
+    }
+}
+
+private struct ProfilePickerButtonStyle: ButtonStyle {
+    var outline = true
+    func makeBody(configuration: Configuration) -> some View {
+        ProfilePickerButtonContent(configuration: configuration, outline: outline)
+    }
+}
+
+private struct ProfilePickerButtonContent: View {
+    let configuration: ButtonStyleConfiguration
+    let outline: Bool
+    @Environment(\.isFocused) private var focused
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.97 : (focused && !reduceMotion ? 1.04 : 1))
+            .opacity(configuration.isPressed ? 0.75 : 1)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: focused)
+            .overlay(RoundedRectangle(cornerRadius: 24).strokeBorder(.white.opacity(focused && outline ? 0.8 : 0), lineWidth: 2))
+    }
+}
+
+#if VORTX_NATIVE_DATA_ENGINE
+/// A full-screen account form needs its own way back to the picker, including before sign-in.
+private struct ProfileAccountRecoveryView: View {
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("VortX account").font(.title2.bold())
+                Spacer()
+                Button("Done") { dismiss() }.buttonStyle(.bordered)
+            }
+            .padding()
+            SyncSettingsView()
+        }
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+    }
+}
+#endif
 
 /// Centered 4-digit gate over dimmed content. Owns its own input state; the caller decides
 /// what unlocking means (switch profiles in the picker, unlock the editor). The content
@@ -268,280 +384,59 @@ struct PinGateOverlay: View {
     let onCancel: () -> Void
     @State private var input = ""
     @State private var wrong = false
+    @AccessibilityFocusState private var pinAccessibilityFocused: Bool
 
     var body: some View {
         ZStack {
             Color.black.opacity(0.72).ignoresSafeArea()
-            VStack(spacing: Theme.Space.lg) {
-                Text("Enter PIN for \(profile.name)")
-                    .font(Theme.Typography.sectionTitle)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                SecureField("PIN", text: $input)
-                    .font(Theme.Typography.body)
-                    .numberPadKeyboard()
-                    .frame(maxWidth: 360)
-                    .onChange(of: input) { _ in
-                        input = String(input.filter(\.isNumber).prefix(4))
-                        wrong = false
+            GeometryReader { geometry in
+                ScrollView {
+                    VStack(spacing: Theme.Space.lg) {
+                        Text("Enter PIN for \(profile.name)")
+                            .font(Theme.Typography.sectionTitle)
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(Theme.Palette.textPrimary)
+                        SecureField("PIN", text: $input)
+                            .font(Theme.Typography.body)
+                            .numberPadKeyboard()
+                            .frame(maxWidth: 360)
+                            .accessibilityLabel("Enter your four-digit PIN")
+                            .accessibilityFocused($pinAccessibilityFocused)
+                            .onChange(of: input) { _ in
+                                input = String(input.filter(\.isNumber).prefix(4))
+                                wrong = false
+                            }
+                        if wrong {
+                            Text("Wrong PIN").font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
+                        }
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: Theme.Space.md) { pinActions }
+                            VStack(spacing: Theme.Space.md) { pinActions }
+                        }
                     }
-                if wrong {
-                    Text("Wrong PIN").font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
-                }
-                HStack(spacing: Theme.Space.md) {
-                    Button("Unlock") {
-                        if profile.pinMatches(input) { onUnlock() } else { wrong = true }
-                    }
-                    .buttonStyle(PrimaryActionStyle())
-                    .disabled(input.count != 4)
-                    Button("Cancel", action: onCancel)
-                        .buttonStyle(ChipButtonStyle(selected: false))
+                    .padding(24)
+                    .frame(maxWidth: 560)
+                    .vortxGlassPanel(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: geometry.size.height)
                 }
             }
-            .padding(Theme.Space.xxl)
-            .vortxGlassPanel(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
+        .accessibilityElement(children: .contain)
+        .onAppear { pinAccessibilityFocused = true }
+    }
+
+    @ViewBuilder private var pinActions: some View {
+        Button("Unlock") {
+            if profile.pinMatches(input) { onUnlock() } else { wrong = true }
+        }
+        .buttonStyle(PrimaryActionStyle())
+        .disabled(input.count != 4)
+        Button("Cancel", action: onCancel)
+            .buttonStyle(ChipButtonStyle(selected: false))
     }
 }
-
-/// One profile in the picker: a flat accent disc with the avatar, name underneath. Focus is
-/// unmistakable at ten feet: a thick warm-white ring, a brighter fill, a soft glow, and the name
-/// lights up, on top of the card lift. The profile you're currently using carries a check badge.
-private struct ProfileCard: View {
-    let profile: UserProfile
-    let isCurrent: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            ProfileCardContent(profile: profile, isCurrent: isCurrent)
-        }
-        #if os(tvOS)
-        .buttonStyle(CardFocusStyle())
-        #else
-        .buttonStyle(.plain)
-        #endif
-    }
-}
-
-private struct ProfileCardContent: View {
-    let profile: UserProfile
-    let isCurrent: Bool
-    @Environment(\.isFocused) private var focused
-    @EnvironmentObject private var theme: ThemeManager
-
-    private var accent: Color {
-        ThemeManager.accents.first { $0.id == profile.accentID }?.base ?? Theme.Palette.accent
-    }
-
-    var body: some View {
-        #if os(tvOS)
-        VStack(spacing: Theme.Space.md) {
-            ZStack {
-                Circle().fill(accent.opacity(focused ? 0.5 : 0.24))
-                Circle().strokeBorder(focused ? Theme.Palette.textPrimary : accent.opacity(0.7),
-                                      lineWidth: focused ? 6 : 3)
-                Text(profile.avatar).font(.system(size: 88, weight: .bold))
-                if profile.hasPin {
-                    Image(systemName: "lock.fill")
-                        .font(.system(size: 24, weight: .bold))
-                        .foregroundStyle(Theme.Palette.textPrimary)
-                        .padding(10)
-                        .background(Theme.Palette.surface2, in: Circle())
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
-                }
-                if isCurrent {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 22, weight: .heavy))
-                        .foregroundStyle(Theme.Palette.onAccent)
-                        .padding(9)
-                        .background(accent, in: Circle())
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-                }
-            }
-            .frame(width: 200, height: 200)
-            .shadow(color: focused ? accent.opacity(0.55) : .clear, radius: 34, y: 6)
-            Text(profile.name)
-                // macOS: keep the name at a CONSTANT size so activating a card cannot reflow the column
-                // taller and get the name/ring clipped by the horizontal ScrollView (FINDING 8). Only the
-                // color changes on focus. tvOS/iOS keep the label->cardTitle step-up for ten-foot focus lift.
-                #if os(macOS)
-                .font(Theme.Typography.cardTitle)
-                #else
-                .font(focused ? Theme.Typography.cardTitle : Theme.Typography.label)
-                #endif
-                .foregroundStyle(focused ? Theme.Palette.textPrimary : Theme.Palette.textSecondary)
-                .lineLimit(1)
-        }
-        .frame(width: 230)
-        .animation(Theme.Motion.focus, value: focused)
-        #else
-        HStack(spacing: Theme.Space.md) {
-            ZStack {
-                Circle().fill(accent.opacity(0.22))
-                Text(profile.avatar)
-                    .font(.system(size: 44, weight: .bold))
-            }
-            .frame(width: 76, height: 76)
-
-            VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                Text(profile.name)
-                    .font(Theme.Typography.cardTitle)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                    .lineLimit(1)
-                Text(profile.isOwner ? "Owner profile" : (profile.isKids ? "Kids profile" : "Profile"))
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-            }
-            Spacer(minLength: Theme.Space.sm)
-            HStack(spacing: Theme.Space.xs) {
-                if profile.hasPin {
-                    Image(systemName: "lock.fill")
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                }
-                if isCurrent {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(accent)
-                        .accessibilityLabel("Current profile")
-                }
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Theme.Palette.textTertiary)
-            }
-        }
-        .padding(Theme.Space.md)
-        .frame(width: 320, alignment: .leading)
-        .frame(minHeight: 100, alignment: .leading)
-        .vortxCinemaCard()
-        #endif
-    }
-}
-
-private struct AddProfileCard: View {
-    let action: () -> Void
-    @EnvironmentObject private var theme: ThemeManager
-
-    var body: some View {
-        Button(action: action) {
-            #if os(tvOS)
-            VStack(spacing: Theme.Space.md) {
-                ZStack {
-                    Circle().fill(Theme.Palette.surface1)
-                    Image(systemName: "plus")
-                        .font(.system(size: 64, weight: .medium))
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                }
-                .frame(width: 200, height: 200)
-                Text("Add Profile")
-                    .font(Theme.Typography.label)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-            }
-            .frame(width: 230)
-            #else
-            HStack(spacing: Theme.Space.md) {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 34, weight: .medium))
-                    .foregroundStyle(Theme.Palette.accent)
-                Text("Add Profile")
-                    .font(Theme.Typography.cardTitle)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                Spacer(minLength: 0)
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Theme.Palette.textTertiary)
-            }
-            .padding(Theme.Space.md)
-            .frame(width: 320, alignment: .leading)
-            .frame(minHeight: 76, alignment: .leading)
-            .vortxCinemaCard()
-            #endif
-        }
-        #if os(tvOS)
-        .buttonStyle(CardFocusStyle())
-        #else
-        .buttonStyle(.plain)
-        #endif
-    }
-}
-
-#if !os(tvOS)
-/// Phone profile picker rows keep the same switch/PIN action as the wide card, but use the viewport width
-/// instead of a fixed 230pt card so names and the current-profile marker never clip on a narrow device.
-private struct CompactProfileRow: View {
-    let profile: UserProfile
-    let isCurrent: Bool
-    let action: () -> Void
-    @EnvironmentObject private var theme: ThemeManager
-
-    private var accent: Color {
-        ThemeManager.accents.first { $0.id == profile.accentID }?.base ?? Theme.Palette.accent
-    }
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: Theme.Space.sm) {
-                ZStack {
-                    Circle().fill(accent.opacity(0.22))
-                    Text(profile.avatar).font(.system(size: 30, weight: .bold))
-                }
-                .frame(width: 52, height: 52)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(profile.name)
-                        .font(Theme.Typography.cardTitle)
-                        .foregroundStyle(Theme.Palette.textPrimary)
-                        .lineLimit(1)
-                    Text(profile.isOwner ? "Owner profile" : (profile.isKids ? "Kids profile" : "Profile"))
-                        .font(Theme.Typography.label)
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                }
-                Spacer(minLength: Theme.Space.xs)
-                if profile.hasPin {
-                    Image(systemName: "lock.fill")
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                }
-                if isCurrent {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(accent)
-                        .accessibilityLabel("Current profile")
-                }
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Theme.Palette.textTertiary)
-            }
-            .padding(.horizontal, Theme.Space.md)
-            .padding(.vertical, Theme.Space.sm)
-            .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
-            .vortxSettingsCard()
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct CompactAddProfileRow: View {
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: Theme.Space.sm) {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 28, weight: .medium))
-                    .foregroundStyle(Theme.Palette.accent)
-                Text("Add Profile")
-                    .font(Theme.Typography.cardTitle)
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                Spacer(minLength: 0)
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Theme.Palette.textTertiary)
-            }
-            .padding(.horizontal, Theme.Space.md)
-            .padding(.vertical, Theme.Space.sm)
-            .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
-            .vortxSettingsCard()
-        }
-        .buttonStyle(.plain)
-    }
-}
-#endif
 
 /// Create or edit a profile: name, avatar, theme, an optional own Stremio account, and an optional
 /// 4-digit PIN. Works on a draft; nothing persists until Save.
@@ -564,6 +459,7 @@ struct ProfileEditorView: View {
     @State private var customAvatar = ""
     @State private var confirmDelete = false
     @State private var switchPinPrompt = false   // PIN gate when switching INTO a locked profile
+    @State private var accountHelpNeeded = false
     @State private var signInNeeded = false      // an own-account profile with no stored token
     @StateObject private var profileAction = ProfileMutationPresentation()
 
@@ -653,7 +549,7 @@ struct ProfileEditorView: View {
                     if draft.isOwner {
                         // The owner IS the main account; offering "its own account" here once
                         // pointed sign-in at an empty token slot and signed out every device.
-                        Text("The main profile. It uses your Stremio account's own watch history, like before profiles existed.")
+                        Text("Your main profile. Other profiles keep their own watch history.")
                             .font(Theme.Typography.label)
                             .foregroundStyle(Theme.Palette.textTertiary)
                     } else {
@@ -680,10 +576,10 @@ struct ProfileEditorView: View {
                                         .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                                 }
                                 Button(pending ? "Connect account" : "Connect or change account") {
-                                    let target = core.captureNativePlaybackTarget()
+                                    let admission = core.captureNativeProfileActionAdmission()
                                     profileAction.start(operation: {
-                                        if store.activeID == draft.id { return true }
-                                        return await store.selectNative(original, target: target)
+                                        if store.activeID == draft.id, core.nativePlaybackTargetIsCurrent(admission.target) { return true }
+                                        return await store.selectNative(original, admission: admission)
                                     }, failureMessage: { store.nativeProfileError ?? "Profile could not be opened." }, onSuccess: {
                                         account.reloadForActiveProfile(); signInNeeded = true
                                     })
@@ -699,7 +595,7 @@ struct ProfileEditorView: View {
                                 .foregroundStyle(Theme.Palette.textTertiary)
 #endif
                         } else {
-                            Text("Keeps its own watch history, synced through your Stremio account to your other devices.")
+                            Text("Uses the same add-ons, but keeps its own watch history.")
                                 .font(Theme.Typography.label)
                                 .foregroundStyle(Theme.Palette.textTertiary)
                         }
@@ -750,10 +646,12 @@ struct ProfileEditorView: View {
                     if let error = profileAction.errorMessage {
                         Text(error).font(Theme.Typography.label).foregroundStyle(.red)
 #if VORTX_NATIVE_DATA_ENGINE
-                        Button("Refresh account binding and retry") {
+                        Button("Try again") {
                             core.refreshNativeProfileEditBinding(draft.id)
                             save()
                         }.buttonStyle(ChipButtonStyle(selected: false))
+                        Button("Account settings") { accountHelpNeeded = true }
+                            .buttonStyle(ChipButtonStyle(selected: false))
 #endif
                     }
                 }
@@ -763,6 +661,7 @@ struct ProfileEditorView: View {
             // Unfocusable while the lock is up, so the remote lands in the lock panel (tvOS focus
             // won't enter an overlay while anything beneath stays focusable).
             .disabled(isLocked || profileAction.isRunning)
+            .accessibilityHidden(isLocked)
 
             if isLocked { lockedPanel }
         }
@@ -770,8 +669,8 @@ struct ProfileEditorView: View {
                             isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 #if VORTX_NATIVE_DATA_ENGINE
-                let target = core.captureNativePlaybackTarget()
-                profileAction.start(operation: { await store.removeNative(original, target: target) },
+                let admission = core.captureNativeProfileActionAdmission()
+                profileAction.start(operation: { await store.removeNative(original, admission: admission) },
                                     failureMessage: { store.nativeProfileError ?? "Profile could not be removed. Please retry." },
                                     onSuccess: { dismiss() })
                 #else
@@ -783,6 +682,11 @@ struct ProfileEditorView: View {
                 #endif
             }
         }
+        #if VORTX_NATIVE_DATA_ENGINE
+        .profileCover(isPresented: $accountHelpNeeded) {
+            ProfileAccountRecoveryView().environmentObject(VortXSyncManager.shared)
+        }
+        #endif
         .profileCover(isPresented: $signInNeeded) {
             // An own-account profile with no stored token: sign in here rather than dismissing into a
             // signed-out profile. LoginView is the tvOS panel; the touch UI ships iOSSignInView.
@@ -809,32 +713,34 @@ struct ProfileEditorView: View {
     private var lockedPanel: some View {
         ZStack {
             Color.black.opacity(0.72).ignoresSafeArea()
-            VStack(spacing: Theme.Space.lg) {
-                Image(systemName: "lock.fill")
-                    .font(.system(size: 48)).foregroundStyle(Theme.Palette.accent)
-                Text("\(original.name) can only be edited from that profile")
-                    .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
-                    .multilineTextAlignment(.center)
-                Text("Switch to \(original.name) to use it and edit its settings.")
-                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
-                    .multilineTextAlignment(.center).frame(maxWidth: 640)
-                if profileAction.isRunning { ProgressView("Opening profile…") }
-                if let error = profileAction.errorMessage {
-                    Text(error).font(Theme.Typography.label).foregroundStyle(.red)
-                }
-                HStack(spacing: Theme.Space.md) {
-                    Button("Switch to \(original.name)") {
-                        if original.hasPin { switchPinPrompt = true } else { commitSwitch() }
+            GeometryReader { geometry in
+                ScrollView {
+                    VStack(spacing: Theme.Space.lg) {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 48)).foregroundStyle(Theme.Palette.accent)
+                        Text("Switch to \(original.name) to edit this profile.")
+                            .font(Theme.Typography.sectionTitle).foregroundStyle(Theme.Palette.textPrimary)
+                            .multilineTextAlignment(.center)
+                        if profileAction.isRunning { ProgressView("Opening profile…") }
+                        if let error = profileAction.errorMessage {
+                            Text(error).font(Theme.Typography.label).foregroundStyle(.red)
+                        }
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: Theme.Space.md) { lockedActions }
+                            VStack(spacing: Theme.Space.md) { lockedActions }
+                        }
                     }
-                    .buttonStyle(PrimaryActionStyle())
-                    Button("Cancel") { dismiss() }
-                        .buttonStyle(ChipButtonStyle(selected: false))
+                    .padding(24)
+                    .frame(maxWidth: 560)
+                    .vortxGlassPanel(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .frame(maxWidth: .infinity)
+                    .frame(minHeight: geometry.size.height)
                 }
             }
-            .padding(Theme.Space.xxl)
-            .vortxGlassPanel(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
             // Unfocusable while the PIN gate is up, so the remote lands in the gate (tvOS).
             .disabled(switchPinPrompt || profileAction.isRunning)
+            .accessibilityHidden(switchPinPrompt)
 
             if switchPinPrompt {
                 PinGateOverlay(profile: original,
@@ -844,19 +750,26 @@ struct ProfileEditorView: View {
         }
     }
 
+    @ViewBuilder private var lockedActions: some View {
+        Button("Switch profile") {
+            if original.hasPin { switchPinPrompt = true } else { commitSwitch() }
+        }
+        .buttonStyle(PrimaryActionStyle())
+        Button("Cancel") { dismiss() }.buttonStyle(ChipButtonStyle(selected: false))
+    }
+
     /// Switch the active profile to this (locked) one, mirroring ProfilePickerView.commit: select it,
-    /// then reload the account/engine for the new profile, and dismiss. A PIN-protected profile prompts
+    /// then reload the account/engine and unlock its editor. A PIN-protected profile prompts
     /// for its PIN first (switchPinPrompt). On .needsSignIn the editor presents sign-in (Option B)
     /// instead of dismissing into a signed-out profile.
     private func commitSwitch() {
         #if VORTX_NATIVE_DATA_ENGINE
-        let target = core.captureNativePlaybackTarget()
-        profileAction.start(operation: { await store.selectNative(original, target: target) },
+        let admission = core.captureNativeProfileActionAdmission()
+        profileAction.start(operation: { await store.selectNative(original, admission: admission, finishPicker: false) },
                             failureMessage: { store.nativeProfileError ?? "Profile could not be opened. Please retry." },
                             onSuccess: {
                                 account.reloadForActiveProfile()
                                 if core.nativeAccountMode(profileID: original.id) == "pending_own" { signInNeeded = true }
-                                else { dismiss() }
                             })
         #else
         switch store.select(original) {
@@ -885,9 +798,9 @@ struct ProfileEditorView: View {
         }
         // empty field keeps the existing PIN; Remove PIN cleared it explicitly
         #if VORTX_NATIVE_DATA_ENGINE
-        let target = core.captureNativePlaybackTarget()
+        let admission = core.captureNativeProfileActionAdmission()
         let profile = draft, creating = isNew
-        profileAction.start(operation: { await store.saveNative(profile, creating: creating, target: target) },
+        profileAction.start(operation: { await store.saveNative(profile, creating: creating, admission: admission) },
                             failureMessage: { store.nativeProfileError ?? "Profile could not be saved. Please retry." },
                             onSuccess: { dismiss() })
         #else

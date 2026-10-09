@@ -322,29 +322,63 @@ final class ProfileStore: ObservableObject {
         }
     }
     @MainActor
+    private func prepareNativeAction(_ admission: CoreBridge.NativeProfileActionAdmission,
+                                     operation: String,
+                                     perform: (PlaybackMutationTarget) async -> Bool) async -> Bool {
+        guard let target = await CoreBridge.shared.prepareNativeProfileActionTarget(admission) else {
+            CoreBridge.shared.reportNativeProfileFailure(operation)
+            nativeProfileError = CoreBridge.shared.nativeProfileRecoveryMessage
+            return false
+        }
+        return await perform(target)
+    }
+    @MainActor
+    func saveNative(_ profile: UserProfile, creating: Bool, admission: CoreBridge.NativeProfileActionAdmission) async -> Bool {
+        await prepareNativeAction(admission, operation: "save") { await self.saveNative(profile, creating: creating, target: $0) }
+    }
+    @MainActor
+    func removeNative(_ profile: UserProfile, admission: CoreBridge.NativeProfileActionAdmission) async -> Bool {
+        await prepareNativeAction(admission, operation: "remove") { await self.removeNative(profile, target: $0) }
+    }
+    @MainActor
+    func selectNative(_ profile: UserProfile, admission: CoreBridge.NativeProfileActionAdmission, finishPicker: Bool = true) async -> Bool {
+        await prepareNativeAction(admission, operation: "open") { await self.selectNative(profile, target: $0, finishPicker: finishPicker) }
+    }
+    @MainActor
     func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget? = nil) async -> Bool {
         let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
         do { try await CoreBridge.shared.saveNativeProfile(profile, creating: creating, target: captured); nativeProfileError = nil; return true }
-        catch { nativeProfileError = "Profile could not be saved. Your edits are still here. Refresh the account binding and retry if it changed on another device."; return false }
+        catch {
+            CoreBridge.shared.reportNativeProfileFailure("save", error: error)
+            nativeProfileError = "Couldn't save this profile. Your changes are still here. Tap Try again."
+            return false
+        }
     }
     @MainActor
     func removeNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil) async -> Bool {
         VortxNativeOwnAccountProducer.invalidate(slot: keychainAccount(for: profile))
         let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
         do { try await CoreBridge.shared.deleteNativeProfile(profile.id, target: captured); nativeProfileError = nil; return true }
-        catch { nativeProfileError = "Profile could not be removed. Please retry."; return false }
+        catch { CoreBridge.shared.reportNativeProfileFailure("remove", error: error); nativeProfileError = "Couldn't remove this profile. Tap again to retry."; return false }
     }
     @MainActor
-    func selectNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil) async -> Bool {
+    func selectNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil, finishPicker: Bool = true) async -> Bool {
         let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
-        guard CoreBridge.shared.nativePlaybackTargetIsCurrent(captured) else { return false }
+        guard CoreBridge.shared.nativePlaybackTargetIsCurrent(captured) else {
+            CoreBridge.shared.reportNativeProfileFailure("open")
+            nativeProfileError = CoreBridge.shared.nativeProfileRecoveryMessage
+            return false
+        }
         var outgoing = active
         outgoing?.playback = currentPlaybackPrefs()
         outgoing?.discovery = currentDiscoveryPrefs()
         do {
             try await CoreBridge.shared.switchNativeProfile(profile.id, outgoing: outgoing, target: captured)
-            pickedThisLaunch = true; nativeProfileError = nil; return true
-        } catch { nativeProfileError = "Profile could not be opened. Please retry."; return false }
+            // An authenticated switch made to edit a profile must not dismiss the picker and
+            // its child editor. Ordinary playback/profile selection still completes the picker.
+            if finishPicker { pickedThisLaunch = true }
+            nativeProfileError = nil; return true
+        } catch { CoreBridge.shared.reportNativeProfileFailure("open", error: error); nativeProfileError = "Couldn't open this profile. Tap again to try once more."; return false }
     }
 #endif
     /// The launch picker shows once per cold start, and only when there is a real choice to make.

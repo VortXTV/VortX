@@ -65,12 +65,13 @@ enum ProfileMutationPresentationTests {
 
         // Guard the platform UI seam as well as executing the real presentation coordinator above.
         let view = try! String(contentsOfFile: "app/SourcesShared/ProfilesView.swift", encoding: .utf8)
-        precondition(view.contains("await store.saveNative(profile, creating: creating, target: target)"))
-        precondition(view.contains("await store.removeNative(original, target: target)"))
-        precondition(view.contains("await store.selectNative(original, target: target)"))
-        precondition(view.contains("await store.selectNative(profile, target: target)"))
+        precondition(view.contains("await store.saveNative(profile, creating: creating, admission: admission)"))
+        precondition(view.contains("await store.removeNative(original, admission: admission)"))
+        precondition(view.contains("await store.selectNative(original, admission: admission)"))
+        precondition(view.contains("await store.selectNative(profile, admission: admission)"))
         // Five admission sites: picker, account editor, removal, selection, and profile save.
-        precondition(view.components(separatedBy: "let target = core.captureNativePlaybackTarget()").count == 6)
+        precondition(view.components(separatedBy: "let admission = core.captureNativeProfileActionAdmission()").count == 6)
+        precondition(!view.contains("let target = core.captureNativePlaybackTarget()"))
         precondition(view.contains(".interactiveDismissDisabled(profileAction.isRunning)"))
         print("PASS actual profile mutation presentation: acknowledgement, failure, retry, duplicate taps, cancelled late completion, captured native UI targets")
     }

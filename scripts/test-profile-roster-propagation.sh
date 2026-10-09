@@ -34,3 +34,7 @@ assert(s.includes("self?.isApplyingRemote = false\n            self?.drainLocalR
 console.log("PASS synchronous roster persistence and post-suppression drain wiring");'
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors app/SourcesShared/ProfileMutationPresentation.swift app/Tests/ProfileMutationPresentationTests.swift -o "$profile_test_dir/profile-presentation"
 "$profile_test_dir/profile-presentation"
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors app/SourcesShared/NativeProfileActionPreparation.swift app/Tests/NativeProfileActionPreparationTests.swift -o "$profile_test_dir/profile-preparation"
+"$profile_test_dir/profile-preparation"
+xcrun swiftc -parse-as-library -warnings-as-errors app/SourcesShared/ProfilePickerLayout.swift app/Tests/ProfilePickerLayoutTests.swift -o "$profile_test_dir/profile-picker-layout"
+"$profile_test_dir/profile-picker-layout"
