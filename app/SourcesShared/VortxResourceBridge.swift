@@ -185,9 +185,17 @@ final class VortxResourceBridge: @unchecked Sendable {
                               result.groups.allSatisfy({ group in addons.contains { $0.id == group.addonId } })
                         else { throw VortxNativeError.invalidResponse }
                         guard !result.cancelled else { throw CancellationError() }
-                        for group in result.groups { _ = try group.items(for: request.resource) }
+                        let groups = result.groups.map { group -> VortxResourceGroup in
+                            do { _ = try group.items(for: request.resource); return group }
+                            catch {
+                                // The envelope above still owns request/source identity. A malformed
+                                // payload belongs to this addon only; do not discard valid peers.
+                                NSLog("[VortXNative] resource=%@ result=partial_error category=invalid_response", request.resource.rawValue)
+                                return .init(addonId: group.addonId, status: .error, content: nil, error: .init(code: "invalid_response"))
+                            }
+                        }
                         let snapshot = VortxResourceSnapshot(ownerID: ownerID, requestID: lease.id,
-                            generation: lease.generation, request: request, groups: result.groups,
+                            generation: lease.generation, request: request, groups: groups,
                             sourceURLs: Dictionary(uniqueKeysWithValues: addons.map { ($0.id, $0.transportUrl) }))
                         guard accepts(snapshot) else { throw VortxNativeError.superseded }
                         continuation.resume(returning: snapshot)

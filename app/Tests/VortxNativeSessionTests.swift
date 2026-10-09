@@ -66,6 +66,7 @@ private final class MutationCounter: @unchecked Sendable {
 private final class SessionStore: VortxCheckpointStore, @unchecked Sendable {
     private let lock = NSLock()
     private var value: String?
+    private var host: Data?
     private var failure = false
     private var installBeforeFailure = false
     private var block = false
@@ -75,6 +76,10 @@ private final class SessionStore: VortxCheckpointStore, @unchecked Sendable {
     func failWrites(afterInstall: Bool = false) { lock.lock(); failure = true; installBeforeFailure = afterInstall; lock.unlock() }
     func recover() { lock.lock(); failure = false; lock.unlock() }
     func read(scope: VortxAccountScope) throws -> String? { lock.lock(); defer { lock.unlock() }; return value }
+    func readHostPreferences(scope: VortxAccountScope) throws -> Data? { lock.withLock { host } }
+    func commit(_ snapshot: String, scope: VortxAccountScope, hostPreferences: Data) throws {
+        try commit(snapshot, scope: scope); lock.withLock { host = hostPreferences }
+    }
     func commit(_ snapshot: String, scope: VortxAccountScope) throws {
         lock.lock(); defer { lock.unlock() }
         if block { block = false; entered.signal(); precondition(release.wait(timeout: .now() + 5) == .success) }
@@ -104,9 +109,229 @@ private final class SessionTransport: VortxResourceTransport, @unchecked Sendabl
     }
 }
 
+/// Gates individual requests without honoring cancellation, so stale-output tests exercise the
+/// production fences rather than depending on a cooperative provider returning early.
+private final class CatalogFanoutTransport: VortxResourceTransport, @unchecked Sendable {
+    final class Token: VortxResourceCancellation, @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func cancel() { lock.withLock { value = true } }
+        var cancelled: Bool { lock.withLock { value } }
+    }
+    private let lock = NSLock()
+    private let gates: [String: DispatchSemaphore]
+    private var requests: [String] = []
+    private var tokens: [String: Token] = [:]
+    private var active = 0
+    private var peak = 0
+    init(held: [String]) { gates = Dictionary(uniqueKeysWithValues: held.map { ($0, DispatchSemaphore(value: 0)) }) }
+    var started: [String] { lock.withLock { requests } }
+    var maximumActive: Int { lock.withLock { peak } }
+    func wasCancelled(_ key: String) -> Bool { lock.withLock { tokens[key]?.cancelled == true } }
+    func release(_ key: String) { gates[key]?.signal() }
+    func makeCancellation() throws -> any VortxResourceCancellation { Token() }
+    func load(_ requestJSON: String, cancellation: any VortxResourceCancellation) throws -> String {
+        let input = try JSONDecoder().decode(VortxJSON.self, from: Data(requestJSON.utf8))
+        let request = try input["request"]!.decode(VortxResourceRequest.self)
+        let query = request.extra.first { $0.first == "search" }?.last ?? ""
+        let skip = request.extra.first { $0.first == "skip" }?.last
+        let key = query + "/" + request.id + (skip.map { "/skip" + $0 } ?? "")
+        lock.withLock { requests.append(key); tokens[key] = cancellation as? Token; active += 1; peak = max(peak, active) }
+        defer { lock.withLock { active -= 1 } }
+        if let gate = gates[key] { precondition(gate.wait(timeout: .now() + 10) == .success, "unreleased catalog \(key)") }
+        if request.id == "failure" { throw VortxNativeError.unavailable }
+        let meta: VortxJSON = .object(["id": .string(key), "name": .string(key), "type": .string(request.type)])
+        let groups: [VortxJSON] = [.object(["addonId": input["addons"]!.array!.first!["id"]!, "status": .string("ready"),
+            "content": .object(["metas": .array([meta])])])]
+        return String(decoding: try JSONEncoder().encode(VortxJSON.object(["kind": .string("resource_result"),
+            "requestId": input["requestId"]!, "generation": input["generation"]!, "request": input["request"]!,
+            "groups": .array(groups), "cancelled": .bool(false)])), as: UTF8.self)
+    }
+}
+
+private final class CatalogPublications: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [VortxJSON] = []
+    func append(_ value: VortxJSON) { lock.withLock { values.append(value) } }
+    var count: Int { lock.withLock { values.count } }
+}
+
 @main enum VortxNativeSessionTests {
     static func check(_ value: Bool, line: Int = #line) { precondition(value, "session assertion at line \(line)") }
+    static func eventually(_ predicate: () -> Bool, line: Int = #line) async throws {
+        for _ in 0..<400 {
+            if predicate() { return }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        check(false, line: line)
+    }
+    static func catalogFanoutTests() async throws {
+        let ids = ["slow", "failure", "fast", "fourth", "fifth", "sixth", "unrequested"]
+        let transport = CatalogFanoutTransport(held: ids.prefix(6).map { "first/" + $0 })
+        let session = try VortxNativeSession(scope: .init(account: "catalog-fanout", ownerProfileID: "owner"),
+            ownerName: "Owner", abi: SessionABI(), store: SessionStore(), transport: transport, allowNewAccount: true)
+        let registry = ids.map { id in VortxResourceAddon(id: "source-" + id, transportUrl: "https://\(id).fixture/manifest.json",
+            manifest: .object(["catalogs": .array([.object(["id": .string(id), "type": .string("movie"),
+                "extraSupported": .array([.string("search"), .string("skip")])])])])) }
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: registry, changed: { _ in })
+        func state() -> VortxJSON? { facade.stateData("board").flatMap { try? JSONDecoder().decode(VortxJSON.self, from: $0) } }
+        func rows() -> [VortxJSON] { state()?["catalogs"]?.array ?? [] }
+        func status(_ index: Int) -> VortxJSON? { let rows = rows(); return index < rows.count ? rows[index].array?.first?["content"]?["type"] : nil }
+        func load(_ query: String) throws {
+            let action: VortxJSON = .object(["action": .string("Load"), "args": .object(["model": .string("CatalogsWithExtra"),
+                "args": .object(["extra": .array([.array([.string("search"), .string(query)])])])])])
+            check(facade.dispatch(data: try JSONEncoder().encode(action), field: "board"))
+        }
+        func range(_ start: Int, _ end: Int) throws {
+            let action: VortxJSON = .object(["action": .string("CatalogsWithExtra"), "args": .object(["action": .string("LoadRange"),
+                "args": .object(["start": .integer(Int64(start)), "end": .integer(Int64(end))])])])
+            check(facade.dispatch(data: try JSONEncoder().encode(action), field: "board"))
+        }
+        try load("first"); try range(0, 5)
+        try await eventually { transport.started.count == 4 }
+        check(Set(transport.started) == Set(ids.prefix(4).map { "first/" + $0 }))
+        check(transport.maximumActive == 4)
+        transport.release("first/fast")
+        try await eventually { status(2) == .string("Ready") && transport.started.count == 5 }
+        check(status(0) == .string("Loading")) // fast row publishes before the deliberately blocked first row
+        let horizontalPage = Data(#"{"action":"CatalogsWithExtra","args":{"action":"LoadNextPage","args":2}}"#.utf8)
+        check(!facade.dispatch(data: horizontalPage, field: "board"))
+        check(facade.lastFailure == "catalog_range_loading" && !transport.wasCancelled("first/slow"))
+        check(rows().count == ids.count && rows()[6].array?.first?["content"] == .null)
+        transport.release("first/failure")
+        try await eventually { status(1) == .string("Err") && transport.started.count == 6 }
+        check(status(2) == .string("Ready")) // one thrown request cannot discard another catalog
+        for id in ids[3...5] { transport.release("first/" + id) }
+        try await eventually { status(5) == .string("Ready") }
+        check(status(0) == .string("Loading") && transport.maximumActive == 4)
+        transport.release("first/slow"); await facade.settled()
+        check(rows().enumerated().allSatisfy { index, row in row.array?.first?["request"]?["path"]?["id"] == .string(ids[index]) })
+        check(state()?["selected"]?["extra"] == .array([.array([.string("search"), .string("first")])]))
+        try range(0, 5); await facade.settled(); check(transport.started.count == 6) // settled rows are reused
+        check(facade.dispatch(data: horizontalPage, field: "board")) // deferred UI request can now retry
+        await facade.settled()
+        check(rows()[2].array?.count == 2 && status(0) == .string("Ready"))
+        check(!rows().contains { $0.array?.contains { $0["content"]?["type"] == .string("Loading") } == true })
+        try range(6, 6); await facade.settled(); check(transport.started.count == 8 && status(6) == .string("Ready"))
+        try load("range"); try range(2, 2); await facade.settled()
+        check(transport.started.filter { $0.hasPrefix("range/") } == ["range/fast"])
+        check(status(2) == .string("Ready") && rows()[0].array?.first?["content"] == .null)
+        await facade.shutdown()
+
+        // The old provider ignores cancellation. Facade generation ownership must still protect a
+        // replacement query and Unload, even after its callback is already running on a worker.
+        for unload in [false, true] {
+            let blocked = CatalogFanoutTransport(held: ["old/slow"])
+            let scoped = try VortxNativeSession(scope: .init(account: "latest-query-\(unload)", ownerProfileID: "owner"),
+                ownerName: "Owner", abi: SessionABI(), store: SessionStore(), transport: blocked, allowNewAccount: true)
+            let bridge = try await VortxNativeCoreFacade.create(session: scoped, registry: [registry[0]], changed: { _ in })
+            func dispatch(_ raw: String) { check(bridge.dispatch(data: Data(raw.utf8), field: "search")) }
+            dispatch(#"{"action":"Load","args":{"model":"CatalogsWithExtra","args":{"extra":[["search","old"]]}}}"#)
+            dispatch(#"{"action":"CatalogsWithExtra","args":{"action":"LoadRange","args":{"start":0,"end":0}}}"#)
+            try await eventually { blocked.started.count == 1 }
+            let oldCompletion = Task { await bridge.settled() }
+            // Allow settled() to capture the currently admitted task before replacement.
+            await Task.yield()
+            if unload { dispatch(#"{"action":"Unload"}"#) }
+            else {
+                dispatch(#"{"action":"Load","args":{"model":"CatalogsWithExtra","args":{"extra":[["search","new"]]}}}"#)
+                dispatch(#"{"action":"CatalogsWithExtra","args":{"action":"LoadRange","args":{"start":0,"end":0}}}"#)
+                try await eventually { blocked.started.contains("new/slow") }
+            }
+            blocked.release("old/slow"); await oldCompletion.value; await bridge.settled()
+            let latest = try JSONDecoder().decode(VortxJSON.self, from: bridge.stateData("search")!)
+            check(blocked.wasCancelled("old/slow"))
+            if unload { check(latest["selected"] == .null && latest["catalogs"] == .array([])) }
+            else { check(latest["catalogs"]?.array?.first?.array?.first?["content"]?["content"]?.array?.first?["id"] == .string("new/slow")) }
+            await bridge.shutdown()
+        }
+        // Actor epoch, profile change, synchronous owner revocation and explicit task cancellation
+        // independently fence the batch, including when the transport eventually returns success.
+        for boundary in ["profile", "resources", "owner", "cancel"] {
+            let blocked = CatalogFanoutTransport(held: ["old/slow"]), publications = CatalogPublications()
+            let scoped = try VortxNativeSession(scope: .init(account: "batch-\(boundary)", ownerProfileID: "owner"),
+                ownerName: "Owner", abi: SessionABI(), store: SessionStore(), transport: blocked, allowNewAccount: true)
+            let operation = Task { try await scoped.loadCatalogs(.search,
+                catalogs: [(registry[0], .init(resource: .catalog, type: "movie", id: "slow", extra: [["search", "old"]]))],
+                selection: .object(["extra": .array([.array([.string("search"), .string("old")])])]), range: 0...0,
+                previous: nil, expectedProfileID: "owner", onUpdate: { publications.append($0) }) }
+            try await eventually { blocked.started.count == 1 }
+            check(publications.count == 1)
+            switch boundary {
+            case "profile": _ = try await scoped.dispatch([#"{"type":"switch_profile","id":"kid"}"#], now: 1)
+            case "resources": await scoped.invalidateResources()
+            case "owner": scoped.revoke()
+            default: operation.cancel()
+            }
+            blocked.release("old/slow")
+            do { _ = try await operation.value; check(false) } catch {}
+            check(publications.count == 1)
+            if boundary == "profile" {
+                do {
+                    _ = try await scoped.loadCatalogs(.search, catalogs: [(registry[0], .init(resource: .catalog, type: "movie", id: "slow"))],
+                        selection: .object([:]), range: 0...0, previous: nil, expectedProfileID: "owner", onUpdate: { publications.append($0) })
+                    check(false)
+                } catch VortxNativeError.superseded {}
+                check(blocked.started.count == 1 && publications.count == 1)
+                check(await scoped.screen("search") == nil) // stale admission cannot replace the new owner's screen
+            }
+            await scoped.close()
+        }
+        print("Native catalog fanout: incremental rows, four-request bound, partial errors, inclusive range/order, latest-query cancellation and owner/profile fences passed")
+    }
+    static func watchlistAdmissionTests() async throws {
+        let profile = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
+        let scope = VortxAccountScope(account: "watchlist-busy", ownerProfileID: profile.uuidString)
+        let store = SessionStore()
+        let session = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(),
+            store: store, transport: SessionTransport(), allowNewAccount: true)
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], changed: { _ in })
+        let binding = facade.watchlistBinding!
+        let entry = VortxNativeWatchlist.Entry(id: "tt-busy", type: "movie", name: "Queued title", poster: nil, addedAt: 123)
+        store.blockNextWrite()
+        let pending = Task { try await facade.mutateProfiles([], hostEdits: [.init(profileID: profile.uuidString, fields: ["avatar": .string("moon")])],
+            expectedProfileID: profile.uuidString, expectedAccountGeneration: binding.accountGeneration) }
+        await withCheckedContinuation { done in DispatchQueue.global().async { precondition(store.entered.wait(timeout: .now() + 5) == .success); done.resume() } }
+        check(facade.registryBinding == nil && facade.watchlistBinding == binding)
+        let add = Task { try await facade.setWatchlist(entry, present: true, expected: binding) }
+        store.release.signal(); try await pending.value
+        check(try await add.value)
+        check(facade.watchlistBinding == binding)
+        check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: profile) == [entry])
+        // Another busy host edit does not invalidate a durable add receipt or its owner's target.
+        store.blockNextWrite()
+        let later = Task { try await facade.mutateProfiles([], hostEdits: [.init(profileID: profile.uuidString, fields: ["avatar": .string("sun")])],
+            expectedProfileID: profile.uuidString, expectedAccountGeneration: binding.accountGeneration) }
+        await withCheckedContinuation { done in DispatchQueue.global().async { precondition(store.entered.wait(timeout: .now() + 5) == .success); done.resume() } }
+        check(facade.registryBinding == nil && facade.watchlistBinding == binding)
+        let remove = Task { try await facade.setWatchlist(entry, present: false, expected: binding) }
+        store.release.signal(); try await later.value
+        check(try await !remove.value)
+        check(try VortxNativeWatchlist.entries(host: facade.profileSnapshot()!.host, profileID: profile).isEmpty)
+        func switchTo(_ id: String) throws {
+            let action: VortxJSON = .object(["action": .string("Vortx"), "args": .object(["type": .string("switch_profile"), "id": .string(id)])])
+            check(facade.dispatch(data: try JSONEncoder().encode(action), field: "native_state"))
+        }
+        try switchTo("kid"); await facade.settled(); try switchTo(profile.uuidString); await facade.settled()
+        check(facade.watchlistBinding != binding && facade.watchlistBinding?.accountGeneration == binding.accountGeneration)
+        do { _ = try await facade.setWatchlist(entry, present: true, expected: binding); check(false) } catch VortxNativeError.superseded {}
+        let rebound = facade.watchlistBinding!
+        var remote = try facade.profileSnapshot()!.state["nativeSync"]!.decode([String: VortxJSON].self)
+        remote["accountSlots"] = .object([profile.uuidString: .object(["activeBinding": .object(["revision": .integer(1)])])])
+        _ = try await facade.mergeSyncDocument(.object(remote))
+        check(facade.watchlistBinding?.accountGeneration != rebound.accountGeneration)
+        do { _ = try await facade.setWatchlist(entry, present: true, expected: rebound); check(false) } catch VortxNativeError.superseded {}
+        let beforeClose = facade.watchlistBinding!
+        await facade.shutdown()
+        do { _ = try await facade.setWatchlist(entry, present: true, expected: beforeClose); check(false) } catch VortxNativeError.superseded {}
+        let cold = try VortxNativeSession(scope: scope, ownerName: "Owner", abi: SessionABI(), store: store, transport: SessionTransport())
+        check(try VortxNativeWatchlist.entries(host: await cold.hostPreferencesDocument(), profileID: profile).isEmpty)
+        await cold.close()
+        print("Native watchlist: busy host FIFO add/remove, acknowledged membership, stable busy target, profile ABA/account rebind/logout rejection and cold readback passed")
+    }
     static func main() async throws {
+        try await catalogFanoutTests()
+        try await watchlistAdmissionTests()
         check(VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: false))
         check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: true, hasLegacyAddonOrderIntent: false))
         check(!VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: false, hasLegacyAddonOrderIntent: true))

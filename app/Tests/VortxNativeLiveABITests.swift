@@ -5,7 +5,29 @@ import CryptoKit
 /// No app process, real account, media decoder or external provider is involved.
 @main enum VortxNativeLiveABITests {
     static func check(_ condition: Bool, line: Int = #line) { precondition(condition, "live ABI assertion at line \(line)") }
+    static func shortUnwatchedEpisode() throws {
+        let runtime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: "short-play-owner", ownerName: "Fixture")
+        defer { runtime.close() }
+        let action = #"{"type":"report_progress","metaId":"fresh-series","videoId":"fresh-series:1:1","name":"Fresh series","positionMs":1000,"durationMs":1375000,"metadata":{"type":"series"}}"#
+        check(try runtime.dispatch(action, now: 1001).contains("\"ok\":true"))
+        func verify(_ candidate: VortxNativeRuntime) throws {
+            let state = try JSONDecoder().decode(VortxJSON.self, from: Data(candidate.stateJSON().utf8))
+            let response = try candidate.resolve(#"{"kind":"profile_playback","profileId":"short-play-owner"}"#)
+            let playback = try JSONDecoder().decode(VortxJSON.self, from: Data(response.utf8))
+            let row = playback["continueWatching"]?.array?.first { $0["metaId"] == .string("fresh-series") }
+            check(row?["videoId"] == .string("fresh-series:1:1") && row?["offsetMs"] == .integer(1000))
+            check(row?["durationMs"] == .integer(1375000) && row?["watched"] == .bool(false))
+            check(playback["watchedTitles"]?["fresh-series"] == nil)
+            check(playback["watchedVideoIdsByTitle"]?["fresh-series"]?.array?.contains(.string("fresh-series:1:1")) != true)
+            check(state["libraries"]?["short-play-owner"]?["items"] == .array([]))
+        }
+        try verify(runtime)
+        let cold = try VortxNativeRuntime(abi: VortxCABI(), snapshot: runtime.stateJSON())
+        defer { cold.close() }; try verify(cold)
+        print("Live native short episode: 1000/1375000ms is unwatched Continue Watching, retains exact episode, stays unsaved and survives cold hydration")
+    }
     static func main() async throws {
+        try shortUnwatchedEpisode()
         let runtime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: "fixture-owner", ownerName: "Fixture")
         let add = try runtime.dispatch(#"{"type":"add_profile","id":"fixture-kid","name":"Kid"}"#, now: 1000)
         check(add.contains("\"ok\":true"))

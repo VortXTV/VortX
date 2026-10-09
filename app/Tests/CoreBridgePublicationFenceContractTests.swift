@@ -345,6 +345,28 @@ check(tvCards.contains("fallbackPreview: catalogPreview")
 check(event.contains("guard let self, self.publicationStillCurrent(publicationToken), self.searchLoaded else { return }")
                 && event.contains("self.loadSearchRange()"),
               "ctx search-range redispatch is dropped for stale or blocked account context")
+let searchPublication = section(event, from: "if fields.contains(\"search\")", until: "if fields.contains(\"local_search\")")
+check(searchPublication.contains("let data = stateData(\"search\")")
+        && searchPublication.contains("searchPublication.capture(query: query)")
+        && searchPublication.contains("self.publicationStillCurrent(publicationToken), let searchToken")
+        && searchPublication.contains("self.searchPublication.accepts(searchToken)"),
+      "search decodes one buffer and checks owner plus expected query generation at final publication")
+let watchlistTarget = section(bridge, from: "private func captureNativeWatchlistTarget()", until: "/// Never fall back to an unrelated legacy profile token")
+check(watchlistTarget.contains("CredentialScopeRegistry.shared.isCurrent(capture)")
+        && watchlistTarget.contains("facade.watchlistBinding")
+        && watchlistTarget.contains("nativePublishedAccountGeneration == binding.accountGeneration")
+        && watchlistTarget.contains("NativeProfileActionPreparation.target")
+        && watchlistTarget.contains("current.facade === target.facade && current.binding == target.binding")
+        && watchlistTarget.contains("target.facade.setWatchlist(entry, present: present, expected: target.binding)")
+        && watchlistTarget.contains("return membership")
+        && !watchlistTarget.contains("nativePlaybackBinding(target)"),
+      "watchlist preparation and acknowledgement retain stable credential/session/profile ownership through unrelated busy sync")
+let rowPagination = section(bridge, from: "func loadBoardRowNextPage(engineIndex:", until: "/// Apply a catalog presentation-order change")
+check(appearsBefore("deferredBoardRowPages.insert(engineIndex); return", "boardRowPageInFlight[engineIndex] = count", in: rowPagination)
+        && rowPagination.contains("if !accepted { boardRowPageInFlight[engineIndex] = nil")
+        && rowPagination.contains("deferredBoardRowPages.remove(index); loadBoardRowNextPage(engineIndex: index)")
+        && rowPagination.contains("!board.catalogs.joined().contains(where: { $0.content?.isLoading == true })"),
+      "native row pagination waits for the active range/page without a stuck latch and retries after settlement")
 check(event.contains("guard let self, self.publicationStillCurrent(publicationToken) else { return }\n                    guard fingerprint != self.discoverPublishedFingerprint")
                 && event.contains("self.discoverPublishedFingerprint = fingerprint"),
               "Discover fingerprint mutation is main-gated by the captured publication token")

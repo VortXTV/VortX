@@ -8,6 +8,27 @@ import StremioXCore
 #error("Native data engine requires the exact state/resource-host VortxEngine artifact and bridge conditions")
 #endif
 
+/// Search text changes before the debounced request. Carry both query and generation through
+/// worker decoding and main-thread publication so even A -> B -> A rejects a queued old A result.
+final class CoreSearchPublicationFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var query = ""
+    private var generation = UUID()
+    func prepare(_ value: String) -> (token: UUID, changed: Bool) {
+        lock.withLock {
+            let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            let changed = value != query
+            if changed { query = value; generation = UUID() }
+            return (generation, changed)
+        }
+    }
+    func capture(query value: String?) -> UUID? {
+        lock.withLock { value == query && query.count >= 2 ? generation : nil }
+    }
+    func accepts(_ token: UUID) -> Bool { lock.withLock { generation == token } }
+    func invalidate() { lock.withLock { generation = UUID() } }
+}
+
 /// Bridges the native Rust **stremio-core** engine (StremioXCore.xcframework) to Swift.
 ///
 /// The engine owns catalogs, library, Continue-Watching, meta and streams, the same way the official
@@ -127,24 +148,32 @@ final class CoreBridge: ObservableObject {
     func reportNativeProgress(for meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double,
                               target: PlaybackMutationTarget) {
         guard let (facade, profile) = nativePlaybackBinding(target),
-              case .native(let binding?) = target, let epoch = binding.accountGeneration,
-              positionSeconds.isFinite, durationSeconds.isFinite, positionSeconds >= 0, durationSeconds > 0,
-              positionSeconds * 1000 < Double(UInt64.max), durationSeconds * 1000 < Double(UInt64.max) else { return }
+              case .native(let binding?) = target, let epoch = binding.accountGeneration else {
+            DiagnosticsLog.log("native-playback", "operation=report_progress result=rejected reason=owner_or_profile_unavailable"); return
+        }
+        guard positionSeconds.isFinite, durationSeconds.isFinite, positionSeconds >= 0, durationSeconds > 0,
+              positionSeconds * 1000 < Double(UInt64.max), durationSeconds * 1000 < Double(UInt64.max) else {
+            DiagnosticsLog.log("native-playback", "operation=report_progress result=rejected reason=invalid_time"); return
+        }
         var action: [String: VortxJSON] = ["type": .string("report_progress"), "metaId": .string(meta.libraryId),
                                           "name": .string(meta.name), "positionMs": .unsigned(UInt64(positionSeconds * 1000)),
                                           "durationMs": .unsigned(UInt64(durationSeconds * 1000)),
                                           "metadata": .object(["type": .string(meta.type), "poster": meta.poster.map(VortxJSON.string) ?? .null])]
         if meta.usesSeriesLifecycle { action["videoId"] = .string(meta.videoId) }
-        _ = facade.dispatchForProfile(.object(action), profileID: profile.uuidString, expectedAccountGeneration: epoch)
+        let accepted = facade.dispatchForProfile(.object(action), profileID: profile.uuidString, expectedAccountGeneration: epoch)
+        DiagnosticsLog.log("native-playback", "operation=report_progress admitted=\(accepted) positionMs=\(UInt64(positionSeconds * 1000)) durationMs=\(UInt64(durationSeconds * 1000)) episode=\(meta.usesSeriesLifecycle)")
     }
     private func nativeWatchedIntent(id: String, videoID: String? = nil, name: String, type: String,
                                      poster: String?, watched: Bool, target: PlaybackMutationTarget? = nil) {
         let target = target ?? .capture(core: self)
-        guard let (facade, profile) = nativePlaybackBinding(target), case .native(let binding?) = target, let epoch = binding.accountGeneration else { return }
+        guard let (facade, profile) = nativePlaybackBinding(target), case .native(let binding?) = target, let epoch = binding.accountGeneration else {
+            DiagnosticsLog.log("native-playback", "operation=watched_intent result=rejected reason=owner_or_profile_unavailable"); return
+        }
         var action: [String: VortxJSON] = ["type": .string(watched ? "mark_watched" : "reset_watched"), "metaId": .string(id),
                                           "name": .string(name), "metadata": .object(["type": .string(type), "poster": poster.map(VortxJSON.string) ?? .null])]
         if let videoID { action["videoId"] = .string(videoID) }
-        _ = facade.dispatchForProfile(.object(action), profileID: profile.uuidString, expectedAccountGeneration: epoch)
+        let accepted = facade.dispatchForProfile(.object(action), profileID: profile.uuidString, expectedAccountGeneration: epoch)
+        DiagnosticsLog.log("native-playback", "operation=watched_intent admitted=\(accepted) watched=\(watched) episode=\(videoID != nil)")
     }
     /// Native series bulk operations are constrained to the exact episode inventory in the
     /// currently accepted metadata response.  IDs are opaque provider identities: never derive
@@ -292,20 +321,63 @@ final class CoreBridge: ObservableObject {
               ProfileStore.shared.activeID == profile else { throw VortxNativeError.closed }
         return try VortxNativeWatchlist.entries(host: snapshot.host, profileID: profile)
     }
-    @MainActor func setNativeWatchlist(_ entry: VortxNativeWatchlist.Entry, present: Bool, target: PlaybackMutationTarget) async throws -> Bool {
-        guard let (facade, _) = nativePlaybackBinding(target), case .native(let binding?) = target,
-              let epoch = binding.accountGeneration, let snapshot = facade.profileSnapshot() else { throw VortxNativeError.superseded }
-        let existing = try VortxNativeWatchlist.entries(host: snapshot.host, profileID: binding.profileID)
-        if present, !existing.contains(where: { $0.id == entry.id && $0.type == entry.type }), existing.count >= VortxNativeWatchlist.displayCap {
-            throw VortxNativeWatchlist.Failure.capacity
+    struct NativeWatchlistTarget {
+        fileprivate let owner: PlaybackMutationOwnershipPolicy.NativeBinding
+        fileprivate let binding: VortxNativeCoreFacade.WatchlistBinding
+        fileprivate let facade: VortxNativeCoreFacade
+    }
+    struct NativeWatchlistActionAdmission {
+        fileprivate let credential: CredentialScopeRegistry.Capture
+        fileprivate let profileID: UUID?
+        fileprivate let target: NativeWatchlistTarget?
+        fileprivate let sessionGeneration: UUID?
+    }
+    private func captureNativeWatchlistTarget() -> NativeWatchlistTarget? {
+        nativeFacadeLock.withLock {
+            guard let profile = ProfileStore.shared.activeID, let capture = nativeCredentialCapture,
+                  CredentialScopeRegistry.shared.isCurrent(capture), let facade = nativeFacadeStorage,
+                  let binding = facade.watchlistBinding, UUID(uuidString: binding.profileID) == profile,
+                  nativePublishedAccountGeneration == binding.accountGeneration else { return nil }
+            return .init(owner: .init(profileID: profile, credential: capture, sessionGeneration: nativeInstallGeneration,
+                accountGeneration: binding.accountGeneration), binding: binding, facade: facade)
         }
-        let field = try VortxNativeWatchlist.field(id: entry.id, type: entry.type)
-        let value: VortxJSON = present ? try VortxNativeWatchlist.value(entry) : .null
-        try await facade.mutateProfiles([], hostEdits: [.init(profileID: binding.profileID.uuidString, fields: [field: value])],
-            expectedProfileID: binding.profileID.uuidString, expectedAccountGeneration: epoch)
-        guard nativePlaybackBinding(target)?.0 === facade else { throw VortxNativeError.superseded }
+    }
+    func nativeWatchlistTargetIsCurrent(_ target: NativeWatchlistTarget) -> Bool {
+        guard let current = captureNativeWatchlistTarget() else { return false }
+        return current.facade === target.facade && current.binding == target.binding &&
+            PlaybackMutationOwnershipPolicy.allowsNative(.native(target.owner), binding: current.owner)
+    }
+    @MainActor func captureNativeWatchlistActionAdmission() -> NativeWatchlistActionAdmission {
+        let target = captureNativeWatchlistTarget()
+        let generation = nativeFacadeLock.withLock { nativeFacadeStorage == nil ? nil : nativeInstallGeneration }
+        return .init(credential: CredentialScopeRegistry.shared.capture(), profileID: ProfileStore.shared.activeID,
+                     target: target, sessionGeneration: generation)
+    }
+    @MainActor func prepareNativeWatchlistActionTarget(_ admission: NativeWatchlistActionAdmission) async -> NativeWatchlistTarget? {
+        await NativeProfileActionPreparation.target(isCurrent: {
+            CredentialScopeRegistry.shared.isCurrent(admission.credential) && ProfileStore.shared.activeID == admission.profileID &&
+                (admission.sessionGeneration == nil || self.nativeFacadeLock.withLock { self.nativeInstallGeneration == admission.sessionGeneration })
+        }, capture: {
+            if let target = admission.target { return self.nativeWatchlistTargetIsCurrent(target) ? target : nil }
+            return self.captureNativeWatchlistTarget()
+        }, prepare: {
+            guard admission.target == nil else { return }
+            if let facade = self.nativeFacade, facade.isAvailable { await facade.settled() }
+            else { _ = await VortXSyncManager.shared.restoreNativeCheckpoint(credentialCapture: admission.credential) }
+        })
+    }
+    @MainActor func setNativeWatchlist(_ entry: VortxNativeWatchlist.Entry, present: Bool, target: NativeWatchlistTarget) async throws -> Bool {
+        try Task.checkCancellation()
+        guard nativeWatchlistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
+        let membership = try await target.facade.setWatchlist(entry, present: present, expected: target.binding)
+        guard nativeWatchlistTargetIsCurrent(target) else { throw VortxNativeError.superseded }
         NotificationCenter.default.post(name: LibraryAutoAdd.watchlistChangedNote, object: nil)
-        return try nativeWatchlist().contains { $0.id == entry.id && $0.type == entry.type }
+        return membership
+    }
+    @MainActor func setNativeWatchlist(_ entry: VortxNativeWatchlist.Entry, present: Bool, target: PlaybackMutationTarget) async throws -> Bool {
+        guard let watchlist = captureNativeWatchlistTarget(),
+              PlaybackMutationOwnershipPolicy.allowsNative(target, binding: watchlist.owner) else { throw VortxNativeError.superseded }
+        return try await setNativeWatchlist(entry, present: present, target: watchlist)
     }
 
     /// Never fall back to an unrelated legacy profile token once a native binding exists.
@@ -587,6 +659,7 @@ final class CoreBridge: ObservableObject {
         addons = []; rawAddonsByUrl = [:]; manifestPreviewCache = [:]
         AddonMetaGate.publish(false)
         boardCatalogTotal = 0; boardPageInFlight = false; boardRowPageInFlight = [:]; boardRowExhausted = []
+        deferredBoardRowPages = []; deferredBoardRangeStep = nil
         metaLoadTargetLock.withLock { requestedMetaLoadTarget = nil }
         pendingEpisodeWatched = [:]; refindRequest = nil; cancelAppleCWMetaRefresh()
         invalidateNZBIndexerResults(); streamsEpoch &+= 1
@@ -2024,6 +2097,7 @@ final class CoreBridge: ObservableObject {
         boardPageInFlight = false
         boardRowPageInFlight = [:]   // catalogs reload from page 1, so engine indices reset (#95)
         boardRowExhausted = []
+        deferredBoardRowPages = []; deferredBoardRangeStep = nil
         dispatch(action: ["action": "Load",
                           "args": ["model": "CatalogsWithExtra",
                                    "args": ["type": NSNull(), "extra": []]]],
@@ -2048,6 +2122,8 @@ final class CoreBridge: ObservableObject {
     /// touched only on the main queue (mirrors `boardPageInFlight`).
     private var boardRowPageInFlight: [Int: Int] = [:]   // engineIndex -> item count when the load was dispatched
     private var boardRowExhausted: Set<Int> = []          // engine indices whose last settled load added nothing
+    private var deferredBoardRowPages: Set<Int> = []
+    private var deferredBoardRangeStep: Int?
 
     /// True while the requested range has not covered the engine's raw catalog count. The visible
     /// `boardRows` count is intentionally irrelevant: hidden, disabled, empty, and failed rows are
@@ -2064,6 +2140,9 @@ final class CoreBridge: ObservableObject {
     /// Home was permanently capped at its first 30 catalogs.
     func loadBoardNextPage(step: Int = 30) {
         guard boardHasNextPage, !boardPageInFlight else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        if !boardRowPageInFlight.isEmpty { deferredBoardRangeStep = step; return }
+#endif
         boardPageInFlight = true
         boardRowsLoaded += step
         dispatch(action: ["action": "CatalogsWithExtra",
@@ -2080,10 +2159,20 @@ final class CoreBridge: ObservableObject {
         guard let board = decode(CoreBoardState.self, field: "board"), engineIndex < board.catalogs.count else { return }
         let count = board.catalogs[engineIndex].compactMap { $0.content?.ready }.flatMap { $0 }.count
         guard count > 0 else { return }   // the row has not hydrated yet; nothing to page from
+#if VORTX_NATIVE_DATA_ENGINE
+        if !boardRowPageInFlight.isEmpty || board.catalogs.joined().contains(where: { $0.content?.isLoading == true }) {
+            deferredBoardRowPages.insert(engineIndex); return
+        }
+#endif
         boardRowPageInFlight[engineIndex] = count
-        dispatch(action: ["action": "CatalogsWithExtra",
+        let accepted = dispatch(action: ["action": "CatalogsWithExtra",
                           "args": ["action": "LoadNextPage", "args": engineIndex]],
                  field: "board")
+#if VORTX_NATIVE_DATA_ENGINE
+        if !accepted { boardRowPageInFlight[engineIndex] = nil; deferredBoardRowPages.insert(engineIndex) }
+#else
+        _ = accepted
+#endif
     }
 
     /// Reconcile in-flight per-row pagination after a `board` emit (#95). A SETTLED load (the catalog no
@@ -2091,7 +2180,7 @@ final class CoreBridge: ObservableObject {
     /// load that added nothing marks the row exhausted so it stops (a finite catalog never loops on no-op
     /// loads, mirroring `discoverExhausted`). Main-queue only; takes the board decoded off-main by the caller.
     private func reconcileBoardRowPagination(_ board: CoreBoardState?) {
-        guard !boardRowPageInFlight.isEmpty, let board else { return }
+        guard let board else { return }
         for (index, dispatchedCount) in boardRowPageInFlight {
             guard index < board.catalogs.count else { boardRowPageInFlight[index] = nil; continue }
             let pages = board.catalogs[index]
@@ -2100,6 +2189,17 @@ final class CoreBridge: ObservableObject {
             boardRowPageInFlight[index] = nil
             if count <= dispatchedCount { boardRowExhausted.insert(index) }
         }
+#if VORTX_NATIVE_DATA_ENGINE
+        guard boardRowPageInFlight.isEmpty, !board.catalogs.joined().contains(where: { $0.content?.isLoading == true }) else { return }
+        if let step = deferredBoardRangeStep {
+            deferredBoardRangeStep = nil; loadBoardNextPage(step: step)
+        } else {
+            deferredBoardRowPages = deferredBoardRowPages.filter { $0 < board.catalogs.count && !boardRowExhausted.contains($0) }
+            if let index = deferredBoardRowPages.min() {
+                deferredBoardRowPages.remove(index); loadBoardRowNextPage(engineIndex: index)
+            }
+        }
+#endif
     }
 
     /// Apply a catalog presentation-order change to Home. The stored order only sorts populated rows after
@@ -2300,6 +2400,27 @@ final class CoreBridge: ObservableObject {
     /// read at worst skips one re-dispatch that the next ctx change catches, or fires one harmless no-op
     /// `LoadRange`), matching the file's `playerActive` convention.
     private var searchLoaded = false
+    private let searchPublication = CoreSearchPublicationFence()
+    private struct SearchQueryEnvelope: Decodable {
+        struct Selection: Decodable { let extra: [[String]]? }
+        let selected: Selection?
+    }
+
+    /// Call synchronously when the text changes, before starting a debounce. This retires the old
+    /// query immediately; search(_:) still calls it for direct submissions and existing callers.
+    func prepareSearch(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prepared = searchPublication.prepare(trimmed)
+        guard prepared.changed else { return }
+        searchLoaded = false
+        dispatch(action: ["action": "Unload"], field: "search")
+        let clear = { [weak self] in
+            guard let self, self.searchPublication.accepts(prepared.token) else { return }
+            self.searchResults = []; self.searchSuggestions = []
+            self.searchIsLoading = trimmed.count >= 2
+        }
+        if Thread.isMainThread { clear() } else { DispatchQueue.main.async(execute: clear) }
+    }
 
     /// Fetch the planned search catalogs the app actually wants: indices `0...searchLoadRangeEnd`,
     /// inclusive engine-side. Shared by the initial `search()` and the mid-search re-dispatch in the `ctx`
@@ -2318,7 +2439,9 @@ final class CoreBridge: ObservableObject {
     /// extra). Results land in `searchResults`, flattened and de-duplicated into one grid.
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        setSearchLoading(trimmed.count >= 2)
+        prepareSearch(trimmed)
+        let token = searchPublication.prepare(trimmed).token
+        setSearchLoading(trimmed.count >= 2, token: token)
         guard trimmed.count >= 2 else {
             searchLoaded = false
             // Tell the ENGINE the search is over, not just the UI. Clearing `searchResults` alone left the
@@ -2329,7 +2452,10 @@ final class CoreBridge: ObservableObject {
             // drops both the selection and the pages engine-side, so the re-announce carries nothing.
             // Mirrors `unloadMeta` / `unloadEnginePlayer`; the `field` scopes it to this model alone.
             dispatch(action: ["action": "Unload"], field: "search")
-            DispatchQueue.main.async { [weak self] in self?.searchResults = [] }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.searchPublication.accepts(token) else { return }
+                self.searchResults = []
+            }
             return
         }
         searchLoaded = true
@@ -2340,11 +2466,14 @@ final class CoreBridge: ObservableObject {
         loadSearchRange()
     }
 
-    private func setSearchLoading(_ loading: Bool) {
+    private func setSearchLoading(_ loading: Bool, token: UUID) {
         if Thread.isMainThread {
-            searchIsLoading = loading
+            if searchPublication.accepts(token) { searchIsLoading = loading }
         } else {
-            DispatchQueue.main.async { [weak self] in self?.searchIsLoading = loading }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.searchPublication.accepts(token) else { return }
+                self.searchIsLoading = loading
+            }
         }
     }
 
@@ -4814,6 +4943,7 @@ final class CoreBridge: ObservableObject {
     /// cancelled as a latency optimisation, but the epoch guard remains the correctness fence for a
     /// closure already executing when cancellation arrives.
     private func invalidatePublicationEpoch() {
+        searchPublication.invalidate()
         publicationEpochLock.lock()
         publicationEpoch &+= 1
         publicationEpochLock.unlock()
@@ -5318,7 +5448,13 @@ final class CoreBridge: ObservableObject {
             }
         }
         if fields.contains("search") {
-            let board = decode(CoreBoardState.self, field: "search")
+            // Decode the query and catalog rows from one buffer, never two racing state reads.
+            let data = stateData("search")
+            let board = data.flatMap { try? JSONDecoder().decode(CoreBoardState.self, from: $0) }
+            let wire = data.flatMap { try? JSONDecoder().decode(SearchQueryEnvelope.self, from: $0) }
+            let extra = wire?.selected?.extra
+            let query = extra?.first { $0.count == 2 && $0[0] == "search" }?[1]
+            let searchToken = searchPublication.capture(query: query)
             let catalogs = board?.catalogs ?? []
             let pages = catalogs.flatMap { $0 }
             // GATE ON `selected` FIRST. The engine re-announces `search` as changed on every
@@ -5362,7 +5498,8 @@ final class CoreBridge: ObservableObject {
             VXProbe.log("engine", "search changed results=\(unique.count) loading=\(hasLoadingPages)")
             published = true
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.publicationStillCurrent(publicationToken) else { return }
+                guard let self, self.publicationStillCurrent(publicationToken), let searchToken,
+                      self.searchPublication.accepts(searchToken) else { return }
                 self.searchIsLoading = hasLoadingPages
                 if !hasLoadingPages || !unique.isEmpty {
                     self.searchResults = unique

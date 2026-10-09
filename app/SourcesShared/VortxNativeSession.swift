@@ -507,6 +507,8 @@ actor VortxNativeSession {
     private var epoch = UUID()
     private var tickets: [String: UUID] = [:]
     private var bridges: [String: VortxResourceBridge] = [:]
+    private var catalogBatchBridges: [String: [VortxResourceBridge]] = [:]
+    private var catalogPlans: [String: VortxJSON] = [:]
     private var pages: [String: [VortxResourceSnapshot]] = [:]
     private var screens: [String: VortxNativeScreenState] = [:]
     private var catalogRegistries: [String: [VortxResourceAddon]] = [:]
@@ -750,6 +752,8 @@ actor VortxNativeSession {
     nonisolated static func revokeAllForOwnerBoundary() { VortxScopeWriter.revokeAll() }
     private func invalidateScreens() {
         epoch = UUID(); bridges.values.forEach { $0.invalidate() }
+        catalogBatchBridges.values.flatMap { $0 }.forEach { $0.invalidate() }
+        catalogBatchBridges.removeAll(); catalogPlans.removeAll()
         tickets.removeAll(); pages.removeAll(); screens.removeAll(); catalogRegistries.removeAll()
     }
     func invalidateResources() { invalidateScreens() }
@@ -995,16 +999,104 @@ actor VortxNativeSession {
         return results
     }
     func screen(_ name: String) -> VortxNativeScreenState? { screens[name] }
-    private func begin(_ name: String) throws -> (VortxResourceBridge, UUID, UUID, String) {
+    private func begin(_ name: String, expectedProfileID: String? = nil) throws -> (VortxResourceBridge, UUID, UUID, String) {
         try Task.checkCancellation()
-        guard !closed else { throw VortxNativeError.closed }
+        guard case .string(let profile) = try scope.validateSnapshot(stateJSON())["activeProfileId"] else { throw VortxNativeError.invalidSnapshot }
+        guard expectedProfileID == nil || expectedProfileID == profile else { throw VortxNativeError.superseded }
+        catalogBatchBridges.removeValue(forKey: name)?.forEach { $0.invalidate() }
         let ticket = UUID(); tickets[name] = ticket; screens[name] = .loading
         let bridge = bridges[name] ?? VortxResourceBridge(transport: transport); bridges[name] = bridge
-        guard case .string(let profile) = try scope.validateSnapshot(runtime.stateJSON())["activeProfileId"] else { throw VortxNativeError.invalidSnapshot }
         try lease.withActive {}; return (bridge, ticket, epoch, profile)
     }
     private func current(_ name: String, _ ticket: UUID, _ capturedEpoch: UUID) -> Bool {
         !closed && epoch == capturedEpoch && tickets[name] == ticket && (try? lease.withActive { true }) == true
+    }
+    /// One screen operation owns the entire range. Individual bridges cannot supersede another
+    /// catalog; the shared ticket/epoch/lease still retire every leg at an owner or query boundary.
+    func loadCatalogs(_ screen: CatalogScreen, catalogs: [(VortxResourceAddon, VortxResourceRequest)],
+                      selection: VortxJSON, range: ClosedRange<Int>, previous: VortxJSON?,
+                      expectedProfileID: String,
+                      onUpdate: @escaping @Sendable (VortxJSON) -> Void) async throws -> VortxJSON {
+        guard catalogs.allSatisfy({ $0.1.resource == .catalog }) else { throw VortxNativeError.invalidResponse }
+        let name = screen.rawValue
+        let (priorBridge, ticket, capturedEpoch, profile) = try begin(name, expectedProfileID: expectedProfileID)
+        priorBridge.invalidate()
+        // A facade may have captured its rows just before this actor processed a profile change.
+        // Reuse only this epoch's own plan, never presentation rows from a retired owner.
+        let previousRows = previous == catalogPlans[name] && previous?["selected"] == selection ? previous?["catalogs"]?.array ?? [] : []
+        var rows = try catalogs.enumerated().map { index, item -> VortxJSON in
+            let request: VortxJSON = .object(["base": .string(item.0.transportUrl), "path": try VortxResourceProjection.path(item.1)])
+            if index < previousRows.count, let first = previousRows[index].array?.first,
+               first["request"] == request, [VortxJSON.string("Ready"), .string("Err")].contains(first["content"]?["type"] ?? .null) {
+                return previousRows[index]
+            }
+            return .array([.object(["request": request, "content": range.contains(index) ? .object(["type": .string("Loading")]) : .null])])
+        }
+        // Preserve only pages still present in this exact plan (including already loaded skips).
+        pages[name] = (pages[name] ?? []).filter { page in
+            page.ownerID == profile && rows.contains { row in
+                row.array?.contains { entry in
+                    entry["request"]?["path"] == (try? VortxResourceProjection.path(page.request)) &&
+                    page.sourceURLs.values.contains { entry["request"]?["base"] == .string($0) } &&
+                    [VortxJSON.string("Ready"), .string("Err")].contains(entry["content"]?["type"] ?? .null)
+                } == true
+            }
+        }
+        var registry: [VortxResourceAddon] = []
+        for (addon, _) in catalogs {
+            if let existing = registry.first(where: { $0.id == addon.id }) {
+                guard existing.transportUrl == addon.transportUrl else { throw VortxNativeError.invalidResponse }
+            } else { registry.append(addon) }
+        }
+        catalogRegistries[name] = registry
+        let pending = rows.indices.filter { range.contains($0) && rows[$0].array?.first?["content"]?["type"] == .string("Loading") }
+        let workers = pending.map { _ in VortxResourceBridge(transport: transport) }
+        catalogBatchBridges[name] = workers
+        defer {
+            workers.forEach { $0.invalidate() }
+            if tickets[name] == ticket { catalogBatchBridges.removeValue(forKey: name) }
+        }
+        func publish() throws -> VortxJSON {
+            try Task.checkCancellation()
+            guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+            let board: VortxJSON = .object(["selected": selection, "catalogs": .array(rows)])
+            catalogPlans[name] = board; screens[name] = .ready(board); onUpdate(board)
+            return board
+        }
+        _ = try publish()
+        return try await withThrowingTaskGroup(of: (Int, VortxResourceSnapshot?).self) { group in
+            func schedule(_ offset: Int) {
+                let item = catalogs[pending[offset]], bridge = workers[offset]
+                group.addTask {
+                    do { return (offset, try await bridge.load(ownerID: profile, request: item.1, addons: [item.0])) }
+                    catch { return (offset, nil) }
+                }
+            }
+            var scheduled = min(4, pending.count)
+            for offset in 0..<scheduled { schedule(offset) }
+            while let (offset, result) = try await group.next() {
+                try Task.checkCancellation()
+                guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+                let index = pending[offset], item = catalogs[index]
+                let snapshot: VortxResourceSnapshot
+                if let result {
+                    guard workers[offset].accepts(result) else { throw VortxNativeError.superseded }
+                    snapshot = result
+                } else {
+                    snapshot = .init(ownerID: profile, requestID: UUID().uuidString, generation: 0, request: item.1,
+                        groups: [], sourceURLs: [item.0.id: item.0.transportUrl])
+                }
+                let failure = VortxResourceGroup(addonId: item.0.id, status: .error, content: nil, error: .init(code: "native_catalog_failed"))
+                let content = snapshot.groups.first ?? failure
+                let accepted = VortxResourceSnapshot(ownerID: snapshot.ownerID, requestID: snapshot.requestID,
+                    generation: snapshot.generation, request: snapshot.request, groups: [content], sourceURLs: snapshot.sourceURLs)
+                pages[name, default: []].append(accepted)
+                rows[index] = .array([try VortxResourceProjection.entry(content, request: item.1, registry: registry)])
+                _ = try publish()
+                if scheduled < pending.count { schedule(scheduled); scheduled += 1 }
+            }
+            return .object(["selected": selection, "catalogs": .array(rows)])
+        }
     }
     func loadCatalog(_ screen: CatalogScreen, request: VortxResourceRequest, addons: [VortxResourceAddon], append: Bool = false) async throws -> VortxJSON {
         guard request.resource == .catalog else { throw VortxNativeError.invalidResponse }
@@ -1025,7 +1117,20 @@ actor VortxNativeSession {
                     guard previous.transportUrl == addon.transportUrl else { throw VortxNativeError.invalidResponse }
                 } else { registry.append(addon) }
             }
-            let projection = try VortxResourceProjection.board(pages: accepted, registry: registry)
+            var projection = try VortxResourceProjection.board(pages: accepted, registry: registry)
+            if append, let plan = catalogPlans[name], var rows = plan["catalogs"]?.array {
+                // Pagination retains the full planned order and the selected query, even when a
+                // different catalog completed first or an unrequested row still has nil content.
+                for row in projection["catalogs"]?.array ?? [] {
+                    guard let request = row.array?.first?["request"], let index = rows.firstIndex(where: {
+                        let existing = $0.array?.first?["request"]
+                        return existing?["base"] == request["base"] && existing?["path"]?["id"] == request["path"]?["id"] && existing?["path"]?["type"] == request["path"]?["type"]
+                    }) else { continue }
+                    rows[index] = row
+                }
+                projection = .object(["selected": plan["selected"] ?? .null, "catalogs": .array(rows)])
+                catalogPlans[name] = projection
+            } else { catalogPlans.removeValue(forKey: name) }
             catalogRegistries[name] = registry; pages[name] = accepted; screens[name] = .ready(projection); return projection
         } catch {
             if current(name, ticket, capturedEpoch) { screens[name] = .failed }; throw error
