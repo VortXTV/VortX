@@ -29,7 +29,8 @@ sed 's/#if os(macOS)/#if USENET_ADMISSION_MAC/g' "$usenet_test_dir/availability-
   # The untouched coordinator's actual cached-TorBox-before-local admission expression.
   printf '%s\n' 'func coordinatorWouldAttemptLocal(stream: CoreStream, nzb: String, confirmedUsenetURLs: Set<String>?, usenetSavedServers: [UsenetProviderServer]) -> Bool {'
   sed -n '/let torBoxHasItCached = confirmedUsenetURLs?.contains(nzb) ?? false/p' app/SourcesShared/DebridResolver.swift
-  sed -n 's/^[[:space:]]*if !torBoxHasItCached, \((.*)\) {/    return !torBoxHasItCached \&\& \1/p' app/SourcesShared/DebridResolver.swift
+  printf '%s\n' 'let resumingCloudJob = false'
+  sed -n 's/^[[:space:]]*if !torBoxHasItCached, !resumingCloudJob, \((.*)\) {/    return !torBoxHasItCached \&\& !resumingCloudJob \&\& \1/p' app/SourcesShared/DebridResolver.swift
   printf '%s\n' '}'
   sed -n '/^enum UsenetLocalResolver {/,/^\/\/ MARK: - Settings screen/p' app/SourcesShared/UsenetProvider.swift | sed '$d'
 } > "$usenet_test_dir/production-methods.swift"

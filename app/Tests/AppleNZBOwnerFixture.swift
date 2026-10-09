@@ -38,14 +38,30 @@ actor FixtureWarmGate {
     func release() { continuation?.resume(); continuation = nil }
 }
 enum DebridService: String, Sendable { case torBox }
-enum DebridError: Error, Equatable { case noKey, sessionChanged, providerError(String) }
+enum DebridError: Error, Equatable { case noKey, sessionChanged, notReady, providerError(String) }
+enum DebridPlaybackAvailability {
+    struct Availability { let canResolveUsenetRemotely = true }
+    static let shared = Availability()
+}
+enum UsenetProviderStore { static let isConfigured = false }
 actor FixtureCloudResolver {
     static let shared = FixtureCloudResolver()
     private(set) var calls = 0
     private var outputGate: FixtureWarmGate?
+    private var existingJob = false
+    private var delay: Duration?
+    private var responseError: DebridError?
+    func setExistingJob(_ value: Bool) { existingJob = value }
+    func setDelay(_ value: Duration?) { delay = value }
+    func setError(_ value: DebridError?) { responseError = value }
+    func hasJob(nzbURL: String, knownHash: String?) -> Bool { existingJob }
+    func isWaiting(nzbURL: String, knownHash: String?) -> Bool { existingJob && responseError == .notReady }
     func gateOutput(_ gate: FixtureWarmGate?) { outputGate = gate }
-    func resolve(nzbUrl: String, knownHash: String?, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
+    func resolve(nzbUrl: String, knownHash: String?, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?,
+                 ownerIsCurrent: @escaping @Sendable () async -> Bool = { true }) async throws -> URL {
         calls += 1
+        if let delay { try await Task.sleep(for: delay) }
+        if let responseError { throw responseError }
         let gate = outputGate; outputGate = nil
         await gate?.wait()
         return URL(string: "https://fixture.invalid/cloud")!
@@ -75,6 +91,8 @@ struct FixtureStream: Sendable {
 enum DebridProbe {
     static func log(_ category: String, _ text: String) {}
     static func h8(_ text: String) -> String { "fixture" }
+    static func since(_ start: Date) -> Int { 0 }
+    static func usenetFailure(_ error: Error) -> String { UsenetNodeClient.failureReason(error) }
 }
 enum StremioServer {
     static let nativeTransportSelected = true
