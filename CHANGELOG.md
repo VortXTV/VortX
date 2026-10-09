@@ -38,11 +38,17 @@ shipping selection and reviewed DV pre-attachment/mpv cache-map repairs are inte
 The website's final native projection/edit/optional-manifest source passed independent review,
 128 tests and the Astro/CSP build gate, and is now production-deployed with the exact reviewed
 tree, nine byte-matched JavaScript bundles and verified 19-page/seven-hash CSP content. This is
-not authenticated multi-device or live Stremio/provider/device proof. Native Usenet still has
-implementation blockers: Apple's legacy-only eligibility, Android's dropped add-on providers/
-mirrors and old Kotlin route, missing direct indexer wiring, and native aggregate deadline,
-caller-operation cancellation and explicit-selection handling. A reviewed sixteen-saved-provider
-transport repair passed 21 targeted NNTP tests, but has no fresh SDK/package yet. Fresh final
+not authenticated multi-device or live Stremio/provider/device proof. Apple's selected-runtime
+NZB eligibility repair and native seek diagnostics are integrated; the latter passed 32 actual
+property/wiring checks, not an original-freeze fix. Native Usenet still needs operation leases,
+per-job cancellation and selector/archive-original-ordinal wiring. Android's captured admission
+API is not full native routing: add-on provider/mirror retention and replacement of the old Kotlin
+route remain pending. Direct indexer wiring's first cohort exposed two old-owner retirement
+failures undergoing repair. The reviewed sixteen-provider transport repair passed 21 NNTP tests;
+its single complete-article deadline follow-up passed 29, after five of eight baseline regressions
+failed. Neither has a fresh packaged SDK yet. A subsequent Android candidate's CI succeeded but
+artifact readback is pending; Apple passed the repaired ABI gate and simulator compilation but
+failed its fail-closed launch smoke gate on UTF-8 decoding. Both use older inputs. Fresh final
 SDK/optimized whole-app rebuilding, actual package versions, signing, provenance/feeds and
 physical device/provider acceptance remain pending. Infuse watched-return, mpv PiP and broader
 parity/features are not claimed complete and remain part of the active overall goal. No public release,
