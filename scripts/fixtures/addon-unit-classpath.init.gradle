@@ -1,0 +1,17 @@
+// Read the genuine Android unit-test runtime classpath after the requested flavor has compiled.
+// This task performs no compilation, app launch, provider request or account operation itself.
+gradle.projectsEvaluated {
+    def app = rootProject.project(':app')
+    app.tasks.register('exportAddonUnitTestClasspath') {
+        doLast {
+            def variant = app.providers.gradleProperty('vortx.addonTestVariant').getOrElse('full')
+            if (!(variant in ['full', 'play'])) throw new GradleException('Expected full or play add-on test flavor')
+            def taskName = variant == 'full' ? 'testFullDebugUnitTest' : 'testPlayDebugUnitTest'
+            def testTask = app.tasks.named(taskName).get()
+            def output = app.layout.buildDirectory.file("addon-${variant}-unit-runtime.classpath").get().asFile
+            output.parentFile.mkdirs()
+            output.text = testTask.classpath.asPath
+            println "Retained actual ${taskName} runtime classpath: ${output}"
+        }
+    }
+}
