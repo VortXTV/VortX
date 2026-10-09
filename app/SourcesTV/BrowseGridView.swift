@@ -416,6 +416,7 @@ struct TVCategoryBrowse: View {
             .heroBottomStrip()
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .tvCatalogQuickViewRoutes()
         .onAppear { if selectedID.isEmpty, let first = subs.first { select(first.id) } }
         .onDisappear { loadTask?.cancel() }
     }
@@ -445,10 +446,9 @@ struct TVCategoryBrowse: View {
         } else {
             LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
                 ForEach(items) { item in
-                    PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                    TVCatalogSelectionCard(presentation: .preview(item), width: TVGridMetrics.landscapeCellWidth,
+                               posterWidth: TVGridMetrics.posterCellWidth, cinematic: false,
                                isWatched: watchedIndex.ids.contains(item.id),
-                               width: TVGridMetrics.posterCellWidth, landscapeWidth: TVGridMetrics.landscapeCellWidth,
-                               menu: .catalog,
                                onFocus: { focusModel.focus(hero(for: item)) })
                         .onAppear { if item.id == items.last?.id { Task { await loadNext() } } }
                 }

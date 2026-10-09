@@ -1161,9 +1161,8 @@ struct TopPicksRow: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(items) { item in
-                        PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                        TVCatalogSelectionCard(presentation: .preview(item), cinematic: false,
                                    isWatched: watchedIndex.ids.contains(item.id),
-                                   menu: .catalog,
                                    onFocus: focusModel.map { model in
                                        { model.focus(hero(for: item)) }
                                    })
