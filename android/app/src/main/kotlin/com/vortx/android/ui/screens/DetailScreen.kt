@@ -80,6 +80,7 @@ import com.vortx.android.catalog.WatchProvidersClient
 import com.vortx.android.debrid.DebridKeys
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.library.WatchlistStore
+import com.vortx.android.ui.components.PersonalRatingActions
 import com.vortx.android.model.Episode
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaDetail
@@ -537,6 +538,12 @@ fun DetailScreen(
                             modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
                         )
                     }
+                }
+                item {
+                    PersonalRatingActions(
+                        detail = m.data, tv = false,
+                        modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+                    )
                 }
                 // DET financials (MOVIES ONLY, gated on the "Show budget & box office" setting) + theatrical
                 // / digital release dates: compact fact lines under the ratings.

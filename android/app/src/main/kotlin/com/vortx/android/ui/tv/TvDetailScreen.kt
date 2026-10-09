@@ -55,6 +55,7 @@ import com.vortx.android.catalog.SimilarClient
 import com.vortx.android.catalog.WatchProvider
 import com.vortx.android.catalog.WatchProvidersClient
 import com.vortx.android.library.WatchlistStore
+import com.vortx.android.ui.components.PersonalRatingActions
 import com.vortx.android.person.CastMember
 import com.vortx.android.person.PersonSeed
 import com.vortx.android.person.TMDBPersonClient
@@ -529,6 +530,10 @@ private fun TvDetailContent(
                     modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.sm),
                 )
             }
+            PersonalRatingActions(
+                detail = detail, tv = true,
+                modifier = Modifier.padding(horizontal = TvDimens.edge, vertical = VortXTheme.spacing.sm),
+            )
 
             // DET financials (MOVIES ONLY, gated on "Show budget & box office"): budget + box office + profit
             // as one compact fact line under the ratings, additive to the hero meta line. Mirrors the phone
