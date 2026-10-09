@@ -161,14 +161,7 @@ class MpvPlayer private constructor(
     @Volatile
     private var hasLoadedSource: Boolean = false
 
-    /// The resume position (ms) to seek to ONCE the pipeline is warm, or 0 for none. A pre-first-frame
-    /// absolute seek on a cold libmpv pipeline arms mpv's cache-emptying hold and wedges video output
-    /// (a blank frame + a frozen timer), so [load] stashes the resume here instead of seeking inline and
-    /// [consumePendingResumeSeek] applies it at the first rendered frame. Volatile: written on [load] and
-    /// read/cleared on the mpv event thread. Mirrors Apple `pendingLibmpvResumeSeek`
-    /// (app/Sources/PlayerScreen.swift:1845 stash -> :1654 first-frame apply).
-    @Volatile
-    private var pendingResumeSeekMs: Long = 0L
+    private val seekCommands = MpvSeekCommandArbiter(mpv::command) { _state.value.durationMs }
 
     private val runtimePolicyScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val subtitleLoadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -253,7 +246,9 @@ class MpvPlayer private constructor(
             // The gate drops the callback entirely when teardown won the race, when a duplicate
             // arrives after the first terminal, or inside the replacement-suppression window; it
             // publishes under its lock only for a state-changing verdict.
-            val applied = terminalGate.onTerminal(event)
+            val applied = seekCommands.onTerminal(retiresLoad = event.reason != MpvTerminalReason.REDIRECT) {
+                terminalGate.onTerminal(event)
+            }
             if (applied?.nativeError != null) {
                 Log.e(TAG, "mpv terminal ${applied.reason}; native error=${applied.nativeError}")
             }
@@ -354,17 +349,18 @@ class MpvPlayer private constructor(
 
     override fun load(playable: Playable) {
         if (released.get()) return
+        // Close the previous auto-resume authority before any setup/property work can admit a callback.
+        val seekLoad = seekCommands.beginLoad {
+            // Reset classification under the same command admission as ticket replacement. Otherwise
+            // an old END_FILE between these steps could retire this new load before it is dispatched.
+            if (hasLoadedSource) terminalGate.beginReplacementLoad() else terminalGate.beginFirstLoad()
+            hasLoadedSource = true
+        } ?: return
         val loadGeneration = synchronized(subtitleGenerationGate) {
             subtitleLoadGeneration.incrementAndGet()
         }
-        // Reset terminal classification and invalidate the previous source's opportunity tokens before
-        // cancelling its jobs. Their finally blocks may run immediately; completion must be a no-op for
-        // this new source generation.
-        if (hasLoadedSource) {
-            terminalGate.beginReplacementLoad()
-        } else {
-            terminalGate.beginFirstLoad()
-        }
+        // The transaction above also invalidated the previous source's opportunity tokens before
+        // cancelling its jobs. Their finally blocks may run immediately and must be no-ops for this load.
         // A replacement never retains work started for its predecessor. The final command is also gated
         // below, covering a job that completed its copy at exactly the same time as this cancellation.
         subtitleLoadScope.coroutineContext.cancelChildren()
@@ -379,7 +375,6 @@ class MpvPlayer private constructor(
         // For a replacement the gate above armed its suppression window: mpv queues the OLD source's
         // END_FILE before the NEW source's START_FILE on this client's event queue, so exactly that span
         // is where a stale old-source terminal must be dropped. START_FILE closes the window.
-        hasLoadedSource = true
         playbackStarted = false
 
         // Every file starts from the known network-identity baseline. This player instance is reused across
@@ -438,48 +433,26 @@ class MpvPlayer private constructor(
         // races file initialization and may attach to the outgoing file (or no file). Always clear first,
         // including ordinary streams, so a previous trailer's audio cannot leak into the next title.
         // argv append preserves a signed URL's colons/commas without path-list re-parsing, matching Apple.
-        mpv.command(arrayOf("change-list", "audio-files", "clr", ""))
+        if (!seekCommands.commandForLoad(seekLoad, arrayOf("change-list", "audio-files", "clr", ""))) return
         playable.audioUrl?.let { audio ->
-            mpv.command(arrayOf("change-list", "audio-files", "append", audio))
+            if (!seekCommands.commandForLoad(seekLoad, arrayOf("change-list", "audio-files", "append", audio))) return
         }
 
         // loadfile as an argv array so a URL containing mpv's list/escape chars is one argument.
-        mpv.command(arrayOf("loadfile", playable.url, "replace"))
-
+        if (!seekCommands.load(seekLoad, playable.url, playable.startPositionMs)) return
         // WHY audit 07.5: never hand an untrusted remote subtitle URL to mpv. Download under the same
         // 8 MiB / 20s bounds as Apple, then mount only the local cache file. Failure never affects playback.
         for (sub in MpvExternalSubtitleTransport.normalizedTracks(playable)) {
             mountExternalSubtitle(sub, loadGeneration)
         }
-
-        // Resume position: DEFER the seek to the first rendered frame rather than issuing it here. A
-        // pre-first-frame absolute seek on a cold libmpv pipeline arms mpv's cache-emptying hold and
-        // wedges video output (a blank frame + a frozen timer); stashing it and applying it at
-        // PLAYBACK_RESTART (or the first observed position advance, the resume watchdog) lands it as an
-        // ordinary warm scrub, which is proven to render. Mirrors the Apple fix
-        // (app/Sources/PlayerScreen.swift:1845 stash -> :1654 first-frame apply). Cleared on every load
-        // so a switch/reload never inherits the previous file's resume.
-        pendingResumeSeekMs = if (playable.startPositionMs > 0L) playable.startPositionMs else 0L
     }
 
     /// Apply the deferred resume seek once the pipeline is warm (first frame rendered, or the first
-    /// position advance as the watchdog). The pending value is cleared BEFORE the seek so the two trigger
-    /// signals (PLAYBACK_RESTART + the first `time-pos` advance) can never double-apply it; both run on the
-    /// single mpv event thread, so no lock is needed. A no-op for a non-resume load. Mirrors Apple
-    /// consuming `pendingLibmpvResumeSeek` at the FIRST FRAME.
+    /// position advance as the watchdog). The arbiter clears the pending value before dispatch and orders
+    /// dispatch with manual seeks/terminal/release. Bare callbacks cannot identify a replacement source,
+    /// so an in-place reused decoder never arms another automatic resume; normal replacements are fresh.
     private fun consumePendingResumeSeek() {
-        val target = pendingResumeSeekMs
-        if (target <= 0L) return
-        pendingResumeSeekMs = 0L
-        // RESUME ADMISSION (Apple PlayerScreen.swift:1812 `resumeSeconds > 5, resumeSeconds < d - 10`):
-        // only honour a resume past a >5s floor and clear of the last 10s, so a barely-started or
-        // all-but-finished title starts over instead of snapping to a position 5s from the credits. The
-        // duration is known by the first frame; when it is not yet, only the floor applies (the tail guard
-        // is gated on a positive duration), which the later position advance never re-triggers.
-        if (target <= RESUME_FLOOR_MS) return
-        val durationMs = _state.value.durationMs
-        if (durationMs > 0L && target >= durationMs - RESUME_TAIL_GUARD_MS) return
-        mpv.command(arrayOf("seek", (target / 1000.0).toString(), "absolute"))
+        seekCommands.onWarm()
     }
 
     /** WHY audit 05.3: mpv keeps filling its forward cache while paused. Mirror Apple's delayed 48 MiB
@@ -542,13 +515,13 @@ class MpvPlayer private constructor(
     }
 
     override fun seekTo(positionMs: Long) {
-        mpv.command(arrayOf("seek", (positionMs.coerceAtLeast(0L) / 1000.0).toString(), "absolute"))
+        seekCommands.seekTo(positionMs)
     }
 
     override fun seekBy(deltaMs: Long) {
         // mpv's own relative seek: exact against mpv's true position (the observed time-pos can lag up
         // to a second behind) and natively clamped to [0, duration], so no state math here.
-        mpv.command(arrayOf("seek", (deltaMs / 1000.0).toString(), "relative"))
+        seekCommands.seekBy(deltaMs)
     }
 
     override fun setPlaybackSpeed(speed: Float) { mpv.setPropertyString(PROP_SPEED, speed.toString()) }
@@ -1046,6 +1019,8 @@ class MpvPlayer private constructor(
     }
 
     override fun release() {
+        // Close command admission before teardown; never hold its monitor across native destroy/join.
+        seekCommands.release()
         if (!released.compareAndSet(false, true)) return
         synchronized(subtitleGenerationGate) {
             subtitleLoadGeneration.incrementAndGet()
@@ -1232,11 +1207,6 @@ class MpvPlayer private constructor(
         /// Final tile quality, 0.7 == Apple's `kCGImageDestinationLossyCompressionQuality: 0.7` on both of
         /// its capture paths. Kept identical so an Android-contributed tile matches an Apple one.
         private const val CAPTURE_JPEG_QUALITY = 70
-
-        /// Resume admission bounds (Apple `resumeSeconds > 5, resumeSeconds < d - 10`): resume only past a
-        /// 5s floor and clear of the last 10s, so a barely-started or all-but-finished title starts over.
-        private const val RESUME_FLOOR_MS = 5_000L
-        private const val RESUME_TAIL_GUARD_MS = 10_000L
 
         // Per-file read-ahead: local torrent/loopback vs remote debrid/CDN (mirrors Apple loadFile).
         // LOCAL stays a conservative flat cap (a torrent/loopback stream buffers in the streaming server's
