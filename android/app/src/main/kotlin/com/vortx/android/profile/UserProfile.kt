@@ -259,6 +259,7 @@ data class PlaybackPrefs(
     val preferKeywords: String? = null,
     val avoidBehavior: String? = null,       // "hide" (drop) or "rank" (demote-but-visible)
     val autoPickBest: Boolean? = null,
+    val matchConfidenceThreshold: Int? = null,
 ) {
     companion object {
         fun encode(p: PlaybackPrefs): JSONObject = JSONObject().apply {
@@ -289,6 +290,7 @@ data class PlaybackPrefs(
             p.preferKeywords?.let { put("preferKeywords", it) }
             p.avoidBehavior?.let { put("avoidBehavior", it) }
             p.autoPickBest?.let { put("autoPickBest", it) }
+            p.matchConfidenceThreshold?.let { put("matchConfidenceThreshold", it.coerceIn(0, 100)) }
         }
 
         fun decode(o: JSONObject): PlaybackPrefs = PlaybackPrefs(
@@ -319,6 +321,7 @@ data class PlaybackPrefs(
             preferKeywords = o.optStringOrNull("preferKeywords"),
             avoidBehavior = o.optStringOrNull("avoidBehavior"),
             autoPickBest = o.optBooleanOrNull("autoPickBest"),
+            matchConfidenceThreshold = o.optIntOrNull("matchConfidenceThreshold")?.coerceIn(0, 100),
         )
     }
 }

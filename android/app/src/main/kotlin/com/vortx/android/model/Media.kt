@@ -304,6 +304,8 @@ data class MetaDetail(
     /// Mirrors Apple `CoreMetaItem.trailerYouTubeID`.
     val trailerYouTubeId: String? = null,
     val relations: List<MediaRelation> = emptyList(),
+    /** Known metadata names for source matching (original/localized names and provider aliases). */
+    val titleAliases: List<String> = emptyList(),
 ) {
     /// All episodes ordered (season, then episode, then id) across EVERY season -- the list handed to
     /// the player so auto-advance rolls past the season boundary. Mirrors Apple

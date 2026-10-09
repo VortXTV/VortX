@@ -73,6 +73,8 @@ data class SourcePrefsSnapshot(
     val maxFileSizeGB: Double,
     val audioLanguages: List<String>,
     val isKids: Boolean,
+    /** Minimum request title/episode text confidence; zero keeps the existing ranking unchanged. */
+    val matchConfidenceThreshold: Int = 0,
 ) {
     /// Whether the Hide / Require fields impose any filter, accounting for regex vs substring mode.
     /// Mirrors Apple `keywordFilterActive`.
@@ -89,7 +91,8 @@ data class SourcePrefsSnapshot(
     val noFiltersActive: Boolean
         get() = !keywordFilterActive && preferTerms.isEmpty() && safetyMode == "off" &&
             !hideDeadTorrents && !instantOnly && !hdrOnly && !excludeAV1 && maxResolution == 0 &&
-            minResolution == 0 && !hideUnknownResolution && !preferredAudioOnly && maxFileSizeGB == 0.0
+            minResolution == 0 && !hideUnknownResolution && !preferredAudioOnly && maxFileSizeGB == 0.0 &&
+            matchConfidenceThreshold == 0
 
     /// Dominant-tier score added to a stream so its source type is the primary sort key. Mirrors Apple
     /// `SourcePreferences.tierWeight(for:)` / `Snapshot.tierWeight(for:)`: the type's position in
@@ -123,6 +126,7 @@ data class SourcePrefsSnapshot(
             maxFileSizeGB.toString(),
             audioLanguages.joinToString(","),
             if (isKids) "1" else "0",
+            matchConfidenceThreshold.toString(),
         ).joinToString("|")
     }
 
@@ -234,6 +238,13 @@ class SourcePreferencesStore(context: Context) {
     var autoPickBest: Boolean
         get() = prefs.getBoolean(AUTO_PICK_BEST_KEY, DEFAULT_AUTO_PICK_BEST)
         set(value) { prefs.edit().putBoolean(AUTO_PICK_BEST_KEY, value).apply() }
+
+    var matchConfidenceThreshold: Int
+        get() = prefs.getInt(MATCH_CONFIDENCE_KEY, DEFAULT_MATCH_CONFIDENCE).coerceIn(0, 100)
+        set(value) {
+            prefs.edit().putInt(MATCH_CONFIDENCE_KEY, value.coerceIn(0, 100)).apply()
+            StreamRanking.invalidateCaches()
+        }
 
     // ---- Safety + numeric filters ----
 
@@ -365,6 +376,7 @@ class SourcePreferencesStore(context: Context) {
             maxFileSizeGB = maxFileSizeGB,
             audioLanguages = audioLanguages,
             isKids = isKids,
+            matchConfidenceThreshold = matchConfidenceThreshold,
         )
     }
 
@@ -418,6 +430,7 @@ class SourcePreferencesStore(context: Context) {
         const val PREFER_KEY = "vortx.streaming.preferKeywords"
         const val AVOID_BEHAVIOR_KEY = "vortx.streaming.avoidBehavior"
         const val AUTO_PICK_BEST_KEY = "vortx.streaming.autoPickBest"
+        const val MATCH_CONFIDENCE_KEY = "vortx.streaming.matchConfidenceThreshold"
 
         // Documented per-profile stream-filter defaults, in ONE place (Apple's `defaultX` constants).
         const val DEFAULT_SAFETY_MODE = "off"
@@ -438,6 +451,18 @@ class SourcePreferencesStore(context: Context) {
         const val DEFAULT_PREFER_KEYWORDS = ""
         const val DEFAULT_AVOID_BEHAVIOR = "hide"
         const val DEFAULT_AUTO_PICK_BEST = false
+        const val DEFAULT_MATCH_CONFIDENCE = 0
+
+        /** Same flat-key profile apply contract as the other source filters: reset on switch only. */
+        internal fun applyProfileMatchConfidence(
+            editor: SharedPreferences.Editor,
+            value: Int?,
+            resetUnset: Boolean,
+        ) {
+            if (value != null || resetUnset) {
+                editor.putInt(MATCH_CONFIDENCE_KEY, (value ?: DEFAULT_MATCH_CONFIDENCE).coerceIn(0, 100))
+            }
+        }
 
         /// Compile a user pattern case-insensitively, or null when regex mode is off, the field is blank,
         /// or the pattern is invalid (fail-open: a bad regex applies no filter rather than hiding

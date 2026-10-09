@@ -69,6 +69,7 @@ object SourceSettingsRevision {
         SourcePreferencesStore.PREFER_KEY,
         SourcePreferencesStore.AVOID_BEHAVIOR_KEY,
         SourcePreferencesStore.AUTO_PICK_BEST_KEY,
+        SourcePreferencesStore.MATCH_CONFIDENCE_KEY,
         SourcePreferencesStore.DEFAULT_SORT_KEY,
         PlaybackBehaviorSettings.DIRECT_LINKS_ONLY_KEY,
         TrackPreferencesStore.KEY_AUDIO,
