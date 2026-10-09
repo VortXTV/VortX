@@ -170,14 +170,14 @@ class SourceListModel(
     ): SourceListState? {
         val tb = torbox ?: return null
         val sing = singularity ?: return null
+        val js = communityJs
+        val jsSettled = js?.settled ?: MutableStateFlow(true)
+        val jsEpoch = js?.epoch ?: MutableStateFlow(0)
         val settled = withTimeoutOrNull(deadlineMs) {
-            combine(state, tb.settlement, sing.settlement) { current, torboxState, singularityState ->
-                val targetMatches = current.requestGeneration == requestGeneration && current.streamId == streamId
-                val contributorsSettled =
-                    torboxState.requestGeneration == requestGeneration && torboxState.settled &&
-                        singularityState.requestGeneration == requestGeneration && singularityState.settled &&
-                        current.torboxEpoch == tb.epoch && current.singularityEpoch == sing.epoch
-                current.takeIf { targetMatches && contributorsSettled }
+            combine(state, tb.settlement, sing.settlement, jsSettled, jsEpoch) { current, torboxState, singularityState, communitySettled, communityEpoch ->
+                current.takeIf { sourceAssemblySettledForTarget(it, requestGeneration, streamId,
+                    torboxState, singularityState, tb.epoch, sing.epoch, communityEpoch, communitySettled,
+                    rawGroups.value.hashCode(), mediaServerGroups.value.hashCode()) }
             }.first { it != null }
         }
         return settled ?: state.value.takeIf {
@@ -220,6 +220,9 @@ class SourceListModel(
         val assembled = assemble(raw, torboxSnapshot.streams, singularitySnapshot.streams, jsSnapshot.streams, media, ctx).copy(
             torboxEpoch = torboxSnapshot.epoch,
             singularityEpoch = singularitySnapshot.epoch,
+            communityJsEpoch = jsSnapshot.epoch,
+            rawGroupsHash = raw.hashCode(),
+            mediaServerGroupsHash = media.hashCode(),
         )
         _state.value = assembled
 
@@ -475,4 +478,19 @@ data class SourceListState(
     val streamId: String? = null,
     val torboxEpoch: Int = -1,
     val singularityEpoch: Int = -1,
+    val communityJsEpoch: Int = 0,
+    val rawGroupsHash: Int = 0,
+    val mediaServerGroupsHash: Int = 0,
 )
+
+/** Completion is usable only after the coalescer has published every contributor's accepted epoch. */
+internal fun sourceAssemblySettledForTarget(
+    current: SourceListState, requestGeneration: Long, streamId: String?,
+    torbox: SourceContributorSettlement, singularity: SourceContributorSettlement,
+    torboxEpoch: Int, singularityEpoch: Int, communityJsEpoch: Int, communityJsSettled: Boolean,
+    rawGroupsHash: Int = current.rawGroupsHash, mediaServerGroupsHash: Int = current.mediaServerGroupsHash,
+): Boolean = current.requestGeneration == requestGeneration && current.streamId == streamId &&
+    torbox.requestGeneration == requestGeneration && torbox.settled &&
+    singularity.requestGeneration == requestGeneration && singularity.settled && communityJsSettled &&
+    current.torboxEpoch == torboxEpoch && current.singularityEpoch == singularityEpoch && current.communityJsEpoch == communityJsEpoch &&
+    current.rawGroupsHash == rawGroupsHash && current.mediaServerGroupsHash == mediaServerGroupsHash

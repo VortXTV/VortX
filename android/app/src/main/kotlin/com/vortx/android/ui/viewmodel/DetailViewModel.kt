@@ -54,6 +54,7 @@ import com.vortx.android.torbox.TorBoxSearchSource
 import com.vortx.android.communityjs.CommunityJsProviderSource
 import com.vortx.android.ui.UiState
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -129,6 +130,8 @@ internal suspend fun <T> withEpisodeSwitchCancellationRollback(
     rollbackIfOwned()
     throw cancelled
 }
+
+data class EpisodeBrowseAnchor(val videoId: String, val revision: Long)
 
 /**
  * A detail mutation belongs to the profile and canonical meta target visible when the viewer tapped.
@@ -413,6 +416,16 @@ class DetailViewModel(
     private val sourceRequestFence = SourceRequestFence(sourceSticky.currentProfileId())
     private val sourceSwitchCommitGate = PlayerSourceSwitchCommitGate()
     private var sourceLoadJob: Job? = null
+    private var automaticEpisodeBudget: Pair<SourceRequestFence.Token, EpisodeResolutionBudget>? = null
+    private val sourceSettlement = MutableStateFlow(EpisodeSourceSettlement())
+    private var episodeBudgetJob: Job? = null
+    private var lastAcceptedEpisodeId: String? = null
+    private var episodeBrowseRevision = 0L
+    private val _episodeBrowseAnchor = MutableStateFlow<EpisodeBrowseAnchor?>(null)
+    val episodeBrowseAnchor: StateFlow<EpisodeBrowseAnchor?> = _episodeBrowseAnchor.asStateFlow()
+    fun consumeEpisodeBrowseAnchor(revision: Long) {
+        if (_episodeBrowseAnchor.value?.revision == revision) _episodeBrowseAnchor.value = null
+    }
     private var cacheCheckJob: Job? = null
     private val cacheCheckGate = CacheCheckGenerationGate()
     private var playbackResolveJob: Job? = null
@@ -777,9 +790,39 @@ class DetailViewModel(
             sourceRequestFence.begin(profileId, episodeId)
         }
         sourceSelectionRevision = DetailSourceSelectionRevision(token.generation, _sourceAudioLanguageHint.value)
+        sourceSettlement.value = EpisodeSourceSettlement(token)
         sourceLoadJob?.cancel()
+        episodeBudgetJob?.cancel()
+        automaticEpisodeBudget = null
         if (forceRefresh) torbox.reset(token.generation, clearCache = true)
         sourceLoadJob = viewModelScope.launch { loadSources(episodeId, token, forceRefresh) }
+        if (pendingAutoPick && episodeId != null) armAutomaticEpisodeBudget(token)
+    }
+
+    private fun armAutomaticEpisodeBudget(request: SourceRequestFence.Token) {
+        episodeBudgetJob?.cancel()
+        val budget = EpisodeResolutionBudget()
+        val bound = request to budget
+        automaticEpisodeBudget = bound
+        episodeBudgetJob = viewModelScope.launch {
+            delay(budget.sourceRemainingMs())
+            if (automaticEpisodeBudget !== bound || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
+            if (pendingAutoPick) {
+                pendingAutoPick = false
+                pendingAdvanceHint = null
+                val current = sourceModel.state.value.takeIf { it.requestGeneration == request.generation && it.streamId == request.targetId }
+                if (current?.best != null) playAutomatically(current.best)
+                else {
+                    sourceLoadJob?.cancel()
+                    _playback.value = Playback.Failed("No playable source for the next episode.")
+                }
+            }
+            delay(budget.remainingMs())
+            if (automaticEpisodeBudget === bound && sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) && _playback.value is Playback.Resolving) {
+                abandonPlaybackResolve()
+                _playback.value = Playback.Failed("Episode preparation timed out. Try this episode again.")
+            }
+        }
     }
 
     /**
@@ -817,6 +860,11 @@ class DetailViewModel(
         pendingAdvanceHint = null
         invalidateWarmNextSource()
         abandonPlaybackResolve()
+        episodeBudgetJob?.cancel()
+        automaticEpisodeBudget = null
+        if (type == MediaType.SERIES) (lastAcceptedEpisodeId ?: _selectedEpisodeId.value)?.let {
+            _episodeBrowseAnchor.value = EpisodeBrowseAnchor(it, ++episodeBrowseRevision)
+        }
         _playback.value = Playback.Idle
     }
 
@@ -827,6 +875,11 @@ class DetailViewModel(
     private fun publishPlaybackResolve(lease: PlaybackResolveFence.Lease, state: Playback): Boolean {
         if (!canPublishPlaybackResolve(lease)) return false
         _playback.value = state
+        if (state is Playback.Ready && type == MediaType.SERIES) lastAcceptedEpisodeId = _selectedEpisodeId.value
+        if (state is Playback.Ready || state is Playback.Failed) {
+            automaticEpisodeBudget = null
+            episodeBudgetJob?.cancel()
+        }
         playbackResolveFence.finish(lease)
         return true
     }
@@ -847,6 +900,10 @@ class DetailViewModel(
     }
 
     private fun rebuildForProfile(profileId: String) {
+        lastAcceptedEpisodeId = null
+        _episodeBrowseAnchor.value = null
+        episodeBudgetJob?.cancel()
+        automaticEpisodeBudget = null
         detailMutationFence.invalidate()
         invalidateWarmNextSource()
         sourceLoadJob?.cancel()
@@ -860,6 +917,7 @@ class DetailViewModel(
         sourceModel.setMediaServerGroups(emptyList())
         sourceModel.setContext(SourceListModel.Context(requestGeneration = invalidGeneration))
         sourcesReady = false
+        sourceSettlement.value = EpisodeSourceSettlement()
         debridCacheEvidence = null
         resumeRef = null
         lastCtx = null
@@ -905,6 +963,7 @@ class DetailViewModel(
     private suspend fun loadSources(episodeId: String?, request: SourceRequestFence.Token, forceRefresh: Boolean = false) {
         try {
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
+        sourceSettlement.value = EpisodeSourceSettlement(request)
         // Reset per-target state so a superseded episode's rows / cache badges can never leak into the new one.
         sourcesReady = false
         debridCacheEvidence = null
@@ -982,6 +1041,7 @@ class DetailViewModel(
                         _streams.value = UiState.Success(displayRaw)
                     }
                     sourceModel.setRawGroups(raw)
+                    if (update.selectionReady) sourceSettlement.value = EpisodeSourceSettlement(request, settled = true)
                     if (raw.isNotEmpty()) {
                         runCacheCheck(raw, episodeId, season, episodeNum, request, ctx.contentId)
                     }
@@ -999,13 +1059,14 @@ class DetailViewModel(
                     if (autoPickLease != null) {
                         val hint = pendingAdvanceHint
                         pendingAdvanceHint = null
+                        val episodeBudget = automaticEpisodeBudget?.takeIf { it.first === request }?.second
                         val sticky = sourceSticky.preference(id)
                         val unhealthy: (String) -> Boolean = { addon -> ProviderHealth.penaltyActive(addon) }
-                        val pick = if (hint != null) {
+                        val pick = if (hint != null || episodeBudget != null) {
                             val assembled = sourceModel.awaitSettledTarget(
                                 requestGeneration = request.generation,
                                 streamId = episodeId,
-                                deadlineMs = AUTO_NEXT_ASSEMBLY_DEADLINE_MS,
+                                deadlineMs = episodeBudget?.sourceRemainingMs() ?: AUTO_NEXT_ASSEMBLY_DEADLINE_MS,
                             )
                             if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@collect
                             assembled?.best
@@ -1022,7 +1083,7 @@ class DetailViewModel(
                         if (!autoPickIntent.accepts(autoPickLease)) return@collect
                         when {
                             pick != null -> playAutomatically(pick)
-                            hint != null -> _playback.value = Playback.Failed("No playable source for the next episode.")
+                            hint != null || episodeBudget != null -> _playback.value = Playback.Failed("No playable source for this episode.")
                         }
                     }
                 }
@@ -1042,6 +1103,7 @@ class DetailViewModel(
                     pendingAutoPick = false
                     pendingAdvanceHint = null
                     _streams.value = UiState.Error(error.message ?: "Something went wrong loading your add-ons.")
+                    sourceSettlement.value = EpisodeSourceSettlement(request, settled = true)
                 }
         }
         } finally {
@@ -1329,6 +1391,7 @@ class DetailViewModel(
                             playable.copy(
                             startPositionMs = selectedPlaybackStartPosition(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED,
                                 playable.startPositionMs, resumeMs, startPositionOverrideMs),
+                            userForcedSource = playable.userForcedSource || manualPick,
                             mediaRef = ref,
                             expectedDurationMs = expectedRuntimeMs(),
                             posterUrl = nowPlayingPoster(episode),
@@ -1440,26 +1503,21 @@ class DetailViewModel(
                 startSourceLoad(restoreEpisodeId)
             }
         }
-        return withEpisodeSwitchCancellationRollback(::restorePreviousTargetIfCurrent) {
-            val groups = withTimeoutOrNull(EPISODE_SWITCH_SOURCE_DEADLINE_MS) {
-                _streams.first { state ->
-                    sourceRequestFence.currentToken() == request &&
-                        state is UiState.Success && state.data.any { it.streams.isNotEmpty() }
-                } as UiState.Success
-            }?.data ?: run {
-                restorePreviousTargetIfCurrent()
-                return@withEpisodeSwitchCancellationRollback Result.failure(
-                    IllegalStateException("No playable source for this episode."),
-                )
+        val budget = EpisodeResolutionBudget()
+        return budget.outer { withEpisodeSwitchCancellationRollback(::restorePreviousTargetIfCurrent) {
+            budget.source { awaitEpisodeSourceSettlement(sourceSettlement, request) }
+            if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
+                return@withEpisodeSwitchCancellationRollback Result.failure(IllegalStateException(OWNER_CHANGED_MESSAGE))
             }
             val settled = sourceModel.awaitSettledTarget(
                 requestGeneration = request.generation,
                 streamId = target.id,
-                deadlineMs = EPISODE_SWITCH_ASSEMBLY_DEADLINE_MS,
+                deadlineMs = minOf(EPISODE_SWITCH_ASSEMBLY_DEADLINE_MS, budget.sourceRemainingMs()),
             )
             if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 return@withEpisodeSwitchCancellationRollback Result.failure(IllegalStateException())
             }
+            val groups = (_streams.value as? UiState.Success)?.data.orEmpty()
             val source = settled?.best ?: StreamRanking.best(
                 groups = groups,
                 continuity = lastPlayedSource?.let(StreamRanking::signature),
@@ -1475,7 +1533,8 @@ class DetailViewModel(
                 )
             }
             val actionOwner = debridKeys.ownerToken()
-            val result = resolveForOwner(source, target, actionOwner)
+            val result = budget.candidate { resolveForOwner(source, target, actionOwner) }
+                ?: Result.failure(IllegalStateException("Episode preparation timed out. Try this episode again."))
             if (
                 !isActionOwnerCurrent(actionOwner) ||
                 !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
@@ -1509,11 +1568,16 @@ class DetailViewModel(
                         lastPlayedSource = source
                         resumeRef = null
                         explicitManualEpisodeId = target.id
+                        lastAcceptedEpisodeId = target.id
                     },
+                    commitRejected = ::restorePreviousTargetIfCurrent,
                 )
             }
             if (resolution.isFailure) restorePreviousTargetIfCurrent()
             resolution
+        } } ?: run {
+            restorePreviousTargetIfCurrent()
+            Result.failure(IllegalStateException("Episode preparation timed out. Try this episode again."))
         }
     }
 
@@ -1787,9 +1851,13 @@ class DetailViewModel(
         source: StreamSource,
         episode: Episode?,
         owner: DebridOwnerToken?,
-    ): Result<Playable> = com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission,
-        discard = { it.playbackLease?.close() }) {
-        ownerBoundResult(expectedOwner = owner, currentOwner = debridKeys::ownerToken) { repo.resolve(source, episode) }
+    ): Result<Playable> {
+        val budget = automaticEpisodeBudget?.takeIf { it.first === sourceRequestFence.currentToken() }?.second ?: EpisodeResolutionBudget()
+        return budget.candidate {
+            com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission, discard = { it.playbackLease?.close() }) {
+                ownerBoundResult(expectedOwner = owner, currentOwner = debridKeys::ownerToken) { repo.resolve(source, episode) }
+            }
+        } ?: Result.failure(IllegalStateException("Source preparation timed out. Try another source."))
     }
 
     private fun currentModelEpisode(): Episode? {
@@ -2095,6 +2163,7 @@ class DetailViewModel(
             _selectedSeason.value = next.season
             _selectedEpisodeId.value = next.id
             startSourceLoad(next.id)
+            sourceRequestFence.currentToken()?.let(::armAutomaticEpisodeBudget)
             playAutomatically(warm)
             return
         }
@@ -2417,10 +2486,10 @@ class DetailViewModel(
         const val AUTO_NEXT_ASSEMBLY_DEADLINE_MS = 4_000L
 
         /** Same bounded unified-source settlement used by an explicit in-player episode pick. */
-        const val EPISODE_SWITCH_ASSEMBLY_DEADLINE_MS = 4_000L
+        const val EPISODE_SWITCH_ASSEMBLY_DEADLINE_MS = 20_000L
 
         /** Maximum wait for the target episode's first non-empty add-on source wave. */
-        const val EPISODE_SWITCH_SOURCE_DEADLINE_MS = 15_000L
+        const val EPISODE_SWITCH_SOURCE_DEADLINE_MS = 20_000L
 
         /// The text marker folded into an account-cached source's description so the text-based [StreamRanking]
         /// lights the cache badge + applies the +cache bonus (it looks for a bolt / "cached").

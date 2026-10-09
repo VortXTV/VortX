@@ -194,12 +194,12 @@ class NativeSearchBatchTest {
     private fun open(transport: VortxResourceTransport): VortxNativeSession =
         VortxNativeSession.open(VortxAccountScope("search-fixture", "owner"), "Owner", Runtime(), Store(), transport, true)
 
-    private class Store : VortxCheckpointStore {
+    internal class Store : VortxCheckpointStore {
         var value: String? = null
         override fun read(scope: VortxAccountScope) = value
         override fun commit(scope: VortxAccountScope, snapshot: String) { value = snapshot }
     }
-    private class Runtime : VortxRuntimeBindings {
+    internal class Runtime : VortxRuntimeBindings {
         private val values = mutableMapOf<Long, String>(); private var next = 0L
         private fun profile(id: String, owner: Boolean) = JSONObject().put("id", id).put("name", id).put("owner", owner)
             .put("deleted", false).put("addons", "share_primary").put("parental", JSONObject().put("kids", false))
@@ -214,8 +214,11 @@ class NativeSearchBatchTest {
         override fun delta(handle: Long): String? = error("No delta fixture")
         override fun resolve(handle: Long, request: String): String {
             val query = JSONObject(request)
-            check(query.getString("kind") == "installed_addons")
+            if (query.getString("kind") == "resume_point") return JSONObject().put("kind", "resume_point").put("resume", JSONObject.NULL).toString()
             val profile = query.getString("profileId")
+            if (query.getString("kind") == "profile_playback") return JSONObject().put("kind", "profile_playback").put("profileId", profile)
+                .put("history", JSONArray()).put("continueWatching", JSONArray()).put("watchedTitles", JSONObject()).put("watchedVideoIdsByTitle", JSONObject()).toString()
+            check(query.getString("kind") == "installed_addons")
             val records = JSONObject(values[handle]!!).getJSONObject("nativeSync").getJSONObject("addons")
                 .optJSONObject(profile)?.optJSONObject("records") ?: JSONObject()
             return JSONObject().put("kind", "installed_addons").put("profileId", profile).put("addons", JSONArray(

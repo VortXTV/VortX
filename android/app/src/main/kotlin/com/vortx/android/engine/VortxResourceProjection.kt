@@ -62,6 +62,22 @@ internal object VortxResourceProjection {
             .put("metaStreams", embedded).toString()
     }
 
+    /** A projection container is not a transport receipt. Validate every actual provider receipt first. */
+    fun providerDetails(pages: List<VortxResourceSnapshot>, metaRequest: VortxResourceRequest,
+                        streamRequest: VortxResourceRequest?, registry: List<VortxResourceAddon>): String {
+        require(metaRequest.resource == VortxResourceRequest.Resource.META)
+        pages.forEach { page ->
+            validate(page, registry)
+            require(page.ownerId == pages.first().ownerId && (page.request == metaRequest || page.request == streamRequest))
+        }
+        fun view(request: VortxResourceRequest): VortxResourceSnapshot = VortxResourceSnapshot(
+            pages.firstOrNull()?.ownerId.orEmpty(), "projection-only", 0L, request,
+            pages.filter { it.request == request }.flatMap { it.groups },
+            pages.flatMap { it.sourceUrls.entries }.associate { it.key to it.value },
+        )
+        return metaDetails(view(metaRequest), streamRequest?.let(::view), streamRequest, registry)
+    }
+
     fun subtitles(snapshot: VortxResourceSnapshot, registry: List<VortxResourceAddon>): String {
         require(snapshot.request.resource == VortxResourceRequest.Resource.SUBTITLES)
         validate(snapshot, registry)

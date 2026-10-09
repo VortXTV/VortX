@@ -31,6 +31,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -108,6 +109,8 @@ import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.trailer.TrailerCoordinator
 import com.vortx.android.ui.UiState
 import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.components.episodeRailTargetIndex
+import com.vortx.android.ui.components.episodeRailPageIndex
 import com.vortx.android.ui.components.cinemaCardFacts
 import com.vortx.android.ui.components.DefaultEpisodeThumb
 import com.vortx.android.ui.components.ErrorState
@@ -176,6 +179,7 @@ fun DetailScreen(
     val streamsState by viewModel.streams.collectAsStateWithLifecycle()
     val playback by viewModel.playback.collectAsStateWithLifecycle()
     val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
+    val episodeBrowseAnchor by viewModel.episodeBrowseAnchor.collectAsStateWithLifecycle()
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val mutationError by viewModel.mutationError.collectAsStateWithLifecycle()
     val downloadNotice by viewModel.downloadNotice.collectAsStateWithLifecycle()
@@ -452,6 +456,24 @@ fun DetailScreen(
 
     val resolving = playback is Playback.Resolving
     var sourcesOpen by remember { mutableStateOf(false) }
+    val detailListState = rememberLazyListState()
+    val currentDetail = (metaState as? UiState.Success)?.data
+    val railItemIndex = 3 +
+        (if ((streamsState as? UiState.Success)?.let { viewModel.bestSource() }?.let(StreamRanking::pickReason) != null) 1 else 0) +
+        (if (ratings != null) 1 else 0) +
+        (if (financials?.let(FinancialsClient::financialsText) != null) 1 else 0) +
+        (if (releaseDates?.let(ReleaseDatesClient::releaseDatesText) != null) 1 else 0) +
+        (if (sourcesOpen) 1 else 0) +
+        (if (currentDetail?.description?.takeIf(String::isNotBlank) != null || fallbackOverview != null) 1 else 0) +
+        (if (watchAvail != null && currentDetail != null && !isLiveType(currentDetail.type)) 1 else 0) +
+        (if (currentDetail != null && (currentDetail.cast.isNotEmpty() || castMembers.isNotEmpty() || currentDetail.directors.isNotEmpty() || currentDetail.writers.isNotEmpty())) 1 else 0)
+    LaunchedEffect(episodeBrowseAnchor, currentDetail?.id, railItemIndex) {
+        val anchor = episodeBrowseAnchor ?: return@LaunchedEffect
+        if (currentDetail?.videos?.any { it.id == anchor.videoId } != true) return@LaunchedEffect
+        restoreEpisodeFocusId = anchor.videoId
+        detailListState.scrollToItem(railItemIndex)
+        viewModel.consumeEpisodeBrowseAnchor(anchor.revision)
+    }
 
     // Quick View deliberately delegates to the ordinary ranked source path. The request is consumed before
     // dispatch so recomposition, an arriving source group, or returning from the player cannot launch twice.
@@ -476,6 +498,7 @@ fun DetailScreen(
             is UiState.Error -> ErrorState(m.message, onRetry = viewModel::retryMeta, modifier = Modifier.fillMaxSize())
             is UiState.Success -> LazyColumn(
                 modifier = Modifier.fillMaxSize(),
+                state = detailListState,
                 verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
             ) {
                 item { Backdrop(m.data) }
@@ -616,7 +639,30 @@ fun DetailScreen(
                     item {
                         // The phone/touch episode surface is intentionally a cinematic rail, not a long
                         // flat list. Selection and source routing remain the existing per-episode owner.
+                        val episodeRowState = rememberLazyListState()
+                        LaunchedEffect(episodes, selectedEpisodeId, restoreEpisodeFocusId) {
+                            val index = episodeRailTargetIndex(episodes.map { it.id }, restoreEpisodeFocusId ?: selectedEpisodeId)
+                                ?: episodeRailTargetIndex(episodes.map { it.id }, selectedEpisodeId)
+                            if (index != null) {
+                                episodeRowState.scrollToItem(index)
+                                kotlinx.coroutines.yield()
+                                episodeFocusRequesters[episodes[index].id]?.let { runCatching { it.requestFocus() } }
+                            }
+                        }
+                        Row(modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge), horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                            Chip("Previous episodes", false, enabled = episodeRowState.canScrollBackward,
+                                leadingIcon = VortXIcons.chevronLeft, onClick = { scope.launch {
+                                    episodeRowState.animateScrollToItem(episodeRailPageIndex(episodeRowState.firstVisibleItemIndex,
+                                        episodeRowState.layoutInfo.visibleItemsInfo.size, episodes.size, false))
+                                } })
+                            Chip("Next episodes", false, enabled = episodeRowState.canScrollForward,
+                                leadingIcon = VortXIcons.chevronRight, onClick = { scope.launch {
+                                    episodeRowState.animateScrollToItem(episodeRailPageIndex(episodeRowState.firstVisibleItemIndex,
+                                        episodeRowState.layoutInfo.visibleItemsInfo.size, episodes.size, true))
+                                } })
+                        }
                         LazyRow(
+                            state = episodeRowState,
                             contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
                             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
                         ) {

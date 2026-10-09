@@ -209,8 +209,15 @@ private fun TvDetailContent(
     // episode below retargets the hero Watch/Resume + the source list, exactly as the phone screen does.
     val selectedSeason by viewModel.selectedSeason.collectAsStateWithLifecycle()
     val selectedEpisodeId by viewModel.selectedEpisodeId.collectAsStateWithLifecycle()
+    val episodeBrowseAnchor by viewModel.episodeBrowseAnchor.collectAsStateWithLifecycle()
     var focusRestoreEpisodeId by remember(detail.id) { mutableStateOf<String?>(null) }
     var focusRestoreRevision by remember(detail.id) { mutableStateOf(0) }
+    LaunchedEffect(episodeBrowseAnchor) {
+        val anchor = episodeBrowseAnchor ?: return@LaunchedEffect
+        focusRestoreEpisodeId = anchor.videoId
+        focusRestoreRevision++
+        viewModel.consumeEpisodeBrowseAnchor(anchor.revision)
+    }
     LaunchedEffect(playback) {
         if (focusRestoreEpisodeId != null && playback is Playback.Failed) focusRestoreRevision++
         if (focusRestoreEpisodeId != null && playback is Playback.Idle) focusRestoreRevision++
@@ -631,6 +638,7 @@ private fun TvDetailContent(
     // gets one retry when it becomes enabled. A successful secondary request is never displaced.
     LaunchedEffect(detail.id, watchEnabled) {
         delay(140)
+        if (focusRestoreEpisodeId != null) return@LaunchedEffect
         val target = initialFocus.next(watchEnabled) ?: return@LaunchedEffect
         val requestSucceeded = runCatching {
             when (target) {

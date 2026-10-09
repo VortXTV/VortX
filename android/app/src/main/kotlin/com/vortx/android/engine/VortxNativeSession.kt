@@ -765,4 +765,29 @@ internal class VortxNativeSession private constructor(
             completed = true
         } finally { finish(name, slot, revoke = !completed) }
     }
+
+    /** Source/metadata fanout has one publication lease, but one fresh native budget per provider. */
+    suspend fun loadProviders(name: String, owner: VortxNativeOwner, legs: List<NativeProviderLeg>,
+                              onUpdate: suspend (NativeProviderUpdate, UUID) -> Unit) {
+        val slot = begin(name, owner)
+        var completed = false
+        try {
+            collectNativeProviderBatch(legs, load = { leg ->
+                val bridge = bridge(name, slot)
+                try {
+                    bridge.load("${scope.digest}:${owner.profileID}:${owner.revision}", leg.request, listOf(leg.addon),
+                        budgetMs = NATIVE_PROVIDER_BUDGET_MS, maxResponseBytes = NATIVE_PROVIDER_BODY_BYTES).also {
+                        check(current(name, slot) && bridge.accepts(it)) { "Native request superseded" }
+                    }
+                } finally { retire(slot, bridge) }
+            }) { update ->
+                synchronized(this) {
+                    check(current(name, slot)) { "Native request superseded" }
+                    slot.completed = update.pages.map { it.requestId to it.generation }
+                }
+                onUpdate(update, slot.ticket)
+            }
+            completed = true
+        } finally { finish(name, slot, revoke = !completed) }
+    }
 }

@@ -12,14 +12,17 @@ stdlib="$(jar org.jetbrains.kotlin kotlin-stdlib 2.2.10)"
 annotations="$(jar org.jetbrains annotations 13.0)"
 coroutines="$(jar org.jetbrains.kotlinx kotlinx-coroutines-core-jvm 1.10.2)"
 compiler_cp="$(jar org.jetbrains.kotlin kotlin-compiler-embeddable 2.2.10):$stdlib:$(jar org.jetbrains.kotlin kotlin-reflect 1.6.10):$annotations:$coroutines"
-test_cp="$app_classes:$stdlib:$annotations:$coroutines:$(jar org.json json 20240303):$(jar junit junit 4.13.2):$(jar org.hamcrest hamcrest-core 1.3):$android_jar"
 mkdir -p "$repo_root/android/app/build"
 test_dir="$(mktemp -d "$repo_root/android/app/build/native-search-kotlin.XXXXXX")"
+cp "$app_classes" "$test_dir/retained-app.jar"
+zip -qd "$test_dir/retained-app.jar" 'com/vortx/android/engine/EngineState*.class'
+test_cp="$test_dir/retained-app.jar:$stdlib:$annotations:$coroutines:$(jar org.json json 20240303):$(jar junit junit 4.13.2):$(jar org.hamcrest hamcrest-core 1.3):$android_jar"
 source_dir="$repo_root/android/app/src/main/kotlin/com/vortx/android"
 test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
 "$java_bin" -Xmx768m -cp "$compiler_cp" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
-    -no-stdlib -no-reflect -jvm-target 17 -module-name app -Xfriend-paths="$app_classes" -classpath "$test_cp" \
-    "$source_dir/engine/NativeResourceBatch.kt" "$source_dir/engine/VortxNativeSession.kt" \
+    -no-stdlib -no-reflect -jvm-target 17 -module-name app -Xfriend-paths="$test_dir/retained-app.jar" -classpath "$test_cp" \
+    "$source_dir/engine/NativeResourceBatch.kt" "$source_dir/engine/NativeProviderBatch.kt" "$source_dir/engine/VortxNativeSession.kt" \
+    "$source_dir/engine/VortxResourceBridge.kt" "$source_dir/engine/VortxResourceProjection.kt" "$source_dir/engine/EngineState.kt" \
     "$source_dir/engine/NativeCatalogRepository.kt" "$source_dir/ui/search/SearchPresentation.kt" "$source_dir/ui/search/SearchCollections.kt" \
     "$test_source/engine/NativeSearchBatchTest.kt" "$test_source/engine/VortxNativeSessionTest.kt" \
     "$test_source/ui/search/SearchPresentationTest.kt" "$test_source/ui/search/SearchCollectionsTest.kt" "$test_source/ui/search/SearchRailsContractTest.kt" \

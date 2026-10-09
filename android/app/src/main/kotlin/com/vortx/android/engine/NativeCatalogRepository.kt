@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.withContext
@@ -76,7 +77,7 @@ internal class NativeCatalogRepository(
     private data class DurableWatchProof(val owner: VortxNativeOwner, val token: PlaybackSessionToken, val watchedAt: Long,
                                         val admit: (() -> Boolean) -> Boolean)
     private val durableWatchReceipts = java.util.IdentityHashMap<DurableWatchedPlaybackReceipt, DurableWatchProof>()
-    private data class SourceBinding(val owner: VortxNativeOwner, val context: PlaybackContext)
+    private class SourceBinding(val owner: VortxNativeOwner, @Volatile var context: PlaybackContext)
     private val sourceBindings = mutableMapOf<String, SourceBinding>()
     private val resolveSequence = AtomicLong()
     private val playbackSequence = AtomicLong()
@@ -121,11 +122,11 @@ internal class NativeCatalogRepository(
         it.getBoolean("kids") || (!it.isNull("maturityCeiling") && it.has("maturityCeiling"))
     }
     private fun policyPage(page: VortxResourceSnapshot, read: VortxNativeRead, slot: String,
-                           completed: List<VortxResourceSnapshot>): VortxResourceSnapshot {
+                           completed: List<VortxResourceSnapshot>, ticket: java.util.UUID? = null): VortxResourceSnapshot {
         if (!parental(read)) return page
         // A completed load can be superseded while its caller parses. Policy evidence is itself
         // publication: fence the complete admission/revocation, including blocked/null outcomes.
-        return session().publish(slot, read.owner, completed) {
+        return session().publish(slot, read.owner, completed, ticket) {
         val kind = when (page.request.resource) {
             VortxResourceRequest.Resource.CATALOG -> "catalog"
             VortxResourceRequest.Resource.META -> "meta"
@@ -372,15 +373,22 @@ internal class NativeCatalogRepository(
 
     override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)
-        val page = session.load("meta", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons)).single()
-        requireSettled(page)
-        val detail = requireNotNull(EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(policyPage(page, read, "meta", listOf(page)), null, null, addons))) { "Native metadata unavailable or blocked" }
-        check(detail.id == id && detail.type == type) { "Native metadata identity mismatch" }
-        session.publish("meta", read.owner, listOf(page)) {
-            val decorated = decorate(detail, session.read())
-            synchronized(this) { detailCache[type to id] = read.owner to detail }
-            decorated
-        }
+        val request = VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id)
+        flow {
+            session.loadProviders("meta", read.owner, addons.map { NativeProviderLeg(request, it) }) { update, ticket ->
+                val result = session.publish("meta", read.owner, update.pages, ticket) {
+                    check(sessionProvider() === session) { "Native account changed" }
+                    val allowed = update.pages.map { policyPage(it, read, "meta", update.pages, ticket) }
+                    EngineState.parseMetaDetail(VortxResourceProjection.providerDetails(allowed, request, null, addons), appliedAddonOrder = emptyList())?.let { detail ->
+                        check(detail.id == id && detail.type == type) { "Native metadata identity mismatch" }
+                        synchronized(this@NativeCatalogRepository) { detailCache[type to id] = read.owner to detail }
+                        decorate(detail, session.read())
+                    }
+                }
+                if (result != null) emit(result)
+                else if (!update.pending) error("Native metadata unavailable or blocked")
+            }
+        }.first() // First admitted metadata is usable; cancellation retires the remaining peer requests.
     }
     override suspend fun peekMeta(type: MediaType, id: String): MetaDetail? {
         val session = session(); val read = session.read()
@@ -388,51 +396,86 @@ internal class NativeCatalogRepository(
         return session.owned(read.owner) { if (cached.first == read.owner) decorate(cached.second, read) else null }
     }
     override suspend fun streams(type: MediaType, id: String, episodeId: String?, rememberedQuality: String?, wantedAddon: String?, forceRefresh: Boolean): Result<List<StreamGroup>> = attempt {
+        var groups = emptyList<StreamGroup>()
+        streamUpdates(type, id, episodeId, rememberedQuality, wantedAddon, forceRefresh).collect { groups = it.groups }
+        groups
+    }
+
+    override fun streamUpdates(type: MediaType, id: String, episodeId: String?, rememberedQuality: String?, wantedAddon: String?, forceRefresh: Boolean): Flow<StreamLoadUpdate> = flow {
         val session = session(); val read = session.read(); val addons = registry(read)
         // Capture the direct-source owner/profile before native resource loading can suspend. Passing
         // this exact nullable scope later prevents a profile/account switch from retargeting the query.
         val indexerScope = nzbSourceAggregator?.captureNativeScope(read.owner)
         val stream = VortxResourceRequest(VortxResourceRequest.Resource.STREAM, type.id, episodeId ?: id)
-        val pages = session.load("streams", read.owner, listOf(VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons, stream to addons))
-        val metaPage = policyPage(pages[0], read, "streams", pages)
-        if (parental(read)) check(metaPage.groups.any { it.items(VortxResourceRequest.Resource.META).isNotEmpty() }) { "Native metadata blocked or uncertified" }
-        val detail = EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(metaPage, null, null, addons))
-        check(detail == null || (detail.id == id && detail.type == type)) { "Native metadata identity mismatch" }
-        if (parental(read)) check(detail != null && if (type == MediaType.SERIES) {
-            episodeId != null && detail.videos.any { it.id == episodeId }
-        } else episodeId == null || episodeId == id) { "Stream identity is not in approved metadata" }
-        val rawGroups = EngineState.parseStreamGroups(VortxResourceProjection.metaDetails(metaPage, pages[1], stream, addons), episodeId ?: id)
-        val selectedEpisode = detail?.videos?.find { it.id == episodeId }
-        val search = nativeNzbSearch(detail, type, id, episodeId)
-        val direct = if (search != null && indexerScope != null) {
-            try { nzbSourceAggregator!!.aggregate(search, indexerScope) }
-            catch (cancelled: CancellationException) { throw cancelled }
-            catch (_: Exception) { NzbSourceAggregation.empty() } // An indexer failure never erases working addons.
-        } else NzbSourceAggregation.empty()
+        val metaRequest = VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id)
+        val legs = addons.map { NativeProviderLeg(metaRequest, it) } + addons.map { NativeProviderLeg(stream, it) }
         val coroutine = currentCoroutineContext()
-        session.publish("streams", read.owner, pages) {
+        val tokens = mutableMapOf<Pair<String, String>, String>()
+        var initializedBindings = false
+        var lastUpdate = NativeProviderUpdate(emptyList(), 0, legs.size)
+        var lastTicket: java.util.UUID? = null
+        var lastDetail: MetaDetail? = null
+        fun publish(update: NativeProviderUpdate, ticket: java.util.UUID, direct: NzbSourceAggregation = NzbSourceAggregation.empty(), terminal: Boolean): StreamLoadUpdate = session.publish("streams", read.owner, update.pages, ticket) {
             coroutine.ensureActive()
             check(sessionProvider() === session) { "Native account changed" }
+            val allowed = update.pages.map { if (it.request.resource == VortxResourceRequest.Resource.META) policyPage(it, read, "streams", update.pages, ticket) else it }
+            val projection = VortxResourceProjection.providerDetails(allowed, metaRequest, stream, addons)
+            val detail = EngineState.parseMetaDetail(projection, appliedAddonOrder = emptyList()) ?: synchronized(this) { detailCache[type to id]?.takeIf { it.first == read.owner }?.second }
+            check(detail == null || (detail.id == id && detail.type == type)) { "Native metadata identity mismatch" }
+            val approved = !parental(read) || detail != null && if (type == MediaType.SERIES) {
+                episodeId != null && detail.videos.any { it.id == episodeId }
+            } else episodeId == null || episodeId == id
+            if (!approved) {
+                if (terminal) error("Stream identity is not in approved metadata")
+                return@publish StreamLoadUpdate(emptyList(), update.settled, update.total, false)
+            }
+            lastDetail = detail
+            val rawGroups = EngineState.parseStreamGroups(projection, episodeId ?: id)
+            val selectedEpisode = detail?.videos?.find { it.id == episodeId }
             val indexerGroups = if (nzbSourceAggregator?.isAdmitted(direct, coroutine.isActive) == true) direct.groups else emptyList()
             val combined = mergeNzbGroups(rawGroups, indexerGroups)
             val groups = if (parental(read)) combined.map { group -> group.copy(streams = group.streams.filter {
                 StreamRanking.passesUserFilters(it, com.vortx.android.sources.SourcePrefsSnapshot.DEFAULT.copy(isKids = true))
             }) } else combined
-            if (groups.none { it.streams.isNotEmpty() }) requireSettled(pages[1])
-            synchronized(this) {
+            if (terminal && groups.none { it.streams.isNotEmpty() } && addons.isNotEmpty()) {
+                check(update.pages.any { it.request == stream && it.groups.any { group -> group.status == "ready" } }) { "Native resources unavailable" }
+            }
+            val bound = synchronized(this) {
                 if (detail != null) detailCache[type to id] = read.owner to detail
-                sourceBindings.clear()
+                if (!initializedBindings) { sourceBindings.clear(); initializedBindings = true }
                 groups.map { group -> group.copy(streams = group.streams.map { source ->
-                    val token = java.util.UUID.randomUUID().toString()
-                    sourceBindings[token] = SourceBinding(read.owner, PlaybackContext(
+                    // A later partial must not revoke the source token already being resolved.
+                    val token = tokens.getOrPut(source.addon to source.id) { java.util.UUID.randomUUID().toString() }
+                    val context = PlaybackContext(
                         PlaybackContext.Owner(read.owner.profileID, true), id, episodeId ?: id, type.id,
                         selectedEpisode?.season, selectedEpisode?.episode, detail?.name ?: id, detail?.poster,
-                        PlaybackContext.Provenance(source.addon, source.quality, false, null, null), nativeSessionRevision = read.owner.revision))
+                        PlaybackContext.Provenance(source.addon, source.quality, false, null, null), nativeSessionRevision = read.owner.revision)
+                    val binding = sourceBindings.getOrPut(token) { SourceBinding(read.owner, context) }
+                    check(binding.owner == read.owner && binding.context.identityKey == context.identityKey) { "Native source identity changed" }
+                    // Metadata may arrive after this stream. Enrich the stable binding, never replace its
+                    // admission identity or revoke a resolver that already captured that exact object.
+                    if (detail != null) binding.context = context
                     source.copy(nativePlaybackToken = token)
                 }) }
             }
+            StreamLoadUpdate(bound, update.settled, update.total, terminal,
+                selectionReady = terminal || bound.any { it.streams.isNotEmpty() } &&
+                    update.resourceSettled(VortxResourceRequest.Resource.STREAM, addons.size))
         }
-    }
+        session.loadProviders("streams", read.owner, legs) { update, ticket ->
+            lastUpdate = update; lastTicket = ticket
+            emit(publish(update, ticket, terminal = !update.pending && indexerScope == null))
+        }
+        if (indexerScope != null) {
+            val search = nativeNzbSearch(lastDetail, type, id, episodeId)
+            val direct = if (search != null) {
+                try { nzbSourceAggregator!!.aggregate(search, indexerScope) }
+                catch (cancelled: CancellationException) { throw cancelled }
+                catch (_: Exception) { NzbSourceAggregation.empty() }
+            } else NzbSourceAggregation.empty()
+            emit(publish(lastUpdate, requireNotNull(lastTicket), direct, terminal = true))
+        }
+    }.flowOn(Dispatchers.IO)
     suspend fun subtitles(type: MediaType, videoID: String, extra: List<Pair<String, String>> = emptyList()): Result<String> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)
         if (parental(read)) check(synchronized(this) { detailCache.values.any { (owner, meta) -> owner == read.owner && meta.type == type &&
@@ -559,7 +602,7 @@ internal class NativeCatalogRepository(
                 }
             }
         }
-        val detail = requireNotNull(EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(approved, null, null, addons)))
+        val detail = requireNotNull(EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(approved, null, null, addons), appliedAddonOrder = emptyList()))
         val videos = select(detail)
         return session.publish(slot, read.owner, listOf(page)) {
             dispatchWatched(session, read, detail, videos, watched)
@@ -711,7 +754,7 @@ internal class NativeCatalogRepository(
         check(captured.nativeSessionRevision == null || captured.nativeSessionRevision == read.owner.revision) { "Native playback owner expired" }
         require(captured.type in setOf("movie", "series"))
         requireWatchIdentity(read, MediaType.fromId(captured.type), captured.contentId)
-        require(captured.contentId.isNotBlank() && captured.videoId.isNotBlank())
+        require(nativePlaybackIdentityCanRecord(captured)) { "Exact native episode identity required for playback history" }
         if (parental(read)) check(synchronized(this) {
             detailCache[MediaType.fromId(captured.type) to captured.contentId]?.let { (cachedOwner, detail) ->
                 cachedOwner == read.owner && (captured.videoId == detail.id || detail.videos.any { it.id == captured.videoId })
@@ -724,6 +767,7 @@ internal class NativeCatalogRepository(
     private fun progress(sessionToken: PlaybackSessionToken, positionMs: Long, durationMs: Long) {
         val session = session(); val current = synchronized(this) { playing } ?: return
         if (current.token != sessionToken) return
+        if (!nativePlaybackIdentityCanRecord(current.context)) return
         require(positionMs >= 0 && durationMs >= 0)
         session.owned(current.owner) {
             synchronized(this) {
@@ -748,6 +792,7 @@ internal class NativeCatalogRepository(
     override suspend fun endPlaybackSessionWithDurableWatchReceipt(token: PlaybackSessionToken, positionMs: Long, durationMs: Long): Result<DurableWatchedPlaybackReceipt?> = attempt {
         val session = session(); val current = synchronized(this) { playing } ?: return@attempt null
         if (current.token != token) return@attempt null
+        if (!nativePlaybackIdentityCanRecord(current.context)) return@attempt null
         require(positionMs >= 0 && durationMs >= 0)
         session.owned(current.owner) { synchronized(this) {
             if (playing !== current) return@owned null

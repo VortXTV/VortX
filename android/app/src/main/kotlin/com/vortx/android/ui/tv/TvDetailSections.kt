@@ -16,12 +16,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -49,7 +51,10 @@ import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.PersonViewModel
+import com.vortx.android.ui.components.episodeRailTargetIndex
+import com.vortx.android.ui.components.episodeRailPageIndex
 import kotlinx.coroutines.yield
+import kotlinx.coroutines.launch
 
 /// The 10-foot season picker + episode browser for the TV Detail page, the couch analogue of the phone
 /// `DetailScreen`'s `SeasonSelector` + `EpisodeRow` list and the mirror of Apple `app/SourcesTV/DetailView`.
@@ -84,12 +89,15 @@ fun TvSeasonEpisodeSection(
         detail.videos.filter { it.season == activeSeason }.sortedBy { it.episode }
     }
     val seasonFocus = remember(activeSeason) { FocusRequester() }
+    val episodeRowState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
     val episodeFocusRequesters = remember(episodes.map { it.id }) {
         episodes.map { FocusRequester() }
     }
-    LaunchedEffect(focusRestoreEpisodeId, focusRestoreRevision, episodes) {
-        val index = focusRestoreEpisodeId?.let { id -> episodes.indexOfFirst { it.id == id } } ?: return@LaunchedEffect
-        if (index < 0) return@LaunchedEffect
+    LaunchedEffect(focusRestoreEpisodeId, focusRestoreRevision, selectedEpisodeId, episodes) {
+        val index = episodeRailTargetIndex(episodes.map { it.id }, focusRestoreEpisodeId ?: selectedEpisodeId)
+            ?: episodeRailTargetIndex(episodes.map { it.id }, selectedEpisodeId) ?: return@LaunchedEffect
+        episodeRowState.scrollToItem(index)
         yield()
         runCatching { episodeFocusRequesters[index].requestFocus() }
     }
@@ -135,7 +143,18 @@ fun TvSeasonEpisodeSection(
             }
         }
 
+        Row(modifier = Modifier.padding(horizontal = TvDimens.edge), horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+            TvFilterChip("Previous episodes", false, enabled = episodeRowState.canScrollBackward, onClick = { scope.launch {
+                episodeRowState.animateScrollToItem(episodeRailPageIndex(episodeRowState.firstVisibleItemIndex,
+                    episodeRowState.layoutInfo.visibleItemsInfo.size, episodes.size, false))
+            } })
+            TvFilterChip("Next episodes", false, enabled = episodeRowState.canScrollForward, onClick = { scope.launch {
+                episodeRowState.animateScrollToItem(episodeRailPageIndex(episodeRowState.firstVisibleItemIndex,
+                    episodeRowState.layoutInfo.visibleItemsInfo.size, episodes.size, true))
+            } })
+        }
         LazyRow(
+            state = episodeRowState,
             contentPadding = PaddingValues(horizontal = TvDimens.edge),
             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
