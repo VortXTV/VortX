@@ -6,6 +6,8 @@ import com.vortx.android.sources.ResolvedPin
 import com.vortx.android.sources.SeriesSourceSticky
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePrefsSnapshot
+import com.vortx.android.sources.SourceMatchContext
+import com.vortx.android.sources.SourceMatchConfidence
 import com.vortx.android.sources.SourceType
 import java.util.concurrent.ConcurrentHashMap
 
@@ -69,8 +71,9 @@ object StreamRanking {
         groups: List<StreamGroup>,
         prefs: SourcePrefsSnapshot = installedReading,
         pin: ResolvedPin? = null,
+        matchContext: SourceMatchContext? = null,
     ): List<StreamGroup> {
-        val filtered = applyUserFilters(groups, prefs)
+        val filtered = applyUserFilters(groups, prefs, matchContext)
         if (prefs.useAddonOrder) return filtered
         val ranked = filtered.map { group ->
             val sorted = group.streams
@@ -93,8 +96,9 @@ object StreamRanking {
         groups: List<StreamGroup>,
         prefs: SourcePrefsSnapshot = installedReading,
         pin: ResolvedPin? = null,
+        matchContext: SourceMatchContext? = null,
     ): StreamSource? {
-        val filtered = applyUserFilters(groups, prefs)
+        val filtered = applyUserFilters(groups, prefs, matchContext)
         if (prefs.useAddonOrder) {
             if (pin != null) firstPinned(filtered, pin)?.let { return it }
             return playablePairs(filtered).firstOrNull()?.stream
@@ -116,8 +120,9 @@ object StreamRanking {
         sticky: SeriesSourceSticky.Preference? = null,
         providerPenalty: ((String) -> Boolean)? = null,
         prefs: SourcePrefsSnapshot = installedReading,
+        matchContext: SourceMatchContext? = null,
     ): StreamSource? {
-        val filtered = applyUserFilters(groups, prefs)
+        val filtered = applyUserFilters(groups, prefs, matchContext)
         if (prefs.useAddonOrder) {
             if (pin != null) firstPinned(filtered, pin)?.let { return it }
             return playablePairs(filtered).firstOrNull()?.stream
@@ -126,7 +131,7 @@ object StreamRanking {
         val hasBinge = !binge.isNullOrEmpty()
         val hasSticky = !sticky?.addon.isNullOrEmpty() || !sticky?.bingeGroup.isNullOrEmpty()
         if (!hasHint && !hasBinge && pin == null && !hasSticky && providerPenalty == null) {
-            return best(groups, prefs, pin)
+            return best(groups, prefs, pin, matchContext)
         }
         return playablePairs(filtered).maxByOrNull {
             score(it.stream, prefs) +
@@ -148,8 +153,9 @@ object StreamRanking {
         sticky: SeriesSourceSticky.Preference? = null,
         providerPenalty: ((String) -> Boolean)? = null,
         prefs: SourcePrefsSnapshot = installedReading,
+        matchContext: SourceMatchContext? = null,
     ): List<StreamSource> {
-        val filtered = applyUserFilters(groups, prefs)
+        val filtered = applyUserFilters(groups, prefs, matchContext)
         val pairs = playablePairs(filtered)
         val ordered: List<StreamSource> = if (prefs.useAddonOrder) {
             if (pin != null) {
@@ -183,8 +189,9 @@ object StreamRanking {
         groups: List<StreamGroup>,
         prefs: SourcePrefsSnapshot = installedReading,
         perAddonCap: Int = PER_ADDON_CAP,
+        matchContext: SourceMatchContext? = null,
     ): List<StreamSource> {
-        val filtered = applyUserFilters(groups, prefs)
+        val filtered = applyUserFilters(groups, prefs, matchContext)
         val perAddonCount = HashMap<String, Int>()
         val seenHandles = HashSet<String>()
         return playablePairs(filtered)
@@ -450,31 +457,37 @@ object StreamRanking {
 
     /// The best stream per distinct resolution label (4K, 1080p, …), best-first. Mirrors Apple
     /// `resolutionOptions`.
-    fun resolutionOptions(groups: List<StreamGroup>): List<Pair<String, StreamSource>> {
+    fun resolutionOptions(
+        groups: List<StreamGroup>,
+        prefs: SourcePrefsSnapshot = installedReading,
+    ): List<Pair<String, StreamSource>> {
         val playable = groups.flatMap { it.streams }.filter { !it.isYouTubeTrailer }
         val bestByLabel = HashMap<String, StreamSource>()
         for (s in playable) {
             val label = qualityLabel(s)
             val existing = bestByLabel[label]
-            if (existing != null && score(existing) >= score(s)) continue
+            if (existing != null && score(existing, prefs) >= score(s, prefs)) continue
             bestByLabel[label] = s
         }
-        return bestByLabel.map { it.key to it.value }.sortedByDescending { score(it.second) }
+        return bestByLabel.map { it.key to it.value }.sortedByDescending { score(it.second, prefs) }
     }
 
     /// Distinct choices for the visible quality picker: the best stream per resolution-and-flavor
     /// combination, labelled "4K · Dolby Vision · Remux" etc. Best-first. Mirrors Apple `qualityOptions`.
-    fun qualityOptions(groups: List<StreamGroup>): List<Pair<String, StreamSource>> {
+    fun qualityOptions(
+        groups: List<StreamGroup>,
+        prefs: SourcePrefsSnapshot = installedReading,
+    ): List<Pair<String, StreamSource>> {
         val playable = groups.flatMap { it.streams }.filter { !it.isYouTubeTrailer }
         val best = HashMap<String, Pair<Int, StreamSource>>()
         for (s in playable) {
             val label = pickerLabel(s)
-            val sc = score(s)
+            val sc = score(s, prefs)
             val current = best[label]
             if (current != null && current.first >= sc) continue
             best[label] = sc to s
         }
-        return best.map { it.key to it.value.second }.sortedByDescending { score(it.second) }
+        return best.map { it.key to it.value.second }.sortedByDescending { score(it.second, prefs) }
     }
 
     /// The resolution tiers that actually have playable sources, in fixed order, for the first level of the
@@ -488,7 +501,11 @@ object StreamRanking {
 
     /// Second level of the quality picker: distinct flavor variants inside one resolution tier, best
     /// variant of each, best-first, capped at 8. Mirrors Apple `variantOptions`.
-    fun variantOptions(groups: List<StreamGroup>, wantedTier: String): List<Pair<String, StreamSource>> {
+    fun variantOptions(
+        groups: List<StreamGroup>,
+        wantedTier: String,
+        prefs: SourcePrefsSnapshot = installedReading,
+    ): List<Pair<String, StreamSource>> {
         val playable = groups.flatMap { it.streams }
             .filter { !it.isYouTubeTrailer && tier(it) == wantedTier }
         val best = HashMap<String, Pair<Int, StreamSource>>()
@@ -504,7 +521,7 @@ object StreamRanking {
             else if (t.contains("truehd")) tags += "TrueHD"
             else if (t.contains("dts-hd") || t.contains("dts hd")) tags += "DTS-HD"
             val label = if (tags.isEmpty()) "Standard" else tags.joinToString(" · ")
-            val sc = score(s)
+            val sc = score(s, prefs)
             val current = best[label]
             if (current != null && current.first >= sc) continue
             best[label] = sc to s
@@ -514,7 +531,7 @@ object StreamRanking {
             val label = if (size != null) "${entry.key}  ·  $size" else entry.key
             label to entry.value.second
         }
-            .sortedByDescending { score(it.second) }
+            .sortedByDescending { score(it.second, prefs) }
             .take(8)
     }
 
@@ -614,7 +631,14 @@ object StreamRanking {
     /// Whether a stream survives the user's keyword + safety + numeric filters (Settings > Streams). Default
     /// preferences pass everything, so this is a no-op until the user opts in. Mirrors Apple
     /// `passesUserFilters`.
-    fun passesUserFilters(s: StreamSource, prefs: SourcePrefsSnapshot = installedReading): Boolean {
+    fun passesUserFilters(
+        s: StreamSource,
+        prefs: SourcePrefsSnapshot = installedReading,
+        matchContext: SourceMatchContext? = null,
+    ): Boolean {
+        if (matchContext != null && !SourceMatchConfidence.passes(s, prefs.matchConfidenceThreshold, matchContext)) {
+            return false
+        }
         val kids = prefs.isKids
         if (!kids && prefs.noFiltersActive) return true // fast path: nothing opted in (and not a Kids profile)
         val text = qualityText(s)
@@ -683,11 +707,12 @@ object StreamRanking {
     fun applyUserFilters(
         groups: List<StreamGroup>,
         prefs: SourcePrefsSnapshot = installedReading,
+        matchContext: SourceMatchContext? = null,
     ): List<StreamGroup> {
         val stripped = stripNonVideo(groups)
         if (prefs.noFiltersActive && !prefs.isKids) return stripped
         return stripped.mapNotNull { group ->
-            val kept = group.streams.filter { passesUserFilters(it, prefs) }
+            val kept = group.streams.filter { passesUserFilters(it, prefs, matchContext) }
             if (kept.isEmpty()) null else group.copy(streams = kept)
         }
     }

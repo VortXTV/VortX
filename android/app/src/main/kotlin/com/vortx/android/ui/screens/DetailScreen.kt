@@ -558,6 +558,7 @@ fun DetailScreen(
                                 onSortChange = viewModel::setSourceSort,
                                 audioLanguageHint = sourceAudioLanguageHint,
                                 onAudioLanguageHintChange = viewModel::setSourceAudioLanguageHint,
+                                onSourceVariantOptions = viewModel::sourceVariantOptions,
                                 onRefresh = viewModel::refreshSources,
                                 pin = pinUi,
                                 entryNoun = viewModel.pinEntryNoun,
@@ -1724,6 +1725,7 @@ private fun SourcesSection(
     onSortChange: (String) -> Unit,
     audioLanguageHint: String?,
     onAudioLanguageHintChange: (String?) -> Unit,
+    onSourceVariantOptions: (List<StreamGroup>, String) -> List<Pair<String, StreamSource>>,
     onRefresh: () -> Unit,
     pin: DetailViewModel.PinUi,
     entryNoun: String,
@@ -1868,7 +1870,7 @@ private fun SourcesSection(
                                         onClick = { qualityTier = null },
                                     )
                                     if (activeTier != null) {
-                                        StreamRanking.variantOptions(groups, activeTier).forEach { (label, source) ->
+                                        onSourceVariantOptions(groups, activeTier).forEach { (label, source) ->
                                             DropdownMenuItem(
                                                 text = { Text(label) },
                                                 onClick = {

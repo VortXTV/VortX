@@ -50,6 +50,9 @@ import com.vortx.android.sources.SourcePinContext
 import com.vortx.android.sources.SourcePinScope
 import com.vortx.android.sources.SourcePinStore
 import com.vortx.android.sources.SourcePreferencesStore
+import com.vortx.android.sources.SourcePrefsSnapshot
+import com.vortx.android.sources.SourceMatchContext
+import com.vortx.android.sources.SourceMatchConfidence
 import com.vortx.android.torbox.TorBoxSearchSource
 import com.vortx.android.communityjs.CommunityJsProviderSource
 import com.vortx.android.ui.UiState
@@ -236,6 +239,20 @@ internal fun bestSourceForCurrentRequest(
     currentGroups: List<StreamGroup>,
     rankCurrent: (List<StreamGroup>) -> StreamSource?,
 ): StreamSource? = currentAssembledBest(state, request) ?: rankCurrent(currentGroups)
+
+/** Episode cards may claim only the resolution labels assembled for their current accepted target. */
+internal fun selectedEpisodeQualityLabelsForCurrentRequest(
+    state: com.vortx.android.engine.SourceListState,
+    fence: SourceRequestFence,
+    activeProfileId: String,
+    selectedVideoId: String,
+): List<String> {
+    val request = fence.currentToken() ?: return emptyList()
+    if (!fence.accepts(request, activeProfileId) || request.targetId != selectedVideoId ||
+        state.requestGeneration != request.generation || state.streamId != selectedVideoId
+    ) return emptyList()
+    return state.resolutionOptions.map { it.first }.distinct()
+}
 
 /// Map one ranked stream into the failover candidate that carries both its source identity and, for torrents,
 /// the exact provider whose account cache check confirmed the hash. Usenet deliberately carries no torrent
@@ -976,7 +993,11 @@ class DetailViewModel(
                     // now so direct-links-only can never flash or auto-play a raw torrent. Keep [raw] for the
                     // model/capture/cache lanes: their display assembly filters before ranking, while capture
                     // intentionally sees eligible torrent descriptors before the viewer-only display filter.
-                    val displayRaw = SourceListModel.directLinkDisplayGroups(raw, ctx.directLinksOnly)
+                    val displayRaw = StreamRanking.applyUserFilters(
+                        SourceListModel.directLinkDisplayGroups(raw, ctx.directLinksOnly),
+                        prefs = ctx.prefs,
+                        matchContext = ctx.matchContext,
+                    )
                     if (displayRaw.isNotEmpty() || update.terminal) {
                         sourcesReady = true
                         _streams.value = UiState.Success(displayRaw)
@@ -1017,6 +1038,7 @@ class DetailViewModel(
                                 sticky = sticky,
                                 providerPenalty = unhealthy,
                                 prefs = ctx.prefs,
+                                matchContext = ctx.matchContext,
                             )
                         }
                         if (!autoPickIntent.accepts(autoPickLease)) return@collect
@@ -1068,14 +1090,36 @@ class DetailViewModel(
             // isKids rides the snapshot so a Kids profile's content guard (hard-hide adult/junk; Avoid
             // words always DROP, never merely demote) is live in the frozen reading, mirroring Apple's
             // `ProfileStore.activeIsKids()` read inside `passesUserFilters`.
-            prefs = sourcePrefs.snapshot(
-                detailSourceAudioLanguages(_sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
-                isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
-            ),
+            prefs = captureSourcePrefs(),
+            matchContext = sourceMatchContext(episodeId),
             directLinksOnly = PlaybackBehaviorSettings.directLinksOnly(app),
             pin = currentPin(),
             contentId = contentId,
         )
+
+    private fun captureSourcePrefs(): SourcePrefsSnapshot = sourcePrefs.snapshot(
+        detailSourceAudioLanguages(_sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
+        isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
+    )
+
+    private fun sourceMatchContext(episodeId: String?): SourceMatchContext = SourceMatchContext.from(
+        (_meta.value as? UiState.Success)?.data, episodeId, routeName.orEmpty(),
+    )
+
+    /** Only the current generation/target/profile may supply selection preferences and title evidence. */
+    private fun currentSourceContext(): SourceListModel.Context? {
+        val request = sourceRequestFence.currentToken() ?: return null
+        if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return null
+        return lastCtx?.takeIf {
+            it.requestGeneration == request.generation && it.streamId == request.targetId
+        }
+    }
+
+    private fun sourceMatchesCurrentRequest(source: StreamSource): Boolean {
+        val ctx = currentSourceContext() ?: return sourcePrefs.matchConfidenceThreshold == 0
+        val context = ctx.matchContext ?: return ctx.prefs.matchConfidenceThreshold == 0
+        return SourceMatchConfidence.passes(source, ctx.prefs.matchConfidenceThreshold, context)
+    }
 
     /// Query the user's debrid account for which of the loaded torrents it has CACHED, then use the result to
     /// (a) feed the failover race + resume ([cachedHashes] / [cachedUsenetURLs]) and (b) badge + rank up the
@@ -1300,6 +1344,10 @@ class DetailViewModel(
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         val stickyWrite = if (manualPick && type == MediaType.SERIES) sourceSticky.capture(id) else null
+        if (!sourceMatchesCurrentRequest(source)) {
+            _playback.value = Playback.Failed("This source is below your match confidence threshold.")
+            return
+        }
         if (lastPlayedSource != null && handleOf(lastPlayedSource!!) != handleOf(source)) {
             sameSourceReresolved = false   // a different mount gets its own one re-resolve
         }
@@ -1362,6 +1410,9 @@ class DetailViewModel(
         val request = sourceRequestFence.currentToken() ?: return Result.failure(IllegalStateException())
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
             return Result.failure(IllegalStateException())
+        }
+        if (!sourceMatchesCurrentRequest(source)) {
+            return Result.failure(IllegalStateException("This source is below your match confidence threshold."))
         }
         val stickyWrite = if (type == MediaType.SERIES) sourceSticky.capture(id) else null
         val episode = currentModelEpisode()
@@ -1460,6 +1511,8 @@ class DetailViewModel(
             if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 return@withEpisodeSwitchCancellationRollback Result.failure(IllegalStateException())
             }
+            val selectionContext = currentSourceContext()
+                ?: return@withEpisodeSwitchCancellationRollback Result.failure(IllegalStateException())
             val source = settled?.best ?: StreamRanking.best(
                 groups = groups,
                 continuity = lastPlayedSource?.let(StreamRanking::signature),
@@ -1467,7 +1520,8 @@ class DetailViewModel(
                 pin = currentPin(),
                 sticky = sourceSticky.preference(id),
                 providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
-                prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+                prefs = selectionContext.prefs,
+                matchContext = selectionContext.matchContext,
             ) ?: run {
                 restorePreviousTargetIfCurrent()
                 return@withEpisodeSwitchCancellationRollback Result.failure(
@@ -1536,6 +1590,10 @@ class DetailViewModel(
     /// [DownloadManager.download] (it returns a FAILED record whose error text the notice surfaces).
     fun download(source: StreamSource) {
         val detail = (_meta.value as? UiState.Success)?.data ?: return
+        if (!sourceMatchesCurrentRequest(source)) {
+            _downloadNotice.value = "This source is below your match confidence threshold."
+            return
+        }
         val episode = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value }
         val actionOwner = debridKeys.ownerToken()
         _downloadNotice.value = "Preparing download…"
@@ -1759,12 +1817,15 @@ class DetailViewModel(
         if (evidence.hashes.isEmpty() && evidence.usenetUrls.isEmpty()) return null
         // Rank the candidates EXACTLY as the labeled best is picked (score + pin), de-duplicated by handle, so
         // the failover order matches the visible list.
+        val ctx = currentSourceContext() ?: return null
         val ranked = StreamRanking.rankedCandidates(
             groups,
             continuity = null,
             pin = currentPin(),
             sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
             providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+            prefs = ctx.prefs,
+            matchContext = ctx.matchContext,
         )
         val candidates = ranked.mapNotNull { debridCandidateFor(it, evidence.torrentServices) }
         if (candidates.isEmpty()) return null
@@ -1840,17 +1901,19 @@ class DetailViewModel(
     /// published groups directly before the first assembly lands. Null when no sources resolved yet. Drives
     /// the hero Watch button's enabled state.
     fun bestSource(): StreamSource? {
+        val ctx = currentSourceContext() ?: return null
         val request = sourceRequestFence.currentToken()
         val groups = (_streams.value as? UiState.Success)?.data.orEmpty()
         return bestSourceForCurrentRequest(sourceModel.state.value, request, groups) { currentGroups ->
             currentGroups.takeIf { it.isNotEmpty() }?.let {
                 StreamRanking.best(
                     currentGroups,
-                    continuity = lastCtx?.continuity,
+                    continuity = ctx.continuity,
                     pin = currentPin(),
                     sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
                     providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
-                    prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+                    prefs = ctx.prefs,
+                    matchContext = ctx.matchContext,
                 )
             }
         }
@@ -2054,7 +2117,8 @@ class DetailViewModel(
         val binge = lastPlayedSource?.bingeGroup
         val pin = currentPin()
         val sticky = sourceSticky.preference(id)
-        val prefs = lastCtx?.prefs ?: StreamRanking.reading()
+        val prefs = currentSourceContext()?.prefs ?: captureSourcePrefs()
+        val matchContext = SourceMatchContext.from(detail, target.id, routeName.orEmpty())
 
         val groupsResult = repo.streams(
             type = type,
@@ -2076,6 +2140,7 @@ class DetailViewModel(
             sticky = sticky,
             providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
             prefs = prefs,
+            matchContext = matchContext,
         ) ?: return false
         currentCoroutineContext().ensureActive()
         if (!isCurrentWarmNextCapture(capture)) return false
@@ -2171,7 +2236,7 @@ class DetailViewModel(
         ProviderHealth.noteFailure(failedSource.addon)
         if (failed.size >= MAX_SOURCE_ATTEMPTS) return false
         val groups = (_streams.value as? UiState.Success)?.data ?: return false
-        val ctx = lastCtx ?: return false
+        val ctx = currentSourceContext() ?: return false
         // Ranked EXACTLY as the visible list / auto-pick ranks (score + continuity + binge + pin +
         // the user's filter prefs), so the retry order matches what the viewer would pick by hand,
         // hinted toward the failed play's release family (same quality tier, same binge group).
@@ -2183,6 +2248,7 @@ class DetailViewModel(
             sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null,
             providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
             prefs = ctx.prefs,
+            matchContext = ctx.matchContext,
         )
         val next = ranked.firstOrNull { handleOf(it) !in failed } ?: return false
         playAutomatically(next, resumePositionMs)
@@ -2216,8 +2282,27 @@ class DetailViewModel(
             return state.resolutionOptions
         }
         val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
-        return StreamRanking.resolutionOptions(groups)
+        val ctx = currentSourceContext() ?: return emptyList()
+        return StreamRanking.resolutionOptions(
+            StreamRanking.applyUserFilters(groups, ctx.prefs, ctx.matchContext), prefs = ctx.prefs,
+        )
     }
+
+    /** Phone/TV flavor pickers rank with this request's audio hint, never another detail's reading. */
+    fun sourceVariantOptions(groups: List<StreamGroup>, tier: String): List<Pair<String, StreamSource>> {
+        val ctx = currentSourceContext() ?: return emptyList()
+        return StreamRanking.variantOptions(
+            StreamRanking.applyUserFilters(groups, prefs = ctx.prefs, matchContext = ctx.matchContext),
+            tier,
+            prefs = ctx.prefs,
+        )
+    }
+
+    /** No old raw-stream fallback: a card without accepted episode-specific assembly makes no claim. */
+    fun selectedEpisodeQualityLabels(selectedVideoId: String): List<String> =
+        selectedEpisodeQualityLabelsForCurrentRequest(
+            sourceModel.state.value, sourceRequestFence, sourceSticky.currentProfileId(), selectedVideoId,
+        )
 
     /** The exact source whose resolved [Playable] is currently mounted in the player. */
     fun currentPlayerSource(): StreamSource? = lastPlayedSource
@@ -2227,26 +2312,17 @@ class DetailViewModel(
 
     private fun rankedSourceOptions(limit: Int): List<StreamSource> {
         val groups = (_streams.value as? UiState.Success)?.data ?: return emptyList()
-        val prefs = lastCtx?.prefs
+        val ctx = currentSourceContext() ?: return emptyList()
         val sticky = if (type == MediaType.SERIES) sourceSticky.preference(id) else null
-        val ranked = if (prefs != null) {
-            StreamRanking.rankedCandidates(
-                groups,
-                continuity = null,
-                pin = currentPin(),
-                sticky = sticky,
-                providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
-                prefs = prefs,
-            )
-        } else {
-            StreamRanking.rankedCandidates(
-                groups,
-                continuity = null,
-                pin = currentPin(),
-                sticky = sticky,
-                providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
-            )
-        }
+        val ranked = StreamRanking.rankedCandidates(
+            groups,
+            continuity = null,
+            pin = currentPin(),
+            sticky = sticky,
+            providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
+            prefs = ctx.prefs,
+            matchContext = ctx.matchContext,
+        )
         return ranked.take(limit)
     }
 

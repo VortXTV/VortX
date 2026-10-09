@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
+import androidx.compose.material3.Slider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
@@ -112,6 +113,25 @@ internal fun SmartSourceSelectionSection(
                 mutateAndPreview { excludeAV1 = !excludeAV1 }
             }
         }
+
+        // Avoid behavior: two chips instead of a segmented picker (matching Apple's shared surfaces).
+        Text(
+            "Source match confidence: " + if (ui.matchConfidenceThreshold == 0) "Off" else "${ui.matchConfidenceThreshold}%",
+            style = VortXTheme.type.label.copy(color = colors.textPrimary),
+        )
+        Slider(
+            value = ui.matchConfidenceThreshold.toFloat(),
+            onValueChange = { value -> mutateAndPreview { matchConfidenceThreshold = value.toInt() } },
+            onValueChangeFinished = { ProfileStore.sharedOrNull()?.capturePlayback() },
+            valueRange = 0f..100f,
+            steps = 99,
+        )
+        Text(
+            "Hide sources below this title and episode similarity. Off keeps all current sources. " +
+                "A wrong season or episode scores 0%; an unknown episode is capped at 60%, a matching " +
+                "season pack at 70%, and an episode range at 95%. Sources without a release title score 0%.",
+            style = VortXTheme.type.label.copy(color = colors.textSecondary),
+        )
 
         // Avoid behavior: two chips instead of a segmented picker (matching Apple's shared surfaces).
         Text(

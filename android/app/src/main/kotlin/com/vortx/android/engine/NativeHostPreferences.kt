@@ -97,6 +97,10 @@ internal object NativeHostPreferences {
                 bools("useAddonOrder instantOnly hideDeadTorrents hdrOnly excludeAV1 keywordsAreRegex hideUnknownResolution preferredAudioOnly autoPickBest")
                 fields("subSizeScale maxFileSizeGB", ::decimal)
                 fields("maxResolution minResolution", ::integer)
+                fields("matchConfidenceThreshold") {
+                    integer(it)
+                    require((it as Number).toLong() in 0L..100L) { "Source match confidence must be 0..100" }
+                }
                 fields("sourceTypeOrder", ::stringArray)
             }
             "discovery" -> {

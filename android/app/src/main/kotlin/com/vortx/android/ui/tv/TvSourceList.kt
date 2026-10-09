@@ -82,6 +82,7 @@ fun TvSourceList(
     onSortChange: (String) -> Unit,
     audioLanguageHint: String?,
     onAudioLanguageHintChange: (String?) -> Unit,
+    onSourceVariantOptions: (List<StreamGroup>, String) -> List<Pair<String, StreamSource>>,
     pin: DetailViewModel.PinUi,
     entryNoun: String,
     onPlay: (StreamSource) -> Unit,
@@ -109,6 +110,7 @@ fun TvSourceList(
             onSortChange = onSortChange,
             audioLanguageHint = audioLanguageHint,
             onAudioLanguageHintChange = onAudioLanguageHintChange,
+            onSourceVariantOptions = onSourceVariantOptions,
             pin = pin,
             entryNoun = entryNoun,
             onPlay = onPlay,
@@ -132,6 +134,7 @@ private fun TvSourceListContent(
     onSortChange: (String) -> Unit,
     audioLanguageHint: String?,
     onAudioLanguageHintChange: (String?) -> Unit,
+    onSourceVariantOptions: (List<StreamGroup>, String) -> List<Pair<String, StreamSource>>,
     pin: DetailViewModel.PinUi,
     entryNoun: String,
     onPlay: (StreamSource) -> Unit,
@@ -208,6 +211,7 @@ private fun TvSourceListContent(
             onSortChange = onSortChange,
             audioLanguageHint = audioLanguageHint,
             onAudioLanguageHintChange = onAudioLanguageHintChange,
+            onSourceVariantOptions = onSourceVariantOptions,
             qualityOpen = qualityOpen,
             onQualityOpenChange = { qualityOpen = it },
             qualityTier = qualityTier,
@@ -389,6 +393,7 @@ private fun TvSourceControlsRow(
     onSortChange: (String) -> Unit,
     audioLanguageHint: String?,
     onAudioLanguageHintChange: (String?) -> Unit,
+    onSourceVariantOptions: (List<StreamGroup>, String) -> List<Pair<String, StreamSource>>,
     qualityOpen: Boolean,
     onQualityOpenChange: (Boolean) -> Unit,
     qualityTier: String?,
@@ -437,7 +442,7 @@ private fun TvSourceControlsRow(
                     ) {
                         DropdownMenuItem(text = { Text("‹ Back") }, onClick = { onQualityTierChange(null) })
                         if (activeTier != null) {
-                            StreamRanking.variantOptions(groups, activeTier).forEach { (label, source) ->
+                            onSourceVariantOptions(groups, activeTier).forEach { (label, source) ->
                                 DropdownMenuItem(
                                     text = { Text(label) },
                                     onClick = {
