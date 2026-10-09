@@ -57,7 +57,7 @@ int main(int argc, char **argv) {
         if (mpv_set_option_string(m, options[i][0], options[i][1]) < 0) return 66;
     if (mpv_initialize(m) < 0) return 67;
     char *version = mpv_get_property_string(m, "mpv-version");
-    printf("RUNTIME %s network-timeout=%s stream-lavf-o=%s output=null transport-only=1\n", version ? version : "unavailable", argv[2], argv[3]);
+    fprintf(stdout, "RUNTIME %s network-timeout=%s stream-lavf-o=%s output=null transport-only=1\n", version ? version : "unavailable", argv[2], argv[3]);
     mpv_free(version);
     const char *load[] = {"loadfile", argv[1], "replace", NULL};
     if (mpv_command(m, load) < 0) return 68;

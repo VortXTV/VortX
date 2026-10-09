@@ -127,10 +127,11 @@ int main(int argc, char **argv)
                 printf("STOP_ACCEPTED\n");
             } else if (replace) {
                 char replacement[256];
+                const char suffix[] = "/replacement.mkv";
                 size_t prefix = (size_t)(end - argv[1]);
-                if (prefix + strlen("/replacement.mkv") + 1 > sizeof(replacement)) goto cleanup;
+                if (prefix > sizeof(replacement) - sizeof(suffix)) goto cleanup;
                 memcpy(replacement, argv[1], prefix);
-                strcpy(replacement + prefix, "/replacement.mkv");
+                memcpy(replacement + prefix, suffix, sizeof(suffix));
                 const char *command[] = {"loadfile", replacement, "replace", NULL};
                 if (mpv_command(m, command) < 0) goto cleanup;
                 printf("REPLACEMENT_ACCEPTED\n");
