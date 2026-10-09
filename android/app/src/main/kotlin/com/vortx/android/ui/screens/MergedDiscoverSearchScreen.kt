@@ -9,16 +9,11 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.UiState
-import com.vortx.android.ui.components.EmptyState
-import com.vortx.android.ui.components.ErrorState
 import com.vortx.android.ui.components.SignedOutState
-import com.vortx.android.ui.search.searchEmptyMessage
-import com.vortx.android.ui.search.textResourceId
 import com.vortx.android.ui.viewmodel.DiscoverViewModel
 import com.vortx.android.ui.viewmodel.SearchViewModel
 
@@ -26,8 +21,8 @@ import com.vortx.android.ui.viewmodel.SearchViewModel
 /// Android port of Apple's merged mode (iOSRootView.swift:2629-2666): one search field pinned above the
 /// browse, so the tab bar can drop the standalone Search tab. Below the field, the query length is the
 /// switch -- fewer than two characters shows the normal [DiscoverScreen] browse (type/catalog/genre chips
-/// + catalog grid); two or more characters REPLACE the browse with the same grouped Movies/Series/Other
-/// result grid the Search tab renders, with the long-press catalog menu and watched badges. Submitting
+/// + catalog grid); two or more characters REPLACE the browse with the same grouped Movies/Series/Collections/Other
+/// result rails the Search tab renders, with the long-press catalog menu and watched badges. Submitting
 /// runs the search immediately (the field's own IME action skips the debounce). Fully reversible: turning
 /// the pref off restores the Search tab and returns Discover to a plain browse.
 @Composable
@@ -42,6 +37,7 @@ fun MergedDiscoverSearchScreen(
     quickActions: (@Composable () -> Unit)? = null,
 ) {
     val searchState by searchViewModel.screenState.collectAsStateWithLifecycle()
+    val suggestions by searchViewModel.suggestions.collectAsStateWithLifecycle()
     val query = searchState.query
     // The engine's own two-character gate (Apple `hasSearchQuery`): below it, browse; at it, grouped
     // results. So a one-character query keeps the Discover browse on screen, never a misleading "No matches".
@@ -63,22 +59,14 @@ fun MergedDiscoverSearchScreen(
     @Composable
     fun BrowseOrResults(contentModifier: Modifier) {
         if (hasQuery) {
-            when (val s = searchState.content) {
-                is UiState.Loading -> EmptyState("Searching your add-ons…", contentModifier)
-                is UiState.Error -> ErrorState(s.message, modifier = contentModifier)
-                is UiState.Success -> PosterGrid(
-                    items = s.data,
-                    onItem = openItem,
-                    modifier = contentModifier,
-                    emptyHint = when (val message = searchEmptyMessage(query, s)) {
-                        null -> ""
-                        else -> stringResource(message.textResourceId)
-                    },
-                    sectioned = true,
-                    showMenu = true,
-                    cinemaSearch = true,
-                )
-            }
+            SearchResultRails(
+                query = query,
+                items = (searchState.content as? UiState.Success)?.data.orEmpty(),
+                isLoading = searchState.isLoading,
+                onItem = openItem,
+                modifier = contentModifier,
+                errorMessage = (searchState.content as? UiState.Error)?.message,
+            )
         } else {
             // The plain Discover browse fills the space beneath the field.
             DiscoverScreen(
@@ -109,6 +97,7 @@ fun MergedDiscoverSearchScreen(
                         onSubmit = searchViewModel::submitQuery,
                         onClear = { searchViewModel.onQueryChange("") },
                     )
+                    SearchSuggestionsRow(suggestions, searchViewModel::onQueryChange)
                 }
                 BrowseOrResults(Modifier.weight(1f))
             }
@@ -121,6 +110,7 @@ fun MergedDiscoverSearchScreen(
                     onSubmit = searchViewModel::submitQuery,
                     onClear = { searchViewModel.onQueryChange("") },
                 )
+                SearchSuggestionsRow(suggestions, searchViewModel::onQueryChange)
                 BrowseOrResults(Modifier.weight(1f))
             }
         }

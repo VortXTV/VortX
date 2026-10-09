@@ -10,7 +10,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -110,7 +112,8 @@ internal class NativeCatalogRepository(
             VortxResourceAddon(it.getString("transportUrl"), it.getString("transportUrl"), it.getJSONObject("manifest").toString())
         }
     }
-    private fun catalogs(read: VortxNativeRead) = registry(read).flatMap { addon ->
+    private fun catalogs(read: VortxNativeRead) = catalogs(registry(read))
+    private fun catalogs(addons: List<VortxResourceAddon>) = addons.flatMap { addon ->
         JSONObject(requireNotNull(addon.manifestJson)).getJSONArray("catalogs").objects().map { CatalogSpec(addon, it) }
     }
     private fun canLoad(spec: CatalogSpec, extras: Set<String>) = spec.extras.none { it.optBoolean("isRequired") && it.getString("name") !in extras }
@@ -348,21 +351,24 @@ internal class NativeCatalogRepository(
             hasNextPage = selected.accepts("skip") && more)
     }
     override suspend fun search(query: String): Result<List<MetaItem>> = attempt {
-        val session = session(); val read = session.read(); val text = query.trim()
-        if (text.length < 2) {
-            val empty = session.load("search", read.owner, emptyList())
-            return@attempt session.publish("search", read.owner, empty) { emptyList() }
-        }
-        val specs = catalogs(read).filter { it.accepts("search") && canLoad(it, setOf("search")) }
-        val pages = session.load("search", read.owner, specs.map { it.request(listOf("search" to text)) to listOf(it.addon) })
-        requireAnySettled(pages)
-        session.publish("search", read.owner, pages) { EngineState.parseCatalogs(board(pages, registry(read), read, "search")).flatMap { it.items }.distinctBy { it.type to it.id } }
+        var result = emptyList<MetaItem>()
+        searchUpdates(query).collect { (items, _) -> result = items }
+        result
     }
     override fun searchUpdates(query: String): Flow<Pair<List<MetaItem>, Boolean>> = flow {
-        if (query.trim().length >= 2) emit(emptyList<MetaItem>() to true)
-        // Even an empty query must revoke the preceding native consumer slot.
-        emit(search(query).getOrThrow() to false)
-    }
+        val session = session(); val read = session.read(); val text = query.trim()
+        val addons = if (text.length >= 2) registry(read) else emptyList()
+        val specs = catalogs(addons).filter { it.accepts("search") && canLoad(it, setOf("search")) }
+        if (text.length >= 2) emit(emptyList<MetaItem>() to true)
+        // An empty query starts an empty batch too, revoking the preceding native consumer slot.
+        session.loadIncrementally("search", read.owner, specs.map { it.request(listOf("search" to text)) to listOf(it.addon) }) { pages, pending, ticket ->
+            if (!pending) requireAnySettled(pages)
+            val items = session.publish("search", read.owner, pages, ticket) {
+                EngineState.parseCatalogs(board(pages, addons, read, "search")).flatMap { it.items }.distinctBy { it.type to it.id }
+            }
+            emit(items to pending)
+        }
+    }.flowOn(Dispatchers.IO)
 
     override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)

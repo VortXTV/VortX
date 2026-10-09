@@ -277,8 +277,11 @@ internal class VortxNativeSession private constructor(
     private val onMutation: () -> Unit,
     private val beforeOwnerChange: () -> Unit,
 ) : AutoCloseable {
-    private data class Slot(val ticket: UUID, val owner: VortxNativeOwner, val bridge: VortxResourceBridge,
-                            var completed: List<Pair<String, Long>>? = null)
+    private data class Slot(val ticket: UUID, val owner: VortxNativeOwner,
+                            val bridges: MutableList<VortxResourceBridge> = mutableListOf(),
+                            var completed: List<Pair<String, Long>>? = null) {
+        fun close() = bridges.forEach { it.close() }
+    }
     private val slots = mutableMapOf<String, Slot>()
     private var revision = nextRevision.incrementAndGet()
     private var closed = false
@@ -655,7 +658,7 @@ internal class VortxNativeSession private constructor(
     @Synchronized private fun invalidate() {
         beforeOwnerChange()
         revision = nextRevision.incrementAndGet()
-        slots.values.forEach { it.bridge.close() }; slots.clear()
+        slots.values.forEach { it.close() }; slots.clear()
     }
     /** Rename may have succeeded before fsync/readback failed. Keep the previously published view
      * readable, but revoke ALL transaction/resource/reclaim admission until authenticated reopen.
@@ -667,7 +670,7 @@ internal class VortxNativeSession private constructor(
             check(store.read(scope) == snapshot) { "Native checkpoint readback failed" }
         } catch (error: Throwable) {
             checkpointUncertain = true
-            slots.values.forEach { it.bridge.close() }; slots.clear()
+            slots.values.forEach { it.close() }; slots.clear()
             changes.value += 1
             throw error
         }
@@ -686,14 +689,31 @@ internal class VortxNativeSession private constructor(
         changes.value += 1
     }
     @Synchronized private fun begin(name: String, owner: VortxNativeOwner): Slot = owned(owner) {
-        slots.remove(name)?.bridge?.close()
-        Slot(UUID.randomUUID(), owner, VortxResourceBridge(transport)).also { slots[name] = it }
+        slots.remove(name)?.close()
+        Slot(UUID.randomUUID(), owner).also { slots[name] = it }
     }
     @Synchronized private fun current(name: String, slot: Slot): Boolean = accepts(slot.owner) && slots[name] === slot
+    @Synchronized private fun bridge(name: String, slot: Slot): VortxResourceBridge {
+        check(current(name, slot)) { "Native request superseded" }
+        return VortxResourceBridge(transport).also { slot.bridges += it }
+    }
+    @Synchronized private fun retire(slot: Slot, bridge: VortxResourceBridge) {
+        bridge.close()
+        slot.bridges.remove(bridge)
+    }
+    @Synchronized private fun finish(name: String, slot: Slot, revoke: Boolean) {
+        slot.close()
+        if (revoke && slots[name] === slot) slots.remove(name)
+    }
 
     /** Parsing may occur off-lock; publication must still belong to the exact latest consumer load. */
-    @Synchronized fun <T> publish(name: String, owner: VortxNativeOwner, pages: List<VortxResourceSnapshot>, action: () -> T): T = owned(owner) {
-        check(slots[name]?.completed == pages.map { it.requestId to it.generation }) { "Native request superseded" }
+    @Synchronized fun <T> publish(name: String, owner: VortxNativeOwner, pages: List<VortxResourceSnapshot>, action: () -> T): T =
+        publish(name, owner, pages, null, action)
+    @Synchronized fun <T> publish(name: String, owner: VortxNativeOwner, pages: List<VortxResourceSnapshot>,
+                                 ticket: UUID?, action: () -> T): T = owned(owner) {
+        val slot = slots[name]
+        check(slot != null && (ticket == null || slot.ticket == ticket) &&
+            slot.completed == pages.map { it.requestId to it.generation }) { "Native request superseded" }
         action()
     }
 
@@ -701,11 +721,13 @@ internal class VortxNativeSession private constructor(
     suspend fun load(name: String, owner: VortxNativeOwner,
                      requests: List<Pair<VortxResourceRequest, List<VortxResourceAddon>>>): List<VortxResourceSnapshot> {
         val slot = begin(name, owner)
+        var completed = false
         try {
+            val bridge = bridge(name, slot)
             val result = requests.map { (request, addons) ->
                 check(current(name, slot)) { "Native request superseded" }
-                slot.bridge.load("${scope.digest}:${owner.profileID}:${owner.revision}", request, addons).also {
-                    check(current(name, slot) && slot.bridge.accepts(it)) { "Native request superseded" }
+                bridge.load("${scope.digest}:${owner.profileID}:${owner.revision}", request, addons).also {
+                    check(current(name, slot) && bridge.accepts(it)) { "Native request superseded" }
                 }
             }
             check(current(name, slot)) { "Native request superseded" }
@@ -713,7 +735,34 @@ internal class VortxNativeSession private constructor(
                 check(current(name, slot)) { "Native request superseded" }
                 slot.completed = result.map { it.requestId to it.generation }
             }
+            completed = true
             return result
-        } finally { slot.bridge.close() }
+        } finally { finish(name, slot, revoke = !completed) }
+    }
+
+    /** One batch lease, independent bridges, and serialized receipts for incremental search. */
+    suspend fun loadIncrementally(name: String, owner: VortxNativeOwner,
+                                  requests: List<Pair<VortxResourceRequest, List<VortxResourceAddon>>>,
+                                  onUpdate: suspend (List<VortxResourceSnapshot>, Boolean, UUID) -> Unit) {
+        val slot = begin(name, owner)
+        var completed = false
+        try {
+            collectNativeResourceBatch(requests.size, load = { index ->
+                val bridge = bridge(name, slot)
+                val (request, addons) = requests[index]
+                try {
+                    bridge.load("${scope.digest}:${owner.profileID}:${owner.revision}", request, addons).also {
+                        check(current(name, slot) && bridge.accepts(it)) { "Native request superseded" }
+                    }
+                } finally { retire(slot, bridge) }
+            }) { pages, pending ->
+                synchronized(this) {
+                    check(current(name, slot)) { "Native request superseded" }
+                    slot.completed = pages.map { it.requestId to it.generation }
+                }
+                onUpdate(pages, pending, slot.ticket)
+            }
+            completed = true
+        } finally { finish(name, slot, revoke = !completed) }
     }
 }

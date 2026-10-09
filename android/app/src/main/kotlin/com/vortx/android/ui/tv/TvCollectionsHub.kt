@@ -83,6 +83,12 @@ internal fun TvCollectionsHub(
     }
 }
 
+/** Search reuses the focusable collection targets already used by TV Home and Discover. */
+@Composable
+internal fun TvSearchCollectionsRail(tiles: List<CollectionsHubTile>, onOpen: (CollectionsHubTarget) -> Unit) {
+    TvHubRow(stringResource(R.string.collections_title), tiles, onOpen)
+}
+
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 private fun TvProviderLoadError(onRetry: () -> Unit) {
