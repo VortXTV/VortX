@@ -76,7 +76,7 @@ import kotlin.math.roundToInt
 /// `AddonsView.swift:424` -> `toggleAddon`) and drag-reorder priority mode (Apple
 /// `AddonsView.swift:476 .onMove` / `AddonReorderView`). QR pairing and the add-on catalog/store
 /// browser remain separate parity work.
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun AddonsScreen(
     viewModel: AddonsViewModel,
@@ -193,7 +193,10 @@ fun AddonsScreen(
                             ),
                             modifier = Modifier.fillMaxWidth(),
                         )
-                        Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
+                        ) {
                             Chip(
                                 label = if (installing) "Installing…" else "Install",
                                 selected = true,
