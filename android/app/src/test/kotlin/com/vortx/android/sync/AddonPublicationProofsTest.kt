@@ -8,6 +8,34 @@ internal fun publicationAddon(url: String) = requireNotNull(VortXSyncDoc.addonDe
     .put("manifest", JSONObject().put("id", "sample").put("name", "Sample"))))
 
 class AddonPublicationProofsTest {
+    @Test fun `explicit trusted descriptor flags require matching installed flags before publication`() {
+        val expected = publicationAddon("https://fixture.invalid/manifest.json").let {
+            it.copy(raw = JSONObject(it.raw.toString()).put("flags", JSONObject().put("official", true).put("protected", true)))
+        }
+        for (mode in listOf("protected", "official", "absent")) {
+            val actual = expected.copy(raw = JSONObject(expected.raw.toString()).also { raw ->
+                if (mode == "absent") raw.remove("flags") else raw.getJSONObject("flags").put(mode, false)
+            })
+            val proofs = AddonPublicationProofs(MemoryLibraryProofPersistence())
+            val native = NativeLibraryOwner("fixture")
+            assertFalse(AddonPublicationProofs.matchesInstalled(expected, actual))
+            assertFalse(AddonPublicationLease("fixture-account", proofs) { it() }.install(native, expected, { listOf(actual) }) {})
+            assertNull(proofs.published("fixture-account", native, actual))
+        }
+    }
+
+    @Test fun `absent legacy flags retain subset semantics while explicit false cannot be promoted`() {
+        val legacy = publicationAddon("https://fixture.invalid/manifest.json")
+        val emptyLegacy = legacy.copy(raw = JSONObject(legacy.raw.toString()).put("flags", JSONObject()))
+        assertTrue(AddonPublicationProofs.matchesInstalled(emptyLegacy, legacy))
+        val native = legacy.copy(raw = JSONObject(legacy.raw.toString()).put("flags", JSONObject().put("protected", true).put("official", true)))
+        assertTrue(AddonPublicationProofs.matchesInstalled(legacy, native))
+        val untrusted = legacy.copy(raw = JSONObject(legacy.raw.toString()).put("flags", JSONObject().put("protected", false).put("official", false)))
+        assertFalse(AddonPublicationProofs.matchesInstalled(untrusted, native))
+        val actual = untrusted.copy(raw = JSONObject(untrusted.raw.toString()).also { it.getJSONObject("flags").put("futureDefault", true) })
+        assertTrue(AddonPublicationProofs.matchesInstalled(untrusted, actual))
+    }
+
     @Test fun `configured credential case exact raw fingerprint and authorized outbound survive restart`() {
         val disk = MemoryLibraryProofPersistence()
         val proofs = AddonPublicationProofs(disk)

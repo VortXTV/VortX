@@ -53,7 +53,9 @@ internal class AddonPublicationProofs(private val persistence: LibraryProofPersi
         internal fun fingerprint(row: VortXSyncDoc.AddonDescriptor): String = digest(canonical(row.raw))
         internal fun matchesInstalled(expected: VortXSyncDoc.AddonDescriptor, actual: VortXSyncDoc.AddonDescriptor): Boolean =
             endpoint(expected.transportUrl) == endpoint(actual.transportUrl) &&
-                containsExpected(expected.raw.optJSONObject("manifest"), actual.raw.optJSONObject("manifest"))
+                containsExpected(expected.raw.optJSONObject("manifest"), actual.raw.optJSONObject("manifest")) &&
+                // Absent legacy flags remain absent authority; explicit trusted flags need a receipt.
+                (expected.raw.optJSONObject("flags")?.let { it.length() == 0 || containsExpected(it, actual.raw.optJSONObject("flags")) } ?: true)
 
         // Native serde can add defaults. Only action/account-authored fields are exported; a proof never
         // authorizes those extra native fields, even if they were inherited from a previous account.

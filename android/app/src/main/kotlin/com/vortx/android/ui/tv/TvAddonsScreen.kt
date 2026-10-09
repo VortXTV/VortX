@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -35,6 +36,7 @@ import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
 import com.vortx.android.R
+import com.vortx.android.data.AddonManagementTarget
 import com.vortx.android.engine.AddonHealth
 import com.vortx.android.engine.AddonHealthStore
 import com.vortx.android.model.InstalledAddon
@@ -95,18 +97,100 @@ internal fun TvAddonsScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val health by viewModel.health.collectAsStateWithLifecycle()
+    val access by viewModel.managementAccess.collectAsStateWithLifecycle()
+    // Plain composition value: callbacks must retain their render's owner, not read delegated State later.
+    val renderedOwner = access.owner
+    val urlInput by viewModel.urlInput.collectAsStateWithLifecycle()
+    val installing by viewModel.installing.collectAsStateWithLifecycle()
+    val installMessage by viewModel.installMessage.collectAsStateWithLifecycle()
+    val pendingUpdate by viewModel.pendingUpdate.collectAsStateWithLifecycle()
+    val mutating by viewModel.mutating.collectAsStateWithLifecycle()
+    val changeMessage by viewModel.changeUrlMessage.collectAsStateWithLifecycle()
+    val changeDone by viewModel.changeUrlDone.collectAsStateWithLifecycle()
+    val actionMessage by viewModel.actionMessage.collectAsStateWithLifecycle()
+    val removeDone by viewModel.removeDone.collectAsStateWithLifecycle()
     val installed = (state as? UiState.Success)?.data.orEmpty()
     val latestInstalled by rememberUpdatedState(installed)
     val backFocus = remember { FocusRequester() }
+    val listState = rememberLazyListState()
     var moveFocus by remember { mutableStateOf<TvAddonMoveFocus?>(null) }
     var moveFocusSequence by remember { mutableStateOf(0) }
+    var changeTarget by remember { mutableStateOf<AddonManagementTarget?>(null) }
+    var removeTarget by remember { mutableStateOf<AddonManagementTarget?>(null) }
+    var replacementUrl by remember { mutableStateOf("") }
+    var actionFocus by remember { mutableStateOf<TvAddonActionFocus?>(null) }
+    var actionFocusSequence by remember { mutableStateOf(0) }
+    var backFocusSequence by remember { mutableStateOf(0) }
+    var observedDone by remember { mutableStateOf(changeDone to removeDone) }
+
+    fun closeManagementDialog() {
+        val target = changeTarget ?: removeTarget
+        val kind = if (changeTarget != null) TvAddonDialogKind.CHANGE_URL else TvAddonDialogKind.REMOVE
+        changeTarget = null; removeTarget = null
+        target?.addon?.let { actionFocus = TvAddonActionFocus(it.transportUrl, kind); actionFocusSequence += 1 }
+    }
+
+    LaunchedEffect(access.owner) {
+        if (changeTarget?.owner?.let { it != access.owner } == true || removeTarget?.owner?.let { it != access.owner } == true) {
+            closeManagementDialog()
+            actionFocus = null
+            backFocusSequence += 1
+        }
+    }
+    LaunchedEffect(changeDone, removeDone) {
+        if (observedDone != (changeDone to removeDone)) {
+            observedDone = changeDone to removeDone
+            closeManagementDialog()
+            // The success reload is asynchronous: never focus an old row that is about to disappear.
+            actionFocus = null
+            backFocusSequence += 1
+        }
+    }
+    LaunchedEffect(backFocusSequence) {
+        if (backFocusSequence > 0) {
+            listState.scrollToItem(0)
+            withFrameNanos { }; runCatching { backFocus.requestFocus() }
+        }
+    }
+    LaunchedEffect(actionFocusSequence, installed) {
+        if (actionFocus != null && installed.none { it.transportUrl == actionFocus?.transportUrl }) {
+            listState.scrollToItem(0)
+            withFrameNanos { }; runCatching { backFocus.requestFocus() }
+            actionFocus = null
+        }
+    }
+
+    changeTarget?.let { target ->
+        TvAddonManagementDialog(
+            title = "Change URL — ${target.addon?.name.orEmpty()}",
+            description = "Paste the configured manifest URL. The new add-on is validated before the old endpoint is replaced.",
+            confirmLabel = "Change URL", busy = mutating, message = changeMessage,
+            url = replacementUrl, onUrlChange = { replacementUrl = it },
+            confirmEnabled = replacementUrl.isNotBlank() && replacementUrl.trim() != target.addon?.transportUrl,
+            onConfirm = { viewModel.changeAddonUrl(target, replacementUrl) }, onDismiss = ::closeManagementDialog,
+        )
+    }
+    removeTarget?.let { target ->
+        TvAddonManagementDialog(title = "Remove ${target.addon?.name.orEmpty()}?",
+            description = "Remove this add-on from the account. Its catalogs and sources will no longer be available to profiles using it.",
+            confirmLabel = "Remove", busy = mutating, message = actionMessage,
+            onConfirm = { viewModel.remove(target) }, onDismiss = ::closeManagementDialog)
+    }
+    if (pendingUpdate != null) {
+        TvAddonManagementDialog(
+            title = stringResource(R.string.addon_update_confirm_title),
+            description = stringResource(R.string.addon_update_confirm_message),
+            confirmLabel = stringResource(R.string.addon_update_confirm_button), busy = mutating,
+            message = null, onConfirm = viewModel::confirmUpdate, onDismiss = viewModel::cancelUpdate,
+        )
+    }
 
     fun moveAddon(transportUrl: String, direction: TvAddonMoveDirection) {
         // Re-read the latest observed set on every press: a stale row callback must not resurrect an
         // add-on removed since composition, and newly installed rows participate in the move order.
         val latestUrls = latestInstalled.map(InstalledAddon::transportUrl)
         val result = tvAddonMove(latestUrls, transportUrl, direction) ?: return
-        viewModel.applyOrder(result.order)
+        viewModel.applyOrder(result.order, renderedOwner)
         moveFocusSequence += 1
         moveFocus = TvAddonMoveFocus(transportUrl, result.focusDirection)
     }
@@ -127,6 +211,7 @@ internal fun TvAddonsScreen(
     }
 
     LazyColumn(
+        state = listState,
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(TvDimens.edge),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
@@ -146,6 +231,18 @@ internal fun TvAddonsScreen(
                     stringResource(R.string.addon_health_tv_description),
                     style = VortXTheme.type.body.copy(color = VortXTheme.colors.textSecondary),
                 )
+            }
+        }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+                TvAddonUrlField(urlInput, viewModel::onUrlChange, !mutating && access.canManageInstalled)
+                TvAddonAction(if (installing) "Installing…" else "Install by URL", { viewModel.install(renderedOwner) },
+                    Modifier.width(260.dp), enabled = !mutating && access.canManageInstalled && urlInput.isNotBlank())
+                access.reason?.let { Text(it, style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary)) }
+                installMessage?.let { (message, failed) -> Text(message,
+                    style = VortXTheme.type.label.copy(color = if (failed) VortXTheme.colors.danger else VortXTheme.colors.textSecondary)) }
+                actionMessage?.let { (message, failed) -> Text(message,
+                    style = VortXTheme.type.label.copy(color = if (failed) VortXTheme.colors.danger else VortXTheme.colors.textSecondary)) }
             }
         }
         item {
@@ -191,22 +288,35 @@ internal fun TvAddonsScreen(
                     item { Text(stringResource(R.string.addon_health_empty), style = VortXTheme.type.body) }
                 } else {
                     items(current.data, key = InstalledAddon::transportUrl) { addon ->
+                        val actions = tvAddonManagementActions(addon, access.canManageInstalled)
                         TvAddonRow(
                             addon = addon,
                             health = health[AddonHealthStore.normalizeUrl(addon.transportUrl)]
                                 ?: AddonHealth.Unknown,
-                            onClick = { if (!addon.isProtected) viewModel.toggleAddon(addon) },
-                            onConfigure = if (addon.isConfigurable) {
+                            onClick = { if (!addon.isProtected) viewModel.toggleAddon(addon, renderedOwner) },
+                            enabled = !mutating,
+                            onConfigure = if (actions.configure) {
                                 { configureAddon = addon }
                             } else {
                                 null
                             },
+                            onChangeUrl = if (actions.changeUrl) { {
+                                viewModel.captureManagementTarget(addon, renderedOwner)?.let { target ->
+                                    viewModel.onChangeUrlOpen(target); replacementUrl = addon.transportUrl; changeTarget = target
+                                }
+                            } } else null,
+                            onRemove = if (actions.remove) { {
+                                viewModel.captureManagementTarget(addon, renderedOwner)?.let { viewModel.onRemoveOpen(); removeTarget = it }
+                            } } else null,
                             onMoveUp = { moveAddon(addon.transportUrl, TvAddonMoveDirection.UP) },
                             onMoveDown = { moveAddon(addon.transportUrl, TvAddonMoveDirection.DOWN) },
                             canMoveUp = current.data.indexOfFirst { it.transportUrl == addon.transportUrl } > 0,
                             canMoveDown = current.data.indexOfFirst { it.transportUrl == addon.transportUrl } < current.data.lastIndex,
                             moveFocus = moveFocus,
                             moveFocusSequence = moveFocusSequence,
+                            actionFocus = actionFocus,
+                            actionFocusSequence = actionFocusSequence,
+                            onActionFocusRestored = { actionFocus = null },
                         )
                     }
                 }
@@ -231,6 +341,7 @@ private data class TvAddonMoveFocus(
     val transportUrl: String,
     val direction: TvAddonMoveDirection,
 )
+private data class TvAddonActionFocus(val transportUrl: String, val kind: TvAddonDialogKind)
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -238,17 +349,32 @@ private fun TvAddonRow(
     addon: InstalledAddon,
     health: AddonHealth,
     onClick: () -> Unit,
+    enabled: Boolean,
     onConfigure: (() -> Unit)? = null,
+    onChangeUrl: (() -> Unit)? = null,
+    onRemove: (() -> Unit)? = null,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     canMoveUp: Boolean,
     canMoveDown: Boolean,
     moveFocus: TvAddonMoveFocus?,
     moveFocusSequence: Int,
+    actionFocus: TvAddonActionFocus?,
+    actionFocusSequence: Int,
+    onActionFocusRestored: () -> Unit,
 ) {
     val colors = VortXTheme.colors
     val upFocus = remember(addon.transportUrl) { FocusRequester() }
     val downFocus = remember(addon.transportUrl) { FocusRequester() }
+    val changeFocus = remember(addon.transportUrl) { FocusRequester() }
+    val removeFocus = remember(addon.transportUrl) { FocusRequester() }
+    LaunchedEffect(actionFocusSequence, actionFocus, enabled) {
+        if (actionFocus?.transportUrl == addon.transportUrl) {
+            withFrameNanos { }
+            val focused = runCatching { if (actionFocus.kind == TvAddonDialogKind.CHANGE_URL) changeFocus.requestFocus() else removeFocus.requestFocus() }.getOrDefault(false)
+            if (focused) onActionFocusRestored()
+        }
+    }
     LaunchedEffect(moveFocusSequence, moveFocus) {
         if (moveFocus?.transportUrl == addon.transportUrl) {
             withFrameNanos { }
@@ -260,14 +386,14 @@ private fun TvAddonRow(
             }
         }
     }
-    Row(
+    Column(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
-        verticalAlignment = Alignment.CenterVertically,
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
     ) {
         Surface(
             onClick = onClick,
-            modifier = Modifier.weight(1f),
+            enabled = enabled && !addon.isProtected,
+            modifier = Modifier.fillMaxWidth(),
             shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
             colors = ClickableSurfaceDefaults.colors(
                 containerColor = colors.surface1,
@@ -323,33 +449,37 @@ private fun TvAddonRow(
                 )
             }
         }
-        if (onConfigure != null) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
+            if (onConfigure != null) {
+                TvAddonAction(
+                    label = stringResource(R.string.addon_configure),
+                    onClick = onConfigure,
+                    modifier = Modifier.weight(1f), enabled = enabled,
+                )
+            }
+            if (onChangeUrl != null) TvAddonAction("Change URL", onChangeUrl, Modifier.weight(1f), changeFocus, enabled)
+            if (onRemove != null) TvAddonAction("Remove", onRemove, Modifier.weight(1f), removeFocus, enabled)
             TvAddonAction(
-                label = stringResource(R.string.addon_configure),
-                onClick = onConfigure,
-                modifier = Modifier.width(200.dp),
+                label = "Move up",
+                onClick = onMoveUp,
+                modifier = Modifier.weight(1f),
+                focusRequester = upFocus,
+                enabled = canMoveUp && enabled,
+            )
+            TvAddonAction(
+                label = "Move down",
+                onClick = onMoveDown,
+                modifier = Modifier.weight(1f),
+                focusRequester = downFocus,
+                enabled = canMoveDown && enabled,
             )
         }
-        TvAddonAction(
-            label = "Move up",
-            onClick = onMoveUp,
-            modifier = Modifier.width(150.dp),
-            focusRequester = upFocus,
-            enabled = canMoveUp,
-        )
-        TvAddonAction(
-            label = "Move down",
-            onClick = onMoveDown,
-            modifier = Modifier.width(170.dp),
-            focusRequester = downFocus,
-            enabled = canMoveDown,
-        )
     }
 }
 
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvAddonAction(
+internal fun TvAddonAction(
     label: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,

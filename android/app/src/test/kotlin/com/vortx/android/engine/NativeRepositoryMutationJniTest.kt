@@ -2,6 +2,7 @@ package com.vortx.android.engine
 
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
+import com.vortx.android.data.AddonManagementTarget
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Dispatchers
@@ -57,11 +58,11 @@ class NativeRepositoryMutationJniTest {
                 })).toString()
         }
     }
-    private fun open(store: Store, transport: Transport, runtime: VortxRuntimeBindings = bindings()): VortxNativeSession {
+    private fun open(store: Store, transport: Transport, runtime: VortxRuntimeBindings = bindings(), onMutation: () -> Unit = {}): VortxNativeSession {
         val path = System.getenv("VORTX_JNI_LIBRARY")
         assumeTrue("Reviewed JNI fixture required", System.getenv("VORTX_JNI_SYNC") == "1" && !path.isNullOrBlank())
         System.load(requireNotNull(path))
-        return VortxNativeSession.open(scope, "Owner", runtime, store, transport, true)
+        return VortxNativeSession.open(scope, "Owner", runtime, store, transport, true, onMutation = onMutation)
     }
     private fun install(session: VortxNativeSession, url: String = "https://old.invalid/manifest.json", protected: Boolean = false) {
         session.dispatch(listOf(JSONObject().put("type", "install_addon").put("profileId", "owner").put("addon", JSONObject().put("transportUrl", url)
@@ -69,6 +70,106 @@ class NativeRepositoryMutationJniTest {
     }
     private fun watched(session: VortxNativeSession): Set<String> = session.resolve(JSONObject().put("kind", "profile_playback").put("profileId", "owner"))
         .getJSONObject("watchedVideoIdsByTitle").optJSONArray("series")?.let { values -> (0 until values.length()).map(values::getString).toSet() }.orEmpty()
+
+    @Test fun `owned addon admission rejects pre IO profile ABA before resource fetch`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            val repo = NativeCatalogRepository { session }
+            val target = AddonManagementTarget(repo.continueWatchingOwner())
+            session.dispatch(listOf(JSONObject("""{"type":"add_profile","id":"guest","name":"Guest"}""")))
+            session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"guest"}""")))
+            session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"owner"}""")))
+            val before = store.value; val calls = transport.calls
+            assertTrue(repo.installAddon("https://new.invalid", target).isFailure)
+            assertEquals(calls, transport.calls); assertEquals(before, store.value)
+        }
+    }
+
+    @Test fun `owned stale descriptor cannot remove a current installed endpoint`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            install(session); val repo = NativeCatalogRepository { session }
+            val old = repo.installedAddons().getOrThrow().single()
+            val stale = old.copy(rawDescriptorJson = JSONObject(old.rawDescriptorJson).also { it.getJSONObject("manifest").put("version", "stale") }.toString())
+            val target = AddonManagementTarget(repo.continueWatchingOwner(), stale); val before = store.value
+            assertTrue(repo.removeAddon(target).isFailure); assertEquals(before, store.value)
+            assertEquals(old, repo.installedAddons().getOrThrow().single())
+        }
+    }
+
+    @Test fun `owned update manifest completion cannot resurrect a removed item`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            install(session); val repo = NativeCatalogRepository { session }; val old = repo.installedAddons().getOrThrow().single()
+            val target = AddonManagementTarget(repo.continueWatchingOwner(), old)
+            transport.delayedId = ""; transport.entered = CountDownLatch(1); transport.release = CountDownLatch(1)
+            val pending = async(Dispatchers.IO) { repo.installAddon(old.transportUrl, target) }
+            try {
+                assertTrue(transport.entered!!.await(10, TimeUnit.SECONDS))
+                repo.removeAddon(old).getOrThrow(); val removed = store.value
+                transport.release!!.countDown()
+                assertTrue(pending.await().isFailure); assertEquals(removed, store.value)
+                assertTrue(repo.installedAddons().getOrThrow().isEmpty())
+            } finally { transport.release!!.countDown() }
+        }
+    }
+
+    @Test fun `owned update preserves protected flags and returns the new revision receipt`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            install(session, protected = true); val repo = NativeCatalogRepository { session }
+            val old = repo.installedAddons().getOrThrow().single(); val target = AddonManagementTarget(repo.continueWatchingOwner(), old)
+            val receipt = repo.installAddon(old.transportUrl, target).getOrThrow()
+            assertEquals(repo.continueWatchingOwner(), receipt); assertNotEquals(target.owner.revision, receipt.revision)
+            assertTrue(repo.installedAddons().getOrThrow().single().isProtected)
+        }
+    }
+
+    @Test fun `reentrant owner ABA after commit cannot become the addon action receipt`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        lateinit var mounted: VortxNativeSession
+        var replaceAtNotification = false
+        mounted = open(store, transport, onMutation = {
+            if (replaceAtNotification) {
+                replaceAtNotification = false
+                mounted.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"guest"}""")))
+                mounted.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"owner"}""")))
+            }
+        })
+        mounted.use { session ->
+            install(session); session.dispatch(listOf(JSONObject("""{"type":"add_profile","id":"guest","name":"Guest"}""")))
+            val repo = NativeCatalogRepository { session }; val old = repo.installedAddons().getOrThrow().single()
+            val target = AddonManagementTarget(repo.continueWatchingOwner(), old)
+            replaceAtNotification = true
+            val receipt = repo.installAddon(old.transportUrl, target).getOrThrow()
+            assertNotEquals(repo.continueWatchingOwner(), receipt)
+            assertEquals(target.owner.profileId, receipt.profileId)
+            assertTrue(repo.continueWatchingOwner().revision > target.owner.revision + 1)
+        }
+    }
+
+    @Test fun `shared profile availability blocks membership and retains its visibility action`() = runBlocking {
+        val store = Store(); val transport = Transport()
+        open(store, transport).use { session ->
+            install(session); install(session, "https://second.invalid/manifest.json")
+            val ownerOrder = NativeCatalogRepository { session }.installedAddons().getOrThrow().map { it.transportUrl }
+            session.dispatch(listOf(JSONObject("""{"type":"add_profile","id":"guest","name":"Guest"}"""),
+                JSONObject("""{"type":"switch_profile","id":"guest"}""")))
+            val repo = NativeCatalogRepository { session }; val access = repo.addonManagementAccess()
+            assertFalse(access.canManageInstalled); assertNotNull(access.reason)
+            val old = repo.installedAddons().getOrThrow().first(); val target = AddonManagementTarget(access.owner, old)
+            val before = store.value; val calls = transport.calls
+            assertTrue(repo.installAddon("https://new.invalid", AddonManagementTarget(access.owner)).isFailure)
+            assertTrue(repo.removeAddon(target).isFailure); assertTrue(repo.changeAddonUrl(target, "https://new.invalid").isFailure)
+            assertEquals(calls, transport.calls); assertEquals(before, store.value)
+            repo.setAddonDisabled(target, true).getOrThrow()
+            assertTrue(repo.installedAddons().getOrThrow().first().isDisabled)
+            repo.applyAddonOrder(AddonManagementTarget(repo.continueWatchingOwner()), ownerOrder.reversed()).getOrThrow()
+            assertEquals(ownerOrder.reversed(), repo.installedAddons().getOrThrow().map { it.transportUrl })
+            session.dispatch(listOf(JSONObject("""{"type":"switch_profile","id":"owner"}""")))
+            assertEquals(ownerOrder, repo.installedAddons().getOrThrow().map { it.transportUrl })
+        }
+    }
 
     @Test fun `whole series and season use exact isolated inventory and one durable commit`() = runBlocking {
         val store = Store(); val transport = Transport()
