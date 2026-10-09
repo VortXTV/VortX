@@ -127,6 +127,9 @@ internal object AccountWatchlistClient {
      * (Apple's shape). SIMKL has no watchlist-remove, so [simklWatchlistAdd] is the only SIMKL write here.
      */
     suspend fun simklWatchlistAdd(ref: TitleRef, expectedEpoch: Long): Boolean {
+        val owner = com.vortx.android.integrations.ConnectedIntegrationAccess.owner(
+            com.vortx.android.integrations.RatingProvider.SIMKL) ?: return false
+        if (owner.sessionEpoch != expectedEpoch) return false
         if (!ref.hasUsableId || !SIMKLAuth.isSignedIn) return false
         if (SIMKLAuth.currentSessionEpoch != expectedEpoch) return false
         val token = runCatching { SIMKLAuth.validToken() }.getOrNull() ?: return false
@@ -144,6 +147,9 @@ internal object AccountWatchlistClient {
             urlString = "${SIMKLAuth.API_BASE}/sync/add-to-list?${SIMKLAuth.requiredQuery()}",
             headers = SIMKLAuth.authHeaders(token),
             body = body.toString(),
+            shouldProceed = { com.vortx.android.integrations.ConnectedIntegrationAccess.current(owner) &&
+                com.vortx.android.integrations.ScrobbleService.isToggleOn(
+                    com.vortx.android.integrations.ScrobbleService.KEY_SIMKL_WATCHLIST, true) },
         )
         return response.isSuccess
     }

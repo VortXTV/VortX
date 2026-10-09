@@ -218,17 +218,29 @@ object SIMKLAuth {
     }
 
     /** Exact-account authenticated GET. Stale responses are discarded after disconnect/account switch. */
-    internal suspend fun sessionBoundGet(path: String, expectedEpoch: Long): IntegrationsHttp.Response? {
-        if (!isSessionCurrent(expectedEpoch)) return null
+    internal suspend fun sessionBoundGet(path: String, expectedEpoch: Long): IntegrationsHttp.Response? =
+        sessionBoundRequest("GET", path, expectedEpoch)
+
+    internal suspend fun sessionBoundRequest(
+        method: String, path: String, expectedEpoch: Long, body: String? = null,
+        ownerCurrent: () -> Boolean = { true },
+    ): IntegrationsHttp.Response? {
+        if (!ownerCurrent() || !isSessionCurrent(expectedEpoch)) return null
         val token = runCatching { validToken() }.getOrNull() ?: return null
-        if (!isSessionCurrent(expectedEpoch)) return null
+        if (!ownerCurrent() || !isSessionCurrent(expectedEpoch)) return null
         val response = IntegrationsHttp.request(
-            method = "GET",
+            method = method,
             urlString = "$API_BASE${simklSessionQueryPath(path, requiredQuery())}",
             headers = authHeaders(token),
+            body = body,
+            shouldProceed = { ownerCurrent() && isSessionCurrent(expectedEpoch) },
         )
-        return response.takeIf { isSessionCurrent(expectedEpoch) }
+        return response.takeIf { ownerCurrent() && isSessionCurrent(expectedEpoch) }
     }
+
+    internal fun <T> withSessionCurrent(expectedEpoch: Long, action: () -> T): T? = tokenMutations.snapshot {
+        if (currentSessionEpoch() == expectedEpoch && tokenStore?.connectionState == CredentialConnectionState.CONNECTED) action() else null
+    }.value
 
     private fun isSessionCurrent(expectedEpoch: Long): Boolean = tokenMutations.snapshot {
         currentSessionEpoch() == expectedEpoch &&
