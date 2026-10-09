@@ -153,27 +153,63 @@ enum UsenetLocalResolver {
     struct RoutedStream: Sendable {
         let url: URL
         let route: DebridUsenetRoute
+        let nativeLease: UsenetNodeClient.OperationLease?
     }
 
-    /// Resolve `nzbUrl` to a loopback stream URL, or throw. The nntp URL (carrying the user's provider
+    /// Resolve `nzbUrl` to a lease-bearing loopback stream, or throw. Consumers retain the result,
+    /// not just its URL, until playback/download retirement. The nntp URL (carrying the user's provider
     /// password) is POSTed ONLY to `StremioServer.usenetEndpoint` (the selected local runtime),
     /// never `StremioServer.base`. Native capabilities are validated first. Secrets are never logged.
-    static func resolve(nzbUrl: String, credentials: UsenetProviderCredentials) async throws -> URL {
+    @MainActor static func resolve(nzbUrl: String, credentials: UsenetProviderCredentials) async throws -> RoutedStream {
         try await resolve(nzbURLs: [nzbUrl], servers: [], credentials: credentials)
     }
 
     /// Submit validated add-on mirrors and NNTP hints to the local NZB control endpoint. A saved VortX
     /// provider is appended when present; add-on credentials are never copied into preferences or logs.
-    static func resolve(nzbURLs: [String], servers: [String],
+    @MainActor static func resolve(nzbURLs: [String], servers: [String],
                         credentials: UsenetProviderCredentials? = nil,
-                        waitForNode: Bool = false) async throws -> URL {
+                        waitForNode: Bool = false) async throws -> RoutedStream {
         let savedServers = credentials.map { [UsenetProviderServer(legacy: $0)] } ?? []
+        let owner = captureNativeOwner()
         guard let resolved = try await resolveRouted(nzbURLs: nzbURLs, servers: servers,
                                                      savedServers: savedServers,
-                                                     waitForNode: waitForNode) else {
+                                                     waitForNode: waitForNode,
+                                                     ownerIsCurrent: owner.isCurrent) else {
             throw ResolveError.unavailable
         }
-        return resolved.url
+        return resolved
+    }
+
+    struct NativeOwner: Sendable {
+        let credential: CredentialScopeRegistry.Capture
+        let requiresNativeAuthority: Bool
+        let isCurrent: @Sendable () async -> Bool
+
+        func validate() async throws {
+            guard !Task.isCancelled, await isCurrent(), !Task.isCancelled else { throw CancellationError() }
+        }
+
+        func permitsRecovery(from previous: UsenetNodeClient.OperationLease?) async -> Bool {
+            guard !Task.isCancelled else { return false }
+            if let previous, !(await previous.authorityIsCurrent()) { return false }
+            guard !Task.isCancelled else { return false }
+            return await isCurrent()
+        }
+    }
+
+    /// Public resolve entry captures both identities in one uninterrupted MainActor turn, before
+    /// warm-up or provider suspension. The actor worker never replaces this with a later owner.
+    @MainActor
+    static func captureNativeOwner() -> NativeOwner {
+        let credential = CredentialScopeRegistry.shared.capture()
+        let requiresNativeAuthority = StremioServer.nativeTransportSelected
+        let check = nativeOwnerCheck(capture: credential)
+        let coherent = CredentialScopeRegistry.shared.isCurrent(credential)
+        return NativeOwner(credential: credential, requiresNativeAuthority: requiresNativeAuthority,
+                           isCurrent: {
+                               guard coherent else { return false }
+                               return await check()
+                           })
     }
 
     /// Add-on route first, then the saved servers in the user's priority order as ONE create each.
@@ -183,7 +219,9 @@ enum UsenetLocalResolver {
     static func resolveRouted(nzbURLs: [String], servers: [String],
                               savedServers: [UsenetProviderServer] = [],
                               waitForNode: Bool = false,
-                              excluding: Set<DebridUsenetRoute> = []) async throws -> RoutedStream? {
+                              excluding: Set<DebridUsenetRoute> = [],
+                              selection: UsenetNodeClient.Selection = .init(),
+                              ownerIsCurrent: @escaping @Sendable () async -> Bool) async throws -> RoutedStream? {
         #if VORTX_NO_EMBEDDED_SERVER
         throw ResolveError.unavailable
         #else
@@ -208,15 +246,32 @@ enum UsenetLocalResolver {
         defer { session.invalidateAndCancel() }
 
         // This is the same serial/cancellation policy exercised by the injected transport regression test.
-        guard let (route, url) = try await UsenetRoutingPolicy.firstSuccessful(attempts, create: { attempt in
+        guard let (route, created) = try await UsenetRoutingPolicy.firstSuccessful(attempts, create: { attempt in
             try await UsenetNodeClient.createStream(
-                endpoint: endpoint, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout
+                endpoint: endpoint, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout,
+                selection: selection, ownerIsCurrent: ownerIsCurrent
             )
         }) else {
             throw ResolveError.badResponse
         }
-        return RoutedStream(url: url, route: route)
+        return RoutedStream(url: created.url, route: route, nativeLease: created.lease)
         #endif
+    }
+
+    /// Captures profile/account/session authority once, before any local create. A new resolve job,
+    /// E+1 preparation, or a source-list refresh is not an account or playback-owner retirement.
+    @MainActor
+    static func nativeOwnerCheck(capture: CredentialScopeRegistry.Capture) -> @Sendable () async -> Bool {
+        guard StremioServer.nativeTransportSelected else {
+            return { CredentialScopeRegistry.shared.isCurrent(capture) }
+        }
+        let target = PlaybackMutationTarget.capture(core: CoreBridge.shared)
+        let profileID = ProfileStore.shared.activeID
+        return { @MainActor in
+            CredentialScopeRegistry.shared.isCurrent(capture)
+                && ProfileStore.shared.activeID == profileID
+                && target.stillOwnsCurrentContext(core: CoreBridge.shared)
+        }
     }
 
     /// An explicit tap waits briefly for the selected local engine to publish its endpoint.

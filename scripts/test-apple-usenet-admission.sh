@@ -44,7 +44,7 @@ for variant in mobile mac lite; do
     "$usenet_test_dir/availability.swift" "$usenet_test_dir/production-methods.swift" \
     app/SourcesShared/UsenetStreamValidation.swift app/SourcesShared/UsenetProviderConfiguration.swift \
     app/SourcesShared/UsenetRoutingPolicy.swift app/SourcesShared/NativeTransportPolicy.swift \
-    app/SourcesShared/UsenetNodeClient.swift app/Tests/AppleUsenetAdmissionTests.swift \
+    app/SourcesShared/UsenetNodeClient.swift app/Tests/AppleNZBOwnerFixture.swift app/Tests/AppleUsenetAdmissionTests.swift \
     -o "$usenet_test_dir/$variant"
   "$usenet_test_dir/$variant" || runtime_failed=1
 done

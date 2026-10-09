@@ -95,9 +95,11 @@ struct DebridPlaybackRef: Sendable, Equatable {
     let fileIdx: Int?
     /// Usenet provenance for one-shot playback recovery. Nil preserves legacy/direct/torrent references.
     let usenetRoute: DebridUsenetRoute?
+    /// Process-local only. Never persisted in history, sent to a provider, or shared with a successor owner.
+    let nativeUsenetLease: UsenetNodeClient.OperationLease?
 
     init(url: URL, service: DebridService, infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?,
-         usenetRoute: DebridUsenetRoute? = nil) {
+         usenetRoute: DebridUsenetRoute? = nil, nativeUsenetLease: UsenetNodeClient.OperationLease? = nil) {
         self.url = url
         self.service = service
         self.infoHash = infoHash
@@ -105,6 +107,7 @@ struct DebridPlaybackRef: Sendable, Equatable {
         self.fileId = fileId
         self.fileIdx = fileIdx
         self.usenetRoute = usenetRoute
+        self.nativeUsenetLease = nativeUsenetLease
     }
 }
 
@@ -1386,9 +1389,13 @@ actor DebridCoordinator {
     /// Resolve a usenet stream (nzb link) to a direct HTTPS URL via the TorBox usenet backend. Throws
     /// `.noKey` when no TorBox key is configured, so the bounded resolve below collapses it to `nil`.
     /// `knownHash` = the stream's authoritative NZB md5 when its emitter carried one (nil otherwise).
-    func resolveUsenet(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
+    func resolveUsenet(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?,
+                       inheritedNativeOwner: UsenetLocalResolver.NativeOwner? = nil) async throws -> URL {
+        try await inheritedNativeOwner?.validate()
         await warmIfNeeded()
+        try await inheritedNativeOwner?.validate()
         guard let capture = currentAuthorityCapture() else { throw DebridError.sessionChanged }
+        guard inheritedNativeOwner == nil || inheritedNativeOwner?.credential == capture else { throw DebridError.sessionChanged }
         let revision = latestCredentialRevision
         guard let usenet = torboxUsenet else { throw DebridError.noKey }
         let breakerProvider = DebridService.torBox.rawValue
@@ -1396,10 +1403,12 @@ actor DebridCoordinator {
         guard await ProviderCircuitBreaker.shared.shouldAttempt(
             provider: breakerProvider, sourceID: breakerSource
         ) else { throw DebridError.providerError("circuit open, backing off \(breakerProvider)") }
+        try await inheritedNativeOwner?.validate()
         let result: URL
         do {
             result = try await runProvider(capture: capture, revision: revision) {
-                try await usenet.resolve(
+                try await inheritedNativeOwner?.validate()
+                return try await usenet.resolve(
                     nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
                     fileIdx: fileIdx, episode: episode
                 )
@@ -1409,7 +1418,9 @@ actor DebridCoordinator {
             throw error
         }
         guard isCurrent(capture, revision: revision) else { throw DebridError.sessionChanged }
+        try await inheritedNativeOwner?.validate()
         await ProviderCircuitBreaker.shared.recordSuccess(provider: breakerProvider, sourceID: breakerSource)
+        try await inheritedNativeOwner?.validate()
         return result
     }
 
@@ -1495,10 +1506,12 @@ extension DebridCoordinator {
     /// intentionally monotonic: an add-on route can advance to saved NNTP/cloud, a saved route can advance to
     /// cloud, and cloud (or a legacy ref with no provenance) never starts a new cycle.  The raw NZB descriptor
     /// remains inside this coordinator; the player only receives a fresh opaque playback reference.
-    func recoverUsenetPlayback(for stream: CoreStream, previous: DebridPlaybackRef,
+    @MainActor func recoverUsenetPlayback(for stream: CoreStream, previous: DebridPlaybackRef,
                                episode: DebridEpisode? = nil) async throws -> DebridPlaybackRef? {
+        let nativeOwner = UsenetLocalResolver.captureNativeOwner()
         try Task.checkCancellation()
         guard stream.isUsenet, stream.url == nil, let previousRoute = previous.usenetRoute else { return nil }
+        guard await nativeOwner.permitsRecovery(from: previous.nativeUsenetLease) else { throw CancellationError() }
         let excluded: Set<DebridUsenetRoute>
         switch previousRoute {
         case .addonNNTP:
@@ -1511,11 +1524,11 @@ extension DebridCoordinator {
             // that a local route has not already failed, so stop rather than cycling paid/provider attempts.
             return nil
         }
-        let result = await resolvedPlaybackRef(for: stream, episode: episode,
+        let result = await resolvePlaybackRef(for: stream, episode: episode,
                                                confirmedCachedHashes: nil, confirmedUsenetURLs: nil,
                                                waitForLocalUsenetNode: true,
                                                usenetResolveTimeout: .seconds(35),
-                                               excludingUsenetRoutes: excluded)
+                                               excludingUsenetRoutes: excluded, nativeOwner: nativeOwner)
         try Task.checkCancellation()
         return result
     }
@@ -1563,12 +1576,27 @@ extension DebridCoordinator {
     /// later refresh an expired link. `resolvedPlaybackURL` is a thin `?.url` wrapper over this, so every
     /// guarantee (raw-torrent-only, no-key immediate nil (no network, only the at-most-once lazy warm hop),
     /// timeout → nil) is identical.
-    func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
+    @MainActor func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
                              confirmedCachedHashes: Set<String>? = nil,
                              confirmedUsenetURLs: Set<String>? = nil,
                              waitForLocalUsenetNode: Bool = false,
                              usenetResolveTimeout: Duration = DebridCoordinator.resolveTimeout,
                              excludingUsenetRoutes: Set<DebridUsenetRoute> = []) async -> DebridPlaybackRef? {
+        let nativeOwner = UsenetLocalResolver.captureNativeOwner()
+        return await resolvePlaybackRef(for: stream, episode: episode,
+            confirmedCachedHashes: confirmedCachedHashes, confirmedUsenetURLs: confirmedUsenetURLs,
+            waitForLocalUsenetNode: waitForLocalUsenetNode, usenetResolveTimeout: usenetResolveTimeout,
+            excludingUsenetRoutes: excludingUsenetRoutes, nativeOwner: nativeOwner)
+    }
+
+    /// Provider/cache work stays on this actor. Only immutable authority crosses from the entry.
+    private func resolvePlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
+                             confirmedCachedHashes: Set<String>? = nil,
+                             confirmedUsenetURLs: Set<String>? = nil,
+                             waitForLocalUsenetNode: Bool = false,
+                             usenetResolveTimeout: Duration = DebridCoordinator.resolveTimeout,
+                             excludingUsenetRoutes: Set<DebridUsenetRoute> = [],
+                             nativeOwner: UsenetLocalResolver.NativeOwner) async -> DebridPlaybackRef? {
         let selectionEpisode = episode.map {
             DebridEpisode(
                 season: $0.season, episode: $0.episode,
@@ -1583,8 +1611,22 @@ extension DebridCoordinator {
         if stream.url == nil,
            let nzb = stream.usenetURLs.first(where: { confirmedUsenetURLs?.contains($0) == true })
                 ?? stream.usenetURLs.first {
+            var nativeFallbackOwner: UsenetLocalResolver.NativeOwner?
+            #if !VORTX_NO_EMBEDDED_SERVER
+            let ownsNativeAttempt = nativeOwner.requiresNativeAuthority
+                && !(confirmedUsenetURLs?.contains(nzb) ?? false)
+            if ownsNativeAttempt {
+                guard await warmNativeUsenet(owner: nativeOwner) else { return nil }
+            } else {
+                await warmIfNeeded()
+            }
+            #else
             await warmIfNeeded()
+            #endif
             guard !Task.isCancelled, let usenetCapture = currentAuthorityCapture() else { return nil }
+            #if !VORTX_NO_EMBEDDED_SERVER
+            guard !ownsNativeAttempt || nativeOwner.credential == usenetCapture else { return nil }
+            #endif
             let usenetRevision = latestCredentialRevision
             // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet providers, resolve
             // the nzb on device through the embedded server's dormant NNTP engine (no debrid). Preferred over
@@ -1600,26 +1642,35 @@ extension DebridCoordinator {
             // inside the network awaits below.
             let usenetSavedServers = UsenetProviderStore.loadEnabledServers(ownerCapture: usenetCapture)
             if !torBoxHasItCached, (!stream.usenetServers.isEmpty || !usenetSavedServers.isEmpty) {
+                nativeFallbackOwner = nativeOwner.requiresNativeAuthority ? nativeOwner : nil
                 do {
+                    let nativeOwnerIsCurrent = nativeOwner.isCurrent
                     let local = try await runProvider(capture: usenetCapture, revision: usenetRevision) {
                         try await UsenetLocalResolver.resolveRouted(
                             nzbURLs: stream.usenetURLs, servers: stream.usenetServers,
                             savedServers: usenetSavedServers,
-                            waitForNode: waitForLocalUsenetNode, excluding: excludingUsenetRoutes
+                            waitForNode: waitForLocalUsenetNode, excluding: excludingUsenetRoutes,
+                            selection: .init(fileIdx: stream.fileIdx, fileMustInclude: stream.fileMustInclude,
+                                             episode: selectionEpisode.map { .init(season: $0.season, episode: $0.episode) }),
+                            ownerIsCurrent: nativeOwnerIsCurrent
                         )
                     }
-                    guard isCurrent(usenetCapture, revision: usenetRevision) else { return nil }
+                    guard await nativeOwnerIsCurrent(), isCurrent(usenetCapture, revision: usenetRevision) else {
+                        local?.nativeLease?.close()
+                        return nil
+                    }
                     if let local {
                         DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) BUILT-IN NNTP -> local stream ready")
                     // A loopback stream: no infoHash / torrentId to carry (no reresolve fast path), and the
                     // service tag is inert here (the url alone drives playback), matching the usenet ref shape.
                     return DebridPlaybackRef(url: local.url, service: .torBox, infoHash: "",
                                              torrentId: nil, fileId: nil, fileIdx: stream.fileIdx,
-                                             usenetRoute: local.route)
+                                             usenetRoute: local.route, nativeUsenetLease: local.nativeLease)
                     }
                 } catch is CancellationError {
                     return nil
                 } catch {
+                    if let nativeFallbackOwner, !(await nativeFallbackOwner.isCurrent()) { return nil }
                     guard !Task.isCancelled, isCurrent(usenetCapture, revision: usenetRevision),
                           (error as? DebridError) != .sessionChanged else { return nil }
                 }
@@ -1639,12 +1690,13 @@ extension DebridCoordinator {
             let mustInclude = stream.fileMustInclude
             let fileIdx = stream.fileIdx
             let knownHash = stream.usenetKnownHash
-            return await withTaskGroup(of: DebridPlaybackRef?.self) { group in
+            let fallbackOwner = nativeFallbackOwner
+            let result = await withTaskGroup(of: DebridPlaybackRef?.self) { group in
                 group.addTask {
                     do {
                         let url = try await DebridCoordinator.shared.resolveUsenet(
                             nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,
-                            fileIdx: fileIdx, episode: selectionEpisode
+                            fileIdx: fileIdx, episode: selectionEpisode, inheritedNativeOwner: fallbackOwner
                         )
                     // Usenet is a plain direct link: no infoHash / torrentId to carry (no reresolve fast
                     // path), so the ref's torrent fields are nil. The `url` alone lets the player open it.
@@ -1661,6 +1713,8 @@ extension DebridCoordinator {
                 group.cancelAll()
                 return first
             }
+            if let fallbackOwner, !(await fallbackOwner.isCurrent()) { return nil }
+            return result
         }
         // Raw torrent only: a stream WITH a `url` is already a direct/debrid link; one with neither url nor
         // infoHash (YouTube / external) isn't ours to resolve. Branch out before any provider work.
@@ -1717,6 +1771,13 @@ extension DebridCoordinator {
         // 5s timeout sentinel won the race (a stall). Either way the caller falls soft to the embedded path.
         DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) blocking-resolve RESULT -> \(result.map { "\($0.service) url ok" } ?? "nil (throw or 5s timeout)") elapsed=\(DebridProbe.since(srcProbeStart))ms")
         return result
+    }
+
+    private func warmNativeUsenet(owner: UsenetLocalResolver.NativeOwner) async -> Bool {
+        guard !Task.isCancelled, await owner.isCurrent() else { return false }
+        await warmIfNeeded()
+        guard !Task.isCancelled else { return false }
+        return await owner.isCurrent()
     }
 
     /// PARALLEL cached-source race for the AUTO-PICK play path: resolve up to the top `max` CACHED

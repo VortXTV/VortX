@@ -13,7 +13,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         requests.append(("GET", self.path))
         body = json.dumps({"version": 1, "raw": True, "multipartYenc": True,
                            "checksumsRequired": True,
-                           "archives": ["rar4-store", "rar5-store", "7z-copy"]}).encode()
+                           "archives": ["rar4-store", "rar5-store", "7z-copy"],
+                           "operationCancellation": True, "operationIdFormat": "uuid",
+                           "selection": {"fileIdx": True, "fileMustInclude": True, "episode": True,
+                                         "fileIdxOrder": "nzb-media-or-archive-entry-order",
+                                         "regexSyntax": "bare-or-js-ims"}}).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -37,7 +41,9 @@ thread.start()
 try:
     subprocess.run([sys.argv[1], "--redirect-fixture", f"http://127.0.0.1:{server.server_port}"],
                    check=True, timeout=15)
-    assert requests == [("GET", "/nzb/capabilities"), ("POST", "/nzb/create")], requests
+    assert requests[:2] == [("GET", "/nzb/capabilities"), ("POST", "/nzb/create")], requests
+    assert all(path.startswith("/nzb/operations/") and path.endswith("/cancel")
+               for method, path in requests[2:]), requests
 finally:
     server.shutdown()
     server.server_close()

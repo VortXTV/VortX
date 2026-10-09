@@ -1330,6 +1330,10 @@ struct TVPlayerView: View {
         // and no waiting for the viewer to open a panel before the buttons show up.
         .onChange(of: playbackDeadlineClock.isPaused) { _ in refreshPlaybackIdleTimer() }
         .onChange(of: loadFailed) { _ in refreshPlaybackIdleTimer() }
+        .onChange(of: curDebridRef?.nativeUsenetLease) { [oldLease = curDebridRef?.nativeUsenetLease] newLease in
+            // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
+            if oldLease != newLease { oldLease?.close() }
+        }
         .onChange(of: core.streamsEpoch) { _ in
             refreshSourceOptionCounts()
             establishSubtitleTimingScopeIfAvailable()
@@ -6271,6 +6275,8 @@ struct TVPlayerView: View {
     /// later dismissal can each call this. Same shape as the debrid-crash straddle root cause
     /// (stop-before-dismiss): engine down first, then the surface state change.
     private func presentTerminalLoadFailure() {
+        pendingAdvance?.debridRef?.nativeUsenetLease?.close()
+        curDebridRef?.nativeUsenetLease?.close()
         cancelEmptySourceRecovery()
         buffering = false
         reconnecting = false
@@ -10909,6 +10915,8 @@ struct TVPlayerView: View {
     /// exit (Back-to-exit, the close button, the terminal auto-advance) routes through here, so no
     /// engine is leaked.
     private func leavePlayback() {
+        pendingAdvance?.debridRef?.nativeUsenetLease?.close()
+        curDebridRef?.nativeUsenetLease?.close()
         failedEpisodeResolutionTarget = nil
         resetRapidBufferingRecovery(reason: "playback exit")
         clearPostFrameResumeSeekWatchdog()

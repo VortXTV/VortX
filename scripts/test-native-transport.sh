@@ -30,6 +30,7 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   -o "$transport_test_dir/routing-contract"
 "$transport_test_dir/routing-contract"
 bash scripts/test-apple-usenet-admission.sh
+bash scripts/test-apple-nzb-operation.sh
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/UsenetRoutingPolicy.swift app/Tests/UsenetRoutingPolicyTests.swift \
   -o "$transport_test_dir/routing-policy"

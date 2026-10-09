@@ -9,7 +9,9 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
     }
     private static let state = State()
     static func reset(_ scenario: Scenario) { state.lock.withLock { state.scenario = scenario; state.requests = [] } }
-    static var requests: [URLRequest] { state.lock.withLock { state.requests } }
+    static var requests: [URLRequest] {
+        state.lock.withLock { state.requests.filter { !$0.url!.path.hasSuffix("/cancel") } }
+    }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -18,7 +20,10 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         let body: String
         if request.url!.path == "/nzb/capabilities" {
             status = scenario == .oldServer ? 404 : 200
-            body = #"{"version":1,"raw":true,"multipartYenc":true,"checksumsRequired":true,"archives":["rar4-store","rar5-store","7z-copy"]}"#
+            body = #"{"version":1,"raw":true,"multipartYenc":true,"checksumsRequired":true,"archives":["rar4-store","rar5-store","7z-copy"],"operationCancellation":true,"operationIdFormat":"uuid","selection":{"fileIdx":true,"fileMustInclude":true,"episode":true,"fileIdxOrder":"nzb-media-or-archive-entry-order","regexSyntax":"bare-or-js-ims"}}"#
+        } else if request.url!.path.hasSuffix("/cancel") {
+            status = 204
+            body = ""
         } else {
             status = scenario == .unsupported ? 422 : 200
             body = scenario == .unsupported ? #"{"error":"unsupported_archive_or_encoding"}"# : #"{"key":"opaque-key"}"#
@@ -41,7 +46,7 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
                 _ = try await UsenetNodeClient.createStream(
                     endpoint: .init(base: CommandLine.arguments[2], requiresNativeCapabilities: true),
                     nzbURLs: ["https://fixture.example/one.nzb"], servers: ["nntps://fixture:password@news.example:563/4"],
-                    session: session, timeout: 2)
+                    session: session, timeout: 2, ownerIsCurrent: { true })
                 preconditionFailure("Credential POST followed a redirect")
             } catch UsenetNodeClient.ClientError.createFailed(307) {}
             print("PASS real HTTP credential POST redirect is rejected")
@@ -63,17 +68,21 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
         let endpoint = UsenetNodeClient.Endpoint(base: "http://127.0.0.1:54321", requiresNativeCapabilities: true)
-        func create(_ target: UsenetNodeClient.Endpoint = endpoint) async throws -> URL {
+        func create(_ target: UsenetNodeClient.Endpoint = endpoint) async throws -> UsenetNodeClient.CreatedStream {
             try await UsenetNodeClient.createStream(endpoint: target, nzbURLs: ["https://fixture.example/one.nzb"],
-                servers: ["nntps://fixture:password@news.example:563/4"], session: session, timeout: 1)
+                servers: ["nntps://fixture:password@news.example:563/4"], session: session, timeout: 1,
+                ownerIsCurrent: { true })
         }
         TransportFixture.reset(.native)
-        let url = try await create()
+        let created = try await create()
+        let url = created.url
         precondition(url.absoluteString == "http://127.0.0.1:54321/nzb/stream?key=opaque-key")
         precondition(TransportFixture.requests.map { $0.url!.path } == ["/nzb/capabilities", "/nzb/create"])
         precondition(TransportFixture.requests.map(\.httpMethod) == ["GET", "POST"])
         precondition(TransportFixture.requests.allSatisfy { $0.value(forHTTPHeaderField: "Origin") == nil })
         precondition(TransportFixture.requests.first?.httpBody == nil)
+        // Keep the native lease alive until after request assertions (discarding it retires its UUID).
+        withExtendedLifetime(created) {}
 
         TransportFixture.reset(.oldServer)
         do { _ = try await create(); preconditionFailure("Old native server received credentials") }
@@ -109,7 +118,8 @@ private final class TransportFixture: URLProtocol, @unchecked Sendable {
         precondition(TransportFixture.requests.isEmpty)
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         let mobile = try String(contentsOf: root.appendingPathComponent("app/Sources/NodeServer.swift"), encoding: .utf8)
-        let bootstrap = String(mobile.components(separatedBy: "static func startIfNeeded() {")[1].prefix(450))
+        let bootstrap = mobile.components(separatedBy: "static func startIfNeeded() {")[1]
+            .components(separatedBy: "guard !started else")[0]
         precondition(bootstrap.contains("if VortxNativeServerFlag.isOn {") && bootstrap.contains("VortxNativeServer.startIfNeeded()\n            return"))
         let selection = try String(contentsOf: root.appendingPathComponent("app/SourcesShared/VortxNativeServer.swift"), encoding: .utf8)
         precondition(selection.contains("static let isOn = NativeTransportPolicy.selectsNative("))

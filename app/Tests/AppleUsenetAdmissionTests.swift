@@ -149,7 +149,7 @@ extension StreamRanking {
         let started = ProcessInfo.processInfo.systemUptime
         do {
             _ = try await UsenetLocalResolver.resolveRouted(
-                nzbURLs: addon.usenetURLs, servers: addon.usenetServers, waitForNode: true)
+                nzbURLs: addon.usenetURLs, servers: addon.usenetServers, waitForNode: true, ownerIsCurrent: { true })
             check("\(label) failed startup never returns a descriptor as media", false)
         } catch UsenetLocalResolver.ResolveError.unavailable {
             check("\(label) failed startup is bounded and returns no media", ProcessInfo.processInfo.systemUptime - started < 3)

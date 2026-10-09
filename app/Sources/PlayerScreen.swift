@@ -2295,6 +2295,10 @@ struct PlayerScreen: View {
             observeMacFullScreen()
             #endif
         }
+        .onChange(of: curDebridRef?.nativeUsenetLease) { [oldLease = curDebridRef?.nativeUsenetLease] newLease in
+            // Accepted source/episode replacement only; prewarm and engine remount keep this lease.
+            if oldLease != newLease { oldLease?.close() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
             refreshAutoSkipSettings()
         }
@@ -4594,6 +4598,8 @@ struct PlayerScreen: View {
     /// later dismissal can each call this. Same shape as the debrid-crash straddle root cause
     /// (stop-before-dismiss): engine down first, then the surface state change.
     private func presentTerminalLoadFailure() {
+        pendingAdvance?.debridRef?.nativeUsenetLease?.close()
+        curDebridRef?.nativeUsenetLease?.close()
         deferredResumeAttempt.invalidate()
         autoRetryTask?.cancel(); autoRetryTask = nil
         loadTimeout?.cancel(); loadTimeout = nil
@@ -10398,6 +10404,8 @@ struct PlayerScreen: View {
     /// the cover down - so a stuck load can never trap the user with a Task still spinning. Routed from
     /// the always-present pre-start close button, the error-overlay Back, and the top-bar chevron.
     @MainActor private func leavePlayback() {
+        pendingAdvance?.debridRef?.nativeUsenetLease?.close()
+        curDebridRef?.nativeUsenetLease?.close()
         // Preview time is temporary editor state, not the viewer's watch progress.
         // Restore it under the original owner before terminal/history/scrobble decisions.
         if skipDBPreviewing { stopSkipDBPreview() }

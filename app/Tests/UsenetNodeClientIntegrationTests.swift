@@ -47,8 +47,9 @@ private enum UsenetNodeClientIntegrationTests {
         do {
             stream = try await UsenetNodeClient.createStream(
                 base: "http://127.0.0.1:45678", nzbURLs: ["https://nzb.example/a.nzb", "https://nzb.example/b.nzb"],
-                servers: ["nntps://user:pass@news.example:563/4"], session: session, timeout: 1
-            )
+                servers: ["nntps://user:pass@news.example:563/4"], session: session, timeout: 1,
+                ownerIsCurrent: { true }
+            ).url
         } catch { throw error }
         let (request, body) = FakeNodeProtocol.capturedRequest()
         guard request?.httpMethod == "POST", request?.url?.absoluteString == "http://127.0.0.1:45678/nzb/create",
