@@ -50,6 +50,19 @@ manifest with pinned, SHA-256-verified Google bundletool. All three must match t
 `Android versionCode:` and `Android versionName:` records added to `SIGNING_PROVENANCE.txt`.
 Feed augmentation requires those immutable records; it must never substitute an Apple build.
 
+## Mac installation note required in every release
+
+Every release that includes a Mac app must include this command in its release notes, after
+the instruction to drag VortX into Applications:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/VortX.app
+```
+
+Explain plainly that users should run it only if macOS blocks the app obtained from the
+official VortX GitHub release. It removes the download quarantine flag; it does not notarize
+the app. Publishing notes does not authorize running the command on a user's installed app.
+
 ## Secretless pull-request validation
 
 `.github/workflows/release-packaging-validation.yml` runs on every pull request with zero secret

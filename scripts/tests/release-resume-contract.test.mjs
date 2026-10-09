@@ -205,6 +205,99 @@ test('exact known pre-write failure admits only original bytes and emits no appr
   }
 });
 
+const beta2Input = { runId: 37976846977, attempt: 1, appsArtifactId: 11642526112, feedArtifactId: 11642361427,
+  sourceCommit: 'c4ef656587d70f4f673f28d4766525f48f17897b', build: '261' };
+const beta2Env = { TAG: 'v0.5.0-beta.2', RELEASE_ID_INPUT: '408240903' };
+const directTagRecoverySteps = ['Validate immutable Beta 1 source recovery', 'Checkout the immutable recovered app source',
+  'Verify immutable recovered source checkout'];
+function beta2Evidence() {
+  const data = evidence();
+  for (const run of [data.run, data.latest]) {
+    Object.assign(run, { id: beta2Input.runId, run_attempt: 1, head_sha: beta2Input.sourceCommit, head_branch: beta2Env.TAG });
+    run.repository.id = run.head_repository.id = 1261501126;
+  }
+  for (const job of data.jobs) Object.assign(job, { run_id: beta2Input.runId, run_attempt: 1, head_sha: beta2Input.sourceCommit });
+  data.jobs[0].id = 113977202330;
+  data.jobs[0].steps = [
+    { ...upload('Upload the immutable app handoff'), started_at: '2026-10-09T19:56:32Z', completed_at: '2026-10-09T19:56:39Z' },
+    { ...upload('Upload the immutable feed handoff'), started_at: '2026-10-09T19:56:39Z', completed_at: '2026-10-09T19:56:40Z' },
+    ...directTagRecoverySteps.map(name => ({ ...upload(name), conclusion: 'skipped' })),
+  ];
+  data.jobs[1].id = 114000130101;
+  data.jobs[1].steps = [upload('Validate immutable handoff provenance before coordinator resume'),
+    { ...upload('Download and authenticate immutable handoff archives'), conclusion: 'failure' },
+    ...['Bind the draft release, tag commit, and monotonic source before any write',
+      'Attach only exact draft assets and create the authenticated staged receipt',
+      'Atomically activate the staged feed, prove routes, then publish last'].map(name => ({ ...upload(name), conclusion: 'skipped' }))];
+  Object.assign(data.apps, { id: beta2Input.appsArtifactId, size_in_bytes: 207639035, created_at: '2026-10-09T19:56:40Z',
+    digest: 'sha256:871a6eed0531897b40204529488d724309735f293559bf075ce10db06d18099b' });
+  Object.assign(data.feed, { id: beta2Input.feedArtifactId, size_in_bytes: 42700, created_at: '2026-10-09T19:56:40Z',
+    digest: 'sha256:9b7539632ddead42779c0de3f03cc2f1c1e9f0598436817e98e1324d0faa10a1' });
+  for (const artifact of [data.apps, data.feed]) Object.assign(artifact.workflow_run, { id: beta2Input.runId,
+    head_sha: beta2Input.sourceCommit, head_branch: beta2Env.TAG, repository_id: 1261501126, head_repository_id: 1261501126 });
+  data.comparison.merge_base_commit.sha = beta2Input.sourceCommit;
+  return data;
+}
+test('exact Beta2 pre-download retry admits only the accepted original attempt with every write skipped', () => {
+  const result = provenance(beta2Evidence(), beta2Input, beta2Env);
+  assert.equal(result.status, 0, result.stderr);
+  for (const output of ['build_attempt=1', `build_run_id=${beta2Input.runId}`, `build_source_sha=${beta2Input.sourceCommit}`,
+    `build_workflow_sha=${beta2Input.sourceCommit}`, `build_branch=${beta2Env.TAG}`, 'expected_build=261',
+    `apps_id=${beta2Input.appsArtifactId}`, `feed_id=${beta2Input.feedArtifactId}`]) assert(result.outputs.includes(output + '\n'));
+  const mutations = {
+    'latest attempt advanced': e => { e.latest.run_attempt++; },
+    'latest run successful': e => { e.latest.conclusion = 'success'; },
+    'original run successful': e => { e.run.conclusion = 'success'; },
+    'build ID changed': e => { e.jobs[0].id++; }, 'attach ID changed': e => { e.jobs[1].id++; },
+    'failed build': e => { e.jobs[0].conclusion = 'failure'; }, 'failed app upload': e => { e.jobs[0].steps[0].conclusion = 'failure'; },
+    'missing app upload': e => { e.jobs[0].steps.shift(); },
+    'duplicate build': e => { e.jobs.push(structuredClone(e.jobs[0])); },
+    'missing build': e => { e.jobs.shift(); }, 'duplicate attach': e => { e.jobs.push(structuredClone(e.jobs[1])); },
+    'missing attach': e => { e.jobs.splice(1, 1); },
+    'missing published verifier': e => { e.jobs.pop(); },
+    'duplicate published verifier': e => { e.jobs.push(structuredClone(e.jobs[2])); },
+    'published verifier ran': e => { e.jobs[2].conclusion = 'success'; },
+    'published verifier incomplete': e => { e.jobs[2].status = 'in_progress'; },
+    'another job failure': e => { e.jobs[2].conclusion = 'failure'; },
+    'different failed attach step': e => { e.jobs[1].steps[1].name = 'Unrelated failure'; },
+    'second attach failure': e => { e.jobs[1].steps[2].conclusion = 'failure'; },
+    'source ancestry drift': e => { e.comparison.merge_base_commit.sha = sha; },
+    'source ancestry diverged': e => { e.comparison.status = 'diverged'; },
+    'workflow SHA drift': e => { e.run.head_sha = sha; },
+    'source tag branch drift': e => { e.run.head_branch = 'main'; },
+  };
+  for (const index of [0, 1, 2, 3, 4]) {
+    mutations[`missing attach step ${index}`] = e => { e.jobs[1].steps.splice(index, 1); };
+    mutations[`duplicate attach step ${index}`] = e => { e.jobs[1].steps.push(structuredClone(e.jobs[1].steps[index])); };
+    mutations[`unfinished attach step ${index}`] = e => { e.jobs[1].steps[index].status = 'in_progress'; };
+    for (const conclusion of ['success', 'failure', 'skipped'].filter(value => value !== ['success', 'failure', 'skipped', 'skipped', 'skipped'][index]))
+      mutations[`wrong attach step ${index} ${conclusion}`] = e => { e.jobs[1].steps[index].conclusion = conclusion; };
+  }
+  for (const index of [2, 3, 4]) {
+    mutations[`missing direct-tag recovery step ${index}`] = e => { e.jobs[0].steps.splice(index, 1); };
+    mutations[`duplicate direct-tag recovery step ${index}`] = e => { e.jobs[0].steps.push(structuredClone(e.jobs[0].steps[index])); };
+    mutations[`direct-tag recovery step ran ${index}`] = e => { e.jobs[0].steps[index].conclusion = 'success'; };
+  }
+  for (const asset of ['apps', 'feed']) for (const [field, value] of Object.entries({ expired: true, size_in_bytes: 999,
+    digest: `sha256:${'d'.repeat(64)}`, created_at: '2026-10-09T19:56:42Z' }))
+    mutations[`${asset} ${field} changed`] = e => { e[asset][field] = value; };
+  for (const [name, mutate] of Object.entries(mutations)) {
+    const data = beta2Evidence(); mutate(data);
+    const denied = provenance(data, beta2Input, beta2Env);
+    assert.notEqual(denied.status, 0, name); assert.equal(denied.outputs, '', name);
+  }
+  for (const field of Object.keys(beta2Input)) {
+    const input = { ...beta2Input, [field]: typeof beta2Input[field] === 'number' ? beta2Input[field] + 1 : field === 'build' ? '262' : sha };
+    const denied = provenance(beta2Evidence(), input, beta2Env);
+    assert.notEqual(denied.status, 0, field); assert.equal(denied.outputs, '', field);
+  }
+  for (const env of [{ TAG: 'v0.5.0-beta.1' }, { RELEASE_ID_INPUT: '408240904' }, { GITHUB_REF: 'refs/heads/feature' },
+    { GITHUB_EVENT_NAME: 'push' }, { RECOVERY_SOURCE: beta2Input.sourceCommit }]) {
+    const denied = provenance(beta2Evidence(), beta2Input, { ...beta2Env, ...env });
+    assert.notEqual(denied.status, 0, JSON.stringify(env)); assert.equal(denied.outputs, '');
+  }
+});
+
 test('all three actual release PATCH calls explicitly preserve identity under untagged-on-omission API behavior', () => fixture(dir => {
   const promotion = script('Atomically activate the staged feed, prove routes, then publish last');
   const calls = promotion.split('\n').filter(line => line.includes('gh api --method PATCH') && line.includes('repos/$GH_REPO/releases/$RELEASE_ID'));

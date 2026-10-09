@@ -181,21 +181,34 @@ function handoffBytes(label = 'accepted') {
 const acceptedBytes = handoffBytes();
 const uploadStep = name => ({ name, status: 'completed', conclusion: 'success',
   started_at: '2026-10-09T12:00:00Z', completed_at: '2026-10-09T12:01:00Z' });
+function uploadLog(data) {
+  return ['apps', 'feed'].flatMap((key, index) => {
+    const artifact = data[key], second = 30 + index;
+    return [
+      `2026-10-09T12:00:${second}.1000000Z SHA256 digest of uploaded artifact is ${artifact.digest.slice(7)}`,
+      `2026-10-09T12:00:${second}.2000000Z Artifact ${artifact.name} successfully finalized. Artifact ID ${artifact.id}`,
+      `2026-10-09T12:00:${second}.3000000Z Artifact ${artifact.name} has been successfully uploaded! Final size is ${artifact.size_in_bytes} bytes. Artifact ID is ${artifact.id}`,
+    ];
+  }).join('\n') + '\n';
+}
 function downloadEvidence() {
   const run = { id: 123, run_attempt: 2, repository: { id: 1, full_name: 'VortXTV/VortX' }, head_repository: { id: 1, full_name: 'VortXTV/VortX' },
     path: '.github/workflows/release-tvos.yml', event: 'workflow_dispatch', head_sha: code, head_branch: 'main', status: 'in_progress' };
-  const jobs = [{ name: 'build-tvos', head_sha: code, run_id: 123, run_attempt: 2, status: 'completed', conclusion: 'success',
+  const jobs = [{ id: 321, name: 'build-tvos', head_sha: code, run_id: 123, run_attempt: 2, status: 'completed', conclusion: 'success',
     steps: [uploadStep('Upload the immutable app handoff'), uploadStep('Upload the immutable feed handoff')] }];
   const artifact = (id, name, bytes) => ({ id, name, expired: false, size_in_bytes: bytes.length, digest: `sha256:${sha256(bytes)}`,
     created_at: '2026-10-09T12:00:30Z', workflow_run: { id: 123, head_sha: code, head_branch: 'main', repository_id: 1, head_repository_id: 1 } });
-  return { run, jobs, apps: artifact(456, 'VortX-tvOS-ci', acceptedBytes.appsZip), feed: artifact(457, 'VortX-release-feed', acceptedBytes.feedZip),
+  const data = { run, jobs, apps: artifact(456, 'VortX-tvOS-ci', acceptedBytes.appsZip), feed: artifact(457, 'VortX-release-feed', acceptedBytes.feedZip),
     appsZip: acceptedBytes.appsZip, feedZip: acceptedBytes.feedZip };
+  data.log = uploadLog(data);
+  return data;
 }
 function downloadHandoff(data, before = () => {}) {
   return fixture(dir => {
     for (const key of ['run', 'jobs', 'apps', 'feed']) writeFileSync(join(dir, `${key}.json`), JSON.stringify(data[key]));
     writeFileSync(join(dir, 'apps.zip'), data.appsZip);
     writeFileSync(join(dir, 'feed.zip'), data.feedZip);
+    writeFileSync(join(dir, 'build-upload.log'), data.log);
     before(dir);
     const result = spawnSync('bash', ['-c', `
 gh() {
@@ -203,6 +216,7 @@ gh() {
   case "\${*: -1}" in
     repos/VortXTV/VortX/actions/runs/123) command cat "$RUNNER_TEMP/run.json" ;;
     repos/VortXTV/VortX/actions/runs/123/attempts/2/jobs?per_page=100) jq '[{jobs:.}]' "$RUNNER_TEMP/jobs.json" ;;
+    repos/VortXTV/VortX/actions/jobs/321/logs) command cat "$RUNNER_TEMP/build-upload.log" ;;
     repos/VortXTV/VortX/actions/artifacts/456) command cat "$RUNNER_TEMP/apps.json" ;;
     repos/VortXTV/VortX/actions/artifacts/457) command cat "$RUNNER_TEMP/feed.json" ;;
     repos/VortXTV/VortX/actions/artifacts/456/zip) command cat "$RUNNER_TEMP/apps.zip" ;;
@@ -224,6 +238,9 @@ function authenticateChangedZip(data, key, entries) {
   data[`${key}Zip`] = zip(entries);
   data[key].digest = `sha256:${sha256(data[`${key}Zip`])}`;
   data[key].size_in_bytes = data[`${key}Zip`].length;
+  // Keep authenticated upload evidence coherent so archive mutations exercise
+  // the actual ZIP gate instead of failing early at the separate log-proof gate.
+  data.log = uploadLog(data);
 }
 
 test('exact API IDs download once and the same authenticated ZIP bytes reach the coordinator', () => {
@@ -234,6 +251,7 @@ test('exact API IDs download once and the same authenticated ZIP bytes reach the
   assert.deepEqual(result.payload, acceptedBytes.apps[0].bytes);
   assert.equal((result.calls.match(/artifacts\/456\/zip/g) ?? []).length, 1);
   assert.equal((result.calls.match(/artifacts\/457\/zip/g) ?? []).length, 1);
+  assert.equal((result.calls.match(/jobs\/321\/logs/g) ?? []).length, 1);
   assert.doesNotMatch(result.calls, /--method|POST|PATCH|PUT|DELETE/);
   assert.match(result.stdout, /both authenticated artifact ZIPs extracted after exact digest/);
 });
@@ -275,11 +293,13 @@ for (const [name, mutate] of Object.entries({
     e.appsZip.writeUInt32LE(1024 ** 3 + 1, 22);
     e.appsZip.writeUInt32LE(1024 ** 3 + 1, e.appsZip.indexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02])) + 24);
     e.apps.digest = `sha256:${sha256(e.appsZip)}`;
+    e.log = uploadLog(e);
   },
   'authenticated ZIP with corrupt member CRC': e => {
     e.appsZip = Buffer.from(e.appsZip);
     e.appsZip[e.appsZip.indexOf(acceptedBytes.apps[0].bytes)] ^= 1;
     e.apps.digest = `sha256:${sha256(e.appsZip)}`;
+    e.log = uploadLog(e);
   },
   'excessive archive members': e => { authenticateChangedZip(e, 'apps', [...acceptedBytes.apps,
     ...Array.from({ length: 65 }, (_, index) => ({ name: `native-extra-${index}.json`, bytes: '{}' }))]); }
