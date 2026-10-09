@@ -122,6 +122,40 @@ private final class CaptureDelivery: @unchecked Sendable {
 }
 
 class MetalLayer: CAMetalLayer {
+    #if os(iOS)
+    private final class PiPPresentationReceipt: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completion: ((Bool) -> Void)?
+        init(_ completion: @escaping (Bool) -> Void) { self.completion = completion }
+        func complete(_ presented: Bool) {
+            lock.lock()
+            let callback = completion
+            completion = nil
+            lock.unlock()
+            callback?(presented)
+        }
+    }
+    private let pipPresentationLock = NSLock()
+    private var pipPresentationReceipt: PiPPresentationReceipt?
+
+    /// Armed while the native GPU is retired, before foreground recreation.
+    /// Only a subsequently acquired drawable may acknowledge inline restoration.
+    func requestPiPPresentation(_ completion: @escaping (Bool) -> Void) {
+        pipPresentationLock.lock()
+        let old = pipPresentationReceipt
+        pipPresentationReceipt = PiPPresentationReceipt(completion)
+        pipPresentationLock.unlock()
+        old?.complete(false)
+    }
+
+    func cancelPiPPresentation() {
+        pipPresentationLock.lock()
+        let old = pipPresentationReceipt
+        pipPresentationReceipt = nil
+        pipPresentationLock.unlock()
+        old?.complete(false)
+    }
+    #endif
 
     #if os(tvOS)
     /// Owned by the player controller. Kept weak so the layer and late drawable
@@ -213,6 +247,16 @@ class MetalLayer: CAMetalLayer {
         previous?.complete(succeeded: false)
     }
 
+    /// Cancel only work which has not acquired a drawable. An acquired capture is
+    /// drained by its owner's complete-operation gate, through GPU and CI/JPEG.
+    func cancelPendingCapture() {
+        captureLock.lock()
+        let pending = captureDelivery
+        captureDelivery = nil
+        captureLock.unlock()
+        pending?.complete(succeeded: false)
+    }
+
     override func nextDrawable() -> (any CAMetalDrawable)? {
         #if os(tvOS)
         let drawableWaitStartedAt = CACurrentMediaTime()
@@ -229,6 +273,16 @@ class MetalLayer: CAMetalLayer {
         // receipts are the platform-supported boundary here; mpv's VO counters cover the downstream result.
         #endif
         guard let d else { return nil }
+        #if os(iOS)
+        pipPresentationLock.lock()
+        let pipReceipt = pipPresentationReceipt
+        pipPresentationLock.unlock()
+        if let pipReceipt {
+            d.addPresentedHandler { drawable in
+                if drawable.presentedTime > 0 { pipReceipt.complete(true) }
+            }
+        }
+        #endif
 
         captureLock.lock()
         let leaseToken = captureDelivery == nil ? nil : captureLeaseState.acquire()

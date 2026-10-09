@@ -24,6 +24,14 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
 
     /// Shared construction + wiring of the player controller (identical on every platform).
     private func makeController(_ context: Context) -> MPVMetalViewController {
+        #if os(iOS)
+        if let retained = coordinator.pictureInPictureOwner,
+           retained.pictureInPicture.retainsPlayback {
+            retained.pictureInPicture.attachInline()
+            coordinator.pictureInPictureOwner = nil
+            return retained // same decoder and exact owner, never load the URL again
+        }
+        #endif
         let mpv = MPVMetalViewController()
         mpv.playDelegate = coordinator
         mpv.playUrl = coordinator.playUrl
@@ -47,6 +55,12 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
     func makeUIViewController(context: Context) -> MPVMetalViewController { makeController(context) }
     func updateUIViewController(_ controller: MPVMetalViewController, context: Context) {}
     static func dismantleUIViewController(_ controller: MPVMetalViewController, coordinator: Coordinator) {
+        #if os(iOS)
+        if coordinator.player === controller, controller.pictureInPicture.detachInline() {
+            coordinator.pictureInPictureOwner = controller
+            return
+        }
+        #endif
         controller.stop()
     }
     #elseif canImport(AppKit)
@@ -125,6 +139,11 @@ struct MPVMetalPlayerView: PlatformViewControllerRepresentable {
         // `any PlayerEngine` so the same Coordinator + chrome can be driven by either the libmpv
         // controller or an AVFoundation engine; whichever is assigned here is what the chrome talks to.
         weak var player: (any PlayerEngine)?
+        #if os(iOS)
+        /// Explicit handoff only during the exact active PiP owner. stop and
+        /// native retirement clear this lease, even when SwiftUI does not remount.
+        var pictureInPictureOwner: MPVMetalViewController?
+        #endif
 
         var playUrl : URL?
         var playHeaders: [String: String]?

@@ -243,6 +243,17 @@ final class MPVMetalViewController: PlatformViewController {
         return loadProvenance.activeToken ?? initializationFailure.activeToken
     }
     private lazy var captureQueue = DispatchQueue(label: "com.stremiox.trickplay.capture", qos: .utility)
+    #if os(iOS)
+    private let pipCaptureGate = MPVPiPCaptureGate()
+    lazy var pictureInPicture = MPVSampleBufferPiPController(owner: self)
+    // Native transitions and handle lifetime are serialized with readEvents and
+    // terminate_destroy on queue. Never read these fields from a frame callback.
+    private var pipGPUTransitionAttempted = false
+    private var pipGPURetired = false
+    private var pipForegroundAllowed = true
+    private var pipBackgroundDroppedVideo = false
+    private var pipResumeAfterOwnedBackgroundPause: PlayerLoadToken?
+    #endif
     private lazy var captureQueueState = CaptureQueueState(queue: captureQueue)
     /// One-time breadcrumb for the Apple TV HD capture gate (#188). Main-thread confined:
     /// captureFrameJPEGData is only invoked from the main-actor player views.
@@ -510,6 +521,9 @@ final class MPVMetalViewController: PlatformViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         layoutDrawable()
+        #if os(iOS)
+        pictureInPicture.attachInline()
+        #endif
     }
     #elseif canImport(AppKit)
     override func viewDidLayout() {
@@ -820,6 +834,10 @@ final class MPVMetalViewController: PlatformViewController {
             initializationFailure.fail("VortX Player could not create its playback engine. Try another player or reopen playback.")
             return
         }
+        #if os(iOS)
+        pipForegroundAllowed = UIApplication.shared.applicationState != .background
+        VortXMPVNativeSetForeground(UnsafeMutableRawPointer(mpv), pipForegroundAllowed)
+        #endif
 
         // Hero-preview options (#44), set before mpv_initialize so they take at init time. `mute=yes`
         // gives a soundless ambient clip (no audio output is ever opened); `loop-file=inf` makes mpv
@@ -1207,6 +1225,168 @@ final class MPVMetalViewController: PlatformViewController {
         return escaped.joined(separator: ":")
     }
 
+    #if os(iOS)
+    var pipLoadedOwner: PlayerLoadToken? { callbackLoadToken(requiresLoadedFile: true) }
+    var piPHasRetiredGPU: Bool { queue.sync { pipGPURetired || pipGPUTransitionAttempted } }
+    private var piPLifecycleNeedsForegroundReturn: Bool { queue.sync { !pipForegroundAllowed } }
+
+    /// No PiP phase is admitted until the ENTIRE existing MPS/CI operation has
+    /// drained. Once admitted, capture remains closed through restoration, so a
+    /// lifecycle barrier never inherits an uncancellable thumbnail operation.
+    func preparePiPCaptureAdmission() -> Bool {
+        queue.sync {
+            guard pipForegroundAllowed else { return false }
+            let receipt = pipCaptureGate.seal()
+            metalLayer.cancelPendingCapture()
+            let drained = pipCaptureGate.waitUntilDrained(receipt, before: Date().addingTimeInterval(0.1))
+            if !drained { pipCaptureGate.reopen() }
+            return drained
+        }
+    }
+
+    func releasePiPCaptureAdmission() {
+        guard UIApplication.shared.applicationState == .active else { return }
+        queue.sync {
+            if pipForegroundAllowed && !pipGPURetired && !pipGPUTransitionAttempted { pipCaptureGate.reopen() }
+        }
+    }
+
+    func subscribePiP(owner: PlayerLoadToken, numericOwner: UInt64, context: UnsafeMutableRawPointer,
+                      callback: VortXMPVNativeFrameCallback, destroy: VortXMPVNativeFrameDestroy) -> MPVNativeFrameSubscription? {
+        queue.sync {
+            guard let handle = mpv, pipForegroundAllowed,
+                  callbackLoadToken(requiresLoadedFile: true) == owner else { return nil }
+            var session: UnsafeMutableRawPointer?
+            var cookie: UInt64 = 0
+            guard VortXMPVNativeSubscribe(UnsafeMutableRawPointer(handle), numericOwner,
+                    callback, destroy, context, &session, &cookie) == 0,
+                  let session, cookie != 0 else { return nil }
+            return MPVNativeFrameSubscription(session: session, cookie: cookie, owner: owner)
+        }
+    }
+
+    /// Call only on queue: it is the same serialization domain as final handle
+    /// destruction. A canceled/late callback can own its session, never a freed mpv.
+    private func performPiPMode(_ subscription: MPVNativeFrameSubscription, headless: Bool) -> Int32 {
+        dispatchPrecondition(condition: .onQueue(queue))
+        guard let handle = mpv, pipForegroundAllowed, !subscription.isClosed,
+              callbackLoadToken(requiresLoadedFile: true) == subscription.owner else { return 2 }
+        if headless {
+            let receipt = pipCaptureGate.seal()
+            metalLayer.cancelPendingCapture()
+            guard pipCaptureGate.waitUntilDrained(receipt, before: Date().addingTimeInterval(0.1)) else {
+                pipCaptureGate.reopen()
+                return 9
+            }
+            pipGPUTransitionAttempted = true
+        }
+        let result = VortXMPVNativeSetHeadless(UnsafeMutableRawPointer(handle), subscription.session,
+                                              subscription.cookie, headless)
+        if result == 0 {
+            pipGPURetired = headless
+            pipGPUTransitionAttempted = headless
+            // Keep the host capture gate closed until the inline PRESENTED
+            // receipt, not merely the native restoration acknowledgement.
+        }
+        // On a late-owner refusal the native GPU can already be retired. Never
+        // infer that an unsuccessful acknowledgement permits GPU submissions.
+        return result
+    }
+
+    func setPiPHeadless(_ subscription: MPVNativeFrameSubscription, headless: Bool,
+                       completion: @escaping @MainActor (Int32) -> Void) {
+        queue.async { [weak self] in
+            let result = self?.performPiPMode(subscription, headless: headless) ?? 2
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    func restorePiPBeforeReplacement(_ subscription: MPVNativeFrameSubscription) -> Bool {
+        queue.sync {
+            guard pipGPURetired || pipGPUTransitionAttempted else { return true }
+            return performPiPMode(subscription, headless: false) == 0
+        }
+    }
+
+    func closePiPForegroundAuthority(subscription: MPVNativeFrameSubscription?, preserveVideo: Bool) -> Bool {
+        let completed = queue.sync { () -> Bool in
+            guard let handle = mpv, pipForegroundAllowed else { return true }
+            if preserveVideo, !pipGPURetired, let subscription {
+                // Foreground restore may have completed on queue while its UI
+                // acknowledgement is still pending. Retire that same VO again.
+                _ = performPiPMode(subscription, headless: true)
+            }
+            // A start interrupted before a valid retirement receipt does not
+            // qualify for background video. Retire the ordinary VO while still
+            // foreground, then revoke fresh-VO creation in the native core.
+            if !preserveVideo || !pipGPURetired {
+                guard mpv_set_property_string(handle, "vid", "no") >= 0 else {
+                    // Do not publish a successful drop or reopen capture. The
+                    // caller terminally drains this exact handle while foreground.
+                    pipForegroundAllowed = false
+                    return false
+                }
+                pipBackgroundDroppedVideo = true
+                pipGPURetired = false
+                pipGPUTransitionAttempted = false
+            }
+            VortXMPVNativeSetForeground(UnsafeMutableRawPointer(handle), false)
+            pipForegroundAllowed = false
+            return true
+        }
+        if !completed {
+            stop()
+            queue.sync {} // final terminate_destroy (including GPU) has returned
+        }
+        return completed
+    }
+
+    func openPiPForegroundAuthority() {
+        guard UIApplication.shared.applicationState == .active else { return }
+        let restoreDroppedVideo = queue.sync { () -> Bool in
+            guard let handle = mpv else { return false }
+            VortXMPVNativeSetForeground(UnsafeMutableRawPointer(handle), true)
+            pipForegroundAllowed = true
+            let dropped = pipBackgroundDroppedVideo
+            pipBackgroundDroppedVideo = false
+            return dropped
+        }
+        if restoreDroppedVideo, let handle = mpv {
+            mpv_set_property_string(handle, "vid", "auto")
+            applyVideoSize { self.setString($0, $1) }
+            if pipResumeAfterOwnedBackgroundPause == activeLoadToken,
+               pipResumeAfterOwnedBackgroundPause != nil { play() }
+            pipResumeAfterOwnedBackgroundPause = nil
+        }
+    }
+
+    @objc private func pipWillResignActive() { pictureInPicture.willResignActive() }
+    @objc private func pipDidBecomeActive() { pictureInPicture.becameActive() }
+
+    func seekForPiP(by interval: Double, owner: PlayerLoadToken) -> MPVResumeSeekTicket<PlayerLoadToken>? {
+        guard callbackLoadToken(requiresLoadedFile: true) == owner, !playUrlLive else { return nil }
+        let position = getDouble(MPVProperty.timePos)
+        let duration = getDouble(MPVProperty.duration)
+        guard position.isFinite, duration.isFinite, duration > 0, interval.isFinite else { return nil }
+        let target = max(0, min(duration, position + interval))
+        guard target.isFinite else { return nil }
+        seek(to: target) // existing user-seek and pause-intent path, not optimistic display time
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        guard let ticket = latestAcceptedAbsoluteSeek, ticket.owner == owner, ticket.target == target else { return nil }
+        return ticket
+    }
+
+    func piPSeekHasSettled(_ ticket: MPVResumeSeekTicket<PlayerLoadToken>) -> Bool {
+        guard let handle = mpv else { return false }
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        guard loadProvenance.callbackToken(requiresLoadedFile: true) == ticket.owner,
+              latestAcceptedAbsoluteSeek?.generation == ticket.generation else { return false }
+        let sample = nativeSeekSnapshot(handle: handle)
+        return seekSettlement.evidenceForLatestCommand(owner: ticket.owner, generation: ticket.generation,
+            seeking: sample.seeking, eofReached: sample.eof)?.settled == true
+    }
+    #endif
+
     public func setupNotification() {
         // App-lifecycle + audio-route observers are iOS/tvOS only (UIApplication notifications and
         // AVAudioSession both exist there). On macOS mpv's coreaudio AO handles routing and the app
@@ -1214,6 +1394,10 @@ final class MPVMetalViewController: PlatformViewController {
         #if canImport(UIKit)
         NotificationCenter.default.addObserver(self, selector: #selector(enterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(enterForeground), name: UIApplication.willEnterForegroundNotification, object: nil)
+        #if os(iOS)
+        NotificationCenter.default.addObserver(self, selector: #selector(pipWillResignActive), name: UIApplication.willResignActiveNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(pipDidBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
+        #endif
         // The output route can change AFTER the channel policy was chosen: a receiver powers on,
         // an eARC handshake finishes, the user swaps to a different output. mpv's AO stays
         // negotiated against the old route, which can strand audio on a layout the new endpoint
@@ -1228,6 +1412,13 @@ final class MPVMetalViewController: PlatformViewController {
     private var wasPlayingBeforeBackground = false
 
     @objc public func enterBackground() {
+        #if os(iOS)
+        if pictureInPicture.retainsPlayback, piPHasRetiredGPU {
+            // Exact native retirement receipt, not an app setting or requested
+            // PiP flag. The same decoder/audio continue; do not toggle vid/pause.
+            return
+        }
+        #endif
         // Remember the play state BEFORE we pause below, so foregrounding does not silently resume a
         // user-paused title.
         wasPlayingBeforeBackground = mpv != nil && !getFlag(MPVProperty.pause)
@@ -1238,6 +1429,10 @@ final class MPVMetalViewController: PlatformViewController {
         // stop playback (there is no screen-lock-keep-listening case).
         #if os(iOS)
         if !PlaybackSettings.keepPlayingInBackground { pause() }
+        if piPLifecycleNeedsForegroundReturn, wasPlayingBeforeBackground,
+           !PlaybackSettings.keepPlayingInBackground, getFlag(MPVProperty.pause) {
+            pipResumeAfterOwnedBackgroundPause = activeLoadToken
+        }
         #else
         pause()
         #endif
@@ -1261,6 +1456,13 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     @objc public func enterForeground() {
+        #if os(iOS)
+        if pictureInPicture.retainsPlayback || piPHasRetiredGPU || piPLifecycleNeedsForegroundReturn {
+            // didBecomeActive restores the native permission/renderer. This
+            // path must not select another video track or unpause the viewer.
+            return
+        }
+        #endif
         // A silent hero preview never claimed the audio session (setupMpv skips configureAudioSession when
         // startMuted), so it must not reactivate the session or reapply the channel policy here either.
         if !startMuted {
@@ -1307,6 +1509,10 @@ final class MPVMetalViewController: PlatformViewController {
     #endif   // canImport(UIKit): audio-session + lifecycle observers are iOS/tvOS only
 
     func invalidateLoadToken() {
+        #if os(iOS)
+        pipResumeAfterOwnedBackgroundPause = nil
+        pictureInPicture.invalidate()
+        #endif
         finishCacheFlushFlight(cacheFlushFlight.reset())
         seekEOFRecoveryTimeout?.cancel(); seekEOFRecoveryTimeout = nil
         seekEOFRecovery.reset()
@@ -1521,6 +1727,12 @@ final class MPVMetalViewController: PlatformViewController {
             }
             return issuedToken
         }
+        #if os(iOS)
+        guard pictureInPicture.retireForSourceReplacement() else {
+            DiagnosticsLog.log("player", "loadfile refused: native PiP owner needs foreground restoration")
+            return issuedToken // no new provenance, headers, pause, or source mutation
+        }
+        #endif
         // Header-admission transaction begins before mutating the still-owned source's state.
         // Per-stream HTTP headers (behaviorHints.proxyHeaders): some add-ons front CDNs that
         // require a specific Referer or a browser User-Agent; without them the server rejects
@@ -3070,6 +3282,9 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     func play() {
+        #if os(iOS)
+        pipResumeAfterOwnedBackgroundPause = nil
+        #endif
         if let owner = activeLoadToken,
            seekEOFRecovery.updateTransportIntent(owner: owner, paused: false) != nil {
             return
@@ -3086,6 +3301,9 @@ final class MPVMetalViewController: PlatformViewController {
     }
     
     func pause() {
+        #if os(iOS)
+        pipResumeAfterOwnedBackgroundPause = nil
+        #endif
         if let owner = activeLoadToken,
            seekEOFRecovery.updateTransportIntent(owner: owner, paused: true) != nil {
             return
@@ -4138,6 +4356,9 @@ final class MPVMetalViewController: PlatformViewController {
         //print("\(command) -- \(args)")
         let returnValue: Int32
         var seekWitness: (PlayerLoadToken, MPVSeekSettlementEvidence)?
+        #if os(iOS)
+        let pipSeekBoundary = command == "seek" ? pictureInPicture.currentFrameEpoch : nil
+        #endif
         if command == "seek" {
             loadTokenLock.lock()
             let owner = loadProvenance.callbackToken(requiresLoadedFile: true)
@@ -4170,6 +4391,9 @@ final class MPVMetalViewController: PlatformViewController {
             cb(returnValue)
         }
         if let (owner, evidence) = seekWitness {
+            #if os(iOS)
+            pictureInPicture.seekAccepted(previousEpoch: pipSeekBoundary)
+            #endif
             scheduleNativeSeekWitness(owner: owner, evidence: evidence)
         }
     }
@@ -4195,6 +4419,17 @@ final class MPVMetalViewController: PlatformViewController {
 
     func captureFrameJPEGData(maxWidth: CGFloat, completion: @escaping (Data?) -> Void) {
         guard mpv != nil else { completion(nil); return }
+        #if os(iOS)
+        guard pipCaptureGate.enter() else { completion(nil); return }
+        let gate = pipCaptureGate
+        let originalCompletion = completion
+        let completion: (Data?) -> Void = { data in
+            // CI/JPEG has materialized its bytes before this receipt. Release
+            // before arbitrary caller work, never before the GPU consumer ends.
+            gate.leave()
+            originalCompletion(data)
+        }
+        #endif
         let captureQueue = captureQueue
         let captureQueueState = captureQueueState
         // Build or rebuild the pipeline lazily; at VIDEO_RECONFIG time the device/drawableSize may

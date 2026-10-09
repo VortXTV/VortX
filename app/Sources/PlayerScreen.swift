@@ -1855,7 +1855,14 @@ struct PlayerScreen: View {
         // fullscreen player, so signal "a player is up" for as long as this screen is mounted - the hero
         // views unmount their looping libmpv clip on it, instead of decoding a 1080p trailer beneath the
         // whole movie (micro stutter + audio crackle on every stream).
-        .onAppear { FullscreenPlaybackGate.shared.playerDidAppear(); LoopbackPlaybackAssertion.begin(for: url) }
+        .onAppear {
+            #if os(iOS)
+            if let mpv = coordinator.player as? MPVMetalViewController,
+               mpv.pictureInPicture.resumeDisappearance(.presentation) { return }
+            #endif
+            FullscreenPlaybackGate.shared.playerDidAppear()
+            LoopbackPlaybackAssertion.begin(for: url)
+        }
         .onChange(of: core.streamsEpoch) { _ in
             establishSubtitleTimingScopeIfAvailable()
             if appliedAutoTracks {
@@ -1872,7 +1879,17 @@ struct PlayerScreen: View {
             episodeInventoryUnavailable = false
             hydrateDirectResumeSeriesInventory()
         }
-        .onDisappear { FullscreenPlaybackGate.shared.playerDidDisappear(); LoopbackPlaybackAssertion.end() }
+        .onDisappear {
+            let finish = {
+                FullscreenPlaybackGate.shared.playerDidDisappear()
+                LoopbackPlaybackAssertion.end()
+            }
+            #if os(iOS)
+            if let mpv = coordinator.player as? MPVMetalViewController,
+               mpv.pictureInPicture.retainDisappearance(.presentation, finish: finish) { return }
+            #endif
+            finish()
+        }
     }
 
     #if os(iOS) || os(macOS)
@@ -2207,6 +2224,10 @@ struct PlayerScreen: View {
         #endif
         .tint(Theme.Palette.accent)
         .onAppear {
+            #if os(iOS)
+            if let mpv = coordinator.player as? MPVMetalViewController,
+               mpv.pictureInPicture.resumeDisappearance(.screen) { return }
+            #endif
             refreshAutoSkipSettings()
             playbackExited = false
             persistenceBlockedForExit = false
@@ -2303,41 +2324,15 @@ struct PlayerScreen: View {
             refreshAutoSkipSettings()
         }
         .onDisappear {
-            let assetSanityAccepted =
-                assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken)
-            invalidateEpisodeWorkForExit()
-            invalidateLocalTrickplayCapture()
-            cancelAssetSanityObservationDeadline()
-            core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
-            hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
-            stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
-            cancelPostFrameResumeSeekWatchdog()
-            refreshTask?.cancel(); sleepTask?.cancel(); trickplayCaptureTimer?.cancel(); idleWatchTask?.cancel()
-            cancelTerminalFinalityRefresh()
-            cancelDirectResumeInventoryRefresh()
-            #if os(iOS) || os(macOS)
-            engineNoticeTask?.cancel(); avStartWatchdog?.cancel()
-            avReplacementFirstFrameDeadlineTask?.cancel()
-            avReplacementFirstFrameDeadlineTask = nil
-            avReplacementFirstFrameOwner = nil
-            #endif
-            pendingLibmpvResumeSeek = nil   // teardown: drop any deferred resume seek so it cannot fire on a later mount
-            cancelPostFrameResumeSeekWatchdog()
-            // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
-            // (first-writer-wins, background, gated; no-op if the community already had a set). Never
-            // touches the player teardown below.
-            if assetSanityAccepted {
-                scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)   // tag the set's source height (tvOS parity)
-            }
-            NowPlayingCenter.clear()   // drop the Lock Screen / Control Center now-playing on close
             #if os(iOS)
-            UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
-            PlayerOrientation.release()                       // hand orientation back to the user's rotation lock
-            #elseif os(macOS)
-            if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
-            removeMacKeyMonitor()
-            unobserveMacFullScreen()
+            if let mpv = coordinator.player as? MPVMetalViewController,
+               mpv.pictureInPicture.retainDisappearance(.screen, finish: finishPlayerScreenDisappearance) {
+                // PiP did not leave this playback. Keep its exact state/callback
+                // owner; explicit Close still executes invalidateEpisodeWorkForExit.
+                return
+            }
             #endif
+            finishPlayerScreenDisappearance()
         }
         #if canImport(UIKit)
         // FOREGROUND RECONCILE (binge-desync fix, leg 2): an episode advance can straddle a background
@@ -7479,6 +7474,44 @@ struct PlayerScreen: View {
         episodeResolutionAdmitted = false
     }
 
+    private func finishPlayerScreenDisappearance() {
+        let assetSanityAccepted =
+            assetSanityAttempt.isAccepted(owner: coordinator.player?.activeLoadToken)
+        invalidateEpisodeWorkForExit()
+        invalidateLocalTrickplayCapture()
+        cancelAssetSanityObservationDeadline()
+        core.setPlayerActive(false)   // balance the onAppear +1; re-enables the In-Library re-decode
+        hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
+        stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
+        cancelPostFrameResumeSeekWatchdog()
+        refreshTask?.cancel(); sleepTask?.cancel(); trickplayCaptureTimer?.cancel(); idleWatchTask?.cancel()
+        cancelTerminalFinalityRefresh()
+        cancelDirectResumeInventoryRefresh()
+        #if os(iOS) || os(macOS)
+        engineNoticeTask?.cancel(); avStartWatchdog?.cancel()
+        avReplacementFirstFrameDeadlineTask?.cancel()
+        avReplacementFirstFrameDeadlineTask = nil
+        avReplacementFirstFrameOwner = nil
+        #endif
+        pendingLibmpvResumeSeek = nil   // teardown: drop any deferred resume seek so it cannot fire on a later mount
+        cancelPostFrameResumeSeekWatchdog()
+        // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
+        // (first-writer-wins, background, gated; no-op if the community already had a set). Never
+        // touches the player teardown below.
+        if assetSanityAccepted {
+            scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)   // tag the set's source height (tvOS parity)
+        }
+        NowPlayingCenter.clear()   // drop the Lock Screen / Control Center now-playing on close
+        #if os(iOS)
+        UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
+        PlayerOrientation.release()                       // hand orientation back to the user's rotation lock
+        #elseif os(macOS)
+        if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
+        removeMacKeyMonitor()
+        unobserveMacFullScreen()
+        #endif
+    }
+
     private func invalidateEpisodeWorkForExit() {
         persistenceBlockedForExit = hasUncommittedIssuedMedia
         playbackExited = true
@@ -8041,6 +8074,9 @@ struct PlayerScreen: View {
             pictureInPicture: {
                 if let controller = coordinator.player as? AVPlayerEngineController {
                     return AnyView(AVPlayerPictureInPictureButton(controller: controller) { scheduleHide() })
+                }
+                if let controller = coordinator.player as? MPVMetalViewController {
+                    return AnyView(MPVPictureInPictureButton(controller: controller.pictureInPicture) { scheduleHide() })
                 }
                 return AnyView(EmptyView())
             },
