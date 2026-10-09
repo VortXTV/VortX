@@ -1,13 +1,18 @@
-# Native repository integration (experimental, default off)
+# Native Android repository integration (0.5 native default)
 
-The shipping default remains `EngineStremioRepository`. `-Pvortx.nativeEngine=true`
-sets `BuildConfig.NATIVE_ENGINE_ENABLED` and selects `NativeCatalogRepository` for
-both application repository seams. In that mode the application never falls back
-to Stremio or preview data, and direct construction of the legacy repository fails.
+`android/app/build.gradle.kts` defaults `vortx.nativeEngine` to true, and
+`vortx.nativeResourceHost` follows that selection unless independently overridden.
+`VortXApplication.catalogRepository` selects `NativeCatalogRepository` in native
+mode; its `authRepository` selects the separate `NativeStreamingAuthRepository`
+described below. Native catalog access never falls back to the legacy engine or
+preview data, and direct construction of `EngineStremioRepository` is guarded.
+The legacy implementation remains available only for explicit non-native comparison
+selection. Source selection is not a claim that every 0.5 runtime/release gate has passed.
 
-## Android native 0.5 release-selection contract (staged)
+## Android native 0.5 build and artifact contract
 
-The 0.5 candidate selects native mode explicitly at the Gradle invocation boundary:
+Native is the source default; the workflows also select it explicitly at the Gradle
+invocation boundary:
 
 ```text
 ./gradlew <release-or-debug-tasks> -Pvortx.nativeEngine=true -Pvortx.nativeResourceHost=true
@@ -16,8 +21,10 @@ The 0.5 candidate selects native mode explicitly at the Gradle invocation bounda
 `android/app/build.gradle.kts` resolves those properties (with the matching
 `VORTX_NATIVE_ENGINE` / `VORTX_NATIVE_RESOURCE_HOST` environment variables as a
 local-tooling fallback) before Android variants are configured. Gradle properties
-take precedence over environment values. `nativeEngine=true` without
-`nativeResourceHost=true` fails configuration; a native application must compile
+take precedence over environment values; an explicit false/blank native selection
+chooses comparison mode even over an exported native environment value. With no
+separate resource-host override it follows the native flag. Resolved native mode
+with resource-host disabled fails configuration; a native application must compile
 the `jni,server,resource-host` `vortx-ffi` feature set. `BuildConfig.NATIVE_ENGINE_ENABLED`
 comes from that same resolved native flag, so a server-only/resource-host artifact
 cannot be presented as a native application by accident. Non-native builds retain
@@ -35,23 +42,25 @@ field/value pair and stops at whitespace-tolerant class boundaries. The signed c
 `scripts/verify-native-android-artifacts.sh` before upload. A release artifact that
 contains a resource-host library but advertises `BuildConfig.NATIVE_ENGINE_ENABLED=false` is rejected.
 
-The existing `stremiox-core` checkout remains built and verified in this staged
-lane. The Kotlin source still contains the complete legacy repository implementation
-and its JNI bindings, while the current release verifier requires its callable
-surface. Native mode cannot construct or select that repository, but removing its
-build/package dependency needs a separate link/readback review and an artifact-gate
-change; this selection lane does not claim that removal. The private engine pins
-are intentionally unchanged and are recorded here for the parent approval step:
+Native `preBuild` schedules `cargoNdkBuildVortxFfi`, not the legacy `cargoNdkBuild`.
+The legacy JNI output directory is attached only in comparison mode, and native
+packaging explicitly excludes `libstremiox_core.so`. The workflows invoke
+`verify-native-android-artifacts.sh --native-only`: it rejects that legacy library,
+requires exactly one VortX engine slice for each shipped ABI, checks callable
+resource-host/server JNI and ELF architecture, and compares packaged bytes with
+fresh staged bytes after the same pinned strip normalization. The verifier's
+default two-engine mode remains a comparison contract, not the native workflow gate.
 
-- `.github/workflows/android.yml`: `VortXTV/stremiox-core` and `VortXTV/vortx-core`
-- `.github/workflows/android-release.yml`: `VortXTV/stremiox-core` and `VortXTV/vortx-core`
-
-Each workflow currently names an immutable 40-character commit for both checkouts.
-The pending private CI replacement (including the currently discussed `ec96`
-candidate) must be approved and filled by the parent across all release lanes; this
-contract change does not repin or build either private repository. Host/device
-ABI, signing, and final release gates remain outstanding, so this is staged native
-selection rather than a claim that the product cutover is complete.
+At public source `ab00559c1286e209b067d79f41b892fc045459ce`, both Android workflows
+pin `VortXTV/vortx-core` to `a722eef43f80bd82226215cf460bba2e02869777`. They also
+retain a `VortXTV/stremiox-core` checkout at
+`31c66611822043e089f5819ad232a5df93975873` for comparison/tooling; checkout presence
+does not mean it is built or packaged in native variants. These exact source pins
+replace the former pending-candidate description, but do not prove that the
+latest host's complete native server capability contract is in a freshly built,
+signed Android artifact. Compatible real SDK slices, successful CI/artifact
+readback, signing and device/runtime gates must be evidenced separately; older or
+missing capabilities fail explicitly rather than selecting the legacy engine.
 
 `VortXSyncManager` now activates `NativeAccountCoordinator` after its captured
 account lease has authenticated/decrypted a successful backup response. Scope is
@@ -64,8 +73,12 @@ an automatic overwrite. The kernel applies only changed fields/events with suffi
 causal evidence; missing/regressing/ambiguous clocks reject the full transaction.
 Every authenticated route, including existing checkpoints and native carriers,
 reprojects the current legacy material and reconciles its receipt in the same atomic
-transaction as native merge. Pending/malformed website `profileEdits` and missing
-native-carrier import receipts fail closed before checkpoint publication. Unchanged
+transaction as native merge. Missing native-carrier import receipts and malformed
+source material fail closed. Supported immutable website profile/add-on events
+have their own validation, pending journals and kernel receipts; historical
+`profileEdits` is handled by its narrow original-baseline path, never folded by the
+broad importer or re-clocked as a new local edit. Unsupported/conflicting events
+remain pending rather than being falsely acknowledged. Unchanged
 legacy material and acknowledged ancestors remain no-ops after native edits; unsupported differing material never silently
 mounts an older native state. The exact account/mount is checked again after UI projection.
 An authenticated never-backed account can provision a deterministic Main/A11C baseline
@@ -111,6 +124,13 @@ host credential/global-settings restoration on pull is retained. Native profile,
 library and watch changes still synchronize through the native carrier using the
 existing encrypted optimistic-concurrency push. Active profile selection is never
 exported in `nativeSync`.
+
+Each upload is derived from its freshly pulled backup revision: an exact revision
+`N` produces `N + 1`, and authoritative absence alone produces create-only revision
+zero. Rejection causes another pull and rebuild; wall-clock time, a local high-water
+mark and a rejected PUT's echo cannot confer authority on an older payload. Malformed,
+fractional or overflowing revisions fail closed.
+
 Host-only profile preferences (including avatar, playback and discovery settings)
 use shared schema-one per-field registers: `{clock,actor,value}`, ordered by safe-integer
 Lamport clock then lowercase UUID actor. Null is explicit deletion; equal-event unequal
@@ -139,8 +159,8 @@ Existing explicitly account-qualified metadata/debrid slots can supply the initi
 fallback. Unscoped legacy OAuth tuples require reauthentication; they are not assigned to
 the current account. The credential carrier is excluded entirely from local host archives
 and native checkpoints. Native provider backing stays solely in encrypted credential
-storage and encrypted cloud documents. Default native selection remains off; local
-fixtures do not establish Android Keystore, actual provider or device behavior.
+storage and encrypted cloud documents. Native selection is now the source default;
+local fixtures still do not establish Android Keystore, actual provider or device behavior.
 
 Checkpoints live in Android's `noBackupFilesDir/native-state`. Android Keystore
 holds a non-exportable AES-256 key per scope. The sealed payload is
@@ -155,6 +175,35 @@ after the full checkpoint; missing/corrupt/unindexed prior state is not fresh-ac
 authority. Cached global registers and archived settings project under the same lease
 before network access. Account bearer tokens and passwords are not accepted by the session.
 
+## Streaming authentication and own-account migration
+
+Mounted VortX account authority is separate from optional Main-profile Stremio
+authentication. The application's native `authRepository` uses
+`NativeStreamingAuthRepository`, with a captured management revision/account epoch
+and the unlocked Main/PIN gate. Connect/disconnect verifies and publishes that
+optional credential state; it does not relabel the VortX owner, sign out the VortX
+account or replace native saved data. Direct `NativeCatalogRepository` Stremio
+sign-in operations still fail explicitly; they are not the application's auth seam.
+
+Non-owner own-account setup/linking uses `NativeAccountCoordinator` and
+`NativeStreamingAccountLink`, not a legacy engine instance. It verifies the source
+UID and obtains that source's independent library/add-on material under the exact
+captured account, profile, binding revision and transaction. A verified UID alone
+does not attribute an old root overlay to the newly signed-in source. Tokens and
+link intents require confirmed encrypted credential-store readback; they are not
+written into `nativeSync`, native checkpoints or host source archives.
+
+`pending_own`, own-account A-to-B replacement and return to shared mode are durable
+account-slot transitions. Histories remain source-qualified: an unresolved non-owner
+slot never borrows Main's original Library/history or another UID's records.
+Supported migration requires exact source/overlay evidence and complete watched
+evidence. Missing, stale, uncertain or incomplete evidence retains the sealed
+candidate/pending intent for retry, rather than acknowledging a partial import.
+Credential, source and binding readback must pass before publication. This is an
+implemented guarded path, not universal legacy-migration, provider or device proof.
+
+## Native repository and playback behavior
+
 The real repository currently supports:
 
 - Board catalogs and per-row skip pagination, Discover selection/genre/skip pagination and search from native
@@ -165,6 +214,9 @@ The real repository currently supports:
 - Durable per-profile standard library membership, library export, individual
   movie/episode watched changes, Continue Watching reads/dismissal, and explicitly
   identified offline/native-streaming playback progress callbacks.
+  History, Library and Watchlist remain distinct: native Watchlist intent/migration
+  retains per-profile removals, and ambiguous source attribution stays pending rather
+  than borrowing another account's membership.
 - Atomic series/season watched/reset over the complete returned metadata inventory, and
   exact episode membership checks (no synthetic episode identities or inferred episodes).
   The isolated mutation lookup does not replace visible detail navigation. Missing/ambiguous
@@ -196,6 +248,24 @@ The real repository currently supports:
   history identity. Late or replaced source selections release their playback lease.
   Native hero playback bypasses the legacy debrid fast path so the issued immutable
   playback context is retained. Exact video-ID resume points come from the kernel.
+- Configured Newznab indexers participate in native streams through
+  `NzbSourceAggregator`. The factory requires an actual projected active profile
+  (`active?.id`, never an Owner fallback) and an account/profile-qualified indexer
+  store matching the captured native owner. Searches use approved exact metadata
+  and the selected episode; ordered indexer results append after the captured add-on
+  groups. Disabled/empty configuration is a no-op, individual failures do not erase
+  working add-ons, and indexer-only success is supported. Parental admission and
+  exact request/configuration/owner/coroutine fences run before cache or source-token
+  publication; appended sources retain the same immutable playback context.
+
+Native Usenet routing retains ordered NZB mirrors, add-on server lists and explicit
+selection hints. Positively confirmed cached TorBox material may route without NNTP;
+otherwise add-on servers precede the captured saved provider, with TorBox used only
+when its configured policy admits that mirror. A capability or provider failure is
+not evidence of cache readiness. The local control endpoint is literal-loopback,
+proxy-free and redirect-free; compatible operation-cancellation and file-selection
+capabilities are required, and older/missing contracts fail explicitly. Returned
+provider/enclosure URLs alone are not playable-media or live-provider proof.
 
 Each resource consumer has its own cancellation/generation slot. Publication
 checks the completed request identity after parsing. Profile/registry changes,
@@ -205,17 +275,29 @@ Watch-only/idempotent cloud merges preserve an active playback lease; actual
 profile, registry and host-preference changes revoke it. A cached detail offset
 cannot overwrite the kernel's exact resume offset or explicit reset-to-zero.
 
-Still unsupported (repository operations fail explicitly): Stremio login,
-unresolved own-Stremio-account migration, ambiguous or incomplete legacy carriers,
-legacy changes without the shared reducer's required causal evidence (including pending
-website profile patches), unscoped legacy OAuth ownership attribution,
+Pending resolution and handed-off playback have different fences. Pending admission
+checks the captured caller Job, mounted session/owner, exact source binding and resolve
+sequence; final admission repeats those checks and closes a denied returned lease.
+Retired admission becomes a handled failure only while the caller remains active;
+genuine coroutine cancellation stays terminal. The Usenet playback-lifetime callback
+checks only the captured session identity/native owner, supplemented by the transport's
+captured credential/provider revision. It excludes the completed caller Job, mutable
+source map and later prewarm sequence, so new source reads do not retire current
+playback. A pending timeout closes its retained operation; after handoff, operation
+monitoring closes the owned lease on explicit close or authority retirement.
+
+Still unsupported or explicitly gated: ambiguous or incomplete legacy carriers,
+legacy changes without the shared reducer's required causal evidence, unsupported
+website payloads, unscoped legacy OAuth ownership attribution,
 global settings outside the explicit shared SettingsBackup type whitelist (and legacy
 flat native-profile theme changes). The existing profile UI verifies projected salted PINs before
 selection; stale projected profiles are rejected. Direct repository PIN switching
 remains blocked rather than bypassing that gate. Source
 ordering does not yet implement `rememberedQuality`/`wantedAddon` continuity.
-Native auth state reflects successfully mounted VortX accounts. Terminal playback can issue a
-one-use owner/session-bound watched receipt only when a fresh authenticated checkpoint query
+Native account authorization reflects successfully mounted VortX accounts; optional
+Main authentication is verified separately and never borrowed from a child UID.
+Terminal playback can issue a one-use owner/session-bound watched receipt only when
+a fresh authenticated checkpoint query
 confirms a new exact-video completion. Cleanup rechecks that same persisted watch clock and owner;
 the existing download coordinator still separately requires decoder/lease release and the user's
 auto-delete setting. Final cleanup admission holds the download lifecycle, native session, captured
@@ -230,6 +312,10 @@ excluded. Set `VORTX_JNI_LIBRARY` to a reviewed host JNI library to execute the
 otherwise skipped real-JNI hydration/resource-ABI test. No test starts a player,
 provider request, application or device session. Android Keystore and final APK
 ABI packaging/signing still require device/release gates.
+An actual-JNI acceptance receipt must show that these tests executed with zero
+skips and retain the exact public source, native artifact/header fingerprints and
+command. Excluding native build tasks is a host-test technique, not a fresh Android
+SDK build or packaged-artifact receipt.
 
 With the reviewed native-sync artifact, also set `VORTX_JNI_SYNC=1` to execute
 the real JNI session test: bind scope, mutate library/profile/progress, checkpoint,
@@ -243,3 +329,10 @@ updates pass. Delayed projection tests reject retirement before install reports 
 Resource bytes in that test are local fixtures; the test does not prove live
 provider behavior. The host ABI test creates/frees a resource host without loading
 network resources.
+
+Workflow declarations and passing host tests do not establish a terminal CI build,
+fresh source-matched SDK slices for every shipped ABI, signed APK/AAB readback,
+Keystore/device behavior, physical playback or live account/provider success.
+Those gates remain separate, including compatibility with the native Usenet control
+contract. Source continuity (`rememberedQuality`/`wantedAddon`) remains unimplemented;
+this document makes no complete-parity, published-Beta or release-acceptance claim.
