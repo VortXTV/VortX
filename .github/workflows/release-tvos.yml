@@ -494,12 +494,16 @@ jobs:
           TVOS_TEST_ONLY: ${{ inputs.tvos_test_only }}
         run: |
           set -euo pipefail
-          SERVER=()
-          if [ "$TVOS_TEST_ONLY" != true ]; then SERVER=(--mac-server app/Vendor/vortx-streaming-server); fi
-          python3 scripts/verify-native-apple-package.py snapshot \
-            --engine app/Vendor/VortxEngine.xcframework --mpvkit app/Vendor/MPVKit-DVFEL \
-            --engine-revision "$VORTX_ENGINE_SOURCE_REVISION" "${SERVER[@]}" \
-            --output out/native-build-inputs.json
+          # Bash 3.2 treats an empty array as unbound under nounset. Keep the
+          # complete snapshot argv nonempty in the artifact-only seed lane.
+          SNAPSHOT_ARGS=(snapshot
+            --engine app/Vendor/VortxEngine.xcframework --mpvkit app/Vendor/MPVKit-DVFEL
+            --engine-revision "$VORTX_ENGINE_SOURCE_REVISION"
+            --output out/native-build-inputs.json)
+          if [ "$TVOS_TEST_ONLY" != true ]; then
+            SNAPSHOT_ARGS+=(--mac-server app/Vendor/vortx-streaming-server)
+          fi
+          python3 scripts/verify-native-apple-package.py "${SNAPSHOT_ARGS[@]}"
 
       - name: Check shared server settings at the iOS 16 deployment target
         if: inputs.tvos_test_only != true

@@ -23,6 +23,7 @@ on:
       - "scripts/test-native-apple-project.rb"
       - "scripts/verify-native-apple-package.py"
       - "scripts/tests/test_native_apple_package.py"
+      - "scripts/tests/test_release_native_snapshot_argv.py"
       - "scripts/verify-android-release-version.sh"
       - "scripts/tests/test_android_release_version.py"
       - "workers/vortx-appcast/**"
@@ -52,6 +53,7 @@ on:
       - "scripts/test-native-apple-project.rb"
       - "scripts/verify-native-apple-package.py"
       - "scripts/tests/test_native_apple_package.py"
+      - "scripts/tests/test_release_native_snapshot_argv.py"
       - "scripts/verify-android-release-version.sh"
       - "scripts/tests/test_android_release_version.py"
       - "workers/vortx-appcast/**"
@@ -76,6 +78,7 @@ jobs:
       - run: bash scripts/test-release-orchestration-contracts.sh
       - run: ruby scripts/test-native-apple-project.rb
       - run: python3 scripts/tests/test_native_apple_package.py
+      - run: python3 scripts/tests/test_release_native_snapshot_argv.py
       - run: python3 scripts/tests/test_android_release_version.py
       - run: node --test workers/vortx-appcast/test/index.test.mjs
       - run: bash scripts/test-subtitle-source-contracts.sh
