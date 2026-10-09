@@ -18,6 +18,19 @@ protocol VortxRuntimeABI: Sendable {
 
 enum VortxNativeError: Error, Equatable {
     case unavailable, closed, invalidSnapshot, invalidResponse, superseded, checkpointUncertain
+
+    static func diagnosticCode(_ error: Error?) -> String {
+        guard let error else { return "not_dispatched" }
+        switch error as? Self {
+        case .unavailable: return "unavailable"
+        case .closed: return "closed"
+        case .invalidSnapshot: return "invalid_snapshot"
+        case .invalidResponse: return "invalid_response"
+        case .superseded: return "superseded"
+        case .checkpointUncertain: return "checkpoint_uncertain"
+        case nil: return "restore_or_storage_failed"
+        }
+    }
 }
 
 /// Every handle call, replacement and teardown uses the same lock. A failed cold load leaves

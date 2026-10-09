@@ -45,6 +45,62 @@ final class CoreBridge: ObservableObject {
         nativeFacadeLock.withLock { .native(currentNativePlaybackBinding()) }
     }
     func nativePlaybackTargetIsCurrent(_ target: PlaybackMutationTarget) -> Bool { nativePlaybackBinding(target) != nil }
+    struct NativeProfileActionAdmission {
+        let credential: CredentialScopeRegistry.Capture
+        let profileID: UUID?
+        let target: PlaybackMutationTarget
+    }
+    @MainActor
+    func captureNativeProfileActionAdmission() -> NativeProfileActionAdmission {
+        .init(credential: CredentialScopeRegistry.shared.capture(), profileID: ProfileStore.shared.activeID,
+              target: captureNativePlaybackTarget())
+    }
+    /// A cached roster can appear before cold-start restoration finishes. Wait under the original
+    /// owner/profile fence, then capture a real acknowledged target. Never upgrade a stale live target.
+    @MainActor
+    func prepareNativeProfileActionTarget(_ admission: NativeProfileActionAdmission) async -> PlaybackMutationTarget? {
+        await NativeProfileActionPreparation.target(isCurrent: {
+            CredentialScopeRegistry.shared.isCurrent(admission.credential)
+                && ProfileStore.shared.activeID == admission.profileID
+        }, capture: {
+            if case .native(let binding?) = admission.target {
+                return self.nativePlaybackTargetIsCurrent(.native(binding)) ? admission.target : nil
+            }
+            let target = self.captureNativePlaybackTarget()
+            return self.nativePlaybackTargetIsCurrent(target) ? target : nil
+        }, prepare: {
+            guard case .native(nil) = admission.target else { return }
+            if let facade = self.nativeFacade, facade.isAvailable {
+                // An admitted profile transaction owns the FIFO; do not replace its session.
+                await facade.settled()
+            } else {
+                _ = await VortXSyncManager.shared.restoreNativeCheckpoint(credentialCapture: admission.credential)
+            }
+        })
+    }
+    @MainActor
+    var nativeProfileRecoveryMessage: String {
+        if !VortXSyncManager.shared.isSignedIn { return "Sign in to your VortX account to open or save profiles." }
+        if !hasNativeSession { return "Couldn't load your profiles. Your saved data is safe. Tap again to retry, or open Account settings." }
+        return "The profile changed while loading. Tap again to try once more."
+    }
+    @MainActor
+    func reportNativeProfileFailure(_ operation: String, error: Error? = nil) {
+        let reason = nativeFacadeLock.withLock { () -> String in
+            guard let profile = ProfileStore.shared.activeID else { return "no_active_profile" }
+            guard let capture = nativeCredentialCapture else { return "session_not_installed" }
+            guard CredentialScopeRegistry.shared.isCurrent(capture) else { return "credential_changed" }
+            guard let facade = nativeFacadeStorage, facade.isAvailable else { return "session_unavailable" }
+            guard let nativeID = facade.registryBinding?.profileID else { return "profile_transition_pending" }
+            guard nativeID == profile.uuidString else {
+                return UUID(uuidString: nativeID) == profile ? "profile_id_case_mismatch" : "profile_binding_mismatch"
+            }
+            guard nativePublishedAccountGeneration == facade.accountGeneration else { return "profile_not_published" }
+            return "native_dispatch_rejected"
+        }
+        // Static categories only: no names, UUIDs, credential slots, account IDs or raw errors.
+        DiagnosticsLog.log("profiles", "operation=\(operation) result=rejected reason=\(reason) error=\(VortxNativeError.diagnosticCode(error)) checkpoint=\(VortXSyncManager.shared.nativeCheckpointStatus)")
+    }
     /// Called only under nativeFacadeLock; never substitute a new session into a captured target.
     private func currentNativePlaybackBinding() -> PlaybackMutationOwnershipPolicy.NativeBinding? {
         guard let profile = ProfileStore.shared.activeID, let capture = nativeCredentialCapture,

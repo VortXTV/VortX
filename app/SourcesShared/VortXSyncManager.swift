@@ -858,7 +858,10 @@ final class VortXSyncManager: ObservableObject {
     func restoreNativeCheckpoint(credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
         let selectedProfile = ProfileStore.shared.activeID
-        guard isSignedIn, isCurrent(capture), case .account = capture.scope else { return false }
+        guard isSignedIn, isCurrent(capture), case .account = capture.scope else {
+            DiagnosticsLog.log("native-profiles", "restore result=not_started reason=account_not_ready")
+            return false
+        }
         if let pending = nativeCheckpointTask, nativeCheckpointCapture == capture, nativeCheckpointProfile == selectedProfile {
             return await pending.value
         }
@@ -875,6 +878,8 @@ final class VortXSyncManager: ObservableObject {
                 }
             }
             guard self.isCurrent(capture), !Task.isCancelled else { return false }
+            self.nativeCheckpointStatus = "restoring"
+            DiagnosticsLog.log("native-profiles", "restore result=started")
             // Global ProfileStore is not account-attribution evidence. Pin the owner from this
             // freshly authenticated/decrypted account roster, including historical PIN-bound IDs.
             let pulled = await self.pullDocVersionedResult(credentialCapture: capture)
@@ -901,6 +906,7 @@ final class VortXSyncManager: ObservableObject {
             guard owners.count == 1, let selectedProfile else {
                 self.nativeCheckpointStatus = "profile_attribution_unavailable"; return false
             }
+            var stage = "account_preflight"
             do {
                 let scope = VortxAccountScope(account: capture.namespace, ownerProfileID: owners[0].id.uuidString)
                 _ = try self.mergedNativeProviderState(document, capture: capture) // validate before any native checkpoint commit
@@ -913,6 +919,7 @@ final class VortXSyncManager: ObservableObject {
                 let hadCheckpoint = checkpoint != nil
                 // Every open checks the complete legacy projection, including pending web edits.
                 // Native authority cannot silently ignore a later old-client membership/watch edit.
+                stage = "legacy_preparation"
                 let prepared = try await self.prepareNativeLegacyMaterial(document, capture: capture, enforceMountedFence: false)
                 guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
                       ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
@@ -923,6 +930,7 @@ final class VortXSyncManager: ObservableObject {
                     try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0))
                 }
                 if hadCheckpoint || remoteNative != nil {
+                    stage = "legacy_compatibility"
                     try VortxNativeSession.validateLegacyCompatibility(scope: scope, ownerName: owners[0].name,
                                                                        snapshot: checkpoint, nativeSync: remoteNative,
                                                                        material: material, abi: VortxCABI(), baselineMaterial: probe.readLegacyMaterial(scope: scope))
@@ -943,6 +951,7 @@ final class VortXSyncManager: ObservableObject {
                 let archive = try VortxNativeBootstrapArchive.encode(document: documentBytes, material: material, authenticatedSourceArchive: prepared.sourceArchive)
                 // Keep an already validated session visible while authentication/source parsing
                 // is pending or fails. Only retire it once the replacement has passed preflight.
+                stage = "session_replacement"
                 await CoreBridge.shared.closeNativeSession()
                 guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
                       ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
@@ -950,15 +959,18 @@ final class VortXSyncManager: ObservableObject {
                 // This opener deliberately retires its old facade. Its equivalent source fence
                 // is exact pre-fetch checkpoint+sidecar equality after retirement, not isAvailable.
                 guard finalCheckpoint == checkpoint, try probe.readHostPreferences(scope: scope) == preparationHost else { throw VortxNativeError.superseded }
+                stage = "checkpoint_creation"
                 let store = try VortxEncryptedCheckpointStore(directory: directory, key: SymmetricKey(data: keyBytes),
                                                                installationKey: VortxNativeInstallationKey.loadOrCreate(),
                                                                bootstrap: archive, bootstrapScope: scope)
+                stage = "session_creation"
                 let session = try VortxNativeSession(scope: scope, ownerName: owners[0].name, abi: VortxCABI(), store: store,
                                                     transport: VortxCResourceTransport(), allowNewAccount: !hadCheckpoint, initialActions: initialActions,
                                                     hostActor: self.nativeHostActor(capture: capture), sourceAuthority: prepared.authority,
                                                     authenticatedSourceArchive: !hadCheckpoint ? prepared.sourceArchive : nil,
                                                     initialLegacyMaterial: !hadCheckpoint && remoteNative != nil ? material : nil)
                 do {
+                    stage = "account_merge"
                     let hostRemote = try document["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
                     let watchlists = try self.nativeLegacyWatchlists(document)
                     let websiteEvents = try Self.nativeWebsiteEvents(document)
@@ -976,14 +988,17 @@ final class VortXSyncManager: ObservableObject {
                     // Prefer it only when present in this authenticated roster; otherwise its owner.
                     let installationProfile = (selectedRecord == nil || selectedRecord?["deleted"] == .bool(true)) ? owners[0].id : selectedProfile
                     if state["activeProfileId"] != .string(installationProfile.uuidString) {
+                        stage = "active_profile_selection"
                         let action = VortxJSON.object(["type": .string("switch_profile"), "id": .string(installationProfile.uuidString)])
                         _ = try await session.dispatch([String(decoding: JSONEncoder().encode(action), as: UTF8.self)], now: UInt64(Date().timeIntervalSince1970))
                     }
+                    stage = "profile_projection"
                     let registry = try await session.resourceRegistry()
                     let acceptedHost = try await session.hostPreferencesDocument()
                     let websiteOutcome = try await session.websiteEditOutcome()
                     guard self.isCurrent(capture), !Task.isCancelled, ProfileStore.shared.activeID == selectedProfile else { throw VortxNativeError.superseded }
                     try store.rememberAuthenticatedScope(scope)
+                    stage = "session_installation"
                     try await CoreBridge.shared.installNativeSession(session, registry: registry, capture: capture, hostProfiles: roster.profiles)
                     guard self.isCurrent(capture), !Task.isCancelled, self.nativeCheckpointGeneration == generation,
                           ProfileStore.shared.activeID == installationProfile else { throw VortxNativeError.superseded }
@@ -992,11 +1007,14 @@ final class VortXSyncManager: ObservableObject {
                     // Upload only the new nativeSync carrier. The archive never enters the wire,
                     // and adopting an existing remote carrier must not create an echo push.
                     if didImportLegacy || !websiteEvents.isEmpty || !websiteAddonEvents.isEmpty { self.requestSyncSoon() }
-                    self.nativeCheckpointStatus = "mounted"; return true
+                    self.nativeCheckpointStatus = "mounted"
+                    DiagnosticsLog.log("native-profiles", "restore result=mounted")
+                    return true
                 } catch { await session.close(); throw error }
             } catch {
                 if self.isCurrent(capture), self.nativeCheckpointGeneration == generation,
                    ProfileStore.shared.activeID == selectedProfile { self.nativeCheckpointStatus = (error as? VortxNativeWatchedArchive.Failure) == .pending ? "watched_migration_pending" : "native_checkpoint_unavailable" }
+                DiagnosticsLog.log("native-profiles", "restore result=failed stage=\(stage) reason=\(VortxNativeError.diagnosticCode(error))")
                 return false // No empty account, legacy token dispatch, or destructive repair fallback.
             }
         }
