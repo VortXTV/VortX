@@ -129,7 +129,13 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 syncManager === manager && manager.sessionOwnerSnapshot() == captured && action()
             } }
             gate
-        } }, onAuthorityChanged = { com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority() }) }
+        } }, onAuthorityChanged = { com.vortx.android.library.WatchlistStore.shared(this).invalidateNativeAuthority() },
+        projectTransfer = { accepted, admission -> withContext(Dispatchers.Main) {
+            admission.publish {
+                check(nativeAccounts.session() === accepted) { "Native transfer writer changed" }
+                ProfileStore.sharedOrNull()?.attachNativeGateway(nativeProfiles)
+            }
+        } }) }
     internal fun nativeStreamingAccounts(): NativeAccountCoordinator {
         check(BuildConfig.NATIVE_ENGINE_ENABLED) { "Native streaming accounts are not enabled" }
         return nativeAccounts

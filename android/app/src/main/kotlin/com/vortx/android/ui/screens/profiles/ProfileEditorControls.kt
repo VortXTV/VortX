@@ -19,7 +19,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
-import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.components.Chip as StandardChip
+import com.vortx.android.ui.tv.profileFocusTarget
+import androidx.compose.ui.graphics.Color
 import com.vortx.android.ui.screens.SettingsSection
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXTheme
@@ -136,7 +138,7 @@ internal fun ProfileAccentSection(selectedId: String, onSelect: (String) -> Unit
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
         ) {
             VortXAccents.curated.forEach { accent ->
-                Chip(
+                ProfileChip(
                     label = accent.label,
                     selected = selectedId == accent.id,
                     onClick = { onSelect(accent.id) },
@@ -164,8 +166,14 @@ internal fun ProfileBackgroundSection(oled: Boolean, onOled: (Boolean) -> Unit) 
             modifier = Modifier.padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.xs),
             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
         ) {
-            Chip(label = "Warm", selected = !oled, onClick = { onOled(false) }, modifier = Modifier.heightIn(min = 48.dp))
-            Chip(label = "OLED Black", selected = oled, onClick = { onOled(true) }, modifier = Modifier.heightIn(min = 48.dp))
+            ProfileChip(label = "Warm", selected = !oled, onClick = { onOled(false) }, modifier = Modifier.heightIn(min = 48.dp))
+            ProfileChip(label = "OLED Black", selected = oled, onClick = { onOled(true) }, modifier = Modifier.heightIn(min = 48.dp))
         }
     }
+}
+
+@Composable
+internal fun ProfileChip(label: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier,
+    accent: Color = VortXTheme.colors.accent, accentText: Color = VortXTheme.colors.accentBright) {
+    StandardChip(label, selected, onClick, modifier.profileFocusTarget(), accent = accent, accentText = accentText)
 }

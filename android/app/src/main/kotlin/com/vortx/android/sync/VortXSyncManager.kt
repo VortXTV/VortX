@@ -316,6 +316,13 @@ internal class SessionOperationCoordinator {
     fun isCurrentSnapshot(expectedGeneration: Long): Boolean =
         sessionGeneration == expectedGeneration
 
+    fun cancelRetiredSessionCalls() {
+        val cancellations = synchronized(lock) {
+            retireCallsLocked { it.owner == OutboundCallOwner.SESSION && !it.matchesGeneration() }
+        }
+        cancelCalls(cancellations)
+    }
+
     fun <T> mutateIfCurrent(
         expectedGeneration: Long,
         mutation: () -> T,
@@ -334,7 +341,7 @@ internal class SessionOperationCoordinator {
         if (sessionGeneration != expectedGeneration || !validate()) {
             null
         } else {
-            registerCallLocked(OutboundCallOwner.SESSION, expectedGeneration)
+            registerCallLocked(OutboundCallOwner.SESSION, expectedGeneration, validate)
         }
     }
 
@@ -353,14 +360,24 @@ internal class SessionOperationCoordinator {
             }
         }
 
+        fun cancel() {
+            val cancellations = synchronized(lock) {
+                if (authGeneration != expectedAuthGeneration) return
+                authGeneration = nextGeneration(authGeneration)
+                retireCallsLocked { it.owner == OutboundCallOwner.AUTH }
+            }
+            cancelCalls(cancellations)
+        }
+
         fun commitSessionMutation(
             onCommitted: () -> Unit = {},
+            admission: () -> Boolean = { true },
             mutation: () -> Boolean,
         ): SessionMutationResult<Boolean> {
             var cancellations = emptyList<() -> Unit>()
             return try {
                 synchronized(lock) {
-                    if (authGeneration != expectedAuthGeneration) {
+                    if (authGeneration != expectedAuthGeneration || !admission()) {
                         SessionMutationResult.Stale
                     } else {
                         val nextSessionGeneration = nextGeneration(sessionGeneration)
@@ -384,6 +401,7 @@ internal class SessionOperationCoordinator {
     internal inner class OutboundCallPermit internal constructor(
         internal val owner: OutboundCallOwner,
         private val expectedGeneration: Long,
+        private val validate: () -> Boolean,
     ) {
         internal var cancellation: (() -> Unit)? = null
 
@@ -409,7 +427,7 @@ internal class SessionOperationCoordinator {
 
         internal fun matchesGeneration(): Boolean = when (owner) {
             OutboundCallOwner.AUTH -> authGeneration == expectedGeneration
-            OutboundCallOwner.SESSION -> sessionGeneration == expectedGeneration
+            OutboundCallOwner.SESSION -> sessionGeneration == expectedGeneration && validate()
         }
     }
 
@@ -421,8 +439,9 @@ internal class SessionOperationCoordinator {
     private fun registerCallLocked(
         owner: OutboundCallOwner,
         generation: Long,
+        validate: () -> Boolean = { true },
     ): OutboundCallPermit =
-        OutboundCallPermit(owner, generation).also(activeCalls::add)
+        OutboundCallPermit(owner, generation, validate).also(activeCalls::add)
 
     private fun isPermitCurrentLocked(permit: OutboundCallPermit): Boolean =
         permit in activeCalls && permit.matchesGeneration()
@@ -457,10 +476,31 @@ internal class SyncSessionLease(
     val accountId: String,
     val token: String,
     dataKey: ByteArray,
+    val syncAdmissionGeneration: Long = 0L,
+    val transfer: SyncTransferCapability? = null,
 ) {
     private val immutableDataKey = dataKey.copyOf()
 
     fun dataKeyCopy(): ByteArray = immutableDataKey.copyOf()
+}
+
+internal class SyncTransferCapability(
+    val accountId: String,
+    val ownerEpoch: Long,
+    val profile: com.vortx.android.profile.ContinueWatchingOwnerGate.TransferWitness,
+    val resumeOnCancel: Boolean,
+)
+
+private data class SyncAdmissionState(val generation: Long = 0L, val transfer: SyncTransferCapability? = null)
+
+internal class QrTransferApproval {
+    private val profile = com.vortx.android.profile.ContinueWatchingOwnerGate.captureTransferWitness()
+    @Volatile private var active = true
+    fun isCurrent(): Boolean = active && profile.isCurrent()
+    fun retire() = com.vortx.android.profile.ContinueWatchingOwnerGate.serialized { active = false; profile.retire() }
+    fun <T> admit(action: () -> T): T? = com.vortx.android.profile.ContinueWatchingOwnerGate.serialized {
+        if (isCurrent()) action() else null
+    }
 }
 
 internal fun sessionTruthMatches(
@@ -757,7 +797,11 @@ class VortXSyncManager(context: Context) {
         val devicePublicKey: String,
         internal val ephemeralPrivateKey: ByteArray,
         internal val operation: SessionOperationCoordinator.AuthOperation,
+        internal val transferApproval: QrTransferApproval? = null,
     )
+    {
+        internal var consumed = false // guarded by AuthOperation's commit monitor
+    }
 
     sealed interface QrJoinResult {
         data object Pending : QrJoinResult
@@ -942,10 +986,11 @@ class VortXSyncManager(context: Context) {
     private val addonPrefs = AddonPrefsStore(appContext)
     private val store = SessionStore(appContext)
     private val initialSessionLoad = store.load()
+    private var sessionPersistTestSeam: ((Session, Long) -> Boolean)? = null
     private val sessionState = DurableSessionState(
         initialValue = (initialSessionLoad as? SessionLoad.Available)?.session,
         initialOwnerEpoch = initialSessionLoad.ownerEpochOrInitial(),
-        persist = store::persist,
+        persist = { candidate, epoch -> sessionPersistTestSeam?.invoke(candidate, epoch) ?: store.persist(candidate, epoch) },
         clear = store::clear,
         ownerTransition = { mutation ->
             if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) mutation()
@@ -953,6 +998,7 @@ class VortXSyncManager(context: Context) {
         },
     )
     private val operations = SessionOperationCoordinator()
+    @Volatile private var syncAdmission = SyncAdmissionState()
 
     /**
      * Per-account version + downgrade-ratchet state for the sync engine (the analogue of Apple's
@@ -969,6 +1015,8 @@ class VortXSyncManager(context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile private var requestTestSeam: SyncRequestTestSeam? = null
+    @Volatile private var transferNativeMutationTestSeam: ((String) -> Unit)? = null
+    @Volatile private var realtimeStartTestSeam: (() -> Unit)? = null
     @Volatile private var versionedPayloadTestObserver: (() -> Unit)? = null
     @Volatile private var sessionRestoreTestSeam: SessionLoad? = null
 
@@ -1049,6 +1097,8 @@ class VortXSyncManager(context: Context) {
     private val _sessionUiState = MutableStateFlow(initialSessionLoad.uiState())
     /** Tri-state persistence truth for account surfaces, including an explicit unavailable/retry state. */
     val sessionUiState: StateFlow<SessionUiState> = _sessionUiState.asStateFlow()
+    private val _transferPending = MutableStateFlow(session?.account?.id?.let(syncState::transferPending) == true)
+    val transferPending: StateFlow<Boolean> = _transferPending.asStateFlow()
 
     /** True whenever a session is present (a token + data key were adopted and persisted). */
     val isSignedIn: Boolean get() = session != null
@@ -1096,6 +1146,7 @@ class VortXSyncManager(context: Context) {
         } else {
             _account.value = current.account
             _sessionUiState.value = SessionUiState.SignedIn(current.account)
+            _transferPending.value = syncState.transferPending(current.account.id)
             SessionOwnerSnapshot.Account(current.account.id, sessionState.ownerEpoch)
         }
     } }
@@ -1114,6 +1165,8 @@ class VortXSyncManager(context: Context) {
         require(testSession == null || testSession.account.id.isNotBlank())
         sessionRestoreTestSeam = SessionLoad.Available(testSession, ownerEpoch)
     }
+
+    internal fun installSessionPersistTestSeam(persist: (Session, Long) -> Boolean) { sessionPersistTestSeam = persist }
 
     /** Forces the retryable secure-storage-unavailable branch for local recovery-path tests. */
     internal fun installUnavailableSessionRestoreTestSeam() {
@@ -1159,7 +1212,7 @@ class VortXSyncManager(context: Context) {
         }
     }
 
-    private fun captureSyncLease(): SyncSessionLease? =
+    private fun captureSyncLease(transfer: SyncTransferCapability? = null): SyncSessionLease? =
         operations.snapshot { operationGeneration ->
             sessionState.serialized {
                 val current = sessionState.value ?: return@serialized null
@@ -1169,6 +1222,8 @@ class VortXSyncManager(context: Context) {
                     accountId = current.account.id,
                     token = current.token,
                     dataKey = current.dataKey,
+                    syncAdmissionGeneration = syncAdmission.generation,
+                    transfer = transfer,
                 )
             }
         }
@@ -1210,7 +1265,22 @@ class VortXSyncManager(context: Context) {
         val current = sessionState.value ?: return false
         return sessionState.ownerEpoch == lease.ownerEpoch &&
             current.account.id == lease.accountId &&
-            current.token == lease.token
+            current.token == lease.token && syncAdmissionAllows(lease)
+    }
+
+    private fun syncAdmissionAllows(lease: SyncSessionLease): Boolean {
+        val admission = syncAdmission
+        if (lease.syncAdmissionGeneration != admission.generation) return false
+        val held = admission.transfer
+        return if (held == null) lease.transfer == null && !syncState.transferPending(lease.accountId)
+        else lease.transfer === held && held.accountId == lease.accountId && held.ownerEpoch == lease.ownerEpoch && held.profile.isCurrent()
+    }
+
+    /** Called under the session-operation monitor; every change fences previously captured work. */
+    private fun advanceSyncAdmission(transfer: SyncTransferCapability?) {
+        val prior = syncAdmission
+        check(prior.generation < Long.MAX_VALUE)
+        syncAdmission = SyncAdmissionState(prior.generation + 1, transfer)
     }
 
     /**
@@ -1356,7 +1426,12 @@ class VortXSyncManager(context: Context) {
     }
 
     /** Start the joiner side of VortX account device pairing. */
-    suspend fun qrStart(): QrJoinSession? {
+    suspend fun qrStart(): QrJoinSession? = startQrJoiner(null)
+    internal suspend fun qrStart(approval: QrTransferApproval): QrJoinSession? = startQrJoiner(approval)
+    internal fun cancelQrJoiner(session: QrJoinSession) { session.operation.cancel() }
+
+    private suspend fun startQrJoiner(approval: QrTransferApproval?): QrJoinSession? {
+        if (approval?.isCurrent() == false) return null
         val operation = beginAuthOperation()
         val ephemeral = VortXPairingCrypto.newEphemeral()
         val permit = operation.acquireCallPermit() ?: return null
@@ -1366,7 +1441,7 @@ class VortXSyncManager(context: Context) {
             body = JSONObject().put("devicePublicKey", ephemeral.publicKeyBase64URL),
             callPermit = permit,
         )
-        if (!operation.isCurrent() || status != 200) return null
+        if (!operation.isCurrent() || approval?.isCurrent() == false || status != 200) return null
         val pairingID = json?.optString("pairingID")?.takeIf { it.isNotBlank() } ?: return null
         val code = json.optString("code").takeIf { it.isNotBlank() } ?: return null
         return QrJoinSession(
@@ -1375,11 +1450,13 @@ class VortXSyncManager(context: Context) {
             devicePublicKey = ephemeral.publicKeyBase64URL,
             ephemeralPrivateKey = ephemeral.privateKey,
             operation = operation,
+            transferApproval = approval,
         )
     }
 
     /** Poll once, adopting only after the approved payload decrypts to a valid 32-byte data key. */
     suspend fun qrPoll(session: QrJoinSession): QrJoinResult {
+        if (session.transferApproval?.isCurrent() == false) return QrJoinResult.Failed
         val statusPermit = session.operation.acquireCallPermit() ?: return QrJoinResult.Failed
         val encodedID = URLEncoder.encode(session.pairingID, Charsets.UTF_8.name())
         val (status, json) = request(
@@ -1412,7 +1489,19 @@ class VortXSyncManager(context: Context) {
         if (!session.operation.isCurrent()) return QrJoinResult.Failed
         val account = meJson?.optJSONObject("account")
         if (meStatus != 200 || account == null) return QrJoinResult.Failed
-        return when (adopt(session.operation, token.orEmpty(), account, dataKey)) {
+        fun accept(): SessionAdoption = adopt(session.operation, token.orEmpty(), account, dataKey,
+            deferAutomaticSync = session.transferApproval != null,
+            admission = {
+                if (session.consumed || session.transferApproval?.isCurrent() == false) false
+                else { session.consumed = true; true }
+            })
+        val adoption = session.transferApproval?.let { it.admit(::accept) ?: SessionAdoption.STALE } ?: accept()
+        if (adoption == SessionAdoption.ADOPTED && session.transferApproval != null) {
+            // retire() enqueues the old native projection's clear on Main. Drain that earlier
+            // publication before the controller captures a fresh profile witness for this account.
+            withContext(Dispatchers.Main) { kotlinx.coroutines.yield() }
+        }
+        return when (adoption) {
             SessionAdoption.ADOPTED -> QrJoinResult.SignedIn(account.optString("email"))
             SessionAdoption.STALE,
             SessionAdoption.STORAGE_FAILURE,
@@ -1482,6 +1571,7 @@ class VortXSyncManager(context: Context) {
     /** Sign out only after the encrypted session clear succeeds. */
     fun signOut(): Boolean {
         var retained: RetainedSessionWork? = null
+        var retiredTransfer: SyncTransferCapability? = null
         val cleared = operations.invalidate {
             retained = operations.snapshot { operationGeneration ->
                 sessionState.serialized {
@@ -1498,14 +1588,18 @@ class VortXSyncManager(context: Context) {
             }
             cancelSessionWork()
             sessionState.clear {
+                retiredTransfer = syncAdmission.transfer
+                advanceSyncAdmission(null)
                 bindLibraryAccount(null)
                 AddonTombstones.activateAccount(null)
                 AddonPrefsStore.activateAccount(null)
                 _account.value = null
                 _sessionUiState.value = SessionUiState.SignedOut
+                _transferPending.value = false
                 nativeGateway?.retire()
             }
         }
+        retiredTransfer?.profile?.retire()
         if (!cleared) {
             resumeRetainedSessionWork(retained)
             return false
@@ -1540,6 +1634,7 @@ class VortXSyncManager(context: Context) {
         AddonPrefsStore.activateAccount(testSession.account.id)
         _account.value = testSession.account
         _sessionUiState.value = SessionUiState.SignedIn(testSession.account)
+        _transferPending.value = syncState.transferPending(testSession.account.id)
         syncState.setLastVersion(testSession.account.id, highWaterVersion)
         requestTestSeam = transport
         versionedPayloadTestObserver = onVersionedPayloadApply
@@ -1547,9 +1642,30 @@ class VortXSyncManager(context: Context) {
         }
     }
 
+    internal fun installSignedOutAuthTestSeam(transport: SyncRequestTestSeam) {
+        operations.invalidate {
+            sessionState.restore(null)
+            sessionRestoreTestSeam = SessionLoad.Available(null, sessionState.ownerEpoch)
+            _account.value = null
+            _sessionUiState.value = SessionUiState.SignedOut
+            _transferPending.value = false
+            requestTestSeam = transport
+        }
+    }
+
     /** Narrow regression seam for final native-dispatch admission; production replacements use the same coordinator. */
     internal fun captureSyncLeaseAdmissionTestSeam(): ((() -> Boolean) -> Boolean)? =
         captureSyncLease()?.let(::syncLeaseAdmission)
+
+    /** Exposes the actual registered permit/request path, not a second test-only admission policy. */
+    internal fun captureOutboundPermitTestSeam(): SessionOperationCoordinator.OutboundCallPermit? =
+        captureSyncLease()?.let(::acquireSyncCallPermit)
+    internal suspend fun dispatchOutboundPermitTestSeam(permit: SessionOperationCoordinator.OutboundCallPermit): Int =
+        request("PUT", "/v1/backup", JSONObject().put("fixture", true), callPermit = permit).first
+    internal fun installTransferNativeMutationTestSeam(beforeAdmission: (String) -> Unit) {
+        transferNativeMutationTestSeam = beforeAdmission
+    }
+    internal fun installRealtimeStartTestSeam(start: () -> Unit) { realtimeStartTestSeam = start }
 
     /** Capture invocation ownership even while signed out; a queued action cannot adopt a later session. */
     internal fun captureLocalLibraryMutationAdmission(): ((() -> Boolean) -> Boolean)? =
@@ -1890,13 +2006,16 @@ class VortXSyncManager(context: Context) {
         return synced && isSyncLeaseCurrent(lease)
     }
 
-    private suspend fun nativeSyncDown(lease: SyncSessionLease): Boolean {
+    private suspend fun nativeSyncDown(lease: SyncSessionLease, allowEmptySeed: Boolean = true): Boolean {
         val gateway = nativeGateway ?: return false
         val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
         // Local availability is independent of network availability. The lease came from verified
         // secure session persistence; the encrypted locator supplies the historical owner, never
         // the unscoped device roster. Failed/corrupt recovery is not permission to create an account.
-        val reopened = try { gateway.reopenCheckpoint(account) { isSyncLeaseCurrent(lease) } }
+        val reopened = try {
+            transferProjection(lease)?.let { gateway.reopenTransferCheckpoint(account, { isSyncLeaseCurrent(lease) }, it) }
+                ?: gateway.reopenCheckpoint(account) { isSyncLeaseCurrent(lease) }
+        }
         catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
         catch (_: Exception) { return false }
         if (reopened && !applyNativeHostSettings(lease, gateway.exportDocument(account))) return false
@@ -1906,12 +2025,12 @@ class VortXSyncManager(context: Context) {
         if (retryPendingPushBeforePull(lease)) return false
         val pulled = pullSyncDocResult(lease)
         if (pulled == SyncDocPull.Empty) {
-            return nativeSyncUp(lease)
+            return allowEmptySeed && nativeSyncUp(lease)
         }
         val pull = pulled as? SyncDocPull.Doc ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
         if (retryPendingPushBeforePull(lease)) return false
-        val applied = try { gateway.applyDocument(account, pull.doc) { isSyncLeaseCurrent(lease) } }
+        val applied = try { applyNativeDocument(gateway, lease, pull.doc) }
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
         if (!applied) return false
@@ -1941,9 +2060,36 @@ class VortXSyncManager(context: Context) {
             val result = if (profileStore != null) profileStore.withoutNativePreferenceCapture { apply() } else apply()
             // Re-project profile-owned flat keys only after releasing the auth lock. Remote global
             // settings must not mint local profile edits or introduce auth-lock/runtime-lock inversion.
-            if (result && profileStore != null && previousSettings != settingsPrefs.all && isSyncLeaseCurrent(lease)) profileStore.refreshNativeProjection(forceSettings = true)
+            if (result && profileStore != null && previousSettings != settingsPrefs.all && isSyncLeaseCurrent(lease)) {
+                val projection = transferProjection(lease)
+                if (projection != null) return@withContext projection.publish { profileStore.refreshNativeProjection(forceSettings = true) }
+                profileStore.refreshNativeProjection(forceSettings = true)
+            }
             result
         }
+    }
+
+    private fun transferProjection(lease: SyncSessionLease): NativeTransferProjection? = lease.transfer?.let { capability ->
+        object : NativeTransferProjection {
+            override fun publish(projection: () -> Unit): Boolean = capability.profile.project({ isSyncLeaseCurrent(lease) }, projection)
+            override fun commit(mutation: () -> Unit): Boolean = com.vortx.android.profile.ContinueWatchingOwnerGate.serialized {
+                if (!isSyncLeaseCurrent(lease)) false else { mutation(); isSyncLeaseCurrent(lease) }
+            }
+        }
+    }
+
+    private suspend fun applyNativeDocument(gateway: NativeAccountGateway, lease: SyncSessionLease, document: JSONObject): Boolean {
+        val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
+        val projection = transferProjection(lease)
+        return if (projection == null) gateway.applyDocument(account, document) { isSyncLeaseCurrent(lease) }
+        else gateway.applyTransferDocument(account, document, { isSyncLeaseCurrent(lease) }, projection)
+    }
+
+    private fun mutateNativeTransfer(lease: SyncSessionLease, kind: String, mutation: () -> Boolean): Boolean {
+        val admission = transferProjection(lease) ?: return mutation()
+        transferNativeMutationTestSeam?.invoke(kind)
+        var accepted = false
+        return admission.commit { accepted = mutation() } && accepted
     }
 
     private suspend fun nativeSyncUp(lease: SyncSessionLease): Boolean {
@@ -1969,7 +2115,11 @@ class VortXSyncManager(context: Context) {
             val baseVersion = (pulled as? SyncDocPull.Doc)?.version
             val document = when (pulled) {
                 is SyncDocPull.Doc -> pulled.doc
-                SyncDocPull.Empty -> gateway.prepareEmptyAccount(account) { isSyncLeaseCurrent(lease) } ?: return null
+                SyncDocPull.Empty -> {
+                    val projection = transferProjection(lease)
+                    (if (projection == null) gateway.prepareEmptyAccount(account) { isSyncLeaseCurrent(lease) }
+                    else gateway.prepareTransferEmptyAccount(account, { isSyncLeaseCurrent(lease) }, projection)) ?: return null
+                }
                 SyncDocPull.Failed -> return null
             }
             if (seed) {
@@ -1979,8 +2129,8 @@ class VortXSyncManager(context: Context) {
                 pushedProviders = null
                 return DerivedBackup(document, null)
             }
-            if (!gateway.applyDocument(account, document) { isSyncLeaseCurrent(lease) }) return null
-            if (globals.length() > 0 && !gateway.recordGlobalPreferences(account, globals)) return null
+            if (!applyNativeDocument(gateway, lease, document)) return null
+            if (globals.length() > 0 && !mutateNativeTransfer(lease, "record-globals") { gateway.recordGlobalPreferences(account, globals) }) return null
             val exported = gateway.exportDocument(account) ?: return null
             if (exported.hostProfileSyncPending) return null
             if (!isSyncLeaseCurrent(lease)) return null
@@ -2004,7 +2154,7 @@ class VortXSyncManager(context: Context) {
             // outcome must re-pull; never escalate a stale-empty candidate to epoch milliseconds.
             when (pushSyncDocAt(lease, first.document, 0)) {
                 is PushOutcome.Accepted -> {
-                    if (!gateway.applyDocument(account, first.document) { isSyncLeaseCurrent(lease) }) return false
+                    if (!applyNativeDocument(gateway, lease, first.document)) return false
                     if (pushedStamps.isNotEmpty() || com.vortx.android.integrations.NativeProviderAccess.hasPending(account) != false) return false
                     true
                 }
@@ -2018,7 +2168,7 @@ class VortXSyncManager(context: Context) {
         if (!pushed) return false
         // Only acknowledge the exact carrier accepted by the server. A local edit during the PUT
         // has a different register event and remains pending, including after a cold restart.
-        pushedPreferences?.let { if (!gateway.acknowledgeHostPreferences(account, it)) return false }
+        pushedPreferences?.let { if (!mutateNativeTransfer(lease, "acknowledge-host") { gateway.acknowledgeHostPreferences(account, it) }) return false }
         pushedProviders?.let { sent ->
             var acknowledged = false
             if (!publishIfSyncLeaseCurrent(lease) { acknowledged = com.vortx.android.integrations.NativeProviderAccess.acknowledge(account, sent) } || !acknowledged) return false
@@ -2338,9 +2488,10 @@ class VortXSyncManager(context: Context) {
     private suspend fun syncDown(
         lease: SyncSessionLease,
         force: Boolean = false,
+        allowEmptySeed: Boolean = true,
     ): Boolean {
         if (!isSyncLeaseCurrent(lease)) return false
-        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return try { nativeSyncDown(lease) }
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return try { nativeSyncDown(lease, allowEmptySeed) }
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
         // PENDING-EDIT GUARD: restore a durable process-death marker and retry its push before any
@@ -2644,6 +2795,17 @@ class VortXSyncManager(context: Context) {
         lease: SyncSessionLease,
         recordEdit: Boolean,
     ): Boolean {
+        // Held automatic work cannot run, but a real local edit must retain its durable dirty marker.
+        // Do not attach a debounce/retry job to an explicit transfer lease, including Restore.
+        if (lease.transfer != null) return transferHasPendingChanges(lease)
+        val held = operations.snapshot { sessionState.serialized {
+            val same = sessionState.ownerEpoch == lease.ownerEpoch && sessionState.value?.account?.id == lease.accountId &&
+                sessionState.value?.token == lease.token && lease.syncAdmissionGeneration == syncAdmission.generation
+            val paused = same && (syncAdmission.transfer != null || syncState.transferPending(lease.accountId))
+            if (paused && recordEdit) syncState.setPendingPush(lease.accountId, true)
+            paused
+        } }
+        if (held) return true
         if (!isSyncLeaseCurrent(lease)) return false
         val owner = pendingOwner(lease)
         val proposedAttempt = PendingSyncAttempt(owner)
@@ -2719,8 +2881,10 @@ class VortXSyncManager(context: Context) {
      * to the fallback poll, never breaking the pull+debounced-push engine underneath.
      */
     fun startRealtime() {
-        captureSyncLease()?.let(::retryPendingPushBeforePull)
-        realtime.start()
+        val lease = captureSyncLease() ?: return
+        if (!isSyncLeaseCurrent(lease)) return
+        retryPendingPushBeforePull(lease)
+        realtimeStartTestSeam?.invoke() ?: realtime.start()
     }
 
     /** Close the real-time channel. Called on app-background and inside [signOut]. Safe to repeat. */
@@ -2740,6 +2904,91 @@ class VortXSyncManager(context: Context) {
 
     /** Does the account already hold synced data (so a sign-in is a merge), is it empty, or unreachable? */
     enum class AccountDataProbe { HAS_DATA, EMPTY, UNREACHABLE }
+
+    /** Explicit TV transfers retain one authenticated session across probe, choice and dispatch. */
+    internal fun captureAccountTransfer(): AccountTransferSession? {
+        val owner = sessionOwnerSnapshot() as? SessionOwnerSnapshot.Account ?: return null
+        val capability = com.vortx.android.profile.ContinueWatchingOwnerGate.serialized {
+            val witness = com.vortx.android.profile.ContinueWatchingOwnerGate.captureTransferWitness()
+            val next = operations.snapshot { sessionState.serialized {
+                if (sessionState.value?.account?.id != owner.id || sessionState.ownerEpoch != owner.generation) return@serialized null
+                val previous = syncAdmission.transfer
+                val result = SyncTransferCapability(owner.id, owner.generation, witness,
+                    previous?.resumeOnCancel ?: (realtime.isActive() && !syncState.transferPending(owner.id)))
+                advanceSyncAdmission(result)
+                previous?.profile?.retire()
+                cancelSessionWork()
+                result
+            } }
+            if (next == null) witness.retire()
+            next
+        } ?: return null
+        operations.cancelRetiredSessionCalls()
+        val lease = captureSyncLease(capability) ?: return null
+        return object : AccountTransferSession {
+            override fun isCurrent(): Boolean = isSyncLeaseCurrent(lease)
+            override fun hasPendingChanges(): Boolean = transferHasPendingChanges(lease)
+            override fun canKeepDevice(): Boolean = isCurrent() &&
+                (!com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED ||
+                    runCatching { nativeGateway?.exportDocument(SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)) != null }.getOrDefault(false))
+
+            override suspend fun probe(): AccountTransferSession.Probe {
+                if (!isCurrent()) return AccountTransferSession.Probe.UNAVAILABLE
+                // This read deliberately does not resume pending pushes or seed an empty account.
+                val result = pullSyncDocResult(lease)
+                if (!isCurrent()) return AccountTransferSession.Probe.UNAVAILABLE
+                return when (result) {
+                    is SyncDocPull.Doc -> if (listOf("vortx", "settings", "apiKeys", "nativeSync", "nativeHostPreferences").any(result.doc::has))
+                        AccountTransferSession.Probe.HAS_DATA else AccountTransferSession.Probe.EMPTY
+                    SyncDocPull.Empty -> AccountTransferSession.Probe.EMPTY
+                    SyncDocPull.Failed -> AccountTransferSession.Probe.UNAVAILABLE
+                }
+            }
+
+            override suspend fun seed(): Boolean = canKeepDevice() && syncUp(lease) && isSyncLeaseCurrent(lease)
+            override suspend fun keepDevice(): Boolean = canKeepDevice() &&
+                (if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) syncUp(lease) else importThisDeviceLibraryAndPush(lease))
+            override suspend fun restore(): Boolean = isCurrent() &&
+                syncDown(lease, force = true, allowEmptySeed = false) && isSyncLeaseCurrent(lease)
+            override suspend fun merge(): Boolean {
+                if (!isCurrent()) return false
+                // Native push already reads/merges the authenticated remote document before export.
+                // Pending intent stays durable for the normal acknowledgement loop after completion.
+                if (hasPendingChanges() && com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return syncUp(lease)
+                if (!syncDown(lease, force = true, allowEmptySeed = false)) return false
+                if (!isSyncLeaseCurrent(lease)) return false
+                return syncUp(lease) && isSyncLeaseCurrent(lease)
+            }
+            override fun resumeSync(): Boolean = finishAccountTransfer(lease, complete = true)
+            override fun abandon() {
+                finishAccountTransfer(lease, complete = false)
+            }
+        }
+    }
+
+    private fun transferHasPendingChanges(lease: SyncSessionLease): Boolean =
+        syncState.hasPendingPush(lease.accountId) || readDirtySettings().isNotEmpty() ||
+            (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED &&
+                com.vortx.android.integrations.NativeProviderAccess.hasPending(SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)) != false)
+
+    private fun finishAccountTransfer(lease: SyncSessionLease, complete: Boolean): Boolean {
+        val capability = lease.transfer ?: return false
+        var finished = false
+        com.vortx.android.profile.ContinueWatchingOwnerGate.serialized {
+            operations.snapshot { sessionState.serialized finish@{
+                if (syncAdmission.transfer !== capability) return@finish
+                val ownerCurrent = sessionState.value?.account?.id == lease.accountId && sessionState.ownerEpoch == lease.ownerEpoch
+                if (complete && (!isSyncLeaseCurrent(lease) || !syncState.setTransferPending(lease.accountId, false))) return@finish
+                advanceSyncAdmission(null)
+                capability.profile.retire()
+                _transferPending.value = session?.account?.id?.let(syncState::transferPending) == true
+                finished = true
+                if (ownerCurrent && (complete || capability.resumeOnCancel) && !_transferPending.value) startRealtime()
+            } }
+        }
+        operations.cancelRetiredSessionCalls()
+        return finished
+    }
 
     suspend fun accountHasSyncData(): AccountDataProbe {
         val lease = captureSyncLease() ?: return AccountDataProbe.UNREACHABLE
@@ -2801,6 +3050,11 @@ class VortXSyncManager(context: Context) {
     /** Explicit Keep device choice only. Sync now, automatic empty seeding, and Merge both never grant. */
     suspend fun importThisDeviceLibraryAndPush(): Boolean {
         val lease = captureSyncLease() ?: return false
+        return importThisDeviceLibraryAndPush(lease)
+    }
+
+    private suspend fun importThisDeviceLibraryAndPush(lease: SyncSessionLease): Boolean {
+        if (!isSyncLeaseCurrent(lease)) return false
         val gateway = libraryGateway ?: return false
         val nativeLease = gateway.captureAccountLibraryLease() ?: return false
         val native = gateway.nativeLibraryOwner(nativeLease) ?: return false
@@ -2849,6 +3103,8 @@ class VortXSyncManager(context: Context) {
         token: String,
         acct: JSONObject,
         dataKey: ByteArray,
+        deferAutomaticSync: Boolean = false,
+        admission: () -> Boolean = { true },
     ): SessionAdoption {
         val account = Account(
             id = acct.optString("id"),
@@ -2857,25 +3113,38 @@ class VortXSyncManager(context: Context) {
             twoFactorEnabled = acct.optBoolean("twoFactorEnabled", false),
         )
         val s = Session(token, account, dataKey)
+        var retiredTransfer: SyncTransferCapability? = null
         val adoption = when (
             val result = operation.commitSessionMutation(
                 onCommitted = ::cancelSessionWork,
+                admission = admission,
             ) {
-                sessionState.replace(s) {
+                val previouslyPending = syncState.transferPending(account.id)
+                if (!syncState.setTransferPending(account.id, deferAutomaticSync)) return@commitSessionMutation false
+                val replaced = sessionState.replace(s) {
+                    retiredTransfer = syncAdmission.transfer
+                    advanceSyncAdmission(null)
                     nativeGateway?.retire()
                     bindLibraryAccount(account.id)
                     AddonTombstones.activateAccount(account.id)
                     AddonPrefsStore.activateAccount(account.id)
                     _account.value = account
                     _sessionUiState.value = SessionUiState.SignedIn(account)
+                    _transferPending.value = deferAutomaticSync
                 }
+                if (!replaced) {
+                    syncState.setTransferPending(account.id, previouslyPending)
+                    _transferPending.value = session?.account?.id?.let(syncState::transferPending) == true
+                }
+                replaced
             }
         ) {
             is SessionMutationResult.Applied ->
                 if (result.value) SessionAdoption.ADOPTED else SessionAdoption.STORAGE_FAILURE
             SessionMutationResult.Stale -> SessionAdoption.STALE
         }
-        if (adoption == SessionAdoption.ADOPTED) {
+        retiredTransfer?.profile?.retire()
+        if (adoption == SessionAdoption.ADOPTED && !deferAutomaticSync) {
             captureSyncLease()
                 ?.takeIf { it.accountId == account.id && it.token == token }
                 ?.let { armPendingSync(it, recordEdit = false) }
@@ -3073,6 +3342,9 @@ class VortXSyncManager(context: Context) {
             appContext.getSharedPreferences(STATE_FILE, Context.MODE_PRIVATE)
 
         fun lastVersion(accountId: String): Long = prefs.getLong(KEY_VERSION + accountId, 0L)
+        fun transferPending(accountId: String): Boolean = prefs.getBoolean("explicitTransferPending.$accountId", false)
+        fun setTransferPending(accountId: String, pending: Boolean): Boolean =
+            prefs.edit().putBoolean("explicitTransferPending.$accountId", pending).commit()
         fun setLastVersion(accountId: String, version: Long) {
             prefs.edit().putLong(KEY_VERSION + accountId, version).apply()
         }

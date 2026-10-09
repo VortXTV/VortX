@@ -1,5 +1,6 @@
 package com.vortx.android.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -41,12 +42,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.vortx.android.BuildConfig
 import com.vortx.android.VortXApplication
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
-import com.vortx.android.ui.components.Chip
+import com.vortx.android.ui.screens.profiles.ProfileChip as Chip
 import com.vortx.android.ui.screens.profiles.ProfileAccentSection
 import com.vortx.android.ui.screens.profiles.ProfileBackgroundSection
 import com.vortx.android.ui.screens.profiles.ProfileCustomAvatarField
@@ -54,6 +57,10 @@ import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
+import com.vortx.android.ui.tv.LocalTvProfilePresentation
+import com.vortx.android.ui.tv.profileFocusTarget
+import com.vortx.android.ui.tv.profilePageFocus
+import com.vortx.android.ui.tv.TvPinGate
 
 /// Settings > Profiles: the "Who's watching?" switcher plus create / rename / delete, the Android port of
 /// the Apple `ProfilePickerView` + `ProfileEditorView` (`app/SourcesShared/ProfilesView.swift`).
@@ -83,6 +90,7 @@ import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
+    BackHandler(onBack = onBack)
     val nativeModel: NativeStreamingAccountViewModel? = if (BuildConfig.NATIVE_ENGINE_ENABLED) {
         val app = LocalContext.current.applicationContext as? VortXApplication
         val accounts = remember(app) { runCatching { app?.nativeStreamingAccounts() }.getOrNull() }
@@ -170,13 +178,13 @@ fun ProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
         return
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
+    Box(modifier = modifier.fillMaxSize().profilePageFocus()) {
         Scaffold(
             topBar = {
                 TopAppBar(
                     title = { Text("Profiles", style = VortXTheme.type.cardTitle) },
                     navigationIcon = {
-                        IconButton(onClick = onBack) { Icon(VortXIcons.back, contentDescription = "Back") }
+                        IconButton(onClick = onBack, modifier = Modifier.profileFocusTarget()) { Icon(VortXIcons.back, contentDescription = "Back") }
                     },
                 )
             },
@@ -270,9 +278,9 @@ private fun NativeStreamingSetup(state: NativeStreamingAccountViewModel.State, p
                                  retry: () -> Unit, cancel: () -> Unit,
                                  onBack: () -> Unit, modifier: Modifier) {
     var pinTarget by remember { mutableStateOf<NativeStreamingAccountViewModel.Prepared?>(null) }
-    Box(modifier.fillMaxSize()) {
+    Box(modifier.fillMaxSize().profilePageFocus()) {
         Scaffold(topBar = { TopAppBar(title = { Text("Set up profile accounts") },
-            navigationIcon = { IconButton(onClick = onBack) { Icon(VortXIcons.back, "Back") } }) }) { padding ->
+            navigationIcon = { IconButton(onClick = onBack, modifier = Modifier.profileFocusTarget()) { Icon(VortXIcons.back, "Back") } }) }) { padding ->
             Column(Modifier.fillMaxSize().padding(padding).padding(VortXTheme.spacing.edge).verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
                 Text(if (state.migration != null) "Authenticated setup is preserved securely. Episode metadata, profile sign-ins, or Watchlist attribution may need attention; no blank replacement is created."
@@ -303,11 +311,12 @@ private fun NativeStreamingSetup(state: NativeStreamingAccountViewModel.State, p
 @Composable
 private fun NativeStreamingAccountForm(profile: UserProfile, state: NativeStreamingAccountViewModel.State,
                                        submit: (String, String) -> Unit, close: () -> Unit, modifier: Modifier) {
+    BackHandler(onBack = close)
     // Deliberately not rememberSaveable: passwords are never placed in Bundle/saved state.
     var email by remember(profile.id) { mutableStateOf("") }
     var password by remember(profile.id) { mutableStateOf("") }
-    Scaffold(modifier, topBar = { TopAppBar(title = { Text("Sign in for ${profile.name}") },
-        navigationIcon = { IconButton(onClick = { password = ""; close() }) { Icon(VortXIcons.close, "Cancel") } }) }) { padding ->
+    Scaffold(modifier.profilePageFocus(), topBar = { TopAppBar(title = { Text("Sign in for ${profile.name}") },
+        navigationIcon = { IconButton(onClick = { password = ""; close() }, modifier = Modifier.profileFocusTarget()) { Icon(VortXIcons.close, "Cancel") } }) }) { padding ->
         Column(Modifier.fillMaxSize().padding(padding).padding(VortXTheme.spacing.edge).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md)) {
             Text("Use this profile's Stremio account. Its identity is verified before any library is imported. This does not sign the VortX owner into a different account.", style = VortXTheme.type.body)
@@ -338,10 +347,11 @@ private fun ProfileRow(profile: UserProfile, isActive: Boolean, onClick: () -> U
         if (profile.isKids) add("Kids")
         if (profile.hasPin) add("Locked")
     }
-    val subtitle = (marks + (if (isActive) "tap to edit" else "tap to switch")).joinToString("  ·  ")
+    val subtitle = (marks + (if (isActive) "select to edit" else "select to switch")).joinToString("  ·  ")
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .profileFocusTarget()
             .clickable(role = Role.Button, onClick = onClick)
             .padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.xs),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
@@ -422,6 +432,7 @@ private fun AddProfileRow(onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .profileFocusTarget()
             .clickable(role = Role.Button, onClick = onClick)
             .padding(horizontal = VortXTheme.spacing.sm, vertical = VortXTheme.spacing.sm),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
@@ -455,6 +466,7 @@ private fun ProfileEditor(
     onCancel: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    BackHandler(onBack = onCancel)
     var name by remember { mutableStateOf(original.name) }
     var avatar by remember { mutableStateOf(original.avatar) }
     // "Type your own" avatar text is hoisted so tapping a grid emoji clears it (Apple sets customAvatar = "").
@@ -503,14 +515,14 @@ private fun ProfileEditor(
     }
 
     Scaffold(
-        modifier = modifier,
+        modifier = modifier.profilePageFocus(),
         topBar = {
             TopAppBar(
                 title = {
                     Text(if (isNew) "New profile" else "Edit ${original.name}", style = VortXTheme.type.cardTitle)
                 },
                 navigationIcon = {
-                    IconButton(onClick = onCancel) { Icon(VortXIcons.close, contentDescription = "Cancel") }
+                    IconButton(onClick = onCancel, modifier = Modifier.profileFocusTarget()) { Icon(VortXIcons.close, contentDescription = "Cancel") }
                 },
             )
         },
@@ -568,7 +580,10 @@ private fun ProfileEditor(
                         null
                     },
                 ) {
-                    ToggleRow(
+                    if (LocalTvProfilePresentation.current) {
+                        Chip(label = if (isKids) "Kids profile: on" else "Kids profile: off", selected = isKids,
+                            onClick = { isKids = !isKids }, modifier = Modifier.fillMaxWidth())
+                    } else ToggleRow(
                         label = "Kids profile",
                         detail = "Parental content guard for this profile.",
                         checked = isKids,
@@ -595,6 +610,7 @@ private fun ProfileEditor(
                     },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    visualTransformation = PasswordVisualTransformation(),
                     placeholder = {
                         Text(
                             if (original.hasPin) "PIN set. Enter a new one to change it" else "4 digits, empty for none",
@@ -698,6 +714,7 @@ private fun EditorButton(
     Box(
         modifier = modifier
             .fillMaxWidth()
+            .profileFocusTarget()
             .clip(CircleShape)
             .background(container)
             .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
@@ -714,6 +731,13 @@ private fun EditorButton(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun PinGateOverlay(profile: UserProfile, onUnlock: () -> Unit, onCancel: () -> Unit) {
+    BackHandler(onBack = onCancel)
+    if (LocalTvProfilePresentation.current) {
+        Dialog(onDismissRequest = onCancel, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            TvPinGate(profile, onUnlock, onCancel)
+        }
+        return
+    }
     val colors = VortXTheme.colors
     var input by remember { mutableStateOf("") }
     var wrong by remember { mutableStateOf(false) }
@@ -772,12 +796,12 @@ private fun PinGateOverlay(profile: UserProfile, onUnlock: () -> Unit, onCancel:
 @Composable
 private fun ProfilesUnavailable(onBack: () -> Unit, modifier: Modifier) {
     Scaffold(
-        modifier = modifier,
+        modifier = modifier.profilePageFocus(),
         topBar = {
             TopAppBar(
                 title = { Text("Profiles", style = VortXTheme.type.cardTitle) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(VortXIcons.back, contentDescription = "Back") }
+                    IconButton(onClick = onBack, modifier = Modifier.profileFocusTarget()) { Icon(VortXIcons.back, contentDescription = "Back") }
                 },
             )
         },

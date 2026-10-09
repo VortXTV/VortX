@@ -180,11 +180,13 @@ fun TvShell(
         if (destination !in destinations) onDestinationChange(TvDestination.HOME)
     }
 
-    // SD-8: Discover and Search gate on a sign-in. On TV the available signal is the engine's Stremio
-    // auth state (the VortX-primary sign-in surface is a separate TV parity item); a signed-out set sees
-    // the sign-in prompt on those two tabs instead of empty add-on results.
+    // Match the touch shell: either authenticated account admits Search and Discover.
     val authState by auth.authState.collectAsStateWithLifecycle()
-    val signedIn = authState is AuthState.SignedIn
+    val vortxSession by (syncManager?.sessionUiState?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf<VortXSyncManager.SessionUiState?>(null) })
+    val signedIn = tvBrowseSignedIn(authState, vortxSession)
+    val transferPending by (syncManager?.transferPending?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf(false) })
 
     // A single D-pad Back from any non-Home surface returns to Home rather than dropping out of the app --
     // the couch convention (and what a viewer expects after a deliberate tab move). Disabled on Home so the
@@ -219,7 +221,12 @@ fun TvShell(
                 if (dest == destination) reselectSignal++ else onDestinationChange(dest)
             },
             )
-            Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+            Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+            if (transferPending && destination != TvDestination.SETTINGS) {
+                TvFilterChip("Account sync paused — continue in Settings", selected = false,
+                    onClick = { onDestinationChange(TvDestination.SETTINGS) })
+            }
+            Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             // Only the selected destination's ViewModel is instantiated (lazily inside the branch); each is
             // retained in the Activity's ViewModelStore by its default class key, so switching tabs keeps a
             // surface's state (Home's live stream, a Search query) exactly as the phone shell does.
@@ -316,6 +323,8 @@ fun TvShell(
                 )
             }
             }
+        }
+
         }
 
         if (showPlayLinkSheet) {

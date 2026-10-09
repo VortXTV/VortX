@@ -50,6 +50,7 @@ import com.vortx.android.ui.viewmodel.VortXAccountFormState
 import com.vortx.android.ui.viewmodel.VortXAccountMode
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
 import com.vortx.android.ui.viewmodel.VortXQrJoinState
+import com.vortx.android.ui.tv.profileFocusTarget
 
 /// The VortX account screen (Settings > VortX Account): sign in / create / recover when signed out;
 /// account summary + Sync now + sign out when signed in. This is the surface that finally DRIVES
@@ -93,7 +94,7 @@ fun VortXAccountScreen(viewModel: VortXAccountViewModel, onBack: () -> Unit, mod
 /// owns the scroll and padding. Renders exactly one of: the one-time recovery code, the session-unavailable
 /// retry, the signed-out auth card (with the QR joiner), the reconcile question, or the signed-in card.
 @Composable
-fun VortXAccountContent(viewModel: VortXAccountViewModel, modifier: Modifier = Modifier) {
+fun VortXAccountContent(viewModel: VortXAccountViewModel, modifier: Modifier = Modifier, transferOnly: Boolean = false) {
     val sessionUiState by viewModel.sessionUiState.collectAsStateWithLifecycle()
     val recoveryCode by viewModel.recoveryCode.collectAsStateWithLifecycle()
     val showReconcile by viewModel.showReconcile.collectAsStateWithLifecycle()
@@ -114,9 +115,11 @@ fun VortXAccountContent(viewModel: VortXAccountViewModel, modifier: Modifier = M
             when (val session = sessionUiState) {
                 VortXSyncManager.SessionUiState.UnknownOrUnavailable ->
                     SessionUnavailableCard(viewModel::retrySessionRestore)
-                VortXSyncManager.SessionUiState.SignedOut -> AuthCard(viewModel)
+                VortXSyncManager.SessionUiState.SignedOut -> AuthCard(viewModel, qrOnly = transferOnly)
                 is VortXSyncManager.SessionUiState.SignedIn -> {
-                    if (showReconcile) {
+                    if (transferOnly) {
+                        Text("Account approved. Checking your saved data…", style = VortXTheme.type.body)
+                    } else if (showReconcile) {
                         ReconcileCard(viewModel)
                     } else {
                         SignedInCard(session.account, viewModel)
@@ -144,7 +147,7 @@ private fun SessionUnavailableCard(onRetry: () -> Unit) {
             PrimaryButton(
                 text = "Retry",
                 onClick = onRetry,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().profileFocusTarget(),
             )
         }
     }
@@ -216,6 +219,7 @@ private fun SignedInCard(account: VortXSyncManager.Account, viewModel: VortXAcco
     val colors = VortXTheme.colors
     val syncing by viewModel.syncing.collectAsStateWithLifecycle()
     val syncNotice by viewModel.syncNotice.collectAsStateWithLifecycle()
+    val transferPending by viewModel.transferPending.collectAsStateWithLifecycle()
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(VortXTheme.spacing.lg),
@@ -233,8 +237,9 @@ private fun SignedInCard(account: VortXSyncManager.Account, viewModel: VortXAcco
             }
             Text(account.email, style = VortXTheme.type.body.copy(color = colors.textSecondary))
             Text(
-                "Profiles and watch progress sync to your other devices automatically. " +
-                    "Everything is end-to-end encrypted.",
+                if (transferPending) "Backup or restore is waiting for your choice. Open Settings > Backup & Restore to continue, " +
+                    "or sign out below. Automatic sync is paused to preserve this device's data."
+                else "Profiles and watch progress sync to your other devices automatically. Everything is end-to-end encrypted.",
                 style = VortXTheme.type.body.copy(color = colors.textSecondary),
             )
             syncNotice?.let {
@@ -243,6 +248,7 @@ private fun SignedInCard(account: VortXSyncManager.Account, viewModel: VortXAcco
             PrimaryButton(
                 text = if (syncing) "Syncing…" else "Sync now",
                 onClick = viewModel::syncNow,
+                enabled = !transferPending,
                 loading = syncing,
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -254,7 +260,7 @@ private fun SignedInCard(account: VortXSyncManager.Account, viewModel: VortXAcco
 /// Signed-out: the mode switcher (Sign in / Create / Recover) over the active mode's fields. All
 /// three flows submit through the ONE primary button (§1 "One primary action").
 @Composable
-private fun AuthCard(viewModel: VortXAccountViewModel) {
+private fun AuthCard(viewModel: VortXAccountViewModel, qrOnly: Boolean = false) {
     val colors = VortXTheme.colors
     val mode by viewModel.mode.collectAsStateWithLifecycle()
     val login by viewModel.login.collectAsStateWithLifecycle()
@@ -272,6 +278,11 @@ private fun AuthCard(viewModel: VortXAccountViewModel) {
     }
     DisposableEffect(viewModel) {
         onDispose(viewModel::stopQrJoiner)
+    }
+
+    if (qrOnly) {
+        QrJoinerBlock(qrJoinState, viewModel::retryQrJoiner)
+        return
     }
 
     SurfaceCard(modifier = Modifier.fillMaxWidth()) {
@@ -477,6 +488,7 @@ private fun TextAction(text: String, onClick: () -> Unit, danger: Boolean = fals
         style = VortXTheme.type.body.copy(color = if (danger) colors.danger else colors.accent),
         modifier = Modifier
             .fillMaxWidth()
+            .profileFocusTarget()
             .clickable(onClick = onClick)
             .padding(vertical = VortXTheme.spacing.xs),
     )

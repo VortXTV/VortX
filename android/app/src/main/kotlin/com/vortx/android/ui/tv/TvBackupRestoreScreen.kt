@@ -17,7 +17,11 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.withFrameNanos
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
@@ -34,23 +38,12 @@ import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.VortXAccountViewModel
+import com.vortx.android.sync.AccountTransferDirection
+import com.vortx.android.sync.AccountTransferChoice
+import com.vortx.android.sync.AccountTransferStage
 
-/// The 10-foot Backup and Restore surface, the Android TV analogue of Apple
-/// `app/SourcesTV/BackupExportView.swift` + `BackupImportView.swift`. On a TV there is no D-pad-friendly file
-/// picker, so, exactly like the Apple TV, backup and restore ARE the VortX account QR pairing: this screen
-/// reuses the SAME [VortXAccountContent] joiner the Account route drives (over the app-process
-/// `VortXSyncManager`), which shows a scannable QR plus the short human-typable code the viewer enters at
-/// vortx.tv/approve on a signed-in phone or browser. Signing this TV in seeds the account from this device
-/// (export) or, when the account already holds data, restores that data onto this device (restore); the
-/// conflict is reconciled by the sync manager exactly as it is on Apple. The ~1 MB settings blob rides HTTPS
-/// through the sync doc; the QR only ever carries the pairing code plus an ephemeral public key, never a token
-/// (the account token lives only in the secure store and is never placed in a backup). When already signed in,
-/// the joiner instead shows the account summary with Sync now, the manual push-and-pull the phone drives.
-///
-/// It forks NO auth or backup path and sees no credential: every token touch stays inside
-/// [VortXAccountViewModel] and the sync manager's secure store. [vortxViewModel] is null when the process could
-/// not stand up a `VortXSyncManager` (a preview or a wiring failure); the screen then shows an honest note
-/// instead of a dead panel.
+/// Explicit transfer direction, with QR approval only when signed out. Account conflicts require a choice;
+/// the controller retains the authenticated owner through the check and transfer.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
 internal fun TvBackupRestoreScreen(
@@ -58,7 +51,13 @@ internal fun TvBackupRestoreScreen(
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    BackHandler { onBack() }
+    val transfer = vortxViewModel?.transferState?.collectAsStateWithLifecycle()?.value
+    fun back() {
+        if (transfer != null && transfer.stage != AccountTransferStage.IDLE) vortxViewModel?.cancelTransfer()
+        else onBack()
+    }
+    BackHandler { back() }
+    DisposableEffect(vortxViewModel) { onDispose { vortxViewModel?.cancelTransfer() } }
     val colors = VortXTheme.colors
     val backFocus = remember { FocusRequester() }
     Column(
@@ -68,22 +67,54 @@ internal fun TvBackupRestoreScreen(
             .padding(TvDimens.edge),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
     ) {
-        TvBackupBackButton(onClick = onBack, focusRequester = backFocus)
+        TvBackupBackButton(onClick = ::back, focusRequester = backFocus)
         Column(
             modifier = Modifier.widthIn(max = TvDimens.formMaxWidth),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
             Text("Backup and restore", style = VortXTheme.type.sectionTitle)
             Text(
-                "Back up and restore this TV by signing it into your VortX account. Scan the code below, or " +
-                    "enter it at vortx.tv/approve, on a phone or browser already signed in to VortX. Your " +
-                    "profiles, add-ons, library, and settings are stored in your account, end-to-end " +
-                    "encrypted, and restored on any device you sign in. Nothing is written to a file and your " +
-                    "account token never leaves this device.",
+                "Save this TV's profiles, add-ons, library, and settings to your encrypted VortX account, " +
+                    "or bring saved account data onto this TV. Choose a direction before approving a sign-in code.",
                 style = VortXTheme.type.label.copy(color = colors.textSecondary),
             )
-            if (vortxViewModel != null) {
-                VortXAccountContent(vortxViewModel, modifier = Modifier.fillMaxWidth())
+            if (vortxViewModel != null && transfer != null) {
+                when (transfer.stage) {
+                    AccountTransferStage.IDLE -> {
+                        TvTransferButton("Back up this TV", { vortxViewModel.beginTransfer(AccountTransferDirection.BACKUP) })
+                        TvTransferButton("Restore from account", { vortxViewModel.beginTransfer(AccountTransferDirection.RESTORE) })
+                    }
+                    AccountTransferStage.SIGN_IN -> CompositionLocalProvider(LocalTvProfilePresentation provides true) {
+                        VortXAccountContent(vortxViewModel, Modifier.fillMaxWidth(), transferOnly = true)
+                    }
+                    AccountTransferStage.CHECKING -> Text("Checking saved account data…", style = VortXTheme.type.body)
+                    AccountTransferStage.RUNNING -> Text("Transferring data…", style = VortXTheme.type.body)
+                    AccountTransferStage.CHOOSE -> {
+                        Text("This account already has saved data", style = VortXTheme.type.cardTitle)
+                        transfer.message?.let { Text(it, style = VortXTheme.type.body.copy(color = colors.danger)) }
+                        Text("Use account data restores saved data here. Merge both applies the shared account merge rules. " +
+                            "Neither action replaces another account's private data.", style = VortXTheme.type.body)
+                        if (!transfer.canKeepDevice) Text("Keep this device is unavailable: no local data is mounted for this account yet. " +
+                            "Choose Restore or Merge, or return to Account to sign out.", style = VortXTheme.type.body)
+                        val choices = if (transfer.direction == AccountTransferDirection.BACKUP)
+                            listOf(AccountTransferChoice.KEEP_DEVICE, AccountTransferChoice.MERGE, AccountTransferChoice.USE_ACCOUNT)
+                        else listOf(AccountTransferChoice.USE_ACCOUNT, AccountTransferChoice.MERGE, AccountTransferChoice.KEEP_DEVICE)
+                        choices.filter { it != AccountTransferChoice.KEEP_DEVICE || transfer.canKeepDevice }.forEach { choice ->
+                            TvTransferButton(when (choice) {
+                                AccountTransferChoice.KEEP_DEVICE -> "Keep this device"
+                                AccountTransferChoice.USE_ACCOUNT -> "Use account data"
+                                AccountTransferChoice.MERGE -> "Merge both"
+                            }, { vortxViewModel.chooseTransfer(choice) })
+                        }
+                    }
+                    AccountTransferStage.COMPLETE, AccountTransferStage.FAILED -> {
+                        transfer.message?.let { Text(it, style = VortXTheme.type.body) }
+                        if (transfer.stage == AccountTransferStage.FAILED) {
+                            TvTransferButton("Try again", { transfer.direction?.let(vortxViewModel::beginTransfer) })
+                        }
+                        TvTransferButton("Done", vortxViewModel::cancelTransfer)
+                    }
+                }
             } else {
                 Text(
                     "Backup to your account is unavailable right now. Try again after the app has finished " +
@@ -94,9 +125,24 @@ internal fun TvBackupRestoreScreen(
         }
     }
 
-    LaunchedEffect(Unit) {
-        runCatching { backFocus.requestFocus() }
+    LaunchedEffect(transfer?.stage) {
+        withFrameNanos { }
+        backFocus.requestFocus()
     }
+}
+
+@OptIn(ExperimentalTvMaterial3Api::class)
+@Composable
+private fun TvTransferButton(label: String, onClick: () -> Unit) {
+    val colors = VortXTheme.colors
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
+        colors = ClickableSurfaceDefaults.colors(containerColor = colors.surface2,
+            contentColor = colors.textPrimary, focusedContainerColor = colors.surface3),
+        border = ClickableSurfaceDefaults.border(focusedBorder = Border(BorderStroke(2.dp, colors.accentBright), shape = VortXShapes.control)),
+    ) { Text(label, style = VortXTheme.type.body, modifier = Modifier.padding(18.dp)) }
 }
 
 /// A focusable 10-foot Back affordance for the reused-phone-screen TV routes that render no back button of

@@ -3,6 +3,11 @@ package com.vortx.android.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vortx.android.sync.VortXSyncManager
+import com.vortx.android.sync.AccountTransferController
+import com.vortx.android.sync.AccountTransferDirection
+import com.vortx.android.sync.AccountTransferChoice
+import com.vortx.android.sync.AccountTransferStage
+import com.vortx.android.sync.QrTransferApproval
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -87,6 +92,37 @@ private fun urlEncode(value: String): String = URLEncoder.encode(value, Charsets
 /// logs -- the token and data key never leave the sync package.
 class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
+    private val transfer = AccountTransferController(sync::captureAccountTransfer)
+    val transferState = transfer.state
+    private var transferJob: Job? = null
+    private var transferApproval: QrTransferApproval? = null
+    private var qrSession: VortXSyncManager.QrJoinSession? = null
+    val transferPending = sync.transferPending
+
+    fun beginTransfer(direction: AccountTransferDirection) {
+        stopQrJoiner()
+        transferApproval?.retire()
+        transferApproval = if (account.value == null) QrTransferApproval() else null
+        transferJob?.cancel()
+        transfer.prepare(direction)
+        val token = transfer.requestToken
+        if (account.value != null) transferJob = viewModelScope.launch { transfer.authenticated(token) }
+    }
+
+    fun chooseTransfer(choice: AccountTransferChoice) {
+        if (transferState.value.stage != AccountTransferStage.CHOOSE) return
+        transferJob = viewModelScope.launch { transfer.choose(choice) }
+    }
+
+    fun cancelTransfer() {
+        stopQrJoiner()
+        transferApproval?.retire()
+        transferApproval = null
+        transferJob?.cancel()
+        transferJob = null
+        transfer.cancel()
+    }
+
     /// The signed-in VortX account (null when signed out), straight off the manager -- no local
     /// "am I signed in" flag, so a session restored at process start reflects immediately.
     val account: StateFlow<VortXSyncManager.Account?> = sync.account
@@ -164,7 +200,8 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     fun startQrJoiner() {
         if (qrJoinJob?.isActive == true || account.value != null) return
-        qrJoinJob = viewModelScope.launch { runQrJoiner() }
+        val transferToken = transfer.requestToken.takeIf { transferState.value.stage == AccountTransferStage.SIGN_IN }
+        qrJoinJob = viewModelScope.launch { runQrJoiner(transferToken) }
     }
 
     fun retryQrJoiner() {
@@ -173,6 +210,8 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     fun stopQrJoiner() {
+        qrSession?.let(sync::cancelQrJoiner)
+        qrSession = null
         qrJoinJob?.cancel()
         qrJoinJob = null
         if (_qrJoinState.value !is VortXQrJoinState.SignedIn) {
@@ -180,14 +219,19 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         }
     }
 
-    private suspend fun runQrJoiner() {
+    private suspend fun runQrJoiner(transferToken: Long?) {
         while (currentCoroutineContext().isActive) {
             _qrJoinState.value = VortXQrJoinState.Starting
-            val session = sync.qrStart()
+            val session = if (transferToken != null) transferApproval?.let { sync.qrStart(it) } else sync.qrStart()
             if (session == null) {
                 _qrJoinState.value = VortXQrJoinState.Failed
                 return
             }
+            if (transferToken != null && transferToken != transfer.requestToken) {
+                sync.cancelQrJoiner(session)
+                return
+            }
+            qrSession = session
             val mintedAt = System.currentTimeMillis()
             val reducer = QrJoinerReducer()
             val approvalUrl = vortxApprovalUrl(session.code, session.devicePublicKey)
@@ -217,8 +261,9 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
                         // Adoption updates sessionUiState immediately, which removes this QR composable.
                         // Detach the current job first so its onDispose does not cancel reconciliation.
                         qrJoinJob = null
+                        qrSession = null
                         _qrJoinState.value = VortXQrJoinState.SignedIn(action.email)
-                        onQrAuthed()
+                        onQrAuthed(transferToken)
                         return
                     }
                 }
@@ -228,6 +273,8 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
 
     /// Submit whichever flow [mode] is showing. One submit in flight at a time.
     fun submit() {
+        // Transfers deliberately use QR approval only; the ordinary password flows retain their defaults.
+        if (transferState.value.stage != AccountTransferStage.IDLE) return
         if (_formState.value == VortXAccountFormState.Submitting) return
         val error = validate()
         if (error != null) {
@@ -236,11 +283,12 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         }
         stopQrJoiner()
         _formState.value = VortXAccountFormState.Submitting
+        val transferToken = transfer.requestToken.takeIf { transferState.value.stage == AccountTransferStage.SIGN_IN }
         viewModelScope.launch {
             when (_mode.value) {
-                VortXAccountMode.SIGN_IN -> signIn()
-                VortXAccountMode.REGISTER -> register()
-                VortXAccountMode.RECOVER -> recover()
+                VortXAccountMode.SIGN_IN -> signIn(transferToken)
+                VortXAccountMode.REGISTER -> register(transferToken)
+                VortXAccountMode.RECOVER -> recover(transferToken)
             }
         }
     }
@@ -263,10 +311,10 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         return null
     }
 
-    private suspend fun signIn() {
+    private suspend fun signIn(transferToken: Long?) {
         val code = _totp.value.trim().takeIf { it.isNotEmpty() }
         when (val result = sync.signIn(_login.value.trim(), _password.value, code)) {
-            VortXSyncManager.AuthResult.Ok -> onAuthed()
+            VortXSyncManager.AuthResult.Ok -> onAuthed(transferToken)
             VortXSyncManager.AuthResult.TotpRequired -> {
                 // First time: reveal the 6-digit field. With a code already supplied it was wrong.
                 _formState.value = if (code == null) {
@@ -280,14 +328,14 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         }
     }
 
-    private suspend fun register() {
+    private suspend fun register(transferToken: Long?) {
         val result = sync.register(_login.value.trim(), _username.value.trim(), _password.value)
         result.recoveryCode?.let {
             _recoveryCode.value = it
             _password.value = ""
         }
         when (val auth = result.result) {
-            VortXSyncManager.AuthResult.Ok -> onAuthed()
+            VortXSyncManager.AuthResult.Ok -> onAuthed(transferToken)
             is VortXSyncManager.AuthResult.Failed -> {
                 if (result.recoveryCode != null) _mode.value = VortXAccountMode.SIGN_IN
                 _formState.value = VortXAccountFormState.Error(auth.message)
@@ -297,9 +345,9 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
         }
     }
 
-    private suspend fun recover() {
+    private suspend fun recover(transferToken: Long?) {
         when (val result = sync.recover(_login.value.trim(), _recoveryInput.value, _password.value)) {
-            VortXSyncManager.AuthResult.Ok -> onAuthed()
+            VortXSyncManager.AuthResult.Ok -> onAuthed(transferToken)
             is VortXSyncManager.AuthResult.Failed -> _formState.value = VortXAccountFormState.Error(result.message)
             VortXSyncManager.AuthResult.TotpRequired -> // recover never asks for TOTP; treat as failure
                 _formState.value = VortXAccountFormState.Error("Recovery failed.")
@@ -315,8 +363,12 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
      *  - UNREACHABLE: pushed nothing (a blip is never treated as a fresh account); realtime's guarded
      *    catch-up pull + poll retry until the doc is reachable.
      */
-    private suspend fun onAuthed() {
+    private suspend fun onAuthed(transferToken: Long?) {
         clearAuthInputs()
+        if (transferToken != null) {
+            transfer.authenticated(transferToken)
+            return
+        }
         when (sync.reconcileAfterSignIn()) {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> {
                 _syncNotice.value = null
@@ -331,8 +383,12 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     /** QR is a deliberate transfer from an already approved device, so hydrate it without a second prompt. */
-    private suspend fun onQrAuthed() {
+    private suspend fun onQrAuthed(transferToken: Long?) {
         clearAuthInputs()
+        if (transferToken != null) {
+            transfer.authenticated(transferToken)
+            return
+        }
         when (sync.reconcileAfterSignIn()) {
             VortXSyncManager.SignInReconcile.SEEDED_FROM_DEVICE -> _syncNotice.value = null
             VortXSyncManager.SignInReconcile.HAS_ACCOUNT_DATA -> sync.useAccountData()
@@ -403,7 +459,7 @@ class VortXAccountViewModel(private val sync: VortXSyncManager) : ViewModel() {
     }
 
     override fun onCleared() {
-        stopQrJoiner()
+        cancelTransfer()
         super.onCleared()
     }
 
