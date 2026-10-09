@@ -62,9 +62,16 @@ internal class AndroidNativePlaybackResolver(context: Context) : NativePlaybackR
     private val keys by lazy { DebridKeys(this.context) }
     private val resolver by lazy { DebridResolver(keys) }
     private val coordinator by lazy { DebridCoordinator(resolver = resolver, keys = keys, appContext = this.context,
-        usenetProviderStore = UsenetProviderStore(this.context, keys::ownerToken, keys::mutateCurrentOwner)) }
+        usenetProviderStore = UsenetProviderStore(this.context, keys::ownerToken, keys::mutateCurrentOwner), nativeUsenetEnabled = true) }
 
-    override suspend fun resolve(source: StreamSource, episode: Episode?): Playable {
+    override suspend fun resolve(source: StreamSource, episode: Episode?): Playable = resolve(source, episode, { true }, { true })
+
+    override suspend fun resolve(source: StreamSource, episode: Episode?, isCurrent: () -> Boolean): Playable =
+        resolve(source, episode, isCurrent, { true })
+
+    override suspend fun resolve(source: StreamSource, episode: Episode?, isCurrent: () -> Boolean,
+        playbackIsCurrent: () -> Boolean): Playable {
+        if (!isCurrent()) throw CancellationException("Playback owner changed")
         val direct = nativeDirectPlayable(source)
         val playable = when {
             direct != null -> direct
@@ -72,7 +79,9 @@ internal class AndroidNativePlaybackResolver(context: Context) : NativePlaybackR
                 val target = source.usenetResolveTarget(episode)
                 val result = try {
                     coordinator.resolvePlaybackRef(DebridCoordinator.DebridCandidate(nzbUrl = target.nzbUrl,
-                        usenetKnownHash = target.knownHash, fileMustInclude = target.fileMustInclude, fileIdx = target.fileIdx), target.episode)
+                        nzbUrls = target.nzbUrls, usenetServers = target.servers,
+                        usenetKnownHash = target.knownHash, fileMustInclude = target.fileMustInclude, fileIdx = target.fileIdx), target.episode,
+                        playbackIsCurrent = isCurrent, playbackLifetimeIsCurrent = playbackIsCurrent)
                 } catch (cancel: CancellationException) { throw cancel }
                 catch (error: Exception) { throw usenetPlaybackFailure(error) }
                     ?: throw usenetPlaybackFailure(DebridResolver.DebridException.NoKey)

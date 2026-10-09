@@ -259,7 +259,11 @@ internal data class UsenetResolveTarget(
     val fileMustInclude: String?,
     val episode: DebridResolver.Episode?,
     val fileIdx: Int?,
-)
+    val nzbUrls: List<String> = listOf(nzbUrl),
+    val servers: List<String> = emptyList(),
+) {
+    override fun toString(): String = "UsenetResolveTarget(<transient transport>)"
+}
 
 /** Bare-id native removal is allowed only when the carried media type uniquely identifies that id. */
 internal fun validateContinueWatchingRemovalTarget(
@@ -276,7 +280,9 @@ internal fun validateContinueWatchingRemovalTarget(
 internal fun StreamSource.usenetResolveTarget(
     selectedEpisode: Episode?,
 ): UsenetResolveTarget = UsenetResolveTarget(
-    nzbUrl = requireNotNull(nzbUrl) { "Usenet source is missing its NZB URL." },
+    nzbUrl = requireNotNull(usenetUrls.firstOrNull()) { "Usenet source is missing its NZB URL." },
+    nzbUrls = com.vortx.android.usenet.NativeNzbInputs.mirrors(nzbUrl, nzbUrls),
+    servers = com.vortx.android.usenet.NativeNzbInputs.servers(usenetServers),
     knownHash = usenetKnownHash,
     fileMustInclude = fileMustInclude,
     episode = selectedEpisode?.let {

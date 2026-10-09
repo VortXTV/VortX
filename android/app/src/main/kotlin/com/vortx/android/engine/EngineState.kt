@@ -1043,13 +1043,24 @@ internal object EngineState {
         val externalUrl = obj.optStringOrNull("externalUrl")
         val ytId = obj.optStringOrNull("ytId")
         val nzbUrl = obj.optStringOrNull("nzbUrl")
-        val fileIdx = if (obj.has("fileIdx") && !obj.isNull("fileIdx")) obj.optInt("fileIdx") else null
+        val nzbUrls = com.vortx.android.usenet.NativeNzbInputs.mirrors(nzbUrl,
+            com.vortx.android.usenet.NativeNzbInputs.strings(obj, "nzbUrls"))
+        val usenetServers = com.vortx.android.usenet.NativeNzbInputs.servers(
+            com.vortx.android.usenet.NativeNzbInputs.strings(obj, "servers"))
+        val fileIdx = if (obj.has("fileIdx") && !obj.isNull("fileIdx")) {
+            if (nzbUrls.isEmpty()) obj.optInt("fileIdx") else {
+                val number = obj.opt("fileIdx") as? Number ?: throw IllegalArgumentException("Invalid NZB file index")
+                val exact = try { java.math.BigDecimal(number.toString()).intValueExact() }
+                    catch (_: Exception) { throw IllegalArgumentException("Invalid NZB file index") }
+                require(exact >= 0) { "Invalid NZB file index" }; exact
+            }
+        } else null
         // isTorrent mirrors Apple `CoreStream.isTorrent` (`url == nil && infoHash != nil && nzbUrl ==
         // nil`) so a USENET stream (`.nzb`, no url) is classified as usenet, never torrent.
-        val isTorrent = url == null && infoHash != null && nzbUrl == null
+        val isTorrent = url == null && infoHash != null && nzbUrls.isEmpty()
         val behaviorHints = obj.optJSONObject("behaviorHints")
         // Stable id matching CoreStream.id: (url|externalUrl|infoHash|nzbUrl) + "#" + name + description.
-        val handle = url ?: externalUrl ?: infoHash ?: nzbUrl ?: "?"
+        val handle = url ?: externalUrl ?: nzbUrls.firstOrNull() ?: infoHash ?: "?"
         val name = obj.optStringOrNull("name")
         val description = obj.optStringOrNull("description")
         return StreamSource(
@@ -1065,6 +1076,8 @@ internal object EngineState {
             fileIdx = fileIdx,
             externalUrl = externalUrl,
             nzbUrl = nzbUrl,
+            nzbUrls = nzbUrls,
+            usenetServers = usenetServers,
             usenetKnownHash = parseUsenetKnownHash(obj),
             fileMustInclude = obj.optStringOrNull("fileMustInclude"),
             vortxProvider = obj.optStringOrNull("vortxProvider"),

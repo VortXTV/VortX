@@ -490,16 +490,21 @@ data class StreamSource(
     val externalSubtitleTracks: List<ExternalSubtitle> = emptyList(),
     /** Opaque repository-issued attribution. Never a credential or media URL. */
     val nativePlaybackToken: String? = null,
+    /** Ordered addon NZB mirrors and NNTP URLs. Transient only; may contain configured credentials. */
+    val nzbUrls: List<String> = emptyList(),
+    val usenetServers: List<String> = emptyList(),
 ) {
     override fun toString(): String =
-        "StreamSource(id=$id, addon=$addon, title=$title, url=${redactedTransportUrl(url)}, " +
+        "StreamSource(id=${if (isUsenet) "<usenet>" else id}, addon=$addon, title=$title, url=${redactedTransportUrl(url)}, " +
             "requestHeaderCount=${requestHeaders.size}, externalSubtitleCount=${externalSubtitleTracks.size})"
 
     /// A USENET stream: no direct [url] yet, but an `.nzb` link to resolve through a usenet-capable
     /// debrid account. Like a raw torrent, it needs resolution before it is playable. Kept mutually
     /// exclusive from [isTorrent] (which also requires `nzbUrl == null`) so a stream is classified as
     /// exactly one of torrent / usenet / direct. Mirrors Apple `CoreStream.isUsenet`.
-    val isUsenet: Boolean get() = url == null && !nzbUrl.isNullOrEmpty()
+    val isUsenet: Boolean get() = url == null && (!nzbUrl.isNullOrEmpty() || nzbUrls.isNotEmpty())
+
+    val usenetUrls: List<String> get() = (listOfNotNull(nzbUrl) + nzbUrls).distinct()
 
     /// A bare YouTube source ([ytId], no [url]/[infoHash]): a trailer/clip from a trailer add-on, not a
     /// full feature stream. Playable via the `/yt` route but excluded from quality ranking + auto-pick.
@@ -520,7 +525,7 @@ data class StreamSource(
     /// URL-construction half; the live resolve path applies its own debrid/torrent resolution.
     fun playableUrl(torBoxConfigured: Boolean, torrentsDisabled: Boolean = false): String? {
         url?.let { return it }
-        if (isUsenet && torBoxConfigured) nzbUrl?.let { return it }
+        if (isUsenet && torBoxConfigured) usenetUrls.firstOrNull()?.let { return it }
         if (!ytId.isNullOrEmpty()) return "$TRAILER_RESOLVER_BASE/yt/$ytId"
         if (torrentsDisabled) return null
         // Raw torrent: no local streaming-server loopback on Android (see the resolve path).

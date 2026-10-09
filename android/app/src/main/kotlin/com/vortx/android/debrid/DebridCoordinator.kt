@@ -10,7 +10,10 @@ import com.vortx.android.usenet.UsenetProviderCredentials
 import com.vortx.android.usenet.UsenetProviderFallbackPolicy
 import com.vortx.android.usenet.UsenetProviderRead
 import com.vortx.android.usenet.UsenetProviderStore
-import com.vortx.android.usenet.UsenetProgressiveSession
+import com.vortx.android.usenet.NativeNzbInputs
+import com.vortx.android.usenet.NativeNzbRouting
+import com.vortx.android.usenet.NativeNzbTransport
+import com.vortx.android.engine.VortxServer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -58,7 +61,13 @@ internal class DebridCoordinator(
     private val keys: DebridKeys,
     private val appContext: android.content.Context? = null,
     private val usenetProviderStore: UsenetProviderStore? = null,
+    private val nativeUsenetEnabled: Boolean = com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED,
+    nzbTransport: NativeNzbTransport? = null,
 ) {
+    private val nativeNzbTransport by lazy { nzbTransport ?: NativeNzbTransport(serverBase = {
+        val context = appContext ?: throw NativeNzbTransport.Unavailable()
+        VortxServer.awaitStartIfNeeded(context)
+    }) }
     /// Convenience: build the resolver + key store from the app context (the assembly/play layer already
     /// owns a [DebridResolver]; prefer sharing that via the primary constructor when possible).
     constructor(context: Context) : this(
@@ -109,7 +118,7 @@ internal class DebridCoordinator(
         /// The player opens it directly as a local file; it carries no provider reresolve id.
         val isNativeFile: Boolean = false,
         /** Live native NNTP producer. This is intentionally non-persisted and must be closed on stale/drop. */
-        val progressiveSession: UsenetProgressiveSession? = null,
+        val progressiveSession: AutoCloseable? = null,
     )
 
     /// A resolvable source the failover race operates on. The source-list assembly wave maps each ranked
@@ -134,7 +143,13 @@ internal class DebridCoordinator(
         val hasDirectUrl: Boolean = false,
         val source: StreamSource? = null,
         val confirmedCachedService: DebridService? = null,
-    )
+        val nzbUrls: List<String> = emptyList(),
+        val usenetServers: List<String> = emptyList(),
+    ) {
+        val usenetUrls: List<String> get() = (listOfNotNull(nzbUrl) + nzbUrls + source?.usenetUrls.orEmpty()).distinct()
+        val orderedUsenetServers: List<String> get() = if (usenetServers.isNotEmpty()) usenetServers else source?.usenetServers.orEmpty()
+        override fun toString(): String = "DebridCandidate(<transient source>)"
+    }
 
     /// A cache-check hit: which provider has the hash cached, plus the cached file list. Mirrors the Apple
     /// `cacheCheck` return `(service, files)`.
@@ -338,9 +353,48 @@ internal class DebridCoordinator(
         confirmedCachedHashes: Set<String>? = null,
         confirmedUsenetURLs: Set<String>? = null,
         expectedOwner: DebridOwnerToken? = null,
+        playbackIsCurrent: () -> Boolean = { true },
+        playbackLifetimeIsCurrent: () -> Boolean = { true },
     ): DebridPlaybackRef? {
         val owner = expectedOwner ?: keys.ownerToken() ?: return null
         if (!keys.isCurrent(owner)) return null
+        if (nativeUsenetEnabled && !candidate.hasDirectUrl && candidate.usenetUrls.isNotEmpty()) {
+            // This branch is exclusive: native mode never falls through to Kotlin NntpClient/ProgressiveSession.
+            val providerRead = usenetProviderStore?.snapshot(owner)
+            val providerRevision = when (providerRead) {
+                is UsenetProviderRead.Available -> providerRead.revision
+                is UsenetProviderRead.Missing -> providerRead.revision
+                is UsenetProviderRead.UnavailableOrCorrupt -> providerRead.revision
+                null -> null
+            }
+            val credentialsCurrent = {
+                keys.isCurrent(owner) &&
+                    (providerRevision == null || usenetProviderStore?.isCurrent(owner, providerRevision) == true)
+            }
+            val current = { playbackIsCurrent() && playbackLifetimeIsCurrent() && credentialsCurrent() }
+            val playbackCurrent = { playbackLifetimeIsCurrent() && credentialsCurrent() }
+            val result = NativeNzbRouting.resolve(
+                mirrors = candidate.usenetUrls,
+                addonServers = candidate.orderedUsenetServers,
+                savedServers = NativeNzbInputs.saved((providerRead as? UsenetProviderRead.Available)?.servers?.servers.orEmpty()),
+                confirmedCached = confirmedUsenetURLs,
+                torBoxConfigured = keys.isConfigured(DebridService.TOR_BOX, owner),
+                isCurrent = current,
+                local = { urls, providers ->
+                    nativeNzbTransport.create(urls, providers, timeoutMs = 24_000,
+                        selection = NativeNzbTransport.Selection(candidate.fileIdx, candidate.fileMustInclude, episode?.season, episode?.episode),
+                        playbackIsCurrent = playbackCurrent,
+                        isCurrent = current)
+                },
+                torBox = { url -> resolver.resolveUsenet(url, candidate.usenetKnownHash, candidate.fileMustInclude, candidate.fileIdx, episode, owner) },
+            ) ?: return null
+            if (!current()) {
+                result.lease.close()
+                throw CancellationException("Usenet playback owner changed")
+            }
+            return DebridPlaybackRef(result.url, DebridService.TOR_BOX, owner, "", null, null,
+                candidate.fileIdx, episode, isNativeFile = result.isLocal, progressiveSession = result.lease)
+        }
         // USENET first: saved native NNTP accounts are attempted in their explicit priority order, and only
         // after each has proven a usable progressive prefix do we return a local URL. TorBox cloud remains a
         // final fallback; a bare configured account never becomes a fake cache hit or a blank local URL.
@@ -527,8 +581,7 @@ internal class DebridCoordinator(
             if (c.hasDirectUrl) return@filter false
             val h = c.infoHash?.trim()?.lowercase()
             if (!h.isNullOrEmpty() && h in cachedHashes) return@filter true
-            val nzb = c.nzbUrl
-            if (!nzb.isNullOrEmpty() && nzb in cachedUsenetURLs) return@filter true
+            if (c.usenetUrls.any { it in cachedUsenetURLs }) return@filter true
             false
         }
         if (cached.isEmpty()) return null
@@ -546,8 +599,7 @@ internal class DebridCoordinator(
             if (best.url != null) return@let true // direct / debrid link resolves without an add-then-download
             val h = best.infoHash?.trim()?.lowercase()
             if (!h.isNullOrEmpty() && h in cachedHashes) return@let true
-            val nzb = best.nzbUrl
-            if (!nzb.isNullOrEmpty() && nzb in cachedUsenetURLs) return@let true
+            if (best.usenetUrls.any { it in cachedUsenetURLs }) return@let true
             false
         } ?: false
         fun acceptable(candidate: DebridCandidate): Boolean {

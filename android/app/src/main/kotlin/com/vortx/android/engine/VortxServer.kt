@@ -5,6 +5,14 @@ import android.util.Log
 import com.vortx.android.sources.SourcePreferencesStore
 import org.json.JSONObject
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /// The raw JNI surface to the OWN vortx-core IN-PROCESS STREAMING SERVER (the rqbit torrent
 /// server inside `libvortx_ffi.so`, built from the engine branch's `vortx-core/crates/ffi` cdylib
@@ -104,6 +112,21 @@ object VortxServer {
     @Volatile
     private var baseUrl: String? = null
 
+    @Volatile private var lifecycleGeneration = 0L
+    private val startup = VortxServerStartup()
+
+    /** Cancel only this waiter, never the process-owned JNI startup or another caller's service. */
+    internal suspend fun awaitStartIfNeeded(context: Context): String? {
+        val generation = lifecycleGeneration
+        val application = context.applicationContext
+        return startup.await(generation, { lifecycleGeneration }) {
+            // startIfNeeded/stop remain the sole serialized native handle authority.
+            synchronized(this) {
+                if (lifecycleGeneration != generation) null else startIfNeeded(application)
+            }
+        }
+    }
+
     /// One-shot warn guard so a persistently failing start logs once per process, not per play.
     @Volatile
     private var warnedStartFailed = false
@@ -155,6 +178,7 @@ object VortxServer {
     /// [startIfNeeded] starts a fresh server (new ephemeral port).
     @Synchronized
     fun stop() {
+        lifecycleGeneration++
         val current = handle
         handle = 0L
         baseUrl = null
@@ -165,5 +189,49 @@ object VortxServer {
         if (warnedStartFailed) return
         warnedStartFailed = true
         Log.w(TAG, message)
+    }
+}
+
+/** Shared non-cooperative startup, independently cancellable waiters, and bounded failure retry. */
+internal class VortxServerStartup(
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    private val nanoTime: () -> Long = System::nanoTime,
+) {
+    private class Flight(val generation: Long, val result: Deferred<String?>) {
+        var failed = false
+        var retryAt = 0L
+    }
+    private val gate = Any()
+    private var flight: Flight? = null
+
+    suspend fun await(generation: Long, currentGeneration: () -> Long, start: () -> String?): String? {
+        currentCoroutineContext().ensureActive()
+        if (currentGeneration() != generation) return null
+        val selected = synchronized(gate) {
+            val previous = flight
+            when {
+                previous != null && !previous.result.isCompleted -> previous
+                previous != null && previous.generation == generation &&
+                    (!previous.failed || nanoTime() < previous.retryAt) -> previous
+                else -> {
+                    lateinit var next: Flight
+                    val result = scope.async(start = CoroutineStart.LAZY) {
+                        val value = runCatching { if (currentGeneration() == generation) start() else null }.getOrNull()
+                        synchronized(gate) {
+                            next.failed = value == null
+                            next.retryAt = nanoTime() + 1_000_000_000L
+                        }
+                        value
+                    }
+                    next = Flight(generation, result)
+                    flight = next
+                    result.start()
+                    next
+                }
+            }
+        }
+        val result = selected.result.await()
+        currentCoroutineContext().ensureActive()
+        return if (selected.generation == generation && currentGeneration() == generation) result else null
     }
 }
