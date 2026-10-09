@@ -18,6 +18,16 @@
       "screenshotURLs": [],
       "versions": [
         {
+          "version": "0.5.0",
+          "buildVersion": "260",
+          "date": "2026-10-09",
+          "localizedDescription": "0.5 Beta 1: native VortX core, Cinema across Apple and Android, durable profiles and Watchlist/history, ordered add-ons, improved Usenet and seek recovery. Update every device; see release notes for known beta limits.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.5.0-beta.1/VortX-iOS-v0.5.0-beta.1-ci.ipa",
+          "size": 49917296,
+          "sha256": "83342ab8d8dc6be20d5b5e7157b22993a4346a6e5c9f5adc0642d7247612e9eb",
+          "minOSVersion": "16.0"
+        },
+        {
           "version": "0.4.0",
           "buildVersion": "259",
           "date": "2026-10-08",
@@ -86,16 +96,6 @@
           "size": 65500086,
           "sha256": "bc5d4af376778faea57e8d56983df7a1cd1954c00be0c2ea42af7fe1cc5d760b",
           "minOSVersion": "16.0"
-        },
-        {
-          "version": "0.4.0",
-          "buildVersion": "245",
-          "date": "2026-09-11",
-          "localizedDescription": "Apple build 245: playback recovery, add-on order and sync, artwork, prioritized Usenet and NZB indexers.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.12/VortX-iOS-v0.4.0-beta.12-ci.ipa",
-          "size": 65471776,
-          "sha256": "bcb72cd2c722dad64b624e8bf03c22b9e363810a8953c612e3bec846c6291e2a",
-          "minOSVersion": "16.0"
         }
       ]
     },
@@ -110,6 +110,16 @@
       "category": "entertainment",
       "screenshotURLs": [],
       "versions": [
+        {
+          "version": "0.5.0",
+          "buildVersion": "260",
+          "date": "2026-10-09",
+          "localizedDescription": "0.5 Beta 1: native VortX core, Cinema across Apple and Android, durable profiles and Watchlist/history, ordered add-ons, improved Usenet and seek recovery. Update every device; see release notes for known beta limits.",
+          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.5.0-beta.1/VortX-tvOS-v0.5.0-beta.1-ci.ipa",
+          "size": 48908742,
+          "sha256": "d278c40b9928b7ea13879c73198cb3cbcde04829f5538c6c9aec0e7bde4f111c",
+          "minOSVersion": "18.0"
+        },
         {
           "version": "0.4.0",
           "buildVersion": "259",
@@ -178,16 +188,6 @@
           "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.14/VortX-tvOS-v0.4.0-beta.14-ci.ipa",
           "size": 65060961,
           "sha256": "bade529bf77d30b5dbf769680769a0c2925e5f9f1679d21fb8a0a9ec1128318c",
-          "minOSVersion": "18.0"
-        },
-        {
-          "version": "0.4.0",
-          "buildVersion": "245",
-          "date": "2026-09-11",
-          "localizedDescription": "Apple build 245: playback recovery, add-on order and sync, artwork, prioritized Usenet and NZB indexers.",
-          "downloadURL": "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.12/VortX-tvOS-v0.4.0-beta.12-ci.ipa",
-          "size": 65031315,
-          "sha256": "5d33893b6d6a839b52919fb7083516d53e4c51686a00c5c7c71c21cd0b4c8bcc",
           "minOSVersion": "18.0"
         }
       ]
