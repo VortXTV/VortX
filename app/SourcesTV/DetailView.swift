@@ -31,6 +31,13 @@ struct DetailView: View {
     var initialVideoID: String? = nil
     var initialTraktSessionID: TraktSessionID? = nil
     var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+    /// Explicit catalog QuickView Watch only; ordinary Details and every CW route default off.
+    var autoPlayOnAppear = false
+    @EnvironmentObject private var account: StremioAccount
+    @State private var quickWatchSeriesConsumed = false
+    @State private var quickWatchSeriesTarget: TVQuickViewEpisodeTarget?
+    @State private var quickWatchSeriesInvalidated = false
+    @StateObject private var quickWatchOwner = TVQuickViewWatchOwner()
     @State private var resumeHintOpenedAt = Date()
     var client: AddonClient = AddonClient()   // kept for call-site compatibility (Search)
     @EnvironmentObject private var core: CoreBridge
@@ -113,6 +120,13 @@ struct DetailView: View {
         ResidentMeta.fenced(core.metaDetails?.meta, pageID: metaRequestID) { $0.id }
     }
 
+    /// Keep the explicit movie Watch child mounted while its IMDb placeholder hydrates. Ordinary
+    /// Details retains the established fallback branch below; no consumed Watch intent is rearmed.
+    private var quickWatchMoviePlaceholder: CoreMetaItem? {
+        guard autoPlayOnAppear, !LiveTypes.contains(type), type != "series", metaRequestID.hasPrefix("tt") else { return nil }
+        return CoreMetaItem.placeholder(id: metaRequestID, type: type, name: "")
+    }
+
     /// Navigation-carried Trakt state is private to the credential session that created it. Revalidate at
     /// every use because the detail page can remain mounted across sign-out or an account replacement.
     private var validInitialResumeSeconds: Double? {
@@ -137,7 +151,7 @@ struct DetailView: View {
 
     var body: some View {
         Group {
-            if let meta = fencedMeta {
+            if let meta = fencedMeta ?? quickWatchMoviePlaceholder {
                 // Live (tv / channel / events) gets its own stripped-down page BEFORE the movie
                 // fallback (today live falls through to moviePage): backdrop + name + a red LIVE
                 // badge + the channel source list, with NO VOD chrome: no trailer chip, no movie
@@ -218,6 +232,8 @@ struct DetailView: View {
             refreshLanguageChips()
         }
         .onDisappear {
+            if autoPlayOnAppear { quickWatchSeriesConsumed = true }
+            if autoPlayOnAppear, quickWatchSeriesTarget == nil, presenter.request == nil { quickWatchOwner.retire() }
             langChipsDebounce?.cancel()
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
             // user presses Back the NavigationStack pops but the bar can stay hidden at its scroll-
@@ -227,6 +243,12 @@ struct DetailView: View {
         // Re-dispatch streams under the AUTHORITATIVE meta.type once it arrives (Collections-hub fix): if the
         // hub's TMDB guess was wrong, meta.type corrects it and the request re-fires under the type add-ons use.
         .onChange(of: fencedMeta?.type) { loadMovieStreamsIfNeeded() }
+        .onChange(of: profiles.activeID) { _, _ in
+            if autoPlayOnAppear { quickWatchOwner.retire(); quickWatchSeriesInvalidated = true; quickWatchSeriesConsumed = true; quickWatchSeriesTarget = nil }
+        }
+        .onChange(of: account.credentialBoundaryGeneration) { _, _ in
+            if autoPlayOnAppear { quickWatchOwner.retire(); quickWatchSeriesInvalidated = true; quickWatchSeriesConsumed = true; quickWatchSeriesTarget = nil }
+        }
         .onChange(of: fencedMeta?.id) {
             captureHero()
             langChips = []; langChipsKey = ""   // new title: reset the language chips before recomputing
@@ -1076,6 +1098,24 @@ struct DetailView: View {
                 }
             }
         }
+        // Activate the same primary episode the visible Play/Resume control selected. This task does
+        // not select a new episode or source; episode playback owns the settled-source Watch request.
+        .task(id: primary?.video.id) {
+            guard autoPlayOnAppear, !quickWatchSeriesConsumed, !quickWatchSeriesInvalidated,
+                  !Task.isCancelled, !profiles.needsPicker, presenter.request == nil,
+                  initialContinueWatchingIntent == nil, initialTraktSessionID == nil,
+                  let primary, fencedMeta?.id == meta.id else { return }
+            quickWatchSeriesConsumed = true
+            quickWatchSeriesTarget = .init(meta: meta, video: primary.video, episodes: ordered,
+                                           resumeSeconds: primaryResumeSeconds)
+        }
+        .navigationDestination(item: $quickWatchSeriesTarget) { target in
+            if !quickWatchSeriesInvalidated {
+                CoreEpisodeStreams(meta: target.meta, video: target.video, season: target.video.season ?? 0,
+                    episodes: target.episodes, initialStartAtSeconds: target.resumeSeconds,
+                    autoPlayOnAppear: true, quickWatchOwner: quickWatchOwner)
+            }
+        }
         // Show-level watched rollup (issue #143): a series reads as watched once every AIRED, regular-season
         // episode is watched, so unaired episodes and Season 0 specials never hold a finished show back, and a
         // series whose episodes were MARKED (not played) still flips the poster badge even though the engine's
@@ -1161,6 +1201,8 @@ struct DetailView: View {
                                                initialStartAtSeconds: validInitialResumeSeconds,
                                                initialTraktSessionID: initialTraktSessionID,
                                                initialContinueWatchingIntent: initialContinueWatchingIntent,
+                                               autoPlayOnAppear: autoPlayOnAppear,
+                                               quickWatchOwner: quickWatchOwner,
                                                secondaryAction: hasFullTrailer(m) ? AnyView(trailerChip(m)) : nil,
                                                onDetailMove: { direction, region in
                                                    handleDetailMove(direction, from: region, using: proxy)
@@ -1606,6 +1648,7 @@ struct DetailView: View {
     /// but every request now carries `trailerYouTubeID` so a dead load can be rescued by the YouTube
     /// app inside TVPlayerView instead of dead-ending on "Trailer unavailable".
     @MainActor private func playFullTrailerInApp(_ m: CoreMetaItem) async {
+        if autoPlayOnAppear { quickWatchOwner.retire() }
         // #95: the YouTube id the player hands to the YouTube app if the in-app load dies. The D11
         // language-preferred pick when the YouTube path resolves one; the meta's default id when a
         // direct (non-YouTube) stream short-circuits the resolve below.
@@ -1639,6 +1682,7 @@ struct DetailView: View {
     /// (whose own dead-end still ends at the "Trailer unavailable" note), so the action never
     /// silently does nothing.
     @MainActor private func openTrailerInYouTubeApp(_ m: CoreMetaItem) async {
+        if autoPlayOnAppear { quickWatchOwner.retire() }
         guard let yt = await preferredTrailerYouTubeID(m) else { return }
         YouTubeAppOpener.openTrailer(youTubeID: yt) { opened in
             if opened {
@@ -2308,6 +2352,8 @@ struct CoreEpisodeStreams: View {
     var initialStartAtSeconds: Double? = nil
     var initialTraktSessionID: TraktSessionID? = nil
     var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+    var autoPlayOnAppear = false
+    var quickWatchOwner: TVQuickViewWatchOwner? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var profiles: ProfileStore   // per-profile engine-history gate (activeUsesEngineHistory)
@@ -2332,7 +2378,9 @@ struct CoreEpisodeStreams: View {
         episodes: [CoreVideo] = [],
         initialStartAtSeconds: Double? = nil,
         initialTraktSessionID: TraktSessionID? = nil,
-        initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+        initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil,
+        autoPlayOnAppear: Bool = false,
+        quickWatchOwner: TVQuickViewWatchOwner? = nil
     ) {
         self.meta = meta
         self.video = video
@@ -2341,6 +2389,8 @@ struct CoreEpisodeStreams: View {
         self.initialStartAtSeconds = initialStartAtSeconds
         self.initialTraktSessionID = initialTraktSessionID
         self.initialContinueWatchingIntent = initialContinueWatchingIntent
+        self.autoPlayOnAppear = autoPlayOnAppear
+        self.quickWatchOwner = quickWatchOwner
         _currentVideo = State(initialValue: video)
     }
 
@@ -2443,6 +2493,8 @@ struct CoreEpisodeStreams: View {
                                    initialStartAtSeconds: initialStartAtSeconds,
                                    initialTraktSessionID: initialTraktSessionID,
                                    initialContinueWatchingIntent: initialContinueWatchingIntent,
+                                   autoPlayOnAppear: autoPlayOnAppear,
+                                   quickWatchOwner: quickWatchOwner,
                                    onDetailMove: { direction, region in
                                        guard direction == .up,
                                              TVDetailActionFocusPolicy.destination(
@@ -2623,6 +2675,12 @@ struct CoreStreamList: View {
     /// Exact Trakt session that owns `initialStartAtSeconds`. nil means the offset is local, not remote.
     var initialTraktSessionID: TraktSessionID? = nil
     var initialContinueWatchingIntent: HomeContinueWatchingSelection.Intent? = nil
+    var autoPlayOnAppear = false
+    @EnvironmentObject private var profiles: ProfileStore
+    var quickWatchOwner: TVQuickViewWatchOwner? = nil
+    @State private var quickWatchMutationTarget: PlaybackMutationTarget?
+    @State private var quickWatchAuxiliaryTarget: SourceIndexIdentity.TargetResolution?
+    @State private var quickWatchMessage: String?
     /// Optional detail action supplied by the mounting page (the movie trailer). It joins the secondary
     /// row so every action remains in one of the two semantic focus sections instead of forming a stray
     /// third row above the source controls. `AnyView` keeps this view's generic surface unchanged for the
@@ -2766,6 +2824,7 @@ struct CoreStreamList: View {
     /// state, then Unload -> Load the engine meta (via `performRefindLoad`) so expired sources are replaced. A
     /// plain re-Load would be an engine eq_update no-op; the Unload -> Load is what re-queries the add-ons.
     private func refindSources() {
+        if autoPlayOnAppear { retireQuickWatch() }
         guard refindEnabled else { return }
         torboxSearch.invalidateCachedResult(for: auxiliaryTarget)
         mediaServers.invalidateCache()
@@ -3206,6 +3265,18 @@ struct CoreStreamList: View {
         // FIX H: on appear, seat focus on Watch Now (above) rather than letting the focus engine pick the
         // first focusable view, which on the movie page is the Trailer chip laid out higher up.
         .defaultFocus($watchFocused, true)
+        .overlay(alignment: .bottomLeading) {
+            if let quickWatchMessage {
+                Text(quickWatchMessage).font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+        }
+        .task(id: quickWatchTaskIdentity) { await performQuickWatchIfRequested() }
+        .onChange(of: profiles.activeID) { _, _ in retireQuickWatch() }
+        .onChange(of: account.credentialBoundaryGeneration) { _, _ in retireQuickWatch() }
+        .onChange(of: meta?.libraryId) { _, _ in retireQuickWatch() }
+        .onChange(of: meta?.videoId) { _, _ in retireQuickWatch() }
+        .onChange(of: meta?.type) { _, _ in retireQuickWatch() }
         .alert("NZB playback", isPresented: Binding(
             get: { usenetPlaybackMessage != nil },
             set: { if !$0 { usenetPlaybackMessage = nil } }
@@ -3234,7 +3305,7 @@ struct CoreStreamList: View {
         // then routes through the EXISTING `playBest` auto-pick. Fires once; a manual pick (presenter.request
         // set) or backing out cancels/short-circuits it, leaving the full list.
         .task {
-            guard SourcePreferences.shared.autoPickBest,
+            guard !autoPlayOnAppear, SourcePreferences.shared.autoPickBest,
                   meta?.usesSeriesLifecycle == true,
                   !didAutoPick else { return }
             var step = 0
@@ -3303,6 +3374,7 @@ struct CoreStreamList: View {
         }
         .onDisappear {
             externalHandoffEpoch = UUID()
+            if autoPlayOnAppear, presenter.request == nil { retireQuickWatch() }
             sourceRefreshDebounce?.cancel()
             sourceRefreshDebounce = nil
             sourceRefreshPlaybackGate.reset()
@@ -3415,7 +3487,81 @@ struct CoreStreamList: View {
     /// pages also pass an episodeStreamId while preserving their original metadata type.
     private var isEpisodePlayback: Bool { episodeStreamId != nil }
 
+    private var quickWatchTaskIdentity: String {
+        "\(meta?.libraryId ?? "")|\(meta?.videoId ?? "")|\(meta?.type ?? "")|\(profiles.activeID?.uuidString ?? "")|\(account.credentialBoundaryGeneration)|\(quickWatchOwner?.generation ?? 0)"
+    }
+
+    private func captureQuickWatchScope() -> CinemaQuickWatchScope {
+        .init(titleID: meta?.libraryId ?? "", titleType: meta?.type ?? "", episodeID: episodeStreamId,
+              profileID: profiles.activeID?.uuidString,
+              accountBoundaryGeneration: account.credentialBoundaryGeneration,
+              traktSessionID: TraktAuth.storedSessionID?.rawValue, routeGeneration: quickWatchOwner?.generation ?? 0)
+    }
+
+    private func quickWatchScopeIsCurrent(_ scope: CinemaQuickWatchScope) -> Bool {
+        guard !profiles.needsPicker, presenter.request == nil,
+              quickWatchMutationTarget?.stillOwnsCurrentContext(core: core) == true,
+              quickWatchAuxiliaryTarget == auxiliaryTarget,
+              CinemaQuickWatchScopePolicy.accepts(scope,
+                titleID: meta?.libraryId ?? "", titleType: meta?.type ?? "", episodeID: episodeStreamId,
+                profileID: profiles.activeID?.uuidString,
+                accountBoundaryGeneration: account.credentialBoundaryGeneration,
+                traktSessionID: TraktAuth.storedSessionID?.rawValue,
+                routeGeneration: quickWatchOwner?.generation ?? 0, taskCancelled: Task.isCancelled) else { return false }
+        return true
+    }
+
+    private func retireQuickWatch() {
+        guard autoPlayOnAppear else { return }
+        quickWatchOwner?.retire()
+        quickWatchMessage = nil
+    }
+
+    @MainActor private func performQuickWatchIfRequested() async {
+        guard autoPlayOnAppear, !isLive, meta != nil,
+              initialContinueWatchingIntent == nil, initialTraktSessionID == nil,
+              let quickWatchOwner, quickWatchOwner.begin(enabled: autoPlayOnAppear) else { return }
+        let scope = captureQuickWatchScope()
+        quickWatchMutationTarget = PlaybackMutationTarget.capture(core: core)
+        quickWatchAuxiliaryTarget = auxiliaryTarget
+        for _ in 0..<120 {
+            let decision = quickWatchOwner.decide(ownerCurrent: quickWatchScopeIsCurrent(scope),
+                cancelled: Task.isCancelled, playbackPresent: presenter.request != nil,
+                settled: sourceList.isSettled, hasBest: sourceList.best != nil)
+            switch decision {
+            case .play:
+                guard quickWatchScopeIsCurrent(scope),
+                      targetIsCurrent(videoID: episodeStreamId, generation: episodeTargetGeneration),
+                      let best = sourceList.best, sourceList.isSettled else { return }
+                didAutoPick = true
+                // Await the existing resolver in this cancellable view task. The task-local scope
+                // follows its single-source fallback and every existing targetIsCurrent boundary.
+                await playBestResolving(best, in: sourceList.groups,
+                    startProposal: proposedInitialStart(fromStart: false), quickWatchScope: scope)
+                if quickWatchScopeIsCurrent(scope) {
+                    quickWatchMessage = "Couldn't start playback. Choose a source or try Watch Now."
+                }
+                return
+            case .unavailable:
+                if quickWatchScopeIsCurrent(scope) { quickWatchMessage = "No playable sources are available. Choose another title or try again." }
+                return
+            case .retired: return
+            case .waiting: break
+            }
+            do { try await Task.sleep(for: .milliseconds(250)) }
+            catch { quickWatchOwner.retire(); return }
+        }
+        // Finish admission without changing the scope generation, so the current timeout message
+        // can be shown. A later child remount still sees the permanently finished owner state.
+        _ = quickWatchOwner.decide(ownerCurrent: true, cancelled: true, playbackPresent: false,
+                                   settled: false, hasBest: false)
+        if quickWatchScopeIsCurrent(scope) {
+            quickWatchMessage = "Sources are still loading. Use Watch Now when they are ready."
+        }
+    }
+
     private func targetIsCurrent(videoID: String?, generation: Int) -> Bool {
+        if let scope = TVQuickViewWatchTask.scope, !quickWatchScopeIsCurrent(scope) { return false }
         guard initialContinueWatchingIntent?.isCurrent() != false else { return false }
         if let episodeTargetIsCurrent {
             return episodeTargetIsCurrent(videoID, generation)
@@ -3717,6 +3863,7 @@ struct CoreStreamList: View {
         enginePreference: PlayerEngineRouter.Override? = nil,
         sourceAddon: String? = nil
     ) {
+        if autoPlayOnAppear { retireQuickWatch() }
         // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) is NOT a content stream. Route it to
         // the trailer path (isTrailer:true, meta:nil) so a dead trailer hits TVPlayerView's isTrailer guard
         // ("Trailer unavailable") and STOPS, instead of failing over to the title's content streams and
@@ -3791,6 +3938,7 @@ struct CoreStreamList: View {
         fromStart: Bool = false,
         resumeSuggestion: AccountBoundResumeSuggestion<TraktSessionID>? = nil
     ) {
+        if autoPlayOnAppear { retireQuickWatch() }
         let proposedStart = proposedInitialStart(
             fromStart: fromStart,
             resumeSuggestion: resumeSuggestion
@@ -3839,6 +3987,18 @@ struct CoreStreamList: View {
     }
 
     @MainActor private func playBestResolving(
+        _ best: CoreStream,
+        in groups: [CoreStreamSourceGroup],
+        fromStart: Bool = false,
+        startProposal: AccountBoundResumeProposal<TraktSessionID>,
+        quickWatchScope: CinemaQuickWatchScope? = nil
+    ) async {
+        await TVQuickViewWatchTask.$scope.withValue(quickWatchScope) {
+            await playBestResolvingOwned(best, in: groups, fromStart: fromStart, startProposal: startProposal)
+        }
+    }
+
+    @MainActor private func playBestResolvingOwned(
         _ best: CoreStream,
         in groups: [CoreStreamSourceGroup],
         fromStart: Bool = false,
@@ -4107,6 +4267,7 @@ struct CoreStreamList: View {
            ) {
             ForEach(ExternalPlayers.detected()) { player in
                 Button("Play in \(player.name)") {
+                    if autoPlayOnAppear { retireQuickWatch() }
                     let epoch = externalHandoffEpoch
                     let videoID = episodeStreamId
                     let generation = episodeTargetGeneration

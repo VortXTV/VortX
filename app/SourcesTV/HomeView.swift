@@ -192,6 +192,7 @@ struct HomeView: View {
                     .ignoresSafeArea()   // absolute top-left, clear of the hero title below
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            .tvCatalogQuickViewRoutes()
             // Register outside the lazy rail container so See All stays available as rows recycle.
             .navigationDestination(item: $catalogBrowseTarget) { TVCatalogBrowseView(target: $0) }
         }
@@ -1059,8 +1060,8 @@ struct CoreCatalogRowView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
                     ForEach(row.items) { item in
-                        TVCinemaCard(presentation: .meta(item), isWatched: watchedIndex.ids.contains(item.id),
-                                     menu: .catalog, onFocus: focusModel.map { model in
+                        TVCatalogSelectionCard(presentation: .meta(item), isWatched: watchedIndex.ids.contains(item.id),
+                                     onFocus: focusModel.map { model in
                                          { model.focus(item.focusedHero) }
                                      })
                             // #95: horizontal infinite scroll. The last card asks the engine for this
@@ -1114,9 +1115,8 @@ struct CoreCatalogWallSection: View {
             RailHeader(title: row.title)
             LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
                 ForEach(row.items) { item in
-                    PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                               width: TVGridMetrics.posterCellWidth, landscapeWidth: TVGridMetrics.landscapeCellWidth,
-                               menu: .catalog,
+                    TVCatalogSelectionCard(presentation: .meta(item), width: TVGridMetrics.landscapeCellWidth,
+                               posterWidth: TVGridMetrics.posterCellWidth, cinematic: false,
                                onFocus: focusModel.map { model in
                                    { model.focus(item.focusedHero) }
                                })

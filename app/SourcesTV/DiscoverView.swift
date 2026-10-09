@@ -8,6 +8,8 @@ struct DiscoverView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @AppStorage(TabBarPrefs.hideLive) private var hideLiveTab = false   // also hide Live types from the Discover type filter (#117 per-tab key)
+    @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
+    @Binding var searchQuery: String
     @StateObject private var focusModel = FocusedItemModel()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
@@ -31,10 +33,14 @@ struct DiscoverView: View {
             ZStack {
                 // The living backdrop: art owns the screen, details pinned above the strip. The
                 // title, chips, and grid all live in the bottom strip and tuck under the hero.
-                BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
+                if !mergeDiscoverSearch { BrowseHeroBackdrop(model: focusModel, detailsBottom: 520) }
                 ScrollView {
                     VStack(alignment: .leading, spacing: Theme.Space.md) {
                         Color.clear.frame(height: 0).scrollToTopAnchor()   // re-select Discover tab -> scroll here
+                        if mergeDiscoverSearch {
+                            TVMergedDiscoverSearch(query: $searchQuery)
+                        }
+                        if !mergeDiscoverSearch || !TVDiscoverSearchPolicy.hasQuery(searchQuery) {
                         titleRow(hasCatalog: core.discover != nil)
                         if showCollectionsHub, CollectionsHubModel.isAvailable {
                             TVCollectionsHub(model: collectionsHub)
@@ -50,19 +56,22 @@ struct DiscoverView: View {
                         } else {
                             CoreEmptyState.signedOut
                         }
+                        }
                     }
                     .padding(.top, Theme.Space.sm)
                     .padding(.bottom, Theme.Space.xl)
                 }
-                .heroBottomStrip()
+                .tvDiscoverSearchLayout(merged: mergeDiscoverSearch)
                 // Re-selecting the active Discover tab scrolls back to the top.
                 .scrollToTopOnBump(TabScrollKeys.discover)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
+            .tvCatalogQuickViewRoutes()
         }
         .onAppear { if core.discover == nil { core.loadDiscover() }; seed(); if showCollectionsHub { collectionsHub.load() } }
         .onChange(of: core.discover?.items.first?.id) { seed() }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Home too
+        .onChange(of: mergeDiscoverSearch) { _, merged in if !merged { searchQuery = "" } }
         // Keep the filtered grid full: when a page settles or the filter set changes, pull the next page
         // while too few cards match and more pages exist (loadDiscoverNextPage self-guards duplicate loads).
         .onChange(of: core.discover?.items.count ?? 0) { _ in autoFillFilteredGrid() }
@@ -194,8 +203,8 @@ struct DiscoverView: View {
     private func gridOf(_ shown: [CoreMeta]) -> some View {
         LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
             ForEach(shown) { item in
-                PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                           width: kPosterWidth, landscapeWidth: kLandscapeCardWidth, menu: .catalog,
+                TVCatalogSelectionCard(presentation: .meta(item), width: kLandscapeCardWidth,
+                           posterWidth: kPosterWidth, cinematic: false,
                            onFocus: { focusModel.focus(item.focusedHero) })
                     // Infinite scroll: load the next catalog page when focus reaches the last VISIBLE card
                     // (same shared engine path the touch grid uses). With a filter on, the last visible card

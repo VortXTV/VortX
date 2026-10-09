@@ -22,6 +22,7 @@ struct SearchView: View {
             if account.isSignedIn || vortxSync.isSignedIn { results } else { CoreEmptyState.signedOut }
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .tvCatalogQuickViewRoutes()
     }
 
     private var results: some View {
@@ -137,9 +138,8 @@ struct SearchView: View {
                                      count: TVGridMetrics.landscapeColumns),
                       alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(items) { item in
-                    TVCinemaCard(presentation: .meta(item), width: TVGridMetrics.landscapeCellWidth,
-                                 menu: .catalog)
-                        .simultaneousGesture(TapGesture().onEnded { _ in saveToHistory(query) })
+                    TVCatalogSelectionCard(presentation: .meta(item), width: TVGridMetrics.landscapeCellWidth,
+                                           onSelect: { saveToHistory(query) })
                 }
             }
             .padding(.vertical, Theme.Space.md)

@@ -276,6 +276,7 @@ struct RootTabView: View {
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     @State private var selection = 0
+    @State private var discoverSearchQuery = ""
     // Per-tab identity token. Each tab owns its own NavigationStack whose pushed pages persist
     // while the tab stays alive (tvOS keeps tabs mounted). Bumping the token of the tab you LEAVE
     // changes that tab's view identity, so the next time you open it SwiftUI rebuilds it fresh at
@@ -291,6 +292,7 @@ struct RootTabView: View {
     @AppStorage(TabBarPrefs.hideDiscover) private var hideDiscoverTab = false
     @AppStorage(TabBarPrefs.hideLibrary) private var hideLibraryTab = false
     @AppStorage(TabBarPrefs.hideSearch) private var hideSearchTab = false
+    @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
     /// Live connectivity (#120): drives the quiet "You're offline" chip and the one-shot offline
     /// launch routing below. The monitor debounces changes, so a brief flap never thrashes the shell.
     @ObservedObject private var connectivity = ConnectivityMonitor.shared
@@ -359,7 +361,7 @@ struct RootTabView: View {
             // TabView entirely when its Settings > Tab bar toggle hides it, and the matching .onChange
             // below heals the selection to Home so the TabView never points at a missing tag.
             if !hideDiscoverTab {
-                DiscoverView().id(resetTokens[1])
+                DiscoverView(searchQuery: $discoverSearchQuery).id(resetTokens[1])
                     .tabItem { Label("Discover", systemImage: "safari.fill") }.tag(1)
             }
             // Live TV sits after Discover. Tags 0-5 were already taken (Search uses 4, Add-ons 3),
@@ -373,7 +375,7 @@ struct RootTabView: View {
                 LibraryView().id(resetTokens[2])
                     .tabItem { Label("Library", systemImage: "books.vertical.fill") }.tag(2)
             }
-            if !hideSearchTab {
+            if TVDiscoverSearchPolicy.showsSeparateSearch(merged: mergeDiscoverSearch, hideSearch: hideSearchTab) {
                 NavigationStack { SearchView() }.id(resetTokens[4])
                     .tabItem { Label("Search", systemImage: "magnifyingglass") }.tag(4)
             }
@@ -423,6 +425,8 @@ struct RootTabView: View {
         .onExitCommand(perform: selection == 0 ? nil : {
             if let nav = focusedNavigationController(), nav.viewControllers.count > 1 {
                 nav.popViewController(animated: true)
+            } else if selection == 1, mergeDiscoverSearch, !discoverSearchQuery.isEmpty {
+                discoverSearchQuery = ""
             } else {
                 selection = 0
             }
@@ -474,6 +478,7 @@ struct RootTabView: View {
         // Reset the tab being LEFT to its root, so returning to it lands on the root page.
         .onChange(of: selection) { old, new in
             if old >= 0, old < resetTokens.count { resetTokens[old] += 1 }
+            if old == 1 { discoverSearchQuery = "" }
             presentUpdateIfReady()
             let name = Self.tabName(new)
             VXProbeState.shared.setRoute(name)
@@ -493,6 +498,10 @@ struct RootTabView: View {
         }
         .onChange(of: hideSearchTab) { _, hidden in
             if hidden, selection == 4 { selection = 0 }
+        }
+        .onChange(of: mergeDiscoverSearch) { _, merged in
+            selection = TVDiscoverSearchPolicy.selectionAfterMerge(selection, merged: merged,
+                                                                    hideDiscover: hideDiscoverTab)
         }
         // The active profile owns the theme: mirror Settings changes into it so they survive a switch.
         .onChange(of: theme.accentID) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }

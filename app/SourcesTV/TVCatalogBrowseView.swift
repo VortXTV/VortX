@@ -159,8 +159,8 @@ struct TVCatalogBrowseView: View {
                 if let live {
                     LazyVGrid(columns: columns, alignment: .leading, spacing: Theme.Space.xl) {
                         ForEach(live.row.items) { item in
-                            TVCinemaCard(presentation: .meta(item), width: TVGridMetrics.landscapeCellWidth,
-                                         isWatched: watchedIndex.ids.contains(item.id), menu: .catalog)
+                            TVCatalogSelectionCard(presentation: .meta(item), width: TVGridMetrics.landscapeCellWidth,
+                                                   isWatched: watchedIndex.ids.contains(item.id))
                                 .onAppear {
                                     if item.id == live.row.items.last?.id { page() }
                                 }
@@ -196,6 +196,7 @@ struct TVCatalogBrowseView: View {
             .padding(.vertical, Theme.Space.lg)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
+        .tvCatalogQuickViewRoutes()
         .navigationBarBackButtonHidden(true)
         .onAppear { backFocused = true; refresh() }
         .onReceive(core.$boardRows) { _ in refresh() }
