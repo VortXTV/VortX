@@ -1185,6 +1185,7 @@ struct TVPlayerView: View {
             if stillWatching { stillWatchingOverlay }
         }
         .onAppear {
+            ExternalPlaybackHandoff.shared.enteredInternalPlayer()
             refreshAutoSkipSettings()
             VXProbeState.shared.setRoute("player")
             // #130 mitigation: hold a short background assertion while a loopback (torrent) stream plays, so a
@@ -3983,17 +3984,38 @@ struct TVPlayerView: View {
         // headers (it is either playing through our embedded /proxy/ on a loopback URL, or as a
         // bare CDN URL whose headers live on mpv); an external player gets neither and cannot
         // replay it, so it would just fail. Hide handoff in that case.
-        let handoffEligible = !isTorrentPlayback && (curHeaders?.isEmpty ?? true)
+        let handoffEligible = !isTorrentPlayback && curSourceStream?.isUsenet != true && (curHeaders?.isEmpty ?? true)
         if handoffEligible, let url = curURL {
             let players = ExternalPlayers.menu()
             if !players.isEmpty {
                 rows.append(OptionRow(label: "Play in", isHeader: true))
                 for player in players {
                     rows.append(OptionRow(label: player.name, detail: "›") {
-                        saveProgress(at: currentTime)
-                        coordinator.player?.pause()
-                        ExternalPlayers.open(url, in: player, metadata: curMeta)
-                        withAnimation { showOptions = false }
+                        let session = playbackSessionID
+                        let generation = episodeSwitchGeneration
+                        let owner = coordinator.player?.activeLoadToken
+                        let allowsLaunch = {
+                            !leftPlayback && curURL == url && playbackSessionID == session
+                                && episodeSwitchGeneration == generation && coordinator.player?.activeLoadToken == owner
+                        }
+                        let handoff = ExternalPlaybackHandoff.Request(
+                            metadata: curMeta, account: account, target: playbackMutationTarget,
+                            position: hasStartedPlaying ? max(currentTime, suppressedResumeFloor ?? 0) : resumeSeconds,
+                            duration: assetSanityAttempt.isAccepted(owner: owner) && !isCurrentLiveStream ? duration : nil,
+                            episodes: ExternalPlaybackHandoff.episodes(allEpisodes),
+                            addon: manualSourceToRemember?.addon, bingeGroup: manualSourceToRemember?.bingeGroup,
+                            allowsLaunch: allowsLaunch)
+                        ExternalPlayers.open(url, in: player, metadata: curMeta, handoff: handoff) { launched in
+                            guard allowsLaunch() else { return }
+                            guard launched else { showEngineNote("Could not open \(player.name)."); return }
+                            if player.scheme == "infuse" {
+                                leavePlayback(externalHandoff: true)
+                            } else {
+                                saveProgress(at: currentTime)
+                                coordinator.player?.pause()
+                            }
+                            withAnimation { showOptions = false }
+                        }
                     })
                 }
             }
@@ -4109,10 +4131,25 @@ struct TVPlayerView: View {
     private func maybeRouteToDefaultExternalPlayer() {
         guard let player = ExternalPlayers.defaultPlayer(),
               !isTrailer,
+              curSourceStream?.isUsenet != true,
               !isTorrentPlayback, (curHeaders?.isEmpty ?? true),
+              let owner = coordinator.player?.activeLoadToken,
               let u = curURL, let host = u.host, host != "127.0.0.1", host != "localhost", host != "::1"
         else { return }
-        ExternalPlayers.open(u, in: player, metadata: curMeta)
+        let session = playbackSessionID
+        let generation = episodeSwitchGeneration
+        let allowsLaunch = { !leftPlayback && curURL == u && playbackSessionID == session && episodeSwitchGeneration == generation && coordinator.player?.activeLoadToken == owner }
+        let handoff = ExternalPlaybackHandoff.Request(
+            metadata: curMeta, account: account, target: playbackMutationTarget,
+            position: startFromZero ? 0 : startAtSeconds,
+            episodes: ExternalPlaybackHandoff.episodes(allEpisodes),
+            addon: startedFromExplicitPick && !startedFromResume ? initialSourceAddon : nil,
+            bingeGroup: startedFromExplicitPick && !startedFromResume ? bingeGroup : nil,
+            allowsLaunch: allowsLaunch)
+        ExternalPlayers.open(u, in: player, metadata: curMeta, handoff: handoff) { launched in
+            guard allowsLaunch(), launched, player.scheme == "infuse" else { return }
+            leavePlayback(externalHandoff: true)
+        }
     }
 
     /// A concise one-line label for a source: the first line of its name, else its description.
@@ -10914,7 +10951,7 @@ struct TVPlayerView: View {
     /// a SwiftUI `.id(req.id)` rebuild - onDisappear no longer tears it down (see Fix B). Every real
     /// exit (Back-to-exit, the close button, the terminal auto-advance) routes through here, so no
     /// engine is leaked.
-    private func leavePlayback() {
+    private func leavePlayback(externalHandoff: Bool = false) {
         pendingAdvance?.debridRef?.nativeUsenetLease?.close()
         curDebridRef?.nativeUsenetLease?.close()
         failedEpisodeResolutionTarget = nil
@@ -10936,7 +10973,7 @@ struct TVPlayerView: View {
         avToMPVHandoffTask?.cancel()
         invalidateLocalTrickplayCapture()
         cancelAssetSanityObservationDeadline()
-        persistenceBlockedForExit = hasUncommittedIssuedMedia
+        persistenceBlockedForExit = externalHandoff || hasUncommittedIssuedMedia
         episodeSwitchGeneration &+= 1
         sourceSwitchGeneration &+= 1
         resumeRetryGeneration &+= 1

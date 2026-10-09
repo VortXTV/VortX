@@ -8,16 +8,26 @@ import Foundation
 enum InfuseDeepLink {
     private static let fallbackExtension = "mkv"
 
-    static func playURL(stream: URL, metadata: PlaybackMeta?) -> URL? {
+    static func playURL(stream: URL, metadata: PlaybackMeta?, position: Double = 0,
+                        success: URL? = nil, failure: URL? = nil) -> URL? {
         var components = URLComponents()
         components.scheme = "infuse"
         components.host = "x-callback-url"
         components.path = "/play"
         components.queryItems = [
             URLQueryItem(name: "url", value: stream.absoluteString),
-            URLQueryItem(name: "filename", value: filename(for: stream, metadata: metadata))
+            URLQueryItem(name: "filename", value: filename(for: stream, metadata: metadata)),
+            URLQueryItem(name: "position", value: String(resumePosition(position)))
         ]
+        if let success { components.queryItems?.append(URLQueryItem(name: "x-success", value: success.absoluteString)) }
+        if let failure { components.queryItems?.append(URLQueryItem(name: "x-error", value: failure.absoluteString)) }
         return components.url
+    }
+
+    /// Infuse accepts whole seconds. Invalid/unbounded inputs must not trap during integer conversion.
+    static func resumePosition(_ seconds: Double) -> Int {
+        guard seconds.isFinite, seconds >= 0, seconds <= 604_800 else { return 0 }
+        return Int(seconds.rounded(.down))
     }
 
     static func filename(for stream: URL, metadata: PlaybackMeta?) -> String {

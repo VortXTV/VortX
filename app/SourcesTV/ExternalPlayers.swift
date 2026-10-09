@@ -83,12 +83,29 @@ enum ExternalPlayers {
         return candidates.first { $0.id == id }
     }
 
-    /// Open `streamURL` in `player`. `metadata` enriches only Infuse's documented filename field.
-    @discardableResult
-    static func open(_ streamURL: URL, in player: Player, metadata: PlaybackMeta? = nil) -> Bool {
-        guard let url = player.launch(streamURL, metadata) else { return false }
-        UIApplication.shared.open(url)
-        return true
+    /// The platform's asynchronous result, not successful URL construction, confirms launch.
+    @MainActor
+    static func open(_ streamURL: URL, in player: Player, metadata: PlaybackMeta? = nil,
+                     handoff: ExternalPlaybackHandoff.Request? = nil,
+                     completion: @escaping @MainActor (Bool) -> Void = { _ in }) {
+        Task { @MainActor in
+            let prepared: ExternalPlaybackHandoff.Prepared?
+            if player.scheme == "infuse" {
+                prepared = await ExternalPlaybackHandoff.shared.prepare(stream: streamURL, metadata: metadata, request: handoff)
+            } else {
+                ExternalPlaybackHandoff.shared.enteredInternalPlayer()
+                prepared = player.launch(streamURL, metadata).map { .init(url: $0, id: nil) }
+            }
+            guard let prepared else { completion(false); return }
+            let isInfuse = player.scheme == "infuse"
+            UIApplication.shared.open(prepared.url, options: [:]) { launched in
+                Task { @MainActor in
+                    let admitted = launched && (!isInfuse || (handoff.map { $0.ownerIsCurrent && $0.allowsLaunch() } ?? true))
+                    ExternalPlaybackHandoff.shared.launchFinished(prepared, launched: admitted)
+                    completion(admitted)
+                }
+            }
+        }
     }
 
     private static func encoded(_ url: URL) -> String? {

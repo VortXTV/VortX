@@ -4,8 +4,8 @@
 //   swiftc -parse-as-library -warnings-as-errors \
 //     app/SourcesShared/InfuseDeepLink.swift app/Sources/ExternalPlayer.swift \
 //     app/Tests/ExternalPlayerHandoffContractTests.swift \
-//     -o /tmp/external-player-handoff-contract-tests && \
-//   /tmp/external-player-handoff-contract-tests
+//     -o app/build/external-player-handoff-contract-tests && \
+//   app/build/external-player-handoff-contract-tests
 
 import Foundation
 
@@ -19,6 +19,24 @@ struct PlaybackMeta: Hashable {
     let poster: String?
     let season: Int?
     let episode: Int?
+}
+
+// This older filename/OS-wrapper contract never opens an app. The actual return adapter and its
+// owner/progress boundaries run separately in scripts/test-infuse-return.mjs, not through this stub.
+@MainActor
+enum ExternalPlaybackHandoff {
+    struct Request {
+        var ownerIsCurrent: Bool { true }
+        func allowsLaunch() -> Bool { true }
+    }
+    struct Prepared { let url: URL; let id: UUID? }
+    static var shared: Self { .fixture }
+    case fixture
+    func enteredInternalPlayer() {}
+    func prepare(stream: URL, metadata: PlaybackMeta?, request: Request?) async -> Prepared? {
+        InfuseDeepLink.playURL(stream: stream, metadata: metadata).map { .init(url: $0, id: nil) }
+    }
+    func launchFinished(_ prepared: Prepared, launched: Bool) {}
 }
 
 @MainActor private var failures = 0
@@ -67,7 +85,7 @@ private func tvDefaultRouteKeepsTrailersNative(_ source: String) -> Bool {
         "guard let player = ExternalPlayers.defaultPlayer(),",
         "!isTrailer,",
         "!isTorrentPlayback",
-        "ExternalPlayers.open(u, in: player, metadata: curMeta)"
+        "ExternalPlayers.open(u, in: player, metadata: curMeta, handoff: handoff)"
     ], in: route)
 }
 
@@ -119,14 +137,14 @@ private enum ExternalPlayerHandoffContractTests {
 
         check("iOS open uses the platform completion handler",
               externalPlayer.contains("UIApplication.shared.open(link, options: [:])")
-                  && externalPlayer.contains("finish(launched)"))
+                  && externalPlayer.contains("didOpen(launched)"))
         check("macOS open uses the platform completion handler",
               externalPlayer.contains("NSWorkspace.shared.open(link, configuration: NSWorkspace.OpenConfiguration())")
-                  && externalPlayer.contains("finish(error == nil)"))
+                  && externalPlayer.contains("didOpen(error == nil)"))
         check("launch rejection is reported as failure",
               externalPlayer.contains("finish(false)"))
         check("macOS completion reports NSError failure",
-              externalPlayer.contains("finish(error == nil)"))
+              externalPlayer.contains("didOpen(error == nil)"))
         check("legacy synchronous iOS open is absent",
               !externalPlayer.contains("UIApplication.shared.open(link)"))
         check("legacy synchronous macOS open is absent",
@@ -184,14 +202,14 @@ private enum ExternalPlayerHandoffContractTests {
               ordered(["ExternalPlayer.open", "externalHandoff.matches", "if launched"], in: explicitChooser))
 
         check("iOS and macOS player handoffs forward the current media identity",
-              playerScreen.contains("routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta)")
-                  && playerScreen.contains("ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta)"))
+              playerScreen.contains("routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta, handoff: infuseHandoff)")
+                  && playerScreen.contains("ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta, handoff: infuseHandoff)"))
         check("tvOS player handoffs forward the current media identity",
               tvPlayerView.components(separatedBy: "ExternalPlayers.open(").count == 3
-                  && tvPlayerView.contains("ExternalPlayers.open(url, in: player, metadata: curMeta)")
-                  && tvPlayerView.contains("ExternalPlayers.open(u, in: player, metadata: curMeta)"))
+                  && tvPlayerView.contains("ExternalPlayers.open(url, in: player, metadata: curMeta, handoff: handoff)")
+                  && tvPlayerView.contains("ExternalPlayers.open(u, in: player, metadata: curMeta, handoff: handoff)"))
         check("detail handoffs forward movie, episode, and live identities",
-              tvDetail.contains("ExternalPlayers.open(url, in: player, metadata: meta)")
+              tvDetail.contains("ExternalPlayers.open(url, in: player, metadata: meta, handoff: handoff)")
                   && iosDetail.contains("playbackMeta: moviePlaybackMeta")
                   && iosDetail.contains("playbackMeta: livePlaybackMeta")
                   && iosDetail.contains("metadata: playbackMeta"))

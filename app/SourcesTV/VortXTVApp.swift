@@ -111,6 +111,7 @@ struct VortXTVApp: App {
                     RootView()   // player OR shell, never both, the only reliable tvOS focus isolation
                 }
             }
+            .externalPlaybackReturns()
             .environmentObject(account)
             .environmentObject(core)
             .environmentObject(presenter)
@@ -129,7 +130,9 @@ struct VortXTVApp: App {
             // `directResume`) lifted into a shared helper. That is a refactor of the app's most
             // bug-historied path and does not belong inside a new feature's diff, so it is left as a
             // deliberate follow-up rather than duplicated out here where the two copies would drift.
-            .onOpenURL { DeepLinkRouter.shared.handle($0) }
+            .onOpenURL {
+                if !ExternalPlaybackHandoff.shared.handle($0) { DeepLinkRouter.shared.handle($0) }
+            }
             .onChange(of: scenePhase) { _, phase in
                 // Distinguishes "the system suspended us" (an unhandled menu press)
                 // from "we crashed" when a device report says the app vanished.

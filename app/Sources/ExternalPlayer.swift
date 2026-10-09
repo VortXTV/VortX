@@ -6,8 +6,8 @@ import AppKit
 
 /// Hands a captured Stremio stream off to a third-party player (Infuse, VLC) via its documented
 /// URL scheme, for users who prefer an external player to the built-in libmpv one. Works on iOS
-/// (UIApplication) and macOS (NSWorkspace); tvOS does not compile this file (it cannot launch other
-/// apps and uses SourcesTV/ExternalPlayers.swift's own curated handoff instead).
+/// (UIApplication) and macOS (NSWorkspace); tvOS uses SourcesTV/ExternalPlayers.swift's curated
+/// handoff and the same shared Infuse return coordinator.
 enum ExternalPlayer {
     /// Exact identity for one external handoff request. A completion from another URL, playback
     /// session, episode generation, or engine load is stale and must not mutate the current player.
@@ -113,26 +113,46 @@ enum ExternalPlayer {
         _ target: Target,
         stream: URL,
         metadata: PlaybackMeta? = nil,
+        handoff: ExternalPlaybackHandoff.Request? = nil,
         completion: @escaping @MainActor @Sendable (Bool) -> Void
     ) {
         let finish: @Sendable (Bool) -> Void = { launched in
             DispatchQueue.main.async { completion(launched) }
         }
-        guard target.isInstalled, let link = target.deepLink(for: stream, metadata: metadata) else {
+        guard target.isInstalled else {
             finish(false)
             return
         }
-        #if canImport(UIKit)
-        UIApplication.shared.open(link, options: [:]) { launched in
-            finish(launched)
+        Task { @MainActor in
+            let prepared: ExternalPlaybackHandoff.Prepared?
+            if target.id == "infuse" {
+                prepared = await ExternalPlaybackHandoff.shared.prepare(stream: stream, metadata: metadata, request: handoff)
+            } else {
+                ExternalPlaybackHandoff.shared.enteredInternalPlayer()
+                prepared = target.deepLink(for: stream, metadata: metadata).map { .init(url: $0, id: nil) }
+            }
+            guard let prepared else { finish(false); return }
+            let link = prepared.url
+            let isInfuse = target.id == "infuse"
+            let didOpen: @Sendable (Bool) -> Void = { launched in
+                Task { @MainActor in
+                    let admitted = launched && (!isInfuse || (handoff.map { $0.ownerIsCurrent && $0.allowsLaunch() } ?? true))
+                    ExternalPlaybackHandoff.shared.launchFinished(prepared, launched: admitted)
+                    finish(admitted)
+                }
+            }
+            #if canImport(UIKit)
+            UIApplication.shared.open(link, options: [:]) { launched in
+                didOpen(launched)
+            }
+            #elseif canImport(AppKit)
+            NSWorkspace.shared.open(link, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                didOpen(error == nil)
+            }
+            #else
+            didOpen(false)
+            #endif
         }
-        #elseif canImport(AppKit)
-        NSWorkspace.shared.open(link, configuration: NSWorkspace.OpenConfiguration()) { _, error in
-            finish(error == nil)
-        }
-        #else
-        finish(false)
-        #endif
     }
 
     /// HEAD-probe a stream URL before handing it to an external app, so a dead debrid / CDN link is caught
@@ -193,9 +213,10 @@ enum ExternalPlayer {
         _ stream: URL,
         isTorrent: Bool,
         metadata: PlaybackMeta? = nil,
+        handoff: ExternalPlaybackHandoff.Request? = nil,
         completion: @escaping @MainActor @Sendable (Bool) -> Void
     ) {
         guard canRouteExternally(stream, isTorrent: isTorrent), let target = defaultTarget else { return }
-        open(target, stream: stream, metadata: metadata, completion: completion)
+        open(target, stream: stream, metadata: metadata, handoff: handoff, completion: completion)
     }
 }

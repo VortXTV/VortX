@@ -2576,6 +2576,7 @@ struct FullBleedBackdrop: View {
 private struct SourceRow: Identifiable { let id: String; let addon: String; let stream: CoreStream }
 
 struct CoreStreamList: View {
+    @State private var externalHandoffEpoch = UUID()
     let title: String
     var meta: PlaybackMeta? = nil
     var episodes: [CoreVideo] = []               // the season's episodes (series only), for the player's Prev/Next/Episodes
@@ -3278,6 +3279,7 @@ struct CoreStreamList: View {
             }
         }
         .onDisappear {
+            externalHandoffEpoch = UUID()
             sourceRefreshDebounce?.cancel()
             sourceRefreshDebounce = nil
             sourceRefreshPlaybackGate.reset()
@@ -4082,7 +4084,15 @@ struct CoreStreamList: View {
            ) {
             ForEach(ExternalPlayers.detected()) { player in
                 Button("Play in \(player.name)") {
-                    ExternalPlayers.open(url, in: player, metadata: meta)
+                    let epoch = externalHandoffEpoch
+                    let videoID = episodeStreamId
+                    let generation = episodeTargetGeneration
+                    let handoff = ExternalPlaybackHandoff.Request(
+                        metadata: meta, account: account,
+                        episodes: ExternalPlaybackHandoff.episodes(episodes),
+                        addon: addon, bingeGroup: stream.behaviorHints?.bingeGroup,
+                        allowsLaunch: { epoch == externalHandoffEpoch && targetIsCurrent(videoID: videoID, generation: generation) })
+                    ExternalPlayers.open(url, in: player, metadata: meta, handoff: handoff)
                 }
             }
         }

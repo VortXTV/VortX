@@ -70,9 +70,11 @@ final class CoreBridge: ObservableObject {
     }
     func reportNativeProgress(for meta: PlaybackMeta, positionSeconds: Double, durationSeconds: Double,
                               target: PlaybackMutationTarget) {
+        // Native report_progress accepts zero as unknown duration: preserve the genuine position and
+        // any stored known duration without deriving completion from this observation (Infuse return).
         guard let (facade, profile) = nativePlaybackBinding(target),
               case .native(let binding?) = target, let epoch = binding.accountGeneration,
-              positionSeconds.isFinite, durationSeconds.isFinite, positionSeconds >= 0, durationSeconds > 0,
+              positionSeconds.isFinite, durationSeconds.isFinite, positionSeconds >= 0, durationSeconds >= 0,
               positionSeconds * 1000 < Double(UInt64.max), durationSeconds * 1000 < Double(UInt64.max) else { return }
         var action: [String: VortxJSON] = ["type": .string("report_progress"), "metaId": .string(meta.libraryId),
                                           "name": .string(meta.name), "positionMs": .unsigned(UInt64(positionSeconds * 1000)),

@@ -1550,6 +1550,7 @@ struct PlayerScreen: View {
     @State private var committedLoadToken: PlayerLoadToken?
     @State private var uncommittedIdentityBlocked = false
     @State private var persistenceBlockedForExit = false
+    @State private var externalHandoffConfirmed = false
     private var hasUncommittedIssuedMedia: Bool {
         uncommittedIdentityBlocked
             || pendingAdvance?.issued == true
@@ -2207,6 +2208,8 @@ struct PlayerScreen: View {
         #endif
         .tint(Theme.Palette.accent)
         .onAppear {
+            ExternalPlaybackHandoff.shared.enteredInternalPlayer()
+            externalHandoffConfirmed = false
             refreshAutoSkipSettings()
             playbackExited = false
             persistenceBlockedForExit = false
@@ -2221,7 +2224,7 @@ struct PlayerScreen: View {
             // header-free direct/debrid stream. Torrents, header-gated streams (external apps can't apply our
             // request headers), loopback URLs, and trailers (a direct trailer URL is structurally identical
             // to a debrid movie URL, so it would otherwise be hijacked) stay in the built-in player.
-            if !isTrailer, (headers?.isEmpty ?? true),
+            if !isTrailer, initialSourceStream?.isUsenet != true, (headers?.isEmpty ?? true),
                let externalHandoffLoadToken = coordinator.player?.activeLoadToken {
                 let externalHandoff = ExternalPlayer.HandoffIdentity(
                     url: url,
@@ -2229,7 +2232,18 @@ struct PlayerScreen: View {
                     episodeGeneration: episodeSwitchGeneration,
                     loadToken: externalHandoffLoadToken
                 )
-                ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta) { launched in
+                let defaultExternalIsInfuse = ExternalPlayer.defaultTarget?.id == "infuse"
+                let infuseHandoff = ExternalPlaybackHandoff.Request(
+                    metadata: curMeta, account: account, target: playbackMutationTarget,
+                    position: resumeSeconds,
+                    episodes: allEpisodeRefs.map { .init(id: $0.id, season: $0.season, episode: $0.episode) },
+                    addon: startedFromExplicitPick && !startedFromResume ? initialSourceAddon : nil,
+                    bingeGroup: startedFromExplicitPick && !startedFromResume ? recordBingeGroup : nil,
+                    allowsLaunch: {
+                        !playbackExited && externalHandoff.matches(url: curURL ?? url, sessionID: playbackSessionID,
+                            episodeGeneration: episodeSwitchGeneration, loadToken: coordinator.player?.activeLoadToken)
+                    })
+                ExternalPlayer.routeToDefaultIfSet(url, isTorrent: recordIsTorrent, metadata: curMeta, handoff: infuseHandoff) { launched in
                     guard !playbackExited,
                           externalHandoff.matches(
                               url: curURL ?? url,
@@ -2238,6 +2252,10 @@ struct PlayerScreen: View {
                               loadToken: coordinator.player?.activeLoadToken
                           ) else { return }
                     if launched {
+                        if defaultExternalIsInfuse {
+                            externalHandoffConfirmed = true
+                            persistenceBlockedForExit = true
+                        }
                         onClose()
                     } else {
                         externalLinkDead = true
@@ -2383,6 +2401,16 @@ struct PlayerScreen: View {
                         episodeGeneration: externalHandoffEpisodeGeneration,
                         loadToken: externalHandoffLoadToken
                     )
+                    let infuseHandoff = ExternalPlaybackHandoff.Request(
+                        metadata: curMeta, account: account, target: playbackMutationTarget,
+                        position: hasStartedPlaying ? max(currentTime, suppressedResumeFloor ?? 0) : resumeSeconds,
+                        duration: assetSanityAttempt.isAccepted(owner: externalHandoffLoadToken) && !effectivelyLive ? duration : nil,
+                        episodes: allEpisodeRefs.map { .init(id: $0.id, season: $0.season, episode: $0.episode) },
+                        addon: manualSourceToRemember?.addon, bingeGroup: manualSourceToRemember?.bingeGroup,
+                        allowsLaunch: {
+                            !playbackExited && externalHandoff.matches(url: curURL ?? url, sessionID: playbackSessionID,
+                                episodeGeneration: episodeSwitchGeneration, loadToken: coordinator.player?.activeLoadToken)
+                        })
                     // Pre-flight the link before handing off, so a dead debrid / CDN URL is caught here
                     // (we keep playing in the built-in player and say so) instead of bouncing the user
                     // into Infuse / VLC's own load error. Loopback torrents probe as alive instantly.
@@ -2404,7 +2432,8 @@ struct PlayerScreen: View {
                               ) else { return }
                         guard probeSucceeded else { externalLinkDead = true; return }
                         // Handed off, stop local playback so the stream isn't decoded twice.
-                        ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta) { launched in
+                        guard curSourceStream?.isUsenet != true else { externalLinkDead = true; return }
+                        ExternalPlayer.open(target, stream: externalHandoff.url, metadata: curMeta, handoff: infuseHandoff) { launched in
                             guard !playbackExited,
                                   externalHandoff.matches(
                                       url: curURL ?? url,
@@ -2412,7 +2441,11 @@ struct PlayerScreen: View {
                                       episodeGeneration: episodeSwitchGeneration,
                                       loadToken: coordinator.player?.activeLoadToken
                                   ) else { return }
-                            if launched, !isPaused {
+                            if launched, target.id == "infuse" {
+                                externalHandoffConfirmed = true
+                                persistenceBlockedForExit = true
+                                onClose()
+                            } else if launched, !isPaused {
                                 viewerPause()
                             } else if !launched {
                                 externalLinkDead = true
@@ -7480,7 +7513,7 @@ struct PlayerScreen: View {
     }
 
     private func invalidateEpisodeWorkForExit() {
-        persistenceBlockedForExit = hasUncommittedIssuedMedia
+        persistenceBlockedForExit = externalHandoffConfirmed || hasUncommittedIssuedMedia
         playbackExited = true
         invalidateEpisodeResolution()
         episodeSwitchGeneration &+= 1
