@@ -27,6 +27,8 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -479,6 +481,7 @@ internal suspend fun runPendingSyncRetryLoop(
     shouldContinue: () -> Boolean,
     wait: suspend (Long) -> Unit,
     attempt: suspend () -> Boolean,
+    resetDelay: () -> Boolean = { false },
 ): Boolean {
     require(initialDelayMs > 0 && maxDelayMs >= initialDelayMs)
     var retryDelayMs = initialDelayMs
@@ -488,7 +491,7 @@ internal suspend fun runPendingSyncRetryLoop(
         val succeeded = attempt()
         if (succeeded) return true
         if (!shouldContinue()) return false
-        retryDelayMs =
+        retryDelayMs = if (resetDelay()) initialDelayMs else
             if (retryDelayMs > maxDelayMs / 2) maxDelayMs else retryDelayMs * 2
     }
     return false
@@ -511,6 +514,7 @@ internal class PendingSyncAttempt internal constructor(
 ) {
     @Volatile
     internal var job: Job? = null
+    internal var editGeneration = 1L
 }
 
 internal data class PendingSyncClaim(
@@ -550,6 +554,14 @@ internal class DurablePendingSyncState(
             // A failed SharedPreferences commit may still mutate its process-local cache. Remember the
             // uncertainty and never trust a same-process read as proof of restart durability.
             PendingMarkerTruth.DIRTY_UNCONFIRMED
+        }
+        val current = attempt
+        if (owner == nextOwner && current?.job?.let { !it.isCancelled && !it.isCompleted } == true) {
+            check(current.editGeneration < Long.MAX_VALUE) { "Pending edit generation exhausted" }
+            current.editGeneration++
+            // A continuing stream of progress events must not postpone the first upload forever.
+            // Do not cancel a PUT either: its exact snapshot will be acknowledged independently.
+            return@synchronized PendingSyncClaim(blockPull = true)
         }
         val replaced = attempt?.job
         owner = nextOwner
@@ -638,6 +650,7 @@ internal class DurablePendingSyncState(
     fun completeAccepted(
         expectedAttempt: PendingSyncAttempt,
         job: Job,
+        expectedEditGeneration: Long = expectedAttempt.editGeneration,
         isCurrentSnapshot: () -> Boolean,
     ): Boolean = synchronized(lock) {
         val accountId = expectedAttempt.owner.accountId
@@ -645,6 +658,7 @@ internal class DurablePendingSyncState(
             owner != expectedAttempt.owner ||
             attempt !== expectedAttempt ||
             expectedAttempt.job !== job ||
+            expectedAttempt.editGeneration != expectedEditGeneration ||
             truthByAccount[accountId] != PendingMarkerTruth.DIRTY_CONFIRMED ||
             !isCurrentSnapshot()
         ) {
@@ -658,6 +672,11 @@ internal class DurablePendingSyncState(
             attempt = null
             true
         }
+    }
+
+    fun captureEditGeneration(expectedAttempt: PendingSyncAttempt, job: Job): Long? = synchronized(lock) {
+        if (owner == expectedAttempt.owner && attempt === expectedAttempt && expectedAttempt.job === job)
+            expectedAttempt.editGeneration else null
     }
 
     fun abandon(
@@ -726,7 +745,8 @@ internal class DurablePendingSyncState(
  * ([SecureTokenStore] / [com.vortx.android.auth.AuthIdentityStore] use the same fail-soft pattern). The
  * data key decrypts the WHOLE account, so it never sits in plain SharedPreferences.
  */
-class VortXSyncManager(context: Context) {
+class VortXSyncManager internal constructor(context: Context, private val scope: CoroutineScope) {
+    constructor(context: Context) : this(context, CoroutineScope(SupervisorJob() + Dispatchers.IO))
 
     /** The account fields the server returns (mirrors Apple `VortXSyncManager.Account`). */
     data class Account(
@@ -966,7 +986,12 @@ class VortXSyncManager(context: Context) {
     )
 
     /** IO scope for the debounced auto-push (requestSyncSoon) and background catch-up pulls. */
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // Native joins and their host/credential/stamp receipts form one transaction. A broadcast,
+    // foreground catch-up, and a queued local push must not interleave those receipts.
+    private val nativeSyncMutex = Mutex()
+    // Auth completion is not foreground intent. Only the process lifecycle may enable the
+    // socket/poll; a late sign-in/reconcile result must not reopen it after background stop.
+    private var realtimeForeground = false
 
     @Volatile private var requestTestSeam: SyncRequestTestSeam? = null
     @Volatile private var versionedPayloadTestObserver: (() -> Unit)? = null
@@ -1154,7 +1179,7 @@ class VortXSyncManager(context: Context) {
                         current.token == retained.token
                 }
             if (shouldResumeRetainedRealtime(retained.hadActiveRealtime, retainedSessionIsCurrent)) {
-                realtime.start()
+                startRealtime()
             }
         }
     }
@@ -1635,6 +1660,12 @@ class VortXSyncManager(context: Context) {
     /** Real local library mutations arm the existing durable/debounced account push. */
     fun onLocalOwnerLibraryChanged() = requestSyncSoon()
 
+    /** Origin must be captured by the mounted native transaction, not after an async queue hop. */
+    internal fun onLocalNativeMutation(origin: SessionOwnerSnapshot.Account) {
+        val lease = captureSyncLease()?.takeIf { it.accountId == origin.id && it.ownerEpoch == origin.generation } ?: return
+        armPendingSync(lease, recordEdit = true)
+    }
+
     private fun resolveStore(): ProfileStore? = profileStore ?: ProfileStore.sharedOrNull()
 
     // ---- Per-account version guards (H-1 downgrade ratchet, H-2 high-water floor) ----
@@ -1647,13 +1678,16 @@ class VortXSyncManager(context: Context) {
     private fun lastSyncedVersion(lease: SyncSessionLease): Long =
         syncState.lastVersion(lease.accountId)
 
-    private fun advanceVersion(lease: SyncSessionLease, version: Long): Boolean =
-        publishIfSyncLeaseCurrent(lease) {
-            syncState.setLastVersion(
+    private fun advanceVersion(lease: SyncSessionLease, version: Long): Boolean {
+        var persisted = false
+        return publishIfSyncLeaseCurrent(lease) {
+            persisted = syncState.setLastVersion(
                 lease.accountId,
                 maxOf(version, syncState.lastVersion(lease.accountId)),
             )
-        }
+            if (persisted && writeSyncDocV2) markSawDocV2(lease.accountId)
+        } && persisted
+    }
 
     // H-1 downgrade ratchet (per account): once this account's doc has opened as v2, a bare-legacy blob is
     // treated as tamper and never opened (a legacy blob authenticates at ANY version, so a backend could
@@ -1803,14 +1837,9 @@ class VortXSyncManager(context: Context) {
                 var remembered = false
                 if (!publishIfSyncLeaseCurrent(lease) { remembered = syncState.markNativeBackupSeen(lease.accountId) } || !remembered) return PushOutcome.Error
             }
-            val published = publishIfSyncLeaseCurrent(lease) {
-                syncState.setLastVersion(
-                    lease.accountId,
-                    maxOf(version, syncState.lastVersion(lease.accountId)),
-                )
-                if (writeSyncDocV2) markSawDocV2(lease.accountId)
-            }
-            if (!published) return PushOutcome.Error
+            // Native acceptance is not yet a completed local transaction (seed apply, host and
+            // credential receipts can still fail). Its caller stamps only after those all succeed.
+            if (!com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED && !advanceVersion(lease, version)) return PushOutcome.Error
             return PushOutcome.Accepted(version)
         }
         // A winner echo is not the base of our document. Only a fresh authenticated GET + merge
@@ -1832,13 +1861,14 @@ class VortXSyncManager(context: Context) {
     private suspend fun pushDerivedDoc(
         lease: SyncSessionLease,
         initial: DerivedBackup,
+        onAccepted: (Long) -> Unit = {},
         rebuild: suspend () -> DerivedBackup?,
     ): Boolean {
         var candidate = initial
         repeat(PUSH_MAX_RETRIES) { attempt ->
             val version = BackupRevisionPolicy.next(candidate.baseVersion) ?: return false
-            when (pushSyncDocAt(lease, candidate.document, version)) {
-                is PushOutcome.Accepted -> return true
+            when (val outcome = pushSyncDocAt(lease, candidate.document, version)) {
+                is PushOutcome.Accepted -> { onAccepted(outcome.version); return true }
                 is PushOutcome.Error -> return false              // network/server/encode failure: reconcile later
                 is PushOutcome.Rejected -> {
                     if (!isSyncLeaseCurrent(lease)) return false
@@ -1868,7 +1898,7 @@ class VortXSyncManager(context: Context) {
 
     private suspend fun syncUp(lease: SyncSessionLease): Boolean {
         if (!isSyncLeaseCurrent(lease)) return false
-        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return try { nativeSyncUp(lease) }
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return try { nativeSyncMutex.withLock { nativeSyncUp(lease) } }
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
         // Stamp snapshot taken when the push BEGINS, before the blob is built: a key re-edited while this
@@ -1890,7 +1920,7 @@ class VortXSyncManager(context: Context) {
         return synced && isSyncLeaseCurrent(lease)
     }
 
-    private suspend fun nativeSyncDown(lease: SyncSessionLease): Boolean {
+    private suspend fun nativeSyncDown(lease: SyncSessionLease, force: Boolean = false): Boolean {
         val gateway = nativeGateway ?: return false
         val account = SessionOwnerSnapshot.Account(lease.accountId, lease.ownerEpoch)
         // Local availability is independent of network availability. The lease came from verified
@@ -1911,18 +1941,31 @@ class VortXSyncManager(context: Context) {
         val pull = pulled as? SyncDocPull.Doc ?: return false
         if (!isSyncLeaseCurrent(lease)) return false
         if (retryPendingPushBeforePull(lease)) return false
+        // A confirmed mounted checkpoint already contains this acknowledged revision. Replaying
+        // it on every active poll remounts/projections and can arm needless peer echo work.
+        if (reopened && !force && syncState.hasLastVersion(lease.accountId) && pull.version == lastSyncedVersion(lease)) {
+            val exported = gateway.exportDocument(account) ?: return false
+            if (NativeSyncPublicationPolicy.needsRepublish(pull.doc, exported)) armPendingSync(lease, recordEdit = true)
+            return isSyncLeaseCurrent(lease)
+        }
         val applied = try { gateway.applyDocument(account, pull.doc) { isSyncLeaseCurrent(lease) } }
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
         if (!applied) return false
-        if (!applyNativeHostSettings(lease, gateway.exportDocument(account))) return false
+        val exported = gateway.exportDocument(account) ?: return false
+        if (!applyNativeHostSettings(lease, exported)) return false
         // The same atomic secure record backs provider reads and register intent. No deferred
         // credential application can replay an older pull over a newer local edit after suspension.
         var credentialsStored = false
         if (!publishIfSyncLeaseCurrent(lease) {
             credentialsStored = com.vortx.android.integrations.NativeProviderAccess.merge(account, pull.doc) != null
         } || !credentialsStored) return false
-        return advanceVersion(lease, pull.version)
+        if (!advanceVersion(lease, pull.version)) return false
+        // A higher envelope revision from an old client can carry an older causal document. The
+        // authenticated native join retains our facts; publish only if that joined wire carrier
+        // actually contributes facts missing from the server (never a projection or wall clock).
+        if (NativeSyncPublicationPolicy.needsRepublish(pull.doc, exported)) armPendingSync(lease, recordEdit = true)
+        return isSyncLeaseCurrent(lease)
     }
 
     private suspend fun applyNativeHostSettings(lease: SyncSessionLease, exported: NativeAccountExport?): Boolean {
@@ -1952,6 +1995,7 @@ class VortXSyncManager(context: Context) {
         var pushedStamps: Map<String, Double> = emptyMap()
         var pushedPreferences: JSONObject? = null
         var pushedProviders: JSONObject? = null
+        var acceptedVersion: Long? = null
         suspend fun derived(): DerivedBackup? {
             var globals = JSONObject()
             if (!publishIfSyncLeaseCurrent(lease) {
@@ -2002,20 +2046,25 @@ class VortXSyncManager(context: Context) {
             // Deployed worker's atomic INSERT/strictly-greater update predicate makes zero a
             // create-only write against normal nonnegative backup versions. A collision or unknown
             // outcome must re-pull; never escalate a stale-empty candidate to epoch milliseconds.
-            when (pushSyncDocAt(lease, first.document, 0)) {
+            when (val outcome = pushSyncDocAt(lease, first.document, 0)) {
                 is PushOutcome.Accepted -> {
                     if (!gateway.applyDocument(account, first.document) { isSyncLeaseCurrent(lease) }) return false
                     if (pushedStamps.isNotEmpty() || com.vortx.android.integrations.NativeProviderAccess.hasPending(account) != false) return false
+                    acceptedVersion = outcome.version
                     true
                 }
                 is PushOutcome.Error -> false
                 is PushOutcome.Rejected -> {
                     val merged = derived()
-                    if (merged?.baseVersion == null) false else pushDerivedDoc(lease, merged) { derived()?.takeIf { it.baseVersion != null } }
+                    if (merged?.baseVersion == null) false else pushDerivedDoc(lease, merged,
+                        onAccepted = { acceptedVersion = it }) { derived()?.takeIf { it.baseVersion != null } }
                 }
             }
-        } else pushDerivedDoc(lease, first) { derived()?.takeIf { it.baseVersion != null } }
+        } else pushDerivedDoc(lease, first, onAccepted = { acceptedVersion = it }) { derived()?.takeIf { it.baseVersion != null } }
         if (!pushed) return false
+        // A PUT ACK alone does not publish the joined host settings to this device. Complete
+        // that application before acknowledging registers or retiring the durable dirty marker.
+        if (!applyNativeHostSettings(lease, gateway.exportDocument(account))) return false
         // Only acknowledge the exact carrier accepted by the server. A local edit during the PUT
         // has a different register event and remains pending, including after a cold restart.
         pushedPreferences?.let { if (!gateway.acknowledgeHostPreferences(account, it)) return false }
@@ -2024,7 +2073,7 @@ class VortXSyncManager(context: Context) {
             if (!publishIfSyncLeaseCurrent(lease) { acknowledged = com.vortx.android.integrations.NativeProviderAccess.acknowledge(account, sent) } || !acknowledged) return false
         }
         if (!publishIfSyncLeaseCurrent(lease) { clearPushedDirtySettings(pushedStamps) }) return false
-        return isSyncLeaseCurrent(lease)
+        return acceptedVersion?.let { advanceVersion(lease, it) } == true
     }
 
     private fun applyLibraryTombstonesToVortx(vortx: JSONObject): JSONObject {
@@ -2340,7 +2389,7 @@ class VortXSyncManager(context: Context) {
         force: Boolean = false,
     ): Boolean {
         if (!isSyncLeaseCurrent(lease)) return false
-        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return try { nativeSyncDown(lease) }
+        if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) return try { nativeSyncMutex.withLock { nativeSyncDown(lease, force) } }
             catch (cancel: kotlinx.coroutines.CancellationException) { throw cancel }
             catch (_: Exception) { false }
         // PENDING-EDIT GUARD: restore a durable process-death marker and retry its push before any
@@ -2657,6 +2706,7 @@ class VortXSyncManager(context: Context) {
 
         val job = scope.launch(start = CoroutineStart.LAZY) {
             val runningJob = currentCoroutineContext()[Job] ?: return@launch
+            var acceptedWithNewEdits = false
             runPendingSyncRetryLoop(
                 initialDelayMs = SYNC_DEBOUNCE_MS,
                 maxDelayMs = SYNC_RETRY_MAX_MS,
@@ -2670,15 +2720,19 @@ class VortXSyncManager(context: Context) {
                     if (!pendingState.ensureMarker(attempt, runningJob)) {
                         false
                     } else {
+                        val editGeneration = pendingState.captureEditGeneration(attempt, runningJob) ?: return@runPendingSyncRetryLoop false
                         val synced = syncUp(lease)
+                        acceptedWithNewEdits = synced
                         synced &&
                             pendingState.completeAccepted(
                                 expectedAttempt = attempt,
                                 job = runningJob,
                                 isCurrentSnapshot = { isSyncLeaseCurrentSnapshot(lease) },
+                                expectedEditGeneration = editGeneration,
                             )
                     }
                 },
+                resetDelay = { acceptedWithNewEdits.also { acceptedWithNewEdits = false } },
             )
         }
         if (!pendingState.attachJob(attempt, job)) {
@@ -2704,13 +2758,16 @@ class VortXSyncManager(context: Context) {
 
     /**
      * The Android port of the Apple realtime leg ([VortXSyncRealtime]): the worker SyncRoom WebSocket
-     * plus the 10s while-active fallback poll. Lazy so a signed-out launch never builds the OkHttp
+     * plus the 3s while-active fallback poll. Lazy so a signed-out launch never builds the OkHttp
      * client. The channel only ever calls the guarded [syncDown] -- the #145 pull guards (tri-state
      * pull, version-wins, pending-push defer) all still apply to every realtime-triggered apply.
      */
-    private val realtime by lazy {
+    private val defaultRealtime by lazy {
         VortXSyncRealtime(this, scope, BASE.replaceFirst("https://", "wss://") + "/v1/sync/connect")
     }
+    private var realtimeTestSeam: VortXSyncRealtime? = null
+    private val realtime: VortXSyncRealtime get() = realtimeTestSeam ?: defaultRealtime
+    internal fun installRealtimeTestSeam(channel: VortXSyncRealtime) { realtimeTestSeam = channel }
 
     /**
      * Open the real-time channel + run one catch-up pull. Called on app-foreground (the
@@ -2719,12 +2776,25 @@ class VortXSyncManager(context: Context) {
      * to the fallback poll, never breaking the pull+debounced-push engine underneath.
      */
     fun startRealtime() {
-        captureSyncLease()?.let(::retryPendingPushBeforePull)
-        realtime.start()
+        operations.snapshot {
+            if (realtimeForeground) {
+                captureSyncLease()?.let(::retryPendingPushBeforePull)
+                realtime.start()
+            }
+        }
+    }
+
+    /** Process activity-count transition; auth callers may request start but cannot create intent. */
+    internal fun setRealtimeForeground(active: Boolean) {
+        operations.snapshot {
+            realtimeForeground = active
+            if (active) startRealtime() else realtime.stop()
+        }
     }
 
     /** Close the real-time channel. Called on app-background and inside [signOut]. Safe to repeat. */
     fun stopRealtime() {
+        // Session retirement closes delivery but preserves the still-foreground lifecycle intent.
         realtime.stop()
     }
 
@@ -2735,6 +2805,16 @@ class VortXSyncManager(context: Context) {
      */
     internal fun lastAppliedVersion(): Long =
         captureSyncLease()?.let(::lastSyncedVersion) ?: 0L
+
+    // Realtime work carries the session captured when its channel opened, never recaptures a
+    // replacement session after a queued callback. Generation + ownerEpoch also fence A→B→A.
+    internal fun captureRealtimeLease(): SyncSessionLease? = captureSyncLease()
+    internal fun isRealtimeLeaseCurrent(lease: SyncSessionLease): Boolean = isSyncLeaseCurrent(lease)
+    internal fun admitRealtimeLease(lease: SyncSessionLease, action: () -> Boolean): Boolean =
+        syncLeaseAdmission(lease).invoke(action)
+    internal fun lastAppliedVersion(lease: SyncSessionLease): Long =
+        if (isSyncLeaseCurrent(lease)) lastSyncedVersion(lease) else Long.MAX_VALUE
+    internal suspend fun syncDownForRealtime(lease: SyncSessionLease): Boolean = syncDown(lease)
 
     // ---- Sign-in reconciliation (no blind last-writer-wins) ----
 
@@ -3073,9 +3153,9 @@ class VortXSyncManager(context: Context) {
             appContext.getSharedPreferences(STATE_FILE, Context.MODE_PRIVATE)
 
         fun lastVersion(accountId: String): Long = prefs.getLong(KEY_VERSION + accountId, 0L)
-        fun setLastVersion(accountId: String, version: Long) {
-            prefs.edit().putLong(KEY_VERSION + accountId, version).apply()
-        }
+        fun hasLastVersion(accountId: String): Boolean = prefs.contains(KEY_VERSION + accountId)
+        fun setLastVersion(accountId: String, version: Long): Boolean =
+            prefs.edit().putLong(KEY_VERSION + accountId, version).commit()
 
         fun sawV2(accountId: String): Boolean = prefs.getBoolean(KEY_SAW_V2 + accountId, false)
         fun nativeBackupSeen(accountId: String): Boolean = prefs.getBoolean("nativeBackupSeen." + accountId, false)
