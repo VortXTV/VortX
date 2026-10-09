@@ -74,8 +74,6 @@ struct LibraryView: View {
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
     @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
     @StateObject private var focusModel = FocusedItemModel()
-    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
-    @ObservedObject private var apiKeys = ApiKeys.shared
     @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
     @ObservedObject private var watchedIndex = WatchedIndex.shared   // series-completion badge (#143) refreshes reactively
     /// Active client-side type segment (Movies / TV / Anime); `.all` keeps the flat, mixed grid.
@@ -89,11 +87,10 @@ struct LibraryView: View {
     @State private var serviceHistoryRevision = 0
     @State private var watchlistRevision = 0
     private enum Destination: Hashable { case downloads, watchlist, history }
-    /// Cinematic landscape cards (TMDB key required) are wider, so fewer per row; portrait keeps 6-up.
+    /// The same Cinema card footprint as Home/Search. Cell and rendered card widths must match.
     private var columns: [GridItem] {
-        catalogPrefs.landscapeCards && apiKeys.hasTMDB
-            ? Array(repeating: GridItem(.fixed(kLandscapeCardWidth), spacing: Theme.Space.lg), count: 3)
-            : Array(repeating: GridItem(.fixed(kPosterWidth), spacing: Theme.Space.lg), count: 6)
+        Array(repeating: GridItem(.fixed(TVGridMetrics.landscapeCellWidth), spacing: Theme.Space.lg),
+              count: TVGridMetrics.landscapeColumns)
     }
 
     var body: some View {
@@ -226,9 +223,10 @@ struct LibraryView: View {
                     LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
                         ForEach(history) { entry in
                             VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                                PosterCard(title: entry.item.name, poster: entry.item.poster, type: entry.item.type,
-                                    id: entry.item.id, progress: entry.item.progress > 0 ? entry.item.progress : nil,
-                                    isWatched: entry.item.isWatched, width: kPosterWidth, landscapeWidth: kLandscapeCardWidth,
+                                TVCinemaCard(presentation: entry.item.tvCinemaPresentation,
+                                    width: TVGridMetrics.landscapeCellWidth,
+                                    progress: entry.item.progress > 0 ? entry.item.progress : nil,
+                                    resumeSeconds: entry.item.resumeSeconds, isWatched: entry.item.isWatched, menu: .none,
                                     directPlay: { openHistory(entry, context: snapshot.context) },
                                     onDetails: { openHistory(entry, context: snapshot.context) })
                                 if let caption = entry.episodeCaption {
@@ -254,8 +252,9 @@ struct LibraryView: View {
             else {
                 LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
                     ForEach(entries) { entry in
-                        PosterCard(title: entry.name ?? entry.id, poster: entry.poster, type: entry.type, id: entry.id,
-                            width: kPosterWidth, landscapeWidth: kLandscapeCardWidth,
+                        TVCinemaCard(presentation: .init(id: entry.id, type: entry.type,
+                            title: entry.name ?? entry.id, poster: entry.poster),
+                            width: TVGridMetrics.landscapeCellWidth, menu: .none,
                             directPlay: {
                                 guard snapshot.context.isCurrent(core: core, profiles: profiles) else { return }
                                 path.append(TVLibraryHistoryTarget(id: entry.id, type: entry.type,
@@ -403,11 +402,11 @@ struct LibraryView: View {
     private func grid(_ items: [CoreCWItem]) -> some View {
         LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
             ForEach(items) { item in
-                PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                           progress: item.progress > 0 ? item.progress : nil,
-                           isWatched: isWatched(item),
-                           width: kPosterWidth, landscapeWidth: kLandscapeCardWidth, menu: .library,
-                           onFocus: { focusModel.focus(item.focusedHero) })
+                TVCinemaCard(presentation: item.tvCinemaPresentation,
+                             width: TVGridMetrics.landscapeCellWidth,
+                             progress: item.progress > 0 ? item.progress : nil,
+                             resumeSeconds: item.resumeSeconds, isWatched: isWatched(item), menu: .library,
+                             onFocus: { focusModel.focus(item.focusedHero) })
             }
         }
         .padding(.horizontal, Theme.Space.screenEdge).padding(.top, Theme.Space.sm)
