@@ -108,17 +108,40 @@ def verify_link_map(manifest: dict, platform: str, link_map: Path) -> dict:
                      if entry["kind"] == "mpv" and entry["slice"] == MPV_SLICES[platform]})
     loaded = {}
     content_hashes = {}
-    for line in link_map.read_text().splitlines():
-        match = re.match(r"^\[\s*\d+\]\s+(.+)$", line)
+    # Symbol names in Apple's map may contain raw, non-UTF-8 bytes. Only Object files
+    # rows are paths used by this proof; never decode or sanitize the symbol tail.
+    # The receipt still hashes the entire original map, including those symbol bytes.
+    lines = link_map.read_bytes().splitlines()
+    object_sections = [index for index, line in enumerate(lines) if line == b"# Object files:"]
+    if len(object_sections) != 1:
+        raise ValueError("link map requires exactly one Object files section")
+    boundaries = [index for index, line in enumerate(lines) if line == b"# Sections:"]
+    if len(boundaries) != 1 or boundaries[0] <= object_sections[0]:
+        raise ValueError("link map lacks a unique Sections boundary after Object files")
+    indexes = set()
+    for line in lines[object_sections[0] + 1:boundaries[0]]:
+        match = re.fullmatch(rb"\[[ \t]*(\d+)\][ \t]+(.+)", line)
         if not match:
-            continue
+            raise ValueError("link map contains a malformed object row")
+        index = int(match.group(1))
+        if index in indexes:
+            raise ValueError(f"link map contains a duplicate object index: {index}")
+        indexes.add(index)
+        try:
+            object_path = match.group(2).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"link map object path is not UTF-8 at index {index}") from error
+        if "\x00" in object_path:
+            raise ValueError(f"link map contains a malformed object path at index {index}")
         # Linker-map archive member syntax: /exact/path/lib.a(member.o).
-        archive_path = match.group(1).rsplit("(", 1)[0]
+        archive_path = object_path.rsplit("(", 1)[0]
         if re.search(r"StremioXCore|libstremiox|NodeMobile", archive_path, re.IGNORECASE):
             raise ValueError(f"legacy engine/runtime contributed to native link: {archive_path}")
         name = Path(archive_path).name
         if name not in expected:
             continue
+        if not re.fullmatch(r".+\([^()]+\)", object_path):
+            raise ValueError(f"native link contains a malformed archive member: {object_path}")
         path = Path(archive_path)
         if not path.is_file():
             raise ValueError(f"native link consumed an unavailable archive: {archive_path}")
