@@ -31,6 +31,22 @@ internal fun interface NativePlaybackResolver {
             throw failure
         }
     }
+
+    /** Playback authority outlives this resolve Job and is independent of newer source loads/prewarm. */
+    suspend fun resolve(source: StreamSource, episode: Episode?, isCurrent: () -> Boolean,
+        playbackIsCurrent: () -> Boolean): Playable {
+        currentCoroutineContext().ensureActive()
+        if (!playbackIsCurrent()) throw CancellationException("Playback owner changed")
+        val result = resolve(source, episode, isCurrent)
+        try {
+            currentCoroutineContext().ensureActive()
+            if (!playbackIsCurrent()) throw CancellationException("Playback owner changed")
+            return result
+        } catch (failure: Throwable) {
+            result.playbackLease?.close()
+            throw failure
+        }
+    }
 }
 
 internal fun nativeDirectPlayable(source: StreamSource): Playable? {
