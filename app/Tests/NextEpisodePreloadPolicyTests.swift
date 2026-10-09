@@ -567,7 +567,8 @@ struct NextEpisodePreloadPolicyTests {
             "PlayerScreen warms the admitted request under its captured source/language choice"
         )
         expect(
-            detail?.contains("request: request,\n        stride: NextEpisodePreparationBudget.providerRotationStride") == true,
+            detail?.contains("EpisodeSourceCollection.rawGroups(sources: sources, episodeID: request.episodeID") == true
+                && detail?.contains("attemptSequence: request.attemptSequence") == true,
             "iOS/macOS production warming rotates providers from the player request sequence"
         )
     }

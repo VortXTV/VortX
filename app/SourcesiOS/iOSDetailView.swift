@@ -41,26 +41,6 @@ func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
     }
 }
 
-/// One add-on's streams for a series episode, fetched straight over the Stremio add-on protocol so the
-/// F6 warm-up never touches the engine's single meta slot (which would evict the playing episode). Mirrors
-/// the tvOS preload's fetchStreams. nil on any failure or an empty answer, so a dead add-on is skipped.
-private func warmFetchEpisodeStreams(
-    base: String,
-    addon: String,
-    id: String,
-    requestTimeout: TimeInterval
-) async -> CoreStreamSourceGroup? {
-    let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
-    guard let url = URL(string: "\(base)/stream/series/\(escaped).json") else { return nil }
-    var request = URLRequest(url: url)
-    request.timeoutInterval = requestTimeout
-    struct Response: Decodable { let streams: [CoreStream]? }
-    guard let (data, _) = try? await URLSession.shared.data(for: request),
-          let response = try? JSONDecoder().decode(Response.self, from: data),
-          let streams = response.streams, !streams.isEmpty else { return nil }
-    return CoreStreamSourceGroup(id: base, addon: addon, streams: streams)
-}
-
 /// Structured, bounded account add-on fetch for iOS/macOS preparation. The user's sticky provider enters the
 /// first five-wide window, ordinary providers keep a short cap, and results return to account order for rank.
 func warmFetchEpisodeSourceGroups(
@@ -68,48 +48,8 @@ func warmFetchEpisodeSourceGroups(
     request: NextEpisodePreparationRequest,
     wantedAddon: String?
 ) async -> [CoreStreamSourceGroup] {
-    let remaining = max(0, min(
-        NextEpisodePreparationBudget.addonFetchBudget,
-        request.deadline - ProcessInfo.processInfo.systemUptime
-    ))
-    guard remaining > 0, !Task.isCancelled else { return [] }
-    let order = PreloadProviderRotation.order(
-        count: sources.count,
-        request: request,
-        stride: NextEpisodePreparationBudget.providerRotationStride,
-        prioritizedIndex: wantedAddon.flatMap { wanted in
-            sources.firstIndex { $0.name.caseInsensitiveCompare(wanted) == .orderedSame }
-        }
-    )
-    let rotatedSources = order.map { sources[$0] }
-    let rotated: [CoreStreamSourceGroup?] = await BoundedPreloadWorkPool.map(
-        rotatedSources,
-        limit: NextEpisodePreparationBudget.addonConcurrencyLimit,
-        timeoutNanoseconds: UInt64(remaining * 1_000_000_000),
-        operationTimeoutFor: { source in
-            UInt64(
-                NextEpisodePreparationBudget.requestTimeout(
-                    addon: source.name,
-                    wantedAddon: wantedAddon
-                ) * 1_000_000_000
-            )
-        }
-    ) { source in
-        await warmFetchEpisodeStreams(
-            base: source.base,
-            addon: source.name,
-            id: request.episodeID,
-            requestTimeout: NextEpisodePreparationBudget.requestTimeout(
-                addon: source.name,
-                wantedAddon: wantedAddon
-            )
-        )
-    }
-    return PreloadProviderRotation.restoreOriginalOrder(
-        rotated,
-        order: order,
-        count: sources.count
-    ).compactMap { $0 }
+    await EpisodeSourceCollection.rawGroups(sources: sources, episodeID: request.episodeID,
+        wantedAddon: wantedAddon, deadline: request.deadline, attemptSequence: request.attemptSequence)
 }
 
 /// Retire one raw-torrent preparation exactly once. A season-pack request can point at the hash already
@@ -217,12 +157,6 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let resolutionBudget = EpisodeResolutionBudget.current
         ?? EpisodeResolutionBudget(episodeID: videoId, origin: .manual, now: ProcessInfo.processInfo.systemUptime)
     guard resolutionBudget.episodeID == videoId else { return nil }
-    if resolutionBudget.origin == .languageRecovery {
-        core.refindSources(type: "series", id: seriesId, streamType: "series", streamId: v.id)
-    } else {
-        core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
-    }
-    var groups: [CoreStreamSourceGroup] = []
     // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on the show id `seriesId`).
     // PlayerScreen also drives its binge auto-next through THIS resolver (a Continue-Watching resume launch), so
     // like the detail-page `loadEpisodeStream` and tvOS it must honor the pick. Settlement waits for every raw
@@ -231,24 +165,16 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let requiredChoice = SeriesSourceSticky.resolvingChoice
     let sticky = choice.source
     let wantedAddon = sticky.addon
-    while true {
-        guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
-        groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
-        // Hints affect ranking only after every registered contributor is terminal or this request reaches the
-        // shared deadline. A fast matching source cannot open the partial set.
-        let progress = core.streamLoadProgress(forStreamId: v.id)
-        let elapsed = resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)
-        if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                        secondsSinceRequestStart: elapsed, rememberedQuality: continuity,
-                                        wantedAddon: wantedAddon) { break }
-        if elapsed >= StreamRanking.completeSetDeadline { break }
-        do {
-            try await Task.sleep(for: .milliseconds(250))
-        } catch {
-            return nil
-        }
+    let sourceOwner = EpisodeSourceOwner(account: account)
+    func admitted() -> Bool {
+        sourceOwner.isCurrent && SeriesSourceSticky.admits(choice)
+            && (requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice))
     }
-    guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
+    guard let groups = await EpisodeSourceCollection.collect(seriesID: seriesId, videoID: v.id,
+        season: v.season ?? defaultSeason, episode: v.episode, title: seriesName,
+        sources: sourceOwner.sources, wantedAddon: wantedAddon,
+        deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
+        isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
     // The SAME sticky (read above) + provider-health terms the player and the preload rank with (diag-21). This
     // is the lane a viewer actually hits by tapping an episode (and the one a Continue-Watching resume uses), so
@@ -278,7 +204,7 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     guard let selected = await iOSResolveRankedEpisodeCandidate(
         candidates, episode: episodeHint, cachedHashes: cachedHashes.isEmpty ? nil : cachedHashes,
         deadline: resolutionBudget.candidateDeadline,
-        stillCurrent: { requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) }
+        stillCurrent: admitted
     ) else { return nil }
     let (best, url, ref) = (selected.stream, selected.url, selected.ref)
     DiagnosticsLog.log("binge", "episode resolve candidate resolved index=\(selected.index) origin=\(resolutionBudget.origin.rawValue) elapsed=\(Int(resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s")
@@ -293,10 +219,10 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
             await account.resumeOffset(for: pm)
         }) else { return nil }
         resume = resolvedResume
-        guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
+        guard admitted() else { return nil }
     }
     guard !Task.isCancelled, resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime),
-          requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
+          admitted() else { return nil }
     if ref == nil { _ = prepareTorrentStream(best) }   // fire-and-forget prime; self-terminating backoff
     return PlayerEpisodeStream(
         stream: best, url: url, meta: pm, title: title, resume: resume,
@@ -5768,38 +5694,22 @@ struct iOSEpisodeStreams: View {
             guard let launchVideo = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
             v = launchVideo
         }
-        if resolutionBudget.origin == .languageRecovery {
-            core.refindSources(type: "series", id: meta.id, streamType: "series", streamId: v.id)
-        } else {
-            core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: v.id)
-        }
-        var groups: [CoreStreamSourceGroup] = []
         // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on `meta.id`, the SAME
         // show id the pin uses and every episode shares). This is the binge auto-next lane (`goToEpisode` calls
         // it through `loadEpisode`), so `StreamRanking.best` applies it only after the complete-set gate closes.
         let choice = SeriesSourceSticky.snapshot(for: meta.id)
         let sticky = choice.source
         let wantedAddon = sticky.addon
-        while true {
-            guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
-            // Target-engine groups only. The page-owned auxiliary contributors are scoped to shownVideo and
-            // must not leak into a different episode being resolved behind the player.
-            groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
-            // Settlement is contributor-complete or request-deadline bounded. Quality and sticky hints cannot
-            // admit a partial set, which is the diag-22 fast-1080p-before-aggregator race.
-            let progress = core.streamLoadProgress(forStreamId: v.id)
-            let elapsed = resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)
-            if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                            secondsSinceRequestStart: elapsed, rememberedQuality: rememberedQuality,
-                                            wantedAddon: wantedAddon) { break }
-            if elapsed >= StreamRanking.completeSetDeadline { break }
-            do {
-                try await Task.sleep(for: .milliseconds(250))
-            } catch {
-                return nil
-            }
+        let sourceOwner = EpisodeSourceOwner(account: account)
+        func admitted() -> Bool {
+            sourceOwner.isCurrent && SeriesSourceSticky.admits(choice)
         }
-        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
+        guard let groups = await EpisodeSourceCollection.collect(seriesID: meta.id, videoID: v.id,
+            season: v.season ?? season, episode: v.episode, title: meta.name,
+            defaultVideoID: meta.behaviorHints?.defaultVideoId,
+            sources: sourceOwner.sources, wantedAddon: wantedAddon,
+            deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
+            isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
         // Next / Prev / list / binge preserve the chosen release when present. Keep the full filtered
         // candidate set for fallback rather than turning the preference into a source exclusion.
         let candidates = StreamRanking.rankedCandidates(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
@@ -5818,7 +5728,7 @@ struct iOSEpisodeStreams: View {
         guard let selected = await iOSResolveRankedEpisodeCandidate(
             candidates, episode: episodeHint, waitForLocalUsenetNode: true,
             deadline: resolutionBudget.candidateDeadline,
-            stillCurrent: { SeriesSourceSticky.admits(choice) }
+            stillCurrent: admitted
         ) else { return nil }
         let (best, url, ref) = (selected.stream, selected.url, selected.ref)
         DiagnosticsLog.log("binge", "episode resolve candidate resolved index=\(selected.index) origin=\(resolutionBudget.origin.rawValue) elapsed=\(Int(resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s")
@@ -5829,7 +5739,7 @@ struct iOSEpisodeStreams: View {
         guard let resolvedResume = await BoundedPreloadWorkPool.valueBeforeDeadline(resolutionBudget.admissionDeadline, operation: {
             await localResume(pm)
         }) else { return nil }
-        guard !Task.isCancelled, SeriesSourceSticky.admits(choice),
+        guard admitted(),
               resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else { return nil }
         lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
         torrentPrime?.cancel(); torrentPrime = ref == nil ? prepareTorrentStream(best) : nil

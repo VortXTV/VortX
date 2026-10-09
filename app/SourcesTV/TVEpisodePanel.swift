@@ -155,7 +155,7 @@ struct TVPlayerSourcesPanel: View {
 
 /// Resolve another episode of the playing series to a ready-to-present `PlaybackRequest`, the bare tvOS
 /// AVPlayer's twin of `TVPlayerView.play(episode:)` and the iOS `iOSResolveEpisodeStream`. It loads the
-/// episode's streams through the engine, waits on the same settle gate the launch path uses (so it lands on
+/// episode's streams through an isolated bounded collector, waits on the same settle gate (so it lands on
 /// the SAME quality the viewer was watching, not the first torrent that answers), ranks the best (honouring
 /// the source pin), primes the torrent on the embedded server if the best is one, and hands back a request.
 ///
@@ -169,24 +169,19 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     let episode = EpisodePlaybackIdentity.provenEpisodeNumbers(
         season: v.season, episode: episodeNumber
     ).map { DebridEpisode(season: $0.season, episode: $0.episode) }
-    let settlementStartedAt = Date()
-    core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
-    var groups: [CoreStreamSourceGroup] = []
-    while true {
-        guard !Task.isCancelled else { return nil }
-        groups = core.streamGroups(forStreamId: v.id)
-        let progress = core.streamLoadProgress(forStreamId: v.id)
-        let elapsed = Date().timeIntervalSince(settlementStartedAt)
-        if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                        secondsSinceRequestStart: elapsed, rememberedQuality: continuity) { break }
-        if elapsed >= StreamRanking.completeSetDeadline { break }
-        do {
-            try await Task.sleep(for: .milliseconds(250))
-        } catch {
-            return nil
-        }
+    let budget = EpisodeResolutionBudget.current
+        ?? EpisodeResolutionBudget(episodeID: v.id, origin: .manual, now: ProcessInfo.processInfo.systemUptime)
+    guard budget.episodeID == v.id else { return nil }
+    let owner = EpisodeSourceOwner(account: account)
+    let choice = SeriesSourceSticky.snapshot(for: seriesId)
+    func admitted() -> Bool {
+        owner.isCurrent && SeriesSourceSticky.admits(choice)
     }
-    guard !Task.isCancelled else { return nil }
+    guard let groups = await EpisodeSourceCollection.collect(seriesID: seriesId, videoID: v.id,
+        season: v.season, episode: v.episode, title: seriesName,
+        sources: owner.sources, wantedAddon: choice.addon,
+        deadline: budget.startedAt + SourceSettlementPolicy.maximumWait,
+        isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
     // The SAME sticky + provider-health terms the player and the preload rank with (diag-21). This is the lane
     // a viewer actually hits by tapping an episode, so ranking it without them would hand that tap to whichever
@@ -194,7 +189,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     // "it switched my source again" report. `seriesId` is the show id, the same key `pin` above uses, and this
     // whole function is series-only by construction (`loadMeta(type: "series", …)`). @MainActor, so reading the
     // main-actor store here needs no snapshot.
-    let sticky = SeriesSourceSticky.preference(for: seriesId)
+    let sticky = choice.source
     // Launch / advance lane: the remembered pick must YIELD to a MATERIALLY better source for THIS episode
     // (a higher source-type tier or a cache hit), not stick over a better debrid/usenet on later episodes.
     // Soft sticky still floats the pick among near-identical releases, so a binge stays consistent without
@@ -202,18 +197,25 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     let candidates = StreamRanking.rankedCandidates(
         groups, continuity: continuity, binge: binge, pin: pin,
         sticky: sticky, stickyAuthoritative: false,
+        preserveChosenRelease: true, desiredAudioLanguage: choice.audioLanguage,
         providerPenalty: { ProviderHealth.penaltyActive(addonName: $0) }
-    )
+    ).filter { !SeriesSourceSticky.rejectedStreams.contains($0.id) }
     var selected: (stream: CoreStream, url: URL, ref: DebridPlaybackRef?)?
-    for candidate in candidates {
+    for (index, candidate) in candidates.enumerated() {
+        guard admitted(), let legDeadline = EpisodeResolutionBudget.candidateLegDeadline(
+            overallDeadline: budget.candidateDeadline, now: ProcessInfo.processInfo.systemUptime,
+            isUsenet: candidate.isUsenet, remainingCandidates: candidates.count - index) else { return nil }
         let ref: DebridPlaybackRef?
         if episode != nil, candidate.isTorrent || candidate.isUsenet {
-            ref = await DebridCoordinator.shared.resolvedPlaybackRef(
-                for: candidate, episode: episode
-            )
+            ref = await BoundedPreloadWorkPool.valueBeforeDeadline(legDeadline) {
+                await DebridCoordinator.shared.resolvedPlaybackRef(for: candidate, episode: episode,
+                    waitForLocalUsenetNode: candidate.isUsenet,
+                    usenetResolveTimeout: .seconds(max(0, legDeadline - ProcessInfo.processInfo.systemUptime)))
+            } ?? nil
         } else {
             ref = nil
         }
+        guard admitted(), budget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else { return nil }
         if let url = EpisodePlaybackIdentity.resolvedEpisodeMediaURL(
             isUsenet: candidate.isUsenet, resolvedURL: ref?.url,
             fallbackURL: candidate.playableURL(isEpisode: true)
@@ -222,7 +224,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
             break
         }
     }
-    guard let selected else { return nil }
+    guard let selected, admitted(), budget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else { return nil }
     let stream = selected.stream
     let rawBase = groups.first(where: { $0.streams.contains(stream) })?.id
     let base = rawBase.flatMap { URL(string: $0)?.scheme == nil ? nil : $0 }
