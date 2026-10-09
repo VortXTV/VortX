@@ -358,6 +358,12 @@ interface CatalogRepository {
         forceRefresh: Boolean = false,
     ): Result<List<StreamGroup>>
 
+    /** Independent batch downloads require explicit owner and source admission; legacy repositories fail closed. */
+    fun captureDownloadSession(expectedOwner: ContinueWatchingOwner): DownloadSourceSession? = null
+
+    /** Capture a visible source once so a queued download can renew after later player source loads. */
+    fun pinDownloadSource(expectedOwner: ContinueWatchingOwner, source: StreamSource, episode: Episode? = null): DownloadSourceResolver? = null
+
     /**
      * Incremental stream fan-out. Implementations emit partial snapshots and one terminal snapshot after
      * every requested add-on has answered, including the authoritative all-empty result.

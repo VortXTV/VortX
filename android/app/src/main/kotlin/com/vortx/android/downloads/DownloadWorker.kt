@@ -128,7 +128,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
             return@withContext Result.success()
         }
         if (!DownloadManager.claimTransfer(id, generation)) return@withContext Result.success()
-        val record = DownloadStore.record(id) ?: run {
+        var record = DownloadStore.record(id) ?: run {
             DownloadManager.handleTransferStopped(id, generation)
             return@withContext Result.success()
         }
@@ -137,7 +137,9 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
             .onFailure { Log.w(TAG, "could not enter foreground for ${record.id}", it) }
 
         try {
-            val prepared = transfer(record, generation)
+            record = DownloadManager.prepareSourceLease(id, generation)
+                ?: throw StaleDebridOwnerException()
+            val prepared = if (record.isHlsOffline) transferHls(record, generation) else transfer(record, generation)
             // Cancellation between the last byte and here would otherwise report a completion for a transfer the user
             // just paused. isStopped is the authoritative check.
             if (isStopped) {
@@ -151,6 +153,12 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
             }
             Result.success()
         } catch (_: StaleTransferGenerationException) {
+            if (!DownloadManager.isDebridOwnerCurrent(record)) {
+                DownloadManager.handleDebridOwnerChanged(id, generation)
+            } else {
+                // Failed admission may race lifecycle retirement; this only parks an owned generation.
+                DownloadManager.handleTransferStopped(id, generation)
+            }
             Result.success()
         } catch (_: StaleDebridOwnerException) {
             DownloadManager.handleDebridOwnerChanged(id, generation)
@@ -177,6 +185,47 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 DownloadManager.FailureVerdict.IGNORED -> Result.success()
             }
         }
+    }
+
+    private fun transferHls(record: DownloadRecord, generation: String): PreparedDownload {
+        val staging = DownloadStore.partFileFor(record)
+        val destination = DownloadStore.artifactFor(record)
+        val downloader = HlsOfflinePackageDownloader()
+        fun requireCurrent() {
+            if (isStopped) throw kotlinx.coroutines.CancellationException("Download stopped")
+            ensureOwnsTransfer(record.id, generation)
+            ensureDebridOwner(record)
+        }
+        downloader.completedPackage(destination, record.remoteURL, record.headers.orEmpty(), ::requireCurrent)?.let {
+            // A crash can occur after the atomic directory rename but before the completed index write.
+            return PreparedDownload(destination, destination, it.totalBytes)
+        }
+        var lastProgressAt = 0L
+        val result = downloader.download(
+            rootUrl = record.remoteURL,
+            headers = record.headers.orEmpty(),
+            directory = staging,
+            ensureCurrent = ::requireCurrent,
+            mutateFile = { mutation ->
+                val accepted = DownloadManager.performTransferFileMutation(record.id, generation) {
+                    try { mutation() }
+                    catch (failure: java.io.IOException) {
+                        throw DownloadWriteException("Could not save the HLS package", failure)
+                    }
+                }
+                if (!accepted) throw StaleTransferGenerationException()
+            },
+            progress = { bytes ->
+                val now = System.currentTimeMillis()
+                if (now - lastProgressAt >= PROGRESS_MIN_INTERVAL_MS) {
+                lastProgressAt = now
+                DownloadManager.handleTransferProgress(record.id, generation, persistIndex = false) {
+                    it.copy(bytesDone = bytes, bytesTotal = 0L)
+                } ?: throw StaleTransferGenerationException()
+                }
+            },
+        )
+        return PreparedDownload(staging, destination, result.totalBytes)
     }
 
     /**
@@ -412,6 +461,7 @@ class DownloadWorker(context: Context, params: WorkerParameters) : CoroutineWork
 
     /** Rename the completed partial onto its real filename. A rename inside one directory moves no bytes. */
     private fun finalize(partFile: File, destination: File) {
+        if (partFile == destination) return // Already published package, fully reverified by transferHls.
         runCatching { destination.delete() }
         if (!partFile.renameTo(destination)) {
             throw DownloadWriteException(

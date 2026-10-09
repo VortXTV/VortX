@@ -363,7 +363,7 @@ private suspend fun playLocal(record: DownloadRecord, onPlay: (Playable) -> Unit
 
     val resolution = withContext(Dispatchers.IO) {
         val file = DownloadStore.fileFor(record)
-        if (!file.isFile) return@withContext null
+        if (!DownloadStore.fileExists(record)) return@withContext null
         DownloadedMediaCapabilityResolver.resolve(
             record = record,
             file = file,
@@ -379,7 +379,8 @@ private suspend fun playLocal(record: DownloadRecord, onPlay: (Playable) -> Unit
         )
     }
     if (resolution == null) {
-        if (record.state == DownloadState.COMPLETED) DownloadManager.cancel(record.id)
+        if (record.isHlsOffline) DownloadManager.markLocalPackageUnavailable(record)
+        else if (record.state == DownloadState.COMPLETED) DownloadManager.cancel(record.id)
         return
     }
     onPlay(

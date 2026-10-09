@@ -13,6 +13,9 @@ import com.vortx.android.debrid.DebridResolver
 import com.vortx.android.debrid.DebridService
 import com.vortx.android.catalog.DetailMetaRecoveryPolicy
 import com.vortx.android.downloads.DownloadManager
+import com.vortx.android.downloads.BatchDownloadCoordinator
+import com.vortx.android.downloads.BatchDownloadPolicy
+import com.vortx.android.downloads.BatchDownloadSnapshot
 import com.vortx.android.engine.SourceListModel
 import com.vortx.android.engine.StreamRanking
 import com.vortx.android.integrations.buildMediaRef
@@ -1532,18 +1535,29 @@ class DetailViewModel(
     ///
     /// Fail-soft, honestly: a raw torrent with no debrid key cannot be resolved to a direct URL on Android
     /// (torrent-to-disk needs the streaming server, not yet wired), so [repo.resolve] throws and its message is
-    /// shown on [_downloadNotice] rather than silently doing nothing. An HLS / non-media source is caught inside
-    /// [DownloadManager.download] (it returns a FAILED record whose error text the notice surfaces).
+    /// shown on [_downloadNotice]. Finite HLS is saved as a verified local package; unsupported formats fail
+    /// through the same queue state and error controls.
     fun download(source: StreamSource) {
         val detail = (_meta.value as? UiState.Success)?.data ?: return
         val episode = detail.videos.firstOrNull { it.id == _selectedEpisodeId.value }
         val actionOwner = debridKeys.ownerToken()
+        val downloadResolver = repo.pinDownloadSource(repo.continueWatchingOwner(), source, episode)
+        if (source.nativePlaybackToken != null && downloadResolver == null) {
+            _downloadNotice.value = "This source selection expired. Refresh sources and try again."
+            return
+        }
         _downloadNotice.value = "Preparing download…"
         viewModelScope.launch {
-            resolveForOwner(source, episode, actionOwner).fold(
+            (downloadResolver?.resolve() ?: resolveForOwner(source, episode, actionOwner)).fold(
                 onSuccess = { playable ->
                     if (!isActionOwnerCurrent(actionOwner)) {
+                        playable.playbackLease?.close()
                         _downloadNotice.value = OWNER_CHANGED_MESSAGE
+                        return@fold
+                    }
+                    if (downloadResolver != null) {
+                        val record = DownloadManager.downloadResolved(downloadResolver, playable, source, detail, episode, actionOwner)
+                        _downloadNotice.value = record?.let(::downloadNoticeFor) ?: OWNER_CHANGED_MESSAGE
                         return@fold
                     }
                     val debridDownloadOwner = actionOwner?.takeIf {
@@ -1571,6 +1585,7 @@ class DetailViewModel(
                         requestHeaders = playable.headers.takeIf { it.isNotEmpty() },
                         debridOwnerIdentity = debridDownloadOwner?.identity,
                         debridOwnerGeneration = debridDownloadOwner?.generation,
+                        sourceLease = playable.playbackLease,
                     )
                     _downloadNotice.value = downloadNoticeFor(record)
                 },
@@ -1578,6 +1593,30 @@ class DetailViewModel(
             )
         }
     }
+
+    private val batchDownloadCoordinator = BatchDownloadCoordinator(repo, viewModelScope)
+    val batchDownloads = batchDownloadCoordinator.state
+
+    fun startBatchDownload(episodeIds: Set<String>, desiredSource: StreamSource? = null) {
+        val detail = (_meta.value as? UiState.Success)?.data ?: return
+        val owner = repo.continueWatchingOwner()
+        val debridOwner = debridKeys.ownerToken()
+        val episodes = runCatching { BatchDownloadPolicy.select(detail, episodeIds) }.getOrElse {
+            _downloadNotice.value = it.message ?: "Choose episodes to download."
+            return
+        }
+        val snapshot = BatchDownloadSnapshot(detail, episodes, owner, debridOwner,
+            sourcePrefs.snapshot(detailSourceAudioLanguages(_sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
+                isKids = ProfileStore.sharedOrNull()?.activeIsKids == true),
+            desiredSource, currentPin(), sourceSticky.preference(id), PlaybackBehaviorSettings.directLinksOnly(app))
+        batchDownloadCoordinator.start(snapshot) {
+            isRouteAdmissionCurrent() && debridKeys.ownerToken() == debridOwner &&
+                (_meta.value as? UiState.Success)?.data?.let { it.id == detail.id && it.type == detail.type } == true
+        }
+    }
+
+    /** Accepted queue items keep their manager-owned producers; only remaining source preparation stops. */
+    fun cancelBatchDownload() = batchDownloadCoordinator.cancel()
 
     /// The transient status line for a just-created download, read off the record [DownloadManager.download]
     /// returned: a FAILED record (HLS / non-media, caught inside the manager) shows its own honest reason; a

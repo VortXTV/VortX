@@ -41,7 +41,7 @@ object DownloadStore {
     private val hydrationGate = OneTimeHydrationGate()
     private const val RECLAIM_TOMBSTONE_SUFFIX = ".reclaiming"
     private val managedMediaFilename = Regex(
-        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(mp4|mkv|avi|mov|m4v|webm|ts|flv|wmv)$",
+        "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.(mp4|mkv|avi|mov|m4v|webm|ts|flv|wmv|hls)$",
     )
 
     /** Newest-first, matching Apple's `records` ordering, for direct consumption by the downloads list. */
@@ -81,7 +81,11 @@ object DownloadStore {
      * Absolute file for a record's media, rebuilt from the CURRENT `filesDir` so a relocated app data dir never
      * strands a stored absolute path (the reason Apple persists only the filename stem, not a path).
      */
-    fun fileFor(record: DownloadRecord): File = File(downloadsDirectory(), record.localFilename)
+    internal fun artifactFor(record: DownloadRecord): File = File(downloadsDirectory(), record.localFilename)
+
+    fun fileFor(record: DownloadRecord): File = if (record.isHlsOffline) {
+        File(artifactFor(record), "index.m3u8")
+    } else artifactFor(record)
 
     /**
      * The in-progress file a transfer appends to, renamed onto [fileFor] only once the transfer completes.
@@ -122,7 +126,9 @@ object DownloadStore {
      * True when the media file for a completed record actually exists on disk (guards play-from-local against a
      * row whose file was purged out from under us -- Android reclaims app storage under pressure much as tvOS does).
      */
-    fun fileExists(record: DownloadRecord): Boolean = fileFor(record).isFile
+    fun fileExists(record: DownloadRecord): Boolean = if (record.isHlsOffline) {
+        HlsOfflinePackage.verify(artifactFor(record), fullHash = false) != null
+    } else fileFor(record).isFile
 
     // MARK: Persistence
 
@@ -258,7 +264,9 @@ object DownloadStore {
         val media = managedFilesFor(record)?.media ?: return false
         return runCatching {
             val uri = URI(rawUri)
-            uri.scheme.equals("file", ignoreCase = true) && File(uri).canonicalFile == media.canonicalFile
+            val expected = if (record.isHlsOffline) File(media, "index.m3u8") else media
+            uri.scheme.equals("file", ignoreCase = true) && File(uri).canonicalFile == expected.canonicalFile &&
+                (!record.isHlsOffline || expected.canonicalFile.parentFile == media)
         }.getOrDefault(false)
     }
 
@@ -268,7 +276,7 @@ object DownloadStore {
     ): DownloadReclaimTransaction.Result {
         val files = managedFilesFor(record) ?: return DownloadReclaimTransaction.Result.FILE_RENAME_FAILED
         val remaining = current.filterNot { it.id == record.id }
-        return DownloadReclaimTransaction().reclaim(
+        return reclaimTransaction(record.isHlsOffline).reclaim(
             mediaFile = files.media,
             tombstoneFile = files.tombstone,
             stalePartFile = files.part,
@@ -284,6 +292,16 @@ object DownloadStore {
     }
 
     private data class ManagedFiles(val media: File, val part: File, val tombstone: File)
+
+    /** Directory packages participate in the same rename/index-commit/rollback transaction as files. */
+    private fun reclaimTransaction(hls: Boolean): DownloadReclaimTransaction = if (!hls) {
+        DownloadReclaimTransaction()
+    } else DownloadReclaimTransaction(object : DownloadReclaimTransaction.FileOps {
+        override fun exists(file: File) = file.exists()
+        override fun isFile(file: File) = file.isDirectory && file.canonicalFile == file.absoluteFile
+        override fun rename(source: File, destination: File) = source.renameTo(destination)
+        override fun delete(file: File) = HlsOfflinePackage.safeDelete(file)
+    })
 
     /**
      * Validate every filename before deletion/rename. A corrupted or hostile index can still render a row, but it
@@ -325,7 +343,7 @@ object DownloadStore {
                     val record = recordsByFilename[mediaName]
                     val media = runCatching { File(directory, mediaName).canonicalFile }.getOrNull() ?: return@forEach
                     if (media.parentFile != directory || media.name != mediaName) return@forEach
-                    DownloadReclaimTransaction().recoverTombstone(
+                    reclaimTransaction(mediaName.endsWith(".hls")).recoverTombstone(
                         mediaFile = media,
                         tombstoneFile = canonicalArtifact,
                         indexStillHasRecord = record != null,
@@ -335,7 +353,9 @@ object DownloadStore {
                     val mediaName = name.removeSuffix(".part")
                     if (!managedMediaFilename.matches(mediaName)) return@forEach
                     val record = recordsByFilename[mediaName]
-                    if (record == null || record.state == DownloadState.COMPLETED) runCatching { canonicalArtifact.delete() }
+                    if (record == null || record.state == DownloadState.COMPLETED) runCatching {
+                        if (mediaName.endsWith(".hls")) HlsOfflinePackage.safeDelete(canonicalArtifact) else canonicalArtifact.delete()
+                    }
                 }
             }
         }
@@ -353,8 +373,10 @@ object DownloadStore {
      */
     fun totalBytesOnDisk(): Long = _records.value.sumOf { record ->
         runCatching {
-            val done = fileFor(record).takeIf { it.isFile }?.length() ?: 0L
-            val partial = partFileFor(record).takeIf { it.isFile }?.length() ?: 0L
+            val done = if (record.isHlsOffline) HlsOfflinePackage.safeSize(artifactFor(record))
+                else fileFor(record).takeIf { it.isFile }?.length() ?: 0L
+            val partial = if (record.isHlsOffline) HlsOfflinePackage.safeSize(partFileFor(record))
+                else partFileFor(record).takeIf { it.isFile }?.length() ?: 0L
             done + partial
         }.getOrDefault(0L)
     }
@@ -453,6 +475,9 @@ object DownloadStore {
         record.debridOwnerIdentity?.let { put("debridOwnerIdentity", it) }
         record.debridOwnerGeneration?.let { put("debridOwnerGeneration", it) }
         put("localFilename", record.localFilename)
+        put("isHlsOffline", record.isHlsOffline)
+        put("requiresSourceLease", record.requiresSourceLease)
+        put("requiresSourceAuthority", record.requiresSourceAuthority)
         put("bytesTotal", record.bytesTotal)
         put("bytesDone", record.bytesDone)
         put("state", record.state.wireValue)
@@ -494,6 +519,9 @@ object DownloadStore {
                 null
             },
             localFilename = json.optString("localFilename"),
+            isHlsOffline = json.optBoolean("isHlsOffline", false),
+            requiresSourceLease = json.optBoolean("requiresSourceLease", false),
+            requiresSourceAuthority = json.optBoolean("requiresSourceAuthority", false),
             bytesTotal = json.optLong("bytesTotal", 0L),
             bytesDone = json.optLong("bytesDone", 0L),
             state = DownloadState.fromWire(json.optString("state")),
@@ -553,7 +581,8 @@ object DownloadStore {
     }
 
     private fun hasManagedCanonicalIdentity(record: DownloadRecord): Boolean =
-        managedMediaFilename.matches(record.localFilename) && record.localFilename.startsWith("${record.id}.")
+        managedMediaFilename.matches(record.localFilename) && record.localFilename.startsWith("${record.id}.") &&
+            (record.isHlsOffline == record.localFilename.endsWith(".hls"))
 
     private fun JSONObject.requiredNonBlankString(key: String): String? =
         (opt(key) as? String)?.takeIf { it.isNotBlank() }

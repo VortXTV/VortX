@@ -86,6 +86,26 @@ fun TvDownloadsScreen(
     val totalSize = remember(records) { DownloadStore.formattedTotalSize() }
     val colors = VortXTheme.colors
     var showLinkSheet by remember { mutableStateOf(false) }
+    var showQueue by remember { mutableStateOf(false) }
+    var restoreQueueFocus by remember { mutableStateOf(false) }
+    val queueFocus = remember { FocusRequester() }
+
+    LaunchedEffect(showQueue) {
+        if (!showQueue && restoreQueueFocus) {
+            runCatching { queueFocus.requestFocus() }
+            restoreQueueFocus = false
+        }
+    }
+    if (showQueue) {
+        TvDownloadQueueScreen(
+            onBack = {
+                restoreQueueFocus = true
+                showQueue = false
+            },
+            modifier = modifier,
+        )
+        return
+    }
 
     Box(modifier = modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -98,6 +118,12 @@ fun TvDownloadsScreen(
             ) {
                 Text("Downloads", style = VortXTheme.type.screenTitle)
                 Spacer(Modifier.weight(1f))
+                TvFilterChip(
+                    label = "Manage queue",
+                    selected = false,
+                    onClick = { showQueue = true },
+                    modifier = Modifier.focusRequester(queueFocus),
+                )
                 // Ad-hoc "Play a link": the couch entry to play a direct/debrid stream URL pasted from a phone.
                 TvFilterChip(label = "Play a link", selected = false, onClick = { showLinkSheet = true })
                 if (records.isNotEmpty()) {
@@ -379,7 +405,7 @@ private suspend fun tvPlayLocal(record: DownloadRecord, onPlay: (Playable) -> Un
     if (record.state != DownloadState.COMPLETED) return
     val resolution = withContext(Dispatchers.IO) {
         val file = DownloadStore.fileFor(record)
-        if (!file.isFile) return@withContext null
+        if (!DownloadStore.fileExists(record)) return@withContext null
         DownloadedMediaCapabilityResolver.resolve(
             record = record,
             file = file,
@@ -395,7 +421,8 @@ private suspend fun tvPlayLocal(record: DownloadRecord, onPlay: (Playable) -> Un
         )
     }
     if (resolution == null) {
-        if (record.state == DownloadState.COMPLETED) DownloadManager.cancel(record.id)
+        if (record.isHlsOffline) DownloadManager.markLocalPackageUnavailable(record)
+        else if (record.state == DownloadState.COMPLETED) DownloadManager.cancel(record.id)
         return
     }
     onPlay(

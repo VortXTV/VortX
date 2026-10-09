@@ -691,6 +691,13 @@ internal class VortxNativeSession private constructor(
     }
     @Synchronized private fun current(name: String, slot: Slot): Boolean = accepts(slot.owner) && slots[name] === slot
 
+    /** Retire only this consumer's captured owner, even after that owner has become stale. */
+    @Synchronized fun release(name: String, owner: VortxNativeOwner) {
+        val slot = slots[name]?.takeIf { it.owner == owner } ?: return
+        slots.remove(name)
+        slot.bridge.close()
+    }
+
     /** Parsing may occur off-lock; publication must still belong to the exact latest consumer load. */
     @Synchronized fun <T> publish(name: String, owner: VortxNativeOwner, pages: List<VortxResourceSnapshot>, action: () -> T): T = owned(owner) {
         check(slots[name]?.completed == pages.map { it.requestId to it.generation }) { "Native request superseded" }

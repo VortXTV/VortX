@@ -7,9 +7,15 @@ import android.util.Log
 import androidx.work.ExistingWorkPolicy
 import androidx.work.WorkManager
 import com.vortx.android.debrid.DebridKeys
+import com.vortx.android.debrid.DebridOwnerToken
+import com.vortx.android.data.DownloadSourceResolver
 import com.vortx.android.model.DownloadRecord
 import com.vortx.android.model.DownloadState
 import com.vortx.android.model.StreamSource
+import com.vortx.android.model.Episode
+import com.vortx.android.model.MetaDetail
+import com.vortx.android.model.Playable
+import com.vortx.android.engine.StreamRanking
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -19,15 +25,16 @@ import java.util.concurrent.Executor
 /**
  * The coordinator for offline downloads. Android port of Apple `app/SourcesShared/DownloadManager.swift`.
  *
- * ONE download = GET an http(s) URL to a local file. Apple splits this across TWO transports (a `.background`
+ * One download is a progressive file or a verified finite HLS package. Apple splits file transfers across TWO transports (a `.background`
  * URLSession for debrid/direct/HTTP, and a `.default` foreground session wrapped in a UIKit background-task
  * assertion for loopback torrent URLs, because the in-app streaming server must stay alive). Android needs only
  * ONE: a [DownloadWorker] running under WorkManager as a foreground service. That single transport covers both
  * Apple modes because:
  *
- *  * **Process-death survival** (Apple's reason for `.background`): WorkManager persists the work in its own
- *    database and re-runs the worker in a fresh process. That is strictly stronger than URLSession resume data,
- *    which Apple holds only in memory and loses on relaunch.
+ *  * WorkManager persists scheduled work. An owner-independent file resumes only with a strong validator;
+ *    an HLS package resumes only with a complete integrity receipt. Native-admitted sources retain an ephemeral
+ *    owner-bound resolver and must be selected again after process death; persisted capability URLs alone cannot
+ *    authorize a new native session.
  *  * **Keeping the streaming server alive** (Apple's reason for the foreground session + `beginBackgroundTask`):
  *    a WorkManager worker runs IN the app process, and `setForeground` holds a foreground-service notification
  *    that keeps that process alive. So a torrent-to-disk transfer keeps the loopback server up for free.
@@ -36,18 +43,14 @@ import java.util.concurrent.Executor
  *    revived the worker into a process whose engine has not started its server), the loopback GET simply fails and
  *    the record parks resumable, exactly as Apple's torrent transfer does when its server dies.
  *
- * WHAT IS DELIBERATELY NOT PORTED (each fails honestly rather than silently doing nothing):
- *  * **HLS offline** (`.m3u8`). Apple downloads these on iOS ONLY, via `AVAssetDownloadTask` into a system-managed
- *    `.movpkg`, and fails honestly on tvOS/macOS where that API does not exist. Android has no `.movpkg` analogue;
- *    the equivalent would be a Media3 `DownloadService` writing an opaque cache, which is a different architecture
- *    from this subsystem's `<id>.<ext>` flat file + `index.json` record schema. So Android takes the SAME honest
- *    failure Apple's tvOS/macOS branch takes. See [isHLSPlaylistURL].
+ *  * Finite HLS VOD uses [HlsOfflinePackageDownloader], saving a local playlist, segments, maps and supported
+ *    identity keys as one verified directory. Unsupported live/DRM/rendition forms fail with a clear reason.
  *  * **Auto-delete watched downloads** is opt-in and only accepts a history-owned,
  *    [WatchedDownloadReclaimRequest] after that exact watched write committed and the local decoder released its
  *    file. It deliberately does not read `WatchedIndex`: that series-level Home badge becomes true after any
  *    episode and would over-delete the rest of a show.
- *  * **The batch coordinator** (`iOSBatchDownloadCoordinator.swift`, "download season 2"). It sits on top of THIS
- *    core plus the ranking settle loop and the contributor merges; it is its own unit.
+ *  * [BatchDownloadCoordinator] prepares selected episodes sequentially through isolated, captured-owner
+ *    source sessions. All accepted items use this same concurrency-limited queue.
  *
  * All state writes go through [DownloadStore] (the local index). Nothing here writes a `libraryItem` document or
  * syncs the list. Apple's manager is `@MainActor`-isolated; this one uses [lock] instead because [DownloadWorker]
@@ -58,7 +61,7 @@ object DownloadManager {
 
     private const val TAG = "downloads"
     private const val OWNER_CHANGED_ERROR =
-        "The VortX account that created this debrid download is no longer active."
+        "This download's source session is no longer active. Select the source again to restart it."
 
     private const val PREFS = "vortx.downloads"
     const val MAX_CONCURRENT_KEY = "vortx.downloads.maxConcurrent"
@@ -130,6 +133,7 @@ object DownloadManager {
      * this starts empty and is refilled by revived workers through [claimTransfer] or by [reconcileInFlight].
      */
     private val activeGenerations = mutableMapOf<String, String>()
+    private val sourceLeases = DownloadSourceLeases()
 
     /**
      * A generation published to the local index but whose WorkManager enqueue operation has not completed yet.
@@ -217,6 +221,32 @@ object DownloadManager {
 
     // MARK: Public API
 
+    /** Consumes the resolved producer exactly once, including rejection/duplicate paths. */
+    internal fun downloadResolved(resolver: DownloadSourceResolver, playable: Playable, source: StreamSource,
+        detail: MetaDetail, episode: Episode?, owner: DebridOwnerToken?): DownloadRecord? = synchronized(lock) {
+        var handedOff = false
+        try {
+            val identity = playable.playbackContext
+            if (!(identity != null && identity.contentId == detail.id && identity.videoId == (episode?.id ?: detail.id) &&
+                identity.type == detail.type.id && identity.season == episode?.season && identity.episode == episode?.episode &&
+                identity.owner.profileId == resolver.owner.profileId && identity.nativeSessionRevision == resolver.owner.revision))
+                return@synchronized null
+            var accepted: DownloadRecord? = null
+            resolver.admit {
+                val boundOwner = owner?.takeIf { source.isTorrent || source.isUsenet }
+                accepted = download(source, detail.id, episode?.id ?: detail.id, detail.type.id,
+                    detail.name, detail.poster, episode?.season, episode?.episode, playable.url,
+                    source.addon, StreamRanking.qualityLabel(source), playable.isDolbyVision, playable.isAtmos,
+                    playable.headers.takeIf { it.isNotEmpty() }, boundOwner?.identity, boundOwner?.generation,
+                    playable.playbackLease, resolver)
+                handedOff = true
+            }
+            accepted
+        } finally {
+            if (!handedOff) runCatching { playable.playbackLease?.close() }
+        }
+    }
+
     /**
      * Begin downloading [stream] for the given title, fetching the already-resolved [resolvedUrl] (the SAME URL the
      * player would have used -- debrid/direct https, or the loopback torrent URL). Returns the record. No-ops to the
@@ -247,6 +277,8 @@ object DownloadManager {
         requestHeaders: Map<String, String>? = null,
         debridOwnerIdentity: String? = null,
         debridOwnerGeneration: Long? = null,
+        sourceLease: AutoCloseable? = null,
+        sourceRenewal: DownloadSourceResolver? = null,
     ): DownloadRecord = synchronized(lock) {
         DownloadStore.records.value.firstOrNull { it.videoId == videoId && it.state != DownloadState.FAILED }
             ?.let { existing ->
@@ -256,6 +288,7 @@ object DownloadManager {
                 ) {
                     cancelWork(existing.id)
                     releaseSlotReservation(existing.id, existing.transferGeneration)
+                    sourceLeases.remove(existing.id)
                     DownloadStore.update(existing.id) {
                         it.copy(
                             state = DownloadState.FAILED,
@@ -264,13 +297,15 @@ object DownloadManager {
                         )
                     }
                 } else {
+                    runCatching { sourceLease?.close() }
                     if (existing.state == DownloadState.PAUSED) resume(existing.id)
                     return@synchronized existing
                 }
             }
 
         val id = UUID.randomUUID().toString()
-        val ext = fileExtension(resolvedUrl)
+        val hls = isHLSPlaylistURL(resolvedUrl)
+        val ext = if (hls) "hls" else fileExtension(resolvedUrl)
         val headers = requestHeaders?.takeIf { it.isNotEmpty() }
         if (
             !DownloadDebridOwnerPolicy.isCurrent(
@@ -286,30 +321,11 @@ object DownloadManager {
                 isTorrent = stream.isTorrent, headers = headers, remoteURL = resolvedUrl,
                 debridOwnerIdentity = debridOwnerIdentity,
                 debridOwnerGeneration = debridOwnerGeneration,
-                localFilename = "$id.$ext", state = DownloadState.FAILED,
+                localFilename = "$id.$ext", isHlsOffline = hls, state = DownloadState.FAILED,
                 errorText = OWNER_CHANGED_ERROR,
             )
             DownloadStore.upsert(failed)
-            return@synchronized failed
-        }
-
-        // HLS sources (adaptive .m3u8) cannot be saved by a single-file transfer -- it fetches only the playlist,
-        // not the media segments. Apple downloads them properly on iOS via AVAssetDownloadTask and fails honestly
-        // everywhere else; Android has no equivalent, so it takes that same honest failure. (An embed page that does
-        // not end in .m3u8 is caught post-download by the content sniff in DownloadWorker.)
-        if (!stream.isTorrent && isHLSPlaylistURL(resolvedUrl)) {
-            val failed = DownloadRecord(
-                id = id, contentId = contentId, videoId = videoId, type = type, name = name, poster = poster,
-                season = season, episode = episode, sourceName = sourceName, qualityText = qualityText,
-                isDolbyVision = isDolbyVision, isAtmos = isAtmos,
-                isTorrent = false, headers = headers, remoteURL = resolvedUrl,
-                debridOwnerIdentity = debridOwnerIdentity,
-                debridOwnerGeneration = debridOwnerGeneration,
-                localFilename = "$id.$ext", state = DownloadState.FAILED,
-                errorText = "This source streams in segments (HLS), which can't be saved for offline on Android yet. " +
-                    "Try a direct or debrid file source.",
-            )
-            DownloadStore.upsert(failed)
+            runCatching { sourceLease?.close() }
             return@synchronized failed
         }
 
@@ -325,10 +341,14 @@ object DownloadManager {
             debridOwnerIdentity = debridOwnerIdentity,
             debridOwnerGeneration = debridOwnerGeneration,
             localFilename = "$id.$ext",
+            isHlsOffline = hls,
+            requiresSourceLease = sourceLease != null,
+            requiresSourceAuthority = sourceRenewal != null,
             state = if (canStartNow) DownloadState.DOWNLOADING else DownloadState.QUEUED,
             transferGeneration = generation,
         )
         DownloadStore.upsert(record)
+        if (sourceLease != null || sourceRenewal != null) sourceLeases.adopt(id, sourceLease, sourceRenewal)
         runCatching { DownloadStore.ensureDownloadsDirectoryExists() }
             .onFailure { Log.w(TAG, "could not create Downloads dir up front", it) }
 
@@ -350,6 +370,7 @@ object DownloadManager {
             val record = DownloadStore.record(id) ?: return
             val pausedState = DownloadTransferStatePolicy.pause(record.state) ?: return
             if (record.state == DownloadState.QUEUED) {
+                sourceLeases.retire(id)
                 DownloadStore.update(id) { it.copy(state = pausedState, transferGeneration = null) }
                 return
             }
@@ -369,6 +390,7 @@ object DownloadManager {
             val record = DownloadStore.record(id) ?: return
             if (!DownloadTransferStatePolicy.mayResume(record.state)) return
             if (!isDebridOwnerCurrent(record)) {
+                sourceLeases.remove(id)
                 DownloadStore.update(id) {
                     it.copy(
                         state = DownloadState.FAILED,
@@ -407,12 +429,21 @@ object DownloadManager {
             cancelWork(id)
             val generation = DownloadStore.record(id)?.transferGeneration
             releaseSlotReservation(id, generation)
+            sourceLeases.remove(id)
             awaitingUnlock.remove(id)
             persistAwaitingUnlock()
             DownloadStore.remove(id)
             pruneQueueOrder()
             fillAvailableSlots()
         }
+    }
+
+    /** A missing/corrupt package is unavailable, but a play tap must not delete its remaining media. */
+    fun markLocalPackageUnavailable(record: DownloadRecord) = synchronized(lock) {
+        DownloadStore.updateIf(record.id, predicate = { it == record && it.state == DownloadState.COMPLETED }) {
+            it.copy(state = DownloadState.FAILED, errorText = "This offline package is incomplete. Select the source again to download it.")
+        }
+        Unit
     }
 
     /** Enter before the native repository's session/account fences. Download enqueue already checks
@@ -563,6 +594,7 @@ object DownloadManager {
         if (!hasFreeSlot()) return
         val next = orderedQueuedRecords().firstOrNull() ?: return
         if (!isDebridOwnerCurrent(next)) {
+            sourceLeases.remove(next.id)
             DownloadStore.update(next.id) {
                 it.copy(
                     state = DownloadState.FAILED,
@@ -573,6 +605,7 @@ object DownloadManager {
             return
         }
         if (next.remoteURL.toHttpUrlOrNull() == null) {
+            sourceLeases.retire(next.id)
             DownloadStore.update(next.id) {
                 it.copy(
                     state = DownloadState.FAILED,
@@ -634,6 +667,7 @@ object DownloadManager {
         if (pendingEnqueueGenerations[id] == generation) pendingEnqueueGenerations.remove(id)
         if (activeGenerations[id] != generation) return false
         activeGenerations.remove(id)
+        sourceLeases.retire(id)
         return true
     }
 
@@ -661,6 +695,7 @@ object DownloadManager {
         }
         if (!isDebridOwnerCurrent(record)) {
             releaseActive(record.id, generation)
+            sourceLeases.remove(record.id)
             DownloadStore.updateIf(
                 id = record.id,
                 predicate = { it.transferGeneration == generation },
@@ -681,6 +716,7 @@ object DownloadManager {
             return DownloadTransferStartResult.NOT_STARTED
         }
         if (storageShortfall(record)) {
+            sourceLeases.retire(record.id)
             val failed = DownloadStore.updateIf(
                 id = record.id,
                 predicate = { it.transferGeneration == generation },
@@ -814,6 +850,7 @@ object DownloadManager {
 
     private fun handleDebridOwnerChangedLocked(id: String, generation: String) {
         releaseSlotReservation(id, generation)
+        if (DownloadStore.record(id)?.transferGeneration == generation) sourceLeases.remove(id)
         DownloadStore.updateIf(
             id = id,
             predicate = { it.transferGeneration == generation },
@@ -828,6 +865,8 @@ object DownloadManager {
     }
 
     fun isDebridOwnerCurrent(record: DownloadRecord): Boolean {
+        if ((record.requiresSourceLease || record.requiresSourceAuthority) &&
+            !synchronized(lock) { sourceLeases.isCurrent(record.id) }) return false
         val identity = record.debridOwnerIdentity
         val generation = record.debridOwnerGeneration
         if (identity == null && generation == null) return true
@@ -843,16 +882,59 @@ object DownloadManager {
     fun ownsTransfer(id: String, generation: String): Boolean =
         synchronized(lock) { ownsTransferLocked(DownloadStore.record(id), generation) }
 
+    /** Recreate only the captured producer after pause; a stale or process-lost capability never gets replayed. */
+    internal suspend fun prepareSourceLease(id: String, generation: String): DownloadRecord? {
+        val entry = synchronized(lock) {
+            val record = DownloadStore.record(id) ?: return null
+            if (!ownsTransferLocked(record, generation)) return null
+            if (!record.requiresSourceLease) return record
+            val held = sourceLeases.entry(id) ?: return null
+            if (held.lease != null) return record
+            held
+        }
+        val resolver = entry.renewal ?: return null
+        val playable = resolver.resolve().getOrThrow()
+        var adopted = false
+        try {
+            return synchronized(lock) {
+                if (sourceLeases.entry(id) !== entry || !ownsTransferLocked(DownloadStore.record(id), generation)) return@synchronized null
+                var updated: DownloadRecord? = null
+                resolver.admit {
+                    check(isHLSPlaylistURL(playable.url) == DownloadStore.record(id)?.isHlsOffline) {
+                        "The source format changed. Select the source again."
+                    }
+                    // A renewed source may become a direct debrid file and no longer need a producer lease.
+                    entry.lease = playable.playbackLease
+                    updated = DownloadStore.updateIf(id, predicate = { it.transferGeneration == generation }) {
+                        it.copy(remoteURL = playable.url, headers = playable.headers.takeIf { h -> h.isNotEmpty() },
+                            requiresSourceLease = playable.playbackLease != null)
+                    }
+                    adopted = updated != null
+                }
+                updated
+            }
+        } finally {
+            if (!adopted) runCatching { playable.playbackLease?.close() }
+        }
+    }
+
     /**
      * Couple a partial-file mutation to the same generation lock as pause/resume. This closes the small window where
      * an old worker could pass an ownership check, get paused, then truncate or append to the new generation's file.
      */
     fun performTransferFileMutation(id: String, generation: String, mutate: () -> Unit): Boolean {
         synchronized(lock) {
-            if (!ownsTransferLocked(DownloadStore.record(id), generation)) return false
-            mutate()
-            return true
+            val record = DownloadStore.record(id)
+            if (!ownsTransferLocked(record, generation) || record == null || !isDebridOwnerCurrent(record)) return false
+            return admitSourceMutation(record, mutate)
         }
+    }
+
+    /** Caller holds the lifecycle lock before entering native owner admission, matching watched-reclaim order. */
+    private fun admitSourceMutation(record: DownloadRecord, mutate: () -> Unit): Boolean {
+        val resolver = sourceLeases.entry(record.id)?.renewal
+        if (record.requiresSourceAuthority && resolver == null) return false
+        return if (resolver != null) resolver.admit(mutate) else { mutate(); true }
     }
 
     /**
@@ -917,12 +999,15 @@ object DownloadManager {
                     recordGeneration = it.transferGeneration,
                     activeGeneration = activeGenerations[id],
                     requestedGeneration = generation,
-                    onAuthorized = finalize,
+                    onAuthorized = {
+                        check(admitSourceMutation(it, finalize)) { "Download source session retired before completion" }
+                    },
                 )
             }
             if (current == null || completedState == null) return false
 
             releaseActive(id, generation)
+            sourceLeases.remove(id)
             DownloadStore.updateIf(
                 id = id,
                 predicate = { it.transferGeneration == generation },

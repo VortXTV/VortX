@@ -1006,15 +1006,14 @@ object StreamRanking {
 
     /// The stream's quality text: name + description + quality + filename, lowercased, with the variation
     /// selector + container extensions stripped and add-on template blobs removed BEFORE any token is
-    /// parsed. Mirrors Apple `qualityText` (name + description + behaviorHints.filename); memoized per stream
-    /// id. The [StreamSource.filename] (behaviorHints.filename) carries the real release tags many
-    /// debrid/torrent add-ons put there, so it is folded in exactly as Apple does.
+    /// parsed. Mirrors Apple `qualityText` (name + description + behaviorHints.filename); memoized by the
+    /// exact metadata input because providers may reuse stream ids across snapshots. The [StreamSource.filename]
+    /// (behaviorHints.filename) carries the real release tags many debrid/torrent add-ons put there,
+    /// so it is folded in exactly as Apple does.
     private fun qualityText(source: StreamSource): String {
-        val key = source.id
+        val key = listOfNotNull(source.title, source.description, source.quality, source.filename).joinToString(" ")
         textCache[key]?.let { return it }
-        var text = listOfNotNull(source.title, source.description, source.quality, source.filename)
-            .joinToString(" ")
-            .lowercase()
+        var text = key.lowercase()
             .replace("\uFE0F", "") // strip the emoji variation selector so "bolt+VS16" matches a bare bolt
         text = stripTemplateBlobs(text)
         text = re("""\.(ts|m2ts|mkv|mp4|avi|webm|mov)(?![a-z0-9])""").replace(text, "")

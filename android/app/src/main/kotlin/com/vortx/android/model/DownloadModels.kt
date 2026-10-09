@@ -7,8 +7,8 @@ import java.util.UUID
  * `app/SourcesShared/DownloadModels.swift`. A download is a physical file on ONE device plus a row in the
  * local index: it is NEVER account-synced and NEVER written into a `libraryItem` document.
  *
- * The iOS-only HLS `.movpkg` branch (`hlsRelativePath` / `isHLSOffline`) is intentionally omitted (Android
- * has no `AVAssetDownloadTask`). Apple's `playbackMeta` convenience IS ported: [PlaybackContext] carries
+ * HLS uses an app-private directory containing a verified local playlist and all referenced assets.
+ * Apple's `playbackMeta` convenience is ported: [PlaybackContext] carries
  * the same identity (`contentId` / `videoId` / `type` / `season` / `episode` + title/poster) plus the
  * play-time owner binding, and [localPlayable] attaches it to every local session.
  */
@@ -84,6 +84,13 @@ data class DownloadRecord(
 
     /** On-disk filename (`<id>.<ext>`), relative to the Downloads directory. The absolute path is rebuilt on demand. */
     val localFilename: String,
+
+    /** A staged HLS package whose entry playlist is index.m3u8. The package moves atomically. */
+    val isHlsOffline: Boolean = false,
+    /** The remote URL is an ephemeral producer capability and cannot be revived without its owned source. */
+    val requiresSourceLease: Boolean = false,
+    /** Native source authority is retained even when the resulting transport has no producer lease. */
+    val requiresSourceAuthority: Boolean = false,
 
     val bytesTotal: Long = 0,
     val bytesDone: Long = 0,

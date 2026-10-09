@@ -5,7 +5,10 @@ import com.vortx.android.model.*
 import java.net.URI
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -19,6 +22,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -74,7 +79,8 @@ internal class NativeCatalogRepository(
     private data class DurableWatchProof(val owner: VortxNativeOwner, val token: PlaybackSessionToken, val watchedAt: Long,
                                         val admit: (() -> Boolean) -> Boolean)
     private val durableWatchReceipts = java.util.IdentityHashMap<DurableWatchedPlaybackReceipt, DurableWatchProof>()
-    private data class SourceBinding(val owner: VortxNativeOwner, val context: PlaybackContext)
+    private data class SourceBinding(val owner: VortxNativeOwner, val context: PlaybackContext,
+        val source: StreamSource, val episode: Episode?)
     private val sourceBindings = mutableMapOf<String, SourceBinding>()
     private val resolveSequence = AtomicLong()
     private val playbackSequence = AtomicLong()
@@ -418,15 +424,229 @@ internal class NativeCatalogRepository(
                 sourceBindings.clear()
                 groups.map { group -> group.copy(streams = group.streams.map { source ->
                     val token = java.util.UUID.randomUUID().toString()
+                    val issued = source.copy(nativePlaybackToken = token)
                     sourceBindings[token] = SourceBinding(read.owner, PlaybackContext(
                         PlaybackContext.Owner(read.owner.profileID, true), id, episodeId ?: id, type.id,
                         selectedEpisode?.season, selectedEpisode?.episode, detail?.name ?: id, detail?.poster,
-                        PlaybackContext.Provenance(source.addon, source.quality, false, null, null), nativeSessionRevision = read.owner.revision))
-                    source.copy(nativePlaybackToken = token)
+                        PlaybackContext.Provenance(source.addon, source.quality, false, null, null), nativeSessionRevision = read.owner.revision),
+                        issued, selectedEpisode)
+                    issued
                 }) }
             }
         }
     }
+    override fun captureDownloadSession(expectedOwner: ContinueWatchingOwner): DownloadSourceSession? = runCatching {
+        val session = session(); val read = session.read()
+        session.owned(read.owner) {
+            check(sessionProvider() === session && owner(read.owner) == expectedOwner) { "Native download owner changed" }
+            NativeDownloadSession(session, read, registry(read))
+        }
+    }.getOrNull()
+
+    private data class DownloadBinding(val source: StreamSource, val context: PlaybackContext, val episode: Episode?)
+
+    // Detach at capture and at resolution: neither visible rows nor returned Playable collections
+    // may expose the payload held by the immutable pin.
+    private fun downloadSourceSnapshot(source: StreamSource): StreamSource =
+        source.copy(requestHeaders = source.requestHeaders.toMap(),
+            externalSubtitles = source.externalSubtitles.toList(),
+            externalSubtitleTracks = source.externalSubtitleTracks.map { ExternalSubtitle(it.url, it.headers, it.language, it.name) },
+            nzbUrls = source.nzbUrls.toList(), usenetServers = source.usenetServers.toList())
+
+    private fun downloadBinding(source: StreamSource, context: PlaybackContext, episode: Episode?) =
+        DownloadBinding(downloadSourceSnapshot(source), context, episode)
+
+    private fun downloadEpisodeMatches(context: PlaybackContext, episode: Episode?): Boolean = episode == null ||
+        (episode.id == context.videoId && (context.season == null || episode.season == context.season) &&
+            (context.episode == null || episode.episode == context.episode))
+
+    override fun pinDownloadSource(expectedOwner: ContinueWatchingOwner, source: StreamSource,
+        episode: Episode?): DownloadSourceResolver? = runCatching {
+        val session = session(); val read = session.read()
+        session.owned(read.owner) {
+            check(sessionProvider() === session && owner(read.owner) == expectedOwner) { "Native download owner changed" }
+            synchronized(this) {
+                val binding = sourceBindings[source.nativePlaybackToken]
+                    ?.takeIf { it.owner == read.owner && (it.source === source ||
+                        source.copy(id = it.source.id, description = it.source.description) == it.source) }
+                    ?: return@synchronized null
+                if (!downloadEpisodeMatches(binding.context, episode)) return@synchronized null
+                // Cache badges may decorate only id/description; resolution always retains the issued payload.
+                NativeDownloadResolver(session, read.owner, downloadBinding(binding.source, binding.context, binding.episode ?: episode))
+            }
+        }
+    }.getOrNull()
+
+    private inner class NativeDownloadSession(
+        private val nativeSession: VortxNativeSession,
+        private val read: VortxNativeRead,
+        private val addons: List<VortxResourceAddon>,
+    ) : DownloadSourceSession {
+        override val owner = owner(read.owner)
+        private val channel = "downloads:${java.util.UUID.randomUUID()}"
+        private val fetches = Mutex()
+        private val bindings = java.util.IdentityHashMap<StreamSource, DownloadBinding>()
+        private var closed = false
+
+        private fun requireOpen() {
+            check(sessionProvider() === nativeSession) { "Native download account changed" }
+            synchronized(this) { check(!closed) { "Native download session closed" } }
+        }
+
+        override suspend fun streams(type: MediaType, id: String, episode: Episode?, rememberedQuality: String?,
+            wantedAddon: String?): Result<List<StreamGroup>> = attempt {
+            // A batch reuses exactly one channel; its episodes never supersede each other's fetches.
+            fetches.withLock {
+                nativeSession.owned(read.owner) { requireOpen() }
+                try {
+                    val episodeId = episode?.id
+                    val indexerScope = nzbSourceAggregator?.captureNativeScope(read.owner)
+                    val stream = VortxResourceRequest(VortxResourceRequest.Resource.STREAM, type.id, episodeId ?: id)
+                    val pages = coroutineScope {
+                        // Start the slot while still owner-gated, so close cannot retire an absent slot
+                        // and then race a new load into existence after returning.
+                        nativeSession.owned(read.owner) {
+                            requireOpen()
+                            async(start = CoroutineStart.UNDISPATCHED) {
+                                nativeSession.load(channel, read.owner, listOf(
+                                    VortxResourceRequest(VortxResourceRequest.Resource.META, type.id, id) to addons, stream to addons))
+                            }
+                        }.await()
+                    }
+                    val metaPage = policyPage(pages[0], read, channel, pages)
+                    if (parental(read)) check(metaPage.groups.any { it.items(VortxResourceRequest.Resource.META).isNotEmpty() }) {
+                        "Native metadata blocked or uncertified"
+                    }
+                    val detail = EngineState.parseMetaDetail(VortxResourceProjection.metaDetails(metaPage, null, null, addons))
+                    check(detail == null || (detail.id == id && detail.type == type)) { "Native metadata identity mismatch" }
+                    if (detail != null && episode != null) check(if (type == MediaType.SERIES) {
+                        detail.videos.any { it.id == episode.id && it.season == episode.season && it.episode == episode.episode }
+                    } else episode.id == id) { "Download episode is not in title metadata" }
+                    if (parental(read)) check(detail != null && if (type == MediaType.SERIES) {
+                        episodeId != null && detail.videos.any { it.id == episodeId }
+                    } else episodeId == null || episodeId == id) { "Stream identity is not in approved metadata" }
+                    val selectedEpisode = detail?.videos?.find { it.id == episodeId } ?: episode
+                    val rawGroups = EngineState.parseStreamGroups(
+                        VortxResourceProjection.metaDetails(metaPage, pages[1], stream, addons), episodeId ?: id)
+                    val search = nativeNzbSearch(detail, type, id, episodeId)
+                    val direct = if (search != null && indexerScope != null) {
+                        try { nzbSourceAggregator!!.aggregate(search, indexerScope) }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (_: Exception) { NzbSourceAggregation.empty() }
+                    } else NzbSourceAggregation.empty()
+                    val coroutine = currentCoroutineContext()
+                    nativeSession.publish(channel, read.owner, pages) {
+                        coroutine.ensureActive()
+                        requireOpen()
+                        val indexerGroups = if (nzbSourceAggregator?.isAdmitted(direct, coroutine.isActive) == true) direct.groups else emptyList()
+                        val combined = mergeNzbGroups(rawGroups, indexerGroups)
+                        val groups = if (parental(read)) combined.map { group -> group.copy(streams = group.streams.filter {
+                            StreamRanking.passesUserFilters(it, com.vortx.android.sources.SourcePrefsSnapshot.DEFAULT.copy(isKids = true))
+                        }) } else combined
+                        if (groups.none { it.streams.isNotEmpty() }) requireSettled(pages[1])
+                        synchronized(this) {
+                            check(!closed) { "Native download session closed" }
+                            groups.map { group -> group.copy(streams = group.streams.map { source ->
+                                val issued = source.copy(nativePlaybackToken = java.util.UUID.randomUUID().toString())
+                                bindings[issued] = downloadBinding(issued, PlaybackContext(
+                                    PlaybackContext.Owner(read.owner.profileID, true), id, episodeId ?: id, type.id,
+                                    selectedEpisode?.season, selectedEpisode?.episode, detail?.name ?: id, detail?.poster,
+                                    PlaybackContext.Provenance(source.addon, source.quality, false, null, null),
+                                    nativeSessionRevision = read.owner.revision), selectedEpisode)
+                                issued
+                            }) }
+                        }
+                    }
+                } finally {
+                    // No completed slot is retained between episodes or after failure/cancellation.
+                    nativeSession.release(channel, read.owner)
+                }
+            }
+        }
+
+        override fun pin(source: StreamSource, episode: Episode?): DownloadSourceResolver? = runCatching {
+            nativeSession.owned(read.owner) {
+                requireOpen()
+                synchronized(this) {
+                    check(!closed) { "Native download session closed" }
+                    val binding = bindings[source] ?: return@synchronized null
+                    if (!downloadEpisodeMatches(binding.context, episode)) return@synchronized null
+                    NativeDownloadResolver(nativeSession, read.owner, binding)
+                }
+            }
+        }.getOrNull()
+
+        override fun close() {
+            synchronized(this) { closed = true; bindings.clear() }
+            nativeSession.release(channel, read.owner)
+        }
+    }
+
+    private inner class NativeDownloadResolver(
+        private val nativeSession: VortxNativeSession,
+        private val nativeOwner: VortxNativeOwner,
+        private val binding: DownloadBinding,
+    ) : DownloadSourceResolver {
+        override val owner = owner(nativeOwner)
+        private val generation = AtomicLong()
+
+        private fun requireCurrent() {
+            check(sessionProvider() === nativeSession) { "Native download account changed" }
+        }
+
+        override fun isCurrent(): Boolean = runCatching {
+            nativeSession.owned(nativeOwner) { requireCurrent(); true }
+        }.getOrDefault(false)
+
+        override fun admit(action: () -> Unit): Boolean {
+            var admitted = false
+            return try {
+                nativeSession.owned(nativeOwner) { requireCurrent(); admitted = true; action(); true }
+            } catch (failure: Throwable) {
+                if (admitted) throw failure
+                false
+            }
+        }
+
+        override suspend fun resolve(): Result<Playable> {
+            var admitted: Playable? = null
+            try {
+                return resolvePinned { admitted = it }
+            } catch (failure: Throwable) {
+                // withContext may reject delivery after IO has admitted a result but the caller was cancelled.
+                admitted?.playbackLease?.close()
+                throw failure
+            }
+        }
+
+        private suspend fun resolvePinned(onAdmitted: (Playable) -> Unit): Result<Playable> = attempt {
+            val sequence = generation.incrementAndGet()
+            val coroutine = currentCoroutineContext()
+            fun requireResolution() {
+                coroutine.ensureActive()
+                requireCurrent()
+                check(generation.get() == sequence) { "Native download resolution superseded" }
+            }
+            nativeSession.owned(nativeOwner) { requireResolution() }
+            val playable = try {
+                playbackResolver.resolve(downloadSourceSnapshot(binding.source), binding.episode,
+                    isCurrent = { runCatching { nativeSession.owned(nativeOwner) { requireResolution(); true } }.getOrDefault(false) },
+                    // Each handed-off lease retains only owner authority, independent of any fetch or resolve Job.
+                    playbackIsCurrent = ::isCurrent)
+            } catch (cancelled: CancellationException) {
+                coroutine.ensureActive()
+                nativeSession.owned(nativeOwner) { requireResolution() }
+                throw cancelled
+            }
+            try {
+                nativeSession.owned(nativeOwner) {
+                    requireResolution()
+                    playable.copy(playbackContext = binding.context).also(onAdmitted)
+                }
+            } catch (failure: Throwable) { playable.playbackLease?.close(); throw failure }
+        }
+    }
+
     suspend fun subtitles(type: MediaType, videoID: String, extra: List<Pair<String, String>> = emptyList()): Result<String> = attempt {
         val session = session(); val read = session.read(); val addons = registry(read)
         if (parental(read)) check(synchronized(this) { detailCache.values.any { (owner, meta) -> owner == read.owner && meta.type == type &&
