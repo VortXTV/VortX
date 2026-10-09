@@ -33,7 +33,12 @@ import Foundation
                      "launch cannot persist a source before accepted playback")
         let batch = try String(contentsOfFile: paths[2], encoding: .utf8)
         precondition(batch.contains("sticky: job.sticky"))
-        precondition(batch.contains("candidates.dropFirst(selected.index + 1)"), "transfer retry must not resurrect earlier resolution failures")
+        precondition(batch.contains("let downloadCandidates = candidates.filter { job.downloadOwner.allows($0) }"),
+                     "batch candidates must retain the captured download owner")
+        precondition(batch.contains("iOSResolveRankedEpisodeCandidate(\n            downloadCandidates, episode: ep"),
+                     "the selected index must belong to the owner-filtered candidate list")
+        precondition(batch.contains("downloadCandidates.dropFirst(selected.index + 1)"),
+                     "transfer retry must use that same list and not resurrect earlier resolution failures")
         print("PASS production release priority/comparator, provenance wiring, binge/preload/CW/batch fallback opt-in")
     }
 }
