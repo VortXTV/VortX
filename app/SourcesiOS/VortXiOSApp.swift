@@ -124,6 +124,8 @@ struct VortXiOSApp: App {
     var body: some Scene {
         WindowGroup {
             iOSRootView(launchReady: splashDone)
+                .externalPlaybackReturns()
+                .onOpenURL { ExternalPlaybackHandoff.shared.handle($0) }
                 // ScenePhase's initial value does not necessarily emit a change on cold launch. Starting here
                 // closes that gap; UpdateChecker makes repeated root/scene calls idempotent and single-flight.
                 .onAppear { UpdateChecker.shared.startMonitoring() }

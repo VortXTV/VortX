@@ -5071,6 +5071,7 @@ struct iOSEpisodeStreams: View {
                 poster: shownVideo.thumbnail ?? meta.poster, season: shownVideo.season,
                 episode: shownVideo.episode
             ),
+            handoffEpisodes: seasonEpisodes,
             states: core.streamAddonStates(forStreamId: shownVideo.id),
             sourcesSettled: sourceList.isSettled,
             continuity: rememberedQuality,
@@ -6229,10 +6230,13 @@ private extension EnvironmentValues {
 
 struct iOSSourceList: View {
     @Environment(\.cinemaSourceJump) private var jumpToSource
+    @EnvironmentObject private var account: StremioAccount
+    @State private var externalHandoffEpoch = UUID()
     let groups: [CoreStreamSourceGroup]
     let progress: (loaded: Int, total: Int)
     /// The resolved movie, episode, or live identity. Only Infuse consumes it as filename metadata.
     var playbackMeta: PlaybackMeta? = nil
+    var handoffEpisodes: [CoreVideo] = []
     /// Per-add-on resolution state, used ONLY to explain an empty result: an add-on that errored
     /// (fetch/timeout/TLS) is surfaced distinctly from one that returned nothing. Empty by default.
     var states: [CoreBridge.StreamAddonState] = []
@@ -6477,7 +6481,9 @@ struct iOSSourceList: View {
         if isSuspended {
             return AnyView(Color.clear.frame(height: 1))
         }
-        return AnyView(sourceListBody)
+        return AnyView(sourceListBody
+            .onChange(of: playbackMeta) { _ in externalHandoffEpoch = UUID() }
+            .onDisappear { externalHandoffEpoch = UUID() })
     }
 
     /// "Re-find sources" control: re-query the add-ons fresh so expired sources are replaced. Rendered by
@@ -6960,7 +6966,14 @@ struct iOSSourceList: View {
         ), ExternalPlayer.canRouteExternally(url, isTorrent: stream.isTorrent) {
             ForEach(externalPlayerTargets) { target in
                 Button("Play in \(target.name)") {
-                    ExternalPlayer.open(target, stream: url, metadata: playbackMeta) { launched in
+                    let epoch = externalHandoffEpoch
+                    let handoff = ExternalPlaybackHandoff.Request(
+                        metadata: playbackMeta, account: account,
+                        episodes: ExternalPlaybackHandoff.episodes(handoffEpisodes),
+                        addon: addon, bingeGroup: stream.behaviorHints?.bingeGroup,
+                        allowsLaunch: { epoch == externalHandoffEpoch })
+                    ExternalPlayer.open(target, stream: url, metadata: playbackMeta, handoff: handoff) { launched in
+                        guard epoch == externalHandoffEpoch else { return }
                         guard !launched else { return }
                         externalPlayerErrorMessage = "Could not open \(target.name)."
                         showExternalPlayerError = true
