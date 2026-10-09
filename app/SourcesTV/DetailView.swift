@@ -691,19 +691,42 @@ struct DetailView: View {
     }
 
     @ViewBuilder private var castSection: some View {
-        if !LiveTypes.contains(type), !railCastMembers.isEmpty {
+        let directors = fencedMeta?.directors ?? []
+        let writers = fencedMeta?.writers ?? []
+        if !LiveTypes.contains(type), !railCastMembers.isEmpty || !directors.isEmpty || !writers.isEmpty {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
-                RailHeader(title: "Cast")
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
-                        ForEach(railCastMembers.prefix(30)) { member in
-                            CastMemberCard(member: member)
+                RailHeader(title: "Cast & Crew")
+                if !railCastMembers.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                            ForEach(railCastMembers.prefix(30)) { member in
+                                CastMemberCard(member: member)
+                            }
                         }
+                        .padding(.horizontal, Theme.Space.screenEdge)
+                        .padding(.vertical, Theme.Space.lg)
                     }
-                    .padding(.horizontal, Theme.Space.screenEdge)
-                    .padding(.vertical, Theme.Space.lg)
                 }
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    crewCreditLine("Director", names: directors)
+                    crewCreditLine("Writer", names: writers)
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
             }
+        }
+    }
+
+    @ViewBuilder private func crewCreditLine(_ role: LocalizedStringKey, names: [String]) -> some View {
+        if !names.isEmpty {
+            HStack(alignment: .firstTextBaseline, spacing: Theme.Space.sm) {
+                Text(role)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                Text(names.prefix(3).joined(separator: ", "))
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(3)
+            }
+            .font(Theme.Typography.label)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
