@@ -50,13 +50,14 @@ enum ProfileAddonPreferencesPolicy {
         }.map(\.element)
     }
 
-    /// Resolve the pre-feature roster without creating a custom mode simply by selecting a profile.
-    /// Old visibility edits are explicit. Old ranking edits survive when they differ from Main.
+    /// Legacy records have no durable Follow Main marker. Explicit ranking fields are therefore
+    /// personal choices even when equal to Main; comparing values would change their mode after a
+    /// later Main edit. Only absent fields inherit, while new carriers retain their nil overrides.
     static func migrated(legacyDisabled: [String]?, legacyTypes: [String]?, legacyUseOrder: Bool?,
                          inheritedRanking: ProfileAddonRanking) -> ProfileAddonPreferences {
         let types = legacyTypes ?? inheritedRanking.sourceTypeOrder
         let useOrder = legacyUseOrder ?? inheritedRanking.useAddonOrder
-        let customized = types != inheritedRanking.sourceTypeOrder || useOrder != inheritedRanking.useAddonOrder
+        let customized = legacyTypes != nil || legacyUseOrder != nil
         return ProfileAddonPreferences(
             disabledAddonURLsOverride: legacyDisabled.map(unique),
             rankingOverride: customized ? ProfileAddonRanking(

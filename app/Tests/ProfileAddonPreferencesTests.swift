@@ -58,7 +58,95 @@ final class ProfileStore {
 }
 
 @main enum ProfileAddonPreferencesTests {
+    /// The same untouched raw legacy record must not change mode when Main changes. This runs
+    /// against both the actual baseline policy (expected RED) and the shipping candidate policy.
+    @MainActor static func legacyMigrationContracts() throws -> Bool {
+        var checks = 0
+        var failures: [String] = []
+        func require(_ condition: Bool, _ message: String) {
+            checks += 1
+            if !condition { failures.append(message) }
+        }
+        let policy = ProfileAddonPreferencesPolicy.self
+        let main = ProfileAddonRanking(sourceTypeOrder: ["debrid", "torrent"], useAddonOrder: false)
+        let changedMain = ProfileAddonRanking(sourceTypeOrder: ["torrent", "debrid"], useAddonOrder: true)
+        let equalBefore = policy.migrated(legacyDisabled: nil, legacyTypes: main.sourceTypeOrder,
+            legacyUseOrder: false, inheritedRanking: main)
+        let equalAfter = policy.migrated(legacyDisabled: nil, legacyTypes: main.sourceTypeOrder,
+            legacyUseOrder: false, inheritedRanking: changedMain)
+        require(equalBefore.rankingOverride != nil && equalAfter.rankingOverride != nil
+            && equalBefore == equalAfter,
+            "stable legacy classification: explicit equal-Main fields stay Custom before and after Main changes")
+        require(equalAfter.rankingOverride?.sourceTypeOrder == main.sourceTypeOrder
+            && equalAfter.rankingOverride?.useAddonOrder == false && equalAfter.rankingOverride?.addonOrder == nil,
+            "legacy personal source choices survive without inventing a personal add-on order")
+        for owner in [main, changedMain] {
+            let absent = policy.migrated(legacyDisabled: nil, legacyTypes: nil,
+                legacyUseOrder: nil, inheritedRanking: owner)
+            require(absent == ProfileAddonPreferences(), "absent legacy fields stay Follow Main")
+            let falseOnly = policy.migrated(legacyDisabled: nil, legacyTypes: nil,
+                legacyUseOrder: false, inheritedRanking: owner)
+            require(falseOnly.rankingOverride?.useAddonOrder == false
+                && falseOnly.rankingOverride?.sourceTypeOrder == owner.sourceTypeOrder,
+                "explicit false is Custom; only missing legacy types use current Main")
+            let typesOnly = policy.migrated(legacyDisabled: nil, legacyTypes: main.sourceTypeOrder,
+                legacyUseOrder: nil, inheritedRanking: owner)
+            require(typesOnly.rankingOverride?.sourceTypeOrder == main.sourceTypeOrder
+                && typesOnly.rankingOverride?.useAddonOrder == owner.useAddonOrder,
+                "explicit types are Custom; only missing use-order uses current Main")
+        }
+        let explicitEmpty = policy.migrated(legacyDisabled: [], legacyTypes: [],
+            legacyUseOrder: false, inheritedRanking: main)
+        require(explicitEmpty.rankingOverride?.sourceTypeOrder == []
+            && explicitEmpty.rankingOverride?.useAddonOrder == false,
+            "explicit empty types remain a present Custom value, not inherited defaults")
+        require(explicitEmpty.disabledAddonURLsOverride == [], "explicit empty visibility stays visible-all")
+        require(policy.disabled(override: explicitEmpty.disabledAddonURLsOverride, inherited: ["hidden"]).isEmpty,
+            "empty visibility does not inherit Main's disabled list")
+        let absentVisibility = policy.migrated(legacyDisabled: nil, legacyTypes: nil,
+            legacyUseOrder: nil, inheritedRanking: main)
+        require(absentVisibility.disabledAddonURLsOverride == nil
+            && policy.disabled(override: absentVisibility.disabledAddonURLsOverride, inherited: ["hidden"]) == ["hidden"],
+            "missing visibility continues live inheritance")
+        let normalized = policy.migrated(legacyDisabled: [" HTTPS://ADDONS.EXAMPLE/Config/A ",
+            "https://addons.example/Config/A", ""], legacyTypes: nil, legacyUseOrder: nil, inheritedRanking: main)
+        require(normalized.disabledAddonURLsOverride == ["https://addons.example/Config/A"]
+            && normalized.rankingOverride == nil, "legacy URL normalization does not invent ranking customization")
+        let restored = try JSONDecoder().decode(ProfileAddonPreferences.self,
+            from: JSONEncoder().encode(explicitEmpty))
+        require(restored == explicitEmpty, "explicit false/empty overrides survive serde")
+        let newCarrier = ProfileAddonPreferences()
+        require(newCarrier.rankingOverride == nil && newCarrier.disabledAddonURLsOverride == nil,
+            "new carrier defaults to Follow Main for ranking and visibility")
+        require(try JSONDecoder().decode(ProfileAddonPreferences.self,
+            from: JSONEncoder().encode(newCarrier)) == newCarrier, "new carrier Follow Main survives serde")
+        let newProfile = UserProfile(name: "New", avatar: "N", playback: ProfileStore.playback())
+        let modelRoundTrip = try JSONDecoder().decode(UserProfile.self, from: JSONEncoder().encode(newProfile))
+        require(newProfile.addonPreferences == newCarrier && modelRoundTrip.addonPreferences == newCarrier,
+            "shipping new UserProfile carrier remains Follow Main despite seeded playback values")
+        let rawLegacy = try JSONDecoder().decode(UserProfile.self,
+            from: Data("{\"name\":\"Raw Legacy\",\"avatar\":\"L\",\"playback\":{\"audioLang\":\"en\",\"subtitleLang\":\"en\",\"forcedPolicy\":\"forced\",\"subFont\":\"system\",\"subSize\":\"medium\",\"subColor\":\"white\",\"subBackground\":\"none\",\"sourceTypeOrder\":[\"debrid\",\"torrent\"],\"useAddonOrder\":false}}".utf8))
+        require(rawLegacy.addonPreferences == nil && rawLegacy.playback?.useAddonOrder == false,
+            "shipping raw legacy decode retains absent carrier and explicit false")
+        let owner = UserProfile(id: UserProfile.ownerID, name: "Main", avatar: "M", isOwner: true,
+            playback: ProfileStore.playback())
+        let store = ProfileStore()
+        store.profiles = [owner, rawLegacy]; store.activeID = rawLegacy.id
+        let before = store.activeInheritsAddonRanking
+        store.profiles[0].playback = ProfileStore.playback(types: ["torrent", "debrid"], useOrder: true)
+        require(!before && !store.activeInheritsAddonRanking,
+            "stable actual ProfileStore classification: untouched equal-valued raw legacy stays Custom")
+        store.profiles[1] = newProfile; store.activeID = newProfile.id
+        require(store.activeInheritsAddonRanking && store.activeInheritsAddonVisibility,
+            "actual ProfileStore keeps new carrier in Follow Main")
+        failures.forEach { print("FAIL: \($0)") }
+        print("Legacy migration contracts: \(checks) checks, \(failures.count) failures")
+        return failures.isEmpty
+    }
+
     @MainActor static func main() throws {
+        guard try legacyMigrationContracts() else { exit(1) }
+        if CommandLine.arguments.contains("--migration-stability-only") { return }
         let a = "https://addons.example/Config/A/manifest.json"
         let b = "https://addons.example/Config/a/manifest.json"
         let c = "https://addons.example/other/manifest.json"
@@ -164,7 +252,8 @@ final class ProfileStore {
         precondition(migrated.disabledAddonURLsOverride == [a] && migrated.rankingOverride?.useAddonOrder == true)
         precondition(migrated.rankingOverride?.addonOrder == nil, "legacy source customization preserves account order")
         precondition(policy.migrated(legacyDisabled: nil, legacyTypes: inherited.sourceTypeOrder,
-            legacyUseOrder: false, inheritedRanking: inherited) == ProfileAddonPreferences())
+            legacyUseOrder: false, inheritedRanking: inherited).rankingOverride == inherited,
+            "explicit legacy values stay Custom even when currently equal to Main")
         let legacy = try JSONDecoder().decode(UserProfile.self,
             from: Data("{\"name\":\"Legacy\",\"disabledAddons\":[\"\(a)\"]}".utf8))
         precondition(legacy.addonPreferences == nil && legacy.disabledAddons == [a])
