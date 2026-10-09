@@ -10,16 +10,22 @@ import SwiftUI
 /// view never syncs the list and never touches `libraryItem` documents. Play-from-local rebuilds the same
 /// engine `PlaybackMeta` a streamed source uses, so progress / Continue Watching record identically.
 ///
-/// Surfaced from `LibraryView` as a section ABOVE the saved-titles grid, shown only when at least one
-/// download exists (so a user with no downloads never sees an empty section).
+/// Surfaced from Library's Downloads destination. Queue order and capacity come from the observable
+/// manager; this view creates no transfers, persisted order or separate download state.
 struct TVDownloadsView: View {
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation (play-from-local)
     @ObservedObject private var store = DownloadStore.shared
-    private let manager = DownloadManager.shared
+    @ObservedObject private var manager = DownloadManager.shared
 
     var body: some View {
+        let queued = manager.orderedQueuedRecords()
+        let orderedIDs = queued.map(\.id)
+        let groups = TVDownloadQueuePresentationPolicy.groupsExcludingQueued(store.groupedDownloads())
+        let capacity = TVDownloadQueuePresentationPolicy.Capacity(maximum: manager.maxConcurrentDownloads,
+                                                                  allowedRange: DownloadManager.concurrencyRange)
         VStack(alignment: .leading, spacing: Theme.Space.md) {
             header
+            capacityCard(capacity, queuedCount: queued.count)
             // The eviction warning, always visible while the section is shown: tvOS can reclaim app storage
             // under pressure, so a saved download is not guaranteed to persist.
             Text("Apple TV can reclaim app storage when the device runs low, so a saved download may be removed by the system. Re-download it any time it is gone.")
@@ -27,11 +33,24 @@ struct TVDownloadsView: View {
                 .foregroundStyle(Theme.Palette.textTertiary)
                 .frame(maxWidth: 1100, alignment: .leading)
                 .padding(.horizontal, Theme.Space.screenEdge)
+            if !queued.isEmpty {
+                VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                    Text("Queued downloads").sectionTitleStyle()
+                    Text("Waiting downloads are considered in this priority order. Eligibility checks may delay an item.")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                    LazyVStack(spacing: Theme.Space.md) {
+                        ForEach(queued) { record in
+                            row(record, priority: TVDownloadQueuePresentationPolicy.priority(for: record.id, orderedIDs: orderedIDs))
+                        }
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+            }
             // Grouped: each series is ONE folder holding its episodes sorted by season then episode
             // (regardless of download order); a movie renders as a standalone row. The grouping is derived
             // from the shared store, so the iOS downloads screen renders the same folders from the same API.
             LazyVStack(spacing: Theme.Space.md) {
-                ForEach(store.groupedDownloads()) { group in
+                ForEach(groups) { group in
                     if group.isShow {
                         showFolder(group)
                     } else if let movie = group.records.first {
@@ -40,6 +59,11 @@ struct TVDownloadsView: View {
                 }
             }
             .padding(.horizontal, Theme.Space.screenEdge)
+            if store.records.isEmpty {
+                Text("Downloads saved on this Apple TV appear here.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                    .padding(.horizontal, Theme.Space.screenEdge)
+            }
         }
     }
 
@@ -52,6 +76,37 @@ struct TVDownloadsView: View {
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textTertiary)
         }
+        .padding(.horizontal, Theme.Space.screenEdge)
+    }
+
+    /// Remote-friendly capacity controls use the current manager value at the action boundary.
+    private func capacityCard(_ capacity: TVDownloadQueuePresentationPolicy.Capacity, queuedCount: Int) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            HStack(spacing: Theme.Space.lg) {
+                VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    Text("Run up to \(capacity.maximum) at once")
+                        .font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    Text("\(store.records.filter { $0.state == .downloading }.count) downloading  ·  \(queuedCount) queued")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                }
+                Spacer(minLength: Theme.Space.md)
+                actionChip("Fewer", "minus", disabled: !capacity.canDecrease) {
+                    manager.setMaxConcurrentDownloads(manager.maxConcurrentDownloads - 1)
+                }
+                .accessibilityLabel("Fewer concurrent downloads")
+                actionChip("More", "plus", disabled: !capacity.canIncrease) {
+                    manager.setMaxConcurrentDownloads(manager.maxConcurrentDownloads + 1)
+                }
+                .accessibilityLabel("More concurrent downloads")
+            }
+            Text("More at once shares your bandwidth. Lowering the limit never interrupts a download already in progress; it holds future starts in the queue.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .vortxCinemaCard()
+        .focusSection()
         .padding(.horizontal, Theme.Space.screenEdge)
     }
 
@@ -118,14 +173,23 @@ struct TVDownloadsView: View {
     /// clear target; Delete is always available. No tap-the-whole-row gesture, which is a touch idiom.
     /// `title` overrides the row heading (used by a show folder to title each episode "S1E2" instead of
     /// repeating the show name); nil uses the record's own display title (movies + standalone rows).
-    @ViewBuilder private func row(_ record: DownloadRecord, title: String? = nil) -> some View {
+    @ViewBuilder private func row(_ record: DownloadRecord, title: String? = nil,
+                                 priority: TVDownloadQueuePresentationPolicy.Priority? = nil) -> some View {
         HStack(alignment: .center, spacing: Theme.Space.lg) {
-            content(record, title: title)
+            VStack(alignment: .leading, spacing: Theme.Space.xs) {
+                if let priority {
+                    Text("Priority \(priority.position) of \(priority.count)")
+                        .font(Theme.Typography.eyebrow).foregroundStyle(Theme.Palette.textSecondary)
+                }
+                content(record, title: title)
+            }
             Spacer(minLength: Theme.Space.md)
-            controls(record)
+            controls(record, priority: priority)
         }
         .padding(Theme.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .vortxCinemaCard()
+        .focusSection()
     }
 
     @ViewBuilder private func content(_ record: DownloadRecord, title: String? = nil) -> some View {
@@ -189,28 +253,36 @@ struct TVDownloadsView: View {
     /// The per-state action bar: Play (completed) / Pause (downloading) / Resume (paused or failed), then a
     /// Delete that is always present. Each is a focusable, focus-styled chip so the TV focus engine has a
     /// clear target on every row.
-    @ViewBuilder private func controls(_ record: DownloadRecord) -> some View {
+    @ViewBuilder private func controls(_ record: DownloadRecord,
+                                      priority: TVDownloadQueuePresentationPolicy.Priority?) -> some View {
         HStack(spacing: Theme.Space.sm) {
             switch record.state {
             case .completed:
                 actionChip("Play", "play.fill") { play(record) }
             case .downloading:
                 actionChip("Pause", "pause.fill") { manager.pause(id: record.id) }
-            case .paused, .failed:
+            case .paused:
                 actionChip("Resume", "arrow.clockwise") { manager.resume(id: record.id) }
+            case .failed:
+                actionChip("Retry", "arrow.clockwise") { manager.resume(id: record.id) }
             case .queued:
-                EmptyView()
+                if let priority {
+                    actionChip("Earlier", "chevron.up", disabled: !priority.canMoveEarlier) { manager.moveQueuedEarlier(id: record.id) }
+                    actionChip("Later", "chevron.down", disabled: !priority.canMoveLater) { manager.moveQueuedLater(id: record.id) }
+                }
+                actionChip("Pause", "pause.fill") { manager.pause(id: record.id) }
             }
             actionChip("Delete", "trash", role: .destructive) { manager.cancel(id: record.id) }
         }
     }
 
-    private func actionChip(_ label: String, _ symbol: String, role: ButtonRole? = nil,
+    private func actionChip(_ label: String, _ symbol: String, role: ButtonRole? = nil, disabled: Bool = false,
                             _ action: @escaping () -> Void) -> some View {
         Button(role: role, action: action) {
             Label(label, systemImage: symbol)
         }
         .buttonStyle(ChipButtonStyle())
+        .disabled(disabled)
     }
 
     // MARK: Play-from-local
