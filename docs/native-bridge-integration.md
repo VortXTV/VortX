@@ -1,49 +1,42 @@
 # Native bridge integration boundary
 
-The app contains additive native state/resource bindings, an Apple account/session facade and
-presentation adapters. Shipping `CoreBridge` and `EngineStremioRepository` remain the active data engine. There is no new user
-selector. A native streaming server is a separate capability from the native data engine.
+The 0.5 source shipping paths select the native state/resource engine, account/session facades
+and presentation adapters. Apple uses the native-generated project; Android defaults to the native
+repository. `CoreBridge` is the Apple compatibility facade, not evidence that its legacy Stremio
+branch is active. The retained legacy Apple project and Android non-native selection are explicit
+comparison paths. A native streaming server is a separate capability from the native data engine.
 
 ## Integration status — 9 October 2026
 
-The public integration branch is `beta/native-engine-integration-20261008` (remote branch
-`beta-native-engine-integration-20261008`). Native defaults are still off; neither a passing
-fixture nor this document authorizes the default flip. The installed/public release is separate.
+Native source selection is already enabled in the shipping configuration; it is not a claim of
+complete migration, provider, packaging or device parity. Source and artifact acceptance must be
+kept separate, and a passing fixture never substitutes for the exact app/package being shipped.
 
-- Reviewed Apple provider intent/ACK handling, account checkpoint recovery, add-on replacement,
-  card-level series/season watched actions and library filter retention are integrated.
-- Reviewed Android provider intent/ACK handling, atomic authoritative watched batches,
-  ordered add-on replacement and Cinema touch navigation are integrated.
-  Library viewing history uses authoritative watched history plus partial Continue Watching,
-  not saved membership. CW cards use a typed, one-shot resume intent and fall back to details
-  when the device has no matching saved stream.
-- Private native source `ec96c6c6e3d18f0aec0dc9c9895ba37bc0523fd4` is reviewed and full
-  CI run `37825134605` passed on Ubuntu and macOS. Public Apple/Android workflows now pin
-  that source, with source-content native-cache partitions and real-SDK DEX verifier fixtures.
-- Reviewed schema-4 own-account rebind and overlay classifier APIs are integrated. Historical
-  A data cannot be relabelled as a newly linked B account; unchanged retained fractional clocks
-  keep their exact values. The immutable C/JNI fixture uses library SHA-256
-  `8eaa51e9e3b5098a60019ef83b9840d2a70101a1d3dd1168ab9a4330ea470e65` and header
-  `f7e277e197c8c72d230be633db5395234a19ff73ec645f971b0d3e88da376672`.
-  Final production own-account UI/bootstrap wiring remains a separate gate.
-- Android website transactions, downloaded-watch receipts and reviewed account-binding service
-  are integrated. The latter's real-JNI suite passed 122 tests, including install-then-error
-  checkpoint recovery and immutable credential selection. Production DI/UI wiring remains WIP.
-- Strict Swift/Kotlin watched-bitfield decoders are integrated. Metadata-backed, same-source
-  inventory evidence and importer wiring remain WIP; do not remove migration guards or invent
-  viewing clocks merely because the pure decoder passes.
-- Website PR5 is merged and production assets were verified against the reviewed build. This
-  does not establish live multi-device convergence for every migration cohort.
-- Fresh five-slice Apple resource-host SDK generation from `ec96c6c` and the separate arm64
-  Mac server build passed. The earlier native-flag app builds were diagnostic snapshots, not
-  final optimized app builds from this source. Current signed Apple/Android packages, feeds,
-  installation and physical playback remain distinct gates.
-- Reviewed offline Cinema renderer/presentation seams are integrated. Mac Home/Search/Sources
-  and compositor-based Quick View captures exist. Phone/tablet-sized Mac windows are not native
-  iPhone/iPad proof; an isolated native simulator renderer is being prepared.
-- Fresh MPVKit artifacts passed the FFmpeg 9, platform/architecture and SecureTransport content
-  checks. Final app linking and physical decoder behavior remain separate. The installed Mac
-  application has not been restarted or replaced; no 0.5 release is established by these receipts.
+- Future Apple/Android workflow checkouts and post-checkout assertions now agree on private
+  source `7b368f447a3dfc46bd68905acef19fa5c136240d`, independently accepted with Linux/macOS
+  CI run `37907843106`. Fresh SDKs and final combined app/package receipts for that revision
+  remain required. Existing generated SDKs are not relabelled by changing a workflow pin.
+- The immutable `v0.5.0-beta.1` source at `844782d29a93ae51991bfadc639d50bc3619d40b` keeps
+  its original `7e3e68be5bf2b11c65d158c1823be94bd1608d1b` pin and artifacts. This document
+  describes future source; it does not modify the release tag, draft, run or installed apps.
+- Native account checkpoint recovery, profile/host-preference projection, own-account linking,
+  website sparse events, provider intent/ACK handling and add-on replacement are integrated.
+  A source UID or successful login alone cannot relabel history from another account.
+- Metadata-backed watched migration and sealed pending-evidence retry are wired. Incomplete
+  original-source inventory, ambiguous ownership or insufficient causal evidence remain explicit
+  reconciliation states, never successful empty history or a legacy-engine fallback.
+- Library membership, Watchlist and viewing history remain distinct. Native playback context,
+  exact episode resume, bulk watched transactions and source-selection fences are integrated;
+  current provider availability and physical decoder behavior still require runtime evidence.
+- The native transport path is selected without booting Node in native mode. Local NZB playback
+  supports raw video, stored RAR and COPY 7z under advertised capability checks. Compressed,
+  encrypted or repair-required archives require an admitted supported route or another source.
+- Apple remains arm64-only on Mac, with a separate native daemon; Full iOS/TV use the embedded
+  server and Lite has no embedded server. Android ships its three declared ABIs. Universal Mac,
+  broader archive support and physical-device parity are not established by the source tests.
+
+See [native-release-packaging.md](native-release-packaging.md) for the unchanged feature sets,
+player input, SDK/cache verification and final artifact gates.
 
 ## Implemented and independently exercisable
 
@@ -78,7 +71,8 @@ The separate pure authenticated Apple extractor feeds the typed native one-time 
 
 `VORTX_NATIVE_DATA_ENGINE` selects the actual Apple `CoreBridge.start/dispatch/stateData` branch:
 that branch does not initialize/call Stremio and rejects unsupported actions. It needs an explicitly
-installed, authenticated session. No target sets this compilation condition. The gated production
+installed, authenticated session. The native-generated shipping targets set this condition;
+the retained comparison project does not. Production
 bootstrap now lives inside `VortXSyncManager`, where the account key remains private: launch,
 credential changes, profile changes and the existing addon-hydration entry point open a validated
 encrypted checkpoint, bind the captured account namespace and merge a freshly decrypted top-level
@@ -88,7 +82,7 @@ projected by the reviewed typed importer (or its existing nativeSync is adopted 
 before the first atomic checkpoint. The first checkpoint includes the sealed credential-free source
 archive and native import receipt. Failed/decrypt-failed account pulls, invalid owner
 attribution and unavailable artifact queries fail closed; there is no empty-account fallback.
-Unresolved source attribution (including own streaming accounts, ambiguous episode/type/alias evidence,
+Unresolved source attribution (including unproven own-account overlays, ambiguous episode/type/alias evidence,
 and unreflected dashboard edits) requires reconciliation. Offline reopening uses an account-key-authenticated
 checkpoint, archived roster and owner locator; it does not provision a fresh account from an unavailable
 cloud response. New-account admission additionally requires a complete authenticated local checkpoint
@@ -159,10 +153,11 @@ Same-account A→B→A and same-profile reopen invalidate old launch targets per
 launches never acquire a later session. The existing owner-gated external scrobble fanout remains
 after this target validation, independently of whether selected-player engine writes are allowed.
 
-The retained schema-4 C-ABI facade/playback fixture uses private source `5c93b9d`, library
+The historical retained schema-4 C-ABI facade/playback receipt used private source `5c93b9d`, library
 SHA-256 `8eaa51e9e3b5098a60019ef83b9840d2a70101a1d3dd1168ab9a4330ea470e65` and header
 `f7e277e197c8c72d230be633db5395234a19ff73ec645f971b0d3e88da376672`, with unchanged before/after
-hashes. That covers real kernel queries/mutations and localhost resources, not full app packaging.
+hashes. That covered real kernel queries/mutations and localhost resources, not full app packaging
+or a fresh artifact built from the current future pin.
 
 ## Artifact gate
 
@@ -183,12 +178,13 @@ Root integration must update the exact private-core pin, copied header, feature 
 symbols and cache keys together. Existing release pins must not acquire calls into absent exports.
 
 Apple's live bindings compile only with `VORTX_ENGINE_STATE_BRIDGE` and
-`VORTX_ENGINE_RESOURCE_HOST`, respectively, plus `canImport(VortxEngine)`. No target enables these
-conditions yet. The optional builder flags `--state-bridge` and `--resource-host` run header and
-symbol verification. The latter uses the separable native resource host, without QuickJS.
-Android's opt-in integration feature is `VORTX_NATIVE_RESOURCE_HOST=1` or
-`-Pvortx.nativeResourceHost=true`. Its live transport requires native resource ABI version 1.
-Neither option changes the selected app repository.
+`VORTX_ENGINE_RESOURCE_HOST`, respectively, plus `canImport(VortxEngine)`. The native shipping
+generator enables them together with `VORTX_NATIVE_DATA_ENGINE`. The builder's `--resource-host`
+mode runs header/symbol verification and selects `resource-host` for kernel-only slices or
+`server,resource-host` for embedded-server slices, with default Cargo features disabled.
+Android's native default and explicit shipping properties select `jni,server,resource-host`;
+an explicit non-native comparison retains `jni,server`. Live transport requires native resource
+ABI version 1. A resource library alone does not select a repository or prove app provenance.
 
 Run `scripts/verify-native-engine-abi.sh apple <xcframework> resource-host` and
 `scripts/verify-native-engine-abi.sh android <libvortx_ffi.so> resource-host` (set `READELF` to the
@@ -210,16 +206,16 @@ native installed-addon materialization, automatic profile registry rebind, top-l
 and encrypted exact-state cold reopen with episode watch contexts. It launches no
 app or media player. The fixture server requires Node 22+ lossless JSON source support.
 
-## Remaining default-cutover gates
+## Remaining coverage and release gates
 
-| Owner lane | Required behavior before selecting native by default |
+| Owner lane | Remaining boundary despite native source selection |
 | --- | --- |
-| Apple facade | Own-streaming-account profile identity, migration and projection; remaining reachable unsupported actions and full-app parity verification. Offline authenticated checkpoint recovery, native profile CRUD/preferences, authoritative playback/history/stat readers and reviewed Apple bulk watched/add-on actions are implemented behind the gate, not a default cutover. |
-| Android facade | Complete own-streaming-account production DI/UI and metadata-backed watched migration. Website edits and downloaded-watch receipts are integrated. Optional Stremio authentication/import is a reachable UnifiedSignIn path and needs a separate native import/auth channel, not VortX login or a legacy-engine fallback. Verify remaining interface defaults at their real consumers. |
-| Native state integration | Website immutable sparse events, independent host causal bases, atomic receipt/state/host persistence, exact CAS acknowledgements, native-aware website projection, and own-account/ambiguous source cohorts. Shared clocked legacy reconciliation is implemented; that alone does not establish website convergence. |
-| Sources/playback | Integrate provider/debrid resolution, full subtitle options, current source preferences, source-preserving resume, episode/binge selection and download admission. |
-| Native server | Advertise/test NNTP/archive capabilities before changing Node routes; unsupported archives require the supported fallback. |
-| Packaging | Exact reviewed core pin, both Android flavors and all ABIs, Apple slice/header/export checks, universal Mac and Lite decisions, device verification. |
+| Apple facade | Standard saved-title library projection is implemented; magnet/playlist presentation and remaining rejected action variants need explicit consumer coverage. Verify the final app's profile/history/Watchlist, source, download and external-player routes together. |
+| Android facade | Native catalog DI and separate streaming-auth/own-account services are wired. Verify remaining interface defaults, player subtitle consumers and all Full/Play route combinations against actual packages; do not treat source-only or JNI fixtures as device proof. |
+| State and migration | Supported clocked legacy reconciliation, website events, own-account binding and watched-evidence retries exist. Unattributed overlays, missing metadata inventory and unsupported/conflicting edits remain pending/fail-closed. Full live mixed-client convergence for every cohort is not established. |
+| Sources/playback | Provider/debrid, source-preserving resume, episode/binge and download paths require current end-to-end regression receipts under account/profile replacement, failure and recovery. Source tests are not availability, audible playback or physical decoder proof. |
+| Native server | Only advertised archive capabilities are admissible; compressed/encrypted/repair-required cases are not newly supported by the retention pin. Preserve paired-server ownership and Lite's no-embedded-server boundary. |
+| Packaging | Build fresh SDKs from the exact future pin, check all Apple slices/headers/exports and Android ABIs/flavors, then verify optimized apps, signing, provenance, final packages and devices. Mac remains deliberately arm64-only; this change does not supply universal slices. |
 
 Passing bridge tests establishes the adapter and lifetime boundary. It does not establish the full
 application cutover or physical playback parity.

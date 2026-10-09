@@ -6,25 +6,33 @@ physical playback, signing or publication. The retained `app/project.yml` still 
 legacy comparison project; the shipping workflow uses the native generator below. All migration,
 independent review, full-build and artifact gates remain required before publication.
 
-## Pinned shipping inputs
+## Pinned future-build inputs
 
 The checkout and post-checkout equality assertion in `release-tvos.yml`, `android.yml` and
 `android-release.yml` must select one identical, reviewed native source revision. Their current
-source contract is `a722eef43f80bd82226215cf460bba2e02869777`. Updating this pin does not establish
-private CI, fresh cross-platform SDK, app, signing or release acceptance; those gates must pass
+source contract is `7b368f447a3dfc46bd68905acef19fa5c136240d`. Its independently accepted private
+Linux/macOS CI is run `37907843106`. That source receipt does not establish fresh cross-platform
+SDK, app, signing or release acceptance; those gates must pass
 against the final combined public source before shipping. The retained Stremio comparison pin is
 `31c66611822043e089f5819ad232a5df93975873`; native packages must not contain its engine or Node runtime.
 
-Apple shipping and secretless validation use the same fresh player archive:
+The immutable `v0.5.0-beta.1` source at `844782d29a93ae51991bfadc639d50bc3619d40b` retains
+`7e3e68be5bf2b11c65d158c1823be94bd1608d1b`. This future-branch update does not change that tag,
+its workflow run, draft, SDK or published artifacts. Existing generated local SDKs and projects are
+not relabelled as the replacement source. The public C header and FFI feature declaration are
+unchanged between these two private revisions; matching exports still require fresh artifact checks.
 
-- URL: `https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-2/mpvkit-dvfel-artifacts-ffmpeg9-20261008.zip`
-- SHA-256: `ccccc9a3faa84276bf10625d652dd4c9eea04c6a0abdc8e26cb1b35f147514fb`
+Apple shipping and secretless validation retain the same reviewed player archive:
+
+- URL: `https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip`
+- SHA-256: `737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1`
 
 The FFmpeg9/SecureTransport content and architecture/floor gates remain required after extraction.
 The retired FFmpeg8/GnuTLS digest stays explicitly rejected; an override cannot bypass that rejection.
 Only public dependency downloads have broad Cargo cache fallback. Native Apple SDK caches are
-exact-key-only and content-addressed to the fetched private source and build helper, and Android's
-private build cache prefix includes its fetched source contents. Warm artifacts still undergo ABI,
+exact-key-only and content-addressed to the fetched private manifests, toolchain, `.cargo/**`
+configuration, crates/headers and build/ABI helpers. Android's private build cache prefix includes
+its fetched source and `.cargo/**` configuration too. Warm artifacts still undergo ABI,
 floor, link-input and packaged-content verification; an older run's SDK or APK/IPA is not proof for
 the replacement private pin.
 
@@ -90,8 +98,10 @@ exports and the absence of the legacy library. It compares the packaged code wit
 staged output after normalizing both with the pinned NDK strip tool, and records the exact source,
 features and per-ABI hashes. Production signer, version, Play GPL boundary and draft gates remain.
 
-Optional Stremio protocol/account import remains a separate host integration requirement. Native
-catalog selection must not route that account flow through the legacy data engine or hide it.
+Optional Stremio protocol/account import uses the separate captured host authentication and
+own-account link service, not the legacy data engine. Source-qualified migration and complete
+watched evidence remain required; unsupported or uncertain cohorts fail closed rather than
+borrowing another account's data. This implemented path is not universal migration/device proof.
 
 ## Proportionate checks
 
@@ -101,6 +111,11 @@ python3 scripts/tests/test_native_apple_package.py
 bash scripts/test-android-native-release-contracts.sh
 bash scripts/test-release-orchestration-contracts.sh
 ```
+
+The Android source contract also runs `scripts/tests/test_native_pin_cache_contract.py`: all six
+Apple/Android checkout/equality pins must agree with the reviewed SHA, Apple `.cargo/**` and
+source/header/build inputs must remain in the exact-only SDK key, and warm hits must run the ABI
+gate. Its negative fixtures edit text in memory; they do not build, fetch or replace an SDK.
 
 `test-native-android-artifact-content.py` additionally accepts already built, reviewed JNI libraries
 and the pinned NDK tools. It exercises APK/AAB ZIP layouts and negative stale-code, extra-ABI and
