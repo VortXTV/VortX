@@ -15,6 +15,8 @@ on:
       - "scripts/test-mpv-seek-settlement.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
       - "scripts/test-profile-roster-propagation.sh"
+      - "scripts/test-cw-service-selection.sh"
+      - "scripts/test-home-cw-selection.sh"
       - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/generate-native-apple-project.rb"
@@ -42,6 +44,8 @@ on:
       - "scripts/test-mpv-seek-settlement.sh"
       - "scripts/test-sync-derived-document-revisions.sh"
       - "scripts/test-profile-roster-propagation.sh"
+      - "scripts/test-cw-service-selection.sh"
+      - "scripts/test-home-cw-selection.sh"
       - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/generate-native-apple-project.rb"
@@ -83,6 +87,12 @@ jobs:
       - run: bash scripts/test-mpv-seek-settlement.sh
       - run: bash scripts/test-sync-derived-document-revisions.sh
       - run: bash scripts/test-profile-roster-propagation.sh
+      - name: Fetch immutable public Continue Watching regression baselines
+        run: |
+          git fetch --no-tags --depth=1 origin 0e196c586ebe95810476be8efde84fb0c061ca12
+          git fetch --no-tags --depth=1 origin 01a0ec988205781d345d94ec2c30a65d1f1bca8c
+      - run: bash scripts/test-cw-service-selection.sh
+      - run: bash scripts/test-home-cw-selection.sh
       - run: bash scripts/test-apple-parity-contracts.sh
       - run: bash scripts/test-apple-player-timeline.sh
       - run: swift app/Tests/MacSettingsShellContractTests.swift
