@@ -222,7 +222,7 @@ def verify_app(manifest: dict, app: Path, platform: str, link_map: Path) -> dict
 
 
 def bundle_payload(app: Path) -> dict:
-    """Hash bundle content while permitting the signing operation performed by packaging."""
+    """Hash normalized content identically at final app acceptance and after packaging."""
     payload = {}
     macho_magics = {b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
                     b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"}
@@ -242,8 +242,18 @@ def bundle_payload(app: Path) -> dict:
 def verify_packaged_copy(receipt: dict, app: Path, platform: str) -> dict:
     if receipt.get("schema") != 1 or receipt.get("platform") != platform:
         raise ValueError("package proof requires the corresponding accepted app receipt")
-    if receipt.get("bundlePayload") != bundle_payload(app):
-        raise ValueError("packaged app payload differs from the accepted native app")
+    accepted = receipt.get("bundlePayload")
+    packaged = bundle_payload(app)
+    if accepted != packaged:
+        if not isinstance(accepted, dict):
+            raise ValueError("accepted native app receipt lacks bundle payload")
+        # Retain the exact hash scope and reject every change. Path-level diagnostics make a
+        # failed runner receipt actionable without accepting or re-baselining modified bytes.
+        differences = {path: {"accepted": accepted.get(path), "packaged": packaged.get(path)}
+                       for path in sorted(accepted.keys() | packaged.keys())
+                       if accepted.get(path) != packaged.get(path)}
+        raise ValueError("packaged app payload differs from the accepted native app: " +
+                         json.dumps(differences, sort_keys=True))
     for path in app.rglob("*"):
         if path.name in ("server.js", "node-darwin-arm64") or "NodeMobile" in path.name or "StremioXCore" in path.name:
             raise ValueError(f"native archive contains a legacy runtime payload: {path}")

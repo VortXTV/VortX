@@ -171,6 +171,34 @@ class LinkMapProofTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "payload differs"):
             NATIVE.verify_packaged_copy(receipt, app, "ios")
 
+    def test_package_mismatch_reports_changed_added_and_removed_paths(self):
+        app = self.root / "VortX.app"
+        app.mkdir()
+        (app / "changed").write_text("accepted")
+        (app / "removed").write_text("accepted")
+        receipt = {"schema": 1, "platform": "macos", "bundlePayload": NATIVE.bundle_payload(app)}
+        (app / "changed").write_text("mutated")
+        (app / "removed").unlink()
+        (app / "added").write_text("unexpected")
+        with self.assertRaises(ValueError) as raised:
+            NATIVE.verify_packaged_copy(receipt, app, "macos")
+        differences = NATIVE.json.loads(str(raised.exception).split(": ", 1)[1])
+        self.assertEqual(set(differences), {"changed", "removed", "added"})
+        self.assertIsNone(differences["added"]["accepted"])
+        self.assertIsNone(differences["removed"]["packaged"])
+        self.assertNotEqual(differences["changed"]["accepted"], differences["changed"]["packaged"])
+
+    def test_normalized_executable_mutation_still_fails_with_exact_path(self):
+        app = self.root / "VortX.app"
+        app.mkdir()
+        binary = app / "VortX"
+        binary.write_bytes(b"\xcf\xfa\xed\xfeaccepted code")
+        with patch.object(NATIVE, "unsigned_hash", side_effect=NATIVE.sha256):
+            receipt = {"schema": 1, "platform": "macos", "bundlePayload": NATIVE.bundle_payload(app)}
+            binary.write_bytes(b"\xcf\xfa\xed\xfemutated code")
+            with self.assertRaisesRegex(ValueError, 'payload differs.*"VortX"'):
+                NATIVE.verify_packaged_copy(receipt, app, "macos")
+
     def test_ipa_path_traversal_is_rejected(self):
         artifact = self.root / "native.ipa"
         with NATIVE.zipfile.ZipFile(artifact, "w") as archive:
