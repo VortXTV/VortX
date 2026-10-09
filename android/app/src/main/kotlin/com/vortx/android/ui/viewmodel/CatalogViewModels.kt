@@ -38,7 +38,6 @@ import com.vortx.android.home.ContinueWatchingPermit
 import com.vortx.android.home.SimklContinueWatchingModel
 import com.vortx.android.home.continueWatchingOwnerIsKnown
 import com.vortx.android.home.withSelectedContinueWatchingRail
-import com.vortx.android.home.importedCatalogRails
 import com.vortx.android.home.upcomingMetaBases
 import com.vortx.android.home.withBecauseYouWatchedRail
 import com.vortx.android.home.withExternalWatchlistRails
@@ -243,8 +242,6 @@ class HomeViewModel internal constructor(
     // Editorial rails are GLOBAL (not profile-specific), like Apple's CuratedCollectionsModel, so they are
     // never cleared on an owner change; the model's own StateFlow keeps this field current.
     private var editorialRails: List<Catalog> = emptyList()
-    private var importedRails: List<Catalog> = importedCatalogs?.catalogs?.value
-        ?.let(::importedCatalogRails).orEmpty()
     private val topPicks = TopPicksModel()
     private val releaseCalendar = ReleaseCalendarModel()
     private val releaseOwnerTracker = ReleaseCalendarOwnerTracker(currentReleaseBoundary())
@@ -345,8 +342,7 @@ class HomeViewModel internal constructor(
         }
         importedCatalogs?.let { registry ->
             scope.launch {
-                registry.catalogs.drop(1).collectLatest { catalogs ->
-                    importedRails = importedCatalogRails(catalogs)
+                registry.catalogs.drop(1).collectLatest {
                     publishHome()
                 }
             }
@@ -698,9 +694,11 @@ class HomeViewModel internal constructor(
 
     private fun publishHome() {
         if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED && renderedOwner == null) return
+        val importedSnapshot = importedCatalogs?.publicationSnapshot()
+        val currentImportedRails = importedSnapshot?.rails.orEmpty()
         val hasClientRows = continueWatchingStatus != null || topPicksItems.isNotEmpty() || becauseYouWatchedRail != null ||
             traktWatchlist.isNotEmpty() || traktContinueWatchingItems.isNotEmpty() || simklWatchlist.isNotEmpty() || mediaServerRails.isNotEmpty() ||
-            importedRails.isNotEmpty() || upcomingEpisodes.isNotEmpty() || upcomingMovies.isNotEmpty() ||
+            currentImportedRails.isNotEmpty() || upcomingEpisodes.isNotEmpty() || upcomingMovies.isNotEmpty() ||
             editorialRails.isNotEmpty()
         if (!sourceHasRows && !hasClientRows) return
         val topRows = withTopPicksRail(baseRows, topPicksItems)
@@ -723,7 +721,7 @@ class HomeViewModel internal constructor(
         } else selectedRows
         val externalRows = withExternalWatchlistRails(traktContinueWatchingRows, traktWatchlist, simklWatchlist)
         val serverRows = withMediaServerRails(externalRows, mediaServerRails)
-        val importedRows = withImportedCatalogRails(serverRows, importedRails)
+        val importedRows = withImportedCatalogRails(serverRows, currentImportedRails)
         val calendarRows = withReleaseCalendarRails(importedRows, upcomingEpisodes, upcomingMovies)
         // Editorial rails are spliced last; HomeRailPreferences.arrange re-groups everything by HomeRail and
         // places them at the EDITORIAL_COLLECTIONS slot (phone default order only, so TV drops them).
@@ -739,7 +737,9 @@ class HomeViewModel internal constructor(
         val admitted = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED)
             renderedOwner?.let { repo.admitClientHomeRows(visibleRows, it).getOrNull() } ?: emptyList()
         else visibleRows
-        _state.value = UiState.Success(admitted)
+        if (importedCatalogs != null && importedSnapshot != null) {
+            importedCatalogs.publishSnapshot(importedSnapshot, admitted) { _state.value = UiState.Success(it) }
+        } else _state.value = UiState.Success(admitted)
     }
 
     fun removeFromContinueWatching(item: MetaItem) {

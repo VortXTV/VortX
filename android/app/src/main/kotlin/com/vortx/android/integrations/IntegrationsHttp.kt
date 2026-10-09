@@ -29,7 +29,17 @@ internal object IntegrationsHttp {
         urlString: String,
         headers: Map<String, String> = emptyMap(),
         body: String? = null,
-    ): Response = withContext(Dispatchers.IO) {
+        shouldProceed: () -> Boolean = { true },
+    ): Response {
+        val send: suspend () -> Response = { performRequest(method, urlString, headers, body, shouldProceed) }
+        return if (method.equals("POST", true) && URL(urlString).host.equals("api.simkl.com", true)) {
+            SimklPostPacer.shared.dispatch(shouldProceed, send) ?: Response(0, "")
+        } else send()
+    }
+
+    private suspend fun performRequest(method: String, urlString: String, headers: Map<String, String>,
+                                       body: String?, shouldProceed: () -> Boolean): Response = withContext(Dispatchers.IO) {
+        if (!shouldProceed()) return@withContext Response(0, "")
         var connection: HttpURLConnection? = null
         try {
             connection = (URL(urlString).openConnection() as HttpURLConnection).apply {
@@ -37,6 +47,8 @@ internal object IntegrationsHttp {
                 connectTimeout = TIMEOUT_MS
                 readTimeout = TIMEOUT_MS
                 useCaches = false
+                // A provider redirect must never forward the captured Bearer to a different host.
+                instanceFollowRedirects = false
                 headers.forEach { (name, value) -> setRequestProperty(name, value) }
                 if (body != null) {
                     doOutput = true

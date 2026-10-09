@@ -78,6 +78,10 @@ fun IntegrationsScreen(repo: CatalogRepository, onBack: () -> Unit, modifier: Mo
             ListImportScreen(onBack = { route = ImportRoute.None }, modifier = modifier)
             return
         }
+        ImportRoute.TraktLists -> {
+            TraktMyListsScreen(onBack = { route = ImportRoute.None }, modifier = modifier)
+            return
+        }
         ImportRoute.None -> Unit
     }
 
@@ -147,6 +151,11 @@ fun IntegrationsScreen(repo: CatalogRepository, onBack: () -> Unit, modifier: Mo
                 title = "Import a list",
                 description = "Paste a public Letterboxd, MDBList, or Trakt list link and browse it as a Home row.",
                 onClick = { route = ImportRoute.List },
+            )
+            NavCard(
+                title = "My Trakt lists",
+                description = "Show personal, private, and liked Trakt lists as rows on Home.",
+                onClick = { route = ImportRoute.TraktLists },
             )
 
             // Stremio mirror: per-category control of whether VortX tracks a connected Stremio account. Default
@@ -492,7 +501,7 @@ internal sealed interface ConnectUi {
 }
 
 /// The in-place import sub-routes reached from the cards at the top of the Integrations screen.
-private enum class ImportRoute { None, Stremio, Nuvio, List }
+private enum class ImportRoute { None, Stremio, Nuvio, List, TraktLists }
 
 /// A tappable settings card that opens a sub-screen (title + description + trailing chevron), matching the
 /// Apple Integrations cards (Nuvio / List import) that push a NavigationLink destination.

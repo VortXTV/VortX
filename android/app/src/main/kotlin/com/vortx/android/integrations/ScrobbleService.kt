@@ -87,7 +87,6 @@ object ScrobbleService {
         }
         TraktAuth.init(app)
         SIMKLAuth.init(app)
-        TraktRatingsSync.init(app)
         startTraktSessionWatcher()
     }
 
@@ -118,11 +117,12 @@ object ScrobbleService {
         }
     }
 
-    /** Future local user-rating mutation hook. Android currently has no writable user-rating store/UI. */
+    /** Compatibility event hook; capture before scheduling so a delayed event cannot change account. */
     fun traktRatingChanged(ref: MediaRef, rating: Int, ratedAt: String) {
+        val owner = PersonalRatings.controller.owner(RatingProvider.TRAKT) ?: return
+        val title = RatingTitle.from(ref) ?: return
         scope.launch {
-            runCatching { TraktRatingsSync.ratingChanged(TraktRatingsSync.Rating(ref, rating, ratedAt)) }
-                .onFailure { Log.d(TAG, "trakt rating push skipped: ${it.message}") }
+            PersonalRatings.controller.set(owner, title, rating)
         }
     }
 
@@ -149,7 +149,7 @@ object ScrobbleService {
     fun isToggleOn(key: String, default: Boolean): Boolean =
         togglePrefs?.getBoolean(key, default) ?: default
 
-    fun setToggle(key: String, enabled: Boolean) {
+    fun setToggle(key: String, enabled: Boolean) = com.vortx.android.profile.ContinueWatchingOwnerGate.serialized {
         togglePrefs?.edit()?.putBoolean(key, enabled)?.apply()
         _toggleChanges.value += 1
     }
@@ -250,6 +250,7 @@ object ScrobbleService {
     // MARK: - SIMKL wire
 
     private suspend fun simklAddToHistory(ref: MediaRef) {
+        val owner = ConnectedIntegrationAccess.owner(RatingProvider.SIMKL) ?: return
         val token = SIMKLAuth.validToken() // throws NotSignedIn when not connected -> caught by runCatching
         val body = JSONObject()
         val ids = JSONObject().apply {
@@ -280,6 +281,7 @@ object ScrobbleService {
             urlString = "${SIMKLAuth.API_BASE}/sync/history?${SIMKLAuth.requiredQuery()}",
             headers = SIMKLAuth.authHeaders(token),
             body = body.toString(),
+            shouldProceed = { ConnectedIntegrationAccess.current(owner) && isSimklScrobbleEnabled() },
         )
         Log.d(TAG, "simkl sync/history -> HTTP ${response.status}")
     }

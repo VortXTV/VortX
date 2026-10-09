@@ -6,6 +6,14 @@ import com.vortx.android.model.Catalog
 import com.vortx.android.model.MediaType
 import com.vortx.android.model.MetaItem
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.ContinueWatchingOwnerGate
+import com.vortx.android.integrations.ConnectedIntegrationAccess
+import com.vortx.android.integrations.ExternalIntegrationOwner
+import com.vortx.android.integrations.TraktAuth
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -33,6 +41,7 @@ internal data class ImportedListCatalog(
     val sourceUrl: String,
     val items: List<MetaItem>,
     val requiresConnection: Boolean = false,
+    val connectionOwner: ExternalIntegrationOwner? = null,
 )
 
 /** Process-live registry for public imported lists written under Apple's exact settings key. */
@@ -40,38 +49,51 @@ internal class ImportedCatalogs private constructor(context: Context) {
     private val prefs = context.applicationContext
         .getSharedPreferences(ProfileStore.PREFS_FILE, Context.MODE_PRIVATE)
     private val _catalogs = MutableStateFlow(read())
+    private val privateCatalogs = ImportedPrivateRows { ConnectedIntegrationAccess.current(it) }
     val catalogs: StateFlow<List<ImportedListCatalog>> = _catalogs.asStateFlow()
 
     // Keep a strong reference for the process lifetime. Android otherwise weakly retains preference listeners.
     private val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (key == KEY) _catalogs.value = read()
+        if (key == KEY) reconcilePrivate()
     }
 
     init {
         prefs.registerOnSharedPreferenceChangeListener(listener)
         val durable = _catalogs.value
         val raw = prefs.all[KEY] as? String
-        if (raw != null && raw.trim() != ImportedCatalogCodec.encode(durable)) persist(durable)
+        if (raw != null && raw.trim() != ImportedCatalogCodec.encode(durable))
+            ContinueWatchingOwnerGate.serialized { persist(durable) }
+        ProfileStore.sharedOrNull()?.addHomeTransitionListener { reconcilePrivate() }
+        ProfileStore.sharedOrNull()?.addSwitchListener { reconcilePrivate() }
+        CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            TraktAuth.sessionBoundary.collect { reconcilePrivate() }
+        }
     }
 
-    @Synchronized
-    fun register(catalog: ImportedListCatalog): Boolean {
-        val validated = ImportedCatalogCodec.validate(catalog) ?: return false
-        if (validated.requiresConnection || validated.items.isEmpty()) return false
+    fun register(catalog: ImportedListCatalog): Boolean = ContinueWatchingOwnerGate.serialized {
+        val validated = ImportedCatalogCodec.validate(catalog) ?: return@serialized false
+        if (validated.items.isEmpty()) return@serialized false
+        if (validated.requiresConnection) {
+            if (!privateCatalogs.register(validated)) return@serialized false
+            persist(listOf(validated) + _catalogs.value.filterNot { it.id == validated.id || it.sourceUrl == validated.sourceUrl })
+            return@serialized true
+        }
+        privateCatalogs.remove(validated.id)
         val next = _catalogs.value
             .filterNot { it.id == validated.id || it.sourceUrl == validated.sourceUrl }
             .toMutableList()
             .apply { add(0, validated) }
             .take(MAX_CATALOGS)
         persist(next)
-        return true
+        true
     }
 
-    @Synchronized
-    fun remove(id: String) = persist(_catalogs.value.filterNot { it.id == id })
+    fun remove(id: String) = ContinueWatchingOwnerGate.serialized {
+        privateCatalogs.remove(id)
+        persist(_catalogs.value.filterNot { it.id == id })
+    }
 
-    @Synchronized
-    fun reorder(ids: List<String>) {
+    fun reorder(ids: List<String>) = ContinueWatchingOwnerGate.serialized {
         val current = _catalogs.value
         val byId = current.associateBy(ImportedListCatalog::id)
         val ordered = ids.distinct().mapNotNull(byId::get)
@@ -85,18 +107,80 @@ internal class ImportedCatalogs private constructor(context: Context) {
         val durable = catalogs.mapNotNull(ImportedCatalogCodec::validate)
             .filterNot(ImportedListCatalog::requiresConnection)
             .take(MAX_CATALOGS)
-        _catalogs.value = durable
+        val private = privateCatalogs.visible().associateBy { it.id }
+        _catalogs.value = catalogs.mapNotNull { if (it.requiresConnection) private[it.id] else it }
+            .distinctBy { it.id }.take(MAX_CATALOGS)
         prefs.edit().putString(KEY, ImportedCatalogCodec.encode(durable)).apply()
     }
+
+    private fun reconcilePrivate() = ContinueWatchingOwnerGate.serialized {
+        val available = (privateCatalogs.visible() + read()).associateBy { it.id }.toMutableMap()
+        val retained = _catalogs.value.mapNotNull { available.remove(it.id) }
+        _catalogs.value = (retained + available.values).take(MAX_CATALOGS)
+    }
+
+    fun publicationSnapshot(): ImportedCatalogPublication = ContinueWatchingOwnerGate.serialized {
+        reconcilePrivate()
+        ImportedCatalogPublication(_catalogs.value.toList())
+    }
+
+    /** Lock order: profile/account gate, then provider admission, held through the Home assignment.
+     * The async registry collector is only a repaint trigger; it is never the privacy boundary.
+     */
+    fun publishSnapshot(snapshot: ImportedCatalogPublication, rows: List<Catalog>, publish: (List<Catalog>) -> Unit) =
+        ContinueWatchingOwnerGate.serialized {
+            val current = publicationSnapshot()
+            val owner = snapshot.catalogs.firstOrNull { it.requiresConnection }?.connectionOwner
+            val admitted = owner?.let { ConnectedIntegrationAccess.publish(it) {
+                publish(admitImportedCatalogPublication(snapshot, current, rows) { captured -> captured == it })
+                true
+            } } == true
+            if (!admitted) publish(admitImportedCatalogPublication(snapshot, current, rows) { false })
+        }
 
     companion object {
         const val KEY = "vortx.catalog.importedLists"
         const val MAX_CATALOGS = 50
 
         @Volatile private var instance: ImportedCatalogs? = null
-        fun shared(context: Context): ImportedCatalogs = instance ?: synchronized(this) {
-            instance ?: ImportedCatalogs(context.applicationContext).also { instance = it }
+        fun reconcileConnection() { instance?.reconcilePrivate() }
+        fun shared(context: Context): ImportedCatalogs = instance ?: ContinueWatchingOwnerGate.serialized {
+            synchronized(this) { instance ?: ImportedCatalogs(context.applicationContext).also { instance = it } }
         }
+    }
+}
+
+internal data class ImportedCatalogPublication(val catalogs: List<ImportedListCatalog>) {
+    val rails: List<Catalog> get() = importedCatalogRails(catalogs)
+}
+
+/** Preserve native admission on each row; only remove stale imports, never recertify replacement items. */
+internal fun admitImportedCatalogPublication(
+    captured: ImportedCatalogPublication, current: ImportedCatalogPublication, rows: List<Catalog>,
+    ownerCurrent: (ExternalIntegrationOwner) -> Boolean,
+): List<Catalog> {
+    val allowed = captured.catalogs.filter { catalog ->
+        current.catalogs.any { it == catalog } && (!catalog.requiresConnection ||
+            catalog.connectionOwner?.let(ownerCurrent) == true)
+    }.mapTo(hashSetOf()) { "$IMPORTED_CATALOG_PREFIX${it.id}" }
+    return rows.filter { !it.id.startsWith(IMPORTED_CATALOG_PREFIX) || it.id in allowed }
+}
+
+/** Caller serializes against the profile/account boundary. No private metadata has a disk codec. */
+internal class ImportedPrivateRows(private val current: (ExternalIntegrationOwner) -> Boolean) {
+    private val rows = mutableListOf<ImportedListCatalog>()
+    fun register(catalog: ImportedListCatalog): Boolean {
+        val owner = catalog.connectionOwner ?: return false
+        if (!catalog.requiresConnection || catalog.provider != ImportedListProvider.TRAKT || !current(owner)) return false
+        rows.removeAll { it.id == catalog.id || it.sourceUrl == catalog.sourceUrl }
+        rows.add(0, catalog)
+        while (rows.size > ImportedCatalogs.MAX_CATALOGS) rows.removeAt(rows.lastIndex)
+        return true
+    }
+    fun remove(id: String) { rows.removeAll { it.id == id } }
+    fun visible(): List<ImportedListCatalog> {
+        rows.removeAll { it.connectionOwner?.let(current) != true }
+        return rows.toList()
     }
 }
 
@@ -212,7 +296,8 @@ internal object ImportedCatalogCodec {
 }
 
 internal fun importedCatalogRails(catalogs: List<ImportedListCatalog>): List<Catalog> = catalogs.mapNotNull { catalog ->
-    catalog.takeIf { !it.requiresConnection && it.items.isNotEmpty() }?.let {
+    catalog.takeIf { it.items.isNotEmpty() && (!it.requiresConnection ||
+        it.connectionOwner?.let { owner -> ConnectedIntegrationAccess.current(owner) } == true) }?.let {
         Catalog("$IMPORTED_CATALOG_PREFIX${it.id}", it.title, it.items)
     }
 }

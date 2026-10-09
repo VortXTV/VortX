@@ -102,6 +102,7 @@ object TraktAuth {
             tokenStore?.clear()
         }
         publishSessionBoundary()
+        com.vortx.android.home.ImportedCatalogs.reconcileConnection()
     }
 
     /** Stable only for the currently connected credential generation. Contains no credential material. */
@@ -382,18 +383,24 @@ object TraktAuth {
         path: String,
         expectedEpoch: Long,
         body: String? = null,
+        ownerCurrent: () -> Boolean = { true },
     ): IntegrationsHttp.Response? {
-        if (!isSessionCurrent(expectedEpoch)) return null
+        if (!ownerCurrent() || !isSessionCurrent(expectedEpoch)) return null
         val token = runCatching { validToken() }.getOrNull() ?: return null
-        if (!isSessionCurrent(expectedEpoch)) return null
+        if (!ownerCurrent() || !isSessionCurrent(expectedEpoch)) return null
         val response = IntegrationsHttp.request(
             method = method,
             urlString = "$API_BASE$path",
             headers = baseHeaders() + mapOf("Authorization" to "Bearer $token"),
             body = body,
+            shouldProceed = { ownerCurrent() && isSessionCurrent(expectedEpoch) },
         )
-        return response.takeIf { isSessionCurrent(expectedEpoch) }
+        return response.takeIf { ownerCurrent() && isSessionCurrent(expectedEpoch) }
     }
+
+    internal fun <T> withSessionCurrent(expectedEpoch: Long, action: () -> T): T? = tokenMutations.snapshot {
+        if (currentSessionEpoch() == expectedEpoch && tokenStore?.connectionState == CredentialConnectionState.CONNECTED) action() else null
+    }.value
 
     private fun isSessionCurrent(expectedEpoch: Long): Boolean = tokenMutations.snapshot {
         currentSessionEpoch() == expectedEpoch &&
