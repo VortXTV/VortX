@@ -10,6 +10,7 @@ server=app/Sources/Player/VortXRemuxHLSServer.swift
 {
   sed '/^    \/\/ INSERT PRODUCTION SERVER METHODS/,$d' "$fixture"
   sed -n '/^    func reportPlaybackPosition(/,/^    private func playbackSegmentID(/p' "$server" | sed '$d'
+  sed -n '/^    private func retireStartupProducerReservation(/,/^    \/\/\/ Updates the lead gate/p' "$server" | sed '$d'
   sed -n '/^    private func refreshProducerLeadGate(/,/^    private func producerDidPublish(/p' "$server" | sed '$d'
   sed -n '/^    \/\/ INSERT PRODUCTION SERVER METHODS/,$p' "$fixture" | sed '1d'
 } > "$seek_gate_dir/server-fixture.swift"

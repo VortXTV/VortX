@@ -114,6 +114,8 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// between AVPlayer's roughly six-second reloads.
     private let producerLeadLock = NSLock()
     private var producerLeadLedger = VortXRemuxProducerLeadLedger()
+    /// One-way startup grant, guarded by producerLeadLock. Never reset by seek, pause or prepared adoption.
+    private var producerLeadPhase = VortXRemuxProducerLeadPolicy.Phase.startup
     private var producerLeadNeedsReanchor = false
     private var lastProducerLeadPaused: Bool?
     /// Cumulative produced-segment byte and media totals, sampled from the same producer-boundary receipts the
@@ -515,14 +517,15 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         let snapshot = stream.hlsSnapshot()
         if snapshot.signaling != nil, prepareMasterPublication() != nil {
             let parkAccepted = stream.requestPreparationProducerPark()
-            let parked = stream.isPreparationProducerParked
+            guard parkAccepted, !isInvalidated, stream.buffer.status().failure == nil else {
+                DiagnosticsLog.log(
+                    "binge", "prepared-remux phase=rejected reason=producer-park-unavailable")
+                return
+            }
+            // The master commit may have closed the startup grant while the producer was already sleeping
+            // on the lead gate. Do not release that byte gate merely to reach the separate preparation gate.
+            let parked = stream.isPreparationProducerParked || stream.producerLeadGate.isParked
             if !parked, !terminal {
-                if !parkAccepted {
-                    DiagnosticsLog.log(
-                        "binge",
-                        "prepared-remux phase=rejected reason=producer-park-unavailable")
-                    return
-                }
                 schedulePreparedReadinessPoll()
                 return
             }
@@ -685,6 +688,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         playbackClockLock.lock()
         defer { playbackClockLock.unlock() }
         guard seekAnchorState.reportPlaybackPosition(playerSeconds, receiptEpoch: receiptEpoch) else { return }
+        if playerSeconds > 0 { retireStartupProducerReservation() }
         // Keep admission and the ledger receipt atomic. Previously rejected pre-seek ticks still reached
         // the producer ledger, and its monotonic frontier then ignored every legitimate backward tick.
         refreshProducerLeadGate(playbackReceipt: playerSeconds)
@@ -805,6 +809,16 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         return seconds ?? .nan
     }
 
+    /// Only durable master publication or an admitted real consumption receipt ends the startup share. The
+    /// publication -> producerLead order is intentional; producer callbacks never acquire publicationLock.
+    private func retireStartupProducerReservation() {
+        producerLeadLock.lock()
+        let changed = producerLeadPhase == .startup
+        producerLeadPhase = .steady
+        producerLeadLock.unlock()
+        if changed { refreshProducerLeadGate() }
+    }
+
     /// Updates the lead gate from either a producer boundary or a confirmed player-clock receipt. This is kept
     /// outside `publicationLock`: neither source needs a playlist render to make progress, and the gate itself
     /// only parks at the next closed fragment boundary.
@@ -848,10 +862,12 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         guard let producedEnd else { producerLeadLock.unlock(); return }
         let playhead = playback ?? .nan
         let wasPaused = stream.producerLeadGate.isPaused
+        let byteBudget = producerLeadPhase.maximumAheadBytes
         let shouldPause = VortXRemuxProducerLeadPolicy.shouldPauseProducer(
             leadSeconds: producedEnd - playhead,
             aheadBytes: aheadBytes,
-            currentlyPaused: wasPaused)
+            currentlyPaused: wasPaused,
+            phase: producerLeadPhase)
         stream.producerLeadGate.setPaused(shouldPause)
         let changed = lastProducerLeadPaused != shouldPause
         lastProducerLeadPaused = shouldPause
@@ -860,7 +876,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             engineReadyLock.lock(); let ready = engineReady; engineReadyLock.unlock()
             DiagnosticsLog.log(
                 "hls",
-                "producer lead gate=\(shouldPause ? "park" : "run") engineReady=\(ready) anchored=\(consumptionAnchored) retainsFullTimeline=\(retainsFullTimeline) edge=\(String(format: "%.3f", producedEnd)) playhead=\(playhead.isFinite ? String(format: "%.3f", playhead) : "unknown") lead=\((producedEnd - playhead).isFinite ? String(format: "%.3f", producedEnd - playhead) : "unknown") aheadBytes=\(aheadBytes) byteBudget=\(VortXRemuxProducerLeadPolicy.maximumAheadBytes) segments=\(segmentCount) bps=\(observedSourceBitsPerSecond().map { Int($0.rounded()) }.map(String.init) ?? "unknown")"
+                "producer lead gate=\(shouldPause ? "park" : "run") engineReady=\(ready) anchored=\(consumptionAnchored) retainsFullTimeline=\(retainsFullTimeline) edge=\(String(format: "%.3f", producedEnd)) playhead=\(playhead.isFinite ? String(format: "%.3f", playhead) : "unknown") lead=\((producedEnd - playhead).isFinite ? String(format: "%.3f", producedEnd - playhead) : "unknown") aheadBytes=\(aheadBytes) byteBudget=\(byteBudget) segments=\(segmentCount) bps=\(observedSourceBitsPerSecond().map { Int($0.rounded()) }.map(String.init) ?? "unknown")"
             )
         }
     }
@@ -1540,6 +1556,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             stream.failHLS("HLS initial playlist receipt could not be recorded")
             return nil
         }
+        retireStartupProducerReservation()
         return MasterPublication(
             audioPlan: audioPlan,
             primaryAudioTag: advertisedPrimaryAudioTag,

@@ -31,6 +31,7 @@ private final class SeekGateFixture: @unchecked Sendable {
     private var publishedVideoWindow: VortXHLSWindow?
     private var seekAnchorState = VortXHLSSeekAnchorState()
     private var producerLeadLedger = VortXRemuxProducerLeadLedger()
+    private var producerLeadPhase = VortXRemuxProducerLeadPolicy.Phase.steady
     private var producerLeadNeedsReanchor = false
     private var lastProducerLeadPaused: Bool?
     private var couplingProducedMediaSeconds: Double = 0
