@@ -425,6 +425,17 @@ final class CoreBridge: ObservableObject {
         return current.facade === target.facade && current.binding == target.binding &&
             PlaybackMutationOwnershipPolicy.allowsNative(.native(target.owner), binding: current.owner)
     }
+    /// Navigation records a displayed identity, not a durable mutation. Ordinary FIFO sync may be
+    /// busy while a frame arrives; acknowledged owner/profile epochs still fence that receipt.
+    struct NativeNavigationTarget {
+        fileprivate let owner: NativeWatchlistTarget
+    }
+    func captureNativeNavigationTarget() -> NativeNavigationTarget? {
+        captureNativeWatchlistTarget().map { .init(owner: $0) }
+    }
+    func nativeNavigationTargetIsCurrent(_ target: NativeNavigationTarget) -> Bool {
+        nativeWatchlistTargetIsCurrent(target.owner)
+    }
     @MainActor func captureNativeWatchlistActionAdmission() -> NativeWatchlistActionAdmission {
         let target = captureNativeWatchlistTarget()
         let generation = nativeFacadeLock.withLock { nativeFacadeStorage == nil ? nil : nativeInstallGeneration }

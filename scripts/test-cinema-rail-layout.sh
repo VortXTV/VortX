@@ -9,5 +9,9 @@ xcrun swiftc -parse-as-library -warnings-as-errors app/SourcesShared/CinemaPrevi
 "$layout_test_dir/synopsis"
 xcrun swiftc -parse-as-library -warnings-as-errors app/SourcesShared/EpisodeReturnIdentityPolicy.swift app/Tests/EpisodeReturnIdentityPolicyTests.swift -o "$layout_test_dir/episode-return"
 "$layout_test_dir/episode-return"
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors -D VORTX_NATIVE_DATA_ENGINE \
+    app/SourcesShared/EpisodeReturnIdentityPolicy.swift app/SourcesShared/PlaybackNavigationOwner.swift \
+    app/Tests/PlaybackNavigationOwnerTests.swift -o "$layout_test_dir/navigation-owner"
+"$layout_test_dir/navigation-owner"
 swift app/Tests/MacSettingsShellContractTests.swift
 swift app/Tests/CinemaNativePresentationContractTests.swift
