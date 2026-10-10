@@ -4859,7 +4859,7 @@ struct TVPlayerView: View {
                         if abandoned && action == .restoreFailure { presentTerminalLoadFailure() }
                     }
                 }
-                func admitted() -> Bool {
+                @MainActor func admitted() -> Bool {
                     owner.isCurrent && !leftPlayback && refinding && curMeta?.videoId == m.videoId
                         && episodeRefindAttempt == attempt
                         && sourceSwitchGeneration == generation && episodeSwitchGeneration == episodeGeneration
@@ -9008,7 +9008,7 @@ struct TVPlayerView: View {
             let choice = SeriesSourceSticky.snapshot(for: current.libraryId)
             let deadline = ProcessInfo.processInfo.systemUptime + SourceSettlementPolicy.maximumWait
             directResumeSourceTask = Task { @MainActor in
-                func admitted() -> Bool {
+                @MainActor func admitted() -> Bool {
                     owner.isCurrent && !leftPlayback && directResumeSourceGeneration == generation
                         && sourceSwitchGeneration == mediaGeneration && episodeSwitchGeneration == episodeGeneration
                         && sourceTargetMeta?.videoId == current.videoId && SeriesSourceSticky.admits(choice)
@@ -9883,7 +9883,7 @@ struct TVPlayerView: View {
                 generation: episodeGeneration, sourceGeneration: sourceGeneration,
                 videoID: v.id, choice: choice
             ) else { return }
-            func admitted() -> Bool {
+            @MainActor func admitted() -> Bool {
                 sourceOwner.isCurrent && episodeSwitchIsCurrent(
                     generation: episodeGeneration, sourceGeneration: sourceGeneration,
                     videoID: v.id, choice: choice
