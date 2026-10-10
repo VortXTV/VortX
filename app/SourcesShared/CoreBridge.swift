@@ -5890,7 +5890,7 @@ final class CoreBridge: ObservableObject {
         // Signature over BOTH stream surfaces: the meta-embedded groups (metaStreams, the HTTP/HLS
         // add-on shape, #122) land on the meta republish, and without them in the diff that arrival
         // looked like "nothing changed" and the source list never rebuilt.
-        return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)
+        return !streamSetsEqual(current.allStreamGroups, next.allStreamGroups)
     }
 
     /// True when a republish changed something the SOURCE LIST derives from: presence, the loaded
@@ -5902,29 +5902,31 @@ final class CoreBridge: ObservableObject {
         if current.selectedMetaID != next.selectedMetaID || current.selected?.streamPath?.id != next.selected?.streamPath?.id { return true }
         if current.meta?.id != next.meta?.id { return true }
         // Both surfaces, matching metaDetailsNeedsRepublish: a metaStreams arrival must bump streamsEpoch.
-        return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)
+        return !streamSetsEqual(current.allStreamGroups, next.allStreamGroups)
     }
 
-    /// A cheap signature of the ready streams per source group: the group's path id plus its ready
-    /// stream count. It changes when new sources land for the current episode, when a group errors in,
-    /// or when a different episode's streams arrive (a new path id), which is exactly when the source
-    /// list / episode-switch poll needs the fresh value. It does NOT change on an identical re-emit.
-    private static func streamSetSignature(_ groups: [CoreStreamGroup]) -> [String] {
-        // Encode the LOADED STATE, not just the ready count. A group in .loading and a group in .err both have
-        // ready==nil, so keying on the count alone made a loading->err transition invisible: when the LAST
-        // unresolved add-on errored, metaDetails was not republished, streamLoadProgress stayed at N-1/N, and
-        // the source-list spinner + the resolveSettled auto-pick waited out the settle timeout. Distinguish
-        // ready(count) vs loading vs err so that transition republishes at once.
-        groups.map { g -> String in
-            let marker: String
-            switch g.content {
-            case .ready(let r)?: marker = "r\(r.count)"
-            case .loading?:      marker = "L"
-            case .err?:          marker = "E"
-            case .none:          marker = "-"
+    /// Compare the decoded source values, including their provider and request identity. Equal counts
+    /// do not mean equal sources: a refreshed URL, proxy header or torrent file selector must replace
+    /// the resident value even when the provider still returns exactly one row. Full CoreStream
+    /// equality also covers fields deliberately omitted from its display id. Compare in memory only;
+    /// configured URLs and headers must never become a logged or persisted signature.
+    private static func streamSetsEqual(_ current: [CoreStreamGroup], _ next: [CoreStreamGroup]) -> Bool {
+        guard current.count == next.count else { return false }
+        for (old, new) in zip(current, next) {
+            guard old.request.base == new.request.base,
+                  old.request.path.resource == new.request.path.resource,
+                  old.request.path.type == new.request.path.type,
+                  old.request.path.id == new.request.path.id else { return false }
+            switch (old.content, new.content) {
+            case let (.ready(oldStreams)?, .ready(newStreams)?):
+                guard oldStreams == newStreams else { return false }
+            case (.loading?, .loading?), (.err?, .err?), (.none, .none):
+                break
+            default:
+                return false
             }
-            return "\(g.request.path.id)#\(marker)"
         }
+        return true
     }
 
     // MARK: Board assembly
