@@ -717,6 +717,15 @@ internal class VortxNativeSession private constructor(
         action()
     }
 
+    /** An auxiliary result may race the next provider receipt. Defer only that receipt mismatch;
+     * a replaced slot/owner is still an error and must retire the entire request, never be swallowed. */
+    @Synchronized fun <T : Any> publishIfLatestReceipt(name: String, owner: VortxNativeOwner,
+        pages: List<VortxResourceSnapshot>, ticket: UUID, action: () -> T): T? = owned(owner) {
+        val slot = slots[name]
+        check(slot != null && slot.ticket == ticket) { "Native request superseded" }
+        if (slot.completed != pages.map { it.requestId to it.generation }) null else action()
+    }
+
     /** A new request replaces only its own consumer slot. Close/profile/account changes fence all slots. */
     suspend fun load(name: String, owner: VortxNativeOwner,
                      requests: List<Pair<VortxResourceRequest, List<VortxResourceAddon>>>): List<VortxResourceSnapshot> {

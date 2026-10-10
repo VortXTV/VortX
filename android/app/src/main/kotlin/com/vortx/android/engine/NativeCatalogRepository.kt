@@ -6,6 +6,11 @@ import java.net.URI
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -78,6 +83,12 @@ internal class NativeCatalogRepository(
                                         val admit: (() -> Boolean) -> Boolean)
     private val durableWatchReceipts = java.util.IdentityHashMap<DurableWatchedPlaybackReceipt, DurableWatchProof>()
     private class SourceBinding(val owner: VortxNativeOwner, @Volatile var context: PlaybackContext)
+    private sealed interface StreamEvent {
+        data class Providers(val update: NativeProviderUpdate, val ticket: java.util.UUID,
+            val accepted: CompletableDeferred<Unit>) : StreamEvent
+        data class Indexer(val result: Result<NzbSourceAggregation>) : StreamEvent
+        data object ProvidersFinished : StreamEvent
+    }
     private val sourceBindings = mutableMapOf<String, SourceBinding>()
     private val resolveSequence = AtomicLong()
     private val playbackSequence = AtomicLong()
@@ -414,22 +425,29 @@ internal class NativeCatalogRepository(
         var initializedBindings = false
         var lastUpdate = NativeProviderUpdate(emptyList(), 0, legs.size)
         var lastTicket: java.util.UUID? = null
-        var lastDetail: MetaDetail? = null
-        fun publish(update: NativeProviderUpdate, ticket: java.util.UUID, direct: NzbSourceAggregation = NzbSourceAggregation.empty(), terminal: Boolean): StreamLoadUpdate = session.publish("streams", read.owner, update.pages, ticket) {
+        var approvedSearch: com.vortx.android.nzb.NzbSearch? = null
+        var direct = NzbSourceAggregation.empty()
+        var providersFinished = false
+        var indexerStarted = false
+        var indexerFinished = indexerScope == null
+        fun publish(update: NativeProviderUpdate, ticket: java.util.UUID, terminal: Boolean): StreamLoadUpdate? = session.publishIfLatestReceipt("streams", read.owner, update.pages, ticket) {
             coroutine.ensureActive()
             check(sessionProvider() === session) { "Native account changed" }
             val allowed = update.pages.map { if (it.request.resource == VortxResourceRequest.Resource.META) policyPage(it, read, "streams", update.pages, ticket) else it }
             val projection = VortxResourceProjection.providerDetails(allowed, metaRequest, stream, addons)
-            val detail = EngineState.parseMetaDetail(projection, appliedAddonOrder = emptyList()) ?: synchronized(this) { detailCache[type to id]?.takeIf { it.first == read.owner }?.second }
+            val currentDetail: MetaDetail? = EngineState.parseMetaDetail(projection, appliedAddonOrder = emptyList())
+            val detail: MetaDetail? = currentDetail ?: synchronized(this) { detailCache[type to id]?.takeIf { it.first == read.owner }?.second }
             check(detail == null || (detail.id == id && detail.type == type)) { "Native metadata identity mismatch" }
             val approved = !parental(read) || detail != null && if (type == MediaType.SERIES) {
                 episodeId != null && detail.videos.any { it.id == episodeId }
             } else episodeId == null || episodeId == id
             if (!approved) {
                 if (terminal) error("Stream identity is not in approved metadata")
-                return@publish StreamLoadUpdate(emptyList(), update.settled, update.total, false)
+                return@publishIfLatestReceipt StreamLoadUpdate(emptyList(), update.settled, update.total, false)
             }
-            lastDetail = detail
+            // A same-owner cached detail is useful for display, not authorization for a fresh
+            // indexer query. Wait for this request's identity-checked, parental-approved metadata.
+            if (currentDetail != null) approvedSearch = nativeNzbSearch(currentDetail, type, id, episodeId)
             val rawGroups = EngineState.parseStreamGroups(projection, episodeId ?: id)
             val selectedEpisode = detail?.videos?.find { it.id == episodeId }
             val indexerGroups = if (nzbSourceAggregator?.isAdmitted(direct, coroutine.isActive) == true) direct.groups else emptyList()
@@ -459,21 +477,67 @@ internal class NativeCatalogRepository(
                 }) }
             }
             StreamLoadUpdate(bound, update.settled, update.total, terminal,
-                selectionReady = terminal || bound.any { it.streams.isNotEmpty() } &&
+                selectionReady = terminal || indexerFinished && bound.any { it.streams.isNotEmpty() } &&
                     update.resourceSettled(VortxResourceRequest.Resource.STREAM, addons.size))
         }
-        session.loadProviders("streams", read.owner, legs) { update, ticket ->
-            lastUpdate = update; lastTicket = ticket
-            emit(publish(update, ticket, terminal = !update.pending && indexerScope == null))
-        }
-        if (indexerScope != null) {
-            val search = nativeNzbSearch(lastDetail, type, id, episodeId)
-            val direct = if (search != null) {
-                try { nzbSourceAggregator!!.aggregate(search, indexerScope) }
-                catch (cancelled: CancellationException) { throw cancelled }
-                catch (_: Exception) { NzbSourceAggregation.empty() }
-            } else NzbSourceAggregation.empty()
-            emit(publish(lastUpdate, requireNotNull(lastTicket), direct, terminal = true))
+        coroutineScope {
+            val events = Channel<StreamEvent>(capacity = 1)
+            var indexerJob: Job? = null
+            val ownerWatcher = launch {
+                session.updates.first { !session.accepts(read.owner) || sessionProvider() !== session }
+                error("Native account changed")
+            }
+            val providers = launch {
+                session.loadProviders("streams", read.owner, legs) { update, ticket ->
+                    val accepted = CompletableDeferred<Unit>()
+                    events.send(StreamEvent.Providers(update, ticket, accepted))
+                    // Backpressure prevents provider receipts from outrunning this coordinator.
+                    accepted.await()
+                }
+                events.send(StreamEvent.ProvidersFinished)
+            }
+            try {
+                while (!providersFinished || !indexerFinished) {
+                    val event = events.receive()
+                    when (event) {
+                        is StreamEvent.Providers -> {
+                            lastUpdate = event.update; lastTicket = event.ticket
+                            val snapshot = publish(lastUpdate, event.ticket, terminal = false)
+                            if (!indexerStarted && indexerScope != null) approvedSearch?.let { search ->
+                                indexerStarted = true
+                                indexerJob = launch {
+                                    val result = try { Result.success(nzbSourceAggregator!!.aggregate(search, indexerScope)) }
+                                    catch (cancelled: CancellationException) {
+                                        // Caller/owner retirement already cancels the coordinator. A
+                                        // contributor's own cancellation must reach it too, not strand
+                                        // the request forever waiting for an unreported completion.
+                                        currentCoroutineContext().ensureActive()
+                                        Result.failure(cancelled)
+                                    }
+                                    catch (_: Exception) { Result.success(NzbSourceAggregation.empty()) }
+                                    events.send(StreamEvent.Indexer(result))
+                                }
+                            }
+                            snapshot?.let { emit(it) }
+                            event.accepted.complete(Unit)
+                        }
+                        is StreamEvent.Indexer -> { direct = event.result.getOrThrow(); indexerFinished = true }
+                        StreamEvent.ProvidersFinished -> {
+                            providersFinished = true
+                            // No current approved metadata: suppress, rather than retarget, the query.
+                            if (!indexerStarted) indexerFinished = true
+                        }
+                    }
+                    if (event !is StreamEvent.Providers) {
+                        // A provider may have advanced its receipt just before sending its event.
+                        // Defer that one partial; the queued callback will publish the retained direct
+                        // result with the newer receipt. Slot/owner replacement still throws.
+                        publish(lastUpdate, requireNotNull(lastTicket), providersFinished && indexerFinished)?.let { emit(it) }
+                    }
+                }
+            } finally {
+                providers.cancel(); indexerJob?.cancel(); ownerWatcher.cancel(); events.cancel()
+            }
         }
     }.flowOn(Dispatchers.IO)
     suspend fun subtitles(type: MediaType, videoID: String, extra: List<Pair<String, String>> = emptyList()): Result<String> = attempt {

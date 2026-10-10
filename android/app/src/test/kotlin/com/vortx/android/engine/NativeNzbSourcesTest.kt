@@ -5,13 +5,22 @@ import com.vortx.android.debrid.DebridOwnerToken
 import com.vortx.android.model.*
 import com.vortx.android.nzb.*
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -48,7 +57,8 @@ class NativeNzbSourcesTest {
         override fun read(scope: VortxAccountScope) = snapshot
         override fun commit(scope: VortxAccountScope, snapshot: String) { this.snapshot = snapshot }
     }
-    private class Runtime(private val kids: Boolean = false, private val blockedMeta: Boolean = false) : VortxRuntimeBindings {
+    private class Runtime(private val kids: Boolean = false, var blockedMeta: Boolean = false,
+        private val addonCount: Int = 1) : VortxRuntimeBindings {
         private var sequence = 0L
         private val states = mutableMapOf<Long, JSONObject>()
         private fun profile(id: String, owner: Boolean) = JSONObject().put("id", id).put("name", id).put("owner", owner).put("deleted", false)
@@ -76,36 +86,413 @@ class NativeNzbSourcesTest {
             val input = JSONObject(request)
             return when (input.getString("kind")) {
                 "installed_addons" -> JSONObject().put("kind", "installed_addons").put("profileId", input.getString("profileId"))
-                    .put("addons", JSONArray().put(JSONObject().put("transportUrl", "https://addon.invalid/manifest.json").put("manifest", JSONObject()
-                        .put("id", "addon").put("name", "Addon").put("catalogs", JSONArray()).put("resources", JSONArray(listOf("meta", "stream")))))).toString()
+                    .put("addons", JSONArray().also { addons -> repeat(addonCount) { index ->
+                        val host = if (index == 0) "addon" else "peer$index"
+                        addons.put(JSONObject().put("transportUrl", "https://$host.invalid/manifest.json").put("manifest", JSONObject()
+                            .put("id", host).put("name", host).put("catalogs", JSONArray()).put("resources", JSONArray(listOf("meta", "stream")))))
+                    } }).toString()
                 "resume_point" -> JSONObject().put("kind", "resume_point").put("resume", JSONObject.NULL).toString()
-                "meta" -> JSONObject().put("kind", "meta").put("meta", if (blockedMeta) JSONObject.NULL else input.get("meta")).toString()
+                "meta" -> JSONObject().put("kind", "meta").put("meta", if (blockedMeta || input.getJSONObject("meta").optString("name") == "Blocked") JSONObject.NULL else input.get("meta")).toString()
                 else -> "{\"kind\":\"error\"}"
             }
         }
     }
     private class Transport : VortxResourceTransport {
         var failStreams = false
+        var beforeLoad: (JSONObject) -> Unit = {}
+        var contentOverride: (JSONObject, String) -> JSONObject? = { _, _ -> null }
         val streamCalls = AtomicInteger()
-        override fun makeCancellation() = object : VortxResourceCancellation { override fun cancel() {}; override fun close() {} }
+        val cancelCalls = AtomicInteger()
+        override fun makeCancellation() = object : VortxResourceCancellation {
+            override fun cancel() { cancelCalls.incrementAndGet() }
+            override fun close() {}
+        }
         override fun load(requestJson: String, cancellation: VortxResourceCancellation): String {
             val input = JSONObject(requestJson); val request = input.getJSONObject("request")
+            beforeLoad(input)
+            val addonId = input.getJSONArray("addons").getJSONObject(0).getString("id")
             val stream = request.getString("resource") == "stream"
             if (stream) streamCalls.incrementAndGet()
-            val content = if (stream) JSONObject().put("streams", JSONArray().put(JSONObject().put("url", "https://addon.invalid/video").put("name", "Addon source")))
+            val content = contentOverride(request, addonId) ?: if (stream) JSONObject().put("streams", JSONArray().put(JSONObject().put("url", "https://addon.invalid/video").put("name", "Addon source")))
             else JSONObject().put("meta", JSONObject().put("id", request.getString("id")).put("type", request.getString("type")).put("name", "Fixture")
                 .put("releaseInfo", "2024").put("videos", JSONArray().put(JSONObject().put("id", "tt123456:1:2").put("season", 1).put("episode", 2).put("title", "Second"))))
             return JSONObject().put("kind", "resource_result").put("requestId", input.getString("requestId")).put("generation", input.getLong("generation"))
-                .put("request", request).put("cancelled", false).put("groups", JSONArray().put(JSONObject().put("addonId", "https://addon.invalid/manifest.json")
+                .put("request", request).put("cancelled", false).put("groups", JSONArray().put(JSONObject().put("addonId", addonId)
                     .put("status", if (stream && failStreams) "error" else "ready").put("content", content))).toString()
         }
     }
-    private fun open(transport: Transport = Transport(), kids: Boolean = false, blockedMeta: Boolean = false) =
-        VortxNativeSession.open(scope, "Owner", Runtime(kids, blockedMeta), Store(), transport, true)
+    private fun open(transport: Transport = Transport(), kids: Boolean = false, blockedMeta: Boolean = false, addonCount: Int = 1) =
+        VortxNativeSession.open(scope, "Owner", Runtime(kids, blockedMeta, addonCount), Store(), transport, true)
     private fun repository(source: ConfigSource, session: () -> VortxNativeSession) = NativeCatalogRepository(
         playbackResolver = NativePlaybackResolver { stream, _ -> Playable(stream.nzbUrl ?: stream.url!!, "Fixture") },
         nzbSourceAggregator = source.aggregator(), sessionProvider = session,
     )
+
+    @Test fun firstApprovedMetadataPublishesIndexerBeforeUnrelatedAddonLegsSettle() = runBlocking {
+        val gate = CountDownLatch(1)
+        val observed = CopyOnWriteArrayList<String>()
+        val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+        source.search = { _, _, search ->
+            assertEquals(1, search.season); assertEquals(2, search.episode)
+            Result.success(listOf(release()))
+        }
+        val transport = Transport().also { it.beforeLoad = { input ->
+            val resource = input.getJSONObject("request").getString("resource")
+            val addon = input.getJSONArray("addons").getJSONObject(0).getString("id")
+            if (resource == "stream" || "peer" in addon) {
+                check(gate.await(3, TimeUnit.SECONDS)) { "Synthetic provider gate expired" }
+            }
+        } }
+        // Two metadata permits: one must remain available for the approved provider. Holding
+        // both permits would test queue admission order instead of early indexer publication.
+        open(transport, addonCount = 2).use { session ->
+            val repo = repository(source) { session }
+            val updates = Channel<com.vortx.android.data.StreamLoadUpdate>(Channel.UNLIMITED)
+            val pending = async(Dispatchers.Default) {
+                repo.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect {
+                    observed += "${it.loaded}/${it.total}:${it.groups.map(StreamGroup::addon)}"
+                    updates.send(it)
+                }
+            }
+            try {
+                val early = try { withTimeout(1_000) {
+                    var update = updates.receive()
+                    while (update.groups.none { it.addon == "direct" }) update = updates.receive()
+                    update
+                } } catch (timeout: kotlinx.coroutines.TimeoutCancellationException) {
+                    throw AssertionError("No early indexer; calls=${source.calls.get()}, updates=$observed", timeout)
+                }
+                assertFalse("Indexer completion must not terminalize pending add-ons", early.terminal)
+                assertTrue(early.loaded < early.total)
+                assertEquals(1, source.calls.get())
+                val direct = early.groups.single().streams.single()
+                assertNotNull(direct.nativePlaybackToken)
+                assertEquals("tt123456:1:2", repo.resolve(direct, Episode("tt123456:1:2", "Second", 1, 2))
+                    .getOrThrow().playbackContext!!.videoId)
+                gate.countDown()
+                withTimeout(2_000) { pending.await() }
+                val final = generateSequence { updates.tryReceive().getOrNull() }.last()
+                assertTrue(final.terminal)
+                assertEquals(listOf("addon.invalid", "peer1.invalid", "direct"), final.groups.map(StreamGroup::addon))
+                assertEquals(direct.nativePlaybackToken, final.groups.last().streams.single().nativePlaybackToken)
+            } finally {
+                gate.countDown(); pending.cancelAndJoin(); updates.close()
+            }
+        }
+    }
+
+    @Test fun indexerFailureSettlesOnceWithoutDroppingSuccessfulProviders() = runBlocking {
+        val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+        val indexerStarted = CountDownLatch(1)
+        val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+        source.search = { _, _, _ -> entered.complete(Unit); indexerStarted.countDown(); release.await(); throw IllegalStateException("Synthetic indexer failure") }
+        val transport = Transport().also { it.beforeLoad = { input -> if (input.getJSONObject("request").getString("resource") == "stream") {
+            check(indexerStarted.await(2, TimeUnit.SECONDS))
+        } } }
+        open(transport).use { session ->
+            val updates = Channel<com.vortx.android.data.StreamLoadUpdate>(Channel.UNLIMITED)
+            val pending = async(Dispatchers.Default) {
+                repository(source) { session }.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect { updates.send(it) }
+            }
+            try {
+                withTimeout(1_000) { entered.await() }
+                val partial = withTimeout(1_000) {
+                    var update = updates.receive()
+                    while (update.groups.isEmpty()) update = updates.receive()
+                    update
+                }
+                assertFalse(partial.terminal); assertFalse(partial.selectionReady)
+                release.complete(Unit); withTimeout(2_000) { pending.await() }
+                val remaining = generateSequence { updates.tryReceive().getOrNull() }.toList()
+                assertEquals(1, remaining.count { it.terminal })
+                assertEquals(listOf("addon.invalid"), remaining.last().groups.map(StreamGroup::addon))
+                assertEquals(1, source.calls.get())
+            } finally { release.complete(Unit); pending.cancelAndJoin(); updates.close() }
+        }
+    }
+
+    @Test fun configuredIndexerCannotBeSkippedByStreamsArrivingBeforeMetadata() = runBlocking {
+        val metaGate = CountDownLatch(1)
+        val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+        source.search = { _, _, _ -> Result.success(listOf(release())) }
+        val transport = Transport().also { it.beforeLoad = { input -> if (input.getJSONObject("request").getString("resource") == "meta") {
+            check(metaGate.await(3, TimeUnit.SECONDS))
+        } } }
+        open(transport).use { session ->
+            val updates = Channel<com.vortx.android.data.StreamLoadUpdate>(Channel.UNLIMITED)
+            val pending = async(Dispatchers.Default) {
+                repository(source) { session }.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect { updates.send(it) }
+            }
+            try {
+                val preMetadata = withTimeout(1_000) { updates.receive() }
+                assertEquals(listOf("addon.invalid"), preMetadata.groups.map(StreamGroup::addon))
+                assertFalse("Configured contributor is pending even before its metadata admission", preMetadata.selectionReady)
+                assertFalse(preMetadata.terminal); assertEquals(0, source.calls.get())
+                metaGate.countDown(); withTimeout(2_000) { pending.await() }
+                val remaining = generateSequence { updates.tryReceive().getOrNull() }.toList()
+                assertEquals(1, remaining.count { it.terminal })
+                assertEquals(listOf("addon.invalid", "direct"), remaining.last().groups.map(StreamGroup::addon))
+                assertEquals(1, source.calls.get())
+            } finally { metaGate.countDown(); pending.cancelAndJoin(); updates.close() }
+        }
+    }
+
+    @Test fun emptyAndDisabledConfigurationsKeepFastPathAndLateEnableNeedsFreshRequest() = runBlocking {
+        for (initial in listOf(emptyList(), listOf(config("disabled", enabled = false)))) {
+            val metaGate = CountDownLatch(1)
+            val source = ConfigSource(account).also { it.configs = initial }
+            source.search = { _, _, _ -> Result.success(listOf(release())) }
+            val transport = Transport().also { it.beforeLoad = { input -> if (input.getJSONObject("request").getString("resource") == "meta") {
+                check(metaGate.await(3, TimeUnit.SECONDS))
+            } } }
+            open(transport).use { session ->
+                val repo = repository(source) { session }
+                val updates = Channel<com.vortx.android.data.StreamLoadUpdate>(Channel.UNLIMITED)
+                val pending = async(Dispatchers.Default) {
+                    repo.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect { updates.send(it) }
+                }
+                try {
+                    val early = withTimeout(1_000) { updates.receive() }
+                    assertTrue("No configured participant must retain stream-settled fast selection", early.selectionReady)
+                    assertFalse(early.terminal); assertEquals(listOf("addon.invalid"), early.groups.map(StreamGroup::addon))
+                    source.configs = listOf(config("direct")); source.revision++
+                    metaGate.countDown(); withTimeout(2_000) { pending.await() }
+                    assertEquals(0, source.calls.get())
+                    assertTrue(generateSequence { updates.tryReceive().getOrNull() }.all { update -> update.groups.none { it.addon == "direct" } })
+                    val fresh = repo.streams(MediaType.SERIES, "tt123456", "tt123456:1:2", forceRefresh = true).getOrThrow()
+                    assertEquals(listOf("addon.invalid", "direct"), fresh.map(StreamGroup::addon)); assertEquals(1, source.calls.get())
+                } finally { metaGate.countDown(); pending.cancelAndJoin(); updates.close() }
+            }
+        }
+    }
+
+    @Test fun blockedCurrentMetadataCannotLaunchFromSameOwnerWarmCache() = runBlocking {
+        val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+        source.search = { _, _, _ -> Result.success(listOf(release())) }
+        val runtime = Runtime(kids = true)
+        val transport = Transport()
+        VortxNativeSession.open(scope, "Owner", runtime, Store(), transport, true).use { session ->
+            val repo = repository(source) { session }
+            repo.streams(MediaType.SERIES, "tt123456", "tt123456:1:2").getOrThrow()
+            assertEquals(1, source.calls.get()); source.calls.set(0)
+            runtime.blockedMeta = true
+            val gate = CountDownLatch(1)
+            transport.beforeLoad = { input -> if (input.getJSONObject("request").getString("resource") == "meta") {
+                check(gate.await(3, TimeUnit.SECONDS))
+            } }
+            val updates = Channel<com.vortx.android.data.StreamLoadUpdate>(Channel.UNLIMITED)
+            val pending = async(Dispatchers.Default) { runCatching {
+                repo.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect { updates.send(it) }
+            } }
+            try {
+                withTimeout(1_000) { updates.receive() }
+                assertEquals("Pending parental metadata must not authorize from cache", 0, source.calls.get())
+                gate.countDown()
+                assertTrue(withTimeout(2_000) { pending.await() }.isFailure)
+                assertEquals(0, source.calls.get())
+                assertTrue(generateSequence { updates.tryReceive().getOrNull() }.all { update -> update.groups.none { it.addon == "direct" } })
+            } finally { gate.countDown(); pending.cancelAndJoin(); updates.close() }
+        }
+    }
+
+    @Test fun capturedNullScopeNeverRetargetsWhenProfileBecomesAvailableDuringMetadata() = runBlocking {
+        val source = ConfigSource(account).also { it.profile = null; it.configs = listOf(config("direct")) }
+        val transport = Transport().also { it.beforeLoad = { source.profile = "owner" } }
+        open(transport).use { session ->
+            assertEquals(listOf("addon.invalid"), repository(source) { session }.streams(MediaType.SERIES, "tt123456", "tt123456:1:2")
+                .getOrThrow().map(StreamGroup::addon))
+            assertEquals(0, source.calls.get())
+        }
+    }
+
+    @Test fun callerCancellationRetiresIndexerAndPendingNativeBridgesWithoutTerminal() = runBlocking {
+        val entered = CompletableDeferred<Unit>(); val retired = CompletableDeferred<Unit>()
+        val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+        source.search = { _, _, _ -> entered.complete(Unit); try { awaitCancellation() } finally { retired.complete(Unit) } }
+        val gate = CountDownLatch(1)
+        val transport = Transport().also { it.beforeLoad = { input -> if (input.getJSONObject("request").getString("resource") == "stream") {
+            check(gate.await(3, TimeUnit.SECONDS))
+        } } }
+        open(transport).use { session ->
+            val terminals = AtomicInteger()
+            val pending = async(Dispatchers.Default) {
+                repository(source) { session }.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect {
+                    if (it.terminal) terminals.incrementAndGet()
+                }
+            }
+            try {
+                withTimeout(1_000) { entered.await() }
+                val cancellations = transport.cancelCalls.get()
+                withTimeout(1_000) { pending.cancelAndJoin(); retired.await() }
+                assertTrue(pending.isCancelled); assertEquals(0, terminals.get())
+                assertTrue("Pending provider bridge must be cancelled", transport.cancelCalls.get() > cancellations)
+            } finally { gate.countDown(); pending.cancelAndJoin() }
+        }
+    }
+
+    @Test fun independentIndexerCancellationTerminatesInsteadOfStrandingCoordinator() = runBlocking {
+        val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+        source.search = { _, _, _ -> throw CancellationException("Synthetic contributor cancellation") }
+        open().use { session ->
+            val terminals = AtomicInteger()
+            val pending = async(Dispatchers.Default) {
+                repository(source) { session }.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect {
+                    if (it.terminal) terminals.incrementAndGet()
+                }
+            }
+            try {
+                try { withTimeout(1_000) { pending.await() }; fail("Contributor cancellation must propagate") }
+                catch (cancelled: CancellationException) {
+                    assertFalse("Cancellation must not be an unreported contributor timeout", cancelled is kotlinx.coroutines.TimeoutCancellationException)
+                }
+                assertTrue(pending.isCancelled); assertEquals(0, terminals.get()); assertEquals(1, source.calls.get())
+            } finally { pending.cancelAndJoin() }
+        }
+    }
+
+    @Test fun ownerProfileAndAccountABARetireOldIndexerBeforePublishingReplacementBindings() = runBlocking {
+        for (transition in listOf("profile", "account")) {
+            val entered = CompletableDeferred<Unit>(); val unblock = CompletableDeferred<Unit>()
+            val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+            source.search = { _, _, _ ->
+                if (source.calls.get() == 1) { entered.complete(Unit); withContext(NonCancellable) { unblock.await() } }
+                Result.success(listOf(release()))
+            }
+            open().use { first -> open().use { second -> open().use { replacement ->
+                var mounted = first
+                val repo = repository(source) { mounted }
+                val stale = async(Dispatchers.Default) { repo.streams(MediaType.SERIES, "tt123456", "tt123456:1:2") }
+                try {
+                    withTimeout(1_000) { entered.await() }
+                    if (transition == "profile") {
+                        first.dispatch(listOf(JSONObject().put("type", "switch_profile").put("id", "guest")))
+                        source.profile = "guest"
+                        first.dispatch(listOf(JSONObject().put("type", "switch_profile").put("id", "owner")))
+                        source.profile = "owner"
+                    } else {
+                        mounted = second; source.owner = DebridOwnerToken(DebridOwnerScope.Account("other"), 2)
+                        mounted = replacement; source.owner = DebridOwnerToken(DebridOwnerScope.Account(account), 3)
+                        first.close()
+                    }
+                    unblock.complete(Unit)
+                    assertTrue("Old $transition A→B→A request must fail", withTimeout(2_000) { stale.await() }.isFailure)
+                    val fresh = repo.streams(MediaType.SERIES, "tt123456", "tt123456:1:2").getOrThrow().last().streams.single()
+                    assertTrue(repo.resolve(fresh).isSuccess)
+                } finally { unblock.complete(Unit); stale.cancelAndJoin() }
+            } } }
+        }
+    }
+
+    @Test fun restoredConfigurationWithNewRevisionCannotAdmitOldIndexerResult() = runBlocking {
+        val entered = CompletableDeferred<Unit>(); val unblock = CompletableDeferred<Unit>()
+        val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+        source.search = { _, _, _ -> entered.complete(Unit); unblock.await(); Result.success(listOf(release())) }
+        open().use { session ->
+            val pending = async(Dispatchers.Default) { repository(source) { session }.streams(MediaType.SERIES, "tt123456", "tt123456:1:2") }
+            try {
+                withTimeout(1_000) { entered.await() }
+                val original = source.configs
+                source.configs = listOf(config("other")); source.revision++
+                source.configs = original; source.revision++
+                unblock.complete(Unit)
+                assertEquals(listOf("addon.invalid"), withTimeout(2_000) { pending.await() }.getOrThrow().map(StreamGroup::addon))
+                assertEquals(1, source.calls.get())
+            } finally { unblock.complete(Unit); pending.cancelAndJoin() }
+        }
+    }
+
+    @Test fun blockedFirstMetadataWaitsForLaterApprovedExactEpisode() = runBlocking {
+        val metaGate = CountDownLatch(1); val streamGate = CountDownLatch(1)
+        val source = ConfigSource(account).also { it.configs = listOf(config("direct")) }
+        source.search = { _, _, query ->
+            assertEquals("Fixture", query.title); assertEquals(1, query.season); assertEquals(2, query.episode)
+            Result.success(listOf(release()))
+        }
+        val transport = Transport().also {
+            it.beforeLoad = { input ->
+                val resource = input.getJSONObject("request").getString("resource")
+                val addon = input.getJSONArray("addons").getJSONObject(0).getString("id")
+                if (resource == "stream") check(streamGate.await(3, TimeUnit.SECONDS))
+                else if ("peer" in addon) check(metaGate.await(3, TimeUnit.SECONDS))
+            }
+            it.contentOverride = { request, addon ->
+                if (request.getString("resource") == "meta" && "peer" !in addon) JSONObject().put("meta", JSONObject()
+                    .put("id", request.getString("id")).put("type", request.getString("type")).put("name", "Blocked")) else null
+            }
+        }
+        open(transport, kids = true, addonCount = 2).use { session ->
+            val updates = Channel<com.vortx.android.data.StreamLoadUpdate>(Channel.UNLIMITED)
+            val pending = async(Dispatchers.Default) {
+                repository(source) { session }.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect { updates.send(it) }
+            }
+            try {
+                val blocked = withTimeout(1_000) { updates.receive() }
+                assertTrue(blocked.groups.isEmpty()); assertEquals(0, source.calls.get())
+                metaGate.countDown()
+                val approved = withTimeout(1_000) {
+                    var update = updates.receive()
+                    while (update.groups.none { it.addon == "direct" }) update = updates.receive()
+                    update
+                }
+                assertFalse(approved.terminal); assertEquals(1, source.calls.get())
+                streamGate.countDown(); withTimeout(2_000) { pending.await() }
+                assertEquals(1, generateSequence { updates.tryReceive().getOrNull() }.count { it.terminal })
+            } finally { metaGate.countDown(); streamGate.countDown(); pending.cancelAndJoin(); updates.close() }
+        }
+    }
+
+    @Test fun malformedMetadataPeerCannotDiscardFastIndexerOrFinalRegistryOrder() = runBlocking {
+        val gate = CountDownLatch(1)
+        val source = ConfigSource(account).also { it.configs = listOf(config("first"), config("failed"), config("last")) }
+        source.search = { config, _, _ ->
+            if (config.id == "failed") Result.failure(IllegalStateException("Synthetic failed indexer"))
+            else Result.success(listOf(release(config.name)))
+        }
+        val transport = Transport().also {
+            it.beforeLoad = { input -> if (input.getJSONObject("request").getString("resource") == "stream") {
+                check(gate.await(3, TimeUnit.SECONDS))
+            } }
+            it.contentOverride = { request, addon ->
+                if (request.getString("resource") == "meta" && "peer" in addon) JSONObject().put("meta", JSONObject()
+                    .put("id", "wrong-title").put("type", "series").put("name", "Malformed")) else null
+            }
+        }
+        open(transport, addonCount = 2).use { session ->
+            val updates = Channel<com.vortx.android.data.StreamLoadUpdate>(Channel.UNLIMITED)
+            val pending = async(Dispatchers.Default) {
+                repository(source) { session }.streamUpdates(MediaType.SERIES, "tt123456", "tt123456:1:2").collect { updates.send(it) }
+            }
+            try {
+                val early = withTimeout(1_000) {
+                    var update = updates.receive()
+                    while (update.groups.none { it.addon == "last" }) update = updates.receive()
+                    update
+                }
+                assertEquals(listOf("first", "last"), early.groups.map(StreamGroup::addon)); assertFalse(early.terminal)
+                gate.countDown(); withTimeout(2_000) { pending.await() }
+                val final = generateSequence { updates.tryReceive().getOrNull() }.last()
+                assertTrue(final.terminal)
+                assertEquals(listOf("addon.invalid", "peer1.invalid", "first", "last"), final.groups.map(StreamGroup::addon))
+                assertEquals(3, source.calls.get())
+            } finally { gate.countDown(); pending.cancelAndJoin(); updates.close() }
+        }
+    }
+
+    @Test fun auxiliaryPublicationDefersOnlyEvolvingReceiptNotReplacedSlot() = runBlocking {
+        open(addonCount = 2).use { session ->
+            val owner = session.read().owner
+            val request = VortxResourceRequest(VortxResourceRequest.Resource.META, "series", "tt123456")
+            val legs = listOf("addon", "peer1").map { name -> NativeProviderLeg(request,
+                VortxResourceAddon("https://$name.invalid/manifest.json", "https://$name.invalid/manifest.json")) }
+            val receipts = mutableListOf<Pair<NativeProviderUpdate, java.util.UUID>>()
+            session.loadProviders("streams", owner, legs) { update, ticket -> receipts += update to ticket }
+            val (older, ticket) = receipts.first(); val latest = receipts.last().first
+            assertNull(session.publishIfLatestReceipt("streams", owner, older.pages, ticket) { "outdated" })
+            assertEquals("latest", session.publishIfLatestReceipt("streams", owner, latest.pages, ticket) { "latest" })
+            session.loadProviders("streams", owner, emptyList()) { _, _ -> }
+            assertTrue(runCatching { session.publishIfLatestReceipt("streams", owner, latest.pages, ticket) { "replaced" } }.isFailure)
+        }
+    }
 
     @Test fun productionNativeFactoryInjectsCapturedSecureIndexerStore() {
         // The runtime cases below prove repository behavior; this separate source contract makes

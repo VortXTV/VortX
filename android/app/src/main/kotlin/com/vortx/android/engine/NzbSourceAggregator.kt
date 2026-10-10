@@ -36,9 +36,13 @@ internal class NzbSourceAggregator(
     constructor(store: NzbIndexerStore, client: NzbIndexerClient = NzbIndexerClient()) :
         this(store::captureScope, store::read, store::keyFor, store::isCurrent, client::search)
 
-    /** Native callers capture once, before resource suspension; a null scope must never retarget. */
+    /** Capture one configured participant before resource suspension. Empty/disabled/unavailable
+     * configuration must not delay ordinary source selection; a null scope must never retarget. */
     fun captureNativeScope(owner: VortxNativeOwner): NzbIndexerStore.Scope? =
         captureScope()?.takeIf { nativeNzbScopeMatches(it, owner) && scopeCurrent(it) }
+            ?.takeIf { captured -> (readScope(captured) as? NzbIndexerStore.Read.Ready)
+                ?.document?.indexers?.any { it.enabled } == true }
+            ?.takeIf(scopeCurrent)
 
     suspend fun aggregate(search: NzbSearch): NzbSourceAggregation = aggregate(search, captureScope())
 
