@@ -732,7 +732,10 @@ struct iOSSettingsView: View {
             if vortxSync.hasCompletedFirstSync {
                 Label {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(MoveSeeding.backedUpLine).font(.subheadline.weight(.semibold))
+                        Text(MoveSeeding.backedUpLine(
+                            synchronizationIsComplete: vortxSync.synchronizationIsComplete,
+                            pendingSettingsMessage: vortxSync.pendingSettingsMessage
+                        )).font(.subheadline.weight(.semibold))
                         Text(MoveSeeding.lastSyncLine(vortxSync.lastSyncAt))
                             .font(.footnote).foregroundStyle(.secondary)
                     }

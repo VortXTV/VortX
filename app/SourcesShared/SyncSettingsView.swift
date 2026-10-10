@@ -85,11 +85,19 @@ struct SyncSettingsView: View {
                 .buttonStyle(ChipButtonStyle(selected: false))
         }
 
-        // The tri-state retry surface: shown when the account doc could not be reached (a network
-        // blip), so the failure is visible and retryable instead of silently swallowed.
+        // Keep failures visible and retryable. A completed account round-trip may still have
+        // a local change waiting, so do not show the backup claim until synchronization is complete.
         if let syncNote {
             Text(syncNote).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        } else {
+            Text(MoveSeeding.backedUpLine(
+                synchronizationIsComplete: sync.synchronizationIsComplete,
+                pendingSettingsMessage: sync.pendingSettingsMessage
+            ))
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
+        Text(MoveSeeding.lastSyncLine(sync.lastSyncAt))
+            .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
     }
 
     // MARK: Signed out
@@ -218,8 +226,10 @@ struct SyncSettingsView: View {
                 syncNote = "Could not reach VortX sync. Check your connection and try again."
                 syncing = false
             case .noConflict:
-                await sync.pushThisDevice()
-                syncNote = nil
+                let pushed = await sync.pushThisDevice()
+                syncNote = pushed
+                    ? nil
+                    : "Could not save your latest changes. Check your connection and try again."
                 syncing = false
             }
         }

@@ -363,7 +363,10 @@ struct SettingsView: View {
                     Image(systemName: "checkmark.icloud.fill")
                         .font(.system(size: 40)).foregroundStyle(Theme.Palette.accent)
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(MoveSeeding.backedUpLine)
+                        Text(MoveSeeding.backedUpLine(
+                            synchronizationIsComplete: vortxSync.synchronizationIsComplete,
+                            pendingSettingsMessage: vortxSync.pendingSettingsMessage
+                        ))
                             .font(Theme.Typography.body.weight(.semibold))
                             .foregroundStyle(Theme.Palette.textPrimary)
                         Text(MoveSeeding.lastSyncLine(vortxSync.lastSyncAt))

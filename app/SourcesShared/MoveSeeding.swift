@@ -106,5 +106,12 @@ enum MoveSeeding {
 
     static let headline = String(localized: "VortX is moving to a new home soon")
     static let message = String(localized: "Sign in to your VortX account so your profiles, watch history, library, and settings carry over. Everything is end-to-end encrypted and restores automatically after the move.")
-    static let backedUpLine = String(localized: "Your data is backed up to your VortX account.")
+    /// Show the backup claim only after the manager says the accepted account sync has no
+    /// locally pending settings. A successful transport can still leave a change waiting, so
+    /// the pending copy must win over the reassuring headline in that state.
+    static func backedUpLine(synchronizationIsComplete: Bool, pendingSettingsMessage: String?) -> String {
+        if let pendingSettingsMessage, !pendingSettingsMessage.isEmpty { return pendingSettingsMessage }
+        guard synchronizationIsComplete else { return String(localized: "Waiting for the first sync to finish…") }
+        return String(localized: "Your data is backed up to your VortX account.")
+    }
 }

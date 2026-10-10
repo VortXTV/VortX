@@ -97,7 +97,10 @@ struct MoveSeedingNagView: View {
     // MARK: Seeded (reached mid-flow when the sign-in lands and the first sync completes)
 
     @ViewBuilder private var confirmation: some View {
-        Text(MoveSeeding.backedUpLine)
+        Text(MoveSeeding.backedUpLine(
+            synchronizationIsComplete: sync.synchronizationIsComplete,
+            pendingSettingsMessage: sync.pendingSettingsMessage
+        ))
             .font(Theme.Typography.screenTitle)
             .foregroundStyle(Theme.Palette.textPrimary)
             .multilineTextAlignment(.center)
