@@ -1,10 +1,14 @@
-// Standalone executable for the Apple Search submission/coalescing contract.
+// Standalone executable for the Apple Search submission/coalescing source contract.
 //
-//   xcrun swiftc -parse-as-library -o /tmp/apple-search-submission-test \
+// This is the lightweight model/source-contract suite. It is not the production extraction
+// gate. Run scripts/test-apple-search-submission.sh for the mechanically extracted closures
+// and methods from app/SourcesiOS/iOSRootView.swift.
+//
+//   mkdir -p app/build && xcrun swiftc -parse-as-library -o app/build/apple-search-submission-model \
 //     app/Tests/AppleSearchSubmissionContractTests.swift && \
-//     /tmp/apple-search-submission-test
+//     app/build/apple-search-submission-model
 //
-// The CoreSpy flow below is an inert extraction of the production query-change, suggestion-submit,
+// The CoreSpy flow below is an inert model of the production query-change, suggestion-submit,
 // empty-query, and top-bar handoff closures. It deliberately models the engine's `search` as one
 // Load + LoadRange-equivalent pair, so the regression is observable without CoreBridge, SwiftUI,
 // the native engine, or a device. The legacy handoff is kept only as a RED proof: it mutates the
@@ -171,7 +175,7 @@ private final class SuggestionsRefreshSpy {
     private(set) var refreshCount = 0
     private(set) var refreshedSnapshots: [(binding: String, query: String)] = []
 
-    /// Inert extraction of AppleSearchPresentation.scheduleSuggestionsRefresh. The queued closure reads
+    /// Inert model of AppleSearchPresentation.scheduleSuggestionsRefresh. The queued closure reads
     /// `binding` and `query` at execution time, matching production's current-owner/current-query rule.
     func scheduleSuggestionsRefresh() {
         guard !refreshScheduled else { return }
