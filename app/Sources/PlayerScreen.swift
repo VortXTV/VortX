@@ -1306,6 +1306,7 @@ struct PlayerScreen: View {
     @State private var appliedSize = false
     @State private var appliedInitialResume = false   // the launch-offset seek runs once; switches use nudgeResume
     @State private var markedWatched = false           // ~90%/EOF watched marker fires once per title (mirrors tvOS)
+    @State private var watchedDwell = WatchedPlaybackDwell<PlayerLoadToken>()
     @State private var autoAddedThisPlayback = false    // D8/D9: the ~60s auto-add + watch-ping fires once per playback
     @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true   // "Auto-add watched to Library" (default ON)
     @State private var buffering = true
@@ -2889,7 +2890,10 @@ struct PlayerScreen: View {
         switch name {
         case MPVProperty.pausedForCache:
             if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
-            if let b = data as? Bool { buffering = b }
+            if let b = data as? Bool {
+                if b { watchedDwell.reset() }
+                buffering = b
+            }
         case MPVProperty.videoParamsSigPeak:
             if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
         case MPVProperty.timePos:
@@ -2899,6 +2903,7 @@ struct PlayerScreen: View {
                 activeToken: coordinator.player?.activeLoadToken
                ) {
                 let d = event.seconds
+                updateWatchedDwell(with: event)
                 guard d.isFinite, d >= 0 else { return }
                 // Recovery retains the last settled position; the UI can still show raw seek targets.
                 if event.positionSettled {
@@ -3152,15 +3157,6 @@ struct PlayerScreen: View {
                        ((duration > 60 && d / duration >= 0.5) || (duration <= 0 && d >= 120)) {
                         warmNextIfNeeded()
                     }
-                    // ~90% in → flip the engine's watched marker live, so the title leaves Continue
-                    // Watching / shows as watched without waiting for EOF (mirrors tvOS:180-183).
-                    if assetSanityAccepted, !markedWatched,
-                       !effectivelyLive, duration > 0, d / duration >= 0.9,
-                       let m = curMeta {
-                        markedWatched = true
-                        core.markPlaybackWatched(m, target: playbackMutationTarget,
-                                                 allowEngineWrite: engineWritesOpen)
-                    }
                 }
                 if hasStartedPlaying, observedAudioLanguage == nil, incomingEpisodeChoice == nil,
                    assetSanityAttempt.isAccepted(owner: event.loadToken) {
@@ -3169,6 +3165,7 @@ struct PlayerScreen: View {
             }
         case MPVProperty.duration:
             if let d = data as? Double {
+                if d != duration || !d.isFinite || d <= 0 { watchedDwell.reset() }
                 duration = d
                 if !appliedSize, d > 0 {                 // re-apply the size mode on every (re)load
                     appliedSize = true
@@ -3252,6 +3249,7 @@ struct PlayerScreen: View {
             if let d = data as? Double, d.isFinite, d >= currentTime { bufferedTime = d }
         case MPVProperty.pause:
             if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
+            if let paused = data as? Bool, paused { watchedDwell.reset() }
             // play()/pause() emit MPVProperty.pause optimistically and the KVO echo then arrives with the same
             // value, so gate every side effect on a real change: the scrobble pause/resume must fire once per
             // press, not twice (this also collapses the pre-existing KVO double-fire). The now-playing write is
@@ -4152,7 +4150,34 @@ struct PlayerScreen: View {
                      isLive: isLive, engine: engine)
     }
 
+    private func updateWatchedDwell(with event: PlayerTimePositionEvent) {
+        guard !markedWatched, let m = curMeta,
+              event.loadToken == coordinator.player?.activeLoadToken,
+              committedLoadToken == event.loadToken,
+              pendingAdvance == nil, supersededAdvance == nil else {
+            watchedDwell.reset()
+            return
+        }
+        let watched = watchedDwell.observe(
+            context: .init(owner: event.loadToken, libraryID: m.libraryId, videoID: m.videoId,
+                           episodeGeneration: episodeSwitchGeneration,
+                           sourceGeneration: sourceSwitchGeneration,
+                           seekGeneration: event.mpvSeekSettlement?.generation),
+            time: ProcessInfo.processInfo.systemUptime, position: event.seconds,
+            duration: duration, rate: speed,
+            eligible: assetSanityAttempt.isAccepted(owner: event.loadToken)
+                && hasStartedPlaying && event.positionSettled
+                && !effectivelyLive && !scrubbing && !isPaused && !buffering
+        )
+        if watched {
+            markedWatched = true
+            core.markPlaybackWatched(m, target: playbackMutationTarget,
+                                     allowEngineWrite: engineWritesOpen)
+        }
+    }
+
     private func resetRawPosition(owner: PlayerLoadToken) {
+        watchedDwell.reset()
         lastRawTimePos = -1
         lastRawTimePosOwner = owner
         lastRawTimePosMountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
@@ -4672,6 +4697,7 @@ struct PlayerScreen: View {
     }
 
     private func viewerPause() {
+        watchedDwell.reset()
         // A surface handoff may temporarily have no controller. The next mount still owes this input.
         localNNTPStallRecovery.suspend()
         recoveryPauseIntent = true
@@ -5337,6 +5363,7 @@ struct PlayerScreen: View {
     }
 
     private func handleDeferredResumeUserSeek(_ intent: DeferredResumeUserSeekPolicy.Intent) -> Bool {
+        watchedDwell.reset()
         let initialTarget = InitialResumeUserIntentPolicy.target(
             applied: appliedInitialResume,
             ownsRequest: assetSanityAttempt.owner.map { $0 == coordinator.player?.activeLoadToken } == true,
@@ -6507,6 +6534,7 @@ struct PlayerScreen: View {
     }
 
     private func resetRuntimeForIssuedSourceSwitch(userInitiated: Bool, explicitPick: Bool) {
+        watchedDwell.reset()
         engineSurfaceTransfer = nil
         #if !os(tvOS)
         skipDBPreviewing = false
@@ -6558,6 +6586,7 @@ struct PlayerScreen: View {
     /// earlier would let a rejected replacement duplicate its watched/auto-add/progress side effects or undo
     /// the viewer's Watch Credits choice.
     private func resetRuntimeForIssuedEpisode() {
+        watchedDwell.reset()
         #if !os(tvOS)
         skipDBPreviewing = false
         skipDBPreviewReturnPosition = nil
@@ -8469,6 +8498,7 @@ struct PlayerScreen: View {
                 hoverPreviewTime: hoverPreviewTime,
                 onScrubChanged: { scrubThumbnails.show(time: $0) },
                 onEditingChanged: { editing in
+                    if editing { watchedDwell.reset() }
                     scrubbing = editing
                     if editing {
                         scrubTarget = currentTime; hideTask?.cancel()
@@ -10506,7 +10536,10 @@ struct PlayerScreen: View {
         cancelDirectResumeInventoryRefresh()
         flushPendingSubOffsetSave()   // a debounced sync nudge must survive the viewer leaving immediately
         invalidateEpisodeWorkForExit()
-        if !persistenceBlockedForExit, assetSanityAccepted, !effectivelyLive, duration > 0,
+        // Dismissing/rewinding Continue Watching requires proven completion, not
+        // a provisional duration or a scrub target that happens to exceed 90%.
+        if !persistenceBlockedForExit, assetSanityAccepted, !effectivelyLive,
+           markedWatched, duration.isFinite, duration > 0, currentTime.isFinite,
            currentTime / duration >= 0.9, let m = curMeta {
             if !m.usesSeriesLifecycle, terminalRewindGate.issueTerminalRewind() {
                 core.finishedWatching(libraryId: m.libraryId, target: playbackMutationTarget)

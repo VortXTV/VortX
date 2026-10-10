@@ -1091,10 +1091,7 @@ struct TVPlayerView: View {
     @State private var postFrameResumeSeekWatchdogOwner: PlayerLoadToken?
     @State private var failedResumeSeekRetry: (owner: PlayerLoadToken, target: Double)?
     private let postFrameResumeSeekWatchdogSeconds: Double = 12
-    /// Wall-clock when settled playback first ticked inside the last-10% "watched" zone, nil while
-    /// outside it (or while scrubbing). The watched marker requires a few seconds of dwell here, so a
-    /// scrub commit that merely LANDS past 90% can no longer mark the episode watched on its first tick.
-    @State private var watchedZoneSince: Double?
+    @State private var watchedDwell = WatchedPlaybackDwell<PlayerLoadToken>()
     private let plog = Logger(subsystem: "com.stremiox.app", category: "tvplayer")
 
     private var controlsHidden: Bool { !showInfo && !showOptions && !loadFailed }
@@ -1983,6 +1980,7 @@ struct TVPlayerView: View {
         case MPVProperty.pausedForCache:
             if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
             if let b = data as? Bool {
+                if b { watchedDwell.reset() }
                 let startedBuffering = b && !buffering
                 buffering = b
                 if startedBuffering {
@@ -1991,6 +1989,7 @@ struct TVPlayerView: View {
             }
         case MPVProperty.pause:
             if let loadToken, loadToken != coordinator.player?.activeLoadToken { return }
+            if let paused = data as? Bool, paused { watchedDwell.reset() }
             // play()/pause() emit MPVProperty.pause optimistically and the KVO echo then arrives with the same
             // value, so gate every side effect on a real change: the scrobble pause/resume, saveProgress and
             // reportProgress must fire once per press, not twice (this also collapses the pre-existing KVO
@@ -2057,6 +2056,7 @@ struct TVPlayerView: View {
                 activeToken: coordinator.player?.activeLoadToken
                ) {
                 let d = event.seconds
+                updateWatchedDwell(with: event)
                 guard d.isFinite, d >= 0 else { return }
                 // Recovery retains the last settled position; the UI can still show raw seek targets.
                 if event.positionSettled {
@@ -2321,34 +2321,6 @@ struct TVPlayerView: View {
                                             target: playbackMutationTarget)   // engine progress
                     }
                 }
-                // ~90% in → flip the watched marker live. DWELL-GATED: a single tick past 90% is not
-                // proof of watching - a scrub commit that lands there (easy mid back-and-forth, since a
-                // held press ramps to 75s steps) used to mark the episode watched instantly, and the mark
-                // stuck even when the viewer scrubbed straight back and exited early: Continue Watching
-                // dropped the episode and the selector moved on (the same wipe as the EOF overshoot).
-                // Require a few seconds of SETTLED playback in the zone (not scrubbing, ticks flowing)
-                // before marking; leaving the zone re-arms. A natural finish is unaffected: the last 10%
-                // of any episode dwarfs the dwell, and a true EOF still marks watched via endFileEof.
-                if assetSanityAccepted, !markedWatched, duration > 0, d / duration >= 0.9 {
-                    let now = Date().timeIntervalSinceReferenceDate
-                    if scrubbing {
-                        watchedZoneSince = nil          // previewing, not watching: reset the dwell
-                    } else if let since = watchedZoneSince {
-                        if now - since >= 5, let m = curMeta {
-                            markedWatched = true
-                            core.markPlaybackWatched(
-                                m, target: playbackMutationTarget, allowEngineWrite: EpisodePlaybackIdentity.engineWritesAllowed(
-                                    boundVideoID: isEpisodePlaybackContext ? enginePlayerVideoId : m.videoId,
-                                    displayedVideoID: m.videoId
-                                )
-                            )
-                        }
-                    } else {
-                        watchedZoneSince = now          // entered the zone: start the dwell clock
-                    }
-                } else {
-                    watchedZoneSince = nil              // below the zone (scrubbed back out): re-arm
-                }
                 // ~60s in → the user is really watching this: auto-add to the Library (D8) + send the anon
                 // fleet watch ping (D9), once per playback. Idempotent + gated (D8 setting + per-profile dedup;
                 // D9 MoatConsent + per-title/day dedup); skipped for live and ad-hoc plays.
@@ -2387,6 +2359,7 @@ struct TVPlayerView: View {
             if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
         case MPVProperty.duration:
             if let d = data as? Double {
+                if d != duration || !d.isFinite || d <= 0 { watchedDwell.reset() }
                 duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps(); fetchAddonSubtitles()
                 // Re-apply the persisted aspect-ratio pick on every (re)load, the same iOS does (aspect
                 // parity: a tvOS pick previously reset to Fit on the next source or episode).
@@ -4416,7 +4389,7 @@ struct TVPlayerView: View {
         suppressedResumeFloor = nil
         inFlightSeekTarget = nil; pendingLibmpvResumeSeek = nil
         clearPostFrameResumeSeekWatchdog()
-        watchedZoneSince = nil
+        watchedDwell.reset()
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
         subFingerprint = nil; subFingerprintKey = ""; pooledSubs = []
         subtitlePoolRequests.invalidate(); subtitleLoadingURL = nil
@@ -6169,7 +6142,38 @@ struct TVPlayerView: View {
                      isLive: isCurrentLiveStream, engine: engine)
     }
 
+    private func updateWatchedDwell(with event: PlayerTimePositionEvent) {
+        guard !markedWatched, let m = curMeta,
+              event.loadToken == coordinator.player?.activeLoadToken,
+              committedLoadToken == event.loadToken,
+              pendingAdvance == nil, supersededAdvance == nil else {
+            watchedDwell.reset()
+            return
+        }
+        let watched = watchedDwell.observe(
+            context: .init(owner: event.loadToken, libraryID: m.libraryId, videoID: m.videoId,
+                           episodeGeneration: episodeSwitchGeneration,
+                           sourceGeneration: sourceSwitchGeneration,
+                           seekGeneration: event.mpvSeekSettlement?.generation),
+            time: ProcessInfo.processInfo.systemUptime, position: event.seconds,
+            duration: duration, rate: playSpeed,
+            eligible: assetSanityAttempt.isAccepted(owner: event.loadToken)
+                && hasStartedPlaying && event.positionSettled
+                && !isCurrentLiveStream && !scrubbing && !isPaused && !buffering
+        )
+        if watched {
+            markedWatched = true
+            core.markPlaybackWatched(
+                m, target: playbackMutationTarget, allowEngineWrite: EpisodePlaybackIdentity.engineWritesAllowed(
+                    boundVideoID: isEpisodePlaybackContext ? enginePlayerVideoId : m.videoId,
+                    displayedVideoID: m.videoId
+                )
+            )
+        }
+    }
+
     private func resetRawPosition(owner: PlayerLoadToken) {
+        watchedDwell.reset()
         lastRawTimePos = -1
         lastRawTimePosOwner = owner
         lastRawTimePosMountGeneration = (coordinator.player as? AVPlayerEngineController)?.currentItemGeneration ?? 0
@@ -6369,6 +6373,7 @@ struct TVPlayerView: View {
     }
 
     private func viewerPause() {
+        watchedDwell.reset()
         // Teardown can temporarily leave no controller; the replacement still owes this input.
         localNNTPStallRecovery.suspend()
         recoveryPauseIntent = true
@@ -7158,6 +7163,7 @@ struct TVPlayerView: View {
 
     /// Returns true when input belongs to the outstanding resume transaction. Never changes Play/Pause.
     private func handleDeferredResumeUserSeek(_ intent: DeferredResumeUserSeekPolicy.Intent) -> Bool {
+        watchedDwell.reset()
         let unsettled = postFrameResumeSeekWatchdogOwner == coordinator.player?.activeLoadToken
             ? postFrameResumeSeekWatchdogTarget : nil
         let decision = DeferredResumeUserSeekPolicy.decision(
@@ -9606,7 +9612,7 @@ struct TVPlayerView: View {
         appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false
         addonSubsResolveTried = false; appliedVolume = false; appliedSize = false
         inFlightSeekTarget = nil; pendingLibmpvResumeSeek = nil
-        watchedZoneSince = nil
+        watchedDwell.reset()
         suppressedResumeFloor = nil
         // Retain the engine that accepted the incoming episode. Clearing fallback here
         // would unmount that controller and reopen AVPlayer with the launch episode.
@@ -11212,6 +11218,7 @@ struct TVPlayerView: View {
         guard duration > 0 else { return }
         let now = Date().timeIntervalSinceReferenceDate
         if !scrubbing {
+            watchedDwell.reset()
             scrubbing = true; scrubTarget = currentTime; scrubStep = 10
         } else if now - lastScrubAt < 0.4 {
             // Gentle LINEAR ramp while holding. The old 1.6x exponential hit the 120s cap in a few
