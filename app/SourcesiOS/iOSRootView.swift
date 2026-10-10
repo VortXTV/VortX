@@ -402,7 +402,7 @@ struct iOSRootView: View {
         case .library:
             if !hideLibraryTab { iOSLibraryView(isActive: true) }
         case .search:
-            if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true, core: core) }
+            if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true) }
         case .addons:
             AddonsView()
         case .settings:
@@ -1070,7 +1070,7 @@ struct iOSHomeView: View {
     @EnvironmentObject private var profiles: ProfileStore   // gate Continue Watching on the active profile's own history
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.accessibilityContrast) private var accessibilityContrast
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
