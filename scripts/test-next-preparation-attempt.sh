@@ -43,7 +43,7 @@ if run_test "$test_dir/baseline"; then
   printf '%s\n' 'FAIL baseline unexpectedly passed the held-cancellation race'
   exit 1
 fi
-if ! rg -q 'FAIL  old deferred cleanup does not clear successor auxiliary snapshots' \
+if ! grep -Fq 'FAIL  old deferred cleanup does not clear successor auxiliary snapshots' \
     "$test_dir/baseline.runtime.log"; then
   printf '%s\n' 'FAIL baseline did not fail at the ownership regression assertion'
   exit 1
