@@ -3141,17 +3141,24 @@ final class MPVMetalViewController: PlatformViewController {
         // scrub (a short hop while the forward cache holds minutes) is a cheap in-cache seek: arming there would
         // needlessly dump that buffer and stall ~2s refilling from the network (the scrub-forward stall, worst on
         // remote/aiostreams sources).
-        if seekTargetOutsideCache(seconds) {
+        let needsSeekRefill = seekTargetOutsideCache(seconds)
+        if needsSeekRefill {
             armSeekCacheHold()   // out-of-window jump empties the forward cache; hold so the AO resumes once on a refilled cache
             lastOutOfWindowSeekTarget = seconds
-            armSeekRefillWatchdog()   // recover a wedged cold-range refill fast (bounded reseek) instead of waiting on the stall reload
         }
         #endif
         let owner = callbackLoadToken(requiresLoadedFile: true)
         let wasPaused = getFlag(MPVProperty.pause)
         let duration = getDouble(MPVProperty.duration)
         command("seek", args: [String(seconds), "absolute"], returnValueCallback: { [weak self] status in
-            guard let self, status >= 0, let owner else { return }
+            guard let self else { return }
+            #if os(tvOS)
+            if status < 0 || owner == nil { self.releaseSeekCacheHoldIfArmed() }
+            #endif
+            guard status >= 0, let owner else { return }
+            #if os(tvOS)
+            if needsSeekRefill { self.armSeekRefillWatchdog(owner: owner) }
+            #endif
             self.seekEOFRecovery.begin(
                 owner: owner, target: seconds, wasPaused: wasPaused, duration: duration, origin: .viewer,
                 now: ProcessInfo.processInfo.systemUptime
@@ -3263,14 +3270,21 @@ final class MPVMetalViewController: PlatformViewController {
         let wasPaused = getFlag(MPVProperty.pause)
         let duration = getDouble(MPVProperty.duration)
         #if os(tvOS)
-        if position.isFinite, seconds.isFinite, target.isFinite, seekTargetOutsideCache(target) {
+        let needsSeekRefill = position.isFinite && seconds.isFinite && target.isFinite && seekTargetOutsideCache(target)
+        if needsSeekRefill {
             armSeekCacheHold()
             lastOutOfWindowSeekTarget = target
-            armSeekRefillWatchdog()
         }
         #endif
         command("seek", args: [String(format: "%.1f", seconds), "relative"], returnValueCallback: { [weak self] status in
-            guard let self, status >= 0, let owner, position.isFinite, seconds.isFinite else { return }
+            guard let self else { return }
+            #if os(tvOS)
+            if status < 0 || owner == nil { self.releaseSeekCacheHoldIfArmed() }
+            #endif
+            guard status >= 0, let owner, position.isFinite, seconds.isFinite else { return }
+            #if os(tvOS)
+            if needsSeekRefill { self.armSeekRefillWatchdog(owner: owner) }
+            #endif
             self.seekEOFRecovery.begin(
                 owner: owner, target: target, wasPaused: wasPaused, duration: duration, origin: .viewer,
                 now: ProcessInfo.processInfo.systemUptime)
@@ -3317,6 +3331,8 @@ final class MPVMetalViewController: PlatformViewController {
     /// seek, cancelled on the pausedForCache=false release edge / loadFile / teardown. Main-thread only.
     private var seekRefillWatchdogWork: DispatchWorkItem?
     private var seekRefillWatchdogGeneration: UInt64 = 0
+    private var seekRefillOwner: PlayerLoadToken?
+    private var seekRefillCommandGeneration: UInt64?
     private var lastOutOfWindowSeekTarget: Double?
     private var seekRefillRecoveriesThisSeek = 0
     private static let seekRefillWedgeWindowSecs: TimeInterval = 4   // no cache growth + still paused-for-cache => wedged
@@ -3370,44 +3386,95 @@ final class MPVMetalViewController: PlatformViewController {
         setString("cache-pause-wait", String(cachePauseWaitSeconds))
     }
 
+    /// A queued buffering-end edge from before a newer scrub cannot release that scrub's hold.
+    /// Track-change holds without a viewer watchdog retain their ordinary buffering-end behavior.
+    private func releaseSeekCacheHoldAfterBuffering(owner: PlayerLoadToken, commandGeneration: UInt64?, seekObserved: Bool) {
+        guard callbackLoadToken(requiresLoadedFile: true) == owner,
+              diagnosticFlag(MPVProperty.pausedForCache) == false else { return }
+        if let refillOwner = seekRefillOwner {
+            guard refillOwner == owner, seekObserved,
+                  commandGeneration == seekRefillCommandGeneration,
+                  let command = seekRefillCommandState(owner: owner),
+                  command.generation == seekRefillCommandGeneration,
+                  command.observed else { return }
+        }
+        releaseSeekCacheHoldIfArmed()
+    }
+
     /// Arm the bounded refill watchdog for the out-of-window seek just issued. Cancels any prior arm (a new
     /// scrub supersedes the old refill), resets the recovery budget, and starts the progress-aware poll.
-    private func armSeekRefillWatchdog() {
-        guard !startMuted, mpv != nil else { return }
+    private func armSeekRefillWatchdog(owner: PlayerLoadToken) {
+        guard !startMuted, mpv != nil,
+              callbackLoadToken(requiresLoadedFile: true) == owner,
+              let command = seekRefillCommandState(owner: owner) else {
+            releaseSeekCacheHoldIfArmed()
+            return
+        }
         seekRefillWatchdogGeneration &+= 1
         seekRefillWatchdogWork?.cancel(); seekRefillWatchdogWork = nil
+        seekRefillOwner = owner
+        seekRefillCommandGeneration = command.generation
         seekRefillRecoveriesThisSeek = 0
         scheduleSeekRefillWatchdogCheck(
             generation: seekRefillWatchdogGeneration,
-            lastCacheSample: diagnosticDouble("demuxer-cache-duration") ?? 0
+            lastCacheSample: nil
         )
     }
 
     private func cancelSeekRefillWatchdog() {
         seekRefillWatchdogWork?.cancel(); seekRefillWatchdogWork = nil
         seekRefillWatchdogGeneration &+= 1
+        seekRefillOwner = nil
+        seekRefillCommandGeneration = nil
     }
 
-    private func scheduleSeekRefillWatchdogCheck(generation: UInt64, lastCacheSample: Double) {
+    /// Command admission is not the asynchronous native SEEK boundary. Native refresh events
+    /// may advance the transport generation, but only a new accepted command supersedes this flight.
+    private func seekRefillCommandState(owner: PlayerLoadToken) -> (generation: UInt64, observed: Bool)? {
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        guard seekSettlement.owner == owner,
+              let generation = seekSettlement.lastAcceptedCommandGeneration,
+              let attempt = seekSettlement.current else { return nil }
+        return (generation, attempt.phase != .awaitingSeek)
+    }
+
+    private func scheduleSeekRefillWatchdogCheck(generation: UInt64, lastCacheSample: Double?) {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.mpv != nil,
                   self.seekRefillWatchdogGeneration == generation,
                   self.seekCacheHoldArmed else { return }   // hold released => refill succeeded, the watchdog is done
-            if self.getFlag(MPVProperty.pause) {
-                self.scheduleSeekRefillWatchdogCheck(generation: generation, lastCacheSample: lastCacheSample)
-                return
-            }
-            let stillBuffering = self.diagnosticFlag(MPVProperty.pausedForCache) ?? false
-            let forwardCache = self.diagnosticDouble("demuxer-cache-duration") ?? 0
-            // A live refill is pulling bytes: the buffered-ahead edge grows. Only a genuine wedge - still
-            // paused-for-cache AND no forward-cache growth across the whole window - is retried, so a healthy but
-            // slow refill is never clobbered (mirrors the progress-aware start watchdog).
-            let progressed = forwardCache > lastCacheSample + Self.seekRefillProgressEpsilonSecs
-            if !stillBuffering {
+            guard let owner = self.seekRefillOwner,
+                  self.callbackLoadToken(requiresLoadedFile: true) == owner,
+                  let command = self.seekRefillCommandState(owner: owner),
+                  command.generation == self.seekRefillCommandGeneration else {
                 self.releaseSeekCacheHoldIfArmed()
                 return
             }
-            if progressed {
+            if self.getFlag(MPVProperty.pause) || !command.observed {
+                self.scheduleSeekRefillWatchdogCheck(generation: generation, lastCacheSample: nil)
+                return
+            }
+            let stillBuffering = self.diagnosticFlag(MPVProperty.pausedForCache)
+            // A live refill is pulling bytes: the buffered-ahead edge grows. Only a genuine wedge - still
+            // paused-for-cache AND no forward-cache growth across the whole window - is retried, so a healthy but
+            // slow refill is never clobbered (mirrors the progress-aware start watchdog).
+            if stillBuffering == false {
+                self.releaseSeekCacheHoldIfArmed()
+                return
+            }
+            guard stillBuffering == true,
+                  let forwardCache = self.diagnosticDouble("demuxer-cache-duration"),
+                  forwardCache.isFinite, forwardCache >= 0 else {
+                self.scheduleSeekRefillWatchdogCheck(generation: generation, lastCacheSample: nil)
+                return
+            }
+            // A command returns before its old cache is discarded. Never compare the new range
+            // with that old payload, and never count paused/unknown observations as a wedge window.
+            guard let lastCacheSample, forwardCache >= lastCacheSample else {
+                self.scheduleSeekRefillWatchdogCheck(generation: generation, lastCacheSample: forwardCache)
+                return
+            }
+            if forwardCache > lastCacheSample + Self.seekRefillProgressEpsilonSecs {
                 self.scheduleSeekRefillWatchdogCheck(generation: generation, lastCacheSample: forwardCache)
                 return
             }
@@ -3421,11 +3488,17 @@ final class MPVMetalViewController: PlatformViewController {
             // Re-issue the SAME absolute seek: a fresh demuxer seek drops the stuck cold-range read and reopens
             // it, which is what unsticks a slow-resyncing mid-file range. Bounded; the mid-play stall watchdog
             // remains the ultimate backstop.
-            self.command("seek", args: [String(target), "absolute"])
-            self.scheduleSeekRefillWatchdogCheck(
-                generation: generation,
-                lastCacheSample: self.diagnosticDouble("demuxer-cache-duration") ?? 0
-            )
+            self.command("seek", args: [String(target), "absolute"], returnValueCallback: { [weak self] status in
+                guard let self, self.seekRefillWatchdogGeneration == generation else { return }
+                guard status >= 0,
+                      self.callbackLoadToken(requiresLoadedFile: true) == owner,
+                      let accepted = self.seekRefillCommandState(owner: owner) else {
+                    self.releaseSeekCacheHoldIfArmed()
+                    return
+                }
+                self.seekRefillCommandGeneration = accepted.generation
+                self.scheduleSeekRefillWatchdogCheck(generation: generation, lastCacheSample: nil)
+            })
         }
         seekRefillWatchdogWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.seekRefillWedgeWindowSecs, execute: work)
@@ -4501,6 +4574,10 @@ final class MPVMetalViewController: PlatformViewController {
                 let rawSeekEvidence = rawSeekOwner.map {
                     self.seekSettlement.evidence(owner: $0, seeking: rawSeeking, eofReached: rawEOF)
                 }
+                #if os(tvOS)
+                let rawSeekCommandGeneration = self.seekSettlement.lastAcceptedCommandGeneration
+                let rawSeekCommandObserved = self.seekSettlement.current.map { $0.phase != .awaitingSeek } ?? false
+                #endif
                 // Capture beside raw dequeue, never later after a new main-thread command.
                 let rawCacheWitness = self.cacheReanchorEventWitness
                 let rawCacheNativeSample = samplesPosition && rawCacheWitness != nil
@@ -4690,12 +4767,10 @@ final class MPVMetalViewController: PlatformViewController {
                             // the fast defaults (main hop, mirroring pausedStateChanged below).
                             if !buffering {
                                 DispatchQueue.main.async { [weak self] in
-                                    guard let self, let callbackToken,
-                                          PlayerLoadProvenanceState.accepts(
-                                            callbackToken: callbackToken, activeToken: self.activeLoadToken
-                                          ),
-                                          self.diagnosticFlag(MPVProperty.pausedForCache) == false else { return }
-                                    self.releaseSeekCacheHoldIfArmed()
+                                    guard let self, let callbackToken else { return }
+                                    self.releaseSeekCacheHoldAfterBuffering(
+                                        owner: callbackToken, commandGeneration: rawSeekCommandGeneration,
+                                        seekObserved: rawSeekCommandObserved)
                                 }
                             }
                             #endif
