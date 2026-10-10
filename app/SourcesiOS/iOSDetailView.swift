@@ -1614,7 +1614,7 @@ struct iOSDetailView: View {
         // Keep the image request in a child view: the detail body observes a large, frequently changing
         // state surface while sources settle, but backdrop loading should only restart when the artwork or
         // its decoded-size budget changes. The child also rejects a late completion from a previous title.
-        iOSCinematicBackdropImage(
+        return iOSCinematicBackdropImage(
             url: bg,
             contentMode: (effectiveType == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill
         )
