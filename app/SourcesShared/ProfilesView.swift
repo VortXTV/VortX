@@ -1114,8 +1114,8 @@ struct ProfileEditorView: View {
         // empty field keeps the existing PIN; Remove PIN cleared it explicitly
         #if VORTX_NATIVE_DATA_ENGINE
         let admission = core.captureNativeProfileActionAdmission()
-        let profile = draft, creating = isNew
-        profileAction.start(operation: { await store.saveNative(profile, creating: creating, admission: admission) },
+        let profile = draft, creating = isNew, preferenceBaseline = original
+        profileAction.start(operation: { await store.saveNative(profile, creating: creating, admission: admission, preferenceBaseline: preferenceBaseline) },
                             failureMessage: { store.nativeProfileError ?? "Profile could not be saved. Please retry." },
                             onSuccess: { dismiss() })
         #else

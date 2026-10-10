@@ -70,7 +70,12 @@ struct UserProfile {
     var usesEngineHistory: Bool = true
     var discovery: ProfileDiscoveryPreferences? = nil
     var playback: PlaybackPrefs? = nil
+    var addonPreferences: ProfileAddonPreferences? = nil
+    var accentID = "ember"
+    var oled = false
+    var textScale = 1.0
 }
+struct ProfileAddonPreferences: Equatable {}
 
 struct CoreLibrary { let catalog: [CoreCWItem] }
 struct CoreCWItem {

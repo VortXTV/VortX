@@ -205,6 +205,25 @@ final class ProfileStore: ObservableObject {
     private var nativeProjectionTarget: PlaybackMutationTarget?
     private var nativePublishedPlayback: UserProfile.PlaybackPrefs?
     private var nativePublishedDiscovery: ProfileDiscoveryPreferences?
+    private struct NativePlaybackProjectionSource: Equatable {
+        let playback: UserProfile.PlaybackPrefs?
+        let addonPreferences: ProfileAddonPreferences?
+    }
+    private struct NativeDiscoveryProjectionSource: Equatable {
+        let discovery: ProfileDiscoveryPreferences?
+    }
+    private var nativePublishedPlaybackSource: NativePlaybackProjectionSource?
+    private var nativePublishedDiscoverySource: NativeDiscoveryProjectionSource?
+    private struct NativeThemeProjection: Equatable {
+        let accentID: String
+        let oled: Bool
+        let textScale: Double
+    }
+    private var nativePublishedTheme: NativeThemeProjection?
+    private func currentNativeThemeProjection() -> NativeThemeProjection {
+        let theme = ThemeManager.shared
+        return .init(accentID: theme.accentID, oled: theme.oled, textScale: theme.textScale)
+    }
     private let continueWatchingLegacyAccount = CredentialScopeRegistry.shared.capture()
     private struct ContinueWatchingMigrationWitness {
         let profileID: UUID
@@ -225,17 +244,97 @@ final class ProfileStore: ObservableObject {
          SourcePreferences.avoidBehaviorKey, SourcePreferences.autoPickBestKey]
     }
     static let nativeThemeProjectionKeys: Set<String> = ["stremiox.theme.accent", "stremiox.theme.oled", "stremiox.theme.textScale"]
+    func nativePreferenceProjectionMatches(_ target: PlaybackMutationTarget) -> Bool {
+        nativeProjectionTarget == target && target.stillOwnsCurrentContext(core: .shared)
+    }
+    private func nativePlaybackProjectionRepresents(_ profile: UserProfile) -> Bool {
+        nativePublishedPlaybackSource == .init(playback: profile.playback, addonPreferences: profile.addonPreferences)
+    }
+    private func nativeDiscoveryProjectionRepresents(_ profile: UserProfile) -> Bool {
+        nativePublishedDiscoverySource == .init(discovery: profile.discovery)
+    }
     /// A projection dirty stamp may acknowledge only a value already represented by the durable
     /// native profile. Unknown/queued/failed writes remain dirty instead of becoming global fields.
     func nativePreferenceIsAcknowledged(_ key: String) -> Bool {
-        guard let active, CoreBridge.shared.hasNativeSession else { return false }
-        if Self.nativePlaybackProjectionKeys.contains(key) { return active.playback == currentPlaybackPrefs() }
-        if ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key) { return active.discovery == currentDiscoveryPrefs() }
+        guard let active, let target = nativeProjectionTarget,
+              target.stillOwnsCurrentContext(core: .shared) else { return false }
+        // Stored optional/inherited fields are not byte-identical to the effective flat values.
+        // A baseline exists only after that exact native binding published its projection.
+        if Self.nativePlaybackProjectionKeys.contains(key) {
+            return nativePlaybackProjectionRepresents(active) && nativePublishedPlayback == currentPlaybackPrefs()
+        }
+        if ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key) {
+            return Self.nativeDiscoveryProjectionIsRepresented(key, by: active.discovery)
+                && nativeDiscoveryProjectionRepresents(active) && nativePublishedDiscovery == currentDiscoveryPrefs()
+        }
         if Self.nativeThemeProjectionKeys.contains(key) {
-            let theme = ThemeManager.shared
-            return active.accentID == theme.accentID && active.oled == theme.oled && active.textScale == theme.textScale
+            return nativePublishedTheme == .init(accentID: active.accentID, oled: active.oled, textScale: active.textScale)
+                && nativePublishedTheme == currentNativeThemeProjection()
         }
         return false
+    }
+    private static func nativeDiscoveryProjectionIsRepresented(_ key: String, by p: ProfileDiscoveryPreferences?) -> Bool {
+        typealias Key = ProfileDiscoveryPreferencesStore.Key
+        switch key {
+        case Key.hiddenCatalogs: return p?.hiddenCatalogs != nil
+        case Key.catalogOrder: return p?.catalogOrder != nil
+        case Key.hiddenHubCategories: return p?.hiddenHubCategories != nil
+        case Key.regionOverride: return p?.regionOverrideCaptured == true || p?.regionOverride != nil
+        case Key.filters: return p?.filtersCaptured == true || p?.filtersData != nil
+        case Key.selectedProviders: return p?.selectedProviders != nil
+        case Key.providerOrder: return p?.providerOrder != nil
+        case Key.hideLiveTab: return p?.tabVisibilityCaptured == true || p?.hideLiveTab != nil
+        case Key.hideDiscoverTab: return p?.tabVisibilityCaptured == true || p?.hideDiscoverTab != nil
+        case Key.hideLibraryTab: return p?.tabVisibilityCaptured == true || p?.hideLibraryTab != nil
+        case Key.hideSearchTab: return p?.tabVisibilityCaptured == true || p?.hideSearchTab != nil
+        case Key.showCollectionsHome: return p?.showCollectionsHome != nil
+        case Key.showCollectionsDiscover: return p?.showCollectionsDiscover != nil
+        case Key.continueWatchingSource: return p?.continueWatchingSource != nil
+        case Key.continueWatchingWindow: return p?.continueWatchingWindow != nil
+        default: return false
+        }
+    }
+    /// Retry only a local change against an already-published, still-current projection. Never
+    /// attribute pre-mount defaults or another account/profile's flat preferences to this owner.
+    @MainActor
+    @discardableResult
+    func retryNativePreferenceProjection(keys: Set<String>) async -> Bool {
+        guard let original = active, let target = nativeProjectionTarget,
+              target.stillOwnsCurrentContext(core: .shared) else { return false }
+        let playback = currentPlaybackPrefs(), discovery = currentDiscoveryPrefs(), theme = currentNativeThemeProjection()
+        let retryPlayback = !keys.isDisjoint(with: Self.nativePlaybackProjectionKeys)
+            && nativePublishedPlayback != nil && nativePublishedPlayback != playback
+        let retryDiscovery = !keys.isDisjoint(with: ProfileDiscoveryPreferencesStore.activeProjectionKeys)
+            && nativePublishedDiscovery != nil && nativePublishedDiscovery != discovery
+        let retryTheme = !keys.isDisjoint(with: Self.nativeThemeProjectionKeys)
+            && nativePublishedTheme != nil && nativePublishedTheme != theme
+        guard retryPlayback || retryDiscovery || retryTheme else { return true }
+        var candidate = retryPlayback ? profileCapturingPlayback(original) : original
+        if retryDiscovery {
+            candidate.discovery = discovery
+            if let witness = continueWatchingMigration, witness.profileID == original.id,
+               witness.target == target, TraktAuth.storedSessionID == witness.session {
+                candidate.discovery?.continueWatchingSource = "trakt"
+            }
+        }
+        if retryTheme { candidate.accentID = theme.accentID; candidate.oled = theme.oled; candidate.textScale = theme.textScale }
+        if candidate != original, !(await saveNative(candidate, creating: false, target: target)) { return false }
+        guard nativeProjectionTarget == target, target.stillOwnsCurrentContext(core: .shared),
+              let accepted = active, accepted.id == original.id else { return false }
+        // The normal publication may preserve inherited fields while this captured write is in
+        // flight. Advance only the exact group durably accepted; a newer edit keeps its old base.
+        if retryPlayback, accepted.playback == candidate.playback, accepted.addonPreferences == candidate.addonPreferences,
+           currentPlaybackPrefs() == playback {
+            nativePublishedPlayback = playback
+            nativePublishedPlaybackSource = .init(playback: accepted.playback, addonPreferences: accepted.addonPreferences)
+        }
+        if retryDiscovery, accepted.discovery == candidate.discovery, currentDiscoveryPrefs() == discovery {
+            nativePublishedDiscovery = discovery
+            nativePublishedDiscoverySource = .init(discovery: accepted.discovery)
+        }
+        if retryTheme, accepted.accentID == candidate.accentID, accepted.oled == candidate.oled,
+           accepted.textScale == candidate.textScale, currentNativeThemeProjection() == theme { nativePublishedTheme = theme }
+        return true
     }
     /// Called only after the native transaction's checkpoint acknowledgement. The old global
     /// roster is replaced as a presentation mirror, never unioned into native account authority.
@@ -243,6 +342,7 @@ final class ProfileStore: ObservableObject {
         guard incoming.contains(where: { $0.id == selected }) else { return }
         let target = projectionTarget ?? CoreBridge.shared.captureNativePlaybackTarget()
         let sameInstallation = nativeProjectionTarget == target && activeID == selected
+        let quarantineFailed = !sameInstallation && !VortXSyncManager.nativePreferenceProjectionWillMount()
         if !sameInstallation { ContinueWatchingPreferences.retireSelection() }
         // A same-session sync publication may run before a queued UI preference save. Preserve
         // its captured flat values until that transaction acknowledges; real switches still reset.
@@ -276,22 +376,32 @@ final class ProfileStore: ObservableObject {
             // migration fields before dirty-value comparison; never replace another queued edit.
             ProfileDiscoveryPreferencesStore.applyContinueWatching(incomingActive?.discovery, resetUnset: true)
         }
-        let flatPlayback = currentPlaybackPrefs(), flatDiscovery = currentDiscoveryPrefs()
-        let pendingPlayback = sameInstallation && nativePublishedPlayback != flatPlayback && incomingActive?.playback != flatPlayback
-        let pendingDiscovery = sameInstallation && nativePublishedDiscovery != flatDiscovery && incomingActive?.discovery != flatDiscovery
+        let flatPlayback = currentPlaybackPrefs(), flatDiscovery = currentDiscoveryPrefs(), flatTheme = currentNativeThemeProjection()
+        let pendingPlayback = quarantineFailed || (sameInstallation && nativePublishedPlayback != flatPlayback && incomingActive?.playback != flatPlayback)
+        let pendingDiscovery = quarantineFailed || (sameInstallation && nativePublishedDiscovery != flatDiscovery && incomingActive?.discovery != flatDiscovery)
+        let pendingTheme = quarantineFailed || (sameInstallation && nativePublishedTheme != flatTheme
+            && (incomingActive?.accentID != flatTheme.accentID || incomingActive?.oled != flatTheme.oled || incomingActive?.textScale != flatTheme.textScale)
+        )
         profiles = incoming; activeID = selected; nativeProfileError = nil
-        nativeProjectionTarget = target
+        nativeProjectionTarget = quarantineFailed ? nil : target
         persist(touch: false)
         if let active {
             VortXSyncManager.suppressHousekeeping {
-                self.applyTheme(active)
+                if !pendingTheme { self.applyTheme(active) }
                 if !pendingPlayback { self.applyPlayback(active, resetUnset: true) }
                 if !pendingDiscovery { self.applyDiscovery(active, resetUnset: true) }
-                if !pendingPlayback { self.nativePublishedPlayback = self.currentPlaybackPrefs() }
-                if !pendingDiscovery { self.nativePublishedDiscovery = self.currentDiscoveryPrefs() }
                 SourcePreferences.shared.reload(); SourcePinStore.shared.reload()
+                if !pendingPlayback {
+                    self.nativePublishedPlayback = self.currentPlaybackPrefs()
+                    self.nativePublishedPlaybackSource = .init(playback: active.playback, addonPreferences: active.addonPreferences)
+                }
+                if !pendingDiscovery {
+                    self.nativePublishedDiscovery = self.currentDiscoveryPrefs()
+                    self.nativePublishedDiscoverySource = .init(discovery: active.discovery)
+                }
+                if !pendingTheme { self.nativePublishedTheme = self.currentNativeThemeProjection() }
             }
-            migrateContinueWatchingIfQualified(active)
+            if !quarantineFailed { migrateContinueWatchingIfQualified(active) }
         }
     }
     private func migrateContinueWatchingIfQualified(_ profile: UserProfile) {
@@ -333,8 +443,11 @@ final class ProfileStore: ObservableObject {
         return await perform(target)
     }
     @MainActor
-    func saveNative(_ profile: UserProfile, creating: Bool, admission: CoreBridge.NativeProfileActionAdmission) async -> Bool {
-        await prepareNativeAction(admission, operation: "save") { await self.saveNative(profile, creating: creating, target: $0) }
+    func saveNative(_ profile: UserProfile, creating: Bool, admission: CoreBridge.NativeProfileActionAdmission,
+                    preferenceBaseline: UserProfile? = nil) async -> Bool {
+        await prepareNativeAction(admission, operation: "save") {
+            await self.saveNative(profile, creating: creating, target: $0, preferenceBaseline: preferenceBaseline)
+        }
     }
     @MainActor
     func removeNative(_ profile: UserProfile, admission: CoreBridge.NativeProfileActionAdmission) async -> Bool {
@@ -345,9 +458,18 @@ final class ProfileStore: ObservableObject {
         await prepareNativeAction(admission, operation: "open") { await self.selectNative(profile, target: $0, finishPicker: finishPicker) }
     }
     @MainActor
-    func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget? = nil) async -> Bool {
+    func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget? = nil,
+                    preferenceIntents suppliedIntents: [NativePreferenceIntentStore.Intent]? = nil,
+                    preferenceBaseline: UserProfile? = nil) async -> Bool {
         let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
-        do { try await CoreBridge.shared.saveNativeProfile(profile, creating: creating, target: captured); nativeProfileError = nil; return true }
+        do {
+            let intents = try suppliedIntents ?? (creating ? [] : VortXSyncManager.shared.prepareNativePreferenceIntents(profile, target: captured, baseline: preferenceBaseline))
+            let submitted = try creating ? profile : VortXSyncManager.shared.normalizedNativePreferenceSubmission(profile, intents: intents, target: captured)
+            try await CoreBridge.shared.saveNativeProfile(submitted, creating: creating, target: captured,
+                preferenceAdmission: creating ? nil : try VortXSyncManager.shared.nativePreferenceAdmission(intents, profile: submitted, target: captured))
+            try VortXSyncManager.shared.finishNativePreferenceIntents(intents, target: captured)
+            nativeProfileError = nil; return true
+        }
         catch {
             CoreBridge.shared.reportNativeProfileFailure("save", error: error)
             nativeProfileError = "Couldn't save this profile. Your changes are still here. Tap Try again."
@@ -690,10 +812,22 @@ final class ProfileStore: ObservableObject {
         persist()
     }
 
-    func update(_ profile: UserProfile) {
+    func update(_ profile: UserProfile, editedPreferenceGroups: Set<NativePreferenceIntentStore.Group>? = nil) {
 #if VORTX_NATIVE_DATA_ENGINE
         let target = CoreBridge.shared.captureNativePlaybackTarget()
-        Task { @MainActor in _ = await saveNative(profile, creating: false, target: target) }; return
+        // Capture synchronously: a process exit before the queued Task runs must not lose the
+        // edit or force the next launch to guess an owner from account-only flat dirty flags.
+        let admission: [NativePreferenceIntentStore.Intent]?
+        if Thread.isMainThread {
+            admission = MainActor.assumeIsolated { try? VortXSyncManager.shared.prepareNativePreferenceIntents(profile, target: target, editedGroups: editedPreferenceGroups) }
+        } else {
+            admission = DispatchQueue.main.sync { try? VortXSyncManager.shared.prepareNativePreferenceIntents(profile, target: target, editedGroups: editedPreferenceGroups) }
+        }
+        guard let admission else {
+            nativeProfileError = "Couldn't save this profile. Your changes are still here. Tap Try again."
+            return
+        }
+        Task { @MainActor in _ = await saveNative(profile, creating: false, target: target, preferenceIntents: admission) }; return
 #endif
         guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return }
         profiles[index] = profile
@@ -1163,12 +1297,34 @@ final class ProfileStore: ObservableObject {
     func captureTheme() {
         guard var profile = active else { return }
         let tm = ThemeManager.shared
-        guard profile.accentID != tm.accentID || profile.oled != tm.oled || profile.textScale != tm.textScale else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+        let representedTheme = NativeThemeProjection(accentID: profile.accentID, oled: profile.oled, textScale: profile.textScale)
+#endif
+        let changed = profile.accentID != tm.accentID || profile.oled != tm.oled || profile.textScale != tm.textScale
         profile.accentID = tm.accentID
         profile.oled = tm.oled
         profile.textScale = tm.textScale
-        update(profile)
+#if VORTX_NATIVE_DATA_ENGINE
+        let reverting = nativePreferenceIsLocalRevert(profile, group: .theme)
+        let unchangedProjection = nativePublishedTheme == representedTheme
+            && nativePublishedTheme == currentNativeThemeProjection()
+        guard nativePreferenceProjectionMatches(CoreBridge.shared.captureNativePlaybackTarget()),
+              (changed && !unchangedProjection) || reverting else { return }
+        update(profile, editedPreferenceGroups: [.theme])
+#else
+        guard changed else { return }; update(profile)
+#endif
     }
+
+#if VORTX_NATIVE_DATA_ENGINE
+    private func nativePreferenceIsLocalRevert(_ profile: UserProfile, group: NativePreferenceIntentStore.Group) -> Bool {
+        let target = CoreBridge.shared.captureNativePlaybackTarget()
+        if Thread.isMainThread {
+            return MainActor.assumeIsolated { VortXSyncManager.shared.nativePreferenceIsLocalRevert(profile, group: group, target: target) }
+        }
+        return DispatchQueue.main.sync { VortXSyncManager.shared.nativePreferenceIsLocalRevert(profile, group: group, target: target) }
+    }
+#endif
 
     // MARK: Per-profile playback preferences (languages + subtitle style)
 
@@ -1319,7 +1475,27 @@ final class ProfileStore: ObservableObject {
     /// and follows the profile across devices. The equality guard stops select()'s own flat-key
     /// writes from echoing back as roster edits.
     func capturePlayback() {
-        guard var profile = active else { return }
+        guard let profile = active else { return }
+        var captured = profileCapturingPlayback(profile)
+#if VORTX_NATIVE_DATA_ENGINE
+        if nativePlaybackProjectionRepresents(profile), nativePublishedPlayback == currentPlaybackPrefs() {
+            // Returning to the unchanged effective projection restores its original nil/inherited
+            // native representation; it does not manufacture explicit platform defaults.
+            captured.playback = profile.playback; captured.addonPreferences = profile.addonPreferences
+        }
+#endif
+        let changed = captured.playback != profile.playback || captured.addonPreferences != profile.addonPreferences
+#if VORTX_NATIVE_DATA_ENGINE
+        let reverting = nativePreferenceIsLocalRevert(captured, group: .playback)
+        guard nativePreferenceProjectionMatches(CoreBridge.shared.captureNativePlaybackTarget()),
+              changed || reverting else { return }
+        update(captured, editedPreferenceGroups: [.playback])
+#else
+        guard changed else { return }; update(captured)
+#endif
+    }
+    private func profileCapturingPlayback(_ original: UserProfile) -> UserProfile {
+        var profile = original
         var now = currentPlaybackPrefs()
         let effective = effectiveAddonRanking(for: profile)
         var preferences = addonPreferences(for: profile)
@@ -1339,10 +1515,9 @@ final class ProfileStore: ObservableObject {
         } else if !activeSharesMainAddons {
             preferences.rankingOverride = nil // owners keep their established account-ranking fields
         }
-        guard profile.playback != now || profile.addonPreferences != preferences else { return }
         profile.playback = now
         profile.addonPreferences = preferences
-        update(profile)
+        return profile
     }
 
     // MARK: Per-profile catalog and Discover preferences
@@ -1395,12 +1570,18 @@ final class ProfileStore: ObservableObject {
             now.continueWatchingSource = "trakt"
         }
 #endif
-        guard profiles[index].discovery != now else { return }
 #if VORTX_NATIVE_DATA_ENGINE
         var profile = profiles[index]
         profile.discovery = now
-        update(profile)
+        if !continueWatchingEdited, nativeDiscoveryProjectionRepresents(profiles[index]), nativePublishedDiscovery == now {
+            profile.discovery = profiles[index].discovery
+        }
+        let reverting = nativePreferenceIsLocalRevert(profile, group: .discovery)
+        guard nativePreferenceProjectionMatches(CoreBridge.shared.captureNativePlaybackTarget()),
+              continueWatchingEdited || profiles[index].discovery != profile.discovery || reverting else { return }
+        update(profile, editedPreferenceGroups: [.discovery])
 #else
+        guard profiles[index].discovery != now else { return }
         profiles[index].discovery = now
         persist()
 #endif

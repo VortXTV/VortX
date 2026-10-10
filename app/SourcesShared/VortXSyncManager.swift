@@ -220,6 +220,18 @@ final class VortXSyncManager: ObservableObject {
     /// from this device (or signed out).
     @Published private(set) var lastSyncAt: Date?
 
+    /// Transport success does not mean every locally retained preference has converged.
+    var pendingSettingsMessage: String? {
+#if VORTX_NATIVE_DATA_ENGINE
+        guard isSignedIn else { return nil }
+        return !nativeUnsupportedSettings.isEmpty || !dirtySettings.isEmpty || nativePreferenceIntentStatus != "idle"
+            ? "Some changes still need to sync." : nil
+#else
+        return isSignedIn && !dirtySettings.isEmpty ? "Some changes still need to sync." : nil
+#endif
+    }
+    var synchronizationIsComplete: Bool { isSignedIn && lastSyncAt != nil && !hasPendingPush && pendingSettingsMessage == nil }
+
     private let base = "https://api.vortx.tv"
     private let kcAccount = "vortx.sync.session.v1"
     private var token: String?
@@ -239,6 +251,331 @@ final class VortXSyncManager: ObservableObject {
     private var nativeLegacyWatchlistPending = Set<String>()
     @Published private(set) var nativeOwnAccountOverlayUnattributed: [UUID] = []
     private var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
+    @Published private(set) var nativePreferenceIntentStatus = "idle"
+    private struct NativePreferenceLocalAdmission {
+        let target: PlaybackMutationTarget
+        let intent: NativePreferenceIntentStore.Intent
+    }
+    private var nativePreferenceLocalAdmissions: [UUID: [NativePreferenceIntentStore.Group: NativePreferenceLocalAdmission]] = [:]
+    /// An account-only legacy dirty stamp is not evidence of the profile that authored it.
+    /// Remember its exact stamp before a new native installation replaces the flat projection.
+    private func quarantineNativePreferenceStamps() -> Bool {
+        var legacy = dirtySettings.filter { Self.nativePreferenceProjectionKeys.contains($0.key) }
+        guard !legacy.isEmpty else { return true }
+        do {
+            let capture = credentialAuthority.capture()
+            let store = try nativePreferenceStore(capture: capture)
+            // Only a saved, authenticated exact stamp exempts an edit from quarantine. The
+            // journal survives native ACK until cloud ACK; an account-only flag never suffices.
+            let target = CoreBridge.shared.captureNativePlaybackTarget()
+            for intent in try store.pending() {
+                guard let id = UUID(uuidString: intent.authority.profileID),
+                      let context = try? nativePreferenceContext(profileID: id, target: target),
+                      context.authority == intent.authority else { continue }
+                for (name, stamp) in intent.projectionStamps where legacy[name] == stamp { legacy.removeValue(forKey: name) }
+            }
+            let preserved = try store.quarantined()
+            let values = try legacy.filter { name, stamp in !preserved.contains(where: { $0.key == name && $0.stamp == stamp }) }.map { name, stamp in
+                // Property-list bytes retain the exact original defaults type (including Data).
+                // This is evidence only, never an inferred edit to the incoming native profile.
+                let raw = try UserDefaults.standard.object(forKey: name).map {
+                    try PropertyListSerialization.data(fromPropertyList: $0, format: .binary, options: 0)
+                }
+                return NativePreferenceIntentStore.QuarantinedProjection(key: name, stamp: stamp,
+                    value: raw.map { .object(["binaryPropertyList": .string($0.base64EncodedString())]) } ?? .null)
+            }
+            try store.quarantine(values)
+        } catch { nativePreferenceIntentStatus = "unavailable"; return false }
+        let key = "vortx.sync.unattributedPreferenceStamps." + (account?.id ?? "")
+        var retained = (UserDefaults.standard.dictionary(forKey: key) as? [String: Double]) ?? [:]
+        for (name, stamp) in legacy { retained[name] = stamp }
+        UserDefaults.standard.set(retained, forKey: key)
+        return true
+    }
+    private static var nativePreferenceProjectionKeys: Set<String> {
+        ProfileStore.nativePlaybackProjectionKeys.union(ProfileStore.nativeThemeProjectionKeys)
+            .union(ProfileDiscoveryPreferencesStore.activeProjectionKeys)
+    }
+    nonisolated static func nativePreferenceProjectionWillMount() -> Bool {
+        if Thread.isMainThread { return MainActor.assumeIsolated { shared.quarantineNativePreferenceStamps() } }
+        return DispatchQueue.main.sync { shared.quarantineNativePreferenceStamps() }
+    }
+    private func nativePreferenceStampIsAttributed(_ key: String) -> Bool {
+        let slot = "vortx.sync.unattributedPreferenceStamps." + (account?.id ?? "")
+        let retained = (UserDefaults.standard.dictionary(forKey: slot) as? [String: Double]) ?? [:]
+        return dirtySettings[key] == nil || retained[key] != dirtySettings[key]
+    }
+    private func nativePreferenceStore(capture: CredentialScopeRegistry.Capture) throws -> NativePreferenceIntentStore {
+        guard isSignedIn, isCurrent(capture), case .account = capture.scope,
+              let key = dataKey, key.count == 32 else { throw VortxNativeError.superseded }
+        let root = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("VortX/native-preference-intents", isDirectory: true)
+        return NativePreferenceIntentStore(directoryURL: root, key: key, namespace: capture.namespace)
+    }
+    private struct NativePreferenceContext {
+        let authority: NativePreferenceIntentStore.Authority
+        let profile: UserProfile
+        let state: VortxJSON
+        let host: VortxJSON
+    }
+    private func nativePreferenceContext(profileID: UUID, target: PlaybackMutationTarget) throws -> NativePreferenceContext {
+        guard case .native(let binding?) = target, isCurrent(binding.credential), target.stillOwnsCurrentContext(core: .shared),
+              let registry = CoreBridge.shared.nativeRegistryBinding, registry.scope.account == binding.credential.namespace,
+              let stateBytes = CoreBridge.shared.stateData("native_state"),
+              let hostBytes = CoreBridge.shared.stateData("native_host_preferences") else { throw VortxNativeError.superseded }
+        let state = try JSONDecoder().decode(VortxJSON.self, from: stateBytes)
+        let host = try JSONDecoder().decode(VortxJSON.self, from: hostBytes)
+        guard let stateAgain = CoreBridge.shared.stateData("native_state"), let hostAgain = CoreBridge.shared.stateData("native_host_preferences"),
+              state == (try? JSONDecoder().decode(VortxJSON.self, from: stateAgain)),
+              host == (try? JSONDecoder().decode(VortxJSON.self, from: hostAgain)),
+              target.stillOwnsCurrentContext(core: .shared) else { throw VortxNativeError.superseded }
+        return try Self.makeNativePreferenceContext(state: state, host: host, profileID: profileID, scope: registry.scope)
+    }
+    nonisolated private static func makeNativePreferenceContext(state: VortxJSON, host: VortxJSON, profileID: UUID,
+                                                                scope: VortxAccountScope) throws -> NativePreferenceContext {
+        guard let profile = try VortxNativeProfiles.project(state: state, host: host, baseline: []).first(where: { $0.id == profileID }),
+              host["scope"] == .string(scope.account), host["ownerProfileId"] == .string(scope.ownerProfileID) else { throw VortxNativeError.invalidSnapshot }
+        let receipt = try VortxNativeProfiles.expectedBinding(state: state, profileID: profileID)
+        let authority = NativePreferenceIntentStore.Authority(account: scope.account, ownerProfileID: scope.ownerProfileID,
+            profileID: profileID.uuidString, profileBinding: .object(["accountBinding": receipt.document,
+                "deletionClock": state["nativeSync"]?["profiles"]?[profileID.uuidString]?["fieldClocks"]?["deleted"] ?? .null]))
+        return .init(authority: authority, profile: profile, state: state, host: host)
+    }
+    nonisolated private static func nativePreferenceValue(_ profile: UserProfile, group: NativePreferenceIntentStore.Group) throws -> VortxJSON {
+        let value = try JSONDecoder().decode(VortxJSON.self, from: JSONEncoder().encode(profile))
+        switch group {
+        case .playback: return .object(["playback": value["playback"] ?? .null, "addonPreferences": value["addonPreferences"] ?? .null])
+        case .discovery: return value["discovery"] ?? .null
+        case .theme:
+            let theme = VortxJSON.object(["accentID": .string(profile.accentID), "oled": .bool(profile.oled),
+                "textScale": .number((profile.textScale * 1_000).rounded() / 1_000)])
+            // JSON has one numeric value domain; round-trip to its canonical integer/double
+            // representation before retaining an exact equality/readback witness.
+            return try JSONDecoder().decode(VortxJSON.self, from: JSONEncoder().encode(theme))
+        }
+    }
+    nonisolated private static func nativePreferenceSnapshot(_ context: NativePreferenceContext, group: NativePreferenceIntentStore.Group) throws -> NativePreferenceIntentStore.Snapshot {
+        let id = context.profile.id.uuidString
+        let revision: VortxJSON
+        switch group {
+        case .theme:
+            let clocks = context.state["nativeSync"]?["profiles"]?[id]?["fieldClocks"]
+            revision = .object(Dictionary(uniqueKeysWithValues: ["accent", "oled", "textScale"].map { ($0, clocks?[$0] ?? .null) }))
+        case .playback:
+            let fields = context.host["profiles"]?[id]?["fields"]
+            revision = .object(["playback": fields?["playback"] ?? .null, "addonPreferences": fields?["addonPreferences"] ?? .null])
+        case .discovery: revision = context.host["profiles"]?[id]?["fields"]?["discovery"] ?? .null
+        }
+        return .init(value: try nativePreferenceValue(context.profile, group: group), revision: revision)
+    }
+    /// Captured values only: the facade evaluates this after prior queued work, before committing.
+    /// It must not reach MainActor, defaults, credentials or the file system from its FIFO lock.
+    func nativePreferenceAdmission(_ intents: [NativePreferenceIntentStore.Intent], profile: UserProfile,
+                                   target: PlaybackMutationTarget) throws -> @Sendable (VortxJSON, VortxJSON) -> Bool {
+        let context = try nativePreferenceContext(profileID: profile.id, target: target)
+        let authority = context.authority
+        var expected: [NativePreferenceIntentStore.Group: NativePreferenceIntentStore.Snapshot] = [:]
+        for group in NativePreferenceIntentStore.Group.allCases {
+            let snapshot = try Self.nativePreferenceSnapshot(context, group: group)
+            let desired = try Self.nativePreferenceValue(profile, group: group)
+            if let intent = intents.first(where: { $0.group == group }) {
+                guard intent.authority == authority, intent.desired == desired,
+                      NativePreferenceIntentStore.decision(intent, current: snapshot, authority: authority) != .conflict else { throw VortxNativeError.superseded }
+            } else {
+                // A stale presentation baseline must not turn an unchanged replay group into
+                // an unguarded write of some other group's older values.
+                guard snapshot.value == desired else { throw VortxNativeError.superseded }
+            }
+            expected[group] = snapshot
+        }
+        let captured = expected
+        return { state, host in
+            guard let id = UUID(uuidString: authority.profileID),
+                  let current = try? Self.makeNativePreferenceContext(state: state, host: host, profileID: id,
+                    scope: .init(account: authority.account, ownerProfileID: authority.ownerProfileID)),
+                  current.authority == authority else { return false }
+            return NativePreferenceIntentStore.Group.allCases.allSatisfy { group in
+                guard let snapshot = try? Self.nativePreferenceSnapshot(current, group: group) else { return false }
+                if let intent = intents.first(where: { $0.group == group }) {
+                    return NativePreferenceIntentStore.decision(intent, current: snapshot, authority: authority) != .conflict
+                }
+                return snapshot == captured[group]
+            }
+        }
+    }
+    /// Unedited presentation fields are not save intent. Carry the current native values for
+    /// those groups, including absent/inherited fields, through the older profile-diff adapter.
+    func normalizedNativePreferenceSubmission(_ profile: UserProfile, intents: [NativePreferenceIntentStore.Intent],
+                                              target: PlaybackMutationTarget) throws -> UserProfile {
+        let current = try nativePreferenceContext(profileID: profile.id, target: target).profile
+        var submitted = profile
+        let groups = Set(intents.map(\.group))
+        if !groups.contains(.playback) { submitted.playback = current.playback; submitted.addonPreferences = current.addonPreferences }
+        if !groups.contains(.discovery) { submitted.discovery = current.discovery }
+        if !groups.contains(.theme) { submitted.accentID = current.accentID; submitted.oled = current.oled; submitted.textScale = current.textScale }
+        return submitted
+    }
+    /// A current-value revert needs positive same-installation local edit evidence. Merely
+    /// mounting defaults after a restart, or submitting another group, must not cancel a journal.
+    func nativePreferenceIsLocalRevert(_ profile: UserProfile, group: NativePreferenceIntentStore.Group,
+                                      target: PlaybackMutationTarget) -> Bool {
+        guard let admitted = nativePreferenceLocalAdmissions[profile.id]?[group], admitted.target == target,
+              ProfileStore.shared.nativePreferenceProjectionMatches(target),
+              case .native(let binding?) = target,
+              let context = try? nativePreferenceContext(profileID: profile.id, target: target),
+              context.authority == admitted.intent.authority,
+              let desired = try? Self.nativePreferenceValue(profile, group: group), desired != admitted.intent.desired,
+              desired == (try? Self.nativePreferenceValue(context.profile, group: group)),
+              let store = try? nativePreferenceStore(capture: binding.credential),
+              let pending = try? store.pending() else { return false }
+        return pending.contains { $0.id == admitted.intent.id && $0.authority == context.authority }
+    }
+    /// Persist while the original authenticated target is still known, before queuing its save.
+    /// An explicit group comes only from its own local capture path; ordinary profile submissions
+    /// are diffed against the published profile, never against newer, unpublished native fields.
+    func prepareNativePreferenceIntents(_ profile: UserProfile, target: PlaybackMutationTarget,
+                                        editedGroups: Set<NativePreferenceIntentStore.Group>? = nil,
+                                        baseline: UserProfile? = nil) throws -> [NativePreferenceIntentStore.Intent] {
+        guard case .native(let binding?) = target else { throw VortxNativeError.superseded }
+        let context = try nativePreferenceContext(profileID: profile.id, target: target)
+        guard let published = baseline ?? ProfileStore.shared.profiles.first(where: { $0.id == profile.id }),
+              published.id == profile.id else { throw VortxNativeError.superseded }
+        let store = try nativePreferenceStore(capture: binding.credential)
+        let pending = try store.pending()
+        let pendingIDs = Set(pending.map(\.id))
+        nativePreferenceLocalAdmissions = nativePreferenceLocalAdmissions.mapValues {
+            $0.filter { $0.value.target == target && pendingIDs.contains($0.value.intent.id) }
+        }.filter { !$0.value.isEmpty }
+        let canAttributeFlat = binding.profileID == profile.id && ProfileStore.shared.nativePreferenceProjectionMatches(target)
+        if canAttributeFlat, !isApplyingRemote { _ = noteLocalSettingsChange() }
+        var result: [NativePreferenceIntentStore.Intent] = []
+        var conflicted = false
+        for group in NativePreferenceIntentStore.Group.allCases {
+            let base = try Self.nativePreferenceSnapshot(context, group: group)
+            let desired = try Self.nativePreferenceValue(profile, group: group)
+            let presented = try Self.nativePreferenceValue(published, group: group)
+            guard editedGroups?.contains(group) ?? (desired != presented) else { continue }
+            // Preserve a stale edited draft without rebasing it onto a peer's newer choice.
+            // Its actual authenticated current snapshot remains the base; the conflict flag
+            // prevents replay unless that exact desired value is subsequently represented.
+            let requiresResolution = base.value != presented && base.value != desired
+            let keys: Set<String>
+            switch group {
+            case .playback: keys = ProfileStore.nativePlaybackProjectionKeys
+            case .discovery: keys = ProfileDiscoveryPreferencesStore.activeProjectionKeys
+            case .theme: keys = ProfileStore.nativeThemeProjectionKeys
+            }
+            let stamps = canAttributeFlat ? dirtySettings.filter { keys.contains($0.key) && nativePreferenceStampIsAttributed($0.key) } : [:]
+            let intent = try store.prepare(authority: context.authority, group: group, base: base, desired: desired,
+                                           projectionStamps: stamps, requiresResolution: requiresResolution)
+            nativePreferenceLocalAdmissions[profile.id, default: [:]][group] = .init(target: target, intent: intent)
+            conflicted = conflicted || NativePreferenceIntentStore.decision(intent, current: base, authority: context.authority) == .conflict
+            result.append(intent)
+        }
+        if !result.isEmpty {
+            nativePreferenceIntentStatus = "pending"
+            // A failed/conflicted existing intent remains visible, but must not re-arm the
+            // transport generation forever while an unrelated native carrier is accepted.
+            if result.contains(where: { intent in !pending.contains(where: { $0.id == intent.id }) }) { requestSyncSoon() }
+        }
+        if conflicted { nativePreferenceIntentStatus = "conflict"; throw VortxNativeError.superseded }
+        return result
+    }
+    func finishNativePreferenceIntents(_ intents: [NativePreferenceIntentStore.Intent], target: PlaybackMutationTarget) throws {
+        guard !intents.isEmpty else { return }
+        guard case .native(let binding?) = target else { throw VortxNativeError.superseded }
+        let store = try nativePreferenceStore(capture: binding.credential)
+        for intent in intents {
+            guard let id = UUID(uuidString: intent.authority.profileID) else { throw VortxNativeError.invalidSnapshot }
+            let context = try nativePreferenceContext(profileID: id, target: target)
+            guard context.authority == intent.authority else { throw VortxNativeError.superseded }
+            guard try store.recordCommitted(intent, current: Self.nativePreferenceSnapshot(context, group: intent.group)) else {
+                nativePreferenceIntentStatus = "pending"; throw VortxNativeError.superseded
+            }
+        }
+        nativePreferenceIntentStatus = try store.pending().isEmpty ? "idle" : "pending"
+    }
+    private func pendingNativePreferenceReceipts(capture: CredentialScopeRegistry.Capture) -> [NativePreferenceIntentStore.Intent] {
+        do { return try nativePreferenceStore(capture: capture).pending() }
+        catch { nativePreferenceIntentStatus = "unavailable"; return [] }
+    }
+    private func acknowledgeNativePreferenceCloud(_ sentDocument: [String: Any], receipts: [NativePreferenceIntentStore.Intent],
+                                                 capture: CredentialScopeRegistry.Capture) {
+        guard !receipts.isEmpty, isCurrent(capture) else { return }
+        do {
+            let document = try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: sentDocument))
+            guard let native = document["nativeSync"], let host = document["nativeHostPreferences"],
+                  case .object(let records) = native["profiles"] else { throw VortxNativeError.invalidSnapshot }
+            let profiles = records.compactMapValues { $0["profile"] }
+            let state = VortxJSON.object(["nativeSync": native, "roster": .object(["profiles": .object(profiles)])])
+            let store = try nativePreferenceStore(capture: capture)
+            for sent in receipts {
+                guard isCurrent(capture), let id = UUID(uuidString: sent.authority.profileID),
+                      let context = try? Self.makeNativePreferenceContext(state: state, host: host, profileID: id,
+                        scope: .init(account: capture.namespace, ownerProfileID: sent.authority.ownerProfileID)),
+                      context.authority == sent.authority,
+                      let current = try? nativePreferenceContext(profileID: id, target: CoreBridge.shared.captureNativePlaybackTarget()),
+                      current.authority == sent.authority else { continue }
+                let exported = try Self.nativePreferenceSnapshot(context, group: sent.group)
+                // Validate the immutable receipt before clearing any stamp. Keep that witness
+                // durable until after defaults are cleared: either crash ordering is retryable.
+                guard try store.authorizesAcknowledgement(sent, current: exported) else { continue }
+                withRemoteApplySuppressed {
+                    var dirty = dirtySettings
+                    SettingsDirtyKeys.clearPushed(sent.projectionStamps, from: &dirty)
+                    dirtySettings = dirty
+                }
+                _ = try store.acknowledge(sent, current: exported)
+            }
+            nativePreferenceIntentStatus = try store.pending().isEmpty ? "idle" : "pending"
+        } catch { nativePreferenceIntentStatus = "unavailable" }
+    }
+    /// A failed save replays only after the peer carrier has merged. A changed group revision is
+    /// a conflict, not permission to manufacture a newer local clock over the peer's choice.
+    private func replayNativePreferenceIntents(capture: CredentialScopeRegistry.Capture) async -> Bool {
+        guard isCurrent(capture) else { return false }
+        do {
+            let store = try nativePreferenceStore(capture: capture)
+            var changed = false, conflict = false
+            for intent in try store.pending() {
+                let target = CoreBridge.shared.captureNativePlaybackTarget()
+                guard isCurrent(capture), case .native(let binding?) = target, binding.credential == capture,
+                      let id = UUID(uuidString: intent.authority.profileID) else { throw VortxNativeError.superseded }
+                let context: NativePreferenceContext
+                do { context = try nativePreferenceContext(profileID: id, target: target) }
+                catch { conflict = true; continue }
+                let current = try Self.nativePreferenceSnapshot(context, group: intent.group)
+                switch NativePreferenceIntentStore.decision(intent, current: current, authority: context.authority) {
+                case .conflict: conflict = true; continue
+                case .alreadyApplied: try finishNativePreferenceIntents([intent], target: target)
+                case .apply:
+                    var profile = context.profile
+                    switch intent.group {
+                    case .playback:
+                        profile.playback = intent.desired["playback"] == .null ? nil : try intent.desired["playback"]?.decode(UserProfile.PlaybackPrefs.self)
+                        profile.addonPreferences = intent.desired["addonPreferences"] == .null ? nil : try intent.desired["addonPreferences"]?.decode(ProfileAddonPreferences.self)
+                    case .discovery: profile.discovery = intent.desired == .null ? nil : try intent.desired.decode(ProfileDiscoveryPreferences.self)
+                    case .theme:
+                        profile.accentID = try intent.desired["accentID"]!.decode(String.self)
+                        profile.oled = try intent.desired["oled"]!.decode(Bool.self)
+                        profile.textScale = try intent.desired["textScale"]!.decode(Double.self)
+                    }
+                    guard await ProfileStore.shared.saveNative(profile, creating: false, target: target, preferenceIntents: [intent]),
+                          isCurrent(capture) else { nativePreferenceIntentStatus = "pending"; return changed }
+                    changed = true
+                }
+            }
+            nativePreferenceIntentStatus = conflict ? "conflict" : (try store.pending().isEmpty ? "idle" : "pending")
+            return changed
+        } catch { nativePreferenceIntentStatus = "unavailable"; return false }
+    }
+    private func nativePreferenceIntentsNeedReplay() -> Bool {
+        do {
+            let pending = try !nativePreferenceStore(capture: credentialAuthority.capture()).pending().isEmpty
+            if pending { nativePreferenceIntentStatus = "pending" }
+            return pending
+        } catch { nativePreferenceIntentStatus = "unavailable"; return false }
+    }
     private func nativeProviderState(capture: CredentialScopeRegistry.Capture) throws -> VortxNativeProviderCredentials {
         guard isCurrent(capture) else { throw VortxNativeError.superseded }
         let bytes: Data?
@@ -430,7 +767,10 @@ final class VortXSyncManager: ObservableObject {
             if !SettingsBackup.isSyncable(key) || ["stremiox.profiles.active", "stremiox.activeProfileId"].contains(key) { continue }
             if ProfileStore.nativePlaybackProjectionKeys.contains(key) || ProfileStore.nativeThemeProjectionKeys.contains(key)
                 || ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key) {
-                guard ProfileStore.shared.nativePreferenceIsAcknowledged(key) else { throw VortxNativeError.invalidSnapshot }
+                // A queued/failed profile preference is not a global edit. Keep its dirty stamp
+                // until the profile transaction commits, but do not hold unrelated durable
+                // Watchlist/history/library changes behind that presentation projection.
+                if !nativePreferenceStampIsAttributed(key) || !ProfileStore.shared.nativePreferenceIsAcknowledged(key) { unsupported.append(key) }
                 continue
             }
             guard VortxNativeHostPreferences.knownGlobals.contains(key) else {
@@ -478,7 +818,7 @@ final class VortXSyncManager: ObservableObject {
         VortxNativeSyncExportPolicy.acknowledgesSetting(key, syncable: SettingsBackup.isSyncable(key),
             profileProjection: ProfileStore.nativePlaybackProjectionKeys.contains(key) || ProfileStore.nativeThemeProjectionKeys.contains(key)
                 || ProfileDiscoveryPreferencesStore.activeProjectionKeys.contains(key),
-            projectionAcknowledged: ProfileStore.shared.nativePreferenceIsAcknowledged(key))
+            projectionAcknowledged: nativePreferenceStampIsAttributed(key) && ProfileStore.shared.nativePreferenceIsAcknowledged(key))
     }
     private func applyNativeGlobals(_ host: VortxJSON) {
         guard case .object(let fields) = host["globals"]?["fields"] else { return }
@@ -1329,7 +1669,7 @@ final class VortXSyncManager: ObservableObject {
     /// it coalesces with any other pending change. No-op when there is nothing unpushed.
     private func flushDirtySettingsIfNeeded() {
 #if VORTX_NATIVE_DATA_ENGINE
-        guard isSignedIn, hasPendingPush || !dirtySettings.isEmpty || pendingAddonOrderIntent != nil else { return }
+        guard isSignedIn, hasPendingPush || !dirtySettings.isEmpty || pendingAddonOrderIntent != nil || nativePreferenceIntentsNeedReplay() else { return }
 #else
         guard isSignedIn, !dirtySettings.isEmpty || pendingAddonOrderIntent != nil else { return }
 #endif
@@ -2979,9 +3319,6 @@ final class VortXSyncManager: ObservableObject {
         guard isSignedIn, isCurrent(capture) else { return false }
 #if VORTX_NATIVE_DATA_ENGINE
         guard await settleNativeProviderJournal(capture: capture), isCurrent(capture) else { return false }
-        guard VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: (try? nativeGlobalEdits()) == nil,
-                                                                hasLegacyAddonOrderIntent: pendingAddonOrderIntent != nil,
-                                                                overridingLegacySource: afterUserChoseThisDevice) else { return false }
 #endif
         guard !hasPendingAccountDocApply(for: capture) else {
             NSLog("[sync] push refused: a remote credential apply is pending certification")
@@ -3023,6 +3360,15 @@ final class VortXSyncManager: ObservableObject {
         let operationID = UUID()
         activeSyncUp = (operationID, capture)
         defer { if activeSyncUp?.id == operationID { activeSyncUp = nil } }
+#if VORTX_NATIVE_DATA_ENGINE
+        // An already-restored account may have lost its resident native session. A queued
+        // upload must repair that binding itself: ordinary pulls defer to this pending push.
+        guard await ensureNativeCheckpoint(credentialCapture: capture), isCurrent(capture) else { return false }
+        guard isCurrent(capture),
+              VortxNativeSyncExportPolicy.permitsStateOnlyExport(hasDirtySettings: (try? nativeGlobalEdits()) == nil,
+                                                                hasLegacyAddonOrderIntent: pendingAddonOrderIntent != nil,
+                                                                overridingLegacySource: afterUserChoseThisDevice) else { return false }
+#endif
         let dirtyAtPushStart = dirtySettings
         let orderIntent = pendingAddonOrderIntent
         // Build the merged doc from the current account base, then push with optimistic-concurrency
@@ -3033,12 +3379,14 @@ final class VortXSyncManager: ObservableObject {
               let initial = await mergeLocalIntoDoc(orderIntent: orderIntent, credentialCapture: capture),
               isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
 #if VORTX_NATIVE_DATA_ENGINE
+        let preferenceReceipts = pendingNativePreferenceReceipts(capture: capture)
         if nativePreparedSeedCapture == capture {
             // Deployed worker: version zero INSERT succeeds only while no row exists. Never
             // escalate a rejected/unknown first insert to an epoch version over a peer's seed.
             switch await pushSyncDocAt(initial.document, version: 0, credentialCapture: capture) {
             case .accepted:
                 guard isCurrent(capture) else { return false }
+                acknowledgeNativePreferenceCloud(initial.document, receipts: preferenceReceipts, capture: capture)
                 clearPushedDirtySettings(dirtyAtPushStart); return true
             case .rejected, .error:
                 guard isCurrent(capture) else { return false }
@@ -3049,6 +3397,9 @@ final class VortXSyncManager: ObservableObject {
 #endif
         let pushed = await pushDerivedDoc(initial, credentialCapture: capture, onAccepted: { [weak self] sentDoc in
             guard let self, self.isCurrent(capture), let id = self.account?.id else { return }
+#if VORTX_NATIVE_DATA_ENGINE
+            self.acknowledgeNativePreferenceCloud(sentDoc, receipts: preferenceReceipts, capture: capture)
+#endif
             self.withRemoteApplySuppressed {
                 if AddonOrderSyncPolicy.acknowledges(self.pendingAddonOrderIntent, sent: orderIntent, accountID: id) {
                     self.pendingAddonOrderIntent = nil
@@ -3111,10 +3462,21 @@ final class VortXSyncManager: ObservableObject {
             guard isCurrent(capture) else { return nil }
             let remote = try doc["nativeSync"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
             let hostRemote = try doc["nativeHostPreferences"].map { try JSONDecoder().decode(VortxJSON.self, from: JSONSerialization.data(withJSONObject: $0)) }
-            let merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture,
+            var merged = try await CoreBridge.shared.mergeNativeAccountDocument(remote, hostRemote: hostRemote, capture: capture,
                                                                                legacyMaterial: prepared.material, hostEdits: nativeGlobalEdits(), websiteEvents: Self.nativeWebsiteEvents(doc), websiteAddonEvents: Self.nativeWebsiteAddonEvents(doc), legacyWatchlists: self.nativeLegacyWatchlists(doc),
                                                                                sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
             guard isCurrent(capture) else { return nil }
+            let replayed = await replayNativePreferenceIntents(capture: capture)
+            // Only still-owned warm projections are eligible; unknown cold stamps stay quarantined.
+            _ = await ProfileStore.shared.retryNativePreferenceProjection(keys: Set(dirtySettings.keys.filter { nativePreferenceStampIsAttributed($0) }))
+            guard isCurrent(capture) else { return nil }
+            // Export the acknowledged state after replay, never the pre-replay merge snapshot.
+            if replayed || !dirtySettings.isEmpty {
+                merged = try await CoreBridge.shared.mergeNativeAccountDocument(nil, hostRemote: nil, capture: capture,
+                    legacyMaterial: prepared.material, hostEdits: nativeGlobalEdits(), websiteEvents: [], websiteAddonEvents: [],
+                    legacyWatchlists: [:], sourceAuthority: prepared.authority, authenticatedSourceArchive: prepared.sourceArchive)
+                guard isCurrent(capture) else { return nil }
+            }
             doc["nativeSync"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["nativeSync"]!))
             doc["nativeHostPreferences"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["nativeHostPreferences"]!))
             doc["profileEditResults"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(merged["profileEditResults"]!))
