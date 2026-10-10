@@ -342,7 +342,7 @@ class VortXSessionOwnerTransitionContractTest {
         assertTrue(matching.contains("sessionState.ownerEpoch == lease.ownerEpoch"))
         assertTrue(matching.contains("current.account.id == lease.accountId"))
         assertTrue(matching.contains("current.token == lease.token"))
-        assertFalse(matching.contains("dataKey"))
+        assertTrue(matching.contains("lease.matchesDataKey(current.dataKey)"))
         assertTrue(mergeLocal.contains("publishIfSyncLeaseCurrent(lease)"))
         assertTrue(syncDown.contains("publishIfSyncLeaseCurrent(lease)"))
         assertTrue(syncDown.contains("advanceVersion(lease, version)"))

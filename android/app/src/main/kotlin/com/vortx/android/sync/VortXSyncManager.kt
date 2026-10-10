@@ -463,6 +463,9 @@ internal class SyncSessionLease(
     private val immutableDataKey = dataKey.copyOf()
 
     fun dataKeyCopy(): ByteArray = immutableDataKey.copyOf()
+
+    fun matchesDataKey(candidate: ByteArray): Boolean =
+        java.security.MessageDigest.isEqual(immutableDataKey, candidate)
 }
 
 internal fun sessionTruthMatches(
@@ -1235,7 +1238,8 @@ class VortXSyncManager internal constructor(context: Context, private val scope:
         val current = sessionState.value ?: return false
         return sessionState.ownerEpoch == lease.ownerEpoch &&
             current.account.id == lease.accountId &&
-            current.token == lease.token
+            current.token == lease.token &&
+            lease.matchesDataKey(current.dataKey)
     }
 
     /**
