@@ -49,13 +49,13 @@ private final class LocalCinematicFixtureServer {
     private let countURL: URL
     private var serverURL: URL?
 
-    init(fixture: Data, fixtureNames: [String]) throws {
+    init(fixtures: [String: Data]) throws {
         let base = FileManager.default.temporaryDirectory
             .appendingPathComponent("vortx-cinematic-backdrop-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         directory = base
         countURL = base.appendingPathComponent("requests.txt")
-        for name in fixtureNames {
+        for (name, fixture) in fixtures {
             try fixture.write(to: base.appendingPathComponent(name), options: .atomic)
         }
     }
@@ -107,9 +107,13 @@ private final class LocalCinematicFixtureServer {
     }
 }
 
-private func oversizedFixture() -> Data {
-    let width = 4_096
-    let height = 3_072
+private func imageFixture(
+    width: Int,
+    height: Int,
+    red: CGFloat,
+    green: CGFloat,
+    blue: CGFloat
+) -> Data {
     guard let context = CGContext(
         data: nil,
         width: width,
@@ -121,7 +125,7 @@ private func oversizedFixture() -> Data {
     ) else {
         fatalError("could not create oversized fixture image")
     }
-    context.setFillColor(CGColor(red: 0.18, green: 0.34, blue: 0.62, alpha: 1))
+    context.setFillColor(CGColor(red: red, green: green, blue: blue, alpha: 1))
     context.fill(CGRect(x: 0, y: 0, width: width, height: height))
     guard let image = context.makeImage() else {
         fatalError("could not snapshot oversized fixture image")
@@ -137,6 +141,22 @@ private func oversizedFixture() -> Data {
     return data as Data
 }
 
+private func oversizedFixture() -> Data {
+    imageFixture(width: 4_096, height: 3_072, red: 0.18, green: 0.34, blue: 0.62)
+}
+
+private func kenBurnsBackdropFixture() -> Data {
+    imageFixture(width: 4_096, height: 2_048, red: 0.75, green: 0.12, blue: 0.10)
+}
+
+private func kenBurnsReplacementFixture() -> Data {
+    imageFixture(width: 3_000, height: 1_000, red: 0.10, green: 0.58, blue: 0.22)
+}
+
+private func kenBurnsPosterFixture() -> Data {
+    imageFixture(width: 1_600, height: 900, red: 0.12, green: 0.22, blue: 0.76)
+}
+
 private func decodedPixelSize(_ image: VXPosterImage) -> (width: Int, height: Int)? {
     #if canImport(UIKit)
     guard let cg = image.cgImage else { return nil }
@@ -146,17 +166,44 @@ private func decodedPixelSize(_ image: VXPosterImage) -> (width: Int, height: In
     return (cg.width, cg.height)
 }
 
-/// Mirrors the production KenBurnsLoader order while exercising the real shared loader. A missing/slow
-/// backdrop must not prevent a usable poster fallback, and every request remains bounded/cached by production.
-private func productionStyleBestArt(
+private func layerImage(_ layer: CALayer) -> CGImage? {
+    guard let contents = layer.contents else { return nil }
+    let object = contents as AnyObject
+    guard CFGetTypeID(object) == CGImage.typeID else { return nil }
+    return unsafeBitCast(object, to: CGImage.self)
+}
+
+/// Wait for the real production KenBurnsLoader to paint a decoded image onto its CALayer.
+@MainActor
+private func waitForLayerContents(_ layer: CALayer, timeout: TimeInterval = 3) async -> CGImage? {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let image = layerImage(layer) {
+            return image
+        }
+        try? await Task.sleep(for: .milliseconds(20))
+    }
+    return layerImage(layer)
+}
+
+/// Exercise the production coordinator rather than copying its backdrop→poster algorithm into the test.
+@MainActor
+private func loadHeroArt(
     backdrop: URL,
     poster: URL,
     maxPixel: CGFloat
-) async -> VXPosterImage? {
-    if let image = await PosterImageLoader.load(backdrop.absoluteString, maxPixel: maxPixel) {
-        return image
-    }
-    return await PosterImageLoader.load(poster.absoluteString, maxPixel: maxPixel)
+) async -> CGImage? {
+    let layer = CALayer()
+    let loader = KenBurnsLoader()
+    loader.load(
+        backdrop: backdrop.absoluteString,
+        poster: poster.absoluteString,
+        maxPixel: Int(maxPixel),
+        into: layer
+    )
+    let image = await waitForLayerContents(layer)
+    loader.cancel()
+    return image
 }
 
 @MainActor
@@ -226,8 +273,12 @@ private enum CinematicBackdropImageTests {
                   && featured.contains("await PosterImageLoader.load(backdrop,"),
               failures: &failures)
         check("featured hero rejects an obsolete completion before layer paint",
-              featured.contains("self?.requestID == requestID")
+              featured.contains("self.requestID == requestID")
                   && featured.contains("task?.cancel()"),
+              failures: &failures)
+        check("featured hero isolates mutable coordinator state on MainActor",
+              featured.contains("@MainActor\nfinal class KenBurnsLoader")
+                  && featured.contains("task = Task.detached"),
               failures: &failures)
         check("featured hero keeps Reduce Motion and title action surfaces",
               featured.contains("reduceMotion")
@@ -235,16 +286,23 @@ private enum CinematicBackdropImageTests {
                   && featured.contains("content(hero)"),
               failures: &failures)
 
-        let fixtureNames = [
-            "oversized.png",
-            "warm-poster.png",
-            "slow-backdrop.png",
-            "fast-poster.png",
-            "slow-stale.png",
-        ] + (0..<5).map { "rotation-poster-\($0).png" }
+        var fixtures: [String: Data] = [
+            "oversized.png": oversizedFixture(),
+            "warm-poster.png": oversizedFixture(),
+            "slow-backdrop.png": oversizedFixture(),
+            "fast-poster.png": oversizedFixture(),
+            "slow-stale.png": oversizedFixture(),
+            "slow-title-a-backdrop.png": kenBurnsBackdropFixture(),
+            "title-b-backdrop.png": kenBurnsReplacementFixture(),
+            "title-a-poster.png": kenBurnsPosterFixture(),
+            "title-b-poster.png": kenBurnsPosterFixture(),
+            "priority-poster.png": kenBurnsPosterFixture(),
+        ]
+        for index in 0..<5 {
+            fixtures["rotation-poster-\(index).png"] = oversizedFixture()
+        }
         guard let fixtureServer = try? LocalCinematicFixtureServer(
-            fixture: oversizedFixture(),
-            fixtureNames: fixtureNames
+            fixtures: fixtures
         ), (try? fixtureServer.start()) != nil else {
             check("local oversized ImageIO fixture server starts", false, failures: &failures)
             print("\(failures) FAILED")
@@ -302,7 +360,7 @@ private enum CinematicBackdropImageTests {
 
         let failedBackdropURL = fixtureServer.url("missing-backdrop.png")
         let fastPosterURL = fixtureServer.url("fast-poster.png")
-        let fallbackImage = await productionStyleBestArt(
+        let fallbackImage = await loadHeroArt(
             backdrop: failedBackdropURL,
             poster: fastPosterURL,
             maxPixel: boundedPixel
@@ -318,7 +376,7 @@ private enum CinematicBackdropImageTests {
             fixtureServer.requestCount(for: "fast-poster.png") == 1,
             failures: &failures
         )
-        _ = await productionStyleBestArt(
+        _ = await loadHeroArt(
             backdrop: failedBackdropURL,
             poster: fastPosterURL,
             maxPixel: boundedPixel
@@ -332,7 +390,7 @@ private enum CinematicBackdropImageTests {
         for index in 0..<5 {
             let rotationBackdropURL = fixtureServer.url("missing-rotation-backdrop-\(index).png")
             let rotationPosterURL = fixtureServer.url("rotation-poster-\(index).png")
-            let rotationImage = await productionStyleBestArt(
+            let rotationImage = await loadHeroArt(
                 backdrop: rotationBackdropURL,
                 poster: rotationPosterURL,
                 maxPixel: boundedPixel
@@ -349,6 +407,57 @@ private enum CinematicBackdropImageTests {
                 failures: &failures
             )
         }
+
+        let priorityImage = await loadHeroArt(
+            backdrop: fixtureServer.url("missing-priority-backdrop.png"),
+            poster: fixtureServer.url("priority-poster.png"),
+            maxPixel: boundedPixel
+        )
+        check(
+            "real KenBurnsLoader falls through a failed backdrop to its poster",
+            priorityImage.map { max($0.width, $0.height) <= Int(boundedPixel) } ?? false,
+            failures: &failures
+        )
+        check(
+            "real KenBurnsLoader requests the failed backdrop once",
+            fixtureServer.requestCount(for: "missing-priority-backdrop.png") == 1,
+            failures: &failures
+        )
+        check(
+            "real KenBurnsLoader requests the fallback poster once",
+            fixtureServer.requestCount(for: "priority-poster.png") == 1,
+            failures: &failures
+        )
+
+        let rotatingLayer = CALayer()
+        let rotatingLoader = KenBurnsLoader()
+        rotatingLoader.load(
+            backdrop: fixtureServer.url("slow-title-a-backdrop.png").absoluteString,
+            poster: fixtureServer.url("title-a-poster.png").absoluteString,
+            maxPixel: Int(boundedPixel),
+            into: rotatingLayer
+        )
+        try? await Task.sleep(for: .milliseconds(50))
+        rotatingLoader.load(
+            backdrop: fixtureServer.url("title-b-backdrop.png").absoluteString,
+            poster: fixtureServer.url("title-b-poster.png").absoluteString,
+            maxPixel: Int(boundedPixel),
+            into: rotatingLayer
+        )
+        let replacementImage = await waitForLayerContents(rotatingLayer)
+        check(
+            "real KenBurnsLoader paints the replacement title after rotation",
+            replacementImage?.width == 1_280 && replacementImage?.height == 427,
+            failures: &failures
+        )
+        try? await Task.sleep(for: .milliseconds(500))
+        let finalImage = layerImage(rotatingLayer)
+        check(
+            "late old-title completion cannot overwrite the replacement layer",
+            finalImage?.width == 1_280 && finalImage?.height == 427,
+            failures: &failures
+        )
+        rotatingLoader.cancel()
 
         let staleURL = fixtureServer.url("slow-stale.png")
         let staleTask = Task {

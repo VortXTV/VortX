@@ -10,11 +10,25 @@ xcrun swiftc -frontend -parse app/SourcesiOS/FeaturedHeroView.swift
 build_dir="$(mktemp -d "${TMPDIR:-/tmp}/vortx-cinematic-backdrop.XXXXXX")"
 trap 'rm -rf "$build_dir"' EXIT
 
+kenburns_source="$build_dir/FeaturedHeroKenBurnsLoader.swift"
+{
+  print -r -- 'import Foundation'
+  print -r -- 'import QuartzCore'
+  print -r -- '#if canImport(AppKit)'
+  print -r -- 'import AppKit'
+  print -r -- '#elseif canImport(UIKit)'
+  print -r -- 'import UIKit'
+  print -r -- '#endif'
+  sed -n '/^\/\/ MARK: - Testable Ken Burns artwork loader$/,/^\/\/ The layer-hosting view:/ { /^\/\/ The layer-hosting view:/!p; }' \
+    app/SourcesiOS/FeaturedHeroView.swift
+} > "$kenburns_source"
+
 xcrun swiftc -parse-as-library -warnings-as-errors \
+  "$kenburns_source" \
   app/SourcesShared/PosterImageLoader.swift \
   app/SourcesShared/HeroArtworkQualityPolicy.swift \
   app/Tests/CinematicBackdropImageTests.swift \
-  -framework SwiftUI -framework AppKit -framework ImageIO -framework CoreGraphics \
+  -framework SwiftUI -framework AppKit -framework QuartzCore -framework ImageIO -framework CoreGraphics \
   -o "$build_dir/cinematic-backdrop-tests"
 "$build_dir/cinematic-backdrop-tests"
 

@@ -647,48 +647,59 @@ private enum KenBurnsPan {
     }
 }
 
-/// Loads the hero art off-main and sets it on the pan layer's `contents`, preferring the 16:9 backdrop and
-/// falling back to the poster (the same order the old poster-behind-backdrop stack showed). Owned by the
-/// representable's coordinator so a host torn down mid-load (the per-title rotation) cancels cleanly.
-private final class KenBurnsLoader {
+// MARK: - Testable Ken Burns artwork loader
+
+/// Owns the mutable representable lifecycle on the main actor while the artwork fetch/decode runs detached
+/// from that actor. It prefers the 16:9 backdrop and falls back to the poster (the same order the old
+/// poster-behind-backdrop stack showed). A host torn down mid-load (the per-title rotation) cancels cleanly.
+@MainActor
+final class KenBurnsLoader {
     private var task: Task<Void, Never>?
     private var requestID = ""
+    private weak var targetLayer: CALayer?
 
     func load(backdrop: String?, poster: String?, maxPixel: Int, into layer: CALayer) {
         let backdropURL = HeroArtworkQualityPolicy.preferredURL(backdrop, maxPixel: maxPixel)
         let requestID = "\(backdropURL ?? poster ?? "")#\(maxPixel)"
         guard self.requestID != requestID else { return }
         self.requestID = requestID
+        targetLayer = layer
         task?.cancel()
-        task = Task { [weak self, weak layer] in
+        // A MainActor coordinator must not inherit its actor for the ImageIO work. The detached task only
+        // returns the decoded CGImage; all mutable request/layer state is checked and painted on MainActor.
+        task = Task.detached { [weak self] in
             let cg = await Self.bestArt(backdrop: backdropURL, poster: poster, maxPixel: maxPixel)
-            guard let cg, !Task.isCancelled, self?.requestID == requestID else { return }
+            guard let cg, !Task.isCancelled else { return }
             let width = cg.width, height = cg.height
-            await MainActor.run { [weak self, weak layer] in
-                // The representable coordinator is reused across SwiftUI updates. Recheck both cancellation
-                // and the request identity on the main-actor paint hop so an older title cannot land after a
-                // rotation, even if its ImageIO task completed just as cancellation arrived.
-                guard !Task.isCancelled, self?.requestID == requestID, let layer else { return }
-                CATransaction.begin(); CATransaction.setDisableActions(true)
-                layer.contents = cg
-                CATransaction.commit()
-            }
+            let painted = await self?.paint(cg, requestID: requestID) ?? false
             // Note that the art actually reached the layer, so a low-CPU reading is a real hero and not a
             // blank band. Logged OFF the main thread, after the contents hop returns: logging on the render
             // path would re-add the very main-thread cost #178 removes. Dimensions only, no URLs or PII.
-            Self.recordProof(width: width, height: height)
+            if painted { Self.recordProof(width: width, height: height) }
         }
     }
 
     func cancel() { task?.cancel(); task = nil }
     deinit { task?.cancel() }
 
+    /// The only layer mutation point. CALayer never crosses the detached task boundary; this MainActor method
+    /// rechecks cancellation and request identity immediately before painting the current title.
+    private func paint(_ image: CGImage, requestID: String) -> Bool {
+        // The representable coordinator is reused across SwiftUI updates. Recheck both cancellation and the
+        // request identity on the main actor so an older title cannot land after a rotation.
+        guard !Task.isCancelled, self.requestID == requestID, let layer = targetLayer else { return false }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        layer.contents = image
+        CATransaction.commit()
+        return true
+    }
+
     /// Note one hero paint: the backdrop art reached the layer at these pixel dimensions. Off-main, log only.
-    private static func recordProof(width: Int, height: Int) {
+    nonisolated private static func recordProof(width: Int, height: Int) {
         NSLog("[kenburns] contents set %dx%d", width, height)
     }
 
-    private static func bestArt(backdrop: String?, poster: String?, maxPixel: Int) async -> CGImage? {
+    nonisolated private static func bestArt(backdrop: String?, poster: String?, maxPixel: Int) async -> CGImage? {
         if let img = await PosterImageLoader.load(backdrop, maxPixel: CGFloat(maxPixel)),
            let cg = img.kenBurnsCGImage { return cg }
         if let img = await PosterImageLoader.load(
