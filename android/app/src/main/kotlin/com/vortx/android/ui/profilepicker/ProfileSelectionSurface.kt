@@ -35,6 +35,26 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.UUID
 
+internal enum class ProfileSelectionOrigin { PICKER, PROFILE_MANAGEMENT }
+
+/** Navigation belongs to the invoking surface; account ownership remains in the request. */
+internal class ProfileSelectionPresentation(
+    val request: ProfileSelectionRequest,
+    val origin: ProfileSelectionOrigin,
+)
+
+/** The actual completion callback used by the surface, including its final ownership admission. */
+internal fun completeProfileSelectionPresentation(
+    presentation: ProfileSelectionPresentation,
+    handoff: ProfileSelectionHandoff,
+    onComplete: () -> Unit,
+    onReturnToProfiles: () -> Unit,
+) {
+    if (handoff.state.value != ProfileSelectionHandoff.State.COMPLETE || !handoff.complete(presentation.request)) return
+    onComplete()
+    if (presentation.origin == ProfileSelectionOrigin.PROFILE_MANAGEMENT) onReturnToProfiles()
+}
+
 /** Opaque account handoff surface; Back always returns to the PIN-owning picker. */
 @Composable
 internal fun ProfileSelectionSurface(
@@ -42,9 +62,12 @@ internal fun ProfileSelectionSurface(
     handoff: ProfileSelectionHandoff,
     onComplete: () -> Unit,
     onChooseAgain: () -> Unit,
+    origin: ProfileSelectionOrigin = ProfileSelectionOrigin.PICKER,
+    onReturnToProfiles: () -> Unit = {},
 ) {
     val state by handoff.state.collectAsStateWithLifecycle()
     val route = remember(request) { UUID.randomUUID().toString() }
+    val presentation = remember(request, origin) { ProfileSelectionPresentation(request, origin) }
     val owner = rememberReplacingViewModelStoreOwner(route)
     val formAuth = remember(request, handoff) { object : AuthRepository {
         override val authState = MutableStateFlow<AuthState>(AuthState.SignedOut).asStateFlow()
@@ -56,7 +79,9 @@ internal fun ProfileSelectionSurface(
         override fun <T : ViewModel> create(modelClass: Class<T>): T = AccountViewModel(formAuth) as T
     })
     LaunchedEffect(request) { handoff.select(request) }
-    LaunchedEffect(state) { if (state == ProfileSelectionHandoff.State.COMPLETE && handoff.complete(request)) onComplete() }
+    LaunchedEffect(state, presentation) {
+        completeProfileSelectionPresentation(presentation, handoff, onComplete, onReturnToProfiles)
+    }
     BackHandler(onBack = onChooseAgain)
     Column(Modifier.fillMaxSize().background(VortXTheme.colors.canvas).verticalScroll(rememberScrollState()).padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(20.dp)) {

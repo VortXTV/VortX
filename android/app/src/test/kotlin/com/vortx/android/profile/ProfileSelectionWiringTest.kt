@@ -12,22 +12,24 @@ class ProfileSelectionWiringTest {
     @Test fun `both cold hosts gate content on typed completion and return Back to picker`() {
         val phone = source("ui/VortXApp.kt")
         val tv = source("ui/tv/TvApp.kt")
-        assertTrue(phone.contains("WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = { profileSelection = it })"))
+        assertTrue(phone.contains("WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {"))
+        assertTrue(phone.contains("if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER"))
         assertTrue(tv.contains("TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it })"))
         for (host in listOf(phone, tv)) {
-            val selection = host.substringAfter("profileSelection?.let { request ->").substringBefore("// The title currently")
+            val selection = host.substringAfter("profileSelection?.let {").substringBefore("// The title currently")
             assertTrue(selection.contains("ProfileSelectionSurface(request, handoff,"))
             assertTrue(selection.contains("return@VortXTheme"))
             assertTrue(selection.contains("onChooseAgain = { profileSelection = null; show"))
         }
         val surface = source("ui/profilepicker/ProfileSelectionSurface.kt")
-        assertTrue(surface.contains("handoff.complete(request)) onComplete()"))
+        assertTrue(surface.contains("handoff.complete(presentation.request)"))
         assertTrue(surface.contains("BackHandler(onBack = onChooseAgain)"))
         assertTrue(surface.contains("handoff.signIn(request, email, password)"))
     }
 
     @Test fun `settings selections preserve typed result to the same host`() {
-        assertTrue(source("ui/VortXApp.kt").contains("ProfilesScreen(onBack = { showProfiles = false }, onSelected = { profileSelection = it })"))
+        assertTrue(source("ui/VortXApp.kt").contains("ProfileSelectionPresentation(it, ProfileSelectionOrigin.PROFILE_MANAGEMENT)"))
+        assertTrue(source("ui/VortXApp.kt").contains("onReturnToProfiles = { showProfiles = true }"))
         assertTrue(source("ui/tv/TvShell.kt").contains("onProfileSelected = onProfileSelected"))
         assertTrue(source("ui/tv/TvSettingsScreen.kt").contains("onSelected = onProfileSelected"))
         val gateway = source("ui/tv/TvProfilesScreen.kt")

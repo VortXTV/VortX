@@ -109,9 +109,10 @@ import com.vortx.android.player.PlayerEpisodeHandoffRequest
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.BuildConfig
-import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.ProfileSelectionHandoff
 import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
+import com.vortx.android.ui.profilepicker.ProfileSelectionOrigin
+import com.vortx.android.ui.profilepicker.ProfileSelectionPresentation
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.update.UpdatePromptHost
 import com.vortx.android.ui.components.Wordmark
@@ -574,16 +575,22 @@ fun VortXApp(
 
         // The cold-launch profile picker sits ABOVE everything: on a shared account it answers "who is
         // watching" before any content renders. It self-dismisses when the store has nothing to pick.
-        var profileSelection by remember { mutableStateOf<ProfileSelectionRequest?>(null) }
-        profileSelection?.let { request ->
+        var profileSelection by remember { mutableStateOf<ProfileSelectionPresentation?>(null) }
+        profileSelection?.let { presentation ->
+            val request = presentation.request
             val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, BuildConfig.NATIVE_ENGINE_ENABLED) }
             ProfileSelectionSurface(request, handoff,
-                onComplete = { profileSelection = null; showWhosWatching = false; showProfiles = false },
-                onChooseAgain = { profileSelection = null; showWhosWatching = true; showProfiles = false })
+                onComplete = { profileSelection = null; showWhosWatching = false },
+                onChooseAgain = { profileSelection = null; showWhosWatching = true },
+                origin = presentation.origin,
+                onReturnToProfiles = { showProfiles = true })
             return@VortXTheme
         }
         if (showWhosWatching) {
-            WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = { profileSelection = it })
+            WhosWatchingScreen(onDone = { showWhosWatching = false }, onSelected = {
+                profileSelection = ProfileSelectionPresentation(it,
+                    if (showProfiles) ProfileSelectionOrigin.PROFILE_MANAGEMENT else ProfileSelectionOrigin.PICKER)
+            })
             return@VortXTheme
         }
 
@@ -1327,7 +1334,9 @@ fun VortXApp(
             // overlays. Switching to a non-owner profile only swaps the active selection + its private
             // overlay; the account library is never touched (the never-poison split lives in the store).
             BackHandler { showProfiles = false }
-            ProfilesScreen(onBack = { showProfiles = false }, onSelected = { profileSelection = it })
+            ProfilesScreen(onBack = { showProfiles = false }, onSelected = {
+                profileSelection = ProfileSelectionPresentation(it, ProfileSelectionOrigin.PROFILE_MANAGEMENT)
+            })
             return@VortXTheme
         }
 
