@@ -5,6 +5,12 @@ import Foundation
 /// Account migration/key acquisition remain explicit prerequisites to constructing the session.
 final class VortxNativeCoreFacade: @unchecked Sendable {
     struct RegistryBinding: Equatable, Sendable { let scope: VortxAccountScope; let profileID: String; let generation: UUID }
+    struct WatchlistBinding: Equatable, Sendable {
+        let scope: VortxAccountScope
+        let profileID: String
+        let accountGeneration: UUID
+        let profileGeneration: UUID
+    }
     private let session: VortxNativeSession
     private var registry: [VortxResourceAddon]
     private var registryGeneration = UUID()
@@ -43,9 +49,19 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     }
     private var pendingProfileTransitions = 0
     private var accountEpoch = UUID()
+    private var watchlistProfileGeneration = UUID()
     private var sourceArchive: Data?
     var authenticatedSourceArchive: Data? { lock.withLock { sourceArchive } }
     var accountGeneration: UUID { lock.withLock { accountEpoch } }
+    /// Queued host/sync edits are busy work, not a new owner. Only acknowledged identity changes
+    /// retire this fence; FIFO admission will recheck it after any preceding profile transaction.
+    var watchlistBinding: WatchlistBinding? {
+        lock.withLock {
+            guard !closed, let profile = string(values["native_state"]?["activeProfileId"]) else { return nil }
+            return .init(scope: session.scope, profileID: profile, accountGeneration: accountEpoch,
+                         profileGeneration: watchlistProfileGeneration)
+        }
+    }
     func captureSourceFence() -> @Sendable () -> Bool {
         guard let captured = profileSnapshot() else { return { false } }
         let archive = authenticatedSourceArchive
@@ -96,6 +112,27 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             return dispatch(data: data, field: field)
         }
     }
+    enum CatalogPageAdmission: Equatable {
+        case started(itemCount: Int, pageCount: Int)
+        case busy, exhausted, rejected
+    }
+    /// Atomically distinguish a started page from an exhausted no-op. A Boolean dispatch result
+    /// cannot tell the UI whether it should retain its latch, retry after settlement, or stop.
+    func dispatchCatalogPage(field: String, index: Int) -> CatalogPageAdmission {
+        lock.withLock {
+            guard !closed, resourceRegistryValid, ["board", "search"].contains(field),
+                  let rows = values[field]?["catalogs"]?.array, rows.indices.contains(index) else { return .rejected }
+            guard pendingProfileTransitions == 0,
+                  !rows.contains(where: { $0.array?.contains { $0["content"]?["type"] == .string("Loading") } == true }) else { return .busy }
+            let pages = rows[index].array ?? []
+            guard nextCatalogPage(pages) != nil else { return .exhausted }
+            let action: VortxJSON = .object(["action": .string("CatalogsWithExtra"), "args": .object([
+                "action": .string("LoadNextPage"), "args": .integer(Int64(index))])])
+            guard let data = try? JSONEncoder().encode(action), dispatch(data: data, field: field) else { return .rejected }
+            let itemCount = pages.reduce(0) { $0 + ($1["content"]?["content"]?.array?.count ?? 0) }
+            return .started(itemCount: itemCount, pageCount: pages.count)
+        }
+    }
 
     static func create(session: VortxNativeSession, registry: [VortxResourceAddon],
                        mutationAccepted: @escaping @Sendable () -> Void = {},
@@ -135,6 +172,24 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         lock.withLock {
             guard !closed, pendingProfileTransitions == 0, let profile = string(values["native_state"]?["activeProfileId"]) else { return nil }
             return RegistryBinding(scope: session.scope, profileID: profile, generation: registryGeneration)
+        }
+    }
+    /// One atomic, active-profile resource inventory. Ordinary queued progress/sync work is not a
+    /// new owner; acknowledged registry/profile/account changes (including ABA) retire this receipt.
+    func captureEpisodeSourceRegistry() -> (data: Data, isCurrent: @Sendable () -> Bool)? {
+        lock.withLock {
+            guard !closed, resourceRegistryValid, let profile = string(values["native_state"]?["activeProfileId"]) else { return nil }
+            let generation = registryGeneration, account = accountEpoch, selection = watchlistProfileGeneration
+            let descriptors = registry.map { VortxJSON.object(["transportUrl": .string($0.transportUrl), "manifest": $0.manifest ?? .object([:])]) }
+            guard let data = try? JSONEncoder().encode(VortxJSON.array(descriptors)) else { return nil }
+            return (data, { [weak self] in
+                guard let self else { return false }
+                return self.lock.withLock {
+                    !self.closed && self.resourceRegistryValid && self.registryGeneration == generation
+                        && self.accountEpoch == account && self.watchlistProfileGeneration == selection
+                        && self.string(self.values["native_state"]?["activeProfileId"]) == profile
+                }
+            })
         }
     }
     /// Caller-confirmed registry replacement is bound to the accepted account/profile generation.
@@ -191,21 +246,43 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func publish(_ fields: [String: VortxJSON], field: String, ticket: UUID) {
         lock.lock()
         guard !closed, generations[field] == ticket else { lock.unlock(); return }
+        var changedFields: [String] = []
         fields.forEach {
-            values[$0.key] = $0.key == "meta_details" ? metaWithPlayback($0.value, library: values["library"]?["catalog"]?.array ?? []) : $0.value
-        }; lock.unlock(); changed(Array(fields.keys))
+            let projected = $0.key == "meta_details" ? metaWithPlayback($0.value, library: values["library"]?["catalog"]?.array ?? []) : $0.value
+            if values[$0.key] != projected { changedFields.append($0.key) }
+            values[$0.key] = projected
+        }
+        lock.unlock()
+        if !changedFields.isEmpty { changed(changedFields.sorted()) }
     }
     private func enqueue(_ field: String, initial: VortxJSON? = nil, operation: @escaping @Sendable () async throws -> [String: VortxJSON]) -> Bool {
+        enqueue(field, initial: initial) { _ in try await operation() }
+    }
+    private func enqueue(_ field: String, initial: VortxJSON? = nil,
+                         operation: @escaping @Sendable (@escaping @Sendable (VortxJSON) -> Void) async throws -> [String: VortxJSON]) -> Bool {
         guard let ticket = begin(field) else { return false }
         if let initial { publish([field: initial], field: field, ticket: ticket) }
         let task = Task { [weak self] in
-            do { try Task.checkCancellation(); let result = try await operation(); try Task.checkCancellation(); self?.publish(result, field: field, ticket: ticket) }
+            do {
+                try Task.checkCancellation()
+                let result = try await operation { [weak self] value in
+                    self?.publish([field: value], field: field, ticket: ticket)
+                }
+                try Task.checkCancellation(); self?.publish(result, field: field, ticket: ticket)
+            }
             catch {
                 guard let self else { return }
-                self.lock.withLock {
-                    if self.generations[field] == ticket && !self.closed { self.failure = "native_operation_failed" }
+                let accepted = self.lock.withLock { () -> Bool in
+                    guard self.generations[field] == ticket && !self.closed else { return false }
+                    self.failure = "native_operation_failed"; return true
                 }
-                self.publish([field: .object(["nativeError": .string("native_operation_failed")])], field: field, ticket: ticket)
+                guard accepted else { return }
+                let category = error is CancellationError ? "cancelled" : error is VortxNativeError ? VortxNativeError.diagnosticCode(error) : "transport_failed"
+                let route = ["board", "search", "discover", "meta_details", "subtitles"].contains(field) ? field : "other"
+                // Static categories only; provider URLs, headers, request paths and raw errors may
+                // contain private account material and must never enter the diagnostic log.
+                NSLog("[VortXNative] resource=%@ result=failed category=%@", route, category)
+                self.publish([field: .object(["nativeError": .string("native_operation_failed"), "nativeErrorCategory": .string(category)])], field: field, ticket: ticket)
             }
         }
         lock.lock()
@@ -216,7 +293,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                                  actions: [String]? = nil, hostRemote: VortxJSON? = nil,
                                  hostEdits: [VortxNativeHostPreferences.Edit] = [],
                                  legacyWatchlists: [UUID: [VortxNativeWatchlist.Entry]] = [:],
-                                 admission: (@Sendable () -> Bool)? = nil,
+                                 admission: (@Sendable () throws -> Bool)? = nil,
                                  websiteEvents: [VortxJSON] = [], websiteAddonEvents: [VortxJSON] = [], websiteBaseline: VortxNativeProfileEditHost.Baselines = [:],
                                  sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil,
                                  completion: (@Sendable (Result<VortxJSON, Error>) -> Void)? = nil) -> Bool {
@@ -237,7 +314,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 // Resource-backed gestures may wait behind an add-on/profile mutation.  Their
                 // metadata was accepted for an earlier registry generation, so revalidate at
                 // the FIFO boundary rather than treating the pre-enqueue check as durable.
-                guard admission?() ?? true else {
+                guard try admission?() ?? true else {
                     _ = self.fail("stale_native_mutation")
                     completion?(.failure(VortxNativeError.superseded))
                     return
@@ -262,13 +339,21 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 // resolves own/share-primary before new-profile resource loads can be admitted.
                 let replacement = resourceChanged ? try? await session.resourceRegistry() : nil
                 if resourceChanged { await session.invalidateResources() }
-                let publishedFields = try self.lock.withLock { () -> [String: VortxJSON]? in
+                let publication = try self.lock.withLock { () -> (fields: [String: VortxJSON], changed: [String])? in
                     guard !self.closed else { return nil }
-                    if self.accountIdentity(self.values["native_state"]) != self.accountIdentity(state) { self.accountEpoch = UUID() }
+                    // Compare against the acknowledged cache before a resource identity change
+                    // clears it. Progress and unchanged sync reads must not synthesize ctx events.
+                    let previousValues = self.values
+                    let identityChanged = self.resourceIdentity(previousValues["native_state"]) != self.resourceIdentity(state)
+                    let accountChanged = self.accountIdentity(self.values["native_state"]) != self.accountIdentity(state)
+                    if accountChanged { self.accountEpoch = UUID() }
+                    if accountChanged || self.values["native_state"]?["activeProfileId"] != state["activeProfileId"] {
+                        self.watchlistProfileGeneration = UUID()
+                    }
                     self.failure = nil
                     self.playback = playback
                     self.sourceArchive = sourceArchive
-                    if self.resourceIdentity(self.values["native_state"]) != self.resourceIdentity(state) {
+                    if identityChanged {
                         self.invalidateResourcePublications(); self.registryGeneration = UUID()
                         if let replacement { self.registry = replacement; self.resourceRegistryValid = true }
                         else { self.failure = "registry_unavailable" }
@@ -278,13 +363,23 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     fields["native_host_preferences"] = host
                     fields["native_website_edits"] = website
                     fields["native_own_overlay_pending"] = ownPending
-                    fields.forEach { self.values[$0.key] = $0.value }; return fields
+                    var changedFields = Set(fields.compactMap { previousValues[$0.key] != $0.value ? $0.key : nil })
+                    // Two profiles may have identical add-on descriptors but different resource
+                    // ownership. Their identity transition still requires one fenced ctx event.
+                    if identityChanged { changedFields.insert("ctx") }
+                    fields.forEach { self.values[$0.key] = $0.value }
+                    return (fields, changedFields.sorted())
                 }
                 // FIFO intents each publish their acknowledged state before the next task executes.
                 // A later get_state must not hide the profile transition's accepted state.
                 if profileTransition { self.lock.withLock { self.pendingProfileTransitions -= 1 }; transitionReleased = true }
-                if let publishedFields { self.changed(Array(publishedFields.keys)) }
-                guard publishedFields != nil, let document = state["nativeSync"] else { throw VortxNativeError.closed }
+                if let publication, !publication.changed.isEmpty { self.changed(publication.changed) }
+                guard publication != nil, let document = state["nativeSync"] else { throw VortxNativeError.closed }
+                if ["report_progress", "mark_watched", "reset_watched"].contains(type) {
+                    let count = playback["continueWatching"]?.array?.count ?? 0
+                    let saved = publication?.fields["library"]?["catalog"]?.array?.count ?? 0
+                    NSLog("[VortXNative] mutation=%@ result=acknowledged continueWatching=%ld savedLibrary=%ld", type, count, saved)
+                }
                 if !["get_state", "merge_native_sync", "bind_sync_scope"].contains(type) || !hostEdits.isEmpty || websiteChanged { self.mutationAccepted() }
                 completion?(.success(document))
             } catch VortxNativeError.checkpointUncertain {
@@ -366,6 +461,37 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                     continuation.resume(throwing: VortxNativeError.closed)
                 }
             } catch { continuation.resume(throwing: error) }
+        }
+    }
+    func setWatchlist(_ entry: VortxNativeWatchlist.Entry, present: Bool, expected: WatchlistBinding) async throws -> Bool {
+        guard let profile = UUID(uuidString: expected.profileID) else { throw VortxNativeError.invalidSnapshot }
+        let field = try VortxNativeWatchlist.field(id: entry.id, type: entry.type)
+        let value: VortxJSON = present ? try VortxNativeWatchlist.value(entry) : .null
+        return try await withCheckedThrowingContinuation { continuation in
+            lock.lock(); defer { lock.unlock() }
+            guard watchlistBinding == expected else { continuation.resume(throwing: VortxNativeError.superseded); return }
+            if !enqueueMutation(type: "edit_watchlist", raw: "", actions: [],
+                hostEdits: [.init(profileID: expected.profileID, fields: [field: value])], admission: { [weak self] in
+                    guard let self else { return false }
+                    return try self.lock.withLock {
+                        guard self.watchlistBinding == expected, let host = self.values["native_host_preferences"] else { return false }
+                        let entries = try VortxNativeWatchlist.entries(host: host, profileID: profile)
+                        if present, !entries.contains(where: { $0.id == entry.id && $0.type == entry.type }), entries.count >= VortxNativeWatchlist.displayCap {
+                            throw VortxNativeWatchlist.Failure.capacity
+                        }
+                        return true
+                    }
+                }, completion: { [weak self] result in
+                    do {
+                        _ = try result.get()
+                        guard let self else { throw VortxNativeError.closed }
+                        let membership = try self.lock.withLock {
+                            guard self.watchlistBinding == expected, let host = self.values["native_host_preferences"] else { throw VortxNativeError.superseded }
+                            return try VortxNativeWatchlist.entries(host: host, profileID: profile).contains { $0.id == entry.id && $0.type == entry.type }
+                        }
+                        continuation.resume(returning: membership)
+                    } catch { continuation.resume(throwing: error) }
+                }) { continuation.resume(throwing: VortxNativeError.closed) }
         }
     }
     /// A synchronous UI admission receipt, not a durable-write acknowledgement. The native FIFO
@@ -648,28 +774,29 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             guard let selection, let screen = VortxNativeSession.CatalogScreen(rawValue: field) else { return fail("missing_selection") }
             let extra = (try? selection["extra"]?.decode([[String]].self)) ?? []
             let catalogs = catalogRequests(extra: extra, type: string(selection["type"]))
+            let start = (try? action["args"]?["args"]?["start"]?.decode(Int.self)) ?? 0
             let end = (try? action["args"]?["args"]?["end"]?.decode(Int.self)) ?? catalogs.count
-            guard end >= 0 else { return fail("invalid_range") }
+            guard start >= 0, end >= start else { return fail("invalid_range") }
             let previous = values[field]
-            let loaded = previous?["catalogs"]?.array?.filter { $0.array?.first?["content"]?["type"] != .string("Loading") } ?? []
-            return enqueue(field) { [self] in
-                var board: VortxJSON = loaded.isEmpty ? .object(["selected": selection, "catalogs": .array([])]) : previous!
-                var hasPages = !loaded.isEmpty
-                for (index, item) in catalogs.prefix(end).enumerated() {
-                    if index < loaded.count { continue }
-                    try Task.checkCancellation()
-                    board = try await session.loadCatalog(screen, request: item.1, addons: [item.0], append: hasPages)
-                    hasPages = true
-                }
-                return [field: board]
+            guard let profile = string(values["native_state"]?["activeProfileId"]) else { return fail("missing_profile") }
+            return enqueue(field) { [self] publish in
+                [field: try await session.loadCatalogs(screen, catalogs: catalogs, selection: selection,
+                    range: start...end, previous: previous, expectedProfileID: profile, onUpdate: publish)]
             }
         }
         if name == "CatalogsWithExtra", string(action["args"]?["action"]) == "LoadNextPage", ["board", "search"].contains(field) {
             guard let index = try? action["args"]?["args"]?.decode(Int.self), index >= 0,
                   let rows = values[field]?["catalogs"]?.array, index < rows.count,
                   let screen = VortxNativeSession.CatalogScreen(rawValue: field) else { return fail("invalid_catalog_page") }
+            // A page must not replace the range's screen ticket while other initial rows are
+            // still loading. CoreBridge queues that intent and retries it once the range settles.
+            guard !rows.contains(where: { $0.array?.contains { $0["content"]?["type"] == .string("Loading") } == true })
+            else { return fail("catalog_range_loading") }
             guard let next = nextCatalogPage(rows[index].array ?? []) else { return true }
-            return enqueue(field) { [self] in
+            guard let loading = try? loadingEntry(next.0, next.1) else { return fail("invalid_catalog_page") }
+            var pendingRows = rows; pendingRows[index] = .array((rows[index].array ?? []) + [loading])
+            let pending: VortxJSON = .object(["selected": values[field]?["selected"] ?? .null, "catalogs": .array(pendingRows)])
+            return enqueue(field, initial: pending) { [self] in
                 [field: try await session.loadCatalog(screen, request: next.1, addons: [next.0], append: true)]
             }
         }
@@ -683,7 +810,11 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 "selected": .object(["metaPath": (try? VortxResourceProjection.path(request)) ?? .null, "streamPath": (try? stream.map(VortxResourceProjection.path)) ?? .null]),
                 "metaItems": .array(addons.compactMap { try? loadingEntry($0, request) }),
                 "streams": .array(stream.map { path in addons.compactMap { try? loadingEntry($0, path) } } ?? []), "metaStreams": .array([])])
-            return enqueue(field, initial: loading) { [self] in [field: try await session.loadMeta(request: request, stream: stream, addons: addons)] }
+            guard let profile = string(values["native_state"]?["activeProfileId"]) else { return fail("missing_profile") }
+            return enqueue(field, initial: loading) { [self] publish in
+                [field: try await session.loadMeta(request: request, stream: stream, addons: addons,
+                    expectedProfileID: profile, onUpdate: publish)]
+            }
         }
         if name == "Load", model == "CatalogWithFilters", field == "discover" {
             let supplied = action["args"]?["args"]?["request"]

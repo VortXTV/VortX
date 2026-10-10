@@ -23,12 +23,19 @@
 # artifacts, never hard-coded. No warning is filtered, suppressed, or grepped away; no debug map is
 # stripped; no -oso_prefix is used - the repair fixed the objects, this only reads them back.
 #
-#   scripts/verify-apple-engine-artifacts.sh [REPO_ROOT]
+#   scripts/verify-apple-engine-artifacts.sh [--native-only] [REPO_ROOT]
+# Native-only builds inspect all five native slices and their retained input archives; the
+# default remains the complete legacy+native check used by the combined CI SDK build.
 #
 # EXIT  0 all inspected archives clean   1 any newer-minOS or missing-OSO source   2 setup error
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NATIVE_ONLY=0
+if [ "${1:-}" = "--native-only" ]; then
+  NATIVE_ONLY=1
+  shift
+fi
 REPO_ROOT="${1:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 VENDOR="$REPO_ROOT/app/Vendor"
 CORE_XC="$VENDOR/StremioXCore.xcframework"
@@ -50,9 +57,25 @@ if [ -z "$LLVM_NM" ]; then
   [ -n "${_sr:-}" ] && [ -n "${_host:-}" ] && [ -x "$_sr/lib/rustlib/$_host/bin/llvm-nm" ] && LLVM_NM="$_sr/lib/rustlib/$_host/bin/llvm-nm"
 fi
 
-[ -d "$CORE_XC" ] || die "missing $CORE_XC (build-core-xcframework.sh did not run / its cache did not restore)"
+if [ "$NATIVE_ONLY" -eq 0 ]; then
+  [ -d "$CORE_XC" ] || die "missing $CORE_XC (build-core-xcframework.sh did not run / its cache did not restore)"
+fi
 [ -d "$FFI_XC" ]  || die "missing $FFI_XC (build-ffi-xcframework.sh did not run / its cache did not restore)"
 [ -d "$PRELOC" ]  || die "missing $PRELOC (retained pre-localization archives absent; the OSO map cannot resolve)"
+
+# A partial native SDK is never sufficient, even if the archives that happen to exist pass.
+# These exact target/slice mappings prevent an unrelated retained archive standing in for
+# the input whose localized native debug map will be consumed by the app link.
+while IFS=' ' read -r slice triple; do
+  [ -s "$FFI_XC/$slice/libvortx_ffi.a" ] || die "missing or empty native slice $slice"
+  [ -s "$PRELOC/VortxEngine/$triple/libvortx_ffi.a" ] || die "missing or empty retained native input $triple"
+done <<'NATIVE_SLICES'
+ios-arm64 aarch64-apple-ios
+ios-arm64-simulator aarch64-apple-ios-sim
+tvos-arm64 aarch64-apple-tvos
+tvos-arm64-simulator aarch64-apple-tvos-sim
+macos-arm64 aarch64-apple-darwin
+NATIVE_SLICES
 
 problems=0
 bad() { printf 'FAIL  %s\n' "$*" >&2; problems=$((problems + 1)); }
@@ -162,7 +185,26 @@ inspect_archive() {
 
 while IFS= read -r a; do
   inspect_archive "$a"
-done < <(find "$CORE_XC" "$FFI_XC" "$PRELOC" -type f -name '*.a' 2>/dev/null | LC_ALL=C sort)
+done < <(
+  {
+  # Enumerate mandatory pairs directly, including valid SDK symlinks. `find -type f`
+  # alone would silently omit a symlinked archive/slice that passed the -s preflight.
+  while IFS=' ' read -r slice triple; do
+    printf '%s\n' "$FFI_XC/$slice/libvortx_ffi.a" "$PRELOC/VortxEngine/$triple/libvortx_ffi.a"
+  done <<'NATIVE_SLICES'
+ios-arm64 aarch64-apple-ios
+ios-arm64-simulator aarch64-apple-ios-sim
+tvos-arm64 aarch64-apple-tvos
+tvos-arm64-simulator aarch64-apple-tvos-sim
+macos-arm64 aarch64-apple-darwin
+NATIVE_SLICES
+  if [ "$NATIVE_ONLY" -eq 1 ]; then
+    find "$FFI_XC" "$PRELOC/VortxEngine" -type f -name '*.a'
+  else
+    find "$CORE_XC" "$FFI_XC" "$PRELOC" -type f -name '*.a'
+  fi
+  } | LC_ALL=C sort -u
+)
 
 [ "$total_archives" -gt 0 ] || die "no .a archives found under the xcframeworks or $PRELOC; nothing was inspected"
 

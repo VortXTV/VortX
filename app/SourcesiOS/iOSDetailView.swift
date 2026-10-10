@@ -41,26 +41,6 @@ func prepareTorrentStream(_ stream: CoreStream) -> Task<Void, Never>? {
     }
 }
 
-/// One add-on's streams for a series episode, fetched straight over the Stremio add-on protocol so the
-/// F6 warm-up never touches the engine's single meta slot (which would evict the playing episode). Mirrors
-/// the tvOS preload's fetchStreams. nil on any failure or an empty answer, so a dead add-on is skipped.
-private func warmFetchEpisodeStreams(
-    base: String,
-    addon: String,
-    id: String,
-    requestTimeout: TimeInterval
-) async -> CoreStreamSourceGroup? {
-    let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
-    guard let url = URL(string: "\(base)/stream/series/\(escaped).json") else { return nil }
-    var request = URLRequest(url: url)
-    request.timeoutInterval = requestTimeout
-    struct Response: Decodable { let streams: [CoreStream]? }
-    guard let (data, _) = try? await URLSession.shared.data(for: request),
-          let response = try? JSONDecoder().decode(Response.self, from: data),
-          let streams = response.streams, !streams.isEmpty else { return nil }
-    return CoreStreamSourceGroup(id: base, addon: addon, streams: streams)
-}
-
 /// Structured, bounded account add-on fetch for iOS/macOS preparation. The user's sticky provider enters the
 /// first five-wide window, ordinary providers keep a short cap, and results return to account order for rank.
 func warmFetchEpisodeSourceGroups(
@@ -68,48 +48,17 @@ func warmFetchEpisodeSourceGroups(
     request: NextEpisodePreparationRequest,
     wantedAddon: String?
 ) async -> [CoreStreamSourceGroup] {
-    let remaining = max(0, min(
-        NextEpisodePreparationBudget.addonFetchBudget,
-        request.deadline - ProcessInfo.processInfo.systemUptime
-    ))
-    guard remaining > 0, !Task.isCancelled else { return [] }
-    let order = PreloadProviderRotation.order(
-        count: sources.count,
-        request: request,
-        stride: NextEpisodePreparationBudget.providerRotationStride,
-        prioritizedIndex: wantedAddon.flatMap { wanted in
-            sources.firstIndex { $0.name.caseInsensitiveCompare(wanted) == .orderedSame }
-        }
-    )
-    let rotatedSources = order.map { sources[$0] }
-    let rotated: [CoreStreamSourceGroup?] = await BoundedPreloadWorkPool.map(
-        rotatedSources,
-        limit: NextEpisodePreparationBudget.addonConcurrencyLimit,
-        timeoutNanoseconds: UInt64(remaining * 1_000_000_000),
-        operationTimeoutFor: { source in
-            UInt64(
-                NextEpisodePreparationBudget.requestTimeout(
-                    addon: source.name,
-                    wantedAddon: wantedAddon
-                ) * 1_000_000_000
-            )
-        }
-    ) { source in
-        await warmFetchEpisodeStreams(
-            base: source.base,
-            addon: source.name,
-            id: request.episodeID,
-            requestTimeout: NextEpisodePreparationBudget.requestTimeout(
-                addon: source.name,
-                wantedAddon: wantedAddon
-            )
-        )
-    }
-    return PreloadProviderRotation.restoreOriginalOrder(
-        rotated,
-        order: order,
-        count: sources.count
-    ).compactMap { $0 }
+    await EpisodeSourceCollection.rawGroups(sources: sources, episodeID: request.episodeID,
+        wantedAddon: wantedAddon, deadline: request.deadline, attemptSequence: request.attemptSequence)
+}
+
+func warmFetchEpisodeSourceGroups(
+    providers: [EpisodeSourceProvider],
+    request: NextEpisodePreparationRequest,
+    wantedAddon: String?
+) async -> [CoreStreamSourceGroup] {
+    await EpisodeSourceCollection.rawGroups(providers: providers, episodeID: request.episodeID,
+        wantedAddon: wantedAddon, deadline: request.deadline, attemptSequence: request.attemptSequence)
 }
 
 /// Retire one raw-torrent preparation exactly once. A season-pack request can point at the hash already
@@ -217,8 +166,6 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let resolutionBudget = EpisodeResolutionBudget.current
         ?? EpisodeResolutionBudget(episodeID: videoId, origin: .manual, now: ProcessInfo.processInfo.systemUptime)
     guard resolutionBudget.episodeID == videoId else { return nil }
-    core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
-    var groups: [CoreStreamSourceGroup] = []
     // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on the show id `seriesId`).
     // PlayerScreen also drives its binge auto-next through THIS resolver (a Continue-Watching resume launch), so
     // like the detail-page `loadEpisodeStream` and tvOS it must honor the pick. Settlement waits for every raw
@@ -227,24 +174,16 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     let requiredChoice = SeriesSourceSticky.resolvingChoice
     let sticky = choice.source
     let wantedAddon = sticky.addon
-    while true {
-        guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
-        groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
-        // Hints affect ranking only after every registered contributor is terminal or this request reaches the
-        // shared deadline. A fast matching source cannot open the partial set.
-        let progress = core.streamLoadProgress(forStreamId: v.id)
-        let elapsed = resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)
-        if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                        secondsSinceRequestStart: elapsed, rememberedQuality: continuity,
-                                        wantedAddon: wantedAddon) { break }
-        if elapsed >= StreamRanking.completeSetDeadline { break }
-        do {
-            try await Task.sleep(for: .milliseconds(250))
-        } catch {
-            return nil
-        }
+    let sourceOwner = EpisodeSourceOwner(core: core, account: account)
+    func admitted() -> Bool {
+        sourceOwner.isCurrent && SeriesSourceSticky.admits(choice)
+            && (requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice))
     }
-    guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
+    guard let groups = await EpisodeSourceCollection.collect(seriesID: seriesId, videoID: v.id,
+        season: v.season ?? defaultSeason, episode: v.episode, title: seriesName,
+        providers: sourceOwner.providers(seriesID: seriesId, videoID: v.id), wantedAddon: wantedAddon,
+        deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
+        isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
     // The SAME sticky (read above) + provider-health terms the player and the preload rank with (diag-21). This
     // is the lane a viewer actually hits by tapping an episode (and the one a Continue-Watching resume uses), so
@@ -274,7 +213,7 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     guard let selected = await iOSResolveRankedEpisodeCandidate(
         candidates, episode: episodeHint, cachedHashes: cachedHashes.isEmpty ? nil : cachedHashes,
         deadline: resolutionBudget.candidateDeadline,
-        stillCurrent: { requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) }
+        stillCurrent: admitted
     ) else { return nil }
     let (best, url, ref) = (selected.stream, selected.url, selected.ref)
     DiagnosticsLog.log("binge", "episode resolve candidate resolved index=\(selected.index) origin=\(resolutionBudget.origin.rawValue) elapsed=\(Int(resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s")
@@ -289,10 +228,10 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
             await account.resumeOffset(for: pm)
         }) else { return nil }
         resume = resolvedResume
-        guard !Task.isCancelled, requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
+        guard admitted() else { return nil }
     }
     guard !Task.isCancelled, resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime),
-          requiredChoice == nil || SeriesSourceSticky.admits(requiredChoice) else { return nil }
+          admitted() else { return nil }
     if ref == nil { _ = prepareTorrentStream(best) }   // fire-and-forget prime; self-terminating backoff
     return PlayerEpisodeStream(
         stream: best, url: url, meta: pm, title: title, resume: resume,
@@ -886,15 +825,8 @@ struct iOSDetailView: View {
     /// hero overlays a text block that an aspectRatio would fight on narrow windows.
     private func heroBandHeight(width: CGFloat, viewport: CGFloat) -> CGFloat {
         #if os(macOS)
-        // The Mac detail hero reads near-fullscreen so the page stops looking empty (owner ask): on a TALL
-        // window the cinematic banner takes ~72% of the height. But because `macDetailBody` PINS this band
-        // (only the region beneath it scrolls, and it is the only way to reach the action row, synopsis,
-        // credits and the episode / source list), the band must never eat the whole window. So we always
-        // reserve a usable inner-scroll region: cap the band at `viewport - reservedForContent` so at least
-        // ~320pt survives below it, even at the app's minimum 600pt window height (StremioXiOSApp.swift:176),
-        // where the band shrinks to ~280pt instead of the old immovable 560pt banner that left a ~40pt slot.
-        // For any window taller than ~1143pt the 0.72 fraction is the smaller term, so tall windows still
-        // read near-fullscreen; the 1000 cap stops an enormous display pushing the banner past that point.
+        // Keep the first screen cinematic while leaving a useful preview of the next section. The banner
+        // now scrolls with the page, so episodes and sources can use the entire viewport after it moves away.
         guard viewport > 0 else { return 620 }
         let reservedForContent: CGFloat = 320
         let band = min(1000, min(viewport * 0.72, viewport - reservedForContent))
@@ -962,15 +894,13 @@ struct iOSDetailView: View {
                                 // #9: on a wide iPad/Mac window keep the hero full-bleed but cap the
                                 // source-heavy content to a readable column and center it (long lines hurt
                                 // readability). iPhone (and any narrow width) stays full-width as before.
-                                Group {
-                                    if isEpisodic {
-                                        episodeList
-                                    } else {
-                                        sourceSection.id(Self.sourcesAnchor)
-                                    }
+                                if isEpisodic {
+                                    episodeList(viewportWidth: geo.size.width)
+                                } else {
+                                    sourceSection.id(Self.sourcesAnchor)
+                                        .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
+                                        .frame(maxWidth: .infinity)
                                 }
-                                .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
-                                .frame(maxWidth: .infinity)
                                 whereToWatchSection
                                 collectionSection
                                 relationsSection
@@ -1437,27 +1367,21 @@ struct iOSDetailView: View {
     }
 
     #if os(macOS)
-    /// macOS pinned-hero layout (item 4): the cinematic banner is a FIXED top layer and only the content
-    /// below it (action row, full synopsis, credits, and the episode / source list) scrolls in its own
-    /// independent inner ScrollView. Deliberately a fixed hero layer + inner ScrollView, NOT a scroll
-    /// section-header pin, which is banned (it triggered the NSToolbar/section-header crash class). The
-    /// hero "Sources" action still scrolls the inner region to the source anchor via the shared proxy.
+    /// One scrolling page lets the large hero move away so complete episode cards remain visible even
+    /// in short Mac windows. No pinned section or native toolbar is involved.
     @ViewBuilder private func macDetailBody(geo: GeometryProxy, proxy: ScrollViewProxy) -> some View {
-        VStack(spacing: 0) {
-            heroBanner(width: geo.size.width, height: geo.size.height)
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    heroBanner(width: geo.size.width, height: geo.size.height)
                     heroBelow(width: geo.size.width) { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
                     // #9: cap the source-heavy content to a readable column and center it on a wide window.
-                    Group {
-                        if isEpisodic {
-                            episodeList
-                        } else {
-                            sourceSection.id(Self.sourcesAnchor)
-                        }
+                    if isEpisodic {
+                        episodeList(viewportWidth: geo.size.width)
+                    } else {
+                        sourceSection.id(Self.sourcesAnchor)
+                            .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
+                            .frame(maxWidth: .infinity)
                     }
-                    .frame(maxWidth: geo.size.width > Theme.Space.wideLayoutMinWidth ? Theme.Space.contentColumn : .infinity)
-                    .frame(maxWidth: .infinity)
                     whereToWatchSection
                     collectionSection
                     relationsSection
@@ -1466,16 +1390,9 @@ struct iOSDetailView: View {
                 }
                 .padding(.bottom, Theme.Space.xl)
                 .frame(width: geo.size.width, alignment: .leading)
-            }
-            .coordinateSpace(name: Self.detailScrollSpace)
         }
-        // Keep atmosphere behind the full detail page without decoding the hero art a second time or applying
-        // a full-window Gaussian blur. The static material and already-computed dominant tint preserve the
-        // cinematic color wash while bounding compositing cost as the inner scroll view moves. macOS-only.
-        .background(alignment: .top) {
-            macDetailBackdrop
-                .ignoresSafeArea()
-        }
+        .coordinateSpace(name: Self.detailScrollSpace)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
     }
     #endif
 
@@ -1542,6 +1459,17 @@ struct iOSDetailView: View {
                 watchNow(scrollToSources: scrollToSources)
             } else {
                 seriesHeroActions
+            }
+            if !isEpisodic, meta != nil, !LiveTypes.contains(type) {
+                let isWatched = watchedIndex.ids.contains(detailTarget.id)
+                Button {
+                    core.markWatched(!isWatched, expected: detailTarget)
+                } label: {
+                    Label(isWatched ? "Mark Unwatched" : "Mark Watched",
+                          systemImage: isWatched ? "arrow.uturn.backward.circle" : "checkmark.circle")
+                }
+                .buttonStyle(ChipButtonStyle(selected: isWatched))
+                .accessibilityHint("Changes this movie's watched status")
             }
             // H2: only show the full description below when it is meaningfully longer than the hero's
             // 3-line excerpt, so a short synopsis is not printed twice on the same screen.
@@ -1692,15 +1620,13 @@ struct iOSDetailView: View {
         let bg = meta?.background ?? meta?.poster
             ?? seedBackdrop
             ?? FeaturedHeroItem.metahubBackground(forId: id)
-        return AsyncImage(url: URL(string: bg ?? "")) { phase in
-            switch phase {
-            // Movies carry a 16:9 `background`, so .fill crops cleanly. A SERIES usually has no landscape
-            // background and falls back to the PORTRAIT `poster`; .fill on that in the landscape band crops
-            // it to black bars (the "shows all have cut off hero image" report), so series fit instead.
-            case .success(let img): img.resizable().aspectRatio(contentMode: (effectiveType == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill)
-            default: Theme.Palette.surface1
-            }
-        }
+        // Keep the image request in a child view: the detail body observes a large, frequently changing
+        // state surface while sources settle, but backdrop loading should only restart when the artwork or
+        // its decoded-size budget changes. The child also rejects a late completion from a previous title.
+        return iOSCinematicBackdropImage(
+            url: bg,
+            contentMode: (effectiveType == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill
+        )
         .frame(height: height)
         // The backdrop is the ZStack's WIDTH ANCHOR: it greedily takes the full viewport width and
         // pins to the leading edge, so the ZStack's leading edge is the screen's leading edge. Before
@@ -1731,18 +1657,95 @@ struct iOSDetailView: View {
         )
     }
 
-    #if os(macOS)
-    /// A static, bounded-cost continuation of the hero palette behind the pinned macOS detail page. The hero
-    /// remains the only full artwork decode; this surface reuses its asynchronously computed dominant tint.
-    private var macDetailBackdrop: some View {
-        LinearGradient(stops: [
-            .init(color: dominantTint ?? Theme.Palette.surface1, location: 0.0),
-            .init(color: Theme.Palette.canvas.opacity(0.92), location: 0.55),
-            .init(color: Theme.Palette.canvas, location: 1.0),
-        ], startPoint: .top, endPoint: .bottom)
-        .accessibilityHidden(true)
+    /// Full-bleed detail artwork backed by the shared off-main ImageIO loader. The request key includes the
+    /// URL and the viewport budget so a warm image is painted synchronously without ever showing a previous
+    /// title's image. A canceled or superseded task cannot publish its result because both checks are required
+    /// after the shared loader returns.
+    private struct iOSCinematicBackdropImage: View {
+        let url: String?
+        let contentMode: ContentMode
+
+        @Environment(\.displayScale) private var displayScale
+        @State private var image: VXPosterImage?
+        @State private var imageRequest: Request?
+
+        private static let minimumBackdropPixel = 1_280
+        private static let maximumBackdropPixel = 2_048
+
+        private struct Request: Equatable {
+            let url: String?
+            let maxPixel: Int
+        }
+
+        private var candidateURL: String? {
+            guard let url, !url.isEmpty, URL(string: url) != nil else { return nil }
+            return url
+        }
+
+        var body: some View {
+            GeometryReader { viewport in
+                let request = Request(
+                    url: candidateURL,
+                    maxPixel: Self.maxPixel(for: viewport.size, displayScale: displayScale)
+                )
+                Group {
+                    if let image, imageRequest == request {
+                        renderedImage(image)
+                    } else if let cached = cachedImage(for: request) {
+                        renderedImage(cached)
+                    } else {
+                        Theme.Palette.surface1
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .task(id: request) { await load(request) }
+            }
+        }
+
+        private static func maxPixel(for viewport: CGSize, displayScale: CGFloat) -> Int {
+            let scale = displayScale.isFinite && displayScale > 0 ? displayScale : 1
+            let longEdge = max(viewport.width, viewport.height)
+            guard longEdge.isFinite, longEdge > 0 else { return minimumBackdropPixel }
+            let requested = longEdge * scale
+            let bounded = min(
+                CGFloat(maximumBackdropPixel),
+                max(CGFloat(minimumBackdropPixel), requested)
+            )
+            return Int(bounded.rounded(.up))
+        }
+
+        private func cachedImage(for request: Request) -> VXPosterImage? {
+            guard let raw = request.url, let parsed = URL(string: raw) else { return nil }
+            return PosterImageLoader.cached(parsed, maxPixel: CGFloat(request.maxPixel))
+        }
+
+        private func load(_ request: Request) async {
+            guard !Task.isCancelled else { return }
+            // Clear before every new request: `@State` survives a URL change, so the previous image must not
+            // remain eligible while this task is waiting on the network or decode gate.
+            image = nil
+            imageRequest = request
+
+            if let cached = cachedImage(for: request) {
+                guard !Task.isCancelled, imageRequest == request else { return }
+                image = cached
+                return
+            }
+
+            let loaded = await PosterImageLoader.load(request.url, maxPixel: CGFloat(request.maxPixel))
+            guard !Task.isCancelled, imageRequest == request else { return }
+            image = loaded
+        }
+
+        @ViewBuilder
+        private func renderedImage(_ image: VXPosterImage) -> some View {
+            #if canImport(UIKit)
+            Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
+            #else
+            Image(nsImage: image).resizable().aspectRatio(contentMode: contentMode)
+            #endif
+        }
     }
-    #endif
 
     /// H3 / #44: the muted, looping in-hero trailer painted over the still backdrop. The owner wants the WHOLE
     /// trailer muted here (not a 10s snippet), through the SAME native /yt path as the explicit Trailer button
@@ -3732,20 +3735,24 @@ struct iOSDetailView: View {
     /// Cinema episode cards keep a generous, readable width on every touch/Mac surface. Compact iPhones
     /// get a card just under the viewport so the next episode peeks into the rail; regular iPad layouts
     /// get a wider card without making the horizontal focus path needlessly long.
-    private var episodeRailCardWidth: CGFloat {
-        #if os(macOS)
-        return 520
-        #elseif os(iOS)
-        return horizontalSizeClass == .regular ? 430 : 340
-        #else
-        return 340
-        #endif
+    @State private var episodeRailFirstVisible = 0
+
+    private struct EpisodeRailPositions: PreferenceKey {
+        static let defaultValue: [String: CGFloat] = [:]
+        static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+            value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+        }
     }
 
-    @ViewBuilder private var episodeList: some View {
+    @ViewBuilder private func episodeList(viewportWidth: CGFloat) -> some View {
         if let videos = meta?.videos, !videos.isEmpty {
             let seasons = Array(Set(videos.compactMap { $0.season })).sorted()
             let watched = watchedSet
+            let visibleEpisodes = episodes(videos)
+            let cardWidth = CinemaRailLayout.episodeWidth(viewport: viewportWidth,
+                                                         inset: Theme.Space.md, spacing: Theme.Space.md)
+            let pageSize = CinemaRailLayout.visibleEpisodes(viewport: viewportWidth, cardWidth: cardWidth,
+                                                            inset: Theme.Space.md, spacing: Theme.Space.md)
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 HStack(alignment: .center, spacing: Theme.Space.sm) {
                     iOSRailHeader(eyebrow: "\(episodes(videos).count) episode\(episodes(videos).count == 1 ? "" : "s")",
@@ -3817,14 +3824,65 @@ struct iOSDetailView: View {
                 // Keep the episode rail horizontal so one large cinematic card owns the reader's attention.
                 // LazyHStack still bounds thumbnail construction for long seasons; the parent detail scroll
                 // remains vertical, so this rail does not create a competing cross-axis focus path.
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: Theme.Space.md) {
-                        ForEach(episodes(videos), id: \.id) { v in
-                            episodeRow(v, isWatched: watched.contains(v.id), progress: episodeProgress(v),
-                                       cardWidth: episodeRailCardWidth)
+                ScrollViewReader { railProxy in
+                    VStack(spacing: Theme.Space.sm) {
+                        ScrollView(.horizontal, showsIndicators: true) {
+                            LazyHStack(alignment: .top, spacing: Theme.Space.md) {
+                                ForEach(visibleEpisodes, id: \.id) { v in
+                                    episodeRow(v, isWatched: watched.contains(v.id), progress: episodeProgress(v),
+                                               cardWidth: cardWidth)
+                                        .overlay(alignment: .topTrailing) {
+                                            if !selectingEpisodes {
+                                                Menu {
+                                                    episodeActions(v, isWatched: watched.contains(v.id))
+                                                } label: {
+                                                    Image(systemName: "ellipsis")
+                                                        .font(.system(size: 18, weight: .semibold))
+                                                        .frame(width: 44, height: 44)
+                                                        .vortxGlassDisc()
+                                                }
+                                                .buttonStyle(.plain)
+                                                .padding(Theme.Space.sm)
+                                                .accessibilityLabel("Actions for \(episodeCoordinate(v))")
+                                            }
+                                        }
+                                        .id(v.id)
+                                        .background {
+                                            GeometryReader { cardGeo in
+                                                Color.clear.preference(key: EpisodeRailPositions.self,
+                                                    value: [v.id: cardGeo.frame(in: .named("cinema-episode-rail")).minX])
+                                            }
+                                        }
+                                }
+                            }
+                            .padding(.vertical, Theme.Space.xs)
+                        }
+                        .coordinateSpace(name: "cinema-episode-rail")
+                        .onPreferenceChange(EpisodeRailPositions.self) { positions in
+                            if let index = visibleEpisodes.firstIndex(where: {
+                                guard let x = positions[$0.id] else { return false }
+                                return x + cardWidth > 1 && x < viewportWidth - Theme.Space.md * 2
+                            }), index != episodeRailFirstVisible { episodeRailFirstVisible = index }
+                        }
+                        HStack(spacing: Theme.Space.sm) {
+                            episodePageButton(forward: false, count: visibleEpisodes.count, pageSize: pageSize) {
+                                pageEpisodes(forward: false, episodes: visibleEpisodes, pageSize: pageSize, proxy: railProxy)
+                            }
+                            Spacer(minLength: 0)
+                            Text(visibleEpisodes.isEmpty ? "No episodes" : "\(min(episodeRailFirstVisible + 1, visibleEpisodes.count))–\(min(episodeRailFirstVisible + pageSize, visibleEpisodes.count)) of \(visibleEpisodes.count)")
+                                .font(Theme.Typography.label)
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .accessibilityLabel("Visible episodes")
+                            Spacer(minLength: 0)
+                            episodePageButton(forward: true, count: visibleEpisodes.count, pageSize: pageSize) {
+                                pageEpisodes(forward: true, episodes: visibleEpisodes, pageSize: pageSize, proxy: railProxy)
+                            }
                         }
                     }
-                    .padding(.vertical, Theme.Space.xs)
+                    .onChange(of: season) { _ in
+                        episodeRailFirstVisible = 0
+                        if let first = visibleEpisodes.first { railProxy.scrollTo(first.id, anchor: .leading) }
+                    }
                 }
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Episodes")
@@ -3842,6 +3900,29 @@ struct iOSDetailView: View {
             }
             .onChange(of: watched) { _ in publishSeriesWatchRollup() }   // a mark flips the show-level badge (#143)
             .onChange(of: season) { _ in didApplySeason = true }
+        }
+    }
+
+    private func episodePageButton(forward: Bool, count: Int, pageSize: Int,
+                                   action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(forward ? "Next" : "Previous", systemImage: forward ? "chevron.right" : "chevron.left")
+                .font(Theme.Typography.label)
+                .padding(.horizontal, Theme.Space.sm)
+                .frame(minHeight: 44)
+        }
+        .buttonStyle(.plain)
+        .vortxGlass(in: Capsule())
+        .disabled(forward ? episodeRailFirstVisible + pageSize >= count : episodeRailFirstVisible == 0)
+        .accessibilityLabel(forward ? "Show next episodes" : "Show previous episodes")
+    }
+
+    private func pageEpisodes(forward: Bool, episodes: [CoreVideo], pageSize: Int, proxy: ScrollViewProxy) {
+        guard !episodes.isEmpty else { return }
+        let index = CinemaRailLayout.pageStart(current: episodeRailFirstVisible, direction: forward ? 1 : -1,
+                                               visible: pageSize, count: episodes.count)
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+            proxy.scrollTo(episodes[index].id, anchor: .leading)
         }
     }
 
@@ -3930,6 +4011,14 @@ struct iOSDetailView: View {
             .vortxCardButton(radius: Theme.Radius.card)
             .accessibilityValue(isWatched ? "Watched" : "")
             .contextMenu {
+                episodeActions(v, isWatched: isWatched)
+            }
+        } else {
+            episodeRowLabel(v, isWatched: isWatched, progress: progress, cardWidth: cardWidth)
+        }
+    }
+
+    @ViewBuilder private func episodeActions(_ v: CoreVideo, isWatched: Bool) -> some View {
                 Button(isWatched ? "Mark as Unwatched" : "Mark as Watched") {
                     core.markVideoWatched(v, !isWatched, expected: detailTarget)
                 }
@@ -3942,16 +4031,12 @@ struct iOSDetailView: View {
                     }
                 }
                 #endif
-            }
-        } else {
-            episodeRowLabel(v, isWatched: isWatched, progress: progress, cardWidth: cardWidth)
-        }
     }
 
     private func episodeRowLabel(_ v: CoreVideo, isWatched: Bool, progress: Double,
                                  cardWidth: CGFloat) -> some View {
-        let imageWidth = max(220, cardWidth - Theme.Space.md * 2)
-        let imageHeight = max(124, imageWidth * 9 / 16)
+        let imageWidth = max(1, cardWidth - Theme.Space.md * 2)
+        let imageHeight = imageWidth * 9 / 16
         return CinemaEpisodeRailCard(
             video: v,
             isWatched: isWatched,
@@ -4623,6 +4708,8 @@ struct iOSEpisodeStreams: View {
     // and two sheets attached to the same view shadow each other, so a #95 trailer cover added ALONGSIDE the
     // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
     @State private var presentation: Presentation?
+    @State private var playbackReturnReceipt = EpisodeReturnReceiptState<UUID, PlaybackMeta>()
+    @State private var playbackReturnTarget: PlaybackNavigationOwner?
     @State private var preparing = false
     @State private var usenetPlaybackMessage: String?
     @State private var launchEnginePreference: PlayerEngineRouter.Override? = nil
@@ -4701,26 +4788,16 @@ struct iOSEpisodeStreams: View {
         ScrollViewReader { proxy in
         Group {
         #if os(macOS)
-        // macOS pinned-episode model (mirrors `iOSDetailView.macDetailBody`, FINDING 3): the episode banner
-        // is a FIXED near-fullscreen top layer and only the overview + source list scroll in an inner
-        // ScrollView, over a continuous blurred backdrop wash. Replaces the old fixed 460 strip + large dead
-        // canvas below (the "tiny hero, blank page" report), so the episode page matches the movie/show page.
-        VStack(spacing: 0) {
-            macEpisodeBanner(width: geo.size.width, height: episodeBandHeight(viewport: geo.size.height))
-            ScrollView {
-                VStack(alignment: .leading, spacing: Theme.Space.lg) {
+        // The hero and source cards share one scrolling canvas. A fixed hero previously squeezed the
+        // cards into a short clipped region and its separate background wash made a hard color seam.
+        ScrollView {
+            VStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    macEpisodeBanner(width: geo.size.width, height: episodeBandHeight(viewport: geo.size.height))
                     episodeOverviewText
                     sourceListView(width: geo.size.width)
                 }
                 .padding(.bottom, Theme.Space.xl)
                 .frame(width: geo.size.width, alignment: .leading)
-            }
-        }
-        // Continuous cinematic wash behind the whole page (blurred FILL, so it never becomes a second crisp
-        // image); the pinned banner owns the crisp focal art up top.
-        .background(alignment: .top) {
-            backdropWash(height: geo.size.height)
-                .ignoresSafeArea()
         }
         #else
         ScrollView {
@@ -4818,7 +4895,19 @@ struct iOSEpisodeStreams: View {
         // Binge-desync fix #4 (Back target): when the player cover dismisses, continuous play may have
         // advanced past the episode this page was pushed for - follow the engine's resume episode so Back
         // lands on the CURRENT episode and Watch-Now plays it, not the launch episode.
-        .onChange(of: presentation == nil) { _ in reanchorToEngineEpisode() }
+        .onChange(of: presentation?.id) { _ in
+            if case .player(let launch) = presentation {
+                beginPlaybackReturn(launch)
+            } else if presentation == nil {
+                if let requestID = playbackReturnReceipt.activeRequestID {
+                    _ = playbackReturnReceipt.close(requestID: requestID)
+                }
+                reanchorToEngineEpisode()
+            } else {
+                playbackReturnReceipt = .init()
+                playbackReturnTarget = nil
+            }
+        }
         #if canImport(UIKit)
         // ...and ALSO on app foreground: across a background boundary no dismissal event fires (the cover
         // stays up / the page stays mounted), so this is the trigger that unfreezes the stale page.
@@ -4867,13 +4956,23 @@ struct iOSEpisodeStreams: View {
                     // launch.meta here saved every advance's progress against the launch episode).
                     onProgress: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
                     onSeek: { pos, dur, target in core.reportProgress(timeSeconds: pos, durationSeconds: dur, target: target) },
+                    onPlaybackIdentityCommitted: { committed in
+                        guard presentation?.id == item.id else { return }
+                        beginPlaybackReturn(launch)
+                        guard playbackReturnTarget?.isCurrent(core: core, account: account) == true else { return }
+                        _ = playbackReturnReceipt.record(committed, requestID: launch.id)
+                    },
                     onClose: {
+                        guard presentation?.id == item.id else { return }
+                        beginPlaybackReturn(launch)
+                        _ = playbackReturnReceipt.close(requestID: launch.id)
                         core.unloadEnginePlayer()
                         presentation = nil
                     }
                 )
                 .ignoresSafeArea()
                 .id(launch.id)
+                .onAppear { beginPlaybackReturn(launch) }
             case .trailer(let launch):
                 // #95: a tapped trailer row plays in the SAME native player as a stream but with isTrailer:true
                 // and no recordMeta, so a dead trailer shows "Trailer unavailable" and never hops to content.
@@ -4885,18 +4984,33 @@ struct iOSEpisodeStreams: View {
         }
     }
 
-    /// Binge-advance re-anchor, shared by BOTH triggers (cover dismissal + app foreground): follow the
-    /// engine's CURRENT resume episode (the per-profile overlay for overlay profiles, the same split every
-    /// resume/progress read uses) so the page shows and plays the episode continuous play is actually on.
-    /// Guarded on the cover being down (never re-point beneath a live player - its own dismissal re-fires
-    /// this) and on a real move to an episode present in `seasonEpisodes`, so a no-op close (paused, same
-    /// episode) leaves the page untouched. Re-points meta_details too, so the source list re-scopes.
+    private func beginPlaybackReturn(_ launch: iOSDetailView.PlayerLaunch) {
+        guard playbackReturnReceipt.activeRequestID != launch.id,
+              playbackReturnReceipt.closedReceipt?.requestID != launch.id,
+              playbackReturnReceipt.closedAttempt?.requestID != launch.id else { return }
+        playbackReturnReceipt.begin(requestID: launch.id)
+        playbackReturnTarget = PlaybackNavigationOwner(core: core, account: account)
+        _ = playbackReturnReceipt.recordAttempt(launch.meta, requestID: launch.id)
+    }
+
+    /// Return to the admitted player identity before consulting asynchronous history. This is navigation
+    /// only: a failed attempt is never persisted as watched/progress, and another profile cannot reuse it.
     private func reanchorToEngineEpisode() {
         guard presentation == nil else { return }
-        let id = profiles.activeUsesEngineHistory
+        let engineID = profiles.activeUsesEngineHistory
             ? core.metaDetails?.libraryItem?.state.videoId
             : profiles.watch[meta.id]?.videoId
-        guard let id, id != shownVideo.id, let moved = seasonEpisodes.first(where: { $0.id == id }) else { return }
+        let ownsReceipt = playbackReturnTarget?.isCurrent(core: core, account: account) == true
+        let committed = ownsReceipt ? playbackReturnReceipt.closedReceipt?.meta : nil
+        let attempted = ownsReceipt ? playbackReturnReceipt.closedAttempt?.meta : nil
+        let inventory = seasonEpisodes + (core.metaDetails?.meta?.id == meta.id ? core.metaDetails?.meta?.videos ?? [] : [])
+        let id = EpisodeReturnIdentityPolicy.resolve(
+            libraryID: meta.id,
+            isVideoAvailable: { target in inventory.contains { $0.id == target } },
+            committedLibraryID: committed?.libraryId, committedVideoID: committed?.videoId,
+            engineVideoID: engineID,
+            attemptedLibraryID: attempted?.libraryId, attemptedVideoID: attempted?.videoId)
+        guard let id, id != shownVideo.id, let moved = inventory.first(where: { $0.id == id }) else { return }
         episodeTargetGeneration &+= 1
         currentVideo = moved
         core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: moved.id)
@@ -5135,7 +5249,7 @@ struct iOSEpisodeStreams: View {
         .frame(width: width, alignment: .leading)
     }
 
-    /// The episode overview, rendered in the macOS inner scroll region (the iOS path keeps it inside `hero`).
+    /// The episode overview, in the same scrolling canvas as the Mac hero (iOS keeps it inside `hero`).
     @ViewBuilder private var episodeOverviewText: some View {
         if let overview = shownVideo.overview, !overview.isEmpty {
             Text(overview)
@@ -5148,8 +5262,7 @@ struct iOSEpisodeStreams: View {
         }
     }
 
-    /// Near-fullscreen episode band height (ports `iOSDetailView.heroBandHeight`'s macOS formula): ~72% of a
-    /// tall window, always reserving ~320pt of inner-scroll room, floored at 280 and capped at 1000.
+    /// Match the scrolling detail hero: cinematic first screen, a visible next section, no pinned canvas.
     private func episodeBandHeight(viewport: CGFloat) -> CGFloat {
         guard viewport > 0 else { return 620 }
         let reservedForContent: CGFloat = 320
@@ -5157,24 +5270,6 @@ struct iOSEpisodeStreams: View {
         return max(280, band)
     }
 
-    /// The full-window BACKGROUND wash behind the pinned episode page: ALWAYS blurred `.fill` + dim, so the
-    /// new full-window paint reads as soft atmosphere and never becomes a second crisp image beside the banner.
-    private func backdropWash(height: CGFloat) -> some View {
-        FallbackArtwork(urls: [shownVideo.thumbnail, meta.background, meta.poster])
-        .frame(height: height)
-        .frame(maxWidth: .infinity, alignment: .top)
-        .clipped()
-        .blur(radius: 40)
-        .overlay(Theme.Palette.canvas.opacity(0.5))
-        .overlay(
-            LinearGradient(stops: [
-                .init(color: .clear, location: 0.0),
-                .init(color: Theme.Palette.canvas.opacity(0.55), location: 0.6),
-                .init(color: Theme.Palette.canvas, location: 1.0),
-            ], startPoint: .top, endPoint: .bottom)
-        )
-        .accessibilityHidden(true)
-    }
     #endif
 
     private var backdrop: some View { backdrop(height: backdropHeight) }
@@ -5307,7 +5402,7 @@ struct iOSEpisodeStreams: View {
         guard presentation == nil,
               episodeTargetIsCurrent(target, generation: targetGeneration, quickWatchScope: quickWatchScope) else { return }
         let bindingSucceeded = core.loadEnginePlayer(
-            for: stream, videoId: pm.videoId,
+            for: stream, videoId: pm.videoId, libraryId: pm.libraryId,
             base: iOSEngineAddonBase(for: stream, in: core.streamGroups(forStreamId: target.id)),
             resolvedURL: ref?.url
         )
@@ -5369,7 +5464,7 @@ struct iOSEpisodeStreams: View {
             guard presentation == nil,
                   episodeTargetIsCurrent(target, generation: targetGeneration, quickWatchScope: quickWatchScope) else { return }
             let bindingSucceeded = core.loadEnginePlayer(
-                for: win.stream, videoId: pm.videoId,
+                for: win.stream, videoId: pm.videoId, libraryId: pm.libraryId,
                 base: iOSEngineAddonBase(for: win.stream, in: core.streamGroups(forStreamId: target.id)),
                 resolvedURL: win.ref.url
             )
@@ -5696,34 +5791,22 @@ struct iOSEpisodeStreams: View {
             guard let launchVideo = seasonEpisodes.first(where: { $0.id == videoId }) else { return nil }
             v = launchVideo
         }
-        core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: v.id)
-        var groups: [CoreStreamSourceGroup] = []
         // The source the viewer picked BY HAND for this show (`SeriesSourceSticky`, keyed on `meta.id`, the SAME
         // show id the pin uses and every episode shares). This is the binge auto-next lane (`goToEpisode` calls
         // it through `loadEpisode`), so `StreamRanking.best` applies it only after the complete-set gate closes.
         let choice = SeriesSourceSticky.snapshot(for: meta.id)
         let sticky = choice.source
         let wantedAddon = sticky.addon
-        while true {
-            guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
-            // Target-engine groups only. The page-owned auxiliary contributors are scoped to shownVideo and
-            // must not leak into a different episode being resolved behind the player.
-            groups = iOSDisplayGroups(core.streamGroups(forStreamId: v.id))
-            // Settlement is contributor-complete or request-deadline bounded. Quality and sticky hints cannot
-            // admit a partial set, which is the diag-22 fast-1080p-before-aggregator race.
-            let progress = core.streamLoadProgress(forStreamId: v.id)
-            let elapsed = resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)
-            if StreamRanking.resolveSettled(groups, loaded: progress.loaded, total: progress.total,
-                                            secondsSinceRequestStart: elapsed, rememberedQuality: rememberedQuality,
-                                            wantedAddon: wantedAddon) { break }
-            if elapsed >= StreamRanking.completeSetDeadline { break }
-            do {
-                try await Task.sleep(for: .milliseconds(250))
-            } catch {
-                return nil
-            }
+        let sourceOwner = EpisodeSourceOwner(core: core, account: account)
+        func admitted() -> Bool {
+            sourceOwner.isCurrent && SeriesSourceSticky.admits(choice)
         }
-        guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return nil }
+        guard let groups = await EpisodeSourceCollection.collect(seriesID: meta.id, videoID: v.id,
+            season: v.season ?? season, episode: v.episode, title: meta.name,
+            defaultVideoID: meta.behaviorHints?.defaultVideoId,
+            providers: sourceOwner.providers(seriesID: meta.id, videoID: v.id), wantedAddon: wantedAddon,
+            deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
+            isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
         // Next / Prev / list / binge preserve the chosen release when present. Keep the full filtered
         // candidate set for fallback rather than turning the preference into a source exclusion.
         let candidates = StreamRanking.rankedCandidates(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
@@ -5742,7 +5825,7 @@ struct iOSEpisodeStreams: View {
         guard let selected = await iOSResolveRankedEpisodeCandidate(
             candidates, episode: episodeHint, waitForLocalUsenetNode: true,
             deadline: resolutionBudget.candidateDeadline,
-            stillCurrent: { SeriesSourceSticky.admits(choice) }
+            stillCurrent: admitted
         ) else { return nil }
         let (best, url, ref) = (selected.stream, selected.url, selected.ref)
         DiagnosticsLog.log("binge", "episode resolve candidate resolved index=\(selected.index) origin=\(resolutionBudget.origin.rawValue) elapsed=\(Int(resolutionBudget.elapsed(at: ProcessInfo.processInfo.systemUptime)))s")
@@ -5753,7 +5836,7 @@ struct iOSEpisodeStreams: View {
         guard let resolvedResume = await BoundedPreloadWorkPool.valueBeforeDeadline(resolutionBudget.admissionDeadline, operation: {
             await localResume(pm)
         }) else { return nil }
-        guard !Task.isCancelled, SeriesSourceSticky.admits(choice),
+        guard admitted(),
               resolutionBudget.canAdmit(at: ProcessInfo.processInfo.systemUptime) else { return nil }
         lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
         torrentPrime?.cancel(); torrentPrime = ref == nil ? prepareTorrentStream(best) : nil
@@ -5770,10 +5853,13 @@ struct iOSEpisodeStreams: View {
         let expectedProfileID = profiles.activeID
         let expectedAccountBoundary = account.credentialBoundaryGeneration
         let expectedTraktSession = initialTraktSessionID
+        let expectedSources = account.streamSources
+        let expectedAddonCapabilities = EpisodeSourceInventory(legacyAddons: account.addons)
         return iOSNextEpisodePreparationContext(
             seriesID: meta.id, seriesName: meta.name, defaultSeason: season,
             defaultVideoID: meta.behaviorHints?.defaultVideoId, poster: meta.poster,
-            sources: account.streamSources, continuity: rememberedQuality, binge: lastBinge,
+            sources: expectedSources, legacyAddons: account.addons,
+            continuity: rememberedQuality, binge: lastBinge,
             pin: sourcePin, cachedHashes: debridCache.cachedHashes,
             signedInToVortX: VortXSyncManager.shared.isSignedIn,
             videos: {
@@ -5787,6 +5873,8 @@ struct iOSEpisodeStreams: View {
             isCurrent: {
                 profiles.activeID == expectedProfileID
                     && account.credentialBoundaryGeneration == expectedAccountBoundary
+                    && account.streamSources == expectedSources
+                    && EpisodeSourceInventory(legacyAddons: account.addons) == expectedAddonCapabilities
                     && (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession)
             }
         )

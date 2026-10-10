@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -88,8 +89,6 @@ import com.vortx.android.ui.library.LibrarySegment
 import com.vortx.android.ui.library.LibrarySmartFilter
 import com.vortx.android.ui.search.RecentSearchesRow
 import com.vortx.android.ui.search.SearchResultSection
-import com.vortx.android.ui.search.textResourceId
-import com.vortx.android.ui.search.searchEmptyMessage
 import com.vortx.android.ui.search.searchResultItemKey
 import com.vortx.android.ui.search.searchResultSectionHeaderKey
 import com.vortx.android.ui.search.searchResultSections
@@ -443,7 +442,7 @@ private fun LibraryFilterChips(filters: LibraryFilters?, onSelect: (String) -> U
     }
 }
 
-/// Search: a query field over a poster grid of matches across every installed add-on, with recent
+/// Search: a query field over horizontal result rails across every installed add-on, with recent
 /// searches as chips when the query is empty (DESIGN-SYSTEM.md §4 "Discover / Search").
 ///
 /// SD-6 polish: a trailing clear button, an IME "Search" action that skips the debounce
@@ -469,10 +468,10 @@ fun SearchScreen(
         viewModel.recordHistory()
         onItem(it)
     }
-    val gridState = rememberLazyGridState()
+    val listState = rememberLazyListState()
     // Re-tap of the active Search tab scrolls the results back to top (Apple `TabScrollToTop`).
     LaunchedEffect(reselectSignal) {
-        if (reselectSignal > 0) gridState.animateScrollToItem(0)
+        if (reselectSignal > 0) listState.animateScrollToItem(0)
     }
 
     // SD-8: a signed-out device sees a sign-in prompt, not empty add-on results. Gate on either account.
@@ -504,32 +503,26 @@ fun SearchScreen(
         }
         // SD-4: as-you-type suggestions under the field. Surfaced from one character (client-side); the
         // engine's own local-search index feeds in from two characters. Cleared when the query is empty.
-        if (suggestions.isNotEmpty()) {
-            ChipScrollRow {
-                suggestions.forEach { suggestion ->
-                    Chip(
-                        label = suggestion,
-                        selected = false,
-                        onClick = { viewModel.onQueryChange(suggestion) },
-                    )
-                }
-            }
-        }
-        when (val s = state) {
-            is UiState.Loading -> EmptyState("Searching your add-ons…")
-            is UiState.Error -> ErrorState(s.message)
-            is UiState.Success -> PosterGrid(
-                items = s.data,
-                onItem = openItem,
-                emptyHint = when (val message = searchEmptyMessage(query, s)) {
-                    null -> ""
-                    else -> stringResource(message.textResourceId)
-                },
-                sectioned = true,
-                showMenu = true,
-                gridState = gridState,
-                cinemaSearch = true,
-            )
+        SearchSuggestionsRow(suggestions, viewModel::onQueryChange)
+        SearchResultRails(
+            query = query,
+            items = (state as? UiState.Success)?.data.orEmpty(),
+            isLoading = searchState.isLoading,
+            onItem = openItem,
+            modifier = Modifier.weight(1f),
+            listState = listState,
+            errorMessage = (state as? UiState.Error)?.message,
+        )
+    }
+}
+
+/** The same live suggestions and query selection behavior on dedicated and merged Search. */
+@Composable
+internal fun SearchSuggestionsRow(suggestions: List<String>, onPick: (String) -> Unit) {
+    if (suggestions.isEmpty()) return
+    ChipScrollRow {
+        suggestions.forEach { suggestion ->
+            Chip(label = suggestion, selected = false, onClick = { onPick(suggestion) })
         }
     }
 }

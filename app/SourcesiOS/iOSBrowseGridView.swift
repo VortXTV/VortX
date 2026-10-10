@@ -111,6 +111,75 @@ struct iOSCollectionsHub: View {
 
 // MARK: - Tiles
 
+/// Search the real collection/category inventory; keep its existing browse target, not a fake movie id.
+struct CinemaSearchCollections: View {
+    let query: String
+    let onOpen: (HubTarget) -> Void
+    @ObservedObject private var model = CollectionsHubModel.shared
+    @ObservedObject private var prefs = CatalogPreferences.shared
+    @Environment(\.cinemaCardViewportWidth) private var viewportWidth
+    #if os(iOS)
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    #endif
+
+    private var matches: [HubTarget] {
+        guard query.trimmingCharacters(in: .whitespacesAndNewlines).count >= 2,
+              CollectionsHubModel.isAvailable else { return [] }
+        var targets: [HubTarget] = []
+        if !prefs.isCategoryHidden(HubCategoryKey.discoverSection) {
+            targets += model.discover.filter { !prefs.isCategoryHidden(HubCategoryKey.discover($0)) }.map(HubTarget.discover)
+        }
+        if !prefs.isCategoryHidden(HubCategoryKey.streamingSection) {
+            targets += ProviderBrandMap.dedupeProviders(model.providers).map { .service(id: $0.providerID, name: $0.name) }
+        }
+        if !prefs.isCategoryHidden(HubCategoryKey.genresSection) {
+            targets += model.genres.filter { !prefs.isCategoryHidden(HubCategoryKey.genre($0)) }.map(HubTarget.genre)
+        }
+        if !prefs.isCategoryHidden(HubCategoryKey.decadesSection) {
+            targets += model.decades.filter { !prefs.isCategoryHidden(HubCategoryKey.decade($0)) }.map(HubTarget.decade)
+        }
+        return targets.filter { $0.title.localizedStandardContains(query.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    }
+
+    var body: some View {
+        #if os(iOS)
+        let compact = sizeClass == .compact
+        #else
+        let compact = false
+        #endif
+        let width = iOSPillMetrics.hubTileWidth(container: viewportWidth, compact: compact)
+        if !matches.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                Text("Collections").sectionTitleStyle().padding(.horizontal, Theme.Space.md)
+                ScrollView(.horizontal, showsIndicators: true) {
+                    LazyHStack(spacing: Theme.Space.sm) {
+                        ForEach(matches, id: \.self) { target in
+                            Button { onOpen(target) } label: { tile(target, width: width) }
+                                .buttonStyle(.plain)
+                                .accessibilityHint("Opens this collection")
+                        }
+                    }
+                    .padding(.horizontal, Theme.Space.md)
+                    .padding(.vertical, Theme.Space.xs)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func tile(_ target: HubTarget, width: CGFloat) -> some View {
+        switch target {
+        case .discover(let list):
+            iOSDiscoverCard(list: list, backdrop: model.discoverBackdrops[list], width: width)
+        case .service(let id, _):
+            if let provider = model.providers.first(where: { $0.providerID == id }) { iOSServiceTile(provider: provider, width: width) }
+        case .genre(let genre):
+            iOSGenreTile(genre: genre, backdrop: model.genreBackdrops[genre.title], width: width)
+        case .decade(let decade):
+            iOSDecadeTile(decade: decade, cover: model.decadeCovers[decade.title], width: width)
+        }
+    }
+}
+
 // One pill WIDTH everywhere (the owner's "every pill should be the same size"): the streaming + genre +
 // Discover hub tiles AND the movie/show/Continue-Watching poster cards all derive their column width from
 // this single value, so no tile is wider or narrower than another. Lives on a shared enum so PosterCardiOS
@@ -126,8 +195,12 @@ enum iOSPillMetrics {
     /// the cards both call this so they stay in lockstep and the adaptive column count recomputes from the
     /// chosen width. `.balanced` returns the shipping values (224 regular / 116 compact), so the default is
     /// unchanged. Hub/pill tiles keep the fixed `cardWidth`; only the movie/show poster cards follow the preset.
-    static func gridPosterWidth(preset: PosterWidthPreset, compact: Bool) -> CGFloat {
-        compact ? preset.compactWidth : preset.regularWidth
+    static func gridPosterWidth(preset: PosterWidthPreset, compact: Bool,
+                                container: CGFloat = 0, landscape: Bool = false) -> CGFloat {
+        if preset == .balanced, landscape, container > 0 {
+            return hubTileWidth(container: container, compact: compact)
+        }
+        return compact ? preset.compactWidth : preset.regularWidth
     }
 
     /// Hub category tile width, derived from the measured viewport so the rail shows an exact per-row
@@ -136,13 +209,8 @@ enum iOSPillMetrics {
     /// the fixed `cardWidth` before the first width measurement lands.
     static func hubTileWidth(container: CGFloat, compact: Bool) -> CGFloat {
         guard container > 0 else { return cardWidth }
-        let outerPadding = 2 * Theme.Space.md   // the rail's horizontal content padding
-        let spacing = Theme.Space.sm
-        if compact {
-            return max(150, (container - outerPadding - spacing) / 2)
-        }
-        let fourUp = (container - outerPadding - 3 * spacing) / 4
-        return min(max(fourUp, cardWidth), 300)
+        return CinemaRailLayout.titleWidth(viewport: container, compact: compact,
+                                           inset: Theme.Space.md, spacing: Theme.Space.sm)
     }
 }
 

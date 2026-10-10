@@ -226,6 +226,8 @@ fun PlayerChrome(
     currentSource: StreamSource? = null,
     sourceSwitching: Boolean = false,
     sourceSwitchError: String? = null,
+    failedEpisode: Episode? = null,
+    onRetryEpisode: () -> Unit = {},
     onSwitchSource: (StreamSource) -> Unit = {},
     onSwitchEpisode: (Episode) -> Unit = {},
     /// Secondary (dual) subtitle state. [secondarySubtitleAvailable] is mpv-only, so the control is hidden
@@ -717,6 +719,10 @@ fun PlayerChrome(
                         add(SheetOption("Switching episode...", false, enabled = false, isStatus = true))
                     } else if (sourceSwitchError != null) {
                         add(SheetOption("Episode switch failed", false, enabled = false, isStatus = true))
+                    }
+                    failedEpisode?.let { failed ->
+                        add(SheetOption("Retry S${failed.season} · E${failed.episode}", false,
+                            detail = failed.title, dismissOnPick = false, onPick = onRetryEpisode))
                     }
                     episodeChoices.forEach { choice ->
                         add(

@@ -32,6 +32,8 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import com.vortx.android.backup.SettingsBackup
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.localSettingsBackupInput
+import com.vortx.android.profile.withLocalSettingsRestoreAdmission
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import kotlinx.coroutines.Dispatchers
@@ -54,8 +56,8 @@ import java.util.Locale
 ///     keeps its current value, so importing an older backup never wipes settings you changed since
 ///     (Apple `restore`'s never-wipe contract). It never `clear`s.
 ///
-/// The roster round-trips as one of those keys (`stremiox.profiles` is a syncable String), so after a
-/// restore [ProfileStore.reloadFromDefaults] re-reads it, keeping THIS device's active selection.
+/// Non-native builds can restore the legacy roster. Native builds refuse profile-bearing files before
+/// any write; authenticated account restore remains the native profile-import path.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
@@ -89,7 +91,9 @@ fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                     context.contentResolver.openOutputStream(uri, "wt")?.use { it.write(payload) }
                         ?: error("Could not open that location for writing.")
                 }
-                "Settings backed up. Import this file on another device to bring your settings and profiles across."
+                if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+                    "Settings backed up. Use your VortX account to restore profiles and watch history."
+                } else "Settings backed up. Import this file on another device to bring your settings and profiles across."
             }.getOrElse { "Backup failed: ${it.message ?: "the file could not be written."}" }
         }
     }
@@ -107,8 +111,17 @@ fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
                 }
                 val values = SettingsBackup.restoreValues(bytes)
                     ?: error("That file is not a VortX settings backup.")
-                withContext(Dispatchers.IO) { applyRestore(prefs, values) }
-                // The roster is one of the restored keys; re-read it while KEEPING this device's selection.
+                // Check source keys, not only typed writable values: malformed profile values must
+                // not be silently omitted while other settings are imported and reported successful.
+                val sourceKeys = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+                    SettingsBackup.decodeDomain(bytes)?.keys ?: error("That file is not a VortX settings backup.")
+                } else values.keys
+                withContext(Dispatchers.IO) {
+                    withLocalSettingsRestoreAdmission(com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED, sourceKeys) {
+                        applyRestore(prefs, values)
+                    }
+                }
+                // Native reload uses only the mounted projection; comparison mode rereads its legacy roster.
                 ProfileStore.sharedOrNull()?.reloadFromDefaults()
                 if (values.isEmpty()) {
                     "That backup held no restorable settings."
@@ -140,23 +153,30 @@ fun BackupRestoreScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
         ) {
             SettingsSection(
                 title = "Settings backup",
-                footer = "Backs up your syncable settings and profiles to a file, no account needed. " +
+                footer = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+                    "Use your VortX account to restore profiles and watch history. " +
+                        "Here you can import files that contain settings only."
+                } else "Backs up your syncable settings and profiles to a file, no account needed. " +
                     "Device-only settings such as the streaming cache size and server address are left out. " +
                     "Importing merges a backup in and never removes settings that are not in the file.",
             ) {
                 ActionRow(
                     icon = VortXIcons.download,
                     label = "Back up settings",
-                    detail = "Save your settings and profiles to a file.",
+                    detail = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) "Save your settings to a file. Restore profiles through your VortX account."
+                        else "Save your settings and profiles to a file.",
                     enabled = !busy,
                     onClick = {
                         busy = true
                         scope.launch {
                             val bytes = withContext(Dispatchers.IO) {
-                                SettingsBackup.makeBackup(prefs.all, bundleId = appContext.packageName)
+                                SettingsBackup.makeBackup(localSettingsBackupInput(
+                                    com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED, prefs.all), bundleId = appContext.packageName)
                             }
                             if (bytes == null) {
-                                status = "Nothing to back up yet. Change a setting or add a profile first."
+                                status = if (com.vortx.android.BuildConfig.NATIVE_ENGINE_ENABLED) {
+                                    "Nothing to back up yet. Change a setting first."
+                                } else "Nothing to back up yet. Change a setting or add a profile first."
                                 busy = false
                                 return@launch
                             }

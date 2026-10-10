@@ -1,5 +1,9 @@
 import SwiftUI
 
+#if os(iOS)
+import UIKit
+#endif
+
 // MARK: - Cross-platform shims (file-local)
 //
 // ProfilesView now lives in SourcesShared, so it compiles into the iOS, macOS and tvOS targets.
@@ -60,6 +64,8 @@ struct ProfilePickerView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var pinTarget: UserProfile?
     @State private var pinIsForEditing = false
@@ -77,12 +83,17 @@ struct ProfilePickerView: View {
         ZStack {
             GeometryReader { geometry in
                 let layout = ProfilePickerLayout(width: geometry.size.width,
-                                                 largeText: dynamicTypeSize.isAccessibilitySize || theme.textScale > 1.20)
+                                                 largeText: dynamicTypeSize.isAccessibilitySize || theme.textScale > 1.20,
+                                                 isPhone: profilePickerIsPhone)
                 ZStack {
                     backgroundArtwork
                     ScrollView(.vertical, showsIndicators: false) {
                         VStack(spacing: 24) {
-                            Spacer(minLength: max(40, geometry.size.height * (layout.isWide ? 0.20 : 0.34)))
+                            if layout.isPhone {
+                                // Preserve the established phone composition. Only the larger picker
+                                // surfaces move to true vertical centering below.
+                                Spacer(minLength: max(40, geometry.size.height * 0.34))
+                            }
                             if let movie = artwork.movie {
                                 Text(movie.name)
                                     .modifier(ProfilePickerText(size: 26, style: .title, design: .serif))
@@ -127,10 +138,11 @@ struct ProfilePickerView: View {
                                 #endif
                         }
                         .padding(.horizontal, layout.horizontalInset)
-                        .padding(.bottom, 32)
+                        .padding(.bottom, layout.isPhone ? 32 : 0)
                         .frame(maxWidth: 1100)
                         .frame(maxWidth: .infinity)
-                        .frame(minHeight: geometry.size.height, alignment: .bottom)
+                        .frame(minHeight: geometry.size.height,
+                               alignment: layout.isPhone ? .bottom : .center)
                     }
                     .disabled(pinTarget != nil || profileAction.isRunning)
                     .accessibilityHidden(pinTarget != nil)
@@ -160,14 +172,42 @@ struct ProfilePickerView: View {
         }
         #endif
         .interactiveDismissDisabled(profileAction.isRunning)
-        .task { await artwork.load() }
-        .onDisappear { profileAction.cancel() }
+        .task(id: artworkTaskKey) {
+            guard artworkIsVisible else {
+                artwork.stopRotation()
+                return
+            }
+            await artwork.load()
+            guard !Task.isCancelled else { return }
+            artwork.startRotation(reduceMotion: reduceMotion)
+        }
+        .onDisappear {
+            artwork.stopRotation()
+            profileAction.cancel()
+        }
+    }
+
+    private var artworkIsVisible: Bool {
+        scenePhase == .active && pinTarget == nil && editorProfile == nil &&
+        !signInNeeded && !accountHelpNeeded && !profileAction.isRunning
+    }
+
+    private var artworkTaskKey: String {
+        "\(artworkIsVisible)-\(reduceMotion)"
+    }
+
+    private var profilePickerIsPhone: Bool {
+        #if os(iOS)
+        UIDevice.current.userInterfaceIdiom == .phone
+        #else
+        false
+        #endif
     }
 
     private var backgroundArtwork: some View {
         ZStack {
             Color.black
-            FallbackArtwork(urls: [artwork.movie?.background, artwork.movie?.poster], maxPixel: 1920)
+            ProfilePickerBackdrop(movie: artwork.movie)
                 .opacity(0.85)
             LinearGradient(stops: [.init(color: .black.opacity(0.12), location: 0),
                                    .init(color: .black.opacity(0.22), location: 0.3),
@@ -181,22 +221,46 @@ struct ProfilePickerView: View {
     }
 
     private func profileGrid(layout: ProfilePickerLayout) -> some View {
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: layout.spacing), count: layout.columns),
-                  alignment: .center, spacing: 24) {
-            ForEach(store.profiles) { profile in
-                ProfileAvatarTile(profile: profile, isCurrent: profile.id == store.activeID,
-                                  isEditing: isEditing, side: layout.avatarSide) { pick(profile) }
-            }
-            ProfilePickerActionTile(title: "Add", symbol: "plus", side: layout.avatarSide) {
-                editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
-            }
-            ProfilePickerActionTile(title: isEditing ? "Done" : "Edit",
-                                    symbol: isEditing ? "checkmark" : "pencil", side: layout.avatarSide) {
-                isEditing.toggle()
+        Group {
+            if layout.isPhone {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: layout.spacing), count: layout.columns),
+                          alignment: .center, spacing: 24) {
+                    ForEach(0..<(store.profiles.count + 2), id: \.self) { index in
+                        profileTile(at: index, side: layout.avatarSide)
+                    }
+                }
+            } else {
+                VStack(spacing: 24) {
+                    ForEach(layout.rows(itemCount: store.profiles.count + 2), id: \.lowerBound) { row in
+                        HStack(alignment: .top, spacing: layout.spacing) {
+                            ForEach(Array(row), id: \.self) { index in
+                                profileTile(at: index, side: layout.avatarSide)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .center)
+                    }
+                }
             }
         }
         .padding(8)
         .profileFocusSection()
+    }
+
+    @ViewBuilder private func profileTile(at index: Int, side: CGFloat) -> some View {
+        if index < store.profiles.count {
+            let profile = store.profiles[index]
+            ProfileAvatarTile(profile: profile, isCurrent: profile.id == store.activeID,
+                              isEditing: isEditing, side: side) { pick(profile) }
+        } else if index == store.profiles.count {
+            ProfilePickerActionTile(title: "Add", symbol: "plus", side: side) {
+                editorProfile = UserProfile(name: "", avatar: "🎬", accentID: theme.accentID)
+            }
+        } else {
+            ProfilePickerActionTile(title: isEditing ? "Done" : "Edit",
+                                    symbol: isEditing ? "checkmark" : "pencil", side: side) {
+                isEditing.toggle()
+            }
+        }
     }
 
     private func pick(_ profile: UserProfile) {
@@ -233,29 +297,260 @@ struct ProfilePickerView: View {
     }
 }
 
+/// A bounded public Cinemeta movie candidate. It deliberately carries no profile, account, history,
+/// addon or playback state, so the pre-profile picker has no dependency on the profile being opened.
+private struct ProfilePickerMovie: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let poster: String?
+    let background: String?
+
+    var artworkURLs: [String] {
+        ArtworkFallbackPolicy.candidates([background, poster])
+    }
+
+    var cacheKey: String {
+        "\(id)|\(background ?? "")|\(poster ?? "")"
+    }
+}
+
+/// Keeps the previous decoded image until the next bounded candidate is warm in PosterImageLoader's cache.
+/// The identity transition then cross-fades the two layers without a blank frame on a rotation tick.
+private struct ProfilePickerBackdrop: View {
+    let movie: ProfilePickerMovie?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var image: VXPosterImage?
+    @State private var imageKey = ""
+
+    private var synchronousCache: VXPosterImage? {
+        guard let movie else { return nil }
+        for raw in movie.artworkURLs {
+            guard let url = URL(string: raw),
+                  let cached = PosterImageLoader.cached(url, maxPixel: ProfilePickerArtwork.artworkMaxPixel) else {
+                continue
+            }
+            return cached
+        }
+        return nil
+    }
+
+    var body: some View {
+        Color.clear
+            .overlay {
+                ZStack {
+                    if let image = image ?? synchronousCache {
+                        imageView(image)
+                            .id(imageKey)
+                            .transition(.opacity)
+                    } else {
+                        Theme.Palette.surface1
+                    }
+                }
+            }
+            .clipped()
+            .task(id: movie?.cacheKey) {
+                guard let movie else { return }
+                let loaded = await ArtworkFallbackPolicy.firstAvailable(movie.artworkURLs) {
+                    await PosterImageLoader.load($0, maxPixel: ProfilePickerArtwork.artworkMaxPixel)
+                }
+                guard !Task.isCancelled, let loaded else { return }
+                let key = movie.cacheKey
+                if reduceMotion {
+                    image = loaded
+                    imageKey = key
+                } else {
+                    withAnimation(.easeInOut(duration: 0.8)) {
+                        image = loaded
+                        imageKey = key
+                    }
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func imageView(_ image: VXPosterImage) -> some View {
+        #if canImport(UIKit)
+        Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+        #else
+        Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
+        #endif
+    }
+}
+
 /// Background art is public, not a peek into the previous profile's viewing history or add-ons.
-/// One catalog and one metadata request per app launch, independent of profile opening.
+/// One bounded public catalog request per app launch, independent of profile opening.
 @MainActor
 private final class ProfilePickerArtwork: ObservableObject {
     static let shared = ProfilePickerArtwork()
-    @Published private(set) var movie: MetaItem?
-    private var request: Task<MetaItem?, Never>?
+
+    private static let candidateLimit = 12
+    private static let rotationIntervalNanoseconds: UInt64 = 5_000_000_000
+    fileprivate static let artworkMaxPixel: CGFloat = CGFloat(HeroArtworkQualityPolicy.mobileLongEdge)
+
+    @Published private(set) var movie: ProfilePickerMovie?
+    private var candidates: [ProfilePickerMovie] = []
+    private var catalogRequest: Task<[ProfilePickerMovie], Never>?
+    private var didAttemptCatalog = false
+    private var currentIndex = 0
+    private var readyIDs = Set<String>()
+    private var unavailableIDs = Set<String>()
+    private var rotationTask: Task<Void, Never>?
+    private var prewarmTask: Task<Bool, Never>?
+    private var rotationToken = UUID()
+
+    deinit {
+        catalogRequest?.cancel()
+        rotationTask?.cancel()
+        prewarmTask?.cancel()
+    }
 
     func load() async {
-        if movie != nil { return }
-        if request == nil {
-            request = Task {
-                let client = AddonClient()
-                guard let titles = try? await client.catalog(base: AddonClient.cinemeta, type: "movie", id: "top", genre: "Family"),
-                      let title = titles.filter({ $0.type == "movie" && $0.id.hasPrefix("tt") && $0.poster?.isEmpty == false })
-                        .prefix(30).randomElement() else { return nil }
-                if let detail = try? await client.meta(type: "movie", id: title.id) { return detail }
-                return MetaItem(id: title.id, type: title.type, name: title.name, poster: title.poster,
-                                background: nil, description: nil, releaseInfo: nil, runtime: nil,
-                                imdbRating: nil, genres: nil, videos: nil)
+        if !didAttemptCatalog {
+            didAttemptCatalog = true
+            catalogRequest = Task { await Self.fetchCandidates() }
+        }
+        guard let catalogRequest else { return }
+        let fetched = await catalogRequest.value
+        guard !Task.isCancelled else { return }
+        if candidates.isEmpty {
+            candidates = fetched
+        }
+        guard movie == nil, !Task.isCancelled else { return }
+        await showInitialCandidate()
+    }
+
+    func startRotation(reduceMotion: Bool) {
+        rotationTask?.cancel()
+        rotationTask = nil
+        rotationToken = UUID()
+        guard !reduceMotion, candidates.count > 1, movie != nil else { return }
+
+        let token = rotationToken
+        rotationTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: ProfilePickerArtwork.rotationIntervalNanoseconds)
+                } catch {
+                    return
+                }
+                guard let self, !Task.isCancelled, self.rotationToken == token else { return }
+                await self.rotate(token: token)
             }
         }
-        movie = await request?.value
+    }
+
+    func stopRotation() {
+        rotationToken = UUID()
+        rotationTask?.cancel()
+        rotationTask = nil
+        prewarmTask?.cancel()
+        prewarmTask = nil
+    }
+
+    private func rotate(token: UUID) async {
+        guard rotationToken == token, candidates.count > 1 else { return }
+        if let prewarmTask {
+            _ = await prewarmTask.value
+            guard rotationToken == token, !Task.isCancelled else { return }
+            self.prewarmTask = nil
+        }
+        // Walk the finite pool once. A failed candidate is negative-cached for this session, so a
+        // rotation tick never retries the same unavailable URL or expands the request set.
+        for offset in 1..<candidates.count {
+            guard rotationToken == token, !Task.isCancelled else { return }
+            let index = (currentIndex + offset) % candidates.count
+            let loaded = await preload(candidates[index])
+            guard rotationToken == token, !Task.isCancelled else { return }
+            if loaded {
+                currentIndex = index
+                movie = candidates[index]
+                prewarmNext(after: index)
+                return
+            }
+        }
+    }
+
+    private func showInitialCandidate() async {
+        guard !candidates.isEmpty, !Task.isCancelled else { return }
+        for index in candidates.indices.shuffled() {
+            if await preload(candidates[index]) {
+                guard !Task.isCancelled else { return }
+                currentIndex = index
+                movie = candidates[index]
+                prewarmNext(after: index)
+                return
+            }
+        }
+    }
+
+    private func prewarmNext(after index: Int) {
+        prewarmTask?.cancel()
+        guard candidates.count > 1 else {
+            prewarmTask = nil
+            return
+        }
+        let next = candidates[(index + 1) % candidates.count]
+        prewarmTask = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            return await self.preload(next)
+        }
+    }
+
+    private func preload(_ candidate: ProfilePickerMovie) async -> Bool {
+        if readyIDs.contains(candidate.id) {
+            let remainsDecoded = candidate.artworkURLs.contains { raw in
+                guard let url = URL(string: raw) else { return false }
+                return PosterImageLoader.cached(url, maxPixel: Self.artworkMaxPixel) != nil
+            }
+            if remainsDecoded { return true }
+            // The bounded decoded LRU may evict an older rotation candidate. The ID is only a
+            // hint; force the shared loader through its cache/URLCache path again before use.
+            readyIDs.remove(candidate.id)
+        }
+        if unavailableIDs.contains(candidate.id) { return false }
+        let image = await ArtworkFallbackPolicy.firstAvailable(candidate.artworkURLs) {
+            await PosterImageLoader.load($0, maxPixel: Self.artworkMaxPixel)
+        }
+        // Cancellation is not a real art failure; do not poison this candidate for the next visible
+        // picker session if the current view disappeared while its request was in flight.
+        guard !Task.isCancelled else { return false }
+        guard image != nil else {
+            unavailableIDs.insert(candidate.id)
+            return false
+        }
+        readyIDs.insert(candidate.id)
+        return true
+    }
+
+    private static func fetchCandidates() async -> [ProfilePickerMovie] {
+        let client = AddonClient()
+        guard let titles = try? await client.catalog(base: AddonClient.cinemeta,
+                                                     type: "movie", id: "top", genre: "Family") else {
+            return []
+        }
+
+        var seen = Set<String>()
+        let eligible = titles.filter { title in
+            guard title.type.lowercased() == "movie",
+                  title.id.hasPrefix("tt"),
+                  !title.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let poster = title.poster,
+                  let url = URL(string: poster),
+                  let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) else {
+                return false
+            }
+            return seen.insert(title.id).inserted
+        }
+        let bounded = Array(eligible.shuffled().prefix(candidateLimit))
+        guard !bounded.isEmpty else { return [] }
+
+        return bounded.map { title in
+            let metahub = "https://images.metahub.space/background/big/\(title.id)/img"
+            return ProfilePickerMovie(id: title.id,
+                                      name: title.name,
+                                      poster: title.poster,
+                                      background: metahub)
+        }
     }
 }
 

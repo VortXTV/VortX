@@ -20,6 +20,15 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   "$native_test_dir/UserProfile.swift" "$native_test_dir/Discovery.swift" app/SourcesShared/ProfileAddonPreferences.swift app/SourcesShared/VortxNativeProviderCredentials.swift app/SourcesShared/VortxNativeProfileEditHost.swift \
   app/Tests/VortxNativeSessionTests.swift -o "$native_test_dir/native-session"
 "$native_test_dir/native-session" "$native_test_dir"
+{
+    printf '%s\n' 'import Foundation'
+    sed -n '/^final class CoreSearchPublicationFence:/,/^}$/p' app/SourcesShared/CoreBridge.swift
+    sed -n '/^struct CoreBoardPageRequest {/,/^}$/p' app/SourcesShared/CoreBridge.swift
+} > "$native_test_dir/SearchPublication.swift"
+xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
+  "$native_test_dir/SearchPublication.swift" app/Tests/CoreSearchPublicationFenceTests.swift \
+  -o "$native_test_dir/search-publication"
+"$native_test_dir/search-publication"
 xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors \
   app/SourcesShared/VortxNativeBootstrapArchive.swift app/Tests/VortxNativeBootstrapArchiveTests.swift -o "$native_test_dir/bootstrap-archive"
 "$native_test_dir/bootstrap-archive"

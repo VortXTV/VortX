@@ -223,13 +223,35 @@ struct iOSSettingsView: View {
     }
 
     private var settingsCardRadius: CGFloat {
-        usesWideSettingsLayout ? Theme.Radius.card + 4 : Theme.Radius.control
+        usesWideSettingsLayout ? 24 : 18
     }
 
     private var settingsRowInsets: EdgeInsets {
         usesWideSettingsLayout
-            ? EdgeInsets(top: Theme.Space.sm, leading: Theme.Space.md, bottom: Theme.Space.sm, trailing: Theme.Space.md)
-            : EdgeInsets(top: Theme.Space.xs / 2, leading: Theme.Space.sm, bottom: Theme.Space.xs / 2, trailing: Theme.Space.sm)
+            ? EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20)
+            : EdgeInsets(top: 14, leading: 18, bottom: 14, trailing: 18)
+    }
+
+    /// Padding keeps text readable; this is the actual space between row cards. The old form only inset
+    /// the background shape, so neighbouring rounded boxes still touched even with generous row padding.
+    private var settingsRowSpacing: CGFloat {
+        usesWideSettingsLayout ? Theme.Space.sm : Theme.Space.xs
+    }
+
+    /// Wide surfaces can carry a little more of the active profile hue; the phone stays restrained so the
+    /// compact form remains dark and scannable instead of becoming a column of coloured slabs.
+    private var settingsTintAlpha: Double {
+        usesWideSettingsLayout ? 0.10 : 0.08
+    }
+
+    /// macOS Form does not expose `listRowSpacing`; keep its wide-column card breathing room with the
+    /// clipped background inset while iPhone/iPad use the real iOS row-spacing API above.
+    private var settingsCardVerticalInset: CGFloat {
+        #if os(macOS)
+        return Theme.Space.xs / 2
+        #else
+        return 0
+        #endif
     }
 
     var body: some View {
@@ -280,6 +302,9 @@ struct iOSSettingsView: View {
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .listRowInsets(settingsRowInsets)
+            #if os(iOS)
+            .listRowSpacing(settingsRowSpacing)
+            #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .frame(maxWidth: usesWideSettingsLayout ? 1120 : .infinity, alignment: .center)
             .padding(.horizontal, usesWideSettingsLayout ? Theme.Space.sm : 0)
@@ -459,9 +484,15 @@ struct iOSSettingsView: View {
     /// grouped-list platter when a new section is added.
     private func styledSettingsSection<Content: View>(_ content: Content) -> some View {
         content
-            .listRowBackground(Color.clear.vortxGlassListRow(
-                in: RoundedRectangle(cornerRadius: settingsCardRadius, style: .continuous)))
+            .listRowBackground(Color.clear.vortxGlassTintedSurface(
+                in: RoundedRectangle(cornerRadius: settingsCardRadius, style: .continuous),
+                fillAlpha: VortXGlass.cardFillAlpha,
+                tint: Theme.Palette.accent,
+                tintAlpha: settingsTintAlpha,
+                shadow: .flat)
+                .padding(.vertical, settingsCardVerticalInset))
             .listRowInsets(settingsRowInsets)
+            .listRowSeparator(.hidden)
     }
 
     /// The trimmed, lowercased query, computed once per body pass so `sectionMatches` is a plain `contains`.
@@ -693,7 +724,7 @@ struct iOSSettingsView: View {
         } header: {
             Text("Profiles")
         } footer: {
-            Text("Select a profile to edit it. Each profile keeps its own look, languages, PIN, and optionally its own Stremio account. A profile with a PIN asks for it before it can be edited.")
+            Text("Choose a profile to edit its colours, languages and watch history. Locked profiles need their PIN before editing.")
         }
     }
 
@@ -1857,7 +1888,7 @@ struct iOSSettingsView: View {
     @ViewBuilder private var tabBarSection: some View {
         Section {
             Toggle("Combine Home & Discover", isOn: $mergeHomeDiscover)
-            Toggle(mergeHomeDiscover ? "Show Browse in Home" : "Show Discover tab",
+            Toggle(mergeHomeDiscover ? "Show Discover in Home" : "Show Discover tab",
                    isOn: Binding(get: { !hideDiscoverTab }, set: { hideDiscoverTab = !$0 }))
             Toggle("Show Live TV tab", isOn: Binding(get: { !hideLiveTab }, set: { hideLiveTab = !$0 }))
             Toggle("Show Library tab", isOn: Binding(get: { !hideLibraryTab }, set: { hideLibraryTab = !$0 }))
@@ -1865,7 +1896,7 @@ struct iOSSettingsView: View {
         } header: {
             Text("Tab bar")
         } footer: {
-            Text("Combined Home has Featured and Browse modes. Turn the combination off to restore a separate Discover tab. Home, Add-ons, and Settings always stay. Hiding Browse returns Home to Featured; hiding another active tab lands on Home.")
+            Text("Combined Home has Featured and Discover modes. Turn the combination off to restore a separate Discover tab. Home, Add-ons, and Settings always stay. Hiding Discover returns Home to Featured; hiding another active tab lands on Home.")
         }
     }
 

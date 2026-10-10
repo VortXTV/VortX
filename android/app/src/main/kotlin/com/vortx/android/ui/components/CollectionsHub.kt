@@ -74,6 +74,12 @@ internal fun CollectionsHub(
     }
 }
 
+/** Search keeps the actual hub cards and targets in one query-matched horizontal row. */
+@Composable
+internal fun SearchCollectionsRail(tiles: List<CollectionsHubTile>, onOpen: (CollectionsHubTarget) -> Unit) {
+    HubTileRow(stringResource(R.string.collections_title), tiles, onOpen)
+}
+
 @Composable
 private fun ProviderLoading() {
     Row(

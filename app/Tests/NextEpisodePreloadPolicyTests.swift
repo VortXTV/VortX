@@ -362,6 +362,148 @@ struct NextEpisodePreloadPolicyTests {
         }
     }
 
+    /// Holds real pool operations behind cancellation-safe continuations. The
+    /// driver releases one admitted input and then waits for its replacement,
+    /// so retry coverage never depends on wall-clock timeout throughput.
+    private actor ControlledOperationGate {
+        private var closed = false
+        private var waiting: [Int: CheckedContinuation<Int?, Never>] = [:]
+        private var started: [Int] = []
+        private var active = 0
+        private var maximum = 0
+        private var startWaiters: [(Int, CheckedContinuation<Bool, Never>)] = []
+
+        func wait(for value: Int) async -> Int? {
+            await withTaskCancellationHandler(operation: {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Int?, Never>) in
+                    guard !closed else {
+                        continuation.resume(returning: nil)
+                        return
+                    }
+                    waiting[value] = continuation
+                    started.append(value)
+                    active += 1
+                    maximum = max(maximum, active)
+                    resumeReadyStartWaiters()
+                }
+            }, onCancel: {
+                Task { await self.close() }
+            })
+        }
+
+        @discardableResult
+        func release(value: Int, result: Int?) -> Bool {
+            guard let continuation = waiting.removeValue(forKey: value) else {
+                return false
+            }
+            continuation.resume(returning: result)
+            return true
+        }
+
+        func end() {
+            active = max(0, active - 1)
+        }
+
+        func waitForStarted(_ count: Int) async -> Bool {
+            guard !closed else { return false }
+            guard started.count < count else { return true }
+            return await withCheckedContinuation { continuation in
+                if closed {
+                    continuation.resume(returning: false)
+                } else {
+                    startWaiters.append((count, continuation))
+                }
+            }
+        }
+
+        func close() {
+            guard !closed else { return }
+            closed = true
+            let continuations = waiting.values
+            waiting.removeAll()
+            for continuation in continuations {
+                continuation.resume(returning: nil)
+            }
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            for (_, continuation) in waiters {
+                continuation.resume(returning: false)
+            }
+        }
+
+        func snapshot() -> (started: [Int], maximum: Int) {
+            (started, maximum)
+        }
+
+        private func resumeReadyStartWaiters() {
+            let ready = startWaiters.filter { started.count >= $0.0 }
+            startWaiters.removeAll { started.count >= $0.0 }
+            for (_, continuation) in ready {
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
+    private struct ControlledAttemptReport: Sendable {
+        let results: [Int?]
+        let started: [Int]
+        let maximum: Int
+        let healthy: Bool
+    }
+
+    private static func controlledRetryAttempt(
+        order: [Int],
+        limit: Int
+    ) async -> ControlledAttemptReport {
+        let gate = ControlledOperationGate()
+        let worker = Task<[Int?], Never> {
+            let results: [Int?] = await BoundedPreloadWorkPool.map(
+                order,
+                limit: limit,
+                timeoutNanoseconds: 5_000_000_000,
+                operationTimeoutNanoseconds: nil
+            ) { value in
+                let result = await gate.wait(for: value)
+                await gate.end()
+                return result
+            }
+            await gate.close()
+            return results
+        }
+        let watchdog = Task<Void, Never> {
+            try? await Task<Never, Never>.sleep(nanoseconds: 5_000_000_000)
+            await gate.close()
+        }
+
+        var healthy = await gate.waitForStarted(limit)
+        if healthy {
+            for index in 0..<20 {
+                let value = order[index]
+                let result = (value == 23 || value == 37) ? value : nil
+                guard await gate.release(value: value, result: result) else {
+                    healthy = false
+                    break
+                }
+                guard await gate.waitForStarted(limit + index + 1) else {
+                    healthy = false
+                    break
+                }
+            }
+        }
+
+        worker.cancel()
+        await gate.close()
+        let results = await worker.value
+        watchdog.cancel()
+        let snapshot = await gate.snapshot()
+        return ControlledAttemptReport(
+            results: results,
+            started: snapshot.started,
+            maximum: snapshot.maximum,
+            healthy: healthy
+        )
+    }
+
     private static func addonFanoutIsBoundedAndRetainsPartialResults() async {
         let counter = ConcurrencyCounter()
         let results: [Int?] = await BoundedPreloadWorkPool.map(
@@ -405,99 +547,225 @@ struct NextEpisodePreloadPolicyTests {
         )
     }
 
-    private static func hungFirstWindowAdvancesToLaterAddons() async {
-        let counter = ConcurrencyCounter()
-        let results: [Int?] = await BoundedPreloadWorkPool.map(
-            Array(0..<12),
-            limit: 5,
-            timeoutNanoseconds: 300_000_000,
-            operationTimeoutNanoseconds: 40_000_000
-        ) { value in
-            await counter.begin(value)
-            do {
-                if value < 5 {
-                    try await Task<Never, Never>.sleep(
-                        nanoseconds: 1_000_000_000
-                    )
-                } else {
-                    try await Task<Never, Never>.sleep(
-                        nanoseconds: 5_000_000
-                    )
+    /// Holds the first five real pool operations behind cancellation-safe
+    /// continuations. Each per-input timeout retires only its own operation;
+    /// the replacement admission is therefore driven by production timer
+    /// cancellation rather than a competing sleep-duration assumption.
+    private actor TimedOperationGate {
+        private var closed = false
+        private var cancelled: Set<Int> = []
+        private var waiting: [Int: CheckedContinuation<Int?, Never>] = [:]
+        private var started: [Int] = []
+        private var ended: [Int] = []
+        private var activeValues: Set<Int> = []
+        private var active = 0
+        private var maximum = 0
+        private var watchdogFired = false
+        private var startWaiters: [(Int, CheckedContinuation<Bool, Never>)] = []
+
+        func wait(for value: Int) async -> Int? {
+            await withTaskCancellationHandler(operation: {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Int?, Never>) in
+                    guard !closed, !cancelled.contains(value), !Task.isCancelled else {
+                        continuation.resume(returning: nil)
+                        return
+                    }
+                    waiting[value] = continuation
+                    activeValues.insert(value)
+                    started.append(value)
+                    active += 1
+                    maximum = max(maximum, active)
+                    resumeReadyStartWaiters()
                 }
-            } catch {
-                await counter.end()
-                return nil
-            }
-            await counter.end()
-            guard !Task.isCancelled else { return nil }
+            }, onCancel: {
+                Task { await self.cancel(value) }
+            })
+        }
+
+        func cancel(_ value: Int) {
+            cancelled.insert(value)
+            guard let continuation = waiting.removeValue(forKey: value) else { return }
+            continuation.resume(returning: nil)
+        }
+
+        func finishImmediately(_ value: Int) -> Int {
+            activeValues.insert(value)
+            started.append(value)
+            active += 1
+            maximum = max(maximum, active)
+            active -= 1
+            activeValues.remove(value)
+            ended.append(value)
+            resumeReadyStartWaiters()
             return value
         }
-        let snapshot = await counter.snapshot()
-        expect(snapshot.maximum <= 5,
+
+        func end(_ value: Int) {
+            guard activeValues.remove(value) != nil else { return }
+            active = max(0, active - 1)
+            ended.append(value)
+        }
+
+        func waitForStarted(_ count: Int) async -> Bool {
+            guard started.count < count else { return true }
+            guard !closed else { return false }
+            return await withCheckedContinuation { continuation in
+                if closed {
+                    continuation.resume(returning: false)
+                } else {
+                    startWaiters.append((count, continuation))
+                }
+            }
+        }
+
+        func markWatchdogFired() {
+            watchdogFired = true
+            close()
+        }
+
+        func close() {
+            guard !closed else { return }
+            closed = true
+            let continuations = waiting.values
+            waiting.removeAll()
+            for continuation in continuations {
+                continuation.resume(returning: nil)
+            }
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            for (_, continuation) in waiters {
+                continuation.resume(returning: false)
+            }
+        }
+
+        func snapshot() -> (
+            started: [Int],
+            ended: [Int],
+            maximum: Int,
+            waitingCount: Int,
+            active: Int,
+            watchdogFired: Bool
+        ) {
+            (started, ended, maximum, waiting.count, activeValues.count, watchdogFired)
+        }
+
+        private func resumeReadyStartWaiters() {
+            let ready = startWaiters.filter { started.count >= $0.0 }
+            startWaiters.removeAll { started.count >= $0.0 }
+            for (_, continuation) in ready {
+                continuation.resume(returning: true)
+            }
+        }
+    }
+
+    private struct TimedAttemptReport: Sendable {
+        let results: [Int?]
+        let started: [Int]
+        let ended: [Int]
+        let maximum: Int
+        let waitingCount: Int
+        let active: Int
+        let healthy: Bool
+    }
+
+    private static func hungFirstWindowAdvancesToLaterAddons() async {
+        let report = await runTimedWindow()
+        expect(report.healthy,
+               "timed add-on fixture reaches replacement admission before its watchdog")
+        expect(report.maximum <= 5,
                "timed add-on slices never exceed the five-request window")
-        expect(snapshot.started.contains(5),
+        expect(report.started.contains(5),
                "five hung account-leading add-ons do not block the next provider")
-        expect(results[5] == 5,
+        expect(report.results.indices.contains(5) && report.results[5] == 5,
                "a later working add-on survives after the hung first window")
+        expect(
+            report.results.prefix(5).allSatisfy { $0 == nil }
+                && report.waitingCount == 0
+                && report.active == 0,
+            "the timer retires held work without leaked continuations or active operations"
+        )
+    }
+
+    private static func runTimedWindow() async -> TimedAttemptReport {
+        let gate = TimedOperationGate()
+        let worker = Task<[Int?], Never> {
+            let results = await BoundedPreloadWorkPool.map(
+                Array(0..<12),
+                limit: 5,
+                timeoutNanoseconds: 1_000_000_000,
+                operationTimeoutFor: { value in
+                    value < 5 ? 40_000_000 : nil
+                }
+            ) { value in
+                if value < 5 {
+                    let result = await gate.wait(for: value)
+                    await gate.end(value)
+                    return result
+                }
+                return await gate.finishImmediately(value)
+            }
+            await gate.close()
+            return results
+        }
+        let watchdog = Task<Void, Never> {
+            do {
+                try await Task<Never, Never>.sleep(nanoseconds: 3_000_000_000)
+            } catch {
+                return
+            }
+            await gate.markWatchdogFired()
+        }
+
+        let initialWindowRegistered = await gate.waitForStarted(5)
+        let results = await worker.value
+        watchdog.cancel()
+        let snapshot = await gate.snapshot()
+        return TimedAttemptReport(
+            results: results,
+            started: snapshot.started,
+            ended: snapshot.ended,
+            maximum: snapshot.maximum,
+            waitingCount: snapshot.waitingCount,
+            active: snapshot.active,
+            healthy: initialWindowRegistered && !snapshot.watchdogFired
+        )
     }
 
     private static func boundedRetriesRotateWithoutChangingAccountOrder() async {
-        let counter = ConcurrencyCounter()
-        var firstAttemptStarted: [Int] = []
-        var secondAttemptResults: [Int] = []
+        let limit = NextEpisodePreloadPolicy.addonConcurrencyLimit
+        let order1 = PreloadProviderRotation.order(
+            count: 50,
+            attemptSequence: 1,
+            stride: NextEpisodePreloadPolicy.providerRotationStride
+        )
+        let order2 = PreloadProviderRotation.order(
+            count: 50,
+            attemptSequence: 2,
+            stride: NextEpisodePreloadPolicy.providerRotationStride
+        )
+        let first = await controlledRetryAttempt(order: order1, limit: limit)
+        let second = await controlledRetryAttempt(order: order2, limit: limit)
+        let restored = PreloadProviderRotation.restoreOriginalOrder(
+            second.results,
+            order: order2,
+            count: 50
+        ).compactMap { $0 }
 
-        for sequence in 1...2 {
-            let order = PreloadProviderRotation.order(
-                count: 50,
-                attemptSequence: sequence,
-                stride: NextEpisodePreloadPolicy.providerRotationStride
-            )
-            let rotatedInputs = order.map { $0 }
-            let rotatedResults: [Int?] = await BoundedPreloadWorkPool.map(
-                rotatedInputs,
-                limit: NextEpisodePreloadPolicy.addonConcurrencyLimit,
-                timeoutNanoseconds: 190_000_000,
-                operationTimeoutNanoseconds: 40_000_000
-            ) { value in
-                await counter.begin(value)
-                do {
-                    if value == 23 || value == 37 {
-                        try await Task<Never, Never>.sleep(
-                            nanoseconds: 5_000_000
-                        )
-                    } else {
-                        try await Task<Never, Never>.sleep(
-                            nanoseconds: 1_000_000_000
-                        )
-                    }
-                } catch {
-                    await counter.end()
-                    return nil
-                }
-                await counter.end()
-                guard !Task.isCancelled else { return nil }
-                return value
-            }
-            let restored = PreloadProviderRotation.restoreOriginalOrder(
-                rotatedResults,
-                order: order,
-                count: 50
-            )
-            if sequence == 1 {
-                firstAttemptStarted = await counter.snapshot().started
-            } else {
-                secondAttemptResults = restored.compactMap { $0 }
-            }
-        }
-
-        let snapshot = await counter.snapshot()
-        expect(!firstAttemptStarted.contains(37),
+        expect(
+            first.healthy && first.started.count == 25,
+            "attempt 1 reaches every controlled replacement admission"
+        )
+        expect(
+            second.healthy && second.started.count == 25,
+            "attempt 2 reaches every controlled replacement admission"
+        )
+        expect(!first.started.contains(37),
                "the working provider is beyond the first bounded attempt window")
-        expect(snapshot.started.contains(37),
+        expect(second.started.contains(37),
                "a bounded retry rotates far enough to attempt the later provider")
-        expect(secondAttemptResults == [23, 37],
+        expect(restored == [23, 37],
                "rotated fetch results return to original account order before ranking")
-        expect(snapshot.maximum <= NextEpisodePreloadPolicy.addonConcurrencyLimit,
+        expect(max(first.maximum, second.maximum) <= limit,
                "fair retry rotation preserves the five-request concurrency limit")
     }
 
@@ -567,7 +835,8 @@ struct NextEpisodePreloadPolicyTests {
             "PlayerScreen warms the admitted request under its captured source/language choice"
         )
         expect(
-            detail?.contains("request: request,\n        stride: NextEpisodePreparationBudget.providerRotationStride") == true,
+            detail?.contains("EpisodeSourceCollection.rawGroups(sources: sources, episodeID: request.episodeID") == true
+                && detail?.contains("attemptSequence: request.attemptSequence") == true,
             "iOS/macOS production warming rotates providers from the player request sequence"
         )
     }

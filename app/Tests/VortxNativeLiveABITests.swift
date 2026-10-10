@@ -1,11 +1,96 @@
 import Foundation
 import CryptoKit
 
+private final class NativeFieldNotifications: @unchecked Sendable {
+    private let lock = NSLock()
+    private var batches: [[String]] = []
+    func append(_ fields: [String]) { lock.withLock { batches.append(fields) } }
+    func drain() -> [[String]] { lock.withLock { defer { batches = [] }; return batches } }
+}
+
 /// Runs only in the explicit ABI integration harness, against a caller-supplied private artifact.
 /// No app process, real account, media decoder or external provider is involved.
 @main enum VortxNativeLiveABITests {
     static func check(_ condition: Bool, line: Int = #line) { precondition(condition, "live ABI assertion at line \(line)") }
+    static func shortUnwatchedEpisode() throws {
+        let runtime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: "short-play-owner", ownerName: "Fixture")
+        defer { runtime.close() }
+        check(try runtime.dispatch(#"{"type":"bind_sync_scope","scope":"short-play-fixture"}"#, now: 1000).contains("\"ok\":true"))
+        let action = #"{"type":"report_progress","metaId":"fresh-series","videoId":"fresh-series:1:1","name":"Fresh series","positionMs":1000,"durationMs":1375000,"metadata":{"type":"series"}}"#
+        check(try runtime.dispatch(action, now: 1001).contains("\"ok\":true"))
+        func verify(_ candidate: VortxNativeRuntime) throws {
+            let state = try JSONDecoder().decode(VortxJSON.self, from: Data(candidate.stateJSON().utf8))
+            let response = try candidate.resolve(#"{"kind":"profile_playback","profileId":"short-play-owner"}"#)
+            let playback = try JSONDecoder().decode(VortxJSON.self, from: Data(response.utf8))
+            check(playback["kind"] == .string("profile_playback"))
+            let row = playback["continueWatching"]?.array?.first { $0["metaId"] == .string("fresh-series") }
+            check(row?["videoId"] == .string("fresh-series:1:1") && row?["offsetMs"] == .integer(1000))
+            check(row?["durationMs"] == .integer(1375000) && row?["watched"] == .bool(false))
+            check(playback["watchedTitles"]?["fresh-series"] == nil)
+            check(playback["watchedVideoIdsByTitle"]?["fresh-series"]?.array?.contains(.string("fresh-series:1:1")) != true)
+            check(state["libraries"]?["short-play-owner"]?["items"] == .array([]))
+        }
+        try verify(runtime)
+        let cold = try VortxNativeRuntime(abi: VortxCABI(), snapshot: runtime.stateJSON())
+        defer { cold.close() }; try verify(cold)
+        print("Live native short episode: 1000/1375000ms is unwatched Continue Watching, retains exact episode, stays unsaved and survives cold hydration")
+    }
+    static func changedFieldNotifications(addon: VortxResourceAddon) async throws {
+        let scope = VortxAccountScope(account: "notification-fixture", ownerProfileID: "notification-owner")
+        let checkpoint = try VortxEncryptedCheckpointStore(directory: URL(fileURLWithPath: CommandLine.arguments[3]).appendingPathComponent("notifications"), key: SymmetricKey(size: .bits256))
+        let session = try VortxNativeSession(scope: scope, ownerName: "Fixture", abi: VortxCABI(), store: checkpoint,
+                                            transport: VortxCResourceTransport(), allowNewAccount: true)
+        let events = NativeFieldNotifications()
+        let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], changed: { events.append($0) })
+        func field(_ name: String) throws -> VortxJSON { try JSONDecoder().decode(VortxJSON.self, from: facade.stateData(name)!) }
+        func dispatch(_ action: VortxJSON) async throws {
+            check(facade.dispatch(data: try JSONEncoder().encode(VortxJSON.object(["action": .string("Vortx"), "args": action])), field: "native_state"))
+            await facade.settled()
+            check(facade.lastFailure == nil)
+        }
+        _ = try await facade.mergeSyncDocument(nil); _ = events.drain() // warm optional projections
+        let unchanged = try await facade.mergeSyncDocument(nil)
+        check(unchanged["scope"] != nil && events.drain().isEmpty) // completion survives no notification
+        try await dispatch(.object(["type": .string("add_profile"), "id": .string("notification-kid"), "name": .string("Kid")]))
+        check(events.drain().filter { $0.contains("ctx") }.count == 1) // roster changes account identity
+        let sameDescriptors = try field("ctx")
+        for profile in ["notification-kid", scope.ownerProfileID] {
+            try await dispatch(.object(["type": .string("switch_profile"), "id": .string(profile)]))
+            let transition = events.drain()
+            check(try transition.filter { $0.contains("ctx") }.count == 1 && field("ctx") == sameDescriptors)
+            check(facade.registryBinding?.profileID == profile) // busy bookkeeping released
+            try await dispatch(.object(["type": .string("switch_profile"), "id": .string(profile)]))
+            check(!events.drain().flatMap { $0 }.contains("ctx"))
+        }
+        try await dispatch(.object(["type": .string("install_addon"), "profileId": .string(scope.ownerProfileID),
+            "addon": .object(["transportUrl": .string(addon.transportUrl), "manifest": addon.manifest!])]))
+        check(events.drain().filter { $0.contains("ctx") }.count == 1)
+        _ = try await facade.mergeSyncDocument(nil); check(events.drain().isEmpty)
+        for position in [1000, 2000] {
+            try await dispatch(.object(["type": .string("report_progress"), "metaId": .string("notification-series"),
+                "videoId": .string("notification-series:1:1"), "name": .string("Fixture"), "positionMs": .integer(Int64(position)),
+                "durationMs": .integer(1375000), "metadata": .object(["type": .string("series")])]))
+            let changed = Set(events.drain().flatMap { $0 })
+            check(changed.contains("native_playback") && changed.contains("continue_watching_preview") && changed.contains("native_state"))
+            check(changed.isDisjoint(with: ["ctx", "board", "search", "meta_details"]))
+            check(facade.cachedResumeSeconds(id: "notification-series:1:1") == Double(position) / 1000)
+            _ = try await facade.mergeSyncDocument(nil); check(events.drain().isEmpty)
+        }
+        let addLibrary: VortxJSON = .object(["action": .string("Ctx"), "args": .object(["action": .string("AddToLibrary"),
+            "args": .object(["id": .string("notification-series"), "type": .string("series"), "name": .string("Fixture")])])])
+        check(facade.dispatch(data: try JSONEncoder().encode(addLibrary), field: "ctx")); await facade.settled()
+        let libraryChanges = Set(events.drain().flatMap { $0 })
+        check(libraryChanges.contains("library") && !libraryChanges.contains("ctx"))
+        check(try field("library")["catalog"]?.array?.count == 1)
+        _ = try await facade.mergeSyncDocument(nil); check(events.drain().isEmpty)
+        // Explicit registry repair remains a context notification even with equal descriptors.
+        try await facade.rebindRegistry([addon], expected: facade.registryBinding!)
+        check(events.drain() == [["ctx"]])
+        await facade.shutdown()
+        print("Live native field notifications: no-op acknowledgments quiet; progress changes playback/CW without ctx/search; equal-descriptor profile identity, addon change and explicit rebind each notify ctx; library remains live")
+    }
     static func main() async throws {
+        try shortUnwatchedEpisode()
         let runtime = try VortxNativeRuntime(abi: VortxCABI(), ownerID: "fixture-owner", ownerName: "Fixture")
         let add = try runtime.dispatch(#"{"type":"add_profile","id":"fixture-kid","name":"Kid"}"#, now: 1000)
         check(add.contains("\"ok\":true"))
@@ -23,6 +108,7 @@ import CryptoKit
         let fixture = try JSONDecoder().decode([String: VortxJSON].self, from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))
         let port = CommandLine.arguments[2]
         let addon = VortxResourceAddon(id: "source-identity", transportUrl: "http://127.0.0.1:\(port)/manifest.json", manifest: fixture["manifest"])
+        try await changedFieldNotifications(addon: addon)
         let bridge = VortxResourceBridge(transport: try VortxCResourceTransport())
         for resource in [VortxResourceRequest.Resource.catalog, .meta, .stream, .subtitles] {
             let id = resource == .catalog ? "popular" : "tt-fixture"
@@ -152,11 +238,13 @@ import CryptoKit
         catch VortxNativeError.superseded {}
         try dispatch(["action": "Ctx", "args": ["action": "AddToLibrary", "args": ["id": "tt-fixture", "type": "series", "name": "Fixture"]]], field: "ctx")
         await facade.settled(); check(try field("library")["catalog"]?.array?.count == 1)
+        let beforeAmbiguousProgress = try field("native_state")["libraries"]?["fixture-owner"]
         try dispatch(["action": "Vortx", "args": ["type": "add_profile", "id": "kid", "name": "Kid"]], field: "native_state")
         try dispatch(["action": "Vortx", "args": ["type": "report_progress", "metaId": "tt-fixture", "name": "Fixture", "positionMs": 120000, "durationMs": 1200000]], field: "native_state")
         await facade.settled()
         check(try field("native_state")["roster"]?["profiles"]?["kid"] != nil)
-        check(try field("native_state")["libraries"]?["fixture-owner"]?["resume"]?["tt-fixture"] != nil)
+        check(try field("native_state")["libraries"]?["fixture-owner"]?["resume"]?["tt-fixture"] == nil)
+        check(try field("native_state")["libraries"]?["fixture-owner"] == beforeAmbiguousProgress)
         let selected: [String: Any] = ["metaRequest": ["base": addon.transportUrl, "path": metaPath],
                                       "streamRequest": ["base": addon.transportUrl, "path": streamPath],
                                       "stream": ["url": "https://media.example/selected.m3u8"]]

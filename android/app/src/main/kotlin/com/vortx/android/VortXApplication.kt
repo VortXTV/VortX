@@ -116,7 +116,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
         { withContext(Dispatchers.Main) {
             ProfileStore.sharedOrNull()?.attachNativeGateway(nativeProfiles)
         } },
-        { applicationScope.launch { syncManager?.onLocalOwnerLibraryChanged() }; Unit },
+        { origin -> applicationScope.launch { syncManager?.onLocalNativeMutation(origin) }; Unit },
         { applicationScope.launch(Dispatchers.Main) {
             if (runCatching { nativeAccounts.session() }.isFailure) {
                 ProfileStore.sharedOrNull()?.clearNativeProjection()
@@ -378,7 +378,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 // startRealtime. Fail-soft + a no-op when signed out or already live, and every pull it
                 // triggers is version-guarded (applies only a strictly-newer remote and defers while a
                 // local push is queued), so it never clobbers local state.
-                if (startedActivities == 0) manager.startRealtime()
+                if (startedActivities == 0) manager.setRealtimeForeground(true)
                 startedActivities++
             }
 
@@ -386,7 +386,7 @@ class VortXApplication : Application(), SingletonImageLoader.Factory {
                 if (startedActivities > 0) startedActivities--
                 // 1 -> 0: the app left the foreground. Close the socket + poll (Apple's scene-.background
                 // stopRealtime); the next foreground re-opens them. Safe to call repeatedly.
-                if (startedActivities == 0) manager.stopRealtime()
+                if (startedActivities == 0) manager.setRealtimeForeground(false)
             }
 
             override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {}

@@ -23,6 +23,7 @@ web/
 
 # --- generated Xcode project (produced by XcodeGen from app/project.yml) ---
 app/*.xcodeproj
+app/project-native-beta*.yml
 
 # --- reference IPAs (Stremio's proprietary binaries, never commit) ---
 reference/

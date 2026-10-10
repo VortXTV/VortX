@@ -49,6 +49,22 @@ private final class FixtureTransport: VortxResourceTransport, @unchecked Sendabl
                               .object(["addonId": .string("b"), "status": .string("timeout"), "error": .object(["code": .string("timeout")])])]),
         ]
         if request["id"] == .string("wrong") { response["requestId"] = .string("foreign-request") }
+        if request["id"] == .string("malformed") {
+            response["groups"] = .array([
+                .object(["addonId": .string("a"), "status": .string("ready"), "content": fixture[resource]!]),
+                .object(["addonId": .string("b"), "status": .string("ready"), "content": .string("malformed-private-payload")]),
+            ])
+        }
+        if request["id"] == .string("duplicate-source") {
+            response["groups"] = .array([response["groups"]!.array![0], response["groups"]!.array![0]])
+        }
+        if request["id"] == .string("foreign-source") {
+            response["groups"] = .array([.object(["addonId": .string("unknown"), "status": .string("ready"), "content": fixture[resource]!])])
+        }
+        if request["id"] == .string("wrong-generation") { response["generation"] = .integer(0) }
+        if request["id"] == .string("wrong-path") {
+            response["request"] = .object(["resource": .string(resource), "type": .string("movie"), "id": .string("other"), "extra": .array([])])
+        }
         return String(decoding: try JSONEncoder().encode(VortxJSON.object(response)), as: UTF8.self)
     }
 }
@@ -56,6 +72,14 @@ private final class FixtureTransport: VortxResourceTransport, @unchecked Sendabl
 @main enum VortxNativeBridgeTests {
     static func check(_ value: Bool) { precondition(value) }
     static func main() async throws {
+        var streamBudget = VortxResourceContentBudget(), metaBudget = VortxResourceContentBudget()
+        let large: VortxJSON = .object(["streams": .array([.object(["description": .string(String(repeating: "x", count: 8_388_608 - 1024))])])])
+        for _ in 0..<4 { check(try streamBudget.claim(large)) } // preserve near8MiB individual providers
+        let beforeOverflow = streamBudget.usedBytes
+        check(try !streamBudget.claim(large))
+        check(streamBudget.usedBytes == beforeOverflow && streamBudget.usedBytes <= 33_554_432)
+        check(try streamBudget.claim(.object(["streams": .array([])]))) // overflow leaves peers' remaining capacity intact
+        check(try metaBudget.claim(large)) // metadata has its own incumbent32MiB resource budget
         let abi = FakeRuntime()
         let runtime = try VortxNativeRuntime(abi: abi, ownerID: "account/profile-a", ownerName: "A")
         _ = try runtime.dispatch("{}", now: 1)
@@ -104,8 +128,19 @@ private final class FixtureTransport: VortxResourceTransport, @unchecked Sendabl
         let subtitleRows = try VortxResourceProjection.subtitles(subtitles, registry: addons)
         precondition(subtitleRows.array![0]["content"]!["content"]!.array!.count == 2)
         precondition(subtitleRows.array![1]["content"]!["type"] == .string("Err"))
-        do { _ = try await bridge.load(ownerID: "owner", request: request(.stream, "wrong"), addons: addons); fatalError("foreign response accepted") }
-        catch VortxNativeError.invalidResponse {}
+        for kind: VortxResourceRequest.Resource in [.catalog, .meta, .stream, .subtitles] {
+            let isolated = try await bridge.load(ownerID: "owner", request: request(kind, "malformed"), addons: addons)
+            check(isolated.groups.map(\.addonId) == ["a", "b"])
+            check(isolated.groups[0].status == .ready && isolated.groups[0].content == fixtures[kind.rawValue])
+            check(isolated.groups[1].status == .error && isolated.groups[1].content == nil)
+            check(isolated.groups[1].error?.code == "invalid_response")
+            let row = try VortxResourceProjection.entry(isolated.groups[1], request: isolated.request, registry: addons)
+            check(row["content"]?["type"] == .string("Err"))
+        }
+        for id in ["wrong", "wrong-generation", "wrong-path", "duplicate-source", "foreign-source"] {
+            do { _ = try await bridge.load(ownerID: "owner", request: request(.stream, id), addons: addons); fatalError("invalid envelope accepted: \(id)") }
+            catch VortxNativeError.invalidResponse {}
+        }
 
         let slow = Task { try await bridge.load(ownerID: "old-owner", request: request(.stream, "slow"), addons: addons) }
         await transport.waitForEntry()

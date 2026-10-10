@@ -24,6 +24,14 @@ enum MacBrowseFocus: Hashable {
 }
 
 extension View {
+    /// Cards retain keyboard focus without a box enclosing the poster and its captions.
+    func macCardFocus(_ isFocused: Bool) -> some View {
+        self
+            .shadow(color: .white.opacity(isFocused ? 0.22 : 0), radius: 12, y: 3)
+            .accessibilityAddTraits(isFocused ? [.isSelected] : [])
+            .focusEffectDisabled()
+    }
+
     /// A visible focus ring for the keyboard-focused poster / tab, using only Theme accent tokens and
     /// compositor-friendly properties (transform + opacity + a stroked overlay, never layout), per
     /// docs/DESIGN-SYSTEM.md. Applied only on macOS and only when `isFocused`, so touch / VoiceOver never sees a ring.

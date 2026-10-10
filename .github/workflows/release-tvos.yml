@@ -155,7 +155,7 @@ jobs:
           # checkout. A future main pin bump must disable this one-cut recovery fail-closed.
           NATIVE_PIN="$(awk '/^      - name: Fetch vortx-core / {step=1; next} step && /^      - / {exit} step && /^          ref:/ {print $2}' .github/workflows/release-tvos.yml)"
           PLAYER_PINS="$(awk '/^      - name: Fetch the MPVKit-DVFEL artifacts / {step=1; next} step && /^      - / {exit} step && /^          (URL|EXPECTED)=/ {sub(/^          /, ""); print}' .github/workflows/release-tvos.yml)"
-          [ "$NATIVE_PIN" = 7e3e68be5bf2b11c65d158c1823be94bd1608d1b ] || exit 1
+          [ "$NATIVE_PIN" = 0c201563c6aa54eeb0545b55ad01582c0c3bcae3 ] || exit 1
           [ "$PLAYER_PINS" = 'EXPECTED="737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1"
           URL="https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip"' ] || exit 1
           gh api -- "repos/$GH_REPO/compare/$BUILD_SOURCE_SHA...$GITHUB_SHA" | jq -e --arg source "$BUILD_SOURCE_SHA" '
@@ -198,7 +198,7 @@ jobs:
           set -euo pipefail
           [ "$(git rev-parse HEAD)" = "$BUILD_SOURCE_SHA" ] && [ -z "$(git status --porcelain)" ] || exit 1
           # Recovery is only packaging orchestration: retain the exact private and vendor pins.
-          grep -Fq 'ref: 7e3e68be5bf2b11c65d158c1823be94bd1608d1b' .github/workflows/release-tvos.yml
+          grep -Fq 'ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3' .github/workflows/release-tvos.yml
           grep -Fq 'vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip' .github/workflows/release-tvos.yml
 
       - name: Bind native acceptance tooling to workflow and source provenance
@@ -278,7 +278,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: 7e3e68be5bf2b11c65d158c1823be94bd1608d1b
+          ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -287,7 +287,7 @@ jobs:
         run: |
           set -euo pipefail
           NATIVE_REVISION="$(git -C _vortx_core_src rev-parse HEAD)"
-          [ "$NATIVE_REVISION" = 7e3e68be5bf2b11c65d158c1823be94bd1608d1b ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
+          [ "$NATIVE_REVISION" = 0c201563c6aa54eeb0545b55ad01582c0c3bcae3 ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
           echo "VORTX_ENGINE_SOURCE_REVISION=$NATIVE_REVISION" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
@@ -527,6 +527,20 @@ jobs:
         run: |
           rustup component add llvm-tools-preview 2>/dev/null || true
           ./scripts/verify-apple-engine-artifacts.sh
+
+      - name: Verify native account and episode ABI against the reviewed engine
+        if: env.VORTX_NATIVE_ONLY == 'true'
+        run: |
+          set -euo pipefail
+          # Exercise the real C/Swift boundary with synthetic local account data only.
+          # This remains a strict disk-backed checkpoint gate, including Complete file
+          # protection; an unavailable protection class fails rather than weakening it.
+          MACOSX_DEPLOYMENT_TARGET=14.0 cargo +nightly-2026-07-19 build --locked \
+            --manifest-path vortx-core/Cargo.toml -p vortx-ffi \
+            --no-default-features --features resource-host --release --target aarch64-apple-darwin
+          VORTX_FFI_HEADER="$PWD/app/Vendor/VortxEngine.xcframework/macos-arm64/Headers/vortx/vortx_ffi.h" \
+            VORTX_FFI_LIBRARY="$PWD/vortx-core/target/aarch64-apple-darwin/release/libvortx_ffi.dylib" \
+            bash scripts/test-native-cutover-live-abi.sh
 
       # The self-built player stack. `app/Vendor/MPVKit-DVFEL/artifacts/` is gitignored and reproducing it
       # needs a multi-hour nine-slice source build, so CI fetches the prebuilt xcframeworks the same way it
@@ -1400,9 +1414,11 @@ jobs:
               .path == ".github/workflows/release-tvos.yml" and .event == "workflow_dispatch" and .head_sha == $sha and .head_branch == $branch and
               .status == "completed" and (.conclusion == "success" or .conclusion == "failure")' "$RECORD" >/dev/null
           done
-          # One-cut retry of a proven pre-write identity failure. This admits only the already
-          # accepted build bytes; the fresh draft/tag/content checks below still run unchanged.
+          # Exact retries of proven pre-write failures. These admit only the already accepted
+          # build bytes; fresh draft/tag/content checks and upload-log authentication still run.
           PREWRITE_RETRY=false
+          RETRY_BUILD_ID=0; RETRY_ATTACH_ID=0; RETRY_FAILURE=''
+          RETRY_SUCCEEDED='[]'; RETRY_SKIPPED='[]'
           if [ "$RUN_ID" = 37948656496 ] && [ "$ATTEMPT" = 1 ] &&
              [ "$BUILD_WORKFLOW_SHA" = 2eb740ee611c6a602f1d54679b5e5b13daeb7ce4 ] &&
              [ "$BUILD_SOURCE_SHA" = 844782d29a93ae51991bfadc639d50bc3619d40b ] &&
@@ -1412,10 +1428,38 @@ jobs:
             jq -e '.conclusion == "failure"' "$RUNNER_TEMP/source-latest-run.json" >/dev/null
             jq -e '.conclusion == "failure"' "$RUNNER_TEMP/source-run.json" >/dev/null
             PREWRITE_RETRY=true
+            RETRY_BUILD_ID=113881434421; RETRY_ATTACH_ID=113915206994
+            RETRY_FAILURE='Bind the draft release, tag commit, and monotonic source before any write'
+            RETRY_SUCCEEDED='["Validate immutable handoff provenance before coordinator resume", "Download and authenticate immutable handoff archives"]'
+            RETRY_SKIPPED='["Attach only exact draft assets and create the authenticated staged receipt", "Atomically activate the staged feed, prove routes, then publish last"]'
+          elif [ "$RUN_ID" = 37976846977 ] && [ "$ATTEMPT" = 1 ] &&
+               [ "$BUILD_WORKFLOW_SHA" = c4ef656587d70f4f673f28d4766525f48f17897b ] &&
+               [ "$BUILD_SOURCE_SHA" = c4ef656587d70f4f673f28d4766525f48f17897b ] &&
+               [ "$BUILD_BRANCH" = v0.5.0-beta.2 ] && [ "$TAG" = v0.5.0-beta.2 ] &&
+               [ "$RELEASE_ID_INPUT" = 408240903 ] && [ "$(jq -r '.build' <<<"$RESUME_HANDOFF")" = 261 ] &&
+               [ "$APPS_ID" = 11642526112 ] && [ "$FEED_ID" = 11642361427 ]; then
+            # GitHub rounded the successful app upload's completion to 19:56:39Z, but the
+            # immutable artifact metadata was created at 19:56:40Z. No release write ran.
+            jq -e '.conclusion == "failure"' "$RUNNER_TEMP/source-latest-run.json" >/dev/null
+            jq -e '.conclusion == "failure"' "$RUNNER_TEMP/source-run.json" >/dev/null
+            PREWRITE_RETRY=true
+            RETRY_BUILD_ID=113977202330; RETRY_ATTACH_ID=114000130101
+            RETRY_FAILURE='Download and authenticate immutable handoff archives'
+            RETRY_SUCCEEDED='["Validate immutable handoff provenance before coordinator resume"]'
+            RETRY_SKIPPED='["Bind the draft release, tag commit, and monotonic source before any write", "Attach only exact draft assets and create the authenticated staged receipt", "Atomically activate the staged feed, prove routes, then publish last"]'
           fi
           # Paginate before flattening: a missing build or a truncated job list never implies success.
           gh api --paginate --slurp -- "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" | jq '[.[].jobs[]]' > "$RUNNER_TEMP/source-jobs.json"
-          jq -e --arg sha "$BUILD_WORKFLOW_SHA" --argjson recovered "$RECOVERED" --argjson prewrite "$PREWRITE_RETRY" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" --slurpfile source "$RUNNER_TEMP/source-run.json" '
+          if [ "$PREWRITE_RETRY" = true ] && [ "$RUN_ID" = 37976846977 ]; then
+            jq -e '
+              ([.[] | select(.name == "verify-published" and .conclusion == "skipped" and .status == "completed")] | length == 1) and
+              ([.[] | select(.name == "verify-published")] | length == 1) and
+              ([.[] | select(.name == "build-tvos")] | .[0].steps as $steps |
+                all(["Validate immutable Beta 1 source recovery", "Checkout the immutable recovered app source", "Verify immutable recovered source checkout"][]; . as $name |
+                  ([$steps[] | select(.name == $name)] | length == 1) and
+                  ([$steps[] | select(.name == $name and .status == "completed" and .conclusion == "skipped")] | length == 1)))' "$RUNNER_TEMP/source-jobs.json" >/dev/null
+          fi
+          jq -e --arg sha "$BUILD_WORKFLOW_SHA" --argjson recovered "$RECOVERED" --argjson prewrite "$PREWRITE_RETRY" --argjson run "$RUN_ID" --argjson attempt "$ATTEMPT" --argjson retryBuild "$RETRY_BUILD_ID" --argjson retryAttach "$RETRY_ATTACH_ID" --arg retryFailure "$RETRY_FAILURE" --argjson retrySucceeded "$RETRY_SUCCEEDED" --argjson retrySkipped "$RETRY_SKIPPED" --slurpfile source "$RUNNER_TEMP/source-run.json" '
             all(.[]; .run_id == $run and .run_attempt == $attempt and .head_sha == $sha and .status == "completed") and
             ([.[] | select(.name == "build-tvos" and .conclusion == "success")] | length == 1) and
             ([.[] | select(.name == "build-tvos")] | length == 1) and
@@ -1427,17 +1471,17 @@ jobs:
             (if $prewrite then
               ([.[] | select(.conclusion == "failure")] | map(.name) == ["attach-release"]) and
               all(.[]; .conclusion == "success" or .conclusion == "failure" or .conclusion == "skipped") and
-              ([.[] | select(.name == "build-tvos" and .id == 113881434421)] | length == 1) and
+              ([.[] | select(.name == "build-tvos" and .id == $retryBuild)] | length == 1) and
               all(.[] | select(.name == "build-tvos") | .steps[]; .status == "completed" and (.conclusion == "success" or .conclusion == "skipped")) and
-              ([.[] | select(.name == "attach-release" and .id == 113915206994 and .conclusion == "failure")] | length == 1) and
+              ([.[] | select(.name == "attach-release" and .id == $retryAttach and .conclusion == "failure")] | length == 1) and
               all(.[] | select(.name == "attach-release") | .steps[]; .status == "completed") and
-              ([.[] | select(.name == "attach-release") | .steps[] | select(.conclusion == "failure")] | map(.name) == ["Bind the draft release, tag commit, and monotonic source before any write"]) and
-              ([.[] | select(.name == "attach-release") | .steps[] | select(.name == "Bind the draft release, tag commit, and monotonic source before any write")] | length == 1) and
+              ([.[] | select(.name == "attach-release") | .steps[] | select(.conclusion == "failure")] | map(.name) == [$retryFailure]) and
+              ([.[] | select(.name == "attach-release") | .steps[] | select(.name == $retryFailure)] | length == 1) and
               ([.[] | select(.name == "attach-release")] | .[0].steps as $steps |
-                all(["Validate immutable handoff provenance before coordinator resume", "Download and authenticate immutable handoff archives"][]; . as $name |
+                all($retrySucceeded[]; . as $name |
                   ([$steps[] | select(.name == $name)] | length == 1) and
                   ([$steps[] | select(.name == $name and .status == "completed" and .conclusion == "success")] | length == 1)) and
-                all(["Attach only exact draft assets and create the authenticated staged receipt", "Atomically activate the staged feed, prove routes, then publish last"][]; . as $name |
+                all($retrySkipped[]; . as $name |
                   ([$steps[] | select(.name == $name)] | length == 1) and
                   ([$steps[] | select(.name == $name and .status == "completed" and .conclusion == "skipped")] | length == 1)))
             else
@@ -1458,12 +1502,17 @@ jobs:
               .workflow_run.id == $run.id and .workflow_run.head_sha == $run.head_sha and .workflow_run.head_branch == $run.head_branch and
               .workflow_run.repository_id == $run.repository.id and .workflow_run.head_repository_id == $run.head_repository.id and
               ([$jobs[0][] | select(.name == "build-tvos") | .steps[] | select(.name == $step and .conclusion == "success" and .status == "completed") |
-                select(.started_at <= $artifact.created_at and .completed_at >= $artifact.created_at)] | length == 1)' "$RUNNER_TEMP/source-artifact.json" >/dev/null
+                select((.started_at | fromdateiso8601) <= ($artifact.created_at | fromdateiso8601) and
+                  (.completed_at | fromdateiso8601) + 1 >= ($artifact.created_at | fromdateiso8601))] | length == 1)' "$RUNNER_TEMP/source-artifact.json" >/dev/null
             if [ "$PREWRITE_RETRY" = true ]; then
               jq -e 'if .id == 11630735650 then
                 .size_in_bytes == 207345211 and .digest == "sha256:e312b5d76a2225ea875cd91d588d877f81a2e53ff808cbe33ce95213d6e85076"
                 elif .id == 11630250815 then
                 .size_in_bytes == 42877 and .digest == "sha256:606daa234f9394dd45e3b05675ca040de8fa45ea3a5f0c5017230e8542a1918e"
+                elif .id == 11642526112 then
+                .size_in_bytes == 207639035 and .digest == "sha256:871a6eed0531897b40204529488d724309735f293559bf075ce10db06d18099b"
+                elif .id == 11642361427 then
+                .size_in_bytes == 42700 and .digest == "sha256:9b7539632ddead42779c0de3f03cc2f1c1e9f0598436817e98e1324d0faa10a1"
                 else false end' "$RUNNER_TEMP/source-artifact.json" >/dev/null
             fi
           done
@@ -1510,7 +1559,10 @@ jobs:
           gh api --paginate --slurp -- "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID/attempts/$BUILD_ATTEMPT/jobs?per_page=100" | jq '[.[].jobs[]]' > "$HANDOFF_DIR/jobs.json"
           jq -e --arg sha "$BUILD_WORKFLOW_SHA" --argjson run "$BUILD_RUN_ID" --argjson attempt "$BUILD_ATTEMPT" '
             [.[] | select(.name == "build-tvos")] | length == 1 and
-            all(.[]; .run_id == $run and .run_attempt == $attempt and .head_sha == $sha and .status == "completed" and .conclusion == "success")' "$HANDOFF_DIR/jobs.json" >/dev/null
+              all(.[]; .run_id == $run and .run_attempt == $attempt and .head_sha == $sha and .status == "completed" and .conclusion == "success")' "$HANDOFF_DIR/jobs.json" >/dev/null
+          UPLOAD_JOB_ID="$(jq -er '.[] | select(.name == "build-tvos") | .id' "$HANDOFF_DIR/jobs.json")"
+          [[ "$UPLOAD_JOB_ID" =~ ^[1-9][0-9]{0,15}$ ]] && [ "$UPLOAD_JOB_ID" -lt 9007199254740992 ] || exit 1
+          gh api -- "repos/$GH_REPO/actions/jobs/$UPLOAD_JOB_ID/logs" > "$HANDOFF_DIR/upload.log"
           for SPEC in "$APPS_ID|VortX-tvOS-ci|Upload the immutable app handoff" "$FEED_ID|VortX-release-feed|Upload the immutable feed handoff"; do
             ID="${SPEC%%|*}"; REST="${SPEC#*|}"; NAME="${REST%%|*}"; UPLOAD_STEP="${REST#*|}"
             gh api -- "repos/$GH_REPO/actions/artifacts/$ID" > "$HANDOFF_DIR/$ID.json"
@@ -1521,7 +1573,51 @@ jobs:
               .workflow_run.id == $run.id and .workflow_run.head_sha == $run.head_sha and .workflow_run.head_branch == $run.head_branch and
               .workflow_run.repository_id == $run.repository.id and .workflow_run.head_repository_id == $run.head_repository.id and
               ([$jobs[0][] | select(.name == "build-tvos") | .steps[] | select(.name == $step and .conclusion == "success" and .status == "completed") |
-                select(.started_at <= $artifact.created_at and .completed_at >= $artifact.created_at)] | length == 1)' "$HANDOFF_DIR/$ID.json" >/dev/null
+                select((.started_at | fromdateiso8601) <= ($artifact.created_at | fromdateiso8601) and
+                  (.completed_at | fromdateiso8601) + 1 >= ($artifact.created_at | fromdateiso8601))] | length == 1)' "$HANDOFF_DIR/$ID.json" >/dev/null
+            # API step times have whole-second precision. Allow only its immediately adjacent
+            # represented second for artifact creation, and require exact unique upload proofs
+            # strictly inside the original step window. ID/name/size/digest and byte checks stay
+            # fail-closed; timestamps alone never authenticate an artifact or a prior attempt.
+            ARTIFACT_ID="$ID" UPLOAD_STEP="$UPLOAD_STEP" python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timedelta
+          from pathlib import Path
+
+          root = Path(os.environ["HANDOFF_DIR"])
+          artifact = json.loads((root / f'{os.environ["ARTIFACT_ID"]}.json').read_text())
+          jobs = json.loads((root / "jobs.json").read_text())
+          steps = [step for job in jobs if job["name"] == "build-tvos" for step in job["steps"]
+                   if step["name"] == os.environ["UPLOAD_STEP"] and
+                   step["status"] == "completed" and step["conclusion"] == "success"]
+          if len(steps) != 1:
+              raise SystemExit("upload proof requires exactly one successful upload step")
+          parse = lambda value: datetime.fromisoformat(value.replace("Z", "+00:00"))
+          start, end = parse(steps[0]["started_at"]), parse(steps[0]["completed_at"])
+          created = parse(artifact["created_at"])
+          boundary = end + timedelta(seconds=1)
+          if end < start or not start <= created <= boundary:
+              raise SystemExit("artifact creation falls outside the upload precision boundary")
+          expected = [
+              f'SHA256 digest of uploaded artifact is {artifact["digest"].removeprefix("sha256:")}',
+              f'Artifact {artifact["name"]} successfully finalized. Artifact ID {artifact["id"]}',
+              f'Artifact {artifact["name"]} has been successfully uploaded! Final size is {artifact["size_in_bytes"]} bytes. Artifact ID is {artifact["id"]}',
+          ]
+          matches = [[] for _ in expected]
+          for line in (root / "upload.log").read_text().splitlines():
+              stamp, separator, body = line.partition(" ")
+              if separator and body in expected:
+                  when = parse(stamp)
+                  if not start <= when < boundary:
+                      raise SystemExit("upload proof is outside the original step window")
+                  matches[expected.index(body)].append(when)
+          if any(len(values) != 1 for values in matches):
+              raise SystemExit("missing or duplicate exact upload ID/name/size/digest proof")
+          digest, finalized, uploaded = [values[0] for values in matches]
+          if not digest <= finalized <= uploaded:
+              raise SystemExit("upload proof order is invalid")
+          print(f'Authenticated exact upload proof for artifact {artifact["id"]}')
+          PY
             # Download the exact authenticated ID. Do not consume actions/download-artifact's
             # extraction: its digest mismatch is warning-only. These ZIP bytes are checked below.
             gh api -- "repos/$GH_REPO/actions/artifacts/$ID/zip" > "$HANDOFF_DIR/$ID.zip"

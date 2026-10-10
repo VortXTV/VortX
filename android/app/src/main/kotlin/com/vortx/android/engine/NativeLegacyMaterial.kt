@@ -5,8 +5,10 @@ import com.vortx.android.profile.UserProfile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.math.BigDecimal
+import java.math.RoundingMode
 import java.net.URI
 import java.time.Instant
+import java.security.MessageDigest
 import java.util.UUID
 import kotlin.math.roundToLong
 import com.vortx.android.engine.LegacyWatchedBitfieldMigrationEvidence.SourceRowLocator as WatchedLocator
@@ -39,16 +41,144 @@ internal fun nativeLegacyMaterial(
         pendingOwnOverlays = pendingOwnOverlays, watchedMigration = watchedMigration).build()
 }
 
+/** Explicit migration projection: original unresolved membership evidence belongs in the encrypted
+ * account archive, not in native membership registers. The strict entry point remains available. */
+internal data class NativeLegacyPreparation(val material: JSONObject, val pendingMembershipReceipts: JSONArray)
+
+internal fun prepareNativeLegacyMaterial(
+    document: JSONObject,
+    roster: List<UserProfile>,
+    rosterModifiedSeconds: Double?,
+    ownAccountSources: List<NativeOwnAccountSource> = emptyList(),
+    retainedOwnAccounts: NativeOwnAccountBaseline? = null,
+    accountScope: VortxAccountScope,
+    pendingOwnOverlays: Set<String> = emptySet(),
+    watchedMigration: NativeWatchedMigrationBatch? = null,
+): NativeLegacyPreparation = withNativeOwnAccountSources(ownAccountSources) {
+    watchedMigration?.requireInputs(document, roster, accountScope, ownAccountSources)
+    require(roster.single { it.isOwner }.id == accountScope.ownerProfileID && ownAccountSources.all { it.accountID == accountScope.accountID })
+    require(retainedOwnAccounts == null || retainedOwnAccounts.scope == accountScope) { "Own-account baseline scope changed" }
+    val pending = JSONArray()
+    val material = LegacyMaterialAdapter(document, roster, rosterModifiedSeconds, ownAccountSources, retainedOwnAccounts,
+        pendingOwnOverlays = pendingOwnOverlays, watchedMigration = watchedMigration, pendingMembership = pending).build()
+    val checked = nativeLegacyMembershipJournal(accountScope, null, pending, roster.map { it.id }.toSet())
+    NativeLegacyPreparation(material, checked.getJSONArray("receipts"))
+}
+
+private fun pendingEnvelope(scope: VortxAccountScope, receipts: JSONArray): JSONObject = JSONObject()
+    .put("schemaVersion", 1).put("scope", scope.accountID).put("ownerProfileId", scope.ownerProfileID).put("receipts", receipts)
+
+/** Keep historical unresolved receipts across pulls and cold reopen, even if a newer carrier omits
+ * them. A receipt is removed only by an explicit future reconciliation, never by source absence. */
+internal fun nativeLegacyMembershipJournal(scope: VortxAccountScope, prior: JSONObject?, current: JSONArray,
+    knownProfileIDs: Set<String> = setOf(scope.ownerProfileID)): JSONObject {
+    fun validate(receipts: JSONArray, fresh: Boolean = false) {
+        requireMaterial(receipts.length() <= 10_000, "Pending membership archive exceeds limits")
+        for (index in 0 until receipts.length()) {
+            val row = receipts.optJSONObject(index) ?: fail("Malformed pending membership receipt")
+            requireMaterial(row.keys().asSequence().toSet() == setOf("profileId", "kind", "identity", "sourceField", "receipt", "sourceDocumentSha256"), "Malformed pending membership receipt")
+            requireMaterial(Regex("[0-9a-f]{64}").matches(string(row, "sourceDocumentSha256")), "Malformed pending membership source digest")
+            requireMaterial(runCatching { UUID.fromString(string(row, "profileId")).toString().equals(row.getString("profileId"), true) }.getOrDefault(false), "Invalid pending membership profile")
+            // Historical evidence can outlive its profile. Only a fresh capture must name the
+            // authenticated input roster; retained receipts never become native commands.
+            requireMaterial(!fresh || row.getString("profileId") in knownProfileIDs, "Pending membership references an unknown profile")
+            string(row, "identity")
+            val field = string(row, "sourceField")
+            requireMaterial(when (string(row, "kind")) {
+                "addon_install" -> field in setOf("/vortx/deletedAddonsTs", "/webAddonRemovals")
+                "library_removal" -> field in setOf("/vortx/deletedLibraryTs", "/vortx/deletedLibrary")
+                "profile_saved_overlay" -> {
+                    val parts = field.split('/')
+                    parts.size == 6 && parts[0].isEmpty() && parts[1] == "vortx" && parts[2] == "byProfile" && parts[4] == "library" &&
+                        Regex("[0-9]+").matches(parts[5]) && runCatching {
+                            val captured = UUID.fromString(parts[3])
+                            captured.toString().equals(parts[3], true) && captured == UUID.fromString(row.getString("profileId"))
+                        }.getOrDefault(false)
+                }
+                "watch_identity_conflict" -> field == "/vortx/byProfile/${row.getString("profileId")}/watch_identity_conflicts"
+                else -> false
+            }, "Unsupported pending membership receipt")
+            requireMaterial(row.get("receipt") is JSONObject || row.get("receipt") is String, "Malformed pending membership source")
+            val receipt = row.get("receipt")
+            when (field) {
+                "/vortx/deletedAddonsTs", "/vortx/deletedLibraryTs" -> {
+                    requireMaterial(receipt is JSONObject, "Malformed pending membership clock receipt")
+                    val clocks = receipt as JSONObject
+                    requireMaterial(clocks.keys().asSequence().all { it in setOf("addedAt", "removedAt") }, "Unsupported pending membership clock fields")
+                    clockField(clocks, "addedAt"); clockField(clocks, "removedAt")
+                }
+                "/webAddonRemovals", "/vortx/deletedLibrary" -> requireMaterial(receipt == row.getString("identity"), "Pending membership identity changed")
+                else -> if (row.getString("kind") == "watch_identity_conflict") {
+                    requireMaterial(receipt is JSONObject && receipt.keys().asSequence().toSet() == setOf("sources"), "Malformed pending watch identity conflict")
+                    val sources = (receipt as JSONObject).optJSONArray("sources") ?: fail("Malformed pending watch conflict sources")
+                    requireMaterial(sources.length() > 0, "Empty pending watch conflict sources")
+                    val locators = hashSetOf<String>()
+                    for (sourceIndex in 0 until sources.length()) {
+                        val source = sources.optJSONObject(sourceIndex) ?: fail("Malformed pending watch conflict source")
+                        requireMaterial(source.keys().asSequence().toSet() == setOf("sourceField", "receipt") &&
+                            string(source, "sourceField").startsWith('/') && locators.add(source.getString("sourceField")) &&
+                            source.optJSONObject("receipt") != null, "Malformed pending watch conflict source")
+                    }
+                } else {
+                    requireMaterial(receipt is JSONObject, "Malformed pending saved overlay")
+                    val saved = receipt as JSONObject
+                    requireMaterial(string(saved, "id") == row.getString("identity"), "Pending saved overlay identity changed")
+                    contentType(saved); secondsToMillis(saved, "t"); secondsToMillis(saved, "d"); lastWatched(saved)
+                    optionalString(saved, "name"); optionalString(saved, "poster")
+                }
+            }
+        }
+    }
+    val retained = prior?.also {
+        requireMaterial(it.keys().asSequence().toSet() == setOf("schemaVersion", "scope", "ownerProfileId", "receipts") &&
+            it.opt("schemaVersion") is Number && it.getDouble("schemaVersion") == 1.0 &&
+            it.optString("scope") == scope.accountID && it.optString("ownerProfileId") == scope.ownerProfileID,
+            "Pending membership account scope changed")
+        NativeHostDocument.requireCredentialFree(it)
+    }?.getJSONArray("receipts") ?: JSONArray()
+    validate(retained); validate(current, fresh = true)
+    val union = JSONArray()
+    fun sameReceipt(left: JSONObject, right: JSONObject): Boolean =
+        listOf("profileId", "kind", "identity", "sourceField", "receipt").all { NativeHostPreferences.equal(left.get(it), right.get(it)) }
+    for (rows in listOf(retained, current)) for (index in 0 until rows.length()) {
+        val row = rows.getJSONObject(index)
+        // Unrelated playback changes the document digest, but not a membership receipt. Preserve
+        // its first capture marker rather than adding a new entry on every legacy-client upload.
+        if ((0 until union.length()).none { sameReceipt(union.getJSONObject(it), row) })
+            union.put(NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(row)))
+    }
+    validate(union)
+    return pendingEnvelope(scope, union).also {
+        requireMaterial(nativeWatchedDocumentSnapshot(it).size <= 32 * 1024 * 1024, "Pending membership archive exceeds limits")
+        NativeHostDocument.requireCredentialFree(it)
+    }
+}
+
+private fun membershipSourceDigest(source: JSONObject): String = MessageDigest.getInstance("SHA-256")
+    .digest(nativeWatchedDocumentSnapshot(source)).joinToString("") { "%02x".format(it) }
+
 /** A rebind source is independent of the owner/global import. Reuse the same typed reducer, with
  * the exact authenticated UUID overlay and raw source only; never project the owner's library. */
 internal fun nativeOwnAccountCarrier(source: NativeOwnAccountSource, profile: UserProfile,
                                      currentDocument: JSONObject,
-                                     watchedMigration: NativeWatchedMigrationBatch? = null): JSONObject = source.withActive {
+                                     watchedMigration: NativeWatchedMigrationBatch? = null): JSONObject =
+    nativeOwnAccountCarrierProjection(source, profile, currentDocument, watchedMigration, null)
+
+internal fun nativePreparedOwnAccountCarrier(source: NativeOwnAccountSource, profile: UserProfile,
+    currentDocument: JSONObject, watchedMigration: NativeWatchedMigrationBatch?, preparedMaterial: JSONObject): JSONObject =
+    nativeOwnAccountCarrierProjection(source, profile, currentDocument, watchedMigration, preparedMaterial)
+
+private fun nativeOwnAccountCarrierProjection(source: NativeOwnAccountSource, profile: UserProfile,
+    currentDocument: JSONObject, watchedMigration: NativeWatchedMigrationBatch?, preparedMaterial: JSONObject?): JSONObject = source.withActive {
     require(source.profileID == profile.id && !profile.isOwner)
     source.requireOverlayUnchanged(currentDocument)
     watchedMigration?.requireOwnSource(source)
     val isolated = profile.copy(isOwner = true, usesOwnAccount = false)
-    val material = LegacyMaterialAdapter(source.legacyDocument(), listOf(isolated), null, independentSource = true,
+    preparedMaterial?.let {
+        requireMaterial(NativeHostPreferences.equal(it.getJSONObject("ownAccountSources").getJSONObject(profile.id), source.proof()),
+            "Prepared own-account source changed")
+    }
+    val material = preparedMaterial ?: LegacyMaterialAdapter(source.legacyDocument(), listOf(isolated), null, independentSource = true,
         watchedMigration = watchedMigration).build()
     JSONObject().put("source", source.proof()).put("addons", material.getJSONObject("addons").getJSONObject(profile.id))
         .put("library", material.getJSONObject("libraries").getJSONObject(profile.id))
@@ -65,6 +195,7 @@ private class LegacyMaterialAdapter(
     private val independentSource: Boolean = false,
     private val pendingOwnOverlays: Set<String> = emptySet(),
     private val watchedMigration: NativeWatchedMigrationBatch? = null,
+    private val pendingMembership: JSONArray? = null,
 ) {
     private val vortx = objectField(document, "vortx") ?: JSONObject()
     private val owner = roster.singleOrNull { it.isOwner }
@@ -73,6 +204,8 @@ private class LegacyMaterialAdapter(
     private val watchRows = linkedMapOf<String, MutableList<JSONObject>>()
     private val knownTitles = linkedMapOf<String, MutableMap<String, String>>()
     private val links = linkedMapOf<String, MutableList<List<String>>>()
+    private val watchSources = linkedMapOf<String, MutableMap<String, MutableMap<String, JSONObject>>>()
+    private val membershipDigest by lazy { membershipSourceDigest(document) }
 
     fun build(): JSONObject {
         // Website patches have not been reconciled into the full legacy carrier. This check must
@@ -86,6 +219,7 @@ private class LegacyMaterialAdapter(
             requireMaterial(runCatching { UUID.fromString(it.id).toString().equals(it.id, true) }.getOrDefault(false), "Invalid profile identity")
             requireMaterial(!it.isOwner || !it.usesOwnAccount, "Owner cannot use an independent profile account")
             watchRows[it.id] = mutableListOf(); knownTitles[it.id] = linkedMapOf(); links[it.id] = mutableListOf()
+            watchSources[it.id] = linkedMapOf()
         }
         modified?.let { validClock(it, "rosterModifiedSeconds") }
         val deleted = strings(arrayField(vortx, "deletedProfiles"), "deletedProfiles").map { raw ->
@@ -127,7 +261,7 @@ private class LegacyMaterialAdapter(
         }
         val output = JSONObject().put("schemaVersion", if (ownIDs.isEmpty()) 1 else 2).put("roster", nativeRoster)
             .put("deletedProfileIds", JSONArray(deleted)).put("addons", addons).put("libraries", libraries)
-            .put("watches", JSONObject().also { out -> watchRows.forEach { (id, rows) -> out.put(id, ownWatches.optJSONArray(id) ?: JSONArray(resolveWatchRows(rows))) } })
+            .put("watches", JSONObject().also { out -> watchRows.forEach { (id, rows) -> out.put(id, ownWatches.optJSONArray(id) ?: JSONArray(resolveWatchRows(id, rows))) } })
             .put("identityLinks", JSONObject().also { out -> links.forEach { (id, groups) -> out.put(id, ownLinks.optJSONArray(id) ?: JSONArray(groups.map(::JSONArray))) } })
         if (ownIDs.isNotEmpty()) output.put("ownAccountSources", proofs)
         modified?.let { output.put("rosterModifiedSeconds", it) }
@@ -170,6 +304,10 @@ private class LegacyMaterialAdapter(
         }
         fun resolve(raw: String): String {
             val normalized = AddonOrder.normalize(raw)
+            val uri = runCatching { URI(normalized) }.getOrNull()
+            requireMaterial(uri != null && uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrBlank() &&
+                uri.rawUserInfo == null && uri.rawFragment == null, "Unsupported add-on transport URL")
+            PublicAddressPolicy.requireLiteralPublicOrHostname(uri!!.host)
             // Old tombstone writers lowercased the entire URL. Match only a UNIQUE actual descriptor;
             // never lowercase configured paths or percent-encoded secrets in the native identity.
             val matches = descriptors.keys.filter { it.lowercase() == normalized.lowercase() }
@@ -201,13 +339,33 @@ private class LegacyMaterialAdapter(
             if (!hasPositiveIntent(intents[url]) && intents[url]?.has("intentV3") != true)
                 intents.getOrPut(url) { JSONObject().put("transportUrl", url) }.put("removedAtMs", 1.0)
         }
+        val pendingURLs = hashSetOf<String>()
+        for ((url, intent) in intents) {
+            val v3 = intent.optJSONObject("intentV3")
+            val present = if (v3 != null) v3.getString("state") == "present" else
+                intent.optDouble("addedAtMs", 0.0) > intent.optDouble("removedAtMs", 0.0)
+            if (present && url !in descriptors) {
+                requireMaterial(pendingMembership != null && v3 == null, "Present add-on intent requires an installed descriptor")
+                pendingURLs += url
+                val stamps = objectField(vortx, "deletedAddonsTs")!!
+                for (raw in stamps.keys().asSequence().filter { resolve(it) == url }.sorted())
+                    retainMembership("addon_install", raw, "/vortx/deletedAddonsTs", stamps.getJSONObject(raw))
+            }
+        }
         for (raw in strings(arrayField(document, "webAddonRemovals"), "webAddonRemovals")) {
+            val url = resolve(raw)
+            if (pendingMembership != null && url !in descriptors) {
+                retainMembership("addon_install", raw, "/webAddonRemovals", raw)
+                continue
+            }
             // Shipping code mints a local clock for an unseen web removal. Migration is pure: a real
             // timestamp must be reconciled by the account layer rather than fabricated here.
-            requireMaterial(hasPositiveIntent(intents[resolve(raw)]) || intents[resolve(raw)]?.has("intentV3") == true,
+            requireMaterial(hasPositiveIntent(intents[url]) || intents[url]?.has("intentV3") == true,
                 "Unclocked web add-on removal requires reconciliation")
         }
         val order = strings(arrayField(document, "addonOrder"), "addonOrder").map(::resolve).distinct()
+        requireMaterial(pendingURLs.none(order::contains), "Ordered add-on requires descriptor reconciliation")
+        pendingURLs.forEach(intents::remove)
         return JSONObject().put("items", JSONArray(descriptors.values)).put("order", JSONArray(order)).put("intents", JSONArray(intents.values))
     }
 
@@ -281,25 +439,40 @@ private class LegacyMaterialAdapter(
                         else WatchedLocator.AuthenticatedOwnerHistory(index, sourceProfileID))
             }
         }
-        fun keyFor(raw: String): String {
+        fun keyFor(raw: String): String? {
+            requireMaterial(raw.isNotBlank(), "Empty library intent identity")
             val known = knownTitles.getValue(owner.id)
             val matched = known.entries.filter { it.key.equals(raw, true) || "${it.value}:${it.key}".equals(raw, true) }
-            requireMaterial(matched.size == 1, "Untyped library removal requires title-type reconciliation")
+            requireMaterial(matched.size == 1 || matched.isEmpty() && pendingMembership != null, "Untyped library removal requires title-type reconciliation")
+            if (matched.isEmpty()) return null
             return "${matched.single().value}:${matched.single().key}"
         }
         objectField(vortx, "deletedLibraryTs")?.let { stamps -> for (raw in stamps.keys()) {
             val entry = stamps.optJSONObject(raw) ?: fail("Malformed library intent")
-            val key = keyFor(raw); val target = intents.getOrPut(key) { JSONObject().put("key", key) }
+            requireMaterial(entry.keys().asSequence().toSet().all { it in setOf("addedAt", "removedAt") }, "Unsupported library intent fields")
+            clockField(entry, "addedAt"); clockField(entry, "removedAt")
+            val key = keyFor(raw)
+            if (key == null) { retainMembership("library_removal", raw, "/vortx/deletedLibraryTs", entry); continue }
+            val target = intents.getOrPut(key) { JSONObject().put("key", key) }
             mergeClock(entry, target, "addedAt", "addedAtMs"); mergeClock(entry, target, "removedAt", "removedAtMs")
         } }
         for (raw in strings(arrayField(vortx, "deletedLibrary"), "deletedLibrary")) {
             val key = keyFor(raw)
+            if (key == null) { retainMembership("library_removal", raw, "/vortx/deletedLibrary", raw); continue }
             // Exact shipping LibraryTombstones.MIGRATION_EPOCH_MS, not a fabricated viewing/now clock.
             if (!hasPositiveIntent(intents[key])) intents.getOrPut(key) { JSONObject().put("key", key) }.put("removedAtMs", 1.0)
         }
         requireMaterial(declaredRemoved.all { (intents[it]?.opt("removedAtMs") as? Number)?.toDouble()?.let { at -> at > 0 } == true },
             "Owner removed row requires explicit library removal intent; viewing clocks are not removal clocks")
         return JSONObject().put("items", JSONArray(items.values)).put("intents", JSONArray(intents.values))
+    }
+
+    private fun retainMembership(kind: String, identity: String, field: String, receipt: Any, profileID: String = owner.id) {
+        val digest = membershipDigest
+        requireNotNull(pendingMembership).put(JSONObject().put("profileId", profileID).put("kind", kind)
+            .put("identity", identity).put("sourceField", field)
+            .put("sourceDocumentSha256", digest)
+            .put("receipt", if (receipt is JSONObject) NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(receipt)) else receipt))
     }
 
     private fun importOverlays() {
@@ -320,6 +493,8 @@ private class LegacyMaterialAdapter(
             for ((index, row) in rows.withIndex()) {
                 val metaId = string(row, "id"); known(id, metaId, contentType(row))
                 importWatch(id, metaId, row, ownerRow = false,
+                    overlaySourceField = "/vortx/byProfile/$rawID/library/$index",
+                    sourcePointer = "/vortx/byProfile/$rawID/library/$index",
                     locator = if (independentSource) WatchedLocator.OwnAccountProfileLibrary(index)
                         else WatchedLocator.AuthenticatedProfileLibrary(index))
             }
@@ -327,23 +502,29 @@ private class LegacyMaterialAdapter(
                 requireMaterial(metaId.isNotBlank(), "Empty durable watch identity")
                 // Account-document ingress uses this ENTIRE carrier only beyond the library rail.
                 // A stale overlapping durable row must not override the current full snapshot.
-                if (metaId !in railTitles) importMarks(id, metaId, map.optJSONObject(metaId) ?: fail("Malformed durable watched row"))
+                if (metaId !in railTitles) importMarks(id, metaId, map.optJSONObject(metaId) ?: fail("Malformed durable watched row"),
+                    sourceField = "/vortx/byProfile/$rawID/watched/${pointerComponent(metaId)}")
             } }
-            val removals = objects(arrayField(bucket, "removed"), "overlay removals") + objects(arrayField(webRemoved, rawID), "web overlay removals")
-            for (removal in removals) {
+            val removals = objects(arrayField(bucket, "removed"), "overlay removals").mapIndexed { index, row -> row to "/vortx/byProfile/$rawID/removed/$index" } +
+                objects(arrayField(webRemoved, rawID), "web overlay removals").mapIndexed { index, row -> row to "/webProgress/removed/byProfile/$rawID/$index" }
+            for ((removal, sourceField) in removals) {
                 val keys = strings(arrayField(removal, "keys"), "removal identity keys")
                 requireMaterial(keys.isNotEmpty(), "Empty watch removal identity")
                 val at = clockField(removal, "removedAt") ?: fail("Unclocked watch removal")
                 val matches = knownTitles.getValue(id).filter { (metaId, type) -> keys.any { key -> removalMatches(key, metaId, type) } }
                 requireMaterial(matches.size == 1 && keys.all { key -> matches.any { (metaId, type) -> removalMatches(key, metaId, type) } }, "Watch removal requires verified title reconciliation")
-                matches.forEach { (metaId, type) -> watchRows.getValue(id).add(JSONObject().put("metaId", metaId).put("type", type).put("removedAtMs", at)) }
+                matches.forEach { (metaId, type) ->
+                    val row = JSONObject().put("metaId", metaId).put("type", type).put("removedAtMs", at)
+                    watchRows.getValue(id).add(row); recordWatchSource(id, metaId, sourceField, removal)
+                }
             }
         }
     }
 
     private fun importWatch(profile: String, metaId: String, raw: JSONObject, ownerRow: Boolean, historyOnly: Boolean = false,
-                            locator: WatchedLocator) {
+                            locator: WatchedLocator, overlaySourceField: String? = null, sourcePointer: String? = null) {
         val position = secondsToMillis(raw, "t"); val duration = secondsToMillis(raw, "d")
+        val positiveSourcePosition = (clockField(raw, "t") ?: 0.0) > 0
         val iso = lastWatched(raw)
         val event = clockField(raw, "eventEpochMs")
         requireMaterial(!historyOnly || event != null && event > 0 && iso != null, "Malformed genuine owner history")
@@ -354,24 +535,32 @@ private class LegacyMaterialAdapter(
             ?: fail("Opaque owner watched bitfield requires source-bound episode reconciliation")
         // Bitmap IDs are bare source facts. Clocked ma/ua and owner intents are merged below;
         // they remain authoritative and no lastWatched/metadata date becomes a mark timestamp.
-        importMarks(profile, metaId, raw, decoded)
+        val sourceField = sourcePointer ?: locator.pointer.replace("<captured-profile>", profile)
+        importMarks(profile, metaId, raw, decoded, sourceField)
         val watched = optionalBoolean(raw, "currentVideoWatched")
         val whole = optionalBoolean(raw, "wholeTitleWatched")
         val timesWatched = optionalUnsigned(raw, "timesWatched", 0xffff_ffffL)
         val type = contentType(raw)
+        val name = optionalString(raw, "name").orEmpty()
+        val poster = optionalString(raw, "poster")?.takeIf(String::isNotBlank)
+        optionalBoolean(raw, "removed"); optionalBoolean(raw, "temp")
         requireMaterial(type != "series" || whole != true, "Whole-series watch intent requires episode reconciliation")
         val hasMarks = decoded.isNotEmpty() || strings(arrayField(raw, "w"), "watched IDs").isNotEmpty() || (objectField(raw, "ma")?.length() ?: 0) > 0 || (objectField(raw, "ua")?.length() ?: 0) > 0
-        if (!ownerRow && position == 0L && !hasMarks && watched != true && whole != true && (timesWatched ?: 0) == 0L) {
+        if (!ownerRow && !positiveSourcePosition && !hasMarks && watched != true && whole != true && (timesWatched ?: 0) == 0L) {
+            if (pendingMembership != null && overlaySourceField != null) {
+                retainMembership("profile_saved_overlay", metaId, overlaySourceField, raw, profile)
+                return
+            }
             fail("Saved-only overlay membership requires explicit reconciliation")
         }
         // Membership writers manufacture lastWatched for zero-offset saves. It is not viewing proof.
-        val hasProgress = position > 0 || historyOnly && raw.has("t") && played != null && played > 0
+        val hasProgress = positiveSourcePosition || historyOnly && raw.has("t") && played != null && played > 0
         if (!hasProgress && watched != true && whole != true && (timesWatched ?: 0) == 0L) return
         requireMaterial(!hasProgress || played != null && played > 0, "Progress lacks a genuine viewing clock")
         requireMaterial(type != "series" || video != null, "Series progress requires an exact video identity")
-        val row = JSONObject().put("metaId", metaId).put("type", type).put("name", optionalString(raw, "name").orEmpty())
+        val row = JSONObject().put("metaId", metaId).put("type", type).put("name", name)
         video?.let { row.put("videoId", it) }
-        optionalString(raw, "poster")?.takeIf(String::isNotBlank)?.let { row.put("poster", it) }
+        poster?.let { row.put("poster", it) }
         if (hasProgress) {
             row.put("positionMs", position).put("lastPlayedAtMs", played)
             if (raw.has("d") && !raw.isNull("d")) row.put("durationMs", duration)
@@ -379,14 +568,28 @@ private class LegacyMaterialAdapter(
         if (watched == true || whole == true) row.put("watched", true)
         timesWatched?.let { row.put("timesWatched", it) }
         watchRows.getValue(profile).add(row)
+        recordWatchSource(profile, optionalString(row, "videoId") ?: metaId, sourceField, raw)
     }
 
     /** Kernel import takes one resolved row per unit. Preserve independent clocks, not arrival order. */
-    private fun resolveWatchRows(source: List<JSONObject>): List<JSONObject> {
+    private fun resolveWatchRows(profileID: String, source: List<JSONObject>): List<JSONObject> {
+        val conflicts = source.groupBy { optionalString(it, "videoId") ?: it.getString("metaId") }
+            .filterValues { rows -> rows.map { it.getString("metaId") }.distinct().size > 1 }.keys
+        requireMaterial(conflicts.isEmpty() || pendingMembership != null, "Watch unit belongs to conflicting title identities")
+        for (unit in conflicts.sorted()) {
+            val originals = watchSources.getValue(profileID)[unit].orEmpty()
+            requireMaterial(originals.isNotEmpty(), "Watch conflict lacks original source provenance")
+            val receipts = JSONArray(originals.toSortedMap().map { (field, raw) ->
+                JSONObject().put("sourceField", field).put("receipt", raw)
+            })
+            retainMembership("watch_identity_conflict", unit, "/vortx/byProfile/$profileID/watch_identity_conflicts",
+                JSONObject().put("sources", receipts), profileID)
+        }
         val units = sortedMapOf<String, JSONObject>()
         for (incoming in source) {
             val metaId = incoming.getString("metaId")
             val key = optionalString(incoming, "videoId") ?: metaId
+            if (key in conflicts) continue
             val previous = units[key]
             if (previous == null) { units[key] = JSONObject(incoming.toString()); continue }
             requireMaterial(previous.getString("metaId") == metaId, "Watch unit belongs to conflicting title identities")
@@ -421,7 +624,7 @@ private class LegacyMaterialAdapter(
         return units.values.toList()
     }
 
-    private fun importMarks(profile: String, metaId: String, raw: JSONObject, decoded: List<String> = emptyList()) {
+    private fun importMarks(profile: String, metaId: String, raw: JSONObject, decoded: List<String> = emptyList(), sourceField: String? = null) {
         val watched = strings(arrayField(raw, "w"), "watched IDs").toSet() + decoded
         fun positiveClocks(key: String): Map<String, Double> {
             val values = objectField(raw, key) ?: return emptyMap()
@@ -441,6 +644,7 @@ private class LegacyMaterialAdapter(
             reset[video]?.let { row.put("resetAtMs", it) }
             if (video !in marked && video !in reset && video in watched) row.put("watched", true)
             watchRows.getValue(profile).add(row)
+            sourceField?.let { recordWatchSource(profile, video, it, raw) }
         }
     }
 
@@ -452,6 +656,7 @@ private class LegacyMaterialAdapter(
             val row = raw.optJSONObject(key) ?: fail("Malformed owner watched intent")
             val intent = Intent(string(row, "t"), string(row, "v"), optionalBoolean(row, "w") ?: fail("Missing watched intent"),
                 clockField(row, "u") ?: fail("Unclocked owner watched intent"), string(row, "a"))
+            recordWatchSource(owner.id, intent.video, "/vortx/ownerWatched/${pointerComponent(key)}", row)
             val identity = intent.title to intent.video; val prior = winners[identity]
             requireMaterial(prior == null || intent.at != prior.at || intent.actor != prior.actor || intent.watched == prior.watched,
                 "Contradictory equal-clock owner intent requires reconciliation")
@@ -465,6 +670,14 @@ private class LegacyMaterialAdapter(
             type?.let { row.put("type", it) }; watchRows.getValue(owner.id).add(row)
         }
     }
+
+    private fun recordWatchSource(profile: String, unit: String, sourceField: String, raw: JSONObject) {
+        if (pendingMembership == null) return
+        watchSources.getValue(profile).getOrPut(unit) { linkedMapOf() }.putIfAbsent(sourceField,
+            NativeProfileOverlayWitness.parseDocument(nativeWatchedDocumentSnapshot(raw)))
+    }
+
+    private fun pointerComponent(value: String): String = value.replace("~", "~0").replace("/", "~1")
 
     private fun known(profile: String, metaId: String, type: String) {
         val previous = knownTitles.getValue(profile).putIfAbsent(metaId, type)
@@ -525,12 +738,12 @@ private fun lastWatched(root: JSONObject): Double? = optionalString(root, "lastW
 }
 private fun secondsToMillis(root: JSONObject, key: String): Long {
     clockField(root, key) ?: return 0
-    // Decimal JSON seconds such as 2.001 must not fail because binary multiplication yields
-    // 2001.0000000000002. Conversely, do not truncate genuine sub-millisecond source progress.
-    val ms = runCatching { BigDecimal(root.get(key).toString()).multiply(BigDecimal(1000)).longValueExact() }
-        .getOrElse { fail("Sub-millisecond or excessive progress cannot be represented") }
-    requireMaterial(ms in 0..9_007_199_254_740_990L, "Excessive progress cannot be represented")
-    return ms
+    // Playback offsets are a millisecond projection of legacy float seconds, not causal clocks.
+    // Preserve the exact source in the host archive; validate before nearest-ms normalization.
+    val ms = runCatching { BigDecimal(root.get(key).toString()).multiply(BigDecimal(1000)) }
+        .getOrElse { fail("Excessive progress cannot be represented") }
+    requireMaterial(ms.signum() >= 0 && ms <= BigDecimal.valueOf(9_007_199_254_740_990L), "Excessive progress cannot be represented")
+    return ms.setScale(0, RoundingMode.HALF_UP).longValueExact()
 }
 private fun optionalUnsigned(root: JSONObject, key: String, maximum: Long): Long? {
     val value = clockField(root, key) ?: return null

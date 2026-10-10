@@ -16,12 +16,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.res.stringResource
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.UiState
-import com.vortx.android.ui.search.searchEmptyMessage
-import com.vortx.android.ui.search.textResourceId
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.SearchViewModel
@@ -104,21 +101,14 @@ fun TvSearchScreen(
             )
         }
 
-        when (val s = state) {
-            is UiState.Loading -> TvEmpty("Searching your add-ons…")
-            // No retry affordance: the flow re-runs on the next query change, so a bare message (not a Retry
-            // card) is the honest state, matching the phone's ErrorState(message) here.
-            is UiState.Error -> TvEmpty(s.message)
-            is UiState.Success -> TvCinemaGrid(
-                items = s.data,
-                onItem = openItem,
-                emptyHint = when (val message = searchEmptyMessage(query, s)) {
-                    null -> ""
-                    else -> stringResource(message.textResourceId)
-                },
-                sectioned = true,
-            )
-        }
+        TvSearchResultRails(
+            query = query,
+            items = (state as? UiState.Success)?.data.orEmpty(),
+            isLoading = searchState.isLoading,
+            onItem = openItem,
+            modifier = Modifier.weight(1f),
+            errorMessage = (state as? UiState.Error)?.message,
+        )
     }
 }
 

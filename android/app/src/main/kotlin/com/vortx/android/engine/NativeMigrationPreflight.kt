@@ -74,7 +74,7 @@ internal fun nativeMigrationSourceDocument(document: JSONObject): JSONObject =
     }
 
 internal val nativeMigrationSidecars = setOf("authenticatedOwnAccountSources", "nativeOwnAccountPending", "nativeOwnAccountCandidates",
-    "nativeWatchedMigrationEvidence", "nativeWatchedMigrationPending", "nativeWatchlistMigrationPending")
+    "nativeWatchedMigrationEvidence", "nativeWatchedMigrationPending", "nativeWatchlistMigrationPending", "nativeLegacyMembershipPending")
 
 internal fun validateNativeOwnAccountCandidates(value: JSONObject): JSONObject {
     value.keys().forEach { id ->

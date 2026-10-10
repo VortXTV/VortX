@@ -8,11 +8,35 @@ import CryptoKit
 enum DebridProbe {
     static func log(_ category: String, _ message: String) {
         guard VXProbe.enabled else { return }
-        NSLog("[src-probe] %@: %@", category, message)
+        if category.hasPrefix("usenet-") {
+            // These producers use fixed outcomes and timings only. Include them in the export the
+            // user can share; the historical torrent probes keep their existing console behavior.
+            VXProbe.log("usenet", "\(category): \(message)")
+        } else {
+            NSLog("[src-probe] %@: %@", category, message)
+        }
     }
     static func h8(_ s: String) -> String { String(s.prefix(8)) }
     static func since(_ start: Date) -> Int { Int(Date().timeIntervalSince(start) * 1000) }
     static func ms(_ d: Duration) -> Int { Int(d.components.seconds) * 1000 }
+    static func usenetFailure(_ error: Error) -> String {
+        if let error = error as? DebridError {
+            switch error {
+            case .noKey: return "no_key"
+            case .sessionChanged: return "owner_changed"
+            case .invalidKey: return "invalid_key"
+            case .notCached: return "not_cached"
+            case .noMatchingFile: return "no_matching_file"
+            case .notReady: return "pending"
+            case .providerError(let message):
+                if message.hasPrefix("HTTP "), let status = Int(message.dropFirst(5)), (100...599).contains(status) {
+                    return "http_\(status)"
+                }
+                return "provider_error"
+            }
+        }
+        return UsenetNodeClient.failureReason(error)
+    }
 }
 
 /// Native in-client debrid resolution: turn a torrent (infohash / magnet) into a DIRECT, streamable
@@ -492,10 +516,32 @@ actor TorBoxUsenetResolver {
     private let session: URLSession
     private static let base = "https://api.torbox.app/v1/api/usenet"
     fileprivate static let queryValueAllowed = DebridQuery.valueAllowed
+    private let pollInterval: Duration
+    private let pollAttempts: Int
+    // This resolver is replaced on every credential revision. IDs never cross an account boundary.
+    // Keep acknowledged creates after timeout/cancellation: TorBox continues that exact cloud job.
+    private struct Job { var id: Int?; var waiting: Bool }
+    private var jobs: [String: Job] = [:]
+    private var creating: Set<String> = []
 
-    init(apiKey: String) {
+    init(apiKey: String, session: URLSession? = nil,
+         pollInterval: Duration = .seconds(3), pollAttempts: Int = 11) {
         self.apiKey = apiKey
-        self.session = TorBoxUsenetWire.makeSession()
+        self.session = session ?? TorBoxUsenetWire.makeSession()
+        self.pollInterval = pollInterval
+        self.pollAttempts = max(1, pollAttempts)
+    }
+
+    private static func jobKey(nzbURL: String, knownHash: String?) -> String {
+        knownHash?.lowercased() ?? identifier(forNzbURL: nzbURL)
+    }
+
+    func hasJob(nzbURL: String, knownHash: String?) -> Bool {
+        jobs[Self.jobKey(nzbURL: nzbURL, knownHash: knownHash)] != nil
+    }
+
+    func isWaiting(nzbURL: String, knownHash: String?) -> Bool {
+        jobs[Self.jobKey(nzbURL: nzbURL, knownHash: knownHash)]?.waiting == true
     }
 
     /// md5 of an nzb link, TorBox's usenet cache identifier (the usenet twin of the torrent infohash).
@@ -557,24 +603,38 @@ actor TorBoxUsenetResolver {
     /// source provenance and never indexes the provider list.
     /// `knownHash` is the source's authoritative NZB md5 when the emitter had one (TorBox search results
     /// carry it); the md5-of-the-link fallback only matches when TorBox derived its key the same way.
-    func resolve(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
-        // 1. Add the nzb using the endpoint's multipart contract. Idempotent: TorBox returns the existing
-        //    download id if the same nzb is already in the user's usenet list.
-        guard let request = TorBoxUsenetWire.createRequest(base: Self.base, apiKey: apiKey, nzbURL: nzbUrl) else {
-            throw DebridError.providerError("Invalid Usenet create request")
+    func resolve(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?,
+                 ownerIsCurrent: @escaping @Sendable () async -> Bool = { true }) async throws -> URL {
+        try Task.checkCancellation()
+        let key = Self.jobKey(nzbURL: nzbUrl, knownHash: knownHash)
+        do {
+            return try await resolveJob(nzbURL: nzbUrl, key: key, fileMustInclude: fileMustInclude,
+                                        fileIdx: fileIdx, episode: episode, ownerIsCurrent: ownerIsCurrent)
+        } catch {
+            // A real status/auth/selection failure must not leave a stale "still preparing" message.
+            // Cancellation at the outer deadline retains a last-known pending job for same-ID Retry.
+            if (error as? DebridError) != .notReady, !(error is CancellationError), !Task.isCancelled {
+                jobs[key]?.waiting = false
+            }
+            throw error
         }
-        let created: Envelope<Created> = try await send(request)
-        guard created.success else { throw DebridError.providerError("TorBox rejected the Usenet create request") }
-        var usenetId = created.data?.usenetId
+    }
 
-        // 2. Poll mylist until the download is finished + present (cached should be ~1 poll).
-        var files: [DebridFile] = []
-        if let id = usenetId, let item = try? await fetchItem(id: id), item.ready {
-            files = (item.files ?? []).map(file(from:))
+    private func resolveJob(nzbURL: String, key: String, fileMustInclude: String?, fileIdx: Int?,
+                            episode: DebridEpisode?, ownerIsCurrent: @escaping @Sendable () async -> Bool) async throws -> URL {
+        let started = Date()
+        // 1. Adopt an existing job before creating one. Concurrent callers serialize only this step;
+        // each caller keeps its own cancellation and file selector while polling the shared provider ID.
+        let existing = try await ensureJob(nzbURL: nzbURL, key: key, ownerIsCurrent: ownerIsCurrent)
+        // 2. Poll the SAME ID, including on Retry after the first playback budget elapsed.
+        let id: Int
+        let files: [DebridFile]
+        if let existing, existing.ready, !(existing.files ?? []).isEmpty {
+            id = existing.id
+            files = (existing.files ?? []).map(file(from:))
         } else {
-            files = try await pollById(&usenetId, hash: knownHash?.lowercased() ?? Self.identifier(forNzbURL: nzbUrl))
+            (id, files) = try await pollJob(key: key, ownerIsCurrent: ownerIsCurrent)
         }
-        guard let id = usenetId else { throw DebridError.notReady }
 
         // 3. Pick the file, applying fileMustInclude first, then the shared semantic episode/movie heuristic.
         guard let pick = pickUsenetFile(files, mustInclude: fileMustInclude, fileIdx: fileIdx, episode: episode) else {
@@ -582,7 +642,48 @@ actor TorBoxUsenetResolver {
         }
 
         // 4. Request the direct stream URL.
-        return try await requestDL(usenetId: id, fileId: pick.id)
+        try await validateOwner(ownerIsCurrent)
+        let url = try await requestDL(usenetId: id, fileId: pick.id)
+        try await validateOwner(ownerIsCurrent)
+        DebridProbe.log("usenet-cloud", "ready elapsed=\(DebridProbe.since(started))ms")
+        return url
+    }
+
+    private func validateOwner(_ ownerIsCurrent: @Sendable () async -> Bool) async throws {
+        guard !Task.isCancelled, await ownerIsCurrent(), !Task.isCancelled else { throw CancellationError() }
+    }
+
+    private func ensureJob(nzbURL: String, key: String,
+                           ownerIsCurrent: @escaping @Sendable () async -> Bool) async throws -> Item? {
+        while true {
+            try await validateOwner(ownerIsCurrent)
+            if !creating.contains(key) { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        if jobs[key] != nil {
+            DebridProbe.log("usenet-cloud", "resume existing job")
+            return nil
+        }
+        creating.insert(key)
+        defer { creating.remove(key) }
+        // An authoritative NZB hash also finds a completed job after the app/resolver restarted.
+        // A lookup failure is not permission to submit another download.
+        if let item = try await fetchItem(hash: key) {
+            try await validateOwner(ownerIsCurrent)
+            jobs[key] = Job(id: item.id, waiting: !item.ready)
+            DebridProbe.log("usenet-cloud", "adopt existing job ready=\(item.ready)")
+            return item
+        }
+        try await validateOwner(ownerIsCurrent)
+        guard let request = TorBoxUsenetWire.createRequest(base: Self.base, apiKey: apiKey, nzbURL: nzbURL) else {
+            throw DebridError.providerError("Invalid Usenet create request")
+        }
+        let created: Envelope<Created> = try await send(request)
+        guard created.success else { throw DebridError.providerError("TorBox rejected the Usenet create request") }
+        jobs[key] = Job(id: created.data?.usenetId, waiting: true)
+        DebridProbe.log("usenet-cloud", "created job hasID=\(created.data?.usenetId != nil)")
+        try await validateOwner(ownerIsCurrent)
+        return nil
     }
 
     /// File pick with the usenet-specific `fileMustInclude` regex applied first when it matches a video,
@@ -615,29 +716,42 @@ actor TorBoxUsenetResolver {
     private func fetchItem(id: Int) async throws -> Item? {
         guard let url = URL(string: "\(Self.base)/mylist?id=\(id)&bypass_cache=true") else { return nil }
         let env: Envelope<Item> = try await get(url)
+        guard env.success else { throw DebridError.providerError("TorBox rejected the Usenet status request") }
+        guard env.data == nil || env.data?.id == id else { throw DebridError.providerError("Unexpected Usenet job") }
         return env.data
     }
 
-    /// Poll the usenet list until the download is ready. Match by id when we have one, else by the nzb md5
-    /// (TorBox echoes the hash), promoting the resolved id out via `inout`. Streaming timeout ~30s; an
-    /// uncached download surfaces as `.notReady` (the caller shows "caching…" and does not hang).
-    private func pollById(_ usenetId: inout Int?, hash: String) async throws -> [DebridFile] {
-        for attempt in 0..<10 {
-            try Task.checkCancellation()   // bounded-resolve timeout cancels the group: stop polling promptly, don't orphan
-            if attempt > 0 { try? await Task.sleep(nanoseconds: 3_000_000_000) }   // 3s between polls
-            if let id = usenetId {
-                if let item = try? await fetchItem(id: id), item.ready, !(item.files ?? []).isEmpty {
-                    return (item.files ?? []).map(file(from:))
-                }
-                continue
+    private func fetchItem(hash: String) async throws -> Item? {
+        guard let url = URL(string: "\(Self.base)/mylist?bypass_cache=true") else { return nil }
+        let env: Envelope<[Item]> = try await get(url)
+        guard env.success else { throw DebridError.providerError("TorBox rejected the Usenet status request") }
+        return (env.data ?? []).first { $0.hash?.lowercased() == hash }
+    }
+
+    /// Eleven observations include the 30-second wait boundary (plus request time), while the existing
+    /// 35-second coordinator deadline remains authoritative. The old loop exhausted its waits at 27s.
+    private func pollJob(key: String, ownerIsCurrent: @escaping @Sendable () async -> Bool) async throws -> (Int, [DebridFile]) {
+        for attempt in 0..<pollAttempts {
+            if attempt > 0 { try await Task.sleep(for: pollInterval) }
+            try await validateOwner(ownerIsCurrent)
+            let item: Item?
+            if let id = jobs[key]?.id {
+                item = try await fetchItem(id: id)
+            } else {
+                item = try await fetchItem(hash: key)
             }
-            guard let url = URL(string: "\(Self.base)/mylist?bypass_cache=true") else { break }
-            let env: Envelope<[Item]> = try await get(url)
-            if let mine = (env.data ?? []).first(where: { $0.hash?.lowercased() == hash && $0.ready && !($0.files ?? []).isEmpty }) {
-                usenetId = mine.id
-                return (mine.files ?? []).map(file(from:))
+            try await validateOwner(ownerIsCurrent)
+            if let item {
+                let ready = item.ready && !(item.files ?? []).isEmpty
+                jobs[key] = Job(id: item.id, waiting: !ready)
+                if ready { return (item.id, (item.files ?? []).map(file(from:))) }
+                if ["failed", "error", "cancelled"].contains(item.downloadState?.lowercased() ?? "") {
+                    jobs[key]?.waiting = false
+                    throw DebridError.providerError("TorBox Usenet job failed")
+                }
             }
         }
+        DebridProbe.log("usenet-cloud", "pending after bounded poll; job retained for Retry")
         throw DebridError.notReady
     }
 
@@ -1410,11 +1524,18 @@ actor DebridCoordinator {
                 try await inheritedNativeOwner?.validate()
                 return try await usenet.resolve(
                     nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
-                    fileIdx: fileIdx, episode: episode
+                    fileIdx: fileIdx, episode: episode,
+                    ownerIsCurrent: {
+                        guard let inheritedNativeOwner else { return true }
+                        return await inheritedNativeOwner.isCurrent()
+                    }
                 )
             }
         } catch {
-            await recordBreakerFailure(error, provider: breakerProvider, sourceID: breakerSource, phase: .resolve)
+            // A queued/download-running job is healthy provider work, not a circuit-breaker failure.
+            if (error as? DebridError) != .notReady {
+                await recordBreakerFailure(error, provider: breakerProvider, sourceID: breakerSource, phase: .resolve)
+            }
             throw error
         }
         guard isCurrent(capture, revision: revision) else { throw DebridError.sessionChanged }
@@ -1496,7 +1617,15 @@ extension DebridCoordinator {
                                                usenetResolveTimeout: .seconds(35)) {
             return .ready(ref)
         }
-        if StremioServer.nativeTransportSelected {
+        guard !Task.isCancelled else { return .failed("NZB playback was cancelled.") }
+        if let capture = currentAuthorityCapture(), let nzb = stream.usenetURLs.first {
+            let revision = latestCredentialRevision
+            let waiting = await torboxUsenet?.isWaiting(nzbURL: nzb, knownHash: stream.usenetKnownHash) == true
+            if waiting, !Task.isCancelled, isCurrent(capture, revision: revision) {
+                return .failed("TorBox is still preparing this NZB. Select this source again to check the same download without starting it over.")
+            }
+        }
+        if StremioServer.nativeTransportSelected, !remoteAvailable {
             return .failed("This NZB could not be started with the configured providers. Native playback supports raw video, stored RAR and COPY 7z archives. Compressed, encrypted or repair-required sources need a supported TorBox route or another source.")
         }
         return .failed("This NZB source could not be started. Check that the provider is available and try another source.")
@@ -1628,6 +1757,10 @@ extension DebridCoordinator {
             guard !ownsNativeAttempt || nativeOwner.credential == usenetCapture else { return nil }
             #endif
             let usenetRevision = latestCredentialRevision
+            // Retry continues a cloud job already chosen for this source. Repeating failed native
+            // probes would delay an already-completed cloud download and restart the route sequence.
+            let resumingCloudJob = await torboxUsenet?.hasJob(nzbURL: nzb, knownHash: stream.usenetKnownHash) == true
+            if resumingCloudJob, nativeOwner.requiresNativeAuthority { nativeFallbackOwner = nativeOwner }
             // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet providers, resolve
             // the nzb on device through the embedded server's dormant NNTP engine (no debrid). Preferred over
             // TorBox EXCEPT when TorBox already has this source confirmed-cached (an instant direct link that
@@ -1641,7 +1774,7 @@ extension DebridCoordinator {
             // any await: the resolver routes through all of them and never reads the account/Keychain again
             // inside the network awaits below.
             let usenetSavedServers = UsenetProviderStore.loadEnabledServers(ownerCapture: usenetCapture)
-            if !torBoxHasItCached, (!stream.usenetServers.isEmpty || !usenetSavedServers.isEmpty) {
+            if !torBoxHasItCached, !resumingCloudJob, (!stream.usenetServers.isEmpty || !usenetSavedServers.isEmpty) {
                 nativeFallbackOwner = nativeOwner.requiresNativeAuthority ? nativeOwner : nil
                 do {
                     let nativeOwnerIsCurrent = nativeOwner.isCurrent
@@ -1652,6 +1785,9 @@ extension DebridCoordinator {
                             waitForNode: waitForLocalUsenetNode, excluding: excludingUsenetRoutes,
                             selection: .init(fileIdx: stream.fileIdx, fileMustInclude: stream.fileMustInclude,
                                              episode: selectionEpisode.map { .init(season: $0.season, episode: $0.episode) }),
+                            onAttempt: { route, outcome, elapsed in
+                                DebridProbe.log("usenet-local", "route=\(route.rawValue) outcome=\(outcome) elapsed=\(elapsed)ms")
+                            },
                             ownerIsCurrent: nativeOwnerIsCurrent
                         )
                     }
@@ -1668,8 +1804,10 @@ extension DebridCoordinator {
                                              usenetRoute: local.route, nativeUsenetLease: local.nativeLease)
                     }
                 } catch is CancellationError {
+                    DebridProbe.log("usenet-local", "cancelled")
                     return nil
                 } catch {
+                    DebridProbe.log("usenet-local", "unavailable reason=\(DebridProbe.usenetFailure(error))")
                     if let nativeFallbackOwner, !(await nativeFallbackOwner.isCurrent()) { return nil }
                     guard !Task.isCancelled, isCurrent(usenetCapture, revision: usenetRevision),
                           (error as? DebridError) != .sessionChanged else { return nil }
@@ -1691,6 +1829,7 @@ extension DebridCoordinator {
             let fileIdx = stream.fileIdx
             let knownHash = stream.usenetKnownHash
             let fallbackOwner = nativeFallbackOwner
+            let started = Date()
             let result = await withTaskGroup(of: DebridPlaybackRef?.self) { group in
                 group.addTask {
                     do {
@@ -1703,10 +1842,14 @@ extension DebridCoordinator {
                         return DebridPlaybackRef(url: url, service: .torBox, infoHash: "",
                                                  torrentId: nil, fileId: nil, fileIdx: fileIdx,
                                                  usenetRoute: .torBoxCloud)
-                    } catch { return nil }
+                    } catch {
+                        DebridProbe.log("usenet-cloud", "resolve failed reason=\(DebridProbe.usenetFailure(error)) elapsed=\(DebridProbe.since(started))ms")
+                        return nil
+                    }
                 }
                 group.addTask {
-                    try? await Task.sleep(for: usenetResolveTimeout)
+                    do { try await Task.sleep(for: usenetResolveTimeout) } catch { return nil }
+                    DebridProbe.log("usenet-cloud", "resolve deadline elapsed=\(DebridProbe.since(started))ms")
                     return nil   // timeout sentinel
                 }
                 let first = await group.next() ?? nil

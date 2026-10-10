@@ -4,6 +4,27 @@ import Foundation
 enum UsenetNodeClient {
     enum ClientError: Error, Equatable {
         case createFailed(Int), badResponse, unsafeEndpoint, nativeUnavailable, unsupportedArchive, invalidSelector
+        case selectionUnmatched, nativeRejected
+    }
+
+    /// Only fixed reason labels/numeric codes may reach diagnostics. Error descriptions and provider
+    /// response bodies can contain an NZB URL or NNTP credentials.
+    static func failureReason(_ error: Error) -> String {
+        if error is CancellationError { return "cancelled" }
+        if let failure = error as? ClientError {
+            switch failure {
+            case .createFailed(let status): return "http_\(status)"
+            case .badResponse: return "invalid_response"
+            case .unsafeEndpoint: return "unsafe_endpoint"
+            case .nativeUnavailable: return "native_capabilities_unavailable"
+            case .unsupportedArchive: return "unsupported_archive"
+            case .invalidSelector: return "invalid_selector"
+            case .selectionUnmatched: return "selection_unmatched"
+            case .nativeRejected: return "native_rejected"
+            }
+        }
+        if let failure = error as? URLError { return "network_\(failure.code.rawValue)" }
+        return "resolver_error"
     }
 
     struct Endpoint: Sendable, Equatable {
@@ -235,7 +256,16 @@ enum UsenetNodeClient {
         try Task.checkCancellation()
         try await lease?.validateOwner()
         let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if lease != nil, code == 422 { throw ClientError.unsupportedArchive }
+        if lease != nil, code == 422 {
+            // A 422 also covers a selector with no matching file. Do not turn every native refusal
+            // into an archive diagnosis, and never log the untrusted response text.
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            switch object?["error"] as? String {
+            case "selection_unmatched": throw ClientError.selectionUnmatched
+            case "unsupported_archive", "unsupported_archive_or_encoding": throw ClientError.unsupportedArchive
+            default: throw ClientError.nativeRejected
+            }
+        }
         guard (200...299).contains(code) else { throw ClientError.createFailed(code) }
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let key = object["key"] as? String, !key.isEmpty else { throw ClientError.badResponse }

@@ -4,6 +4,34 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.5.0-beta.3 - Account loading, watch state, and Cinema polish
+
+Build **263** across Apple and Android. This release repairs account-owned add-on and episode
+loading, including sources embedded in episode metadata, and keeps an old or cancelled
+next-episode request from clearing its replacement. Continue Watching and watched updates keep
+the exact episode identity. Sync retains newer edits through uploads, shows success only after
+the complete update is saved, and uses foreground update notifications with a three-second
+fallback.
+
+Search restores incremental Movies, Series, and Collections rails. Quick View gains a visible
+close button, outside-tap dismissal, a three-line synopsis, and item-owned Watchlist actions.
+Episode rails use the available width with smaller cards, navigation arrows, and watched menus.
+Phone Home has a rounded hero and a soft OLED colour wash; Settings and Library use spaced,
+profile-tinted glass, while player controls keep neutral surfaces. Artwork decoding and Library
+hero work are bounded to reduce rendering stalls.
+
+Usenet streaming keeps a partially-read chunk in the foreground cache instead of repeatedly
+evicting and fetching it. Existing cloud jobs retain their file and episode selection during
+recovery. These are scoped source and regression repairs, not a claim that every provider,
+playback stall, or physical two-device sync case has been verified.
+
+Mac builds may ask for the Mac password when accessing previously saved Keychain credentials.
+The ad-hoc signed Mac app is not notarized. If macOS blocks an official release download:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/VortX.app
+```
+
 ## 0.5.0-beta.1 - Draft: Native core, Cinema, and durable watch state
 
 **Unpublished release candidate.** Source identity is **0.5.0**, Apple build **260** and Android

@@ -163,6 +163,12 @@ extension UsenetNodeClient {
         for scenario in ["failure", "mismatch", "malformed"] {
             do { _ = try await create(scenario); check(false, scenario + " refuses URL") }
             catch {
+                #if !NZB_OPERATION_BASELINE
+                if scenario == "mismatch" {
+                    check(error as? UsenetNodeClient.ClientError == .selectionUnmatched,
+                          "native selector mismatch is not diagnosed as unsupported archive")
+                }
+                #endif
                 let failedID = try await creates().last!["operationId"] as? String ?? "baseline-failure"
                 check(await eventually { await cancelled(failedID) }, scenario + " retires its UUID before retry")
             }
@@ -274,6 +280,33 @@ extension UsenetNodeClient {
         let cloudAfterNormalFallback = await FixtureCloudResolver.shared.calls
         check(ordinaryFallback?.usenetRoute == .torBoxCloud && cloudAfterNormalFallback == cloudAfterRetirement + 1,
               "actual live-owner local failure preserves configured cloud fallback")
+
+        await FixtureCloudResolver.shared.setExistingJob(true)
+        let localBeforeCloudRetry = try await creates().count
+        let resumedCloud = await CoordinatorFixture().resolvedPlaybackRef(for: stream)
+        let localAfterCloudRetry = try await creates().count
+        check(resumedCloud?.usenetRoute == .torBoxCloud && localBeforeCloudRetry == localAfterCloudRetry,
+              "actual cloud Retry does not restart earlier native routes")
+        let cloudBeforeGate = await FixtureCloudResolver.shared.calls
+        let gatedRetry = await CoordinatorFixture().resolvedPlaybackRef(for: stream, confirmedUsenetURLs: [])
+        let cloudAfterGate = await FixtureCloudResolver.shared.calls
+        check(gatedRetry == nil && cloudBeforeGate == cloudAfterGate,
+              "existing cloud job does not bypass unattended cache gate")
+        await FixtureCloudResolver.shared.setDelay(.seconds(5))
+        let deadlineStarted = ContinuousClock.now
+        let deadlineResult = await CoordinatorFixture().resolvedPlaybackRef(
+            for: stream, usenetResolveTimeout: .milliseconds(10))
+        check(deadlineResult == nil && deadlineStarted.duration(to: .now) < .seconds(1),
+              "actual coordinator deadline cancels cloud polling within caller budget")
+        await FixtureCloudResolver.shared.setDelay(nil)
+        await FixtureCloudResolver.shared.setError(.notReady)
+        let explicitPending = await CoordinatorFixture().resolveExplicitUsenetPlayback(for: stream)
+        if case .failed(let message) = explicitPending {
+            check(message.contains("TorBox is still preparing") && !message.contains("Native playback supports"),
+                  "actual explicit pending result explains same-job Retry instead of an archive failure")
+        } else { check(false, "actual explicit pending result explains same-job Retry instead of an archive failure") }
+        await FixtureCloudResolver.shared.setError(nil)
+        await FixtureCloudResolver.shared.setExistingJob(false)
 
         let fallbackWarmGate = FixtureWarmGate()
         let fallbackCoordinator = CoordinatorFixture(warmGate: fallbackWarmGate)

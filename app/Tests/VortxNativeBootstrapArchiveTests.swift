@@ -88,6 +88,60 @@ import Foundation
         do { _ = try VortxNativeBootstrapArchive.encode(document: data([:]), material: data(["schemaVersion": 1, "password": "not-allowed"])); fatalError("typed input was silently sanitized") } catch {}
         var injected = object; injected["password"] = "not-allowed-at-archive-root"
         do { try VortxNativeBootstrapArchive.validate(data(injected)); fatalError("unknown archive root persisted") } catch {}
+        try membershipReceiptRetention()
         print("Native bootstrap archive: exact fractional material, full noncredential settings/unknown fields, nested credential exclusions and ambiguity fences passed")
+    }
+
+    static func membershipReceiptRetention() throws {
+        let scope = "account.fixture"
+        let owner = "00000000-0000-0000-0000-00000000A11C"
+        let digest = String(repeating: "a", count: 64)
+        let receipt: [String: Any] = ["profileId": owner, "kind": "addon_install",
+            "identity": "https://addon.example/retired/manifest.json", "sourceField": "/vortx/deletedAddonsTs",
+            "receipt": ["deletedAddonsTs": ["https://addon.example/retired/manifest.json": ["addedAt": 1000.125, "removedAt": 0]],
+                        "deletedAddons": [], "webAddonRemovals": []], "sourceDocumentSha256": digest]
+        let source = try VortxNativeBootstrapArchive.encode(document: data(["ownAccountSources": [:]]))
+        let archive = try VortxLegacyMembershipReceiptArchive.appending(data([receipt]), to: source,
+            scope: scope, ownerProfileID: owner, sourceDocumentSHA256: digest)
+        try VortxNativeBootstrapArchive.validate(archive)
+        let host = (try JSONSerialization.jsonObject(with: archive) as! [String: Any])["hostDocument"] as! [String: Any]
+        let pending = host[VortxLegacyMembershipReceiptArchive.key] as! [String: Any]
+        let initial = try data(pending)
+        var next = receipt; next["sourceDocumentSha256"] = String(repeating: "b", count: 64)
+        let refreshed: [String: Any] = ["schemaVersion": 1, "scope": scope, "ownerProfileId": owner, "receipts": [next]]
+        let merged = try VortxLegacyMembershipReceiptArchive.merging(initial, with: data(refreshed), scope: scope, ownerProfileID: owner)!
+        let retained = (try JSONSerialization.jsonObject(with: merged) as! [String: Any])["receipts"] as! [[String: Any]]
+        check(retained.count == 1 && retained[0]["sourceDocumentSha256"] as? String == digest)
+        check((((retained[0]["receipt"] as! [String: Any])["deletedAddonsTs"] as! [String: Any])[receipt["identity"] as! String] as! [String: Any])["addedAt"] as? Double == 1000.125)
+        next["receipt"] = ["deletedAddonsTs": [receipt["identity"] as! String: ["addedAt": 1000.875, "removedAt": 0]],
+                           "deletedAddons": [], "webAddonRemovals": []]
+        let changed: [String: Any] = ["schemaVersion": 1, "scope": scope, "ownerProfileId": owner, "receipts": [next]]
+        let history = try VortxLegacyMembershipReceiptArchive.merging(merged, with: data(changed), scope: scope, ownerProfileID: owner)!
+        check(((try JSONSerialization.jsonObject(with: history) as! [String: Any])["receipts"] as! [Any]).count == 2)
+        check(try VortxLegacyMembershipReceiptArchive.merging(history, with: nil, scope: scope, ownerProfileID: owner) == history)
+        do { _ = try VortxLegacyMembershipReceiptArchive.merging(history, with: nil, scope: "account.other", ownerProfileID: owner); fatalError("foreign scope accepted") } catch {}
+        do { _ = try VortxLegacyMembershipReceiptArchive.appending(data([receipt]), to: source, scope: scope, ownerProfileID: owner,
+                sourceDocumentSHA256: String(repeating: "c", count: 64)); fatalError("wrong source accepted") } catch {}
+        var credential = receipt; credential["receipt"] = ["password": "fixture-only"]
+        do { _ = try VortxLegacyMembershipReceiptArchive.appending(data([credential]), to: source, scope: scope, ownerProfileID: owner,
+                sourceDocumentSHA256: digest); fatalError("credential carrier accepted") } catch {}
+        var unknown = receipt; unknown["kind"] = "ignore_everything"
+        let invalid: [String: Any] = ["schemaVersion": 1, "scope": scope, "ownerProfileId": owner, "receipts": [unknown]]
+        do { _ = try VortxLegacyMembershipReceiptArchive.merging(nil, with: data(invalid), scope: scope, ownerProfileID: owner); fatalError("unknown pending kind accepted") } catch {}
+        var malformedKind = receipt; malformedKind["sourceField"] = "/unrelated/path"
+        var noSources = receipt; noSources["kind"] = "watch_identity_conflict"
+        noSources["sourceField"] = "/vortx/byProfile/\(owner)/watch_identity_conflicts"; noSources["receipt"] = [:] as [String: Any]
+        var wrongProfile = receipt; wrongProfile["kind"] = "profile_saved_overlay"
+        wrongProfile["identity"] = "title"; wrongProfile["sourceField"] = "/vortx/byProfile/00000000-0000-0000-0000-00000000ABCD/library/0"
+        wrongProfile["receipt"] = ["id": "title", "type": "series"]
+        var wrongIdentity = wrongProfile; wrongIdentity["sourceField"] = "/vortx/byProfile/\(owner)/library/0"
+        wrongIdentity["receipt"] = ["id": "different", "type": "series"]
+        for malformed in [malformedKind, noSources, wrongProfile, wrongIdentity] {
+            let candidate: [String: Any] = ["schemaVersion": 1, "scope": scope, "ownerProfileId": owner, "receipts": [malformed]]
+            do { _ = try VortxLegacyMembershipReceiptArchive.merging(nil, with: data(candidate), scope: scope, ownerProfileID: owner); fatalError("malformed known kind accepted") } catch {}
+        }
+        let excessive: [String: Any] = ["schemaVersion": 1, "scope": scope, "ownerProfileId": owner, "receipts": Array(repeating: receipt, count: 10_001)]
+        do { _ = try VortxLegacyMembershipReceiptArchive.merging(nil, with: data(excessive), scope: scope, ownerProfileID: owner); fatalError("unbounded journal accepted") } catch {}
+        print("Pending membership receipts: exact values, account binding, no resurrection, bounded idempotent retention and credential fences passed")
     }
 }

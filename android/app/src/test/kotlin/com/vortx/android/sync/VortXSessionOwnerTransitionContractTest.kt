@@ -45,10 +45,10 @@ class VortXSessionOwnerTransitionContractTest {
                 "shouldResumeRetainedRealtime(retained.hadActiveRealtime, retainedSessionIsCurrent)",
             ),
         )
-        assertTrue(resume.contains("realtime.start()"))
+        assertTrue(resume.contains("startRealtime()"))
         assertTrue(
             resume.indexOf("armPendingSync(it, recordEdit = false)") <
-                resume.indexOf("realtime.start()"),
+                resume.indexOf("startRealtime()"),
         )
         assertTrue(adopt.contains("val result = operation.commitSessionMutation("))
         assertTrue(adopt.contains("onCommitted = ::cancelSessionWork"))

@@ -143,7 +143,15 @@ internal class VortxResourceBridge(
                         }
                         require(groups.map { it.addonId }.toSet().size == groups.size)
                         require(groups.all { group -> capturedAddons.any { it.id == group.addonId } })
-                        groups.forEach { it.items(capturedRequest.resource) }
+                        groups.forEach { group ->
+                            val items = group.items(capturedRequest.resource)
+                            if (group.status == "ready") require(requireNotNull(group.contentJson).toByteArray(Charsets.UTF_8).size <= maxResponseBytes) {
+                                "Resource response exceeded body limit"
+                            }
+                            if (capturedRequest.resource == VortxResourceRequest.Resource.META) require(items.all {
+                                it.getString("id") == capturedRequest.id && it.getString("type") == capturedRequest.type
+                            }) { "Metadata response identity mismatch" }
+                        }
                         val snapshot = VortxResourceSnapshot(ownerId, lease.id, lease.generation, capturedRequest, groups,
                             capturedAddons.associate { it.id to it.transportUrl })
                         check(accepts(snapshot)) { "Resource request superseded" }

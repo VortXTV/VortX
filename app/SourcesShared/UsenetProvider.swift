@@ -221,6 +221,7 @@ enum UsenetLocalResolver {
                               waitForNode: Bool = false,
                               excluding: Set<DebridUsenetRoute> = [],
                               selection: UsenetNodeClient.Selection = .init(),
+                              onAttempt: @escaping @Sendable (DebridUsenetRoute, String, Int) -> Void = { _, _, _ in },
                               ownerIsCurrent: @escaping @Sendable () async -> Bool) async throws -> RoutedStream? {
         #if VORTX_NO_EMBEDDED_SERVER
         throw ResolveError.unavailable
@@ -247,10 +248,18 @@ enum UsenetLocalResolver {
 
         // This is the same serial/cancellation policy exercised by the injected transport regression test.
         guard let (route, created) = try await UsenetRoutingPolicy.firstSuccessful(attempts, create: { attempt in
-            try await UsenetNodeClient.createStream(
-                endpoint: endpoint, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout,
-                selection: selection, ownerIsCurrent: ownerIsCurrent
-            )
+            let started = Date()
+            do {
+                let result = try await UsenetNodeClient.createStream(
+                    endpoint: endpoint, nzbURLs: validNZBs, servers: attempt.servers, session: session, timeout: requestTimeout,
+                    selection: selection, ownerIsCurrent: ownerIsCurrent
+                )
+                onAttempt(attempt.route, "ready", Int(Date().timeIntervalSince(started) * 1000))
+                return result
+            } catch {
+                onAttempt(attempt.route, UsenetNodeClient.failureReason(error), Int(Date().timeIntervalSince(started) * 1000))
+                throw error
+            }
         }) else {
             throw ResolveError.badResponse
         }

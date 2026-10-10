@@ -26,7 +26,7 @@ internal class NativeAccountCoordinator(
     private val accountCurrent: (SessionOwnerSnapshot.Account) -> Boolean,
     private val dispose: (() -> Unit) -> Unit,
     private val project: suspend (VortxNativeSession) -> Unit,
-    private val onMutation: () -> Unit = {},
+    private val onMutation: (SessionOwnerSnapshot.Account) -> Unit = {},
     private val onRetired: () -> Unit = {},
     private val ownCredentials: NativeOwnAccountCredentials? = null,
     private val ownProducer: NativeOwnAccountProducer = NativeOwnAccountProducer(),
@@ -231,7 +231,7 @@ internal class NativeAccountCoordinator(
         check(pendingImport === pending && pending.isCurrent() && accountCurrent(target.account))
         val applied = applyDocumentLocked(target.account, pending.document, pending.isCurrent,
             pending.sources.filterNot { it.profileID == target.profile.id } + source)
-        if (applied) onMutation()
+        if (applied) onMutation(target.account)
         applied
     }
     fun session(): VortxNativeSession = checkNotNull(mounted.get()) { "Native account has not completed authenticated bootstrap" }
@@ -277,11 +277,15 @@ internal class NativeAccountCoordinator(
             }
         }
         val state = scope.validateSnapshot(checkNotNull(checkpoints.read(scope)))
+        state.optJSONObject("hostDocument")?.optJSONObject("nativeLegacyMembershipPending")?.let { journal ->
+            nativeLegacyMembershipJournal(scope, journal, JSONArray(),
+                state.getJSONObject("roster").getJSONObject("profiles").keys().asSequence().toSet())
+        }
         requireNotNull(state.getJSONObject("nativeSync").optJSONObject("legacyImport")) { "Native account requires a verified legacy baseline receipt" }
         val ownerName = state.getJSONObject("roster").getJSONObject("profiles").getJSONObject(scope.ownerProfileID).getString("name")
         val resources = transport()
         val candidate = try { VortxNativeSession.open(scope, ownerName, bindings, checkpoints, resources,
-            onMutation = onMutation, beforeOwnerChange = onAuthorityChanged) { isCurrent() && accountCurrent(account) } }
+            onMutation = { onMutation(account) }, beforeOwnerChange = onAuthorityChanged) { isCurrent() && accountCurrent(account) } }
             catch (error: Throwable) { (resources as? AutoCloseable)?.close(); throw error }
         try { withAccountAdmission(account, isCurrent) { checkpoints.remember(scope) } }
         catch (error: Throwable) { candidate.close(); throw error }
@@ -449,8 +453,16 @@ internal class NativeAccountCoordinator(
         }
         val watched = watchedProducer.prepare(scope, materialDocument, roster, sources,
             priorArchive?.optJSONArray("nativeWatchedMigrationEvidence"), migrationCurrent)
-        val material = if (unavailable.isNotEmpty() || !watched.isComplete) null else nativeLegacyMaterial(materialDocument, roster, resolved.modifiedSeconds,
+        val preparation = if (unavailable.isNotEmpty() || !watched.isComplete) null else prepareNativeLegacyMaterial(materialDocument, roster, resolved.modifiedSeconds,
             sources, ownBaseline, scope, pendingOverlays, watchedMigration = watched)
+        val material = preparation?.material
+        // Retain exact unresolved source receipts in the same sealed candidate checkpoint as the
+        // accepted material. Never turn a historical receipt into an install, removal or clock.
+        archive.getJSONObject("document").put("nativeLegacyMembershipPending", nativeLegacyMembershipJournal(scope,
+            priorArchive?.optJSONObject("nativeLegacyMembershipPending"), preparation?.pendingMembershipReceipts ?: JSONArray(),
+            knownProfileIDs = roster.map { it.id }.toSet() +
+                retained?.optJSONObject("roster")?.optJSONObject("profiles")?.keys()?.asSequence()?.toSet().orEmpty() +
+                remote?.optJSONObject("profiles")?.keys()?.asSequence()?.toSet().orEmpty()))
         // Full descriptors may contain encoded custom strings. Retain exact typed input only if it
         // is credential-free; sanitizing it would silently change the shared kernel's receipt input.
         material?.let(NativeHostDocument::requireCredentialFree)
@@ -464,7 +476,8 @@ internal class NativeAccountCoordinator(
             val expected = NativeAccountBinding.parse(JSONObject().put("account", JSONObject().put("kind", "own").put("value", source.verifiedUID))
                 .put("revision", 0).put("transactionId", JSONObject.NULL))
             syncActions += NativeStreamingAccountLink.action(scope, source.profileID, expected, transaction, JSONObject().put("kind", "own")
-                .put("carrier", nativeOwnAccountCarrier(source, roster.single { it.id == source.profileID }, JSONObject(), watchedMigration = watched)))
+                .put("carrier", nativePreparedOwnAccountCarrier(source, roster.single { it.id == source.profileID }, JSONObject(),
+                    watchedMigration = watched, preparedMaterial = material)))
         } }
         val archivedDocument = archive.getJSONObject("document")
         priorArchive?.optJSONObject("nativeOwnAccountCandidates")?.let {
@@ -569,7 +582,7 @@ internal class NativeAccountCoordinator(
             VortxNativeSession.open(scope, owner.name, bindings, checkpoints, resources,
             bootstrapActions = syncActions, initialHostProfiles = hostProfiles, initialHostArchive = archive,
             initialHostPreferences = remoteHost, initialLegacyWatchlists = watchlists.profiles,
-            verifyCandidate = verifySources, onMutation = onMutation, beforeOwnerChange = onAuthorityChanged) { isCurrent() && accountCurrent(account) } } } }
+            verifyCandidate = verifySources, onMutation = { onMutation(account) }, beforeOwnerChange = onAuthorityChanged) { isCurrent() && accountCurrent(account) } } } }
             catch (error: Throwable) {
                 (resources as? AutoCloseable)?.close()
                 // Cancellation did not consume the durable setup source. Restore its setup-only

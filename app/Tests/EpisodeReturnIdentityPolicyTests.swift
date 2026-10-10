@@ -18,6 +18,16 @@ private enum EpisodeReturnIdentityPolicyTests {
         let available: Set<String> = ["series:2:1", "series:2:2", "series:2:3"]
 
         check(
+            "S2E2 to accepted S2E3 returns to E3 despite delayed E2 history",
+            EpisodeReturnIdentityPolicy.resolve(
+                libraryID: "series", isVideoAvailable: available.contains,
+                committedLibraryID: "series", committedVideoID: "series:2:3",
+                engineVideoID: "series:2:2", attemptedLibraryID: "series",
+                attemptedVideoID: "series:2:2"
+            ) == "series:2:3"
+        )
+
+        check(
             "committed first-frame episode outranks delayed engine history",
             EpisodeReturnIdentityPolicy.resolve(
                 libraryID: "series",

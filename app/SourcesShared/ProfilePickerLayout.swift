@@ -4,6 +4,14 @@ import Foundation
 struct ProfilePickerLayout {
     let width: CGFloat
     let largeText: Bool
+    let isPhone: Bool
+
+    init(width: CGFloat, largeText: Bool, isPhone: Bool = false) {
+        self.width = width
+        self.largeText = largeText
+        self.isPhone = isPhone
+    }
+
     var isWide: Bool { width >= 700 }
     var horizontalInset: CGFloat { isWide ? 48 : 24 }
     var spacing: CGFloat { isWide ? 28 : 18 }
@@ -16,5 +24,13 @@ struct ProfilePickerLayout {
     var avatarSide: CGFloat {
         let available = min(width, 1100) - horizontalInset * 2 - 16 - spacing * CGFloat(columns - 1)
         return max(32, min(isWide ? 160 : 110, available / CGFloat(columns)))
+    }
+
+    /// Center each populated row, including the last row; empty grid tracks must not shift avatars.
+    func rows(itemCount: Int) -> [Range<Int>] {
+        guard itemCount > 0 else { return [] }
+        return stride(from: 0, to: itemCount, by: columns).map {
+            $0..<min($0 + columns, itemCount)
+        }
     }
 }

@@ -36,8 +36,6 @@ targets:
       # Use the framework dependencies rather than hand-picked archive paths: Xcode then selects
       # the actual ios-arm64-simulator slices and does not accidentally reuse the macOS renderer's
       # ordinary static archives.
-      - framework: Vendor/StremioXCore.xcframework
-        embed: false
       - framework: Vendor/VortxEngine.xcframework
         embed: false
     settings:
@@ -50,7 +48,7 @@ targets:
         # The normal app entry point is excluded under this condition. The fixture app constructs
         # no CoreBridge/account/player/server owner, and the existing watched/network/provider traps
         # turn any accidental escape path into an immediate failure.
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) DEBUG CINEMA_UI_SMOKE_RENDERER VORTX_NO_EMBEDDED_SERVER VORTX_NATIVE_DATA_ENGINE VORTX_ENGINE_STATE_BRIDGE VORTX_ENGINE_RESOURCE_HOST"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: Cinema UI Smoke iOS
         INFOPLIST_KEY_UILaunchScreen_Generation: "YES"

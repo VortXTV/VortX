@@ -507,6 +507,8 @@ actor VortxNativeSession {
     private var epoch = UUID()
     private var tickets: [String: UUID] = [:]
     private var bridges: [String: VortxResourceBridge] = [:]
+    private var resourceBatchBridges: [String: [VortxResourceBridge]] = [:]
+    private var catalogPlans: [String: VortxJSON] = [:]
     private var pages: [String: [VortxResourceSnapshot]] = [:]
     private var screens: [String: VortxNativeScreenState] = [:]
     private var catalogRegistries: [String: [VortxResourceAddon]] = [:]
@@ -750,6 +752,8 @@ actor VortxNativeSession {
     nonisolated static func revokeAllForOwnerBoundary() { VortxScopeWriter.revokeAll() }
     private func invalidateScreens() {
         epoch = UUID(); bridges.values.forEach { $0.invalidate() }
+        resourceBatchBridges.values.flatMap { $0 }.forEach { $0.invalidate() }
+        resourceBatchBridges.removeAll(); catalogPlans.removeAll()
         tickets.removeAll(); pages.removeAll(); screens.removeAll(); catalogRegistries.removeAll()
     }
     func invalidateResources() { invalidateScreens() }
@@ -995,24 +999,128 @@ actor VortxNativeSession {
         return results
     }
     func screen(_ name: String) -> VortxNativeScreenState? { screens[name] }
-    private func begin(_ name: String) throws -> (VortxResourceBridge, UUID, UUID, String) {
+    private func begin(_ name: String, expectedProfileID: String? = nil) throws -> (VortxResourceBridge, UUID, UUID, String) {
         try Task.checkCancellation()
-        guard !closed else { throw VortxNativeError.closed }
+        guard case .string(let profile) = try scope.validateSnapshot(stateJSON())["activeProfileId"] else { throw VortxNativeError.invalidSnapshot }
+        guard expectedProfileID == nil || expectedProfileID == profile else { throw VortxNativeError.superseded }
+        resourceBatchBridges.removeValue(forKey: name)?.forEach { $0.invalidate() }
         let ticket = UUID(); tickets[name] = ticket; screens[name] = .loading
         let bridge = bridges[name] ?? VortxResourceBridge(transport: transport); bridges[name] = bridge
-        guard case .string(let profile) = try scope.validateSnapshot(runtime.stateJSON())["activeProfileId"] else { throw VortxNativeError.invalidSnapshot }
         try lease.withActive {}; return (bridge, ticket, epoch, profile)
     }
     private func current(_ name: String, _ ticket: UUID, _ capturedEpoch: UUID) -> Bool {
         !closed && epoch == capturedEpoch && tickets[name] == ticket && (try? lease.withActive { true }) == true
+    }
+    /// One screen operation owns the entire range. Individual bridges cannot supersede another
+    /// catalog; the shared ticket/epoch/lease still retire every leg at an owner or query boundary.
+    func loadCatalogs(_ screen: CatalogScreen, catalogs: [(VortxResourceAddon, VortxResourceRequest)],
+                      selection: VortxJSON, range: ClosedRange<Int>, previous: VortxJSON?,
+                      expectedProfileID: String,
+                      onUpdate: @escaping @Sendable (VortxJSON) -> Void) async throws -> VortxJSON {
+        guard catalogs.allSatisfy({ $0.1.resource == .catalog }) else { throw VortxNativeError.invalidResponse }
+        let name = screen.rawValue
+        let (priorBridge, ticket, capturedEpoch, profile) = try begin(name, expectedProfileID: expectedProfileID)
+        priorBridge.invalidate()
+        // A facade may have captured its rows just before this actor processed a profile change.
+        // Reuse only this epoch's own plan, never presentation rows from a retired owner.
+        let previousRows = previous == catalogPlans[name] && previous?["selected"] == selection ? previous?["catalogs"]?.array ?? [] : []
+        var rows = try catalogs.enumerated().map { index, item -> VortxJSON in
+            let request: VortxJSON = .object(["base": .string(item.0.transportUrl), "path": try VortxResourceProjection.path(item.1)])
+            if index < previousRows.count, let first = previousRows[index].array?.first,
+               first["request"] == request, [VortxJSON.string("Ready"), .string("Err")].contains(first["content"]?["type"] ?? .null) {
+                return previousRows[index]
+            }
+            return .array([.object(["request": request, "content": range.contains(index) ? .object(["type": .string("Loading")]) : .null])])
+        }
+        // Preserve only pages still present in this exact plan (including already loaded skips).
+        pages[name] = (pages[name] ?? []).filter { page in
+            page.ownerID == profile && rows.contains { row in
+                row.array?.contains { entry in
+                    entry["request"]?["path"] == (try? VortxResourceProjection.path(page.request)) &&
+                    page.sourceURLs.values.contains { entry["request"]?["base"] == .string($0) } &&
+                    [VortxJSON.string("Ready"), .string("Err")].contains(entry["content"]?["type"] ?? .null)
+                } == true
+            }
+        }
+        var registry: [VortxResourceAddon] = []
+        for (addon, _) in catalogs {
+            if let existing = registry.first(where: { $0.id == addon.id }) {
+                guard existing.transportUrl == addon.transportUrl else { throw VortxNativeError.invalidResponse }
+            } else { registry.append(addon) }
+        }
+        catalogRegistries[name] = registry
+        let pending = rows.indices.filter { range.contains($0) && rows[$0].array?.first?["content"]?["type"] == .string("Loading") }
+        let workers = pending.map { _ in VortxResourceBridge(transport: transport) }
+        resourceBatchBridges[name] = workers
+        defer {
+            workers.forEach { $0.invalidate() }
+            if tickets[name] == ticket { resourceBatchBridges.removeValue(forKey: name) }
+        }
+        func publish() throws -> VortxJSON {
+            try Task.checkCancellation()
+            guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+            let board: VortxJSON = .object(["selected": selection, "catalogs": .array(rows)])
+            catalogPlans[name] = board; screens[name] = .ready(board); onUpdate(board)
+            return board
+        }
+        _ = try publish()
+        return try await withThrowingTaskGroup(of: (Int, VortxResourceSnapshot?).self) { group in
+            func schedule(_ offset: Int) {
+                let item = catalogs[pending[offset]], bridge = workers[offset]
+                group.addTask {
+                    do { return (offset, try await bridge.load(ownerID: profile, request: item.1, addons: [item.0])) }
+                    catch { return (offset, nil) }
+                }
+            }
+            var scheduled = min(4, pending.count)
+            for offset in 0..<scheduled { schedule(offset) }
+            while let (offset, result) = try await group.next() {
+                try Task.checkCancellation()
+                guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+                let index = pending[offset], item = catalogs[index]
+                let snapshot: VortxResourceSnapshot
+                if let result {
+                    guard workers[offset].accepts(result) else { throw VortxNativeError.superseded }
+                    snapshot = result
+                } else {
+                    snapshot = .init(ownerID: profile, requestID: UUID().uuidString, generation: 0, request: item.1,
+                        groups: [], sourceURLs: [item.0.id: item.0.transportUrl])
+                }
+                let failure = VortxResourceGroup(addonId: item.0.id, status: .error, content: nil, error: .init(code: "native_catalog_failed"))
+                let content = snapshot.groups.first ?? failure
+                let accepted = VortxResourceSnapshot(ownerID: snapshot.ownerID, requestID: snapshot.requestID,
+                    generation: snapshot.generation, request: snapshot.request, groups: [content], sourceURLs: snapshot.sourceURLs)
+                pages[name, default: []].append(accepted)
+                rows[index] = .array([try VortxResourceProjection.entry(content, request: item.1, registry: registry)])
+                _ = try publish()
+                if scheduled < pending.count { schedule(scheduled); scheduled += 1 }
+            }
+            return .object(["selected": selection, "catalogs": .array(rows)])
+        }
     }
     func loadCatalog(_ screen: CatalogScreen, request: VortxResourceRequest, addons: [VortxResourceAddon], append: Bool = false) async throws -> VortxJSON {
         guard request.resource == .catalog else { throw VortxNativeError.invalidResponse }
         let name = screen.rawValue
         let (bridge, ticket, capturedEpoch, profile) = try begin(name)
         do {
-            let result = try await bridge.load(ownerID: profile, request: request, addons: addons)
-            guard current(name, ticket, capturedEpoch), bridge.accepts(result) else { throw VortxNativeError.superseded }
+            let result: VortxResourceSnapshot
+            do {
+                let received = try await bridge.load(ownerID: profile, request: request, addons: addons)
+                guard current(name, ticket, capturedEpoch), bridge.accepts(received) else { throw VortxNativeError.superseded }
+                result = received
+            } catch {
+                try Task.checkCancellation()
+                guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+                if case VortxNativeError.superseded = error { throw error }
+                guard append else { throw error }
+                // A failed page settles only its requested catalog. Keep prior pages and peers;
+                // never replace the entire board with a generic operation-error envelope.
+                let category = error is VortxNativeError ? VortxNativeError.diagnosticCode(error) : "transport_failed"
+                NSLog("[VortXNative] resource=catalog result=failed category=%@", category)
+                result = .init(ownerID: profile, requestID: UUID().uuidString, generation: 0, request: request,
+                    groups: addons.map { .init(addonId: $0.id, status: .error, content: nil, error: .init(code: "native_catalog_failed")) },
+                    sourceURLs: Dictionary(addons.map { ($0.id, $0.transportUrl) }, uniquingKeysWith: { first, _ in first }))
+            }
             var accepted = append ? pages[name] ?? [] : []
             // A cancelled host publication can leave its already accepted page in this actor.
             // Retrying the identical source/path replaces that page instead of duplicating it.
@@ -1025,26 +1133,139 @@ actor VortxNativeSession {
                     guard previous.transportUrl == addon.transportUrl else { throw VortxNativeError.invalidResponse }
                 } else { registry.append(addon) }
             }
-            let projection = try VortxResourceProjection.board(pages: accepted, registry: registry)
+            var projection = try VortxResourceProjection.board(pages: accepted, registry: registry)
+            if append, let plan = catalogPlans[name], var rows = plan["catalogs"]?.array {
+                // Pagination retains the full planned order and the selected query, even when a
+                // different catalog completed first or an unrequested row still has nil content.
+                for row in projection["catalogs"]?.array ?? [] {
+                    guard let request = row.array?.first?["request"], let index = rows.firstIndex(where: {
+                        let existing = $0.array?.first?["request"]
+                        return existing?["base"] == request["base"] && existing?["path"]?["id"] == request["path"]?["id"] && existing?["path"]?["type"] == request["path"]?["type"]
+                    }) else { continue }
+                    rows[index] = row
+                }
+                projection = .object(["selected": plan["selected"] ?? .null, "catalogs": .array(rows)])
+                catalogPlans[name] = projection
+            } else { catalogPlans.removeValue(forKey: name) }
             catalogRegistries[name] = registry; pages[name] = accepted; screens[name] = .ready(projection); return projection
         } catch {
             if current(name, ticket, capturedEpoch) { screens[name] = .failed }; throw error
         }
     }
-    func loadMeta(request: VortxResourceRequest, stream: VortxResourceRequest?, addons: [VortxResourceAddon]) async throws -> VortxJSON {
-        guard request.resource == .meta, stream == nil || stream?.resource == .stream else { throw VortxNativeError.invalidResponse }
+    func loadMeta(request: VortxResourceRequest, stream: VortxResourceRequest?, addons: [VortxResourceAddon],
+                  expectedProfileID: String? = nil,
+                  onUpdate: @escaping @Sendable (VortxJSON) -> Void = { _ in }) async throws -> VortxJSON {
+        guard request.resource == .meta, stream == nil || (stream?.resource == .stream && stream?.type == request.type),
+              addons.count <= 128, Set(addons.map(\.id)).count == addons.count else { throw VortxNativeError.invalidResponse }
         let name = "meta_details"
-        let (bridge, ticket, capturedEpoch, profile) = try begin(name)
-        do {
-            let meta = try await bridge.load(ownerID: profile, request: request, addons: addons)
-            guard current(name, ticket, capturedEpoch), bridge.accepts(meta) else { throw VortxNativeError.superseded }
-            var streams: VortxResourceSnapshot?
-            if let stream { try Task.checkCancellation(); streams = try await bridge.load(ownerID: profile, request: stream, addons: addons) }
-            guard current(name, ticket, capturedEpoch), bridge.accepts(streams ?? meta) else { throw VortxNativeError.superseded }
-            let projection = try VortxResourceProjection.metaDetails(meta: meta, streams: streams, expectedStream: stream, registry: addons)
-            screens[name] = .ready(projection); return projection
-        } catch {
-            if current(name, ticket, capturedEpoch) { screens[name] = .failed }; throw error
+        let (priorBridge, ticket, capturedEpoch, profile) = try begin(name, expectedProfileID: expectedProfileID)
+        priorBridge.invalidate()
+        // A native multi-addon call spends its deadline waiting for its internal slots. Schedule
+        // singleton calls here instead: each admitted leg receives its own 20s network budget.
+        // Separate two-meta/four-stream windows prevent slow metadata from starving streams.
+        // Total screen time is multiple bounded waves, not a new 20s all-provider deadline.
+        let jobs = addons.indices.flatMap { index -> [(Int, VortxResourceRequest)] in
+            [(index, request)] + (stream.map { [(index, $0)] } ?? [])
+        }
+        let workers = jobs.map { _ in VortxResourceBridge(transport: transport) }
+        resourceBatchBridges[name] = workers
+        defer {
+            workers.forEach { $0.invalidate() }
+            if tickets[name] == ticket { resourceBatchBridges.removeValue(forKey: name) }
+        }
+        var metas = [VortxResourceGroup?](repeating: nil, count: addons.count)
+        var streams = [VortxResourceGroup?](repeating: nil, count: stream == nil ? 0 : addons.count)
+        var completed = 0
+        var metaContentBudget = VortxResourceContentBudget(), streamContentBudget = VortxResourceContentBudget()
+        let sourceURLs = Dictionary(uniqueKeysWithValues: addons.map { ($0.id, $0.transportUrl) })
+        func snapshot(_ path: VortxResourceRequest, _ groups: [VortxResourceGroup?]) -> VortxResourceSnapshot {
+            .init(ownerID: profile, requestID: ticket.uuidString, generation: 0, request: path,
+                  groups: groups.compactMap { $0 }, sourceURLs: sourceURLs)
+        }
+        func rows(_ path: VortxResourceRequest, _ groups: [VortxResourceGroup?]) throws -> [VortxJSON] {
+            try groups.enumerated().map { index, group in
+                if let group { return try VortxResourceProjection.entry(group, request: path, registry: addons) }
+                return .object(["request": .object(["base": .string(addons[index].transportUrl), "path": try VortxResourceProjection.path(path)]),
+                                "content": .object(["type": .string("Loading")])])
+            }
+        }
+        func publish(logStreams: Bool = false, settled: Bool = false) throws -> VortxJSON {
+            try Task.checkCancellation()
+            guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+            let projection = try VortxResourceProjection.metaDetails(meta: snapshot(request, metas),
+                streams: stream.map { snapshot($0, streams) }, expectedStream: stream, registry: addons)
+            let value: VortxJSON = .object(["selected": projection["selected"] ?? .null,
+                "metaItems": .array(try rows(request, metas)), "streams": .array(try stream.map { try rows($0, streams) } ?? []),
+                "metaStreams": projection["metaStreams"] ?? .array([])])
+            screens[name] = completed == 0 && !jobs.isEmpty ? .loading : .ready(value)
+            onUpdate(value)
+            if logStreams, stream != nil {
+                var ready = 0, empty = 0, failed = 0
+                for case let group? in streams {
+                    if group.status != .ready { failed += 1 }
+                    else if (try? group.items(for: .stream).isEmpty) == true { empty += 1 }
+                    else { ready += 1 }
+                }
+                NSLog("[VortXNative] resource=stream result=%@ ready=%d empty=%d error=%d loading=%d", settled ? "settled" : "partial", ready, empty, failed, streams.count - ready - empty - failed)
+            }
+            return value
+        }
+        _ = try publish(logStreams: true)
+        return try await withThrowingTaskGroup(of: (Int, VortxResourceSnapshot?).self) { group in
+            func schedule(_ offset: Int) {
+                let job = jobs[offset], bridge = workers[offset], addon = addons[job.0]
+                group.addTask {
+                    do { return (offset, try await bridge.load(ownerID: profile, request: job.1, addons: [addon], budgetMs: 20_000,
+                        maxResponseBytes: 8_388_608, maxTotalResponseBytes: 33_554_432)) }
+                    catch { return (offset, nil) }
+                }
+            }
+            let metaStride = stream == nil ? 1 : 2
+            var scheduledMeta = min(2, addons.count), scheduledStreams = stream == nil ? 0 : min(4, addons.count)
+            for index in 0..<scheduledMeta { schedule(index * metaStride) }
+            for index in 0..<scheduledStreams { schedule(index * 2 + 1) }
+            while let (offset, result) = try await group.next() {
+                try Task.checkCancellation()
+                guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+                let job = jobs[offset], addon = addons[job.0]
+                var value: VortxResourceGroup
+                if let result {
+                    guard workers[offset].accepts(result) else { throw VortxNativeError.superseded }
+                    // Unsupported/empty singleton responses are terminal, not still-loading rows.
+                    value = result.groups.first ?? .init(addonId: addon.id, status: .ready,
+                        content: .object(job.1.resource == .meta ? ["meta": .null] : ["streams": .array([])]), error: nil)
+                } else {
+                    value = .init(addonId: addon.id, status: .error, content: nil, error: .init(code: "native_resource_failed"))
+                }
+                if value.status == .ready {
+                    do {
+                        // Validate embedded streams before they enter the combined projection;
+                        // malformed metadata from one provider must not discard valid peers.
+                        if job.1.resource == .meta {
+                            _ = try VortxResourceProjection.metaDetails(meta: snapshot(request, [value]), streams: nil,
+                                expectedStream: stream, registry: addons)
+                        }
+                        // Retain the incumbent32MiB normalized-content cap separately for meta
+                        // and stream. This is not a consumed-wire-byte measure: the ABI does not
+                        // report raw bytes for failed or whitespace-heavy responses.
+                        let fits = try job.1.resource == .meta ? metaContentBudget.claim(value.content ?? .null) : streamContentBudget.claim(value.content ?? .null)
+                        if !fits {
+                            value = .init(addonId: addon.id, status: .error, content: nil, error: .init(code: "body_too_large"))
+                        }
+                    } catch {
+                        value = .init(addonId: addon.id, status: .error, content: nil, error: .init(code: "invalid_response"))
+                    }
+                }
+                if job.1.resource == .meta { metas[job.0] = value } else { streams[job.0] = value }
+                completed += 1
+                _ = try publish(logStreams: job.1.resource == .stream)
+                if job.1.resource == .meta, scheduledMeta < addons.count {
+                    schedule(scheduledMeta * metaStride); scheduledMeta += 1
+                } else if job.1.resource == .stream, scheduledStreams < addons.count {
+                    schedule(scheduledStreams * 2 + 1); scheduledStreams += 1
+                }
+            }
+            return try publish(logStreams: true, settled: true)
         }
     }
     /// Independent, non-UI metadata lookup for a deliberate library add. It cannot replace the

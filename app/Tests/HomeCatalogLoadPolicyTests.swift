@@ -95,6 +95,7 @@ enum HomeCatalogLoadPolicyTests {
             from: "func catalogOrderDidChange()",
             until: "func ensureLiveCatalogsLoaded"
         )
+        let widening = section(bridge, from: "private func widenBoardRange", until: "func loadBoardRowNextPage")
         let refreshAddons = section(
             bridge,
             from: "private func refreshAddons()",
@@ -133,7 +134,8 @@ enum HomeCatalogLoadPolicyTests {
                 && orderChange.contains("HomeCatalogLoadPolicy.fullLoadDepth")
                 && orderChange.contains("includeTombstoned: true")
                 && orderChange.contains("includeDisabled: true")
-                && orderChange.contains("\"action\": \"LoadRange\"")
+                && orderChange.contains("widenBoardRange(to: needed)")
+                && widening.contains("\"action\": \"LoadRange\"")
                 && orderChange.contains("rebuildBoardRows()"))
         check("local reorder routes through full-range hydration",
               reorder.contains("CoreBridge.shared.catalogOrderDidChange()"))

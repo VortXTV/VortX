@@ -55,6 +55,8 @@ else
       else
         sed -n '/    func resolveUsenet(nzbUrl:/,/^    }/p' app/SourcesShared/DebridResolver.swift
       fi
+      sed -n '/    enum ExplicitUsenetResolution:/,/^    }/p' app/SourcesShared/DebridResolver.swift
+      sed -n '/    func resolveExplicitUsenetPlayback(/,/^    }/p' app/SourcesShared/DebridResolver.swift
       sed -n '/    @MainActor func recoverUsenetPlayback(/,/^    }/p' app/SourcesShared/DebridResolver.swift
       sed -n '/    @MainActor func resolvedPlaybackRef(/,/^    }/p' app/SourcesShared/DebridResolver.swift
       sed -n '/    private func warmNativeUsenet(/,/^    }/p' app/SourcesShared/DebridResolver.swift
@@ -64,6 +66,7 @@ else
       sed -n '/            let ownsNativeAttempt = nativeOwner.requiresNativeAuthority/,/            let usenetRevision = latestCredentialRevision/p' \
         app/SourcesShared/DebridResolver.swift \
         | sed '/^[[:space:]]*#else$/,/^[[:space:]]*#endif$/d; /^[[:space:]]*#if/d; /^[[:space:]]*#endif/d'
+      sed -n '/            let resumingCloudJob = /,/            if resumingCloudJob,/p' app/SourcesShared/DebridResolver.swift
     fi
     if [[ -n $warm_baseline ]]; then
       printf '%s\n' 'let usenetSavedServers = savedServers' 'do {'

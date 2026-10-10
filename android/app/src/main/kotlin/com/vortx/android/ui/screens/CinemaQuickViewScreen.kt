@@ -67,7 +67,7 @@ fun CinemaQuickViewScreen(
     Column(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas).safeDrawingPadding()) {
         TopAppBar(
             title = { Text("Quick view", style = VortXTheme.type.screenTitle) },
-            navigationIcon = { IconButton(onClick = onClose) { Icon(VortXIcons.back, "Back") } },
+            navigationIcon = { IconButton(onClick = onClose) { Icon(VortXIcons.close, "Close preview") } },
             windowInsets = WindowInsets(0, 0, 0, 0),
         )
         Column(

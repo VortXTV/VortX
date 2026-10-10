@@ -105,7 +105,7 @@ final class CommunityStreamGateway {
 
 final class DebridPlaybackAvailability {
     static let shared = DebridPlaybackAvailability()
-    var canResolveUsenet: Bool { false }
+    func canResolveUsenet(savedProviderConfigured: Bool, addonServersAvailable: Bool) -> Bool { false }
     var canResolveUsenetRemotely: Bool { false }
 }
 
@@ -436,19 +436,20 @@ enum BingeSourceMemoryRaceContractTests {
         ]
         let callerSource = callerPaths.compactMap { try? String(contentsOfFile: $0, encoding: .utf8) }
             .joined(separator: "\n")
-        expect(callerSource.components(separatedBy: "secondsSinceRequestStart:").count - 1 == 8,
-               "caller clock: every raw settle call passes request-start elapsed time")
+        let collector = (try? String(contentsOfFile: "app/SourcesShared/EpisodeSourceCollection.swift", encoding: .utf8)) ?? ""
+        expect(callerSource.components(separatedBy: "EpisodeSourceCollection.collect(").count - 1 == 7
+               && collector.contains("deadlineExpired: ProcessInfo.processInfo.systemUptime >= deadline"),
+               "caller clock: episode/CW/refind collection uses an owned absolute settlement deadline")
         expect(!callerSource.contains("secondsSinceFirstPlayable"),
                "caller clock: no production raw settle loop retains the first-playable reset")
-        let dateStarts = callerSource.components(separatedBy: "let settlementStartedAt = Date()").count - 1
-        let ownedBudgetStarts = callerSource.components(separatedBy: "let elapsed = resolutionBudget.elapsed(").count - 1
-        expect(dateStarts + ownedBudgetStarts == 5 && ownedBudgetStarts == 3
-               && callerSource.contains("slotPolicy.settlementStartedAt"),
+        expect(callerSource.components(separatedBy: ".startedAt + SourceSettlementPolicy.maximumWait").count - 1 == 5
+               && callerSource.contains("slotPolicy.settlementStartedAt")
+               && collector.contains("deadline - ProcessInfo.processInfo.systemUptime"),
                "caller clock: raw requests and batch slot own an absolute settlement start")
         let directDeadlineBreaks = callerSource.components(
             separatedBy: "if elapsed >= StreamRanking.completeSetDeadline { break }"
         ).count - 1
-        expect(directDeadlineBreaks == 4 && callerSource.contains("if deadlineReached { break }")
+        expect(directDeadlineBreaks == 1 && collector.contains("timeoutNanoseconds: UInt64(remaining * 1_000_000_000)")
                && callerSource.contains("now - slotPolicy.startedAt >= slotPolicy.maximumDuration"),
                "caller clock: every raw loop hard-stops on the same twenty-second request deadline")
 

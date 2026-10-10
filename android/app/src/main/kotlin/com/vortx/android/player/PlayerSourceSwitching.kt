@@ -68,6 +68,7 @@ internal data class PlayerSourceSwitchAuthority(
 internal data class PendingPlayerSourceSwitch(
     val authority: PlayerSourceSwitchAuthority,
     val source: StreamSource,
+    val automatic: Boolean = false,
 ) {
     val sourceHandle: String = playerSourceHandle(source)
 }
@@ -105,9 +106,13 @@ class PlayerSourceSwitchResolution internal constructor(
     private val commitGate: PlayerSourceSwitchCommitGate,
     private val commitAuthorityIsCurrent: () -> Boolean,
     private val commitAccepted: () -> Unit,
+    private val commitRejected: () -> Unit = {},
 ) {
     internal fun commitIfCurrent(hostAuthorityIsCurrent: () -> Boolean): Boolean {
-        if (!commitGate.isValid() || !commitAuthorityIsCurrent() || !hostAuthorityIsCurrent()) return false
+        if (!commitGate.isValid() || !commitAuthorityIsCurrent() || !hostAuthorityIsCurrent()) {
+            commitRejected()
+            return false
+        }
         commitAccepted()
         return true
     }
@@ -126,6 +131,7 @@ internal data class PlayerSourceSwitchState(
     val pendingSwitch: PendingPlayerSourceSwitch? = null,
     val pendingEpisodeSwitch: PendingPlayerEpisodeSwitch? = null,
     val errorMessage: String? = null,
+    val failedEpisode: Episode? = null,
 ) {
     val isSwitching: Boolean get() = pendingSwitch != null || pendingEpisodeSwitch != null
     val sessionKey: PlayerPlaybackSessionKey get() = PlayerPlaybackSessionKey(outerSessionId, playable, revision)
@@ -291,8 +297,15 @@ internal fun beginPlayerSourceSwitch(
     state: PlayerSourceSwitchState,
     source: StreamSource,
     authority: PlayerSourceSwitchAuthority,
+): PlayerSourceSwitchState = beginPlayerSourceSwitch(state, source, authority, automatic = false)
+
+internal fun beginPlayerSourceSwitch(
+    state: PlayerSourceSwitchState,
+    source: StreamSource,
+    authority: PlayerSourceSwitchAuthority,
+    automatic: Boolean,
 ): PlayerSourceSwitchState = state.copy(
-    pendingSwitch = PendingPlayerSourceSwitch(authority, source),
+    pendingSwitch = PendingPlayerSourceSwitch(authority, source, automatic),
     pendingEpisodeSwitch = null,
     errorMessage = null,
 )
@@ -338,7 +351,7 @@ internal fun completePlayerEpisodeSwitch(
         onSuccess = { resolution ->
             if (resolution.playable.url.isBlank() || resolution.resolvedSource == null) {
                 PlayerEpisodeSwitchCompletion(
-                    state.copy(pendingEpisodeSwitch = null, errorMessage = ""),
+                    state.copy(pendingEpisodeSwitch = null, failedEpisode = pending.episode, errorMessage = ""),
                     requestAccepted = true,
                 )
             } else {
@@ -349,6 +362,7 @@ internal fun completePlayerEpisodeSwitch(
                         revision = state.revision + 1L,
                         pendingEpisodeSwitch = null,
                         errorMessage = null,
+                        failedEpisode = null,
                     ),
                     requestAccepted = true,
                     resolution = resolution,
@@ -357,7 +371,7 @@ internal fun completePlayerEpisodeSwitch(
         },
         onFailure = { error ->
             PlayerEpisodeSwitchCompletion(
-                state.copy(pendingEpisodeSwitch = null, errorMessage = error.message.orEmpty()),
+                state.copy(pendingEpisodeSwitch = null, failedEpisode = pending.episode, errorMessage = error.message.orEmpty()),
                 requestAccepted = true,
             )
         },
@@ -380,7 +394,7 @@ internal fun applyPlayerEpisodeSwitchCompletion(
     }
     val resolution = completion.resolution ?: return completion.state
     if (resolution.commitIfCurrent(hostAuthorityIsCurrent)) return completion.state
-    return currentState.copy(pendingEpisodeSwitch = null, errorMessage = "")
+    return currentState.copy(pendingEpisodeSwitch = null, failedEpisode = pending.episode, errorMessage = "")
 }
 
 /**
@@ -452,7 +466,7 @@ internal fun completePlayerSourceSwitch(
             } else {
                 val replacement = resolution.playable
                     .atSourceSwitchPosition(latestPositionMs)
-                    .copy(userForcedSource = true)
+                    .copy(userForcedSource = !pending.automatic || resolution.playable.userForcedSource)
                 PlayerSourceSwitchCompletion(
                     state = state.copy(
                         playable = replacement,
@@ -460,6 +474,7 @@ internal fun completePlayerSourceSwitch(
                         revision = state.revision + 1L,
                         pendingSwitch = null,
                         errorMessage = null,
+                        failedEpisode = null,
                     ),
                     requestAccepted = true,
                     resolution = resolution,

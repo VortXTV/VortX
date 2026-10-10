@@ -88,6 +88,8 @@ struct iOSRootView: View {
 
     @State private var tab: Tab = .home
     @State private var homeBrowse = false
+    @State private var homeHasDestination = false
+    @StateObject private var quickViewPresenter = CinemaQuickViewPresenter()
     /// Phase-0 seeding nag (com.vortx move): armed once per launch by MoveSeeding.armLaunchNag.
     @State private var showSeedingNag = false
     #if os(macOS)
@@ -99,6 +101,7 @@ struct iOSRootView: View {
     @FocusState private var macSearchFocused: Bool
     #endif
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ScaledMetric(relativeTo: .caption) private var compactLabelSize: CGFloat = 11
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
@@ -197,7 +200,13 @@ struct iOSRootView: View {
             mobileCinematicShell
             #endif
         }
+        .environment(\.cinemaQuickViewPresenter, quickViewPresenter)
+        .allowsHitTesting(quickViewPresenter.presentation == nil)
+        .accessibilityHidden(quickViewPresenter.presentation != nil)
+        .overlay { CinemaQuickViewOverlay(presenter: quickViewPresenter) }
+        .onChange(of: profiles.activeID) { _ in quickViewPresenter.close() }
         .onChange(of: tab) { newTab in
+            quickViewPresenter.close()
             presentUpdateIfReady()
             // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
             VXProbeState.shared.setRoute(newTab.probeName)
@@ -269,6 +278,7 @@ struct iOSRootView: View {
         .onChange(of: launchReady) { _ in presentUpdateIfReady() }
         .onChange(of: shellVisible) { _ in presentUpdateIfReady() }
         .onChange(of: playbackGate.playerActive) { active in
+            if active { quickViewPresenter.close() }
             if !active { presentUpdateIfReady() }
         }
         .onChange(of: updates.available?.key) { _ in presentUpdateIfReady() }
@@ -400,34 +410,38 @@ struct iOSRootView: View {
     }
 
     private var unifiedHomeContent: some View {
-        VStack(spacing: 0) {
-            if !hideDiscoverTab {
-                HStack(spacing: Theme.Space.xs) {
-                    homeModeButton("Featured", browse: false)
-                    homeModeButton("Browse", browse: true)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, Theme.Space.md)
-                .padding(.vertical, Theme.Space.xs)
-                .background(Theme.Palette.canvas)
-            }
+        ZStack(alignment: .topLeading) {
             if homeBrowse, !hideDiscoverTab {
-                iOSDiscoverView(isActive: true)
+                iOSDiscoverView(isActive: true, onNavigationDepthChanged: { homeHasDestination = $0 > 0 })
             } else {
-                iOSHomeView(isActive: true, onBrowse: hideDiscoverTab ? nil : { homeBrowse = true })
+                iOSHomeView(isActive: true, onBrowse: hideDiscoverTab ? nil : { homeBrowse = true },
+                            onNavigationDepthChanged: { homeHasDestination = $0 > 0 })
+            }
+            if !hideDiscoverTab, !homeHasDestination {
+                HStack(spacing: Theme.Space.xs) {
+                    homeModeButton("Featured", discover: false)
+                    homeModeButton("Discover", discover: true)
+                }
+                // Phone Home keeps the mode switch close to the centered wordmark/customize chrome;
+                // iPad/Mac retain the existing roomier shell spacing.
+                .padding(compactPhoneHome ? 3 : 6)
+                .vortxGlass(in: Capsule())
+                .padding(.horizontal, compactPhoneHome ? 16 : Theme.Space.md)
+                .padding(.vertical, compactPhoneHome ? 2 : Theme.Space.xs)
             }
         }
     }
 
-    private func homeModeButton(_ title: LocalizedStringKey, browse: Bool) -> some View {
-        let selected = homeBrowse == browse
-        return Button { homeBrowse = browse } label: {
+    private func homeModeButton(_ title: LocalizedStringKey, discover: Bool) -> some View {
+        let selected = homeBrowse == discover
+        return Button { homeBrowse = discover } label: {
             Text(title)
-                .font(.system(size: 14, weight: selected ? .semibold : .medium))
+                .font(.system(size: compactPhoneHome ? 13 : 14,
+                              weight: selected ? .semibold : .medium))
                 .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
-                .padding(.horizontal, Theme.Space.md)
-                .frame(minHeight: 44)
-                .background(selected ? Theme.Palette.accent : Theme.Palette.surface1, in: Capsule())
+                .padding(.horizontal, compactPhoneHome ? 13 : Theme.Space.md)
+                .frame(minHeight: compactPhoneHome ? 36 : 44)
+                .background(selected ? Theme.Palette.accent : .clear, in: Capsule())
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(selected ? [.isSelected] : [])
@@ -445,7 +459,7 @@ struct iOSRootView: View {
     /// TV-inspired desktop navigation, not a sidebar. The transparent safe-area insert keeps
     /// ordinary forms below the floating chrome; the existing hero's top bleed paints behind it.
     private var macDesktopShell: some View {
-        selectedTabContent
+        measuredTabContent
             .safeAreaInset(edge: .top, spacing: 0) { cinematicTopBar }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Palette.canvas)
@@ -525,13 +539,19 @@ struct iOSRootView: View {
             // chrome. Only hero artwork bleeds; every scrolling control has an unobscured viewport.
             VStack(spacing: 0) {
                 if topNavigation { cinematicTopBar }
-                selectedTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)
+                measuredTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)
                 if !topNavigation { bottomTabBarRow }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
     }
     #endif
+
+    private var measuredTabContent: some View {
+        GeometryReader { geometry in
+            selectedTabContent.environment(\.cinemaCardViewportWidth, geometry.size.width)
+        }
+    }
 
     private var cinematicTopBar: some View {
         HStack(spacing: Theme.Space.sm) {
@@ -676,6 +696,17 @@ struct iOSRootView: View {
         if hideLibraryTab { hidden.insert(.library) }
         if hideSearchTab { hidden.insert(.search) }
         return hidden
+    }
+
+    /// The phone-only Home chrome is deliberately keyed to the device idiom as well as the compact
+    /// width class. An iPad in Split View can be compact, but it keeps the existing tablet hero/header
+    /// treatment; the compact card is an iPhone presentation detail only.
+    private var compactPhoneHome: Bool {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .phone && horizontalSizeClass == .compact
+        #else
+        return false
+        #endif
     }
 
     private var customTabBar: some View {
@@ -999,6 +1030,7 @@ struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
     var onBrowse: (() -> Void)? = nil
+    var onNavigationDepthChanged: ((Int) -> Void)? = nil
     @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
@@ -1006,6 +1038,8 @@ struct iOSHomeView: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // gate Continue Watching on the active profile's own history
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
@@ -1190,6 +1224,80 @@ struct iOSHomeView: View {
         return items
     }
 
+    /// The inset hero card is an iPhone-only Home presentation. iPad Split View can report a compact
+    /// width, but it keeps the existing full-width hero geometry and chrome.
+    private var compactPhoneHome: Bool {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .phone && horizontalSizeClass == .compact
+        #else
+        return false
+        #endif
+    }
+
+    /// A restrained cinema wash behind Home. It keeps the theme's deep canvas as the base and places the
+    /// profile accent only near the upper content edges, so OLED still reads black while the page has a
+    /// little of the title-screen atmosphere that a flat canvas loses. It deliberately does not sample or
+    /// decode artwork: FeaturedHeroView already owns its cached per-title tint, and this layer stays static
+    /// between hero rotations instead of repeating a full-size average-color computation.
+    private var homeAmbientCanvas: some View {
+        let alpha = reduceTransparency ? 0.025 : 0.055
+        return ZStack {
+            Theme.Palette.canvas
+            RadialGradient(
+                colors: [Theme.Palette.accent.opacity(alpha), .clear],
+                center: .topLeading,
+                startRadius: 8,
+                endRadius: 300
+            )
+            RadialGradient(
+                colors: [Theme.Palette.accent.opacity(alpha * 0.62), .clear],
+                center: .topTrailing,
+                startRadius: 20,
+                endRadius: 360
+            )
+            LinearGradient(
+                colors: [.clear, Theme.Palette.accent.opacity(alpha * 0.22), .clear],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Home's compact card wrapper keeps the shared FeaturedHeroView's model, actions, rotation, trailer,
+    /// reduce-motion behavior, and navigation untouched. Only the phone presentation gets the inset,
+    /// continuous radius, and quiet accent edge; iPad and Mac continue to call the shared hero directly.
+    @ViewBuilder
+    private var homeFeaturedHero: some View {
+        if compactPhoneHome {
+            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
+                .background {
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .fill(Theme.Palette.accent.opacity(reduceTransparency ? 0.022 : 0.045))
+                        .overlay {
+                            LinearGradient(
+                                colors: [Theme.Palette.accent.opacity(0.075), .clear,
+                                         Theme.Palette.accent.opacity(0.018)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                        }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .strokeBorder(Theme.Palette.accent.opacity(reduceTransparency ? 0.24 : 0.16),
+                                      lineWidth: 0.8)
+                }
+                .shadow(color: .black.opacity(0.32), radius: 20, y: 12)
+                .padding(.horizontal, 16)
+                .padding(.top, Theme.Space.xs)
+        } else {
+            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
+        }
+    }
+
     @ViewBuilder
     private var homeNavigation: some View {
         let renderedContinueWatching = continueWatchingRenderSnapshot
@@ -1207,22 +1315,12 @@ struct iOSHomeView: View {
                     Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Home tab -> scroll here
                     // The redesign mockup's ember "Featured" hero kicker (Home only; Library / Discover pass
                     // no eyebrow so their heroes are unchanged).
-                    FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
+                    homeFeaturedHero
                     // Once this marker (just below the hero) scrolls out of view, the floating
                     // back-to-top button appears; it hides again when you return to the top (#8).
                     // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
                     Color.clear.frame(height: 0).backToTopMarker(key: TabScrollKeys.home, active: isActive)
-                    // Unified Home switches to the existing Discover owner, keeping its filters and
-                    // paging. Separate-tab mode retains this legacy category/deep-link destination.
-                    Group {
-                        if let onBrowse {
-                            Button(action: onBrowse) { CinemaBrowseEntry() }
-                        } else {
-                            NavigationLink(value: HubTarget.discover(.trending)) { CinemaBrowseEntry() }
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, Theme.Space.md)
+                    // Discover already has either a Home switch or its own tab; no duplicate entry card.
                     #if os(macOS)
                     // macOS has no navigation-bar toolbar on Home (custom chrome), and this app's shared
                     // NSToolbar is fragile (see the Sign In toolbar note below), so the "Customize Home"
@@ -1340,7 +1438,7 @@ struct iOSHomeView: View {
             // content still starts below the pill. macOS-only; iOS/iPad already bleed with no shell inset.
             .ignoresSafeArea(.container, edges: .top)
             #endif
-            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .background(homeAmbientCanvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)
             // iOS-only: a runtime insert/remove of this trailing toolbar item when sign-in flips also
             // trips the shared-window NSToolbar on macOS (same crash class as the principal item). On
@@ -1413,6 +1511,8 @@ struct iOSHomeView: View {
         // Re-tapping the active Home tab pops any pushed detail back to root (#22); the scroll-to-top
         // above then lands on the root anchor. Switching tabs never bumps, so pushes survive switches.
         .popToRootOnBump(TabScrollKeys.home, path: $path)
+        .onChange(of: path.count) { onNavigationDepthChanged?($0) }
+        .onAppear { onNavigationDepthChanged?(path.count) }
         // Hidden tabs stay mounted (opacity-switched) and never hit onDisappear, so quiet the ambient
         // hero rotation while this is not the visible tab and re-arm it on return (#24 main-thread work).
         .onChange(of: isActive) { active in
@@ -2167,6 +2267,10 @@ struct iOSLibraryView: View {
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
+    /// The overlay profile's library is derived from an unbounded watch dictionary. Keep the bounded
+    /// hero projection local to this view and refresh it from ProfileStore's published watch mutation,
+    /// instead of sorting the entire dictionary while SwiftUI evaluates every body/signature pass.
+    @State private var overlayHeroCandidates: [FeaturedHeroItem] = []
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
     @State private var downloadPlayer: iOSPlayerLaunch?            // play-from-local cover
@@ -2209,8 +2313,37 @@ struct iOSLibraryView: View {
     /// The hero pool: the first few saved titles. Library entries carry no backdrop field, so (like
     /// tvOS) the hero derives 16:9 art from metahub for IMDB ids and enriches the rest in the background.
     private var heroCandidates: [FeaturedHeroItem] {
-        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
-        return source.prefix(5).map(FeaturedHeroItem.from(cw:))
+        if usesOverlayLibrary {
+            return overlayHeroCandidates
+        }
+        // Native/engine library models already publish their ordered catalog. Keep this projection bounded
+        // to the visible hero pool; no overlay dictionary sort is needed on the ordinary body path.
+        return (core.library?.catalog ?? []).prefix(5).map(FeaturedHeroItem.from(cw:))
+    }
+
+    private var usesOverlayLibrary: Bool {
+        !core.usesNativeProfileState && !profiles.activeUsesEngineHistory
+    }
+
+    /// Rebuild only after an overlay watch/profile mutation. `ProfileStore.libraryItems` intentionally
+    /// retains every saved title for the grid, so this is the one bounded hero projection that is allowed
+    /// to pay its full dictionary sort cost, and only on a genuine published change.
+    @discardableResult
+    private func refreshOverlayHeroCandidates() -> [FeaturedHeroItem] {
+        guard usesOverlayLibrary else {
+            overlayHeroCandidates = []
+            return []
+        }
+        let refreshed = profiles.libraryItems.prefix(5).map(FeaturedHeroItem.from(cw:))
+        overlayHeroCandidates = refreshed
+        return refreshed
+    }
+
+    /// Library's hero pool is bounded to the first five saved titles. Observe that exact ordered identity
+    /// set so a real insert/remove/reorder reseeds the hero, while unrelated engine revisions (metadata,
+    /// source, or progress events) do not walk the library and rebuild the pool.
+    private var heroCandidateSignature: [String] {
+        heroCandidates.map { "\($0.type):\($0.id)" }
     }
 
     /// The Library's compact Continue Watching shelf uses the same owner/profile source and the same
@@ -2232,7 +2365,7 @@ struct iOSLibraryView: View {
                 // the existing value route / local filters: nothing here creates a second data source.
                 VStack(spacing: Theme.Space.sm) {
                     NavigationLink(value: LibraryRoute.downloads) {
-                        CinemaLibraryEntryCard(
+                        iOSLibraryHubCard(
                             title: "Downloads",
                             subtitle: downloads.records.isEmpty
                                 ? "Saved episodes available offline appear here."
@@ -2243,15 +2376,15 @@ struct iOSLibraryView: View {
                     }
                     .buttonStyle(.plain)
                     NavigationLink(value: LibraryRoute.watchlist) {
-                        CinemaLibraryEntryCard(title: "Watchlist", subtitle: "Titles bookmarked to watch later", systemImage: "bookmark.fill")
+                        iOSLibraryHubCard(title: "Watchlist", subtitle: "Titles bookmarked to watch later", systemImage: "bookmark.fill")
                     }
                     .buttonStyle(.plain)
                     Button {
                         segment = .all
                         activeFilters = [.watched]
                     } label: {
-                        CinemaLibraryEntryCard(title: "Previously Watched", subtitle: "Titles marked watched in this profile",
-                                               systemImage: "checkmark.circle.fill")
+                        iOSLibraryHubCard(title: "Previously Watched", subtitle: "Titles marked watched in this profile",
+                                          systemImage: "checkmark.circle.fill")
                     }
                     .buttonStyle(.plain)
                 }
@@ -2368,10 +2501,23 @@ struct iOSLibraryView: View {
                 path.append(LibraryRoute.downloads)
             }
             #endif
+            let refreshed = refreshOverlayHeroCandidates()
             FeaturedHeroModel.configureMetaSources(core.addons)
-            hero.seed(heroCandidates, reduceMotion: reduceMotion)
+            hero.seed(usesOverlayLibrary ? refreshed : heroCandidates, reduceMotion: reduceMotion)
         }
-        .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
+        .onChange(of: heroCandidateSignature) { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        }
+        // Overlay watch is the only unbounded source here. Its @Published dictionary is the existing
+        // mutation signal; sort the full overlay once per real watch update, then keep the signature path
+        // on the five-item local projection above. Engine/native profile switches clear or replace it.
+        .onReceive(profiles.$watch) { _ in
+            _ = refreshOverlayHeroCandidates()
+        }
+        .onChange(of: profiles.activeID) { _ in
+            let refreshed = refreshOverlayHeroCandidates()
+            if isActive { hero.seed(usesOverlayLibrary ? refreshed : heroCandidates, reduceMotion: reduceMotion) }
+        }
         // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
@@ -2552,6 +2698,60 @@ struct iOSLibraryView: View {
         }
     }
 }
+
+#if !os(tvOS)
+/// The three Library doorway cards are intentionally local to the Library surface: their routes remain
+/// owned by `iOSLibraryView`, while this presentation keeps the profile accent inside the same dark glass
+/// material used by Settings. It does not change card actions or introduce a second library source.
+private struct iOSLibraryHubCard: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    var badge: String? = nil
+
+    var body: some View {
+        HStack(spacing: Theme.Space.md) {
+            Image(systemName: systemImage)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(Theme.Palette.accent)
+                .frame(width: 52, height: 52)
+                .vortxGlassTintedSurface(
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous),
+                    fillAlpha: VortXGlass.pillFillAlpha,
+                    tint: Theme.Palette.accent,
+                    tintAlpha: VortXGlass.cinemaTintAlpha * 0.8,
+                    shadow: .flat)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(subtitle)
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            if let badge {
+                Text(badge)
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.accent)
+            }
+            Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.Palette.textTertiary)
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+        .vortxGlassTintedSurface(
+            in: RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous),
+            fillAlpha: VortXGlass.cardFillAlpha,
+            tint: Theme.Palette.accent,
+            tintAlpha: VortXGlass.cinemaTintAlpha,
+            shadow: .card)
+        .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous))
+    }
+}
+#endif
 
 #if !os(tvOS)
 /// The offline-downloads section shown at the top of the Library tab (#30). Lists every download with
@@ -2920,9 +3120,9 @@ struct iOSSearchView: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // per-profile recent searches (#90, ported from tvOS)
     @State private var query = ""
+    @State private var submittedSuggestion: String?
     #if os(iOS)
     @FocusState private var searchFocused: Bool
-    @State private var submittedSuggestion: String?
     #elseif os(macOS)
     @FocusState private var macInlineSearchFocused: Bool
     #endif
@@ -2948,9 +3148,7 @@ struct iOSSearchView: View {
                     // popover remains a shortcut, not a substitute for the page's primary action.
                     // Keep both out of NSToolbar: native searchable reconciliation crashed this shell.
 
-                    #if os(iOS)
                     if isTyping && !suggestionTitles.isEmpty { touchSearchSuggestions }
-                    #endif
                     if !history.isEmpty && !isTyping { historySection }
 
                     results
@@ -2980,16 +3178,17 @@ struct iOSSearchView: View {
                               seedBackdrop: target.item.backdrop, seedLogo: target.item.logo,
                               autoPlayOnAppear: target.autoPlay)
             }
+            .navigationDestination(for: HubTarget.self) { target in
+                iOSCategoryBrowse(target: target, path: $path)
+            }
             .onAppear {
                 core.loadSearchSuggestions()
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
             }
             .onChange(of: query) { value in
-                #if os(iOS)
                 let alreadySubmitted = submittedSuggestion == value
                 submittedSuggestion = nil
                 if alreadySubmitted { return }
-                #endif
                 scheduleSearch(value)
             }
             #if os(iOS)
@@ -3113,6 +3312,8 @@ struct iOSSearchView: View {
         .background(Theme.Palette.canvas)
     }
 
+    #endif
+
     private var touchSearchSuggestions: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: Theme.Space.xs) {
@@ -3138,9 +3339,12 @@ struct iOSSearchView: View {
         searchDebouncePending = false
         core.suggestSearch(value)
         core.search(value)
+        #if os(iOS)
         searchFocused = false
+        #elseif os(macOS)
+        macInlineSearchFocused = false
+        #endif
     }
-    #endif
 
     /// Playback actions live together at the top of Search. The compact phone width stacks them while
     /// iPad and Mac keep Debrid Cloud directly beside Play Link.
@@ -3172,6 +3376,7 @@ struct iOSSearchView: View {
     /// is long enough it groups the results into rail sections, falling back to a loading / no-results
     /// line. Gating at ≥2 chars stops a single-char query showing a misleading "No results".
     @ViewBuilder private var results: some View {
+        if hasSearchQuery { CinemaSearchCollections(query: query) { path.append($0) } }
         if !hasSearchQuery {
             ContentUnavailableViewCompat(title: "Search", systemImage: "magnifyingglass",
                 message: "Search across everything your add-ons cover.").frame(minHeight: 360)
@@ -3186,17 +3391,14 @@ struct iOSSearchView: View {
             // catalog actions (#14).
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(resultSections, id: \.title) { section in
-                    VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                        Text(section.title).sectionTitleStyle().padding(.horizontal, Theme.Space.md)
-                        CinemaSearchResults(items: section.items.map {
+                    PosterRail(title: section.title, items: section.items.map {
                             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
                                      background: $0.background, description: $0.description,
                                      releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-                        }, onOpen: { item in
+                        }, onTap: { item in
                             saveToHistory(query)
                             path.append(FeaturedHeroItem.from(rail: item))
-                        }, onWatch: watchFromQuickView)
-                    }
+                        }, onWatch: watchFromQuickView, menu: .catalog, showWatchedBadges: true)
                 }
             }
         }
@@ -3206,9 +3408,11 @@ struct iOSSearchView: View {
     private var resultSections: [(title: String, items: [CoreMeta])] {
         let movies = core.searchResults.filter { $0.type == "movie" }
         let series = core.searchResults.filter { $0.type == "series" }
-        let other = core.searchResults.filter { $0.type != "series" && $0.type != "movie" }
+        let collections = core.searchResults.filter { ["collection", "collections"].contains($0.type) }
+        let other = core.searchResults.filter { !["series", "movie", "collection", "collections"].contains($0.type) }
         return [(String(localized: "Movies"), movies),
                 (String(localized: "Series"), series),
+                (String(localized: "Collections"), collections),
                 (String(localized: "Other"), other)]
             .filter { !$0.items.isEmpty }
     }
@@ -3269,12 +3473,13 @@ struct iOSSearchView: View {
     private func scheduleSearch(_ value: String) {
         searchTask?.cancel()
         let q = value.trimmingCharacters(in: .whitespaces)
+        core.prepareSearch(q)
+        core.suggestSearch(q)
         searchDebouncePending = q.count >= 2
         guard !q.isEmpty else { searchDebouncePending = false; core.search(""); return }
         searchTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
-            core.suggestSearch(q)
             core.search(q)
             searchDebouncePending = false
         }
@@ -3287,6 +3492,7 @@ struct iOSSearchView: View {
 struct iOSDiscoverView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
+    var onNavigationDepthChanged: ((Int) -> Void)? = nil
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var vortxSync: VortXSyncManager   // VortX-primary front door: a VortX sign-in unlocks the tabs even with no Stremio account connected
@@ -3318,6 +3524,13 @@ struct iOSDiscoverView: View {
     /// own `background` + preview fields, so the hero is rich immediately and enriches for logo/trailer.
     private var heroCandidates: [FeaturedHeroItem] {
         (core.discover?.items.prefix(5).map(FeaturedHeroItem.from(meta:))) ?? []
+    }
+
+    /// Discover's hero pool is bounded to the first five visible catalog items. Observe that exact ordered
+    /// identity set so a real page/selection/order change updates the hero, while unrelated engine revisions
+    /// (metadata, source, or progress events) do not reseed the pool.
+    private var heroCandidateSignature: [String] {
+        heroCandidates.map { "\($0.type):\($0.id)" }
     }
 
     var body: some View {
@@ -3425,6 +3638,8 @@ struct iOSDiscoverView: View {
         }
         // Re-tapping the active Discover tab pops a pushed detail/category browse back to root (#22).
         .popToRootOnBump(TabScrollKeys.discover, path: $path)
+        .onChange(of: path.count) { onNavigationDepthChanged?($0) }
+        .onAppear { onNavigationDepthChanged?(path.count) }
         // Keep the filtered grid full: when a page settles or the filter set changes, pull the next page
         // while too few cards match and more pages exist (loadDiscoverNextPage self-guards duplicate loads).
         .onChange(of: core.discover?.items.count ?? 0) { _ in autoFillFilteredGrid() }
@@ -3440,9 +3655,11 @@ struct iOSDiscoverView: View {
             if showCollectionsHub { collectionsHub.load() }
         }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
-        // The grid changes whenever a different type/catalog/genre is selected, which bumps revision;
-        // reseed so the hero pool tracks the visible catalog.
-        .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
+        // The visible catalog's bounded candidate signature changes whenever a different type/catalog/
+        // genre/page selection changes its first five items. Unrelated core revisions stay off this path.
+        .onChange(of: heroCandidateSignature) { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        }
         // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
@@ -3512,6 +3729,7 @@ struct iOSDiscoverView: View {
     /// Grouped Movies / Series / Other rails for the merged-mode query, reusing the same engine results +
     /// rail layout as iOSSearchView so behavior is identical whether search lives in its own tab or here.
     @ViewBuilder private var mergedSearchResults: some View {
+        CinemaSearchCollections(query: searchQuery) { path.append($0) }
         if core.searchResults.isEmpty {
             ContentUnavailableViewCompat(
                 title: (searchDebouncePending || core.searchIsLoading) ? "Searching…" : "No results",
@@ -3521,9 +3739,11 @@ struct iOSDiscoverView: View {
         } else {
             let movies = core.searchResults.filter { $0.type == "movie" }
             let series = core.searchResults.filter { $0.type == "series" }
-            let other = core.searchResults.filter { $0.type != "series" && $0.type != "movie" }
+            let collections = core.searchResults.filter { ["collection", "collections"].contains($0.type) }
+            let other = core.searchResults.filter { !["series", "movie", "collection", "collections"].contains($0.type) }
             let sections = [(String(localized: "Movies"), movies),
                             (String(localized: "Series"), series),
+                            (String(localized: "Collections"), collections),
                             (String(localized: "Other"), other)]
                 .filter { !$0.1.isEmpty }
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
@@ -3546,12 +3766,13 @@ struct iOSDiscoverView: View {
     private func scheduleMergedSearch(_ value: String) {
         searchTask?.cancel()
         let q = value.trimmingCharacters(in: .whitespaces)
+        core.prepareSearch(q)
+        core.suggestSearch(q)
         searchDebouncePending = q.count >= 2
         guard !q.isEmpty else { searchDebouncePending = false; core.search(""); return }
         searchTask = Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
-            core.suggestSearch(q)
             core.search(q)
             searchDebouncePending = false
         }
@@ -4218,14 +4439,19 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         let preparer = iOSNextEpisodePreparer()
         cancelNextEpisodePreparation = { preparer.cancel() }
         warmNextEpisode = { request in
+            let expectedSources = account.streamSources
+            let expectedAddonCapabilities = EpisodeSourceInventory(legacyAddons: account.addons)
             let valid = {
                 ProfileStore.shared.activeID == pid
                     && account.credentialBoundaryGeneration == accountBoundary
+                    && account.streamSources == expectedSources
+                    && EpisodeSourceInventory(legacyAddons: account.addons) == expectedAddonCapabilities
                     && (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession)
             }
             let context = iOSNextEpisodePreparationContext(
                 seriesID: item.id, seriesName: entry.name, defaultSeason: season,
-                defaultVideoID: nil, poster: entry.poster, sources: account.streamSources,
+                defaultVideoID: nil, poster: entry.poster, sources: expectedSources,
+                legacyAddons: account.addons,
                 continuity: entry.qualityText, binge: entry.bingeGroup, pin: SourcePinStore.shared.effectivePin(
                     SourcePinContext(metaId: item.id, isSeries: true)), cachedHashes: [],
                 signedInToVortX: VortXSyncManager.shared.isSignedIn,
@@ -4274,7 +4500,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         if let source {
             let base = iOSEngineAddonBase(for: source, in: groups)
             let succeeded = core.loadEnginePlayer(
-                for: source, videoId: entry.videoId, base: base,
+                for: source, videoId: entry.videoId, libraryId: item.id, base: base,
                 resolvedURL: explicitDebridRef?.url
             )
             enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
@@ -4783,6 +5009,8 @@ struct PosterGrid: View {
     /// remains outside this component's quick-view path and therefore keeps its one-tap resume contract.
     @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
     @State private var quickViewItem: RailItem?
+    @Environment(\.cinemaQuickViewPresenter) private var quickViewPresenter
+    @Environment(\.cinemaCardViewportWidth) private var viewportWidth
     @Environment(\.horizontalSizeClass) private var hSize
     // Center the adaptive tracks so the cards distribute evenly across the available width.
     private var columns: [GridItem] {
@@ -4794,14 +5022,16 @@ struct PosterGrid: View {
         #else
         let compact = false
         #endif
-        let minTrack = iOSPillMetrics.gridPosterWidth(preset: catalogPrefs.posterWidth, compact: compact)
+        let minTrack = iOSPillMetrics.gridPosterWidth(preset: catalogPrefs.posterWidth, compact: compact,
+                                                    container: viewportWidth,
+                                                    landscape: catalogPrefs.landscapeCards && apiKeys.hasTMDB)
         return [GridItem(.adaptive(minimum: minTrack), spacing: Theme.Space.sm, alignment: .center)]
     }
     var body: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
             ForEach(items) { item in
                 Button {
-                    if shouldPresentQuickView(for: item) { quickViewItem = item }
+                    if shouldPresentQuickView(for: item) { presentQuickView(item) }
                     else { onTap(item) }
                 } label: {
                     PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
@@ -4834,6 +5064,14 @@ struct PosterGrid: View {
 
     private func shouldPresentQuickView(for item: RailItem) -> Bool {
         quickViewEnabled && menu != .continueWatching && item.cwVideoId == nil && item.resumeSeconds == nil
+    }
+
+    private func presentQuickView(_ item: RailItem) {
+        if let quickViewPresenter {
+            quickViewPresenter.present(item, onWatch: {
+                if let onWatch { onWatch(item) } else { onTap(item) }
+            }, onDetails: { onTap(item) })
+        } else { quickViewItem = item }
     }
 }
 
@@ -4905,6 +5143,7 @@ private struct PosterRailBody: View {
     /// byte-for-byte unchanged (no `.focusable`, no ring). The rail is keyed by its `title`.
     var macFocus: FocusState<MacBrowseFocus?>.Binding? = nil
     #endif
+    @Environment(\.cinemaQuickViewPresenter) private var quickViewPresenter
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @AppStorage("vortx.quickViewEnabled") private var quickViewEnabled = true
     @State private var quickViewItem: RailItem?
@@ -4953,6 +5192,7 @@ private struct PosterRailBody: View {
                         }
                     }
                     .padding(.horizontal, Theme.Space.md)
+                    .padding(.vertical, Theme.Space.xs)
                 }
                 .overlay(alignment: .leading) {
                     if showArrows && pageIndex > 0 { railArrow(forward: false) { page(by: -1, proxy) } }
@@ -4982,7 +5222,13 @@ private struct PosterRailBody: View {
             // Continue Watching carries a concrete resumed source and must never be interposed by a
             // generic preview. Catalog and Library cards can use the quick view, which routes back to
             // this exact `onTap` closure for the existing detail path.
-            if shouldPresentQuickView(for: item) { quickViewItem = item }
+            if shouldPresentQuickView(for: item) {
+                if let quickViewPresenter {
+                    quickViewPresenter.present(item, onWatch: {
+                        if let onWatch { onWatch(item) } else { onTap(item) }
+                    }, onDetails: { onTap(item) })
+                } else { quickViewItem = item }
+            }
             else { onTap(item) }
         } label: {
             Group {
@@ -5024,7 +5270,7 @@ private struct PosterRailBody: View {
             base
                 .focusable()
                 .focused(macFocus, equals: target)
-                .macFocusRing(isFocused)
+                .macCardFocus(isFocused)
                 // Only the old and new focused cells receive a changed Bool as focus walks the row.
                 .onChange(of: isFocused) { focused in
                     if focused { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(item.id, anchor: .center) } }
@@ -5399,6 +5645,7 @@ private struct CinemaPosterCardBody: View {
     let presentation: CinemaPosterCardPresentation
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @Environment(\.horizontalSizeClass) private var hSize
+    @Environment(\.cinemaCardViewportWidth) private var viewportWidth
 
     /// The title to show: the pooled localized title in the user's language when available, else the add-on's.
     private var displayName: String { presentation.displayName }
@@ -5418,7 +5665,8 @@ private struct CinemaPosterCardBody: View {
     // + cards stay in lockstep and the responsive column count recomputes from the chosen width. The height
     // follows the card's own aspect (16:9 landscape, 2:3 portrait) so posters aren't distorted.
     private var cardW: CGFloat {
-        iOSPillMetrics.gridPosterWidth(preset: presentation.width, compact: isCompactWidth)
+        iOSPillMetrics.gridPosterWidth(preset: presentation.width, compact: isCompactWidth,
+                                      container: viewportWidth, landscape: landscape)
     }
     /// True on a compact-width class (iPhone portrait), where the preset uses its narrower compact widths.
     private var isCompactWidth: Bool {
@@ -5538,6 +5786,7 @@ private struct CinemaPosterCardBody: View {
                 }
             }
             .frame(width: cardW, height: cardH)
+            .shadow(color: .black.opacity(0.28), radius: 10, y: 5)
             // The title label is hidden when the user turns off poster labels in Poster Style (default:
             // shown). The caption (Upcoming Episodes "S2E5 · Jun 30") is a functional date, not a title, so
             // it stays visible even with labels hidden.

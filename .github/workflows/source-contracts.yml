@@ -17,6 +17,8 @@ on:
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-cw-service-selection.sh"
       - "scripts/test-home-cw-selection.sh"
+      - "scripts/test-episode-source-isolation.sh"
+      - "scripts/test-next-preparation-attempt.sh"
       - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/generate-native-apple-project.rb"
@@ -47,6 +49,8 @@ on:
       - "scripts/test-profile-roster-propagation.sh"
       - "scripts/test-cw-service-selection.sh"
       - "scripts/test-home-cw-selection.sh"
+      - "scripts/test-episode-source-isolation.sh"
+      - "scripts/test-next-preparation-attempt.sh"
       - "test/apple-player-timeline-boundaries.test.js"
       - "scripts/test-release-orchestration-contracts.sh"
       - "scripts/generate-native-apple-project.rb"
@@ -77,6 +81,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash scripts/test-release-orchestration-contracts.sh
       - run: ruby scripts/test-native-apple-project.rb
+      - run: bash scripts/test-cinema-rail-layout.sh
+      - run: bash scripts/test-episode-source-isolation.sh
+      - name: Fetch immutable public next-episode cancellation baseline
+        run: git fetch --no-tags --depth=1 origin f9c45518ba6b8d779343c076da9f0dbcda129a30
+      - run: bash scripts/test-next-preparation-attempt.sh
       - run: python3 scripts/tests/test_native_apple_package.py
       - run: python3 scripts/tests/test_release_native_snapshot_argv.py
       - run: python3 scripts/tests/test_android_release_version.py

@@ -849,7 +849,7 @@ fun PlayerScreen(
         if (!castState.isConnected || currentPlayable.isTrailer) return@LaunchedEffect
         while (isActive) {
             val s = castManager.state.value
-            if (s.durationMs > 0L && !s.isPaused) currentOnProgress(s.positionMs, s.durationMs)
+            if (!s.isPaused && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) currentOnProgress(s.positionMs, s.durationMs)
             delay(CAST_PROGRESS_WRITEBACK_MS)
         }
     }
@@ -1000,6 +1000,7 @@ fun PlayerScreen(
     // viewer's own pick off the manual fallback) is exempt from the VERDICT -- their warned, explicit
     // choice must play -- while the never-poison writeback gates below stay in force regardless.
     var runtimeMismatch by remember(playbackSessionKey) { mutableStateOf(false) }
+    var knownAudioMismatch by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(playerState.durationMs, playbackSessionKey) {
         if (runtimeMismatch || currentPlayable.userForcedSource) return@LaunchedEffect
         val fileMs = latestState.durationMs
@@ -1028,7 +1029,7 @@ fun PlayerScreen(
         }
     }
     // The one committed error verdict everything downstream renders and gates on.
-    val effectiveError = playerState.hasError || stallError || runtimeMismatch
+    val effectiveError = playerState.hasError || stallError || runtimeMismatch || knownAudioMismatch
     LaunchedEffect(playerState.hasEnded, effectiveError) {
         playbackIntent.setSourceTerminal(playerState.hasEnded || effectiveError)
     }
@@ -1170,7 +1171,7 @@ fun PlayerScreen(
     var sourceFailureDispatched by remember(playbackSessionKey) { mutableStateOf(false) }
     LaunchedEffect(playbackSessionKey, effectiveError, sourceSwitchState.isSwitching, playerExitRequested) {
         if (
-            !effectiveError || sourceFailureDispatched || isLocalSession ||
+            !effectiveError || knownAudioMismatch || sourceFailureDispatched || isLocalSession ||
                 sourceTerminalFence.suppress(
                     revision = sourceSwitchState.revision,
                     replacementPending = sourceSwitchState.isSwitching,
@@ -1291,6 +1292,28 @@ fun PlayerScreen(
             if (subId != null && subId >= 0) engine.selectSubtitleTrack(subId) else engine.selectSubtitleTrack(null)
         }
         trackSelectionPhases = trackSelectionPhases.apply(defaults)
+    }
+
+    // Unknown inventory is not rejection evidence. Allow independently arriving tracks to settle,
+    // then reject only a labelled file with no requested/English audio, never a manual source/audio.
+    LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, trackSelectionPhases.audio) {
+        if (currentPlayable.isTrailer || currentPlayable.isLive || currentPlayable.userForcedSource || isLocalSession ||
+            trackSelectionPhases.audio == DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION) {
+            knownAudioMismatch = false
+            return@LaunchedEffect
+        }
+        delay(2_000L)
+        knownAudioMismatch = knownWrongAutomaticAudio(latestState.audioTracks, trackPreferences, matchAudioSub)
+    }
+    val audioAlternates = remember(outerPlaybackSessionId, currentPlayable.playbackContext?.identityKey ?: currentPlayable.mediaRef) { AutomaticAudioAlternates() }
+    LaunchedEffect(playbackSessionKey, knownAudioMismatch, sourceSwitchState.pendingSwitch, sourceOptions, playerExitRequested) {
+        if (!knownAudioMismatch || sourceSwitchState.isSwitching || playerExitRequested) return@LaunchedEffect
+        playbackIntent.setSourceTerminal(true)
+        if (currentOnSwitchSource == null) return@LaunchedEffect
+        val alternate = audioAlternates.next(sourceSwitchState.currentSource, sourceOptions) ?: return@LaunchedEffect
+        sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
+            sourceSwitchState = beginPlayerSourceSwitch(sourceSwitchState, alternate, authority, automatic = true)
+        }
     }
 
     val preferAddonSubtitles = remember(playbackSessionKey) { TrackPreferencesStore(context).prefersAddonSubtitles }
@@ -1538,7 +1561,7 @@ fun PlayerScreen(
     LaunchedEffect(playbackSessionKey, playerState.hasEnded, sourceSwitchState.isSwitching, playerExitRequested) {
         val s = latestState
         if (
-            !playerState.hasEnded || s.hasError || stallError || runtimeMismatch ||
+            !playerState.hasEnded || s.hasError || stallError || runtimeMismatch || knownAudioMismatch ||
                 sourceTerminalFence.suppress(
                     revision = sourceSwitchState.revision,
                     replacementPending = sourceSwitchState.isSwitching,
@@ -1586,7 +1609,7 @@ fun PlayerScreen(
         while (true) {
             delay(PROGRESS_REPORT_MS)
             val s = latestState
-            if (!s.isPaused && s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, currentPlayable)) {
+            if (!s.isPaused && !runtimeMismatch && !knownAudioMismatch && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) {
                 currentOnProgress(s.positionMs, s.durationMs)
                 // PLR-8: drive the host's next-episode preload with the live position/duration. The host
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
@@ -1604,7 +1627,7 @@ fun PlayerScreen(
     DisposableEffect(engine) {
         onDispose {
             val s = latestState
-            if (s.durationMs > 0L && !runtimeMismatch && !isJunkDuration(s.durationMs, currentPlayable)) {
+            if (!runtimeMismatch && !knownAudioMismatch && canReportPlayerProgress(currentPlayable, s.positionMs, s.durationMs)) {
                 currentOnProgress(s.positionMs, s.durationMs)
             }
         }
@@ -1870,7 +1893,7 @@ fun PlayerScreen(
             // junk file may genuinely have EOF'd, but presenting "ended" for a wrong file would be
             // the exact lie this fix removes.
             state = when {
-                runtimeMismatch -> playerState.copy(hasError = true, hasEnded = false)
+                runtimeMismatch || knownAudioMismatch -> playerState.copy(hasError = true, hasEnded = false)
                 stallError -> playerState.copy(hasError = true)
                 else -> playerState
             },
@@ -1951,6 +1974,11 @@ fun PlayerScreen(
             onSeekBy = { showControls(); seekLocalBy(it) },
             onSelectAudio = {
                 showControls()
+                knownAudioMismatch = false
+                if (sourceSwitchState.pendingSwitch?.automatic == true) {
+                    sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)
+                    sourceSwitchState = sourceSwitchState.copy(pendingSwitch = null, errorMessage = null)
+                }
                 trackSelectionPhases = trackSelectionPhases.holdAudio()
                 engine.selectAudioTrack(it)
             },
@@ -1978,6 +2006,17 @@ fun PlayerScreen(
             currentSource = sourceSwitchState.currentSource,
             sourceSwitching = sourceSwitchState.isSwitching,
             sourceSwitchError = sourceSwitchState.errorMessage,
+            failedEpisode = sourceSwitchState.failedEpisode,
+            onRetryEpisode = {
+                sourceSwitchState.failedEpisode?.let { failed ->
+                    if (currentOnSwitchEpisode != null) {
+                        sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
+                        sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
+                            sourceSwitchState = beginPlayerEpisodeSwitch(sourceSwitchState, failed, authority)
+                        }
+                    }
+                }
+            },
             onSwitchSource = { source ->
                 val resolver = currentOnSwitchSource
                 if (
@@ -2523,13 +2562,7 @@ private fun skipBandColor(kind: SkipSegment.Kind): Color = when (kind) {
 }
 
 private fun isJunkDuration(fileDurationMs: Long, playable: Playable): Boolean {
-    if (playable.isTrailer || fileDurationMs <= 0L) return false
-    val expectedMs = playable.expectedDurationMs
-    if (expectedMs > 0L) {
-        val threshold = minOf(expectedMs / 2, expectedMs - EXPECTED_RUNTIME_SLACK_MS)
-        return fileDurationMs < threshold
-    }
-    return fileDurationMs < JUNK_DURATION_FLOOR_MS
+    return isJunkPlayerDuration(fileDurationMs, playable)
 }
 
 /// The EOF-side twin of [isJunkDuration]: whether an END-of-file arrived with the playhead
@@ -2539,13 +2572,7 @@ private fun isJunkDuration(fileDurationMs: Long, playable: Playable): Boolean {
 /// REALLY got to. With no expected runtime, an EOF under the absolute floor of BOTH playhead and
 /// claimed duration is junk (a genuinely short file watched to its end); anything longer is trusted.
 private fun isJunkEof(positionMs: Long, fileDurationMs: Long, playable: Playable): Boolean {
-    if (playable.isTrailer) return false
-    val expectedMs = playable.expectedDurationMs
-    if (expectedMs > 0L) {
-        val threshold = minOf(expectedMs / 2, expectedMs - EXPECTED_RUNTIME_SLACK_MS)
-        return positionMs < threshold
-    }
-    return positionMs < JUNK_DURATION_FLOOR_MS && fileDurationMs < JUNK_DURATION_FLOOR_MS
+    return isJunkPlayerEof(positionMs, fileDurationMs, playable)
 }
 
 /// Slack subtracted from the expected runtime for the mismatch threshold, so credit-less cuts,

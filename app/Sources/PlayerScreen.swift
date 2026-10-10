@@ -408,7 +408,7 @@ private struct PlayerSeekTimelineTrack: View {
 /// These non-generic view boundaries keep each toolbar button and optional editor section's
 /// glass/conditional tree out of its parent's metadata. Keep transport ownership in PlayerScreen.
 ///
-/// Player controls intentionally own their tint and shape. SwiftUI's default macOS Button style can
+/// Player controls intentionally own their glass and shape. SwiftUI's default macOS Button style can
 /// paint a rectangular native button surface around a circular/pill label; that surface is the dark
 /// rectangle visible outside the control in the profile-accent screenshots. Keeping the presentation in
 /// one player-only modifier makes the plain-button contract explicit without changing shared browse/TV
@@ -417,11 +417,20 @@ private enum PlayerControlReduceTransparencyOverrideKey: EnvironmentKey {
     static let defaultValue: Bool? = nil
 }
 
+private enum PlayerControlContrastOverrideKey: EnvironmentKey {
+    static let defaultValue: ColorSchemeContrast? = nil
+}
+
 private extension EnvironmentValues {
     /// Testable player-only override; production callers inherit the system accessibility setting.
     var playerControlReduceTransparencyOverride: Bool? {
         get { self[PlayerControlReduceTransparencyOverrideKey.self] }
         set { self[PlayerControlReduceTransparencyOverrideKey.self] = newValue }
+    }
+
+    var playerControlContrastOverride: ColorSchemeContrast? {
+        get { self[PlayerControlContrastOverrideKey.self] }
+        set { self[PlayerControlContrastOverrideKey.self] = newValue }
     }
 }
 
@@ -432,55 +441,66 @@ private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
 
     @Environment(\.accessibilityReduceTransparency) private var systemReduceTransparency
     @Environment(\.playerControlReduceTransparencyOverride) private var reduceTransparencyOverride
+    @Environment(\.colorSchemeContrast) private var systemContrast
+    @Environment(\.playerControlContrastOverride) private var contrastOverride
     @Environment(\.isEnabled) private var isEnabled
 
     private var reduceTransparency: Bool {
         reduceTransparencyOverride ?? systemReduceTransparency
     }
 
+    private var contrast: ColorSchemeContrast { contrastOverride ?? systemContrast }
+
     func body(content: Content) -> some View {
         content
             .foregroundStyle(foreground)
-            // The chosen accent is painted INSIDE the same shape as the label. The shadow below is
-            // deliberately neutral black, so no profile hue can escape as a rectangular halo.
-            .background { shape.fill(fill) }
+            .background { surface }
             .overlay { shape.strokeBorder(border, lineWidth: 1) }
             .clipShape(shape)
             .contentShape(shape)
             .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, x: 0, y: shadowY)
     }
 
-    private var fill: Color {
-        // Reduce Transparency is a no-compositing contract here: every enabled player
-        // control must cover the moving video with an opaque profile-accent face.
-        guard isEnabled else { return Theme.Palette.surface1 }
-        if reduceTransparency || prominent { return Theme.Palette.accent }
-        let alpha = active ? 0.28 : 0.17
-        return Theme.Palette.accent.opacity(alpha)
+    /// Keep the material inside the exact disc/pill silhouette. A fixed neutral veil protects white
+    /// glyphs over bright video; only a selected setting adds a small accent cue over that glass.
+    @ViewBuilder private var surface: some View {
+        ZStack {
+            if reduceTransparency || contrast == .increased || !isEnabled {
+                shape.fill(neutral)
+            } else {
+                shape.fill(.ultraThinMaterial)
+                    .environment(\.colorScheme, .dark)
+                shape.fill(neutral.opacity(prominent ? 0.62 : 0.66))
+            }
+            if active && isEnabled {
+                shape.fill(Theme.Palette.accent.opacity(0.16))
+            }
+        }
+        .clipShape(shape)
     }
+
+    // Player chrome floats over arbitrary video, so it must not inherit profile-tinted app surfaces.
+    private var neutral: Color { Color(.sRGB, white: 0.08, opacity: 1) }
 
     private var foreground: Color {
-        guard isEnabled else { return Theme.Palette.textTertiary }
-        return (prominent || reduceTransparency) ? Theme.Palette.onAccent : Theme.Palette.accent
+        isEnabled ? .white : .white.opacity(contrast == .increased ? 0.65 : 0.45)
     }
 
-    private var border: Color {
-        guard isEnabled else { return Theme.Palette.hairline }
-        if reduceTransparency {
-            return prominent ? Theme.Palette.accentBright : Theme.Palette.accent
-        }
-        return prominent
-            ? Theme.Palette.accentBright.opacity(0.50)
-            : Theme.Palette.accent.opacity(active ? 0.78 : 0.55)
+    private var border: LinearGradient {
+        let top = contrast == .increased ? 0.48 : prominent ? 0.26 : 0.18
+        let tint: Color = active && isEnabled ? Theme.Palette.accent : .white
+        return LinearGradient(colors: [tint.opacity(active && isEnabled ? 0.72 : top),
+                                       tint.opacity(active && isEnabled ? 0.32 : top * 0.28)],
+                              startPoint: .top, endPoint: .bottom)
     }
 
-    private var shadowOpacity: Double { isEnabled ? (prominent ? 0.30 : 0.28) : 0.18 }
-    private var shadowRadius: CGFloat { prominent ? 6 : 4 }
-    private var shadowY: CGFloat { prominent ? 3 : 2 }
+    private var shadowOpacity: Double { isEnabled ? 0.20 : 0.10 }
+    private var shadowRadius: CGFloat { prominent ? 5 : 3 }
+    private var shadowY: CGFloat { 2 }
 }
 
 private extension View {
-    /// Player-only shape-first tinting. Callers still decide the visual size/tap target before the modifier.
+    /// Player-only neutral glass. Callers still decide the visual size/tap target before the modifier.
     func playerControlSurface<S: InsettableShape>(in shape: S,
                                                    prominent: Bool = false,
                                                    active: Bool = false) -> some View {
@@ -1099,6 +1119,9 @@ struct PlayerScreen: View {
     var onProgress: (Double, Double, PlaybackMutationTarget) -> Void = { _, _, _ in }
     var onSeek: (Double, Double, PlaybackMutationTarget) -> Void = { _, _, _ in }
     var onNext: () -> Void = {}                             // advance to the next episode (legacy, non-episode callers)
+    /// Navigation-only receipt for the media this exact player load actually admitted. Persistence remains
+    /// owned by the captured playback target; a presenter must not infer the closing episode from lagging CW.
+    var onPlaybackIdentityCommitted: (PlaybackMeta) -> Void = { _ in }
     let onClose: () -> Void
 
     // CoreBridge / account are injected at the iOS app root; the player reads them for in-player source
@@ -1445,6 +1468,11 @@ struct PlayerScreen: View {
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var preparingEpisodeID: String?
     @State private var preparedEpisode: PlayerEpisodeStream?
+    @State private var preparedEpisodeSourceOwner: EpisodeSourceOwner?
+    @State private var isolatedEpisodeSources: [String: [CoreStreamSourceGroup]] = [:]
+    @State private var isolatedEpisodeSourceOwner: EpisodeSourceOwner?
+    @State private var episodeSourceHydrationTask: Task<Void, Never>?
+    @State private var episodeSourceHydrationGeneration = UUID()
     @State private var nextEpisodePreparationTask: Task<Void, Never>?
     @State private var nextEpisodePreparationGeneration = 0
     @State private var nextEpisodeAttemptPolicy = PreparedEpisodeAttemptPolicy()
@@ -2164,7 +2192,7 @@ struct PlayerScreen: View {
                         Button { leavePlayback() } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 17, weight: .bold))
-                                // Escape-hatch close uses the same player accent surface as the visible
+                                // Escape-hatch close uses the same player glass surface as the visible
                                 // top-bar close; its cancel shortcut and action remain unchanged.
                                 .frame(width: 44, height: 44)
                                 .playerControlSurface(in: Circle())
@@ -2559,6 +2587,11 @@ struct PlayerScreen: View {
         guard assetSanityAttempt.isAccepted(owner: loadToken),
               assetSanityStartEffectsToken != loadToken else { return }
         assetSanityStartEffectsToken = loadToken
+        if let meta = curMeta, pendingAdvance == nil,
+           assetSanityDeferredStartToken == loadToken,
+           coordinator.player?.activeLoadToken == loadToken {
+            onPlaybackIdentityCommitted(meta)
+        }
         rememberAcceptedSeriesChoice()
         localTrickplayCaptureBreaker.reset()
         recordLastStream()
@@ -4333,7 +4366,7 @@ struct PlayerScreen: View {
                 }
                 if let target = retryMeta, let source = currentStream {
                     let succeeded = core.loadEnginePlayer(
-                        for: source, videoId: target.videoId,
+                        for: source, videoId: target.videoId, libraryId: target.libraryId,
                         base: engineAddonBase(for: source), resolvedURL: fresh
                     )
                     enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
@@ -6365,7 +6398,7 @@ struct PlayerScreen: View {
         pendingAdvance?.terminal = true
         uncommittedIdentityBlocked = true
         invalidatePreparedEpisode(reason: "next episode audio mismatch")
-        if retry, goToEpisode(pending.meta.videoId, autoAdvance: true) { return false }
+        if retry, goToEpisode(pending.meta.videoId, autoAdvance: true, origin: .languageRecovery) { return false }
         loadErrorMsg = "No source with your selected audio language could be played. Choose another source or audio language."
         failedEpisodeResolutionID = pending.meta.videoId
         presentTerminalLoadFailure()
@@ -6707,7 +6740,7 @@ struct PlayerScreen: View {
         if !engineAlreadyBound, isEpisodePlaybackContext,
            let meta = pendingAdvance?.meta ?? curMeta {
             let succeeded = core.loadEnginePlayer(
-                for: stream, videoId: meta.videoId,
+                for: stream, videoId: meta.videoId, libraryId: meta.libraryId,
                 base: engineAddonBaseOverride ?? engineAddonBase(for: stream),
                 resolvedURL: debridRef?.url
             )
@@ -6820,8 +6853,13 @@ struct PlayerScreen: View {
     /// exact title/episode response before it replaces a partial navigation seed.
     private func hydrateDirectResumeMetadataForPlayerUI() {
         guard startedFromResume, let current = curMeta else { return }
-        // Keep the existing shared-meta refresh for source UI on every direct resume, including movies.
-        // Navigation inventory is admitted only by the exact request-owned series refresh below.
+        if isEpisodePlaybackContext {
+            let owner = EpisodeSourceOwner(core: core, account: account)
+            hydrateEpisodeSources(current, owner: owner)
+            return
+        }
+        // Movies retain the existing detail refresh. Series source panels and navigation inventory each
+        // have their own exact-video owner, and must never evict the covered Detail page's shared slot.
         core.loadMeta(
             type: current.type, id: current.libraryId,
             streamType: current.type, streamId: current.videoId
@@ -7263,6 +7301,8 @@ struct PlayerScreen: View {
     /// but only one active attempt, two delayed retries, and one final credits attempt can be admitted.
     private func warmNextIfNeeded() {
         guard let warm = warmNextEpisode, canNextEpisode, let i = episodeIndex else { return }
+        let sourceOwner = EpisodeSourceOwner(core: core, account: account)
+        guard sourceOwner.isCurrent else { return }
         let nextID = allEpisodeRefs[i + 1].id
         guard warmedEpisodeID != nextID, preparingEpisodeID != nextID else { return }
         let now = ProcessInfo.processInfo.systemUptime
@@ -7290,10 +7330,16 @@ struct PlayerScreen: View {
         preparingEpisodeID = nextID
         DiagnosticsLog.log("binge", "next prepare trigger target=\(VXProbeRedaction.identityToken(nextID)) generation=\(generation) attempt=\(attempt.sequence) credits=\(attempt.nearCredits ? "Y" : "N")")
         nextEpisodePreparationTask = Task { @MainActor in
+            guard sourceOwner.isCurrent, SeriesSourceSticky.admits(choice) else {
+                if generation == nextEpisodePreparationGeneration, preparingEpisodeID == nextID {
+                    invalidatePreparedEpisode(reason: "source owner retired before preparation")
+                }
+                return
+            }
             let result = await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
                 await warm(request)
             }
-            guard preparingEpisodeID == nextID,
+            guard sourceOwner.isCurrent, preparingEpisodeID == nextID,
                   PreparedEpisodeRetentionPolicy.ownsCompletion(
                     capturedGeneration: generation,
                     currentGeneration: nextEpisodePreparationGeneration,
@@ -7335,6 +7381,7 @@ struct PlayerScreen: View {
             preparedEpisode?.preparedRemux?.abandon(reason: "replacement prepared episode")
             warmedEpisodeID = nextID
             preparedEpisode = result
+            preparedEpisodeSourceOwner = sourceOwner
             preparedEpisodeChoice = choice
             DiagnosticsLog.log("binge", "next prepare ready target=\(VXProbeRedaction.identityToken(nextID)) host=\(result.url.host ?? "-") generation=\(generation)")
         }
@@ -7342,7 +7389,7 @@ struct PlayerScreen: View {
 
     private func takePreparedEpisode(for videoID: String) -> PlayerEpisodeStream? {
         let choiceIsCurrent = preparedEpisodeChoice == seriesStickyKey.map { SeriesSourceSticky.currentSnapshot(for: $0) }
-        let result = choiceIsCurrent && PreparedEpisodeRetentionPolicy.consumes(
+        let result = choiceIsCurrent && preparedEpisodeSourceOwner?.isCurrent == true && PreparedEpisodeRetentionPolicy.consumes(
             requestedEpisodeID: videoID,
             preparedEpisodeID: preparedEpisode?.meta.videoId
         ) ? preparedEpisode : nil
@@ -7358,6 +7405,7 @@ struct PlayerScreen: View {
         nextEpisodePreparationTask = nil
         preparingEpisodeID = nil
         preparedEpisode = nil
+        preparedEpisodeSourceOwner = nil
         preparedEpisodeChoice = nil
         warmedEpisodeID = nil
         nextEpisodeAttemptPolicy.reset()
@@ -7375,6 +7423,7 @@ struct PlayerScreen: View {
         retirePreparedTorrentEngine(preparedEpisode?.torrentPreparationLease, reason: reason)
         preparedEpisode?.preparedRemux?.abandon(reason: reason)
         preparedEpisode = nil
+        preparedEpisodeSourceOwner = nil
         preparedEpisodeChoice = nil
         warmedEpisodeID = nil
         nextEpisodeAttemptPolicy.reset()
@@ -7480,6 +7529,9 @@ struct PlayerScreen: View {
     }
 
     private func invalidateEpisodeWorkForExit() {
+        episodeSourceHydrationTask?.cancel()
+        episodeSourceHydrationTask = nil
+        episodeSourceHydrationGeneration = UUID()
         persistenceBlockedForExit = hasUncommittedIssuedMedia
         playbackExited = true
         invalidateEpisodeResolution()
@@ -7517,7 +7569,7 @@ struct PlayerScreen: View {
         curIsTorrent = source.isTorrent
         if let stream = source.stream {
             let succeeded = core.loadEnginePlayer(
-                for: stream, videoId: pending.meta.videoId,
+                for: stream, videoId: pending.meta.videoId, libraryId: pending.meta.libraryId,
                 base: source.engineAddonBase, resolvedURL: source.debridRef?.url
             )
             enginePlayerVideoId = EpisodePlaybackIdentity.boundVideoID(
@@ -7553,7 +7605,8 @@ struct PlayerScreen: View {
     /// caller, then hot-swap the source and record against the new episode. No cover teardown - the
     /// chrome stays put and only the video reloads, the same feel as an in-player source switch.
     @discardableResult
-    private func goToEpisode(_ videoId: String, autoAdvance: Bool = false) -> Bool {
+    private func goToEpisode(_ videoId: String, autoAdvance: Bool = false,
+                             origin: EpisodeResolutionBudget.Origin? = nil) -> Bool {
         episodeInventoryUnavailable = false
         playbackDeadlineClock.setPaused(false, now: ProcessInfo.processInfo.systemUptime)
         cancelDirectResumeInventoryRefresh()
@@ -7624,7 +7677,9 @@ struct PlayerScreen: View {
             videoID: videoId
         )
         let resolutionBudget = EpisodeResolutionBudget(episodeID: videoId,
-            origin: autoAdvance ? .automatic : .manual, now: ProcessInfo.processInfo.systemUptime)
+            origin: origin ?? (autoAdvance ? .automatic : .manual), now: ProcessInfo.processInfo.systemUptime)
+        let sourceOwner = EpisodeSourceOwner(core: core, account: account)
+        let sourceReceipt = EpisodeSourceReceipt(videoID: videoId, owner: sourceOwner)
         armEpisodeResolutionDeadline(owner: resolutionOwner, budget: resolutionBudget)
         DiagnosticsLog.log("binge", "episode resolve begin target=\(VXProbeRedaction.identityToken(videoId)) origin=\(resolutionBudget.origin.rawValue) budget=\(Int(Self.episodeResolutionDeadlineSeconds))s prepared=\(retainedPreparedEpisode != nil)")
         autoRetryTask?.cancel()
@@ -7654,29 +7709,20 @@ struct PlayerScreen: View {
                     )
                 }
             }
-            guard !Task.isCancelled, SeriesSourceSticky.admits(choice) else { return }
+            guard sourceOwner.isCurrent, SeriesSourceSticky.admits(choice) else { return }
             let resolved: PlayerEpisodeStream?
             if let retainedPreparedEpisode,
                preparedTorrentLeaseIsAdmissible(
                     retainedPreparedEpisode,
                     requestedEpisodeID: videoId
                ) {
-                // The retained URL/selection avoids a cold resolve, but CoreBridge still has to move its
-                // episode-scoped source owner before switchStream can bind engine attribution or fail over.
-                // This is the same identity load performed by loadEpisodeStream, without re-ranking.
-                guard let sourceIdentityTarget = PreparedEpisodeRetentionPolicy.sourceIdentityTarget(
+                guard PreparedEpisodeRetentionPolicy.sourceIdentityTarget(
                     requestedEpisodeID: videoId,
                     preparedEpisodeID: retainedPreparedEpisode.meta.videoId
-                ) else { return }
-                core.loadMeta(
-                    type: "series",
-                    id: retainedPreparedEpisode.meta.libraryId,
-                    streamType: "series",
-                    streamId: sourceIdentityTarget
-                )
+                ) != nil else { return }
                 DiagnosticsLog.log(
                     "binge",
-                    "next prepare admitted target=\(VXProbeRedaction.identityToken(videoId)); source identity advanced without reselection"
+                    "next prepare admitted target=\(VXProbeRedaction.identityToken(videoId)); owned source retained without reselection"
                 )
                 resolved = retainedPreparedEpisode
             } else {
@@ -7690,11 +7736,13 @@ struct PlayerScreen: View {
                     )
                 }
                 if let resolverRoute {
-                    resolved = await EpisodeResolutionBudget.$current.withValue(resolutionBudget) {
-                        await SeriesSourceSticky.resolveIfCurrent(choice) {
-                            await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
-                                await SeriesSourceSticky.$rejectedStreams.withValue(rejectedStreams) {
-                                    await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                    resolved = await EpisodeSourceCollection.$receipt.withValue(sourceReceipt) {
+                        await EpisodeResolutionBudget.$current.withValue(resolutionBudget) {
+                            await SeriesSourceSticky.resolveIfCurrent(choice) {
+                                await SeriesSourceSticky.$resolvingChoice.withValue(choice) {
+                                    await SeriesSourceSticky.$rejectedStreams.withValue(rejectedStreams) {
+                                        await AppleEpisodeResolverAdmission.resolve(resolverRoute)
+                                    }
                                 }
                             }
                         }
@@ -7703,7 +7751,7 @@ struct PlayerScreen: View {
                     resolved = nil
                 }
             }
-            let resultIsCurrent = !Task.isCancelled && !playbackExited
+            let resultIsCurrent = sourceOwner.isCurrent && !playbackExited
                 && episodeGeneration == episodeSwitchGeneration
                 && mediaGeneration == resumeRetryGeneration
                 && SeriesSourceSticky.admits(choice)
@@ -7801,7 +7849,7 @@ struct PlayerScreen: View {
             // re-mints the session token, and the normal first-frame hook opens the new episode's scrobble.
             // The player command is the transaction boundary. Source state and engine attribution move only
             // after that command returns an exact active token inside switchStream.
-            guard !playbackExited,
+            guard sourceOwner.isCurrent, !playbackExited,
                   SeriesSourceSticky.admits(choice),
                   episodeGeneration == episodeSwitchGeneration,
                   mediaGeneration == resumeRetryGeneration,
@@ -7823,6 +7871,12 @@ struct PlayerScreen: View {
                 expectedPreparedRemuxOwner: expectedPreparedRemuxOwner
             )
             admissionCommandIssued = issued
+            if issued {
+                let fallback = [CoreStreamSourceGroup(id: es.engineAddonBase ?? "prepared",
+                    addon: choice?.addon ?? "", streams: [es.stream])]
+                retainEpisodeSources(sourceReceipt.groups ?? fallback, videoID: es.meta.videoId, owner: sourceOwner)
+                if sourceReceipt.groups == nil { hydrateEpisodeSources(es.meta, owner: sourceOwner) }
+            }
             if issued, resumeAfterLanguageRetry {
                 resumeAfterLanguageRetry = false
                 coordinator.player?.play()
@@ -8257,8 +8311,8 @@ struct PlayerScreen: View {
             }
         }
         // NO GlassEffectContainer here (the old .glassChromeCluster() wrap). Two reasons: (1) the controls
-        // are shape-clipped player accent surfaces with black-only shadows, so there are no glass panes to
-        // merge and the container would only produce the "one continuous blurred slab" over-blur; (2) on OS 26 a
+        // use individually clipped materials, so merging them would only produce a continuous blurred slab;
+        // (2) on OS 26 a
         // GlassEffectContainer renders interactive descendants with its own monochrome/vibrancy treatment,
         // which visually suppressed the volume Slider's ember accent tint (volumeControl lives in this bar).
         // Dropping the container restores the slider's .tint(Theme.Palette.accent) minimum track.
@@ -8314,8 +8368,8 @@ struct PlayerScreen: View {
             Button { Haptics.tap(); viewerToggle(); scheduleHide() } label: {
                 Image(systemName: isPaused ? "play.fill" : "pause.fill")
                     .font(.system(size: 50))
-                    // The inner 84pt accent face is purely visual; the outer 100pt frame keeps the original
-                    // tap target. The player surface clips the accent to the Circle and owns a black-only
+                    // The inner 84pt glass face is purely visual; the outer 100pt frame keeps the original
+                    // tap target. The player surface clips its material to the Circle and owns a black-only
                     // depth shadow, so AppKit cannot add a rectangular button patch around it.
                     .frame(width: 84, height: 84)
                     .playerControlSurface(in: Circle(), prominent: true)
@@ -8367,7 +8421,7 @@ struct PlayerScreen: View {
         } label: {
             Image(systemName: icon).font(.system(size: 30, weight: .semibold))
                 .frame(width: 54, height: 54)
-                // Inner 54pt accent surface; outer 60pt frame retains the existing tap target.
+                // Inner 54pt glass surface; outer 60pt frame retains the existing tap target.
                 .playerControlSurface(in: Circle())
                 .frame(width: 60, height: 60)
                 .contentShape(Circle())
@@ -8864,7 +8918,7 @@ struct PlayerScreen: View {
         Button(action: action) {
             Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
                 .frame(width: 44, height: 44)
-                // The accent stays inside the Circle; this helper is shared by every legacy top-bar
+                // The material stays inside the Circle; this helper is shared by every legacy top-bar
                 // action, including macOS, where an unstyled Button would otherwise paint a square.
                 .playerControlSurface(in: Circle())
         }
@@ -10170,6 +10224,38 @@ struct PlayerScreen: View {
 
     // MARK: - Source switching
 
+    private func retainEpisodeSources(_ groups: [CoreStreamSourceGroup], videoID: String, owner: EpisodeSourceOwner) {
+        guard owner.isCurrent else { return }
+        isolatedEpisodeSources = isolatedEpisodeSourceOwner?.isCurrent == true
+            ? isolatedEpisodeSources.filter { $0.key == curMeta?.videoId } : [:]
+        isolatedEpisodeSources[videoID] = groups
+        isolatedEpisodeSourceOwner = owner
+    }
+
+    /// This task is deliberately separate from episode admission: prepared media issues first. A late
+    /// completion can only enrich the same mounted/pending video and media generation, never another panel.
+    private func hydrateEpisodeSources(_ target: PlaybackMeta, owner: EpisodeSourceOwner) {
+        episodeSourceHydrationTask?.cancel()
+        let generation = UUID()
+        episodeSourceHydrationGeneration = generation
+        let episodeGeneration = episodeSwitchGeneration, mediaGeneration = resumeRetryGeneration
+        let choice = SeriesSourceSticky.snapshot(for: target.libraryId)
+        let deadline = ProcessInfo.processInfo.systemUptime + SourceSettlementPolicy.maximumWait
+        episodeSourceHydrationTask = Task { @MainActor in
+            @MainActor func admitted() -> Bool {
+                owner.isCurrent && !playbackExited && episodeSourceHydrationGeneration == generation
+                    && episodeSwitchGeneration == episodeGeneration && resumeRetryGeneration == mediaGeneration
+                    && (pendingAdvance?.meta ?? curMeta)?.videoId == target.videoId && SeriesSourceSticky.admits(choice)
+            }
+            guard let groups = await EpisodeSourceCollection.collect(seriesID: target.libraryId, videoID: target.videoId,
+                season: target.season, episode: target.episode, title: target.name,
+                providers: owner.providers(seriesID: target.libraryId, videoID: target.videoId), wantedAddon: choice.addon, deadline: deadline,
+                isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
+            // Preserve a prepared winner if alternatives are unavailable; never clear a usable selected row.
+            if !groups.isEmpty { retainEpisodeSources(groups, videoID: target.videoId, owner: owner) }
+        }
+    }
+
     /// Stream groups for the CURRENTLY playing episode / movie. Prefer the per-streamId set so a CW resume
     /// or an episode switch shows THIS episode's sources (not a stale or empty resident set), falling back
     /// to the bare resident groups for movies / before the per-id set has populated. This is what makes the
@@ -10177,6 +10263,9 @@ struct PlayerScreen: View {
     private var currentSourceGroups: [CoreStreamSourceGroup] {
         let target = pendingAdvance?.meta ?? curMeta
         if let meta = target, isEpisodePlaybackContext {
+            if let groups = isolatedEpisodeSources[meta.videoId] {
+                return isolatedEpisodeSourceOwner?.isCurrent == true ? groups : []
+            }
             return core.streamGroups(forStreamId: meta.videoId)
         }
         if let id = target?.videoId {
@@ -10990,7 +11079,7 @@ struct AirPlayRoutePickerButton: View {
         AirPlayPickerRepresentable()
             .frame(width: 44, height: 44)
             // Keep AVRoutePickerView as the native interaction surface, but give its clear wrapper the
-            // same player-owned accent face as sibling controls. The accent is clipped to the Circle;
+            // same player-owned glass face as sibling controls. The material is clipped to the Circle;
             // the route picker behavior and VoiceOver label remain native.
             .playerControlSurface(in: Circle())
             .accessibilityLabel("AirPlay")
