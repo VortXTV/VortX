@@ -71,11 +71,26 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
+internal data class EpisodeSwitchRollbackTarget(val episodeId: String?, val season: Int?)
+
+/** Rollback is anchored to mounted playback, not an unaccepted predecessor's provisional selection. */
+internal fun episodeSwitchRollbackTarget(
+    acceptedEpisodeId: String?,
+    selectedEpisodeId: String?,
+    selectedSeason: Int?,
+    videos: List<Episode>,
+): EpisodeSwitchRollbackTarget = if (acceptedEpisodeId != null) {
+    EpisodeSwitchRollbackTarget(acceptedEpisodeId, videos.firstOrNull { it.id == acceptedEpisodeId }?.season)
+} else {
+    EpisodeSwitchRollbackTarget(selectedEpisodeId, selectedSeason)
+}
+
 internal data class EpisodeSwitchSelectionLease(
     val request: SourceRequestFence.Token,
     val targetEpisodeId: String,
     val previousEpisodeId: String?,
     val previousSeason: Int?,
+    private val restoreAcceptedMetadata: () -> Unit = {},
 ) {
     fun rollbackIfOwned(
         currentRequest: SourceRequestFence.Token?,
@@ -83,6 +98,9 @@ internal data class EpisodeSwitchSelectionLease(
         restore: (episodeId: String?, season: Int?) -> Unit,
     ): Boolean {
         if (currentRequest != request || selectedEpisodeId != targetEpisodeId) return false
+        // commitAccepted can run before host publication fails. Restore its metadata only while this
+        // exact request still owns selection; an older completion must never revert a newer acceptance.
+        restoreAcceptedMetadata()
         restore(previousEpisodeId, previousSeason)
         return true
     }
@@ -1480,8 +1498,12 @@ class DetailViewModel(
         preparedEpisodeSlot.claim(target.id)?.let { claimed ->
             return preparedEpisodeResolution(claimed, target, detail)
         }
-        val previousEpisodeId = _selectedEpisodeId.value
-        val previousSeason = _selectedSeason.value
+        val previousTarget = episodeSwitchRollbackTarget(lastAcceptedEpisodeId, _selectedEpisodeId.value,
+            _selectedSeason.value, detail.videos)
+        val previousSource = lastPlayedSource
+        val previousAcceptedEpisode = lastAcceptedEpisodeId
+        val previousManualEpisode = explicitManualEpisodeId
+        val previousResume = resumeRef
         _selectedEpisodeId.value = target.id
         _selectedSeason.value = target.season
         pendingAutoPick = false
@@ -1492,8 +1514,14 @@ class DetailViewModel(
         val selectionLease = EpisodeSwitchSelectionLease(
             request = request,
             targetEpisodeId = target.id,
-            previousEpisodeId = previousEpisodeId,
-            previousSeason = previousSeason,
+            previousEpisodeId = previousTarget.episodeId,
+            previousSeason = previousTarget.season,
+            restoreAcceptedMetadata = {
+                lastPlayedSource = previousSource
+                lastAcceptedEpisodeId = previousAcceptedEpisode
+                explicitManualEpisodeId = previousManualEpisode
+                resumeRef = previousResume
+            },
         )
         fun restorePreviousTargetIfCurrent() {
             selectionLease.rollbackIfOwned(

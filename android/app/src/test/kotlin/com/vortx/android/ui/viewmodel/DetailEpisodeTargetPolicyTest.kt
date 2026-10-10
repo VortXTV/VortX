@@ -23,6 +23,16 @@ import org.junit.Test
 @OptIn(ExperimentalCoroutinesApi::class)
 class DetailEpisodeTargetPolicyTest {
     @Test
+    fun `episode rollback uses accepted season and has a first-selection fallback without accepting a provisional target`() {
+        val episodes = listOf(Episode("E1", "First", 1, 1), Episode("E2", "Second", 2, 1))
+        assertEquals(EpisodeSwitchRollbackTarget("E1", 1), episodeSwitchRollbackTarget("E1", "E2", 2, episodes))
+        assertEquals(EpisodeSwitchRollbackTarget("E2", 2), episodeSwitchRollbackTarget(null, "E2", 2, episodes))
+        assertEquals(EpisodeSwitchRollbackTarget(null, null), episodeSwitchRollbackTarget(null, null, null, episodes))
+        assertEquals(EpisodeSwitchRollbackTarget("missing-accepted", null),
+            episodeSwitchRollbackTarget("missing-accepted", "E2", 2, episodes))
+    }
+
+    @Test
     fun `route hint chooses its exact actual episode regardless of metadata order or title`() {
         val episodes = listOf(
             Episode("s3e1", "Season premiere", season = 3, episode = 1),

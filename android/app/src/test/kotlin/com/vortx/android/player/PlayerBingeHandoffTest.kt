@@ -3,6 +3,9 @@ package com.vortx.android.player
 import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
+import com.vortx.android.sources.SourceRequestFence
+import com.vortx.android.ui.viewmodel.EpisodeSwitchSelectionLease
+import com.vortx.android.ui.viewmodel.episodeSwitchRollbackTarget
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -12,6 +15,167 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PlayerBingeHandoffTest {
+    @Test fun `prepublication episode failure restores owned accepted metadata but acknowledged publication retains it`() {
+        for (publish in listOf(false, true)) {
+            val fence = SourceRequestFence("owner")
+            val request = fence.begin("owner", "E3")
+            val oldSource = StreamSource("old", "Fixture", "E1")
+            val nextSource = oldSource.copy(id = "next", title = "E3")
+            var source = oldSource
+            var acceptedId = "E1"
+            var manualId = "E1"
+            var resume: String? = "E1-resume"
+            var selected = "E3"
+            var season: Int? = 3
+            var restores = 0
+            val selection = EpisodeSwitchSelectionLease(request, "E3", "E1", 1, restoreAcceptedMetadata = {
+                source = oldSource; acceptedId = "E1"; manualId = "E1"; resume = "E1-resume"; restores++
+            })
+            var incomingCloses = 0
+            var outgoingCloses = 0
+            var history = 0
+            val outgoing = Playable("https://fixture.invalid/e1", "E1", startPositionMs = 900,
+                playbackLease = AutoCloseable { outgoingCloses++ })
+            var mounted = outgoing
+            val incoming = Playable("https://fixture.invalid/e3", "E3",
+                playbackLease = AutoCloseable { incomingCloses++ })
+            val resolution = PlayerSourceSwitchResolution(incoming, commitGate = PlayerSourceSwitchCommitGate(),
+                commitAuthorityIsCurrent = { fence.currentToken() === request },
+                commitAccepted = { source = nextSource; acceptedId = "E3"; manualId = "E3"; resume = null },
+                commitRejected = {
+                    selection.rollbackIfOwned(fence.currentToken(), selected) { id, value ->
+                        selected = requireNotNull(id); season = value; fence.begin("owner", selected)
+                    }
+                })
+            val failure = IllegalStateException("host notification failure")
+            try {
+                resolution.commitIfCurrent({ true }) { acknowledge ->
+                    if (publish) { mounted = incoming; acknowledge(); history++ }
+                    throw failure
+                }
+                fail("The host exception must propagate")
+            } catch (actual: IllegalStateException) { assertSame(failure, actual) }
+            resolution.discard()
+            assertEquals(if (publish) nextSource else oldSource, source)
+            assertEquals(if (publish) "E3" else "E1", acceptedId)
+            assertEquals(if (publish) "E3" else "E1", manualId)
+            assertEquals(if (publish) null else "E1-resume", resume)
+            assertEquals(if (publish) "E3" else "E1", selected)
+            assertEquals(if (publish) 3 else 1, season)
+            assertEquals(if (publish) 0 else 1, restores)
+            assertEquals(if (publish) 1 else 0, history)
+            assertEquals(0, outgoingCloses)
+            assertSame(if (publish) incoming else outgoing, mounted)
+            assertEquals(if (publish) 0 else 1, incomingCloses)
+            if (publish) mounted.playbackLease?.close()
+            outgoing.playbackLease?.close()
+            assertEquals(1, incomingCloses)
+            assertEquals(1, outgoingCloses)
+        }
+    }
+
+    @Test fun `failed episode override restores mounted baseline and accepted override survives late predecessor`() = runBlocking {
+        for (acceptE3 in listOf(false, true)) {
+            val episodes = listOf(Episode("E1", "E1", 1, 1), Episode("E2", "E2", 2, 1), Episode("E3", "E3", 3, 1))
+            val coordinator = PlayerSourceSwitchCoordinator()
+            val outer = coordinator.replaceOuterSession()
+            val fence = SourceRequestFence("owner")
+            fence.begin("owner", "E1")
+            var selected = "E1"
+            var season: Int? = 1
+            var acceptedId = "E1"
+            var menuTarget = "E1"
+            var staleCloses = 0
+            var outgoingCloses = 0
+            var acceptedCloses = 0
+            val history = mutableListOf<String>()
+            val outgoing = Playable("https://fixture.invalid/e1", "E1", startPositionMs = 900,
+                playbackLease = AutoCloseable { outgoingCloses++ })
+            var host = PlayerSourceSwitchState(outer, outgoing, null)
+            fun stage(target: Episode): EpisodeSwitchSelectionLease {
+                val baseline = episodeSwitchRollbackTarget(acceptedId, selected, season, episodes)
+                selected = target.id; season = target.season; menuTarget = target.id
+                return EpisodeSwitchSelectionLease(fence.begin("owner", target.id), target.id, baseline.episodeId, baseline.season)
+            }
+            fun rollback(lease: EpisodeSwitchSelectionLease) {
+                lease.rollbackIfOwned(fence.currentToken(), selected) { restored, restoredSeason ->
+                    selected = requireNotNull(restored); season = restoredSeason; menuTarget = selected
+                    fence.begin("owner", selected)
+                }
+            }
+            val e2Lease = stage(episodes[1])
+            host = beginPlayerEpisodeSwitch(host, episodes[1], requireNotNull(coordinator.beginRequest(outer)), automatic = true)
+            val pendingE2 = requireNotNull(host.pendingEpisodeSwitch)
+            val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+            val oldJob = launch {
+                resolveAndApplyPlayerEpisodeSwitch(coordinator, pendingE2, resolver = {
+                    withContext(NonCancellable) { entered.complete(Unit); release.await() }
+                    Result.success(PlayerSourceSwitchResolution(
+                        Playable("https://fixture.invalid/e2", "E2", playbackLease = AutoCloseable { staleCloses++ }),
+                        commitGate = PlayerSourceSwitchCommitGate(), commitAuthorityIsCurrent = { true },
+                        commitAccepted = { acceptedId = "E2" }, commitRejected = { rollback(e2Lease) }))
+                }, currentState = { host }, publishState = { value, acknowledge -> host = value; acknowledge(); history += value.playable.title })
+            }
+            entered.await()
+            val e3Lease = stage(episodes[2])
+            host = beginPlayerEpisodeSwitch(host, episodes[2], requireNotNull(coordinator.beginRequest(outer)))
+            oldJob.cancel()
+            assertFalse(oldJob.isCompleted)
+            resolveAndApplyPlayerEpisodeSwitch(coordinator, requireNotNull(host.pendingEpisodeSwitch), resolver = {
+                if (!acceptE3) {
+                    rollback(e3Lease)
+                    Result.failure(IllegalStateException("E3 unavailable"))
+                } else Result.success(PlayerSourceSwitchResolution(
+                    Playable("https://fixture.invalid/e3", "E3", startPositionMs = 999,
+                        playbackLease = AutoCloseable { acceptedCloses++ }),
+                    resolvedSource = StreamSource("e3", "Fixture", "E3", url = "https://fixture.invalid/e3"),
+                    commitGate = PlayerSourceSwitchCommitGate(), commitAuthorityIsCurrent = { true },
+                    commitAccepted = { acceptedId = "E3" }, commitRejected = { rollback(e3Lease) }))
+            }, currentState = { host }, publishState = { value, acknowledge ->
+                val previous = host
+                host = value; acknowledge()
+                if (value.revision != previous.revision) {
+                    history += value.playable.title
+                    previous.playable.playbackLease?.close()
+                }
+            })
+            release.complete(Unit); oldJob.join()
+            val expectedId = if (acceptE3) "E3" else "E1"
+            assertEquals(expectedId, selected)
+            assertEquals(if (acceptE3) 3 else 1, season)
+            assertEquals(expectedId, acceptedId)
+            assertEquals(expectedId, menuTarget)
+            assertEquals(expectedId, host.playable.title)
+            assertEquals(if (acceptE3) 0L else 900L, host.playable.startPositionMs)
+            assertEquals(if (acceptE3) 1L else 0L, host.revision)
+            assertEquals(if (acceptE3) listOf("E3") else emptyList<String>(), history)
+            assertEquals(if (acceptE3) 1 else 0, outgoingCloses)
+            assertEquals(1, staleCloses)
+            assertFalse(fence.currentToken() === e2Lease.request)
+            if (!acceptE3) {
+                assertSame(outgoing, host.playable)
+                assertEquals(episodes[2], host.failedEpisode) // Exact retry remains E3, not the rollback baseline.
+                val source = StreamSource("e1-other", "Fixture", "E1 source", url = "https://fixture.invalid/e1-other")
+                host = requestPlayerSourceSwitch(host, source, coordinator)
+                var resolverEpisode: String? = null
+                resolveAndApplyPlayerSourceSwitch(coordinator, requireNotNull(host.pendingSwitch), resolver = {
+                    resolverEpisode = selected
+                    Result.success(PlayerSourceSwitchResolution(Playable(source.url!!, selected),
+                        commitGate = PlayerSourceSwitchCommitGate(), commitAuthorityIsCurrent = { true }, commitAccepted = {}))
+                }, currentState = { host }, latestPositionMs = { 900 }, publishState = { value, acknowledge ->
+                    val previous = host; host = value; acknowledge(); previous.playable.playbackLease?.close()
+                })
+                assertEquals("E1", resolverEpisode)
+                assertEquals("E1", host.playable.title)
+                assertEquals(900L, host.playable.startPositionMs)
+                assertTrue(history.isEmpty())
+            }
+            host.playable.playbackLease?.close()
+            assertEquals(1, outgoingCloses)
+            assertEquals(if (acceptE3) 1 else 0, acceptedCloses)
+        }
+    }
+
     @Test fun `source pick cannot supersede pending cold episode before noncooperative cancellation retires its context`() = runBlocking {
         val coordinator = PlayerSourceSwitchCoordinator()
         val outer = coordinator.replaceOuterSession()
