@@ -9,6 +9,12 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.LinkedBlockingQueue
+import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -127,6 +133,75 @@ class NativeNzbSourcesTest {
         playbackResolver = NativePlaybackResolver { stream, _ -> Playable(stream.nzbUrl ?: stream.url!!, "Fixture") },
         nzbSourceAggregator = source.aggregator(), sessionProvider = session,
     )
+
+    private class QueuedDispatcher : CoroutineDispatcher() {
+        private val queue = LinkedBlockingQueue<Runnable>()
+        override fun dispatch(context: CoroutineContext, block: Runnable) { queue.put(block) }
+        fun next(): Runnable = checkNotNull(queue.poll(3, TimeUnit.SECONDS)) { "Expected queued continuation" }
+    }
+
+    @Test fun cancellationAtIOReturnDiscardsUndeliveredLeaseButNeverDeliveredOrAdoptedLease() = runBlocking {
+        for (path in listOf("prepared", "source", "direct", "magnet")) for (cancelAtReturn in listOf(true, false)) {
+            open().use { session ->
+                val produced = AtomicInteger(); val closes = AtomicInteger()
+                val repo = NativeCatalogRepository(playbackResolver = NativePlaybackResolver { _, _ ->
+                    produced.incrementAndGet()
+                    Playable("https://fixture.invalid/prepared", "Prepared", playbackLease = AutoCloseable { closes.incrementAndGet() })
+                }, sessionProvider = { session })
+                val episode = Episode("tt123456:1:2", "Second", 1, 2)
+                val prepared = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", episode))
+                prepared.updates().collect {}
+                val foreground = repo.streams(MediaType.SERIES, "tt123456", episode.id).getOrThrow().first().streams.first()
+                val dispatcher = QueuedDispatcher(); val parent = Job()
+                var delivered: Playable? = null
+                val pending = CoroutineScope(parent + dispatcher).launch {
+                    delivered = when (path) {
+                        "prepared" -> prepared.resolve(prepared.groups.first().streams.first())
+                        "source" -> repo.resolve(foreground, episode)
+                        "direct" -> repo.resolveDirectLink("https://fixture.invalid/direct", "Direct")
+                        else -> repo.resolveMagnet("a".repeat(40), "Magnet")
+                    }.getOrThrow()
+                }
+                dispatcher.next().run()
+                val returning = dispatcher.next()
+                assertEquals(1, produced.get())
+                if (cancelAtReturn) pending.cancel()
+                returning.run()
+                assertTrue(pending.isCompleted)
+                if (cancelAtReturn) {
+                    assertTrue(pending.isCancelled); assertNull(delivered)
+                    prepared.close(); prepared.close()
+                    assertEquals("$path undelivered return must release once", 1, closes.get())
+                } else {
+                    assertNotNull(delivered)
+                    if (path == "prepared") assertNotNull(prepared.adopt())
+                    prepared.close(); pending.cancel()
+                    assertEquals("$path delivered lease belongs to its caller/player", 0, closes.get())
+                    delivered!!.playbackLease!!.close()
+                    assertEquals(1, closes.get())
+                }
+                parent.cancel()
+            }
+        }
+    }
+
+    @Test fun cancellationBeforeResolverReturnsClosesLateLeaseOnceAcrossBothCleanupBoundaries() = runBlocking {
+        open().use { session ->
+            val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+            val closes = AtomicInteger()
+            val repo = NativeCatalogRepository(playbackResolver = NativePlaybackResolver { _, _ ->
+                withContext(NonCancellable) { entered.complete(Unit); release.await() }
+                Playable("https://fixture.invalid/prepared", "Prepared", playbackLease = AutoCloseable { closes.incrementAndGet() })
+            }, sessionProvider = { session })
+            val prepared = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", Episode("tt123456:1:2", "Second", 1, 2)))
+            prepared.updates().collect {}
+            val pending = launch { prepared.resolve(prepared.groups.first().streams.first()) }
+            withTimeout(2_000) { entered.await() }
+            pending.cancel(); release.complete(Unit); withTimeout(2_000) { pending.join() }
+            prepared.close()
+            assertEquals(1, closes.get())
+        }
+    }
 
     @Test fun preparedSourcesDoNotRevokeForegroundAndAdoptWithoutProviderRefetch() = runBlocking {
         val transport = Transport()

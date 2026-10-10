@@ -125,7 +125,7 @@ internal class NativeCatalogRepository(
 
         override fun updates(): Flow<StreamLoadUpdate> = sourceUpdates(this)
 
-        override suspend fun resolve(source: StreamSource): Result<Playable> = attempt {
+        override suspend fun resolve(source: StreamSource): Result<Playable> = resolveAttempt {
             check(isCurrent()) { "Native preparation expired" }
             val binding = synchronized(this@NativeCatalogRepository) { bindings[source.nativePlaybackToken] }
             check(binding != null && binding.owner == read.owner && binding.context.videoId == episodeId) { "Native prepared source expired" }
@@ -200,6 +200,17 @@ internal class NativeCatalogRepository(
         try { Result.success(action()) } catch (error: CancellationException) { throw error }
         catch (error: Exception) { Result.failure(error) }
         catch (_: LinkageError) { Result.failure(IllegalStateException("Native artifact is missing or incompatible")) }
+    }
+    /** The IO hop itself can reject a successful return through prompt cancellation. Own the
+     * produced lease across that hop; resolveOwned still owns failures before it returns. */
+    private suspend fun resolveAttempt(action: suspend () -> Playable): Result<Playable> {
+        var produced: Playable? = null
+        return try {
+            attempt { action().also { produced = it } }
+        } catch (failure: Throwable) {
+            runCatching { produced?.playbackLease?.close() }
+            throw failure
+        }
     }
     private fun unsupported(capability: String): Nothing = throw UnsupportedOperationException("Native $capability is not enabled in this build")
     private fun session() = sessionProvider()
@@ -1026,7 +1037,7 @@ internal class NativeCatalogRepository(
             }
         } }
     } }.getOrDefault(false)
-    override suspend fun resolve(source: StreamSource, episode: Episode?): Result<Playable> = attempt {
+    override suspend fun resolve(source: StreamSource, episode: Episode?): Result<Playable> = resolveAttempt {
         val session = session(); val read = session.read()
         val context = synchronized(this) { foregroundSources }
         val binding = synchronized(this) { context?.bindings?.get(source.nativePlaybackToken) }
@@ -1075,14 +1086,14 @@ internal class NativeCatalogRepository(
             }
         } catch (error: Throwable) { runCatching { playable.playbackLease?.close() }; throw error }
     }
-    override suspend fun resolveDirectLink(url: String, title: String): Result<Playable> = attempt {
+    override suspend fun resolveDirectLink(url: String, title: String): Result<Playable> = resolveAttempt {
         val session = session(); val read = session.read()
         check(!parental(read)) { "Uncertified direct links are blocked by parental settings" }
         val source = StreamSource(id = url, addon = "Direct link", title = title, url = url)
         requireNotNull(nativeDirectPlayable(source)) { "Only HTTP(S) direct links are supported" }
         resolveOwned(session, read, source, null)
     }
-    override suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int?): Result<Playable> = attempt {
+    override suspend fun resolveMagnet(infoHash: String, title: String, fileIdx: Int?): Result<Playable> = resolveAttempt {
         val session = session(); val read = session.read()
         check(!parental(read)) { "Uncertified magnets are blocked by parental settings" }
         require(Regex("[a-fA-F0-9]{40}").matches(infoHash) && (fileIdx == null || fileIdx >= 0))
