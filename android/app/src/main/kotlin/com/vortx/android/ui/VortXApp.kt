@@ -8,7 +8,9 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -17,14 +19,22 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -52,6 +62,9 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
@@ -103,7 +116,6 @@ import com.vortx.android.ui.prefs.AppearancePrefs
 import com.vortx.android.ui.prefs.HomeDiscoverPreferences
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.prefs.TabSlot
-import com.vortx.android.ui.prefs.isVisible
 import com.vortx.android.ui.screens.AccountScreen
 import com.vortx.android.ui.screens.AddonPairingScreen
 import com.vortx.android.ui.screens.AddonStoreScreen
@@ -208,10 +220,11 @@ private enum class Tab(
     LIVE("Live TV", VortXIcons.live, TabSlot.LIVE),
     LIBRARY("Library", VortXIcons.library, TabSlot.LIBRARY),
     SEARCH("Search", VortXIcons.search, TabSlot.SEARCH),
+    ADDONS("Add-ons", VortXIcons.addon, TabSlot.ADDONS),
     SETTINGS("Settings", VortXIcons.settings, TabSlot.SETTINGS),
 }
 
-/// The whole app: a five-tab shell matching the iOS and Apple TV structure, with a detail overlay.
+/// The touch app: adaptive tab chrome around one persistent content and detail route owner.
 /// [repo] defaults to the offline preview source; the real stremio-core engine is injected here (from
 /// `VortXApplication`), with no change to any screen; every screen consumes a ViewModel, and every
 /// ViewModel depends only on [CatalogRepository] (or, for the account screen, [AuthRepository]).
@@ -279,7 +292,7 @@ fun VortXApp(
             // WHY audit R02: save enum identity, not ordinal, so shell selection survives process death safely.
             var savedTabName by rememberSaveable { mutableStateOf(Tab.HOME.name) }
             var savedHomeModeName by rememberSaveable { mutableStateOf(CinemaHomeMode.FEATURED.name) }
-            val requestedTab = Tab.entries.firstOrNull { it.name == savedTabName } ?: Tab.HOME
+            val requestedTab = Tab.entries.first { it.slot == cinemaStoredTabSlot(savedTabName) }
             val requestedHomeMode = CinemaHomeMode.entries.firstOrNull { it.name == savedHomeModeName } ?: CinemaHomeMode.FEATURED
             // SD-2: the combined Discover+Search surface folds Search into Discover, so the standalone
             // Search tab is dropped from the bar while the pref is on (Apple `visibleTabs`).
@@ -297,7 +310,7 @@ fun VortXApp(
                     val nextHomeMerge = homeDiscoverPrefs.mergeHomeDiscover
                     if (nextHomeMerge != mergeHomeDiscover) {
                         val currentRoute = cinemaTabRoute(
-                            Tab.entries.firstOrNull { it.name == savedTabName }?.slot ?: TabSlot.HOME,
+                            cinemaStoredTabSlot(savedTabName),
                             CinemaHomeMode.entries.firstOrNull { it.name == savedHomeModeName } ?: CinemaHomeMode.FEATURED,
                             tabBarPrefs.state.value, mergeHomeDiscover, mergeDiscoverSearch,
                         )
@@ -413,11 +426,11 @@ fun VortXApp(
         var showGallery by remember { mutableStateOf(false) }
         var showAccount by remember { mutableStateOf(false) }
         var showVortxAccount by remember { mutableStateOf(false) }
-        var showAddons by remember { mutableStateOf(false) }
+        var showAddons by rememberSaveable { mutableStateOf(false) }
         // Nested under Add-ons: the community store browser and the Install-by-QR pairing sheet. Checked
         // BEFORE the showAddons overlay so they render on top, and cleared on Back to reveal Add-ons.
-        var showAddonStore by remember { mutableStateOf(false) }
-        var showAddonPairing by remember { mutableStateOf(false) }
+        var showAddonStore by rememberSaveable { mutableStateOf(false) }
+        var showAddonPairing by rememberSaveable { mutableStateOf(false) }
         var showIntegrations by remember { mutableStateOf(false) }
         var showMediaServers by remember { mutableStateOf(false) }
         var showDownloads by remember { mutableStateOf(false) }
@@ -1097,7 +1110,7 @@ fun VortXApp(
 
         if (showAddons) {
             BackHandler { showAddons = false }
-            val addonsVm: AddonsViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
+            val addonsVm: AddonsViewModel = viewModel(key = "addons-content", factory = StremioXViewModelFactory(repo = repo))
             AddonsScreen(
                 viewModel = addonsVm,
                 onBack = { showAddons = false },
@@ -1472,51 +1485,60 @@ fun VortXApp(
         BackHandler(enabled = mergeHomeDiscover && tab == Tab.HOME && homeMode == CinemaHomeMode.BROWSE) {
             savedHomeModeName = CinemaHomeMode.FEATURED.name
         }
+        BackHandler(enabled = tab == Tab.ADDONS) { savedTabName = Tab.HOME.name }
+        val selectTab: (Tab) -> Unit = { destination ->
+            val selection = cinemaNavigationSelection(tab.slot, destination.slot)
+            if (selection.popToRoot) {
+                openDetail(null)
+                when (destination) {
+                    Tab.SEARCH -> searchReselect++
+                    Tab.DISCOVER -> discoverReselect++
+                    Tab.HOME -> if (homeMode == CinemaHomeMode.BROWSE) discoverReselect++
+                    else -> Unit
+                }
+            } else {
+                savedTabName = destination.name
+            }
+        }
+        val switchProfile: () -> Unit = {
+            if (profileStore != null && profileStore.profiles.size > 1) showWhosWatching = true
+            else showProfiles = true
+        }
+        // Resize changes only chrome. The Scaffold/content call remains at this same composition path,
+        // preserving screen state, ViewModel keys and effect subscriptions in either window layout.
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+        val navigation = cinemaWindowNavigation(maxWidth.value, visibleSlots)
         Scaffold(
             topBar = {
-                // The top bar reads as VortX glass: the stock opaque Material3 container is made transparent
-                // and the flush glass strip renders behind it. Title / items / behavior are unchanged.
-                TopAppBar(
-                    title = {
-                        if (tab == Tab.HOME) Wordmark() else Text(tab.label, style = VortXTheme.type.screenTitle)
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = Color.Transparent,
-                        scrolledContainerColor = Color.Transparent,
-                    ),
-                    modifier = Modifier.vortxGlassStrip(),
-                )
+                if (navigation.topNavigation) {
+                    CinemaWideNavigation(
+                        tabs = visibleTabs,
+                        selected = tab,
+                        onSelect = selectTab,
+                        onSwitchProfile = switchProfile,
+                    )
+                } else if (navigation.usesCompactTitleBar(tab.slot)) {
+                    TopAppBar(
+                        title = {
+                            if (tab == Tab.HOME) Wordmark()
+                            else Text(tab.label, style = VortXTheme.type.screenTitle)
+                        },
+                        actions = {
+                            IconButton(onClick = switchProfile, modifier = Modifier.size(48.dp)) {
+                                Icon(VortXIcons.profiles, contentDescription = "Switch Profile", tint = VortXTheme.colors.textPrimary)
+                            }
+                        },
+                        colors = TopAppBarDefaults.topAppBarColors(
+                            containerColor = Color.Transparent,
+                            scrolledContainerColor = Color.Transparent,
+                        ),
+                        modifier = Modifier.vortxGlassStrip(),
+                    )
+                }
             },
             bottomBar = {
-                // The bottom nav bar reads as VortX glass too: transparent M3 container plus zero tonal
-                // overlay, with the flush glass strip behind. Every tab item stays exactly as it was.
-                NavigationBar(
-                    containerColor = Color.Transparent,
-                    tonalElevation = 0.dp,
-                    modifier = Modifier.vortxGlassStrip(),
-                ) {
-                    visibleTabs.forEach { t ->
-                        NavigationBarItem(
-                            selected = t == tab,
-                            // SD-6: re-tapping the ALREADY-active Search/Discover tab pops any open detail
-                            // (back to root) and scrolls that screen to the top (Apple's active-tab re-tap).
-                            onClick = {
-                                if (t == tab) {
-                                    openDetail(null)
-                                    when (t) {
-                                        Tab.SEARCH -> searchReselect++
-                                        Tab.DISCOVER -> discoverReselect++
-                                        Tab.HOME -> if (homeMode == CinemaHomeMode.BROWSE) discoverReselect++
-                                        else -> Unit
-                                    }
-                                } else {
-                                    savedTabName = t.name
-                                }
-                            },
-                            icon = { Icon(t.icon, contentDescription = t.label) },
-                            label = { Text(t.label) },
-                        )
-                    }
+                if (!navigation.topNavigation) {
+                    CinemaCompactNavigation(navigation = navigation, selected = tab, onSelect = selectTab)
                 }
             },
             // OFFLINE SURFACE (audit 12 cross-cut): the phone shell had no offline chip; the TV shell did
@@ -1562,8 +1584,10 @@ fun VortXApp(
                                 .padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
                             horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
                         ) {
-                            Chip("Featured", homeMode == CinemaHomeMode.FEATURED, onClick = { savedHomeModeName = CinemaHomeMode.FEATURED.name })
-                            Chip("Discover", homeMode == CinemaHomeMode.BROWSE, onClick = { savedHomeModeName = CinemaHomeMode.BROWSE.name })
+                            Chip("Featured", homeMode == CinemaHomeMode.FEATURED,
+                                onClick = { savedHomeModeName = CinemaHomeMode.FEATURED.name }, modifier = Modifier.heightIn(min = 48.dp))
+                            Chip("Discover", homeMode == CinemaHomeMode.BROWSE,
+                                onClick = { savedHomeModeName = CinemaHomeMode.BROWSE.name }, modifier = Modifier.heightIn(min = 48.dp))
                         }
                     }
                     if (mergeHomeDiscover && homeMode == CinemaHomeMode.BROWSE) {
@@ -1622,6 +1646,16 @@ fun VortXApp(
                         )
                     },
                 )
+                Tab.ADDONS -> AddonsScreen(
+                    // The direct destination and legacy Settings overlay share one content owner.
+                    viewModel = viewModel<AddonsViewModel>(key = "addons-content", factory = factory),
+                    onBack = { savedTabName = Tab.HOME.name },
+                    // This screen owns its compact toolbar. Consume shell padding so that toolbar
+                    // never reapplies the status inset, including under persistent wide navigation.
+                    modifier = content.consumeWindowInsets(padding),
+                    onDiscover = { showAddonStore = true },
+                    onInstallByQr = { showAddonPairing = true },
+                )
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,
                     // The VortX account row: live signed-in summary straight off the sync manager's
@@ -1676,7 +1710,134 @@ fun VortXApp(
                 )
             }
         }
+        }
     }
+    }
+}
+
+@Composable
+private fun CinemaWideNavigation(
+    tabs: List<Tab>,
+    selected: Tab,
+    onSelect: (Tab) -> Unit,
+    onSwitchProfile: () -> Unit,
+) {
+    val tabsState = rememberLazyListState()
+    LaunchedEffect(selected, tabs) {
+        val index = tabs.indexOf(selected)
+        if (index >= 0) tabsState.scrollToItem(index)
+    }
+    Box(
+        modifier = Modifier.fillMaxWidth().vortxGlassStrip().statusBarsPadding(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            modifier = Modifier.widthIn(max = 1_200.dp).fillMaxWidth()
+                .padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+        ) {
+            Wordmark()
+            LazyRow(
+                state = tabsState,
+                modifier = Modifier.weight(1f).selectableGroup(),
+                horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                items(tabs, key = { it.name }) { destination ->
+                    Chip(
+                        label = destination.label,
+                        selected = destination == selected,
+                        onClick = { onSelect(destination) },
+                        leadingIcon = destination.icon,
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    )
+                }
+            }
+            IconButton(onClick = onSwitchProfile, modifier = Modifier.size(48.dp)) {
+                Icon(VortXIcons.profiles, contentDescription = "Switch Profile", tint = VortXTheme.colors.textPrimary)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CinemaCompactNavigation(
+    navigation: CinemaWindowNavigation,
+    selected: Tab,
+    onSelect: (Tab) -> Unit,
+) {
+    var moreExpanded by remember { mutableStateOf(false) }
+    val colors = VortXTheme.colors
+    val itemColors = NavigationBarItemDefaults.colors(
+        selectedIconColor = colors.accentBright,
+        selectedTextColor = colors.accentBright,
+        indicatorColor = colors.accentSoft,
+        unselectedIconColor = colors.textSecondary,
+        unselectedTextColor = colors.textSecondary,
+    )
+    NavigationBar(
+        containerColor = Color.Transparent,
+        tonalElevation = 0.dp,
+        modifier = Modifier.vortxGlassStrip(),
+    ) {
+        navigation.primary.forEach { slot ->
+            val destination = Tab.entries.first { it.slot == slot }
+            key(destination.name) {
+                NavigationBarItem(
+                    selected = destination == selected,
+                    onClick = { onSelect(destination) },
+                    icon = { Icon(destination.icon, contentDescription = null) },
+                    label = { Text(destination.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    colors = itemColors,
+                    modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = destination.label },
+                )
+            }
+        }
+        if (navigation.overflow.isNotEmpty()) {
+            val overflowSelected = navigation.selectsOverflow(selected.slot)
+            key("navigation-more") {
+                NavigationBarItem(
+                    selected = overflowSelected,
+                    onClick = { moreExpanded = true },
+                    icon = {
+                        Box {
+                            Icon(if (overflowSelected) selected.icon else VortXIcons.moreHoriz, contentDescription = null)
+                            DropdownMenu(
+                                expanded = moreExpanded,
+                                onDismissRequest = { moreExpanded = false },
+                                containerColor = Color.Transparent,
+                                modifier = Modifier.heightIn(max = 480.dp).vortxGlassPanel(RoundedCornerShape(20.dp)),
+                            ) {
+                                navigation.overflow.forEach { slot ->
+                                    val destination = Tab.entries.first { it.slot == slot }
+                                    key(destination.name) {
+                                        DropdownMenuItem(
+                                            text = { Text(destination.label, color = colors.textPrimary) },
+                                            leadingIcon = {
+                                                Icon(destination.icon, contentDescription = null,
+                                                    tint = if (destination == selected) colors.accentBright else colors.textSecondary)
+                                            },
+                                            trailingIcon = {
+                                                if (destination == selected) Icon(VortXIcons.checkmarkCircle, contentDescription = "Selected", tint = colors.accentBright)
+                                            },
+                                            onClick = { moreExpanded = false; onSelect(destination) },
+                                            modifier = Modifier.heightIn(min = 48.dp),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    label = { Text(if (overflowSelected) selected.label else "More", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    colors = itemColors,
+                    modifier = Modifier.heightIn(min = 48.dp).semantics {
+                        contentDescription = "More destinations"
+                        stateDescription = if (overflowSelected) selected.label else "Opens navigation menu"
+                    },
+                )
+            }
+        }
     }
 }
 
