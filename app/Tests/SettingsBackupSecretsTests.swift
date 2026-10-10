@@ -73,6 +73,31 @@ struct SettingsBackupSecretsTests {
     static var leakedTraktKey: String { Keychain.fallbackKeyPrefix + "vortx.trakt.accessToken" }
     // Non-secret Keychain invalidation state is device-local and must not move to another device.
     static var invalidationKey: String { Keychain.invalidationKeyPrefix + "vortx.sync.session.v1" }
+    // Independent source-derived cache names for the bounded update and Collections cache fix.
+    // Production key builders append the region. Exercise both common source regions to guard the dynamic tail.
+    static let derivedCacheExactKeys = [
+        "stremiox.update.lastChecked",
+        "stremiox.update.cachedRelease",
+        "vortx.collections.decadeCovers",
+        "vortx.collections.decadeCoversAt",
+        "vortx.collections.decadeCoversFailedAt",
+        "vortx.collections.globalProviders.v2",
+        "vortx.collections.globalProvidersAt.v2",
+    ]
+    static let derivedRegionCachePrefixes = [
+        "vortx.collections.genreBackdrops.",
+        "vortx.collections.genreBackdropsAt.",
+        "vortx.collections.discoverBackdrops.",
+        "vortx.collections.discoverBackdropsAt.",
+        "vortx.collections.providers.v2.",
+        "vortx.collections.providersAt.v2.",
+    ]
+    static let derivedCacheRegions = ["GB", "US"]
+    static var derivedCacheKeys: [String] {
+        derivedCacheExactKeys + derivedRegionCachePrefixes.flatMap { prefix in
+            derivedCacheRegions.map { prefix + $0 }
+        }
+    }
 
     /// Raw decode that does NOT go through `decodeDomain`'s filter, so a test can see what was actually
     /// ENCODED rather than what the read side is willing to hand back. Without this, the read-side filter
@@ -93,6 +118,7 @@ struct SettingsBackupSecretsTests {
         return flat.contains(secretToken) || flat.contains(secretDataKey)
     }
 
+    @MainActor
     static func main() {
         let prefix = "tv.vortx.tests.settings-backup."
         guard let expected = ProcessInfo.processInfo.environment["VORTX_SETTINGS_TEST_BUNDLE_ID"],
@@ -109,7 +135,7 @@ struct SettingsBackupSecretsTests {
             exit(2)
         }
 
-        let seeded: [String: Any] = [
+        var seeded: [String: Any] = [
             leakedKey: sessionBlob,
             leakedTraktKey: "SECRET-TOKEN-trakt-zzz",
             invalidationKey: true,
@@ -119,12 +145,18 @@ struct SettingsBackupSecretsTests {
             "vortx.downloads.maxConcurrent": 5,
             "vortx.addons.tmdbMetaInstalled": true,
             "vortx.addons.userPolicy": "preserved",
+            "vortx.collections.refreshCadence": "twiceDaily",
+            "vortx.collections.selectedProviders": "8,12",
+            "vortx.collections.providerOrder": [12, 8],
+            "vortx.collections.userPolicy": "local-collection-policy",
+            "stremiox.update.dismissedVersion": "v0.5.0-beta.4",
             "stremiox.diskCacheBytes": 12_345,
             "vortx.pgsSubtitleOCR": false,
             "vortx.sync.lastSyncedVersion.acct_1": 42,
             "vortx.owner.resumeCache.v2.11111111-1111-1111-1111-111111111111": ["tt-a": ["t": 123]],
             "vortx.owner.resumeCache.readdReceipt.v2.11111111-1111-1111-1111-111111111111": ["tt-a": 456],
         ]
+        for key in derivedCacheKeys { seeded[key] = "local-cache:\(key)" }
         UserDefaults.standard.setPersistentDomain(seeded, forName: bundleID)
 
         print("\n=== T1: makeBackup() must not carry the secret (export + push write side) ===")
@@ -140,30 +172,56 @@ struct SettingsBackupSecretsTests {
               backupRaw["stremiox.accentColor"] as? String == "blue")
         check("T1.5 device-local invalidation absent from backup", backupRaw[invalidationKey] == nil)
         check("T1.6 owner resume cache absent from backup", backupRaw.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
+        check("T1.7 derived update and Collections caches absent from export",
+              derivedCacheKeys.allSatisfy { backupRaw[$0] == nil })
+        check("T1.8 collection preferences and update dismissal remain in export",
+              backupRaw["vortx.collections.refreshCadence"] as? String == "twiceDaily"
+                && backupRaw["vortx.collections.selectedProviders"] as? String == "8,12"
+                && backupRaw["vortx.collections.providerOrder"] as? [Int] == [12, 8]
+                && backupRaw["stremiox.update.dismissedVersion"] as? String == "v0.5.0-beta.4"
+                && backupRaw["vortx.collections.userPolicy"] as? String == "local-collection-policy")
 
         print("\n=== T2: decodeDomain() must not APPLY a secret (restore + pull-apply read side) ===")
         // Encode a POISONED blob directly, bypassing the write-side filter. This is an account doc or backup
         // file written by a PRE-FIX build, which is the case that exists in the wild right now.
-        guard let poisoned = try? SettingsBackup.encode(
-            domain: [
+        var poisonedDomain: [String: Any] = [
                 leakedKey: sessionBlob,
                 invalidationKey: true,
                 "vortx.owner.resumeCache.readdReceipt.v2.11111111-1111-1111-1111-111111111111": ["tt-a": 456],
                 "stremiox.accentColor": "red",
                 "vortx.addons.tmdbMetaInstalled": false,
                 "vortx.addons.userPolicy": "peer-policy",
-            ],
+                "vortx.collections.refreshCadence": "daily",
+                "vortx.collections.selectedProviders": "3,8",
+                "vortx.collections.providerOrder": [3, 8],
+                "vortx.collections.userPolicy": "peer-collection-policy",
+                "stremiox.update.dismissedVersion": "v0.5.1",
+            ]
+        for key in derivedCacheKeys { poisonedDomain[key] = "peer-cache:\(key)" }
+        guard let poisoned = try? SettingsBackup.encode(
+            domain: poisonedDomain,
             bundleID: bundleID,
             app: "VortX")
         else { print("  FAIL  T2.0 encode threw"); exit(1) }
         check("T2.0 poisoned blob really does contain the secret (test is honest)",
               rawPayload(poisoned)[leakedKey] != nil)
+        check("T2.0a poisoned blob really contains every derived-cache fixture",
+              derivedCacheKeys.allSatisfy { rawPayload(poisoned)[$0] != nil })
         let decoded = (try? SettingsBackup.decodeDomain(from: poisoned)) ?? [:]
         check("T2.1 secret filtered out on read", decoded[leakedKey] == nil,
               "found: \(String(describing: decoded[leakedKey]))")
         check("T2.2 ordinary pref still applied", decoded["stremiox.accentColor"] as? String == "red")
         check("T2.3 incoming invalidation cannot cross devices", decoded[invalidationKey] == nil)
         check("T2.4 incoming owner resume receipt cannot cross accounts", decoded.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
+        check("T2.5 incoming derived caches are filtered on read",
+              derivedCacheKeys.allSatisfy { decoded[$0] == nil })
+        let poisonedAppliedKeys = SettingsBackup.appliedKeys(from: poisoned)
+        check("T2.6 imported baseline omits derived caches but keeps user choices",
+              Set(derivedCacheKeys).isDisjoint(with: poisonedAppliedKeys)
+                && poisonedAppliedKeys.contains("vortx.collections.refreshCadence")
+                && poisonedAppliedKeys.contains("vortx.collections.selectedProviders")
+                && poisonedAppliedKeys.contains("vortx.collections.providerOrder")
+                && poisonedAppliedKeys.contains("stremiox.update.dismissedVersion"))
 
         print("\n=== T3: mergedSyncBlob() scrubs a secret already in the account doc (self-heal) ===")
         guard let merged = SettingsBackup.mergedSyncBlob(onto: poisoned.base64EncodedString()) else {
@@ -176,6 +234,17 @@ struct SettingsBackupSecretsTests {
         check("T3.3 secret bytes absent from pushed blob", !containsSecret(merged))
         check("T3.4 stale invalidation not carried into pushed blob", mergedRaw[invalidationKey] == nil)
         check("T3.5 stale owner resume state not carried into pushed blob", mergedRaw.keys.allSatisfy { !$0.hasPrefix("vortx.owner.resumeCache.") })
+
+        print("\n=== T3.6: derived caches are removed from merged settings without losing sibling preferences ===")
+        check("T3.6a all derived cache families scrubbed from merged payload",
+              derivedCacheKeys.allSatisfy { mergedRaw[$0] == nil })
+        check("T3.6b local collections and update user choices survive merge",
+              mergedRaw["vortx.collections.refreshCadence"] as? String == "twiceDaily"
+                && mergedRaw["vortx.collections.selectedProviders"] as? String == "8,12"
+                && mergedRaw["vortx.collections.providerOrder"] as? [Int] == [12, 8]
+                && mergedRaw["vortx.collections.userPolicy"] as? String == "local-collection-policy"
+                && mergedRaw["stremiox.update.dismissedVersion"] as? String == "v0.5.0-beta.4"
+                && mergedRaw["vortx.addons.userPolicy"] as? String == "preserved")
 
         print("\n=== T4: device-local download keys (manager item A) ===")
         check("T4.1 queueOrder excluded", !SettingsBackup.isSyncable("vortx.downloads.queueOrder"))
@@ -226,6 +295,35 @@ struct SettingsBackupSecretsTests {
               mergedRaw["vortx.addons.tmdbMetaInstalled"] == nil)
         check("T6.8 merge retains the unrelated local add-on preference",
               mergedRaw["vortx.addons.userPolicy"] as? String == "preserved")
+
+        print("\n=== T8: update and Collections cache keys stay device-local ===")
+        check("T8.1 all source-defined cache keys and region families are classified device-local",
+              derivedCacheKeys.allSatisfy { !SettingsBackup.isSyncable($0) })
+        check("T8.2 refresh cadence, provider choices/order, update dismissal and sibling prefs remain syncable",
+              SettingsBackup.isSyncable("vortx.collections.refreshCadence")
+                && SettingsBackup.isSyncable("vortx.collections.selectedProviders")
+                && SettingsBackup.isSyncable("vortx.collections.providerOrder")
+                && SettingsBackup.isSyncable("stremiox.update.dismissedVersion")
+                && SettingsBackup.isSyncable("vortx.collections.userPolicy")
+                && SettingsBackup.isSyncable("vortx.addons.userPolicy"))
+        let restoredCount: Int?
+        do {
+            restoredCount = try SettingsBackup.restore(from: poisoned)
+        } catch {
+            restoredCount = nil
+        }
+        check("T8.3 actual restore applies the allowed incoming preferences",
+              restoredCount == decoded.count
+                && UserDefaults.standard.string(forKey: "vortx.collections.refreshCadence") == "daily"
+                && UserDefaults.standard.string(forKey: "vortx.collections.selectedProviders") == "3,8"
+                && UserDefaults.standard.array(forKey: "vortx.collections.providerOrder") as? [Int] == [3, 8]
+                && UserDefaults.standard.string(forKey: "stremiox.update.dismissedVersion") == "v0.5.1"
+                && UserDefaults.standard.string(forKey: "vortx.collections.userPolicy") == "peer-collection-policy"
+                && UserDefaults.standard.string(forKey: "vortx.addons.userPolicy") == "peer-policy")
+        check("T8.4 actual restore leaves every device-local cache value untouched",
+              derivedCacheKeys.allSatisfy {
+                  UserDefaults.standard.string(forKey: $0) == "local-cache:\($0)"
+              })
 
         UserDefaults.standard.removePersistentDomain(forName: bundleID)
         check("T7.1 only the owned test defaults domain is retired",

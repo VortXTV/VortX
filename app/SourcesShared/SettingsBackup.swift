@@ -61,6 +61,16 @@ enum SettingsBackup {
                                          // that chose it.
         "vortx.moveSeeding.launchNagDismissedBuild", // acknowledgement of a launch reminder on THIS device;
                                                      // never suppress another device's migration reminder
+        // Update discovery metadata and collection artwork/provider caches are derived, refreshed locally,
+        // and have no cross-device value. Keep user choices such as update dismissal, refresh cadence,
+        // selected providers, and provider order syncable.
+        "stremiox.update.lastChecked",
+        "stremiox.update.cachedRelease",
+        "vortx.collections.decadeCovers",
+        "vortx.collections.decadeCoversAt",
+        "vortx.collections.decadeCoversFailedAt",
+        "vortx.collections.globalProviders.v2",
+        "vortx.collections.globalProvidersAt.v2",
         // DELIBERATELY NOT HERE: "vortx.downloads.autoDeleteWatched". It looks like it belongs with the two
         // above, and it does not. It is a real cross-device POLICY preference ("I do not want to keep watched
         // downloads"), which is true of the user rather than of the hardware, so it must keep syncing. The test
@@ -105,6 +115,15 @@ enum SettingsBackup {
         // here can only evict THIS device's own resume memory and bloat the payload, so it is per-device
         // by prefix: the profile UUID in the key name is open-ended, exactly like the sync bookkeeping.
         "stremiox.lastStream.",
+        // Region-keyed collection artwork and provider data plus freshness stamps are derived caches.
+        // Their open-ended region suffixes are device-local; the collection cadence and provider-selection
+        // preferences have separate keys and remain portable.
+        "vortx.collections.genreBackdrops.",
+        "vortx.collections.genreBackdropsAt.",
+        "vortx.collections.discoverBackdrops.",
+        "vortx.collections.discoverBackdropsAt.",
+        "vortx.collections.providers.v2.",
+        "vortx.collections.providersAt.v2.",
     ]
 
     /// SECRETS, which must never leave this device in any form. Kept as its OWN list rather than folded into
