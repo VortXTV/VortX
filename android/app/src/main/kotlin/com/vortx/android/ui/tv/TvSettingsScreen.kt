@@ -6,7 +6,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,8 +19,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -39,7 +36,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -106,7 +102,6 @@ import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.tv.TopShelfSettings
 import com.vortx.android.tv.WatchNextPublisher
-import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXIcons
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -121,22 +116,8 @@ import com.vortx.android.ui.viewmodel.StremioXViewModelFactory
 /// [TrackPreferencesStore], and [PlaybackBehaviorSettings]. A couch change and a phone change therefore
 /// write the SAME value in `vortx_settings`. There are no TV-only settings keys.
 ///
-/// PROFILE SWITCHING (this round): the roster is now focusable and switchable from the couch. Tapping a
-/// profile calls [ProfileStore.select], which applies its theme/filters, fires the engine reload +
-/// Home-rebuild seams, and swaps in that profile's private watch overlay -- the account library is never
-/// touched (`EngineStremioRepository.overlayProfiles()` gates every watch path: the never-poison split). A
-/// PIN-gated profile prompts for its PIN through a 10-foot numeric keypad before switching, so a Kids profile
-/// cannot walk into a locked parent profile from the remote. [ProfileStore] exposes plain main-thread fields
-/// (Apple's `@Published` analogue, no Flow), so this screen bumps a local counter after a switch to re-read
-/// `profiles` / `activeID`.
-///
-/// SCOPE, honestly: this ships the primary 10-foot toggles a viewer changes from the couch plus profile
-/// SWITCHING. Creating / renaming / deleting a profile stays on the phone/tablet app for now (text entry is a
-/// touch job); add-ons and debrid API keys have their own nested TV routes, while the remaining deep phone-only surfaces
-/// (Account sign-in, Integrations, Media servers, advanced subtitle styling, Sources ranking,
-/// Downloads, Library transfer) are named at the foot of the list rather than reproduced. Binding a profile
-/// to its own separate account is not wired on Android yet, so a
-/// [ProfileStore.select] returning `SwitchAccount` / `NeedsSignIn` is surfaced as a note.
+/// Profiles opens the shared TV management route: remote Add/Edit/Delete and PIN-gated switching use
+/// the existing ProfileStore and native admission, with no separate roster or history authority.
 @Composable
 fun TvSettingsScreen(
     repo: CatalogRepository,
@@ -165,8 +146,10 @@ fun TvSettingsScreen(
     val settingsListState = rememberLazyListState()
     val debridServicesFocus = remember { FocusRequester() }
     val addonsFocus = remember { FocusRequester() }
+    val profilesFocus = remember { FocusRequester() }
     var restoreFocusTarget by remember { mutableStateOf<TvDebridFocusTarget?>(null) }
     var restoreAddonsFocus by remember { mutableStateOf(false) }
+    var restoreProfilesFocus by remember { mutableStateOf(false) }
 
     // Seed each control from its store once; write through on every change. There is no reactive prefs stream
     // in these modules and none is needed -- the values are read at player load, so a write-through keeps the
@@ -200,15 +183,18 @@ fun TvSettingsScreen(
     var settingsQuery by remember { mutableStateOf("") }
 
     val store = ProfileStore.sharedOrNull()
-    // Bumped after a switch to force a fresh read of the plain (non-observable) store fields.
+    // Re-read the debrid account after returning from profile management.
     var refresh by remember { mutableStateOf(0) }
-    val roster = remember(refresh) { store?.profiles ?: emptyList() }
-    val activeId = remember(refresh) { store?.activeID }
     val debridAccountIdentity = remember(refresh) {
         store?.activeKeychainAccount ?: ProfileStore.PRIMARY_TOKEN_ACCOUNT
     }
-    var pinTarget by remember { mutableStateOf<UserProfile?>(null) }
-    var status by remember { mutableStateOf<String?>(null) }
+    val activeProfile by (store?.activeProfile?.collectAsStateWithLifecycle()
+        ?: remember { mutableStateOf(null) })
+
+    if (route == TvSettingsRoute.PROFILES) {
+        TvProfilesScreen(onBack = { route = TvSettingsRoute.ROOT; refresh++; restoreProfilesFocus = true }, modifier = modifier)
+        return
+    }
 
     fun returnToSettingsRoot() {
         route = route.back()
@@ -434,21 +420,6 @@ fun TvSettingsScreen(
         return
     }
 
-    fun commitSwitch(profile: UserProfile) {
-        if (store == null) return
-        status = null
-        when (store.select(profile)) {
-            ProfileStore.SwitchOutcome.SameAccount -> Unit
-            is ProfileStore.SwitchOutcome.SwitchAccount ->
-                status = "Now watching as ${profile.name}. Per-profile sign-in isn't wired on Android yet, " +
-                    "so this profile keeps the current session."
-            ProfileStore.SwitchOutcome.NeedsSignIn ->
-                status = "Now watching as ${profile.name}. This profile has its own account; per-profile " +
-                    "sign-in isn't available on Android yet."
-        }
-        refresh++
-    }
-
     // A section renders when the search field is blank, or when the query matches any of the section's terms
     // (its title plus the labels a viewer might type). Case-insensitive substring; trimmed. Keeps the couch
     // search dumb-simple and never hides a section the query names.
@@ -463,28 +434,17 @@ fun TvSettingsScreen(
             contentPadding = PaddingValues(TvDimens.edge),
             verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap),
         ) {
-            item { TvProfileHeader(store?.active) }
+            item { TvProfileHeader(activeProfile) }
 
             item {
                 TvSettingsSearchField(query = settingsQuery, onQueryChange = { settingsQuery = it })
             }
 
-            if (roster.isNotEmpty() && show("who's watching", "profile", "switch profile", "kids")) {
+            if (show("who's watching", "profile", "switch profile", "kids", "add profile", "edit profile", "delete profile")) {
                 item {
                     TvSettingsSection("Who's watching") {
-                        roster.forEach { profile ->
-                            TvProfileRow(
-                                profile = profile,
-                                isActive = profile.id == activeId,
-                                onClick = {
-                                    when {
-                                        profile.id == activeId -> Unit          // already active
-                                        profile.hasPin -> pinTarget = profile    // gate the switch on the PIN
-                                        else -> commitSwitch(profile)
-                                    }
-                                },
-                            )
-                        }
+                        TvSettingsNavigationRow(label = "Profiles", detail = "Switch, add, edit or delete profiles. Locked profiles require their PIN.",
+                            focusRequester = profilesFocus, onClick = { route = TvSettingsRoute.PROFILES })
                     }
                 }
             }
@@ -567,16 +527,6 @@ fun TvSettingsScreen(
                             // Turning it off clears the rows now; turning it on lets the next CW update publish.
                             if (!next) WatchNextPublisher.clearOwnedRows(appContext)
                         },
-                    )
-                }
-            }
-
-            status?.let { message ->
-                item {
-                    Text(
-                        text = message,
-                        style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary),
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = VortXTheme.spacing.xs),
                     )
                 }
             }
@@ -956,13 +906,6 @@ fun TvSettingsScreen(
             if (trimmedQuery.isEmpty()) item { TvSettingsFootnote() }
         }
 
-        pinTarget?.let { target ->
-            TvPinGate(
-                profile = target,
-                onUnlock = { pinTarget = null; commitSwitch(target) },
-                onCancel = { pinTarget = null },
-            )
-        }
     }
 
     LaunchedEffect(restoreFocusTarget) {
@@ -990,10 +933,20 @@ fun TvSettingsScreen(
             if (restored) restoreAddonsFocus = false
         }
     }
+    LaunchedEffect(restoreProfilesFocus) {
+        if (restoreProfilesFocus) {
+            // Profiles is the first section after the header/search, even in a filtered list.
+            settingsListState.scrollToItem(2)
+            withFrameNanos { }
+            runCatching { profilesFocus.requestFocus() }
+            restoreProfilesFocus = false
+        }
+    }
 }
 
 internal enum class TvSettingsRoute {
     ROOT,
+    PROFILES,
     ADDONS,
     ADDON_STORE,
     ADDON_PAIRING,
@@ -1032,91 +985,13 @@ private fun TvProfileHeader(profile: UserProfile?) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Text(text = profile?.avatar ?: "🍿", style = VortXTheme.type.hero)
         Spacer(Modifier.width(VortXTheme.spacing.md))
-        Column {
-            Text(text = profile?.name ?: "VortX", style = VortXTheme.type.sectionTitle)
+        Column(Modifier.weight(1f)) {
+            Text(text = profile?.name ?: "VortX", style = VortXTheme.type.sectionTitle, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 text = if (profile?.isKids == true) "Kids profile · active" else "Active profile",
                 style = VortXTheme.type.label.copy(color = colors.textSecondary),
             )
         }
-    }
-}
-
-/// One focusable profile in the switcher, the tv-Surface 10-foot analogue of the phone profile row: an
-/// accent disc with the avatar (its [UserProfile.accentID] color), the name with a Kids badge, and a trailing
-/// check (active) or lock (PIN-gated). The whole row is the D-pad target.
-@OptIn(ExperimentalTvMaterial3Api::class)
-@Composable
-private fun TvProfileRow(profile: UserProfile, isActive: Boolean, onClick: () -> Unit) {
-    val colors = VortXTheme.colors
-    Surface(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
-        shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
-        colors = ClickableSurfaceDefaults.colors(
-            containerColor = colors.surface1,
-            contentColor = colors.textPrimary,
-            focusedContainerColor = colors.surface3,
-            focusedContentColor = colors.textPrimary,
-        ),
-        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.02f),
-        border = ClickableSurfaceDefaults.border(
-            focusedBorder = Border(
-                border = BorderStroke(2.dp, colors.accentBright),
-                shape = VortXShapes.control,
-            ),
-        ),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                modifier = Modifier
-                    .size(48.dp)
-                    .clip(CircleShape)
-                    .background(VortXAccents.byId(profile.accentID).base.copy(alpha = 0.26f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Text(profile.avatar, style = VortXTheme.type.cardTitle)
-            }
-            Spacer(Modifier.width(VortXTheme.spacing.md))
-            Row(
-                modifier = Modifier.weight(1f),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
-            ) {
-                Text(
-                    text = profile.name.ifBlank { "Profile" },
-                    style = VortXTheme.type.body.copy(
-                        color = if (isActive) colors.textPrimary else colors.textSecondary,
-                        fontWeight = if (isActive) FontWeight.SemiBold else FontWeight.Normal,
-                    ),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                if (profile.isKids) TvKidsBadge()
-            }
-            Spacer(Modifier.width(VortXTheme.spacing.sm))
-            when {
-                isActive -> Icon(VortXIcons.checkmarkCircle, contentDescription = "Active profile", tint = colors.accent)
-                profile.hasPin -> Icon(VortXIcons.lock, contentDescription = "Locked", tint = colors.textTertiary)
-            }
-        }
-    }
-}
-
-/// A small "Kids" pill beside a Kids profile's name (the explicit badge at 10 feet).
-@Composable
-private fun TvKidsBadge() {
-    val colors = VortXTheme.colors
-    Box(
-        modifier = Modifier
-            .clip(CircleShape)
-            .background(colors.accentSoft)
-            .padding(horizontal = VortXTheme.spacing.xs, vertical = 2.dp),
-    ) {
-        Text("Kids", style = VortXTheme.type.eyebrow.copy(color = colors.accent))
     }
 }
 
@@ -1332,101 +1207,12 @@ private fun TvSettingsSearchField(query: String, onQueryChange: (String) -> Unit
     )
 }
 
-/// A 10-foot PIN gate: a dimmed scrim over a panel with the entered digits and a focusable numeric keypad,
-/// the couch analogue of the phone `PinGateOverlay`. A TV has no reliable soft keyboard, so entry is a grid
-/// of D-pad-focusable digit keys. [UserProfile.pinMatches] does the check, so the salted hash never leaves the
-/// store. Unlock only enables at 4 digits.
-@OptIn(ExperimentalTvMaterial3Api::class)
-@Composable
-private fun TvPinGate(profile: UserProfile, onUnlock: () -> Unit, onCancel: () -> Unit) {
-    val colors = VortXTheme.colors
-    var input by remember { mutableStateOf("") }
-    var wrong by remember { mutableStateOf(false) }
-    Box(
-        modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.78f)),
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            modifier = Modifier
-                .clip(RoundedCornerShape(24.dp))
-                .background(colors.surface1)
-                .padding(VortXTheme.spacing.xl),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
-        ) {
-            Text("Enter PIN for ${profile.name}", style = VortXTheme.type.sectionTitle)
-            Text(
-                text = if (input.isEmpty()) "----" else "•".repeat(input.length).padEnd(4, '-'),
-                style = VortXTheme.type.hero.copy(color = colors.textPrimary),
-            )
-            if (wrong) Text("Wrong PIN", style = VortXTheme.type.label.copy(color = colors.danger))
-            // 1-9 in a 3x3, then Delete / 0 / Cancel across the bottom.
-            val rows = listOf(listOf("1", "2", "3"), listOf("4", "5", "6"), listOf("7", "8", "9"))
-            rows.forEach { row ->
-                Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-                    row.forEach { digit ->
-                        TvKeypadKey(label = digit, onClick = {
-                            if (input.length < 4) { input += digit; wrong = false }
-                        })
-                    }
-                }
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
-                TvKeypadKey(label = "Del", onClick = { input = input.dropLast(1); wrong = false })
-                TvKeypadKey(label = "0", onClick = { if (input.length < 4) { input += "0"; wrong = false } })
-                TvKeypadKey(label = "Cancel", onClick = onCancel)
-            }
-            TvKeypadKey(
-                label = "Unlock",
-                wide = true,
-                enabled = input.length == 4,
-                onClick = { if (profile.pinMatches(input)) onUnlock() else wrong = true },
-            )
-        }
-    }
-}
-
-/// One focusable keypad key for [TvPinGate]. A disabled key (Unlock before 4 digits) is a dim,
-/// non-focusable/inert surface so the D-pad skips it until it becomes usable.
-@OptIn(ExperimentalTvMaterial3Api::class)
-@Composable
-private fun TvKeypadKey(label: String, onClick: () -> Unit, enabled: Boolean = true, wide: Boolean = false) {
-    val colors = VortXTheme.colors
-    Surface(
-        onClick = onClick,
-        enabled = enabled,
-        modifier = if (wide) Modifier.fillMaxWidth() else Modifier.size(width = 76.dp, height = 56.dp),
-        shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
-        colors = ClickableSurfaceDefaults.colors(
-            containerColor = if (enabled) colors.surface2 else colors.surface1,
-            contentColor = if (enabled) colors.textPrimary else colors.textTertiary,
-            focusedContainerColor = colors.accent,
-            focusedContentColor = colors.onAccent,
-        ),
-        scale = ClickableSurfaceDefaults.scale(focusedScale = 1.06f),
-        border = ClickableSurfaceDefaults.border(
-            focusedBorder = Border(
-                border = BorderStroke(2.dp, colors.accentBright),
-                shape = VortXShapes.control,
-            ),
-        ),
-    ) {
-        Box(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(label, style = VortXTheme.type.body.copy(fontWeight = FontWeight.SemiBold))
-        }
-    }
-}
-
 /// An honest pointer to what is NOT here: the deep settings surfaces that stay on the phone/tablet app for
 /// now. Named rather than hidden, so a tester knows where to reach them.
 @Composable
 private fun TvSettingsFootnote() {
     Text(
-        text = "Creating, renaming, and deleting profiles, plus media servers, source ranking, " +
-            "downloads, and library transfer, are managed in the VortX phone and tablet app.",
+        text = "Library transfer is managed in the VortX phone and tablet app.",
         style = VortXTheme.type.label.copy(color = VortXTheme.colors.textTertiary),
         modifier = Modifier.fillMaxWidth().padding(top = VortXTheme.spacing.sm),
     )

@@ -84,11 +84,7 @@ fun TvApp(
         // skip it by construction, because ProfileStore.needsPicker is false in both cases.
         var showPicker by remember { mutableStateOf(profileStore?.needsPicker == true) }
         if (showPicker) {
-            BackHandler {
-                val store = profileStore
-                if (store != null) store.active?.let { store.select(it) }
-                showPicker = false
-            }
+            // The picker owns Back, its nested editor and exact native selection admission.
             TvWhosWatching(onDone = { showPicker = false })
             return@VortXTheme
         }

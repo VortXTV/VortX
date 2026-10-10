@@ -14,8 +14,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
@@ -26,12 +29,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -39,7 +45,6 @@ import androidx.tv.material3.Border
 import androidx.tv.material3.ClickableSurfaceDefaults
 import androidx.tv.material3.ExperimentalTvMaterial3Api
 import androidx.tv.material3.Surface
-import com.vortx.android.profile.ProfileStore
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXIcons
@@ -62,34 +67,49 @@ import com.vortx.android.ui.theme.VortXTheme
 /// switching (a TV has no reliable soft keyboard), so a Kids remote cannot walk into a locked parent profile.
 /// [UserProfile.pinMatches] does the check, so the salted hash never leaves the store.
 ///
-/// SCOPE: this PICKS among existing profiles. Creating / renaming a profile stays on the phone/tablet app
-/// (text entry is a touch job -- see the TV Settings footnote), so there is no "Add profile" card here, unlike
-/// the Apple TV picker.
+/// Add and Edit use the same native capture/commit admission and editor as TV Settings.
 @Composable
 fun TvWhosWatching(onDone: () -> Unit, modifier: Modifier = Modifier) {
-    val store = ProfileStore.sharedOrNull()
-    val roster = remember(store) { store?.profiles ?: emptyList() }
-
-    // Fail-soft: nothing to choose between. Dismiss on the next frame rather than render an empty picker.
-    if (store == null || roster.size <= 1) {
+    val gateway = rememberTvProfileGateway()
+    if (gateway == null || gateway.read().profiles.isEmpty()) {
         LaunchedEffect(Unit) { onDone() }
         return
     }
+    TvProfilePicker(gateway, onDone, modifier)
+}
 
-    val activeId = remember(store) { store.activeID }
-    var pinTarget by remember { mutableStateOf<UserProfile?>(null) }
-    val firstTileFocus = remember { FocusRequester() }
-
-    fun commit(profile: UserProfile) {
-        // Per-profile own-account sign-in is not wired on Android, so the SwitchOutcome is informational on the
-        // launch path (the phone/Apple TV launch pickers ignore it too); the session simply carries over.
-        store.select(profile)
-        onDone()
+@Composable
+internal fun TvProfilePicker(gateway: TvProfileGateway, onDone: () -> Unit, modifier: Modifier = Modifier) {
+    var refresh by remember { mutableStateOf(0) }
+    @Suppress("UNUSED_VARIABLE") val redraw = refresh
+    val roster = gateway.read().profiles
+    val activeId = gateway.read().activeID
+    var pinTarget by remember { mutableStateOf<Pair<UserProfile, TvProfileGateway.Admission>?>(null) }
+    var manage by remember { mutableStateOf<String?>(null) }
+    var restore by remember { mutableStateOf<String?>(activeId) }
+    var message by remember { mutableStateOf<String?>(null) }
+    val focus = remember { mutableMapOf<String, FocusRequester>() }
+    val rowState = rememberLazyListState()
+    fun requester(key: String) = focus.getOrPut(key) { FocusRequester() }
+    fun commit(profile: UserProfile, captured: TvProfileGateway.Admission) {
+        message = gateway.select(profile, captured)
+        pinTarget = null
+        if (message == null) onDone() else refresh++
+    }
+    BackHandler {
+        roster.find { it.id == activeId }?.let { profile ->
+            gateway.capture(profile, selection = true)?.let { commit(profile, it) }
+        }
+    }
+    manage?.let { route ->
+        TvProfileManagement(gateway, onBack = { manage = null; restore = route; refresh++ }, modifier = modifier,
+            startAdding = route == "add", startEditing = route == "edit", returnAfterEditor = true)
+        return
     }
 
     Box(modifier = modifier.fillMaxSize().background(VortXTheme.colors.canvas)) {
         Column(
-            modifier = Modifier.fillMaxSize().padding(TvDimens.edge),
+            modifier = Modifier.fillMaxSize().padding(TvDimens.edge).verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(TvDimens.rowGap, Alignment.CenterVertically),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -99,34 +119,50 @@ fun TvWhosWatching(onDone: () -> Unit, modifier: Modifier = Modifier) {
                 textAlign = TextAlign.Center,
             )
             LazyRow(
+                state = rowState,
                 horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap, Alignment.CenterHorizontally),
                 contentPadding = PaddingValues(horizontal = TvDimens.edge),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                itemsIndexed(roster, key = { _, p -> p.id }) { index, profile ->
+                itemsIndexed(roster, key = { _, p -> p.id }) { _, profile ->
                     TvWhosWatchingTile(
                         profile = profile,
                         isActive = profile.id == activeId,
-                        focusRequester = if (index == 0) firstTileFocus else null,
+                        focusRequester = requester(profile.id),
                         onClick = {
-                            // The active profile is already unlocked; a locked, non-active profile gates on its PIN.
-                            if (profile.hasPin && profile.id != activeId) pinTarget = profile else commit(profile)
+                            restore = profile.id
+                            val captured = gateway.capture(profile, selection = true)
+                            if (captured == null) message = "The profile changed. Open it again before switching."
+                            else if (profile.hasPin && profile.id != activeId) pinTarget = profile to captured
+                            else commit(profile, captured)
                         },
                     )
                 }
             }
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.fillMaxWidth()) {
+                TvProfileButton("Add profile", modifier = Modifier.weight(1f).focusRequester(requester("add")).testTag("tv-picker-add"), onClick = { manage = "add" })
+                TvProfileButton("Edit active profile", modifier = Modifier.weight(1f).focusRequester(requester("edit")).testTag("tv-picker-edit"), onClick = { manage = "edit" })
+            }
+            message?.let { Text(it, style = VortXTheme.type.label.copy(color = VortXTheme.colors.danger)) }
         }
 
-        pinTarget?.let { target ->
+        pinTarget?.let { (target, captured) ->
             TvWhosWatchingPinGate(
                 profile = target,
-                onUnlock = { pinTarget = null; commit(target) },
-                onCancel = { pinTarget = null },
+                onUnlock = { commit(target, captured) },
+                onCancel = { pinTarget = null; refresh++ },
             )
         }
     }
 
-    LaunchedEffect(Unit) { runCatching { firstTileFocus.requestFocus() } }
+    LaunchedEffect(restore, refresh, pinTarget) {
+        if (pinTarget == null) {
+            val index = roster.indexOfFirst { it.id == restore }
+            if (index >= 0) rowState.scrollToItem(index)
+            withFrameNanos { }
+            restore?.let { runCatching { requester(it).requestFocus() } }
+        }
+    }
 }
 
 /// One focusable profile card in the launch grid: an accent disc holding the avatar (its
@@ -238,16 +274,17 @@ private fun TvWhosWatchingTile(
 /// A 10-foot PIN gate for the launch picker: a dimmed scrim over a panel with the entered digits and a
 /// D-pad-focusable numeric keypad. A TV has no reliable soft keyboard, so entry is a grid of digit keys.
 /// [UserProfile.pinMatches] does the check, so the salted hash never leaves the store. Unlock enables at four
-/// digits. Back dismisses the gate (returns to the picker without switching). Mirrors the private `TvPinGate`
-/// in the TV Settings profile switcher, kept local here so the two gates stay independent.
+/// digits. Back dismisses the gate and returns focus to its invoking profile. Shared by TV Settings and
+/// the launch picker, so both profile paths use the same remote gate.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvWhosWatchingPinGate(profile: UserProfile, onUnlock: () -> Unit, onCancel: () -> Unit) {
+internal fun TvWhosWatchingPinGate(profile: UserProfile, onUnlock: () -> Unit, onCancel: () -> Unit) {
     val colors = VortXTheme.colors
     var input by remember { mutableStateOf("") }
     var wrong by remember { mutableStateOf(false) }
+    val firstKeyFocus = remember { FocusRequester() }
     BackHandler { onCancel() }
-    Box(
+    Dialog(onDismissRequest = onCancel) { Box(
         modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.78f)),
         contentAlignment = Alignment.Center,
     ) {
@@ -255,11 +292,12 @@ private fun TvWhosWatchingPinGate(profile: UserProfile, onUnlock: () -> Unit, on
             modifier = Modifier
                 .clip(RoundedCornerShape(24.dp))
                 .background(colors.surface1)
-                .padding(VortXTheme.spacing.xl),
+                .padding(VortXTheme.spacing.lg)
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
         ) {
-            Text("Enter PIN for ${profile.name}", style = VortXTheme.type.sectionTitle)
+            Text("Enter PIN for ${profile.name}", style = VortXTheme.type.sectionTitle, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Text(
                 text = if (input.isEmpty()) "----" else "•".repeat(input.length).padEnd(4, '-'),
                 style = VortXTheme.type.hero.copy(color = colors.textPrimary),
@@ -269,7 +307,7 @@ private fun TvWhosWatchingPinGate(profile: UserProfile, onUnlock: () -> Unit, on
             rows.forEach { row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
                     row.forEach { digit ->
-                        TvPinKey(label = digit, onClick = {
+                        TvPinKey(label = digit, modifier = if (digit == "1") Modifier.focusRequester(firstKeyFocus) else Modifier, onClick = {
                             if (input.length < 4) { input += digit; wrong = false }
                         })
                     }
@@ -287,19 +325,20 @@ private fun TvWhosWatchingPinGate(profile: UserProfile, onUnlock: () -> Unit, on
                 onClick = { if (profile.pinMatches(input)) onUnlock() else wrong = true },
             )
         }
-    }
+    } }
+    LaunchedEffect(Unit) { withFrameNanos { }; runCatching { firstKeyFocus.requestFocus() } }
 }
 
 /// One focusable keypad key for [TvWhosWatchingPinGate]. A disabled key (Unlock before four digits) is a dim,
 /// inert surface so the D-pad skips it until it becomes usable.
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
-private fun TvPinKey(label: String, onClick: () -> Unit, enabled: Boolean = true, wide: Boolean = false) {
+private fun TvPinKey(label: String, onClick: () -> Unit, enabled: Boolean = true, wide: Boolean = false, modifier: Modifier = Modifier) {
     val colors = VortXTheme.colors
     Surface(
         onClick = onClick,
         enabled = enabled,
-        modifier = if (wide) Modifier.fillMaxWidth() else Modifier.size(width = 76.dp, height = 56.dp),
+        modifier = modifier.then(if (wide) Modifier.fillMaxWidth() else Modifier.size(width = 76.dp, height = 56.dp)),
         shape = ClickableSurfaceDefaults.shape(shape = VortXShapes.control),
         colors = ClickableSurfaceDefaults.colors(
             containerColor = if (enabled) colors.surface2 else colors.surface1,
