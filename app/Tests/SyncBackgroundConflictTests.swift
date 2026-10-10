@@ -48,6 +48,7 @@ private enum NativeForegroundSyncPolicy {
 /* PRODUCTION_PULL_POLICY */
 
 @MainActor private final class VortXSyncManager {
+    static var shared = VortXSyncManager()
     let credentialAuthority = Authority()
     var dataKey: Data? = Data([1])
     var isSignedIn = true
@@ -68,6 +69,10 @@ private enum NativeForegroundSyncPolicy {
     var uploadGate: Gate?
     var pullGate: Gate?
     var settleGate: Gate?
+    var reconcileGate: Gate?
+    /* RECONCILE_RESULT */
+    /* PROBE_RESULT */
+    var reconcileResult: SignInReconcile = .seededFromDevice
     var hydrationCount = 0
     var lastSyncedVersion = 10
     var pendingProviderApply: String?
@@ -93,6 +98,14 @@ private enum NativeForegroundSyncPolicy {
     func stampSyncSuccess() {}
     func hydrateEngineFromOwnedAddons() async { hydrationCount += 1 }
     @discardableResult func keepThisDeviceOverridingAccount() async -> Bool { keepAccepted }
+    func accountHasSyncData() async -> AccountDataProbe {
+        if let gate = reconcileGate { await gate.wait() }
+        switch reconcileResult {
+        case .seededFromDevice: return .empty
+        case .hasAccountData: return .hasData
+        case .unreachable: return .unreachable
+        }
+    }
     func startExternalUpload() -> UUID {
         let id = UUID(); activeSyncUp = (id, credentialAuthority.capture()); return id
     }
@@ -114,6 +127,20 @@ private enum NativeForegroundSyncPolicy {
     func runKeep() { let sync = self.sync; /* KEEP_ACTION */ }
     func runUse() { let sync = self.sync; /* USE_ACTION */ }
     /* PRODUCTION_RESOLUTION */
+}
+
+@MainActor private final class BackupViewFixture {
+    /* BACKUP_STATUS */
+    private var status: Status = .waiting
+    var poller: Task<Void, Never>?
+    var showConflict = false
+    var statusName: String { String(describing: status) }
+    func runMerge() { /* BACKUP_MERGE_ACTION */ }
+    func runKeep() { /* BACKUP_KEEP_ACTION */ }
+    func runUse() { /* BACKUP_USE_ACTION */ }
+    func signedIn() async { /* BACKUP_SIGNED_IN */ }
+    func cancel() { poller?.cancel() }
+    /* BACKUP_RESOLUTION */
 }
 
 @main private enum SyncBackgroundConflictTests {
@@ -287,6 +314,90 @@ private enum NativeForegroundSyncPolicy {
         check(useUI.syncNote != nil, "production use-account button surfaces genuine pull failure")
         _ = useModel.startExternalUpload(); useUI.runUse(); await drain()
         check(useUI.syncNote?.contains("waiting") == true, "production use-account button surfaces pending adoption")
+
+        let backupModel = VortXSyncManager(); VortXSyncManager.shared = backupModel
+        backupModel.keepAccepted = false
+        let failedKeepBackup = BackupViewFixture(); failedKeepBackup.runKeep(); await drain()
+        check(failedKeepBackup.statusName == "failed", "backup keep-device button cannot claim success after failed Bool")
+        backupModel.keepAccepted = true
+        let successfulKeepBackup = BackupViewFixture(); successfulKeepBackup.runKeep(); await drain()
+        check(successfulKeepBackup.statusName == "backedUp", "positive control accepted backup keep-device completes")
+        backupModel.pull = .failed
+        let failedMergeBackup = BackupViewFixture(); failedMergeBackup.runMerge(); await drain()
+        check(failedMergeBackup.statusName == "failed", "backup merge button preserves failed pull/upload result")
+        let failedUseBackup = BackupViewFixture(); failedUseBackup.runUse(); await drain()
+        check(failedUseBackup.statusName == "failed", "backup account adoption preserves genuine pull failure")
+        backupModel.pull = .empty
+        let noOpBackup = BackupViewFixture(); noOpBackup.runUse(); await drain()
+        check(noOpBackup.statusName == "backedUp", "positive control completed no-op receipt is not uniformly failure")
+        _ = backupModel.startExternalUpload()
+        let pendingBackup = BackupViewFixture(); pendingBackup.runUse(); await drain()
+        check(pendingBackup.statusName == "pending", "backup pending account adoption remains retryable without success claim")
+        backupModel.activeSyncUp = nil
+
+        backupModel.reconcileResult = .unreachable
+        let failedSignInBackup = BackupViewFixture(); await failedSignInBackup.signedIn()
+        check(failedSignInBackup.statusName == "failed" && !failedSignInBackup.showConflict,
+              "backup signed-in poll treats unreachable reconciliation as failure")
+        backupModel.reconcileResult = .hasAccountData
+        let conflictBackup = BackupViewFixture(); await conflictBackup.signedIn()
+        check(conflictBackup.showConflict && conflictBackup.statusName != "backedUp", "positive control existing account opens backup conflict")
+        backupModel.reconcileResult = .seededFromDevice
+        let seededBackup = BackupViewFixture(); await seededBackup.signedIn()
+        check(seededBackup.statusName == "backedUp", "positive control successful seeded reconciliation completes backup")
+
+        let cancelBackupModel = VortXSyncManager(); VortXSyncManager.shared = cancelBackupModel
+        let backupHold = Gate(); cancelBackupModel.pullGate = backupHold
+        let cancelledBackup = BackupViewFixture(); cancelledBackup.runUse(); await drain()
+        cancelledBackup.cancel(); backupHold.release(); await drain()
+        check(cancelledBackup.statusName == "saving", "cancelled backup action cannot publish late result")
+        let beforeBackupModel = VortXSyncManager(); VortXSyncManager.shared = beforeBackupModel
+        let beforeBackup = BackupViewFixture(); beforeBackup.runUse(); beforeBackup.cancel(); await drain()
+        check(beforeBackupModel.pullOutcomes.isEmpty && beforeBackup.statusName == "saving",
+              "backup action cancelled before start does not begin account adoption")
+        VortXSyncManager.shared = cancelBackupModel
+        let reconcileHold = Gate(); cancelBackupModel.reconcileGate = reconcileHold
+        let cancelledPollBackup = BackupViewFixture()
+        let backupPollTask = Task { @MainActor in await cancelledPollBackup.signedIn() }
+        await drain(); backupPollTask.cancel(); reconcileHold.release(); _ = await backupPollTask.value
+        check(cancelledPollBackup.statusName == "waiting" && !cancelledPollBackup.showConflict,
+              "cancelled signed-in backup reconciliation cannot publish late success/conflict")
+
+        let failedSeed = VortXSyncManager(); failedSeed.uploadAccepted = false
+        VortXSyncManager.shared = failedSeed
+        let failedSeedBackup = BackupViewFixture(); await failedSeedBackup.signedIn()
+        check(failedSeedBackup.statusName == "failed", "actual rejected seed PUT cannot produce backed-up reconciliation")
+        check(failedSeed.uploadStarts == 1, "failed seed performs one bounded upload attempt")
+        for change in ["account", "key", "cancel"] {
+            let probeModel = VortXSyncManager(); let probeHold = Gate(); probeModel.reconcileGate = probeHold
+            let probeTask = Task { @MainActor in await probeModel.reconcileAfterSignIn() }
+            await drain()
+            switch change {
+            case "account":
+                probeModel.credentialAuthority.current = .init(account: "B", generation: 2)
+                probeModel.credentialAuthority.current = .init(account: "A", generation: 3)
+            case "key": probeModel.dataKey = Data([2])
+            default: probeTask.cancel()
+            }
+            probeHold.release(); let outcome = await probeTask.value
+            check(outcome == .unreachable && probeModel.uploadStarts == 0,
+                  "actual \(change) supersession during account probe cannot seed")
+        }
+        for change in ["account", "key", "cancel"] {
+            let seedModel = VortXSyncManager(); let seedHold = Gate(); seedModel.uploadGate = seedHold
+            let seedTask = Task { @MainActor in await seedModel.reconcileAfterSignIn() }
+            await drain()
+            switch change {
+            case "account":
+                seedModel.credentialAuthority.current = .init(account: "B", generation: 2)
+                seedModel.credentialAuthority.current = .init(account: "A", generation: 3)
+            case "key": seedModel.dataKey = Data([2])
+            default: seedTask.cancel()
+            }
+            seedHold.release(); let outcome = await seedTask.value
+            check(outcome == .unreachable && seedModel.uploadStarts == 1,
+                  "actual \(change) supersession during seed PUT cannot claim completion")
+        }
         print("\(checks - failures)/\(checks) checks passed")
         if failures > 0 { exit(1) }
     }

@@ -4890,11 +4890,15 @@ final class VortXSyncManager: ObservableObject {
     /// pushThisDevice); and when the doc cannot be pulled the caller gets `.unreachable`, a distinct
     /// retry state in which NOTHING is pushed (a blip must never be treated as a fresh account).
     func reconcileAfterSignIn() async -> SignInReconcile {
-        switch await accountHasSyncData() {
+        let capture = credentialAuthority.capture()
+        let capturedDataKey = dataKey
+        let probe = await accountHasSyncData()
+        guard isCurrent(capture), dataKey == capturedDataKey, !Task.isCancelled else { return .unreachable }
+        switch probe {
         case .hasData: return .hasAccountData
         case .unreachable: return .unreachable
         case .empty:
-            await syncUp()
+            guard await syncUp(), isCurrent(capture), dataKey == capturedDataKey, !Task.isCancelled else { return .unreachable }
             return .seededFromDevice
         }
     }

@@ -25,7 +25,7 @@ struct BackupExportView: View {
     @State private var poller: Task<Void, Never>?
     @State private var showConflict = false
 
-    private enum Status: Equatable { case starting, waiting, saving, backedUp, failed }
+    private enum Status: Equatable { case starting, waiting, saving, backedUp, pending, failed }
 
     private static let qrSize: CGFloat = 320
     // A real page on the account site (vortx-site, src/pages/approve.astro), which reads `c` and `k` out of
@@ -78,6 +78,11 @@ struct BackupExportView: View {
                 Text("That backup did not complete. Try again.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.danger)
                 Button("Try again") { start() }.buttonStyle(ChipButtonStyle())
+
+            case .pending:
+                Text("Your changes are still waiting to sync. Try again shortly.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                Button("Try again") { start() }.buttonStyle(ChipButtonStyle())
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -93,8 +98,8 @@ struct BackupExportView: View {
             // keepThisDeviceOverridingAccount, not pushThisDevice: reached only after the account's doc was
             // positively READ, so this is the user's informed choice to overwrite it and the one push allowed
             // past the #145 restore gate.
-            Button("Keep this device") { resolve { await $0.keepThisDeviceOverridingAccount() } }
-            Button("Merge both (keep all profiles)") { resolve { await $0.mergeBoth() } }
+            Button("Keep this device") { resolve { await $0.keepThisDeviceOverridingAccount() ? .completed : .failed } }
+            Button("Merge both (keep all profiles)") { resolve { await $0.mergeBoth() ? .completed : .failed } }
             Button("Use account's data") { resolve { await $0.useAccountData() } }
         } message: {
             Text("This VortX account already holds synced data. Keep this device to save this Apple TV's data over it, merge both to keep every profile, or use the account's data instead.")
@@ -127,26 +132,35 @@ struct BackupExportView: View {
             case .failed:
                 status = .failed; return
             case .signedIn:
+                guard !Task.isCancelled else { return }
                 // BACKUP completion, NOT the joiner's blind useAccountData(): an empty account is already
                 // seeded from this device by reconcileAfterSignIn (.seededFromDevice), so we just confirm; a
                 // non-empty account asks which side to keep, defaulting to keeping THIS device.
-                if await VortXSyncManager.shared.reconcileAfterSignIn() == .hasAccountData {
-                    showConflict = true
-                } else {
-                    status = .backedUp
+                let result = await VortXSyncManager.shared.reconcileAfterSignIn()
+                guard !Task.isCancelled else { return }
+                switch result {
+                case .hasAccountData: showConflict = true
+                case .seededFromDevice: status = .backedUp
+                case .unreachable: status = .failed
                 }
                 return
             }
         }
     }
 
-    /// Run one of the three conflict resolutions, then confirm the backup landed. Each op is @discardableResult
-    /// (or Void), so the closure body discards any Bool and returns Void.
-    private func resolve(_ op: @escaping (VortXSyncManager) async -> Void) {
+    /// Publish the actual conflict result; a failed or queued operation is not a completed backup.
+    private func resolve(_ op: @escaping (VortXSyncManager) async -> VortXSyncManager.ConflictResolutionOutcome) {
+        poller?.cancel()
         status = .saving
-        Task { @MainActor in
-            await op(VortXSyncManager.shared)
-            status = .backedUp
+        poller = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            let outcome = await op(VortXSyncManager.shared)
+            guard !Task.isCancelled else { return }
+            switch outcome {
+            case .completed: status = .backedUp
+            case .pending: status = .pending
+            case .failed: status = .failed
+            }
         }
     }
 }
