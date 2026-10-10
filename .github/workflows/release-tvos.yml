@@ -155,7 +155,7 @@ jobs:
           # checkout. A future main pin bump must disable this one-cut recovery fail-closed.
           NATIVE_PIN="$(awk '/^      - name: Fetch vortx-core / {step=1; next} step && /^      - / {exit} step && /^          ref:/ {print $2}' .github/workflows/release-tvos.yml)"
           PLAYER_PINS="$(awk '/^      - name: Fetch the MPVKit-DVFEL artifacts / {step=1; next} step && /^      - / {exit} step && /^          (URL|EXPECTED)=/ {sub(/^          /, ""); print}' .github/workflows/release-tvos.yml)"
-          [ "$NATIVE_PIN" = 7e3e68be5bf2b11c65d158c1823be94bd1608d1b ] || exit 1
+          [ "$NATIVE_PIN" = 0c201563c6aa54eeb0545b55ad01582c0c3bcae3 ] || exit 1
           [ "$PLAYER_PINS" = 'EXPECTED="737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1"
           URL="https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip"' ] || exit 1
           gh api -- "repos/$GH_REPO/compare/$BUILD_SOURCE_SHA...$GITHUB_SHA" | jq -e --arg source "$BUILD_SOURCE_SHA" '
@@ -198,7 +198,7 @@ jobs:
           set -euo pipefail
           [ "$(git rev-parse HEAD)" = "$BUILD_SOURCE_SHA" ] && [ -z "$(git status --porcelain)" ] || exit 1
           # Recovery is only packaging orchestration: retain the exact private and vendor pins.
-          grep -Fq 'ref: 7e3e68be5bf2b11c65d158c1823be94bd1608d1b' .github/workflows/release-tvos.yml
+          grep -Fq 'ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3' .github/workflows/release-tvos.yml
           grep -Fq 'vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip' .github/workflows/release-tvos.yml
 
       - name: Bind native acceptance tooling to workflow and source provenance
@@ -278,7 +278,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: 7e3e68be5bf2b11c65d158c1823be94bd1608d1b
+          ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -287,7 +287,7 @@ jobs:
         run: |
           set -euo pipefail
           NATIVE_REVISION="$(git -C _vortx_core_src rev-parse HEAD)"
-          [ "$NATIVE_REVISION" = 7e3e68be5bf2b11c65d158c1823be94bd1608d1b ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
+          [ "$NATIVE_REVISION" = 0c201563c6aa54eeb0545b55ad01582c0c3bcae3 ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
           echo "VORTX_ENGINE_SOURCE_REVISION=$NATIVE_REVISION" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
