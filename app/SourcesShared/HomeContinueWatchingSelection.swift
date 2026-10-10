@@ -67,10 +67,22 @@ enum HomeContinueWatchingSelection {
         else if snapshot.context.preferences.source == .trakt { TraktPlaybackShadow.shared.refreshIfStale() }
     }
 
+    /// A newly mounted presentation has no accepted producer yet. Keep its body empty
+    /// without selecting/sorting history; the source refresh installs a captured intent.
+    static func waitingForPresentation(core: CoreBridge, profiles: ProfileStore) -> Snapshot {
+        let context = Context(profileID: profiles.activeID,
+            usesNativeProfileState: core.usesNativeProfileState,
+            usesEngineHistory: profiles.activeUsesEngineHistory, nativeTarget: nil)
+        var selection = TraktPlaybackShadow.ContinueWatchingSelection(items: [], source: .local, sessionID: nil)
+        selection.status = "Waiting for this profile's acknowledged account and Continue Watching settings…"
+        return Snapshot(selection: selection, context: context)
+    }
+
     static func current(
         core: CoreBridge,
         profiles: ProfileStore,
-        shadow: TraktPlaybackShadow? = nil
+        shadow: TraktPlaybackShadow? = nil,
+        localItemsOverride: [CoreCWItem]? = nil
     ) -> Snapshot {
         var context = Context(
             profileID: profiles.activeID,
@@ -91,8 +103,8 @@ enum HomeContinueWatchingSelection {
 
         // A native shared profile has its own core bucket too. Never fall back to its
         // retired legacy overlay, including while a native session is unavailable.
-        let localItems = context.usesNativeProfileState || context.usesEngineHistory
-            ? core.continueWatching : profiles.cwItems
+        let localItems = localItemsOverride ?? (context.usesNativeProfileState || context.usesEngineHistory
+            ? core.continueWatching : profiles.cwItems)
         var selection: TraktPlaybackShadow.ContinueWatchingSelection
         let requested = context.preferences.source
         if !context.usesEngineHistory || requested == .local {

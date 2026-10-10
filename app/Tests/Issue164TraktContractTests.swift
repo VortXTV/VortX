@@ -77,7 +77,7 @@ struct Issue164TraktContractTests {
                     && homeCWSelection.contains("fallback: localItems")
                     && homeCWSelection.contains("libraryItems: core.library?.catalog ?? []"),
                 "tvOS Home must consume the selected Trakt source and local catalog artwork")
-        require(iosHome.contains("HomeContinueWatchingSelection.current(core: core, profiles: profiles)")
+        require(iosHome.contains("HomeContinueWatchingSelection.current(core: core, profiles: profiles,")
                     && homeCWSelection.contains("fallback: localItems")
                     && homeCWSelection.contains("libraryItems: core.library?.catalog ?? []"),
                 "iOS and macOS Home must consume the selected Trakt source and local catalog artwork")
@@ -415,14 +415,16 @@ struct Issue164TraktContractTests {
             from: "private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot",
             to: "#if os(macOS)"
         )
-        require(occurrences(of: "continueWatchingSnapshot", in: iosContinueWatchingSnapshot) == 1
-                    && iosContinueWatchingSnapshot.contains("let snapshot = continueWatchingSnapshot")
+        require(iosContinueWatchingSnapshot.contains("cached.selection.intent.isCurrent(core: core, profiles: profiles)")
+                    && iosContinueWatchingSnapshot.contains("return cached.render")
+                    && iosContinueWatchingSnapshot.contains("snapshot = HomeContinueWatchingSelection.current")
                     && iosContinueWatchingSnapshot.contains("let selection = snapshot.selection")
                     && iosContinueWatchingSnapshot.contains("let items = selection.items.map")
                     && iosContinueWatchingSnapshot.contains("items: items")
                     && iosContinueWatchingSnapshot.contains("source: selection.source")
                     && iosContinueWatchingSnapshot.contains("traktSessionID: selection.sessionID")
-                    && iosContinueWatchingSnapshot.contains("intent: snapshot.intent"),
+                    && iosContinueWatchingSnapshot.contains("intent: snapshot.intent")
+                    && iosContinueWatchingSnapshot.contains("iOSCWPresentationSnapshot(selection: snapshot, render: render,"),
                 "iOS rendered Continue Watching items and provenance must come from one selection snapshot")
         let iosHomeBody = segment(
             in: iosHome,

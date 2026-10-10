@@ -148,6 +148,7 @@ struct CinemaSearchCollections: View {
         let compact = false
         #endif
         let width = iOSPillMetrics.hubTileWidth(container: viewportWidth, compact: compact)
+        let matches = self.matches
         if !matches.isEmpty {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Text("Collections").sectionTitleStyle().padding(.horizontal, Theme.Space.md)

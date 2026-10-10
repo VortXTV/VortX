@@ -61,7 +61,9 @@ private extension View {
 struct ProfilePickerView: View {
     @EnvironmentObject private var store: ProfileStore
     @EnvironmentObject private var account: StremioAccount
-    @EnvironmentObject private var core: CoreBridge
+    /// Actions capture the current admission when tapped. Picker artwork/layout has no
+    /// engine-state dependency and must not subscribe to every engine publication.
+    private let core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
@@ -78,6 +80,8 @@ struct ProfilePickerView: View {
     #if VORTX_NATIVE_DATA_ENGINE
     @ObservedObject private var nativeSync = VortXSyncManager.shared
     #endif
+
+    init(core: CoreBridge = .shared) { self.core = core }
 
     var body: some View {
         ZStack {

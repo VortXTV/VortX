@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 #if canImport(UIKit)
 import UIKit
 #elseif canImport(AppKit)
@@ -401,7 +402,7 @@ struct iOSRootView: View {
         case .library:
             if !hideLibraryTab { iOSLibraryView(isActive: true) }
         case .search:
-            if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true) }
+            if !mergeDiscoverSearch, !hideSearchTab { iOSSearchView(isActive: true, core: core) }
         case .addons:
             AddonsView()
         case .settings:
@@ -1026,6 +1027,12 @@ private struct iOSCWRenderSnapshot {
     let status: String?
 }
 
+private struct iOSCWPresentationSnapshot {
+    let selection: HomeContinueWatchingSelection.Snapshot
+    let render: iOSCWRenderSnapshot
+    let localInput: [AppleHomeHistoryProjection.Key]
+}
+
 struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
@@ -1057,7 +1064,9 @@ struct iOSHomeView: View {
     private var showCollectionsHub: Bool { homeCatalogPrefs.showCollectionsHome }
     @AppStorage(ContinueWatchingPreferences.sourceKey) private var continueWatchingSource = "local"
     @AppStorage(ContinueWatchingPreferences.windowKey) private var continueWatchingWindow = "20"
-    @State private var traktContinueWatchingRevision = 0
+    @State private var overlayHistory = ApplePresentationPublicationCache<[String: WatchEntry],
+        (cw: [CoreCWItem], library: [CoreCWItem])>()
+    @State private var cachedContinueWatching: iOSCWPresentationSnapshot?
     @State private var path = NavigationPath()
     @State private var unavailableContinueWatching: String?
     @State private var showCustomizeHome = false   // presents the Home rows reorder/hide editor
@@ -1081,12 +1090,63 @@ struct iOSHomeView: View {
     /// still matches the episode the engine is parked on. The owner profile rides the account's
     /// engine history; an overlay profile rides its own private synced overlay (never the account).
     private var continueWatchingSnapshot: HomeContinueWatchingSelection.Snapshot {
-        _ = traktContinueWatchingRevision
-        return HomeContinueWatchingSelection.current(core: core, profiles: profiles)
+        cachedContinueWatching?.selection
+            ?? HomeContinueWatchingSelection.waitingForPresentation(core: core, profiles: profiles)
     }
 
     private var continueWatchingRenderSnapshot: iOSCWRenderSnapshot {
+        if let cached = cachedContinueWatching {
+            guard cached.selection.intent.isCurrent(core: core, profiles: profiles) else {
+                return iOSCWRenderSnapshot(items: [], provenance: cached.render.provenance,
+                                          status: "Waiting for this profile's acknowledged account and Continue Watching settings…")
+            }
+            return cached.render
+        }
         let snapshot = continueWatchingSnapshot
+        return iOSCWRenderSnapshot(items: [], provenance: iOSCWProducerProvenance(
+            source: snapshot.selection.source, traktSessionID: snapshot.selection.sessionID,
+            intent: snapshot.intent), status: snapshot.selection.status)
+    }
+
+    /// ProfileStore publishes in willSet. Call this after that publication commits so the
+    /// existing profile builders read the new watch dictionary, once per actual mutation.
+    @discardableResult
+    private func refreshOverlayHistoryProjection() -> Bool {
+        guard !core.usesNativeProfileState, !profiles.activeUsesEngineHistory else { return false }
+        let store = profiles
+        return overlayHistory.accept(store.watch, owner: store.activeID) {
+            (cw: store.cwItems, library: store.libraryItems)
+        }
+    }
+
+    private var localContinueWatchingItems: [CoreCWItem] {
+        core.usesNativeProfileState || profiles.activeUsesEngineHistory
+            ? core.continueWatching : overlayHistory.value(for: profiles.activeID)?.cw ?? []
+    }
+
+    private var homeHistoryKey: [AppleHomeHistoryProjection.Key] {
+        AppleHomeHistoryProjection.key(localContinueWatchingItems)
+    }
+
+    /// Selection sorting and metadata/card conversion happen on source publications, never
+    /// on unrelated Home body evaluations. The selected user window (including 100/90 days)
+    /// remains intact; only observer/hero inputs are capped at thirty.
+    private func refreshContinueWatchingPresentation(localItems: [CoreCWItem]? = nil, selectionChanged: Bool = true) {
+        let incoming = localItems ?? localContinueWatchingItems
+        let reusable = !selectionChanged ? cachedContinueWatching.flatMap { cached in
+            cached.selection.intent.isCurrent(core: core, profiles: profiles) ? cached : nil
+        } : nil
+        let input = reusable?.localInput ?? AppleHomeHistoryProjection.inputKey(incoming)
+        if localItems != nil, selectionChanged, let cached = cachedContinueWatching,
+           cached.localInput == input,
+           cached.selection.intent.isCurrent(core: core, profiles: profiles) { return }
+        let snapshot: HomeContinueWatchingSelection.Snapshot
+        if let cached = reusable {
+            snapshot = cached.selection
+        } else {
+            snapshot = HomeContinueWatchingSelection.current(core: core, profiles: profiles,
+                localItemsOverride: incoming)
+        }
         let selection = snapshot.selection
         let residentCatalog = core.boardRows.flatMap(\.items)
         let items = selection.items.map {
@@ -1100,7 +1160,7 @@ struct iOSHomeView: View {
             }
             return cinemaHistoryRailItem($0, catalog: residentCatalog, residentMeta: core.metaDetails?.meta)
         }
-        return iOSCWRenderSnapshot(
+        let render = iOSCWRenderSnapshot(
             items: items,
             provenance: iOSCWProducerProvenance(
                 source: selection.source,
@@ -1109,6 +1169,14 @@ struct iOSHomeView: View {
             ),
             status: selection.status
         )
+        cachedContinueWatching = iOSCWPresentationSnapshot(selection: snapshot, render: render, localInput: input)
+    }
+
+    private func refreshContinueWatchingAfterHistoryReceipt() {
+        // The source payload already updated a current producer. A receipt only needs to
+        // reselect a snapshot captured before the account/profile binding finished settling.
+        guard cachedContinueWatching?.selection.intent.isCurrent(core: core, profiles: profiles) != true else { return }
+        refreshContinueWatchingPresentation(selectionChanged: false)
     }
 
     private var continueWatchingItems: [RailItem] {
@@ -1213,7 +1281,7 @@ struct iOSHomeView: View {
         let metaByID = Dictionary(core.boardRows.flatMap { $0.items }.map { ($0.id, $0) },
                                   uniquingKeysWith: { first, _ in first })
         // Overlay profiles seed from their own watch overlay, never the account's CW.
-        let cwSource = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
+        let cwSource = localContinueWatchingItems
         var items: [FeaturedHeroItem] = cwSource.prefix(3).map { cw in
             if let meta = metaByID[cw.id] { return FeaturedHeroItem.from(meta: meta) }
             return FeaturedHeroItem.from(cw: cw)
@@ -1517,16 +1585,22 @@ struct iOSHomeView: View {
         // hero rotation while this is not the visible tab and re-arm it on return (#24 main-thread work).
         .onChange(of: isActive) { active in
             if active {
+                refreshContinueWatchingPresentation(selectionChanged: false)
                 if scenePhase == .active { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
                 hero.seed(heroCandidates, reduceMotion: reduceMotion)
             } else { hero.stop() }
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .active, isActive { HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles) }
+            if phase == .active, isActive {
+                refreshContinueWatchingPresentation()
+                HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
+            }
         }
         // Reseed the pool as content arrives; the model ignores no-op reseeds so rotation isn't reset
         // by routine engine re-emits.
         .onAppear {
+            _ = refreshOverlayHistoryProjection()
+            refreshContinueWatchingPresentation()
             // Populate the board on appear (mirrors Discover/Library) so the default Cinemeta catalogs
             // fill Home even when SIGNED OUT; the landing screen shows a real backdrop hero + rails
             // instead of a bare empty state. The Sign In button stays in the toolbar. Guarded on empty
@@ -1542,34 +1616,24 @@ struct iOSHomeView: View {
             if showCuratedRails { curated.load() }
             if showCollectionsHub { collectionsHub.load() }
         }
-        // Key Home refreshes off COARSE signals instead of `core.revision`, which bumps on EVERY NewState
-        // (background sync, catalog paging, search echoes, meta_details bursts) and so re-ran Top Picks, the
-        // Upcoming Episodes calendar, and the hero reseed on idle engine churn.
-        //
-        // THE RULE per signal: a BOUNDED collection is keyed on its EXACT ordered id set (zero missed changes);
-        // an UNBOUNDED one is keyed on a "<first id>#<count>" FINGERPRINT plus a documented bound, because an
-        // exact id key would be O(collection) work on EVERY body evaluation, the very storm this removes.
-        //   - `profiles.cwItems` is BOUNDED (hard-capped at 30 in Profiles.cwItems `.prefix(30)`), so it keys on
-        //     the exact ordered watched/progress fingerprint joined by a control char no id contains: insert,
-        //     remove, reorder, interior swaps, and real watch mutations all fire.
-        //   - `core.continueWatching` is UNBOUNDED: it is the engine `continue_watching_preview`, i.e. every
-        //     in-progress library title, bounded only by the (unbounded) library, with no in-app cap. So it
-        //     keeps the fingerprint. `core.library` (whole library) is the same case.
-        //   - `core.boardRows` is small in practice but keeps the fingerprint too, DELIBERATELY: it feeds only
-        //     the hero pool, where a miss is cosmetic and self-heals on the next distinguishing change, so the
-        //     cheap key is worth the asymmetry with cwItems.
-        // DOCUMENTED BOUND for the fingerprinted signals: a same-count interior swap in a SINGLE emit (one title
-        // replaced by another at a non-head position) leaves first-id and count unchanged and does not fire for
-        // the UNBOUNDED core collections; a per-body content hash is deliberately avoided (this body re-evaluates
-        // far too often to hash an unbounded collection each pass). The next real CW / board / profile change,
-        // or an app foreground, reconciles it. Core progress ticks still use that coarse bound; the bounded overlay
-        // fingerprint above intentionally fires on a real progress mutation. hero.seed stays gated on the visible tab
-        // (`isActive`): `seed` re-arms the rotation timer, which a hidden (opacity-switched) Home must not do;
-        // the isActive onChange reseeds on return.
-        .onChange(of: "\(core.boardRows.first?.id ?? "-")#\(core.boardRows.count)") { _ in
-            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        // Board publications refresh resident metadata once; history observers below compare
+        // at most thirty exact visible entries, including interior progress and artwork changes.
+        // ProfileStore.cwItems itself is unbounded and is evaluated only at its watch publication.
+        .onReceive(core.$boardRows.dropFirst()) { _ in
+            DispatchQueue.main.async {
+                refreshContinueWatchingPresentation(selectionChanged: false)
+                if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+            }
         }
-        .onChange(of: "\(core.continueWatching.first?.id ?? "-")#\(core.continueWatching.count)") { _ in
+        .onReceive(core.$metaDetails.dropFirst()) { _ in
+            DispatchQueue.main.async { refreshContinueWatchingPresentation(selectionChanged: false) }
+        }
+        .onReceive(core.$continueWatching.dropFirst()) { items in
+            guard core.usesNativeProfileState || profiles.activeUsesEngineHistory else { return }
+            refreshContinueWatchingPresentation(localItems: items)
+        }
+        .onChange(of: homeHistoryKey) { _ in
+            guard core.usesNativeProfileState || profiles.activeUsesEngineHistory else { return }
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
         }
         // The old `.onChange(of: core.revision)` hook observed every board/meta event. Observe the
@@ -1577,45 +1641,69 @@ struct iOSHomeView: View {
         // check was only a latest-event hint and is intentionally replaced by the durable receipt below.
         .onChange(of: core.lastAcceptedHistoryReceipt?.revision) { _ in
             guard core.lastAcceptedHistoryReceipt != nil else { return }
+            refreshContinueWatchingAfterHistoryReceipt()
             refreshTopPicks()
         }
     }
 
     private var homeAccountObservers: some View {
         homeHistoryObservers
-        // An overlay profile draws its Continue Watching from `profiles.cwItems` (bounded, exact id-set key
-        // above), not the engine, so its own plays must also re-seed the hero and Top Picks (the engine-CW
-        // onChange never fires for them).
-        // Overlay history is bounded, so observe exact watched/progress state instead of only ids. An
-        // interior watch mutation must refresh recommendations for the active local profile.
-        .onChange(of: BecauseYouWatchedModel.observationSignature(items: profiles.cwItems)) { _ in
-            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        .onReceive(profiles.$watch) { watch in
+            let profileID = profiles.activeID
+            DispatchQueue.main.async {
+                guard profiles.activeID == profileID, profiles.watch == watch,
+                      refreshOverlayHistoryProjection() else { return }
+                if !core.usesNativeProfileState && !profiles.activeUsesEngineHistory {
+                    refreshContinueWatchingPresentation()
+                    if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+                    refreshTopPicks()
+                }
+            }
         }
         .onChange(of: profiles.activeID) { _ in
+            _ = refreshOverlayHistoryProjection()
+            refreshContinueWatchingPresentation()
             HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
         }
+        .onChange(of: core.usesNativeProfileState) { _ in
+            _ = refreshOverlayHistoryProjection()
+            refreshContinueWatchingPresentation()
+        }
+        .onChange(of: profiles.activeUsesEngineHistory) { _ in
+            _ = refreshOverlayHistoryProjection()
+            refreshContinueWatchingPresentation()
+            refreshTopPicks()
+        }
+        .onChange(of: profiles.active?.discovery?.continueWatchingSource) { _ in refreshContinueWatchingPresentation() }
+        .onChange(of: profiles.active?.discovery?.continueWatchingWindow) { _ in refreshContinueWatchingPresentation() }
         .onChange(of: continueWatchingSource) { _ in
+            refreshContinueWatchingPresentation()
             HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
             refreshTopPicks()
         }
-        .onChange(of: continueWatchingWindow) { _ in traktContinueWatchingRevision &+= 1 }
+        .onChange(of: continueWatchingWindow) { _ in refreshContinueWatchingPresentation() }
         .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingPreferences.changedNote)) { _ in
             HomeContinueWatchingSelection.refreshCurrent(core: core, profiles: profiles)
-            traktContinueWatchingRevision &+= 1
+            refreshContinueWatchingPresentation()
         }
         .onReceive(NotificationCenter.default.publisher(for: SIMKLContinueWatchingShadow.changedNote)) { _ in
-            traktContinueWatchingRevision &+= 1
+            refreshContinueWatchingPresentation()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktPlaybackShadow.changedNote)) { _ in
-            traktContinueWatchingRevision &+= 1
+            refreshContinueWatchingPresentation()
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
             refreshTopPicks()
         }
         // Library membership drives both Top Picks (its seed set includes the library) and Upcoming Episodes.
-        // Unbounded, so keyed on catalog.count with the same-count-swap bound documented above.
+        // Library membership remains independently keyed from the bounded visible CW observer.
         .onChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
+        .onReceive(core.$library.dropFirst()) { _ in
+            DispatchQueue.main.async {
+                refreshContinueWatchingPresentation(selectionChanged: continueWatchingSnapshot.selection.source.isPrivate)
+            }
+        }
         // The Upcoming Episodes bases come from `account.addons`, which loads async after sign-in; rebuild
         // once they arrive (same input set as the notification sweep).
         .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
@@ -1627,7 +1715,9 @@ struct iOSHomeView: View {
         // A same-slot credential replacement can retain the same email and isSignedIn=true. The
         // non-secret account-boundary generation is published by StremioAccount and is the refresh edge
         // for that replacement; CoreBridge rotates its settled binding before a history receipt is accepted.
-        .onReceive(account.$credentialBoundaryGeneration) { _ in refreshTopPicks() }
+        .onReceive(account.$credentialBoundaryGeneration) { _ in
+            DispatchQueue.main.async { refreshContinueWatchingPresentation(); refreshTopPicks() }
+        }
     }
 
     var body: some View {
@@ -1964,8 +2054,10 @@ struct iOSHomeView: View {
         let cw: [CoreCWItem]
         let library: [CoreCWItem]
         if !usesEngineHistory {
-            cw = profiles.cwItems
-            library = profiles.libraryItems
+            // The models bound their seeds internally, but need every owned title for
+            // recommendation exclusion. These full arrays were built at the watch edge.
+            cw = overlayHistory.value(for: profiles.activeID)?.cw ?? []
+            library = overlayHistory.value(for: profiles.activeID)?.library ?? []
         } else if core.settledActiveAccountBinding() != nil {
             cw = core.continueWatching
             library = core.library?.catalog ?? []
@@ -3106,6 +3198,63 @@ struct iOSDownloadsScreen: View {
 }
 #endif
 
+/// One shared presentation subscriber for both Apple search surfaces. CoreBridge owns query/
+/// owner fencing; only its accepted result publisher can rebuild the card projection.
+final class AppleSearchPresentation: ObservableObject {
+    static let shared = AppleSearchPresentation()
+    @Published private(set) var results = AppleSearchResultProjection([])
+    @Published private(set) var isLoading = false
+    @Published private(set) var suggestionTitles: [String] = []
+    private var subscriptions = Set<AnyCancellable>()
+    private weak var core: CoreBridge?
+    private var query = ""
+    private var lastResultInput: [AppleSearchResultProjection.Input]?
+    private let projectResults: ([CoreMeta]) -> AppleSearchResultProjection
+
+    init(projectResults: @escaping ([CoreMeta]) -> AppleSearchResultProjection = { AppleSearchResultProjection($0) }) {
+        self.projectResults = projectResults
+    }
+
+    func bind(to core: CoreBridge) {
+        guard self.core !== core else { return }
+        subscriptions.removeAll()
+        lastResultInput = nil
+        self.core = core
+        core.$searchResults.sink { [weak self] items in
+            guard let self else { return }
+            let input = AppleSearchResultProjection.inputKey(items)
+            guard self.lastResultInput != input else { return }
+            self.lastResultInput = input
+            self.results = self.projectResults(items)
+            self.scheduleSuggestionsRefresh()
+        }.store(in: &subscriptions)
+        core.$searchIsLoading.removeDuplicates().sink { [weak self] in self?.isLoading = $0 }
+            .store(in: &subscriptions)
+        core.$searchSuggestions.sink { [weak self] _ in self?.scheduleSuggestionsRefresh() }
+            .store(in: &subscriptions)
+        core.$continueWatching.sink { [weak self] _ in self?.scheduleSuggestionsRefresh() }
+            .store(in: &subscriptions)
+        core.$boardRows.sink { [weak self] _ in self?.scheduleSuggestionsRefresh() }
+            .store(in: &subscriptions)
+    }
+
+    func setQuery(_ query: String) {
+        self.query = query
+        refreshSuggestions()
+    }
+
+    private func scheduleSuggestionsRefresh() {
+        // @Published delivers before storage commits. Suggestions use the committed source
+        // snapshot; accepted result cards above use the publication payload directly.
+        DispatchQueue.main.async { [weak self] in self?.refreshSuggestions() }
+    }
+
+    private func refreshSuggestions() {
+        let titles = core?.searchSuggestionTitles(for: query) ?? []
+        if titles != suggestionTitles { suggestionTitles = titles }
+    }
+}
+
 /// Search across every installed add-on, on the engine (debounced). Mirrors the tvOS `SearchView`:
 /// results are grouped into Movies / Series / Other rail sections (#16) rather than one flat grid, a
 /// "Play a link or magnet" entry sits at the top (the touch/Mac `OpenLinkView`), inline suggestions
@@ -3115,7 +3264,8 @@ struct iOSDownloadsScreen: View {
 struct iOSSearchView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
-    @EnvironmentObject private var core: CoreBridge
+    private let core: CoreBridge
+    @StateObject private var searchPresentation = AppleSearchPresentation.shared
     @EnvironmentObject private var account: StremioAccount   // passed to the lifted paste-a-link player
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // per-profile recent searches (#90, ported from tvOS)
@@ -3134,6 +3284,11 @@ struct iOSSearchView: View {
     @State private var pendingLaunch: iOSPlayerLaunch?  // staged while the link sheet dismisses, presented in onDismiss
     @State private var history: [String] = []           // recent searches for the active profile (#90)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
+
+    init(isActive: Bool = true, core: CoreBridge = .shared) {
+        self.isActive = isActive
+        self.core = core
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -3182,10 +3337,13 @@ struct iOSSearchView: View {
                 iOSCategoryBrowse(target: target, path: $path)
             }
             .onAppear {
+                searchPresentation.bind(to: core)
+                searchPresentation.setQuery(query)
                 core.loadSearchSuggestions()
                 history = SearchHistoryStore.load(profileID: profiles.activeID)
             }
             .onChange(of: query) { value in
+                searchPresentation.setQuery(value)
                 let alreadySubmitted = submittedSuggestion == value
                 submittedSuggestion = nil
                 if alreadySubmitted { return }
@@ -3380,7 +3538,7 @@ struct iOSSearchView: View {
         if !hasSearchQuery {
             ContentUnavailableViewCompat(title: "Search", systemImage: "magnifyingglass",
                 message: "Search across everything your add-ons cover.").frame(minHeight: 360)
-        } else if core.searchResults.isEmpty {
+        } else if searchPresentation.results.isEmpty {
             ContentUnavailableViewCompat(
                 title: isWaitingForCurrentQuery ? "Searching…" : "No results",
                 systemImage: "magnifyingglass",
@@ -3391,11 +3549,7 @@ struct iOSSearchView: View {
             // catalog actions (#14).
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(resultSections, id: \.title) { section in
-                    PosterRail(title: section.title, items: section.items.map {
-                            RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
-                                     background: $0.background, description: $0.description,
-                                     releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-                        }, onTap: { item in
+                    PosterRail(title: section.title, items: section.items, onTap: { item in
                             saveToHistory(query)
                             path.append(FeaturedHeroItem.from(rail: item))
                         }, onWatch: watchFromQuickView, menu: .catalog, showWatchedBadges: true)
@@ -3405,19 +3559,20 @@ struct iOSSearchView: View {
     }
 
     /// Group results into Movies / Series / Other, dropping empty sections, the tvOS `resultSections`.
-    private var resultSections: [(title: String, items: [CoreMeta])] {
-        let movies = core.searchResults.filter { $0.type == "movie" }
-        let series = core.searchResults.filter { $0.type == "series" }
-        let collections = core.searchResults.filter { ["collection", "collections"].contains($0.type) }
-        let other = core.searchResults.filter { !["series", "movie", "collection", "collections"].contains($0.type) }
-        return [(String(localized: "Movies"), movies),
-                (String(localized: "Series"), series),
-                (String(localized: "Collections"), collections),
-                (String(localized: "Other"), other)]
-            .filter { !$0.items.isEmpty }
+    private var resultSections: [(title: String, items: [RailItem])] {
+        searchPresentation.results.sections.map { section in
+            let title: String
+            switch section.id {
+            case .movies: title = String(localized: "Movies")
+            case .series: title = String(localized: "Series")
+            case .collections: title = String(localized: "Collections")
+            case .other: title = String(localized: "Other")
+            }
+            return (title: title, items: section.items)
+        }
     }
 
-    private var suggestionTitles: [String] { core.searchSuggestionTitles(for: query) }
+    private var suggestionTitles: [String] { searchPresentation.suggestionTitles }
 
     /// Recent searches (per profile, sync-backed) shown when the field is empty, the touch/Mac twin of
     /// the tvOS SearchView history row (#90). Tap a chip to re-run it; Clear wipes the list.
@@ -3467,7 +3622,7 @@ struct iOSSearchView: View {
     }
 
     private var isWaitingForCurrentQuery: Bool {
-        hasSearchQuery && (searchDebouncePending || core.searchIsLoading)
+        hasSearchQuery && (searchDebouncePending || searchPresentation.isLoading)
     }
 
     private func scheduleSearch(_ value: String) {
@@ -3509,6 +3664,7 @@ struct iOSDiscoverView: View {
     @State private var searchQuery = ""
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
+    @StateObject private var searchPresentation = AppleSearchPresentation.shared
     @State private var path = NavigationPath()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     /// Presents the advanced filter panel (genre / year / age rating / duration / seasons / upcoming).
@@ -3624,7 +3780,10 @@ struct iOSDiscoverView: View {
             .navigationDestination(for: HubTarget.self) { target in
                 iOSCategoryBrowse(target: target, path: $path)
             }
-            .onAppear { if core.discover == nil { core.loadDiscover() } }
+            .onAppear {
+                searchPresentation.bind(to: core)
+                if core.discover == nil { core.loadDiscover() }
+            }
             // Advanced filter panel. Presented as a sheet (never a `.toolbar` item, which realizes on the
             // single shared macOS window toolbar and crashes in _insertNewItemWithItemIdentifier, the same
             // NSToolbar-insert crash class the wordmark/search items are gated for).
@@ -3730,30 +3889,27 @@ struct iOSDiscoverView: View {
     /// rail layout as iOSSearchView so behavior is identical whether search lives in its own tab or here.
     @ViewBuilder private var mergedSearchResults: some View {
         CinemaSearchCollections(query: searchQuery) { path.append($0) }
-        if core.searchResults.isEmpty {
+        if searchPresentation.results.isEmpty {
             ContentUnavailableViewCompat(
-                title: (searchDebouncePending || core.searchIsLoading) ? "Searching…" : "No results",
+                title: (searchDebouncePending || searchPresentation.isLoading) ? "Searching…" : "No results",
                 systemImage: "magnifyingglass",
-                message: (searchDebouncePending || core.searchIsLoading) ? "" : "Nothing matched what you typed.")
+                message: (searchDebouncePending || searchPresentation.isLoading) ? "" : "Nothing matched what you typed.")
                 .frame(minHeight: 360)
         } else {
-            let movies = core.searchResults.filter { $0.type == "movie" }
-            let series = core.searchResults.filter { $0.type == "series" }
-            let collections = core.searchResults.filter { ["collection", "collections"].contains($0.type) }
-            let other = core.searchResults.filter { !["series", "movie", "collection", "collections"].contains($0.type) }
-            let sections = [(String(localized: "Movies"), movies),
-                            (String(localized: "Series"), series),
-                            (String(localized: "Collections"), collections),
-                            (String(localized: "Other"), other)]
-                .filter { !$0.1.isEmpty }
+            let sections = searchPresentation.results.sections.map { section -> (String, [RailItem]) in
+                let title: String
+                switch section.id {
+                case .movies: title = String(localized: "Movies")
+                case .series: title = String(localized: "Series")
+                case .collections: title = String(localized: "Collections")
+                case .other: title = String(localized: "Other")
+                }
+                return (title, section.items)
+            }
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 ForEach(sections, id: \.0) { section in
                     PosterRail(title: section.0,
-                               items: section.1.map {
-                                   RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
-                                            background: $0.background, description: $0.description,
-                                            releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-                               },
+                               items: section.1,
                                onTap: { path.append(FeaturedHeroItem.from(rail: $0)) },
                                onWatch: watchFromQuickView,
                                menu: .catalog, showWatchedBadges: true)
