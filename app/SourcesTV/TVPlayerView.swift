@@ -2077,14 +2077,13 @@ struct TVPlayerView: View {
                 let supersededTick = supersededAdvance?.pending.issued == true
                     && event.loadToken == supersededAdvance?.pending.loadToken
                 if supersededTick { return }
-                let avPlayerRenderedFrame =
-                    (coordinator.player as? AVPlayerEngineController)?
-                        .hasProducedPlayableVideoFrame == true
+                let avStartEvidence = (coordinator.player as? AVPlayerEngineController)?.playbackStartEvidence
                 if pendingAdvance?.issued == true,
                    event.loadToken == pendingAdvance?.loadToken,
                    ApplePlaybackStartPolicy.shouldIgnoreIssuedAdvanceTick(
                     positionSeconds: d,
-                    avPlayerRenderedFrame: avPlayerRenderedFrame
+                    positionSettled: event.transportSettled,
+                    avPlayerEvidence: avStartEvidence
                    ) { return }
                 // Publish-at-first-frame guard: a tick of the OUTGOING file during an advance's resolve
                 // window (the incoming load has NOT been handed to the player yet, so the previous episode
@@ -2094,7 +2093,8 @@ struct TVPlayerView: View {
                 let outgoingResolveTick = pendingAdvance != nil && pendingAdvance?.issued != true
                 if ApplePlaybackStartPolicy.hasStarted(
                     positionSeconds: d,
-                    avPlayerRenderedFrame: avPlayerRenderedFrame),
+                    positionSettled: event.transportSettled,
+                    avPlayerEvidence: avStartEvidence),
                    !hasStartedPlaying, !outgoingResolveTick {            // playback actually began
                     if let pending = pendingAdvance {
                         guard pending.generation == episodeSwitchGeneration,

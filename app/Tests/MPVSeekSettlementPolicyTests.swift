@@ -101,6 +101,17 @@ enum MPVSeekSettlementPolicyTests {
         let owner = PlayerLoadToken()
         let av = PlayerTimePositionEvent(seconds: 366, loadToken: owner)
         check(av.transportSettled && av.positionSettled && av.mpvSeekSettlement == nil, "AV initializer unchanged")
+        let optimisticAV = PlayerTimePositionEvent(seconds: 366, loadToken: owner, positionSettled: false)
+        check(!optimisticAV.transportSettled && !optimisticAV.positionSettled
+                && optimisticAV.mpvSeekSettlement == nil,
+              "AV optimistic seek target carries no settled transport or MPV receipt")
+        let completedAV = PlayerTimePositionEvent(seconds: 365.8, loadToken: owner, positionSettled: true)
+        check(completedAV.transportSettled && completedAV.positionSettled,
+              "AV actual seek completion explicitly restores settled position")
+        let explicitMPV = PlayerTimePositionEvent(seconds: 365.8, loadToken: owner,
+            mpvSeekSettlement: MPVSeekSettlementEvidence(generation: 7, settled: true), positionSettled: false)
+        check(explicitMPV.transportSettled && explicitMPV.positionSettled,
+              "MPV evidence takes precedence over the non-MPV initializer flag")
         let ambiguousEvent = PlayerTimePositionEvent(seconds: 99, loadToken: owner,
             mpvSeekSettlement: MPVSeekSettlementEvidence(generation: 7, settled: true, attributed: false))
         check(ambiguousEvent.positionSettled && !ambiguousEvent.transportSettled,

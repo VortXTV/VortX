@@ -269,31 +269,146 @@ private enum TVAVStartWatchdogPolicyTests {
             ) == .cancel
         )
 
+        let videoWaiting = StartPolicy.AVPlayerEvidence(
+            requiresVideoFrame: true, renderedVideoFrame: false, settledNativeClockAdvanced: false)
+        let videoRendered = StartPolicy.AVPlayerEvidence(
+            requiresVideoFrame: true, renderedVideoFrame: true, settledNativeClockAdvanced: false)
         check(
             "first frame: AVPlayer render proof commits playback while its clock is still zero",
-            StartPolicy.hasStarted(positionSeconds: 0, avPlayerRenderedFrame: true)
+            StartPolicy.hasStarted(positionSeconds: 0, avPlayerEvidence: videoRendered)
         )
         check(
             "first frame: zero without render proof remains unstarted",
-            !StartPolicy.hasStarted(positionSeconds: 0, avPlayerRenderedFrame: false)
+            !StartPolicy.hasStarted(positionSeconds: 0, avPlayerEvidence: videoWaiting)
         )
         check(
             "first frame: positive libmpv time still commits without AVPlayer proof",
-            StartPolicy.hasStarted(positionSeconds: 0.001, avPlayerRenderedFrame: false)
+            StartPolicy.hasStarted(positionSeconds: 0.001)
+        )
+        check(
+            "regression: remux source origin is not a rendered AVPlayer frame",
+            !StartPolicy.hasStarted(positionSeconds: 120, avPlayerEvidence: videoWaiting)
+        )
+        check(
+            "regression: pending AVPlayer replacement keeps first-frame ownership before picture",
+            StartPolicy.shouldIgnoreIssuedAdvanceTick(
+                positionSeconds: 120, avPlayerEvidence: videoWaiting)
         )
         check(
             "pending advance: zero-clock AVPlayer frame reaches first-frame commit",
             !StartPolicy.shouldIgnoreIssuedAdvanceTick(
                 positionSeconds: 0,
-                avPlayerRenderedFrame: true)
+                avPlayerEvidence: videoRendered)
         )
         check(
             "pending advance: zero-clock tick without render proof remains ignored",
             StartPolicy.shouldIgnoreIssuedAdvanceTick(
                 positionSeconds: 0,
-                avPlayerRenderedFrame: false)
+                avPlayerEvidence: videoWaiting)
         )
+        check("first frame: known video cannot start from audio/native-clock progress alone",
+            !StartPolicy.hasStarted(positionSeconds: 120.25, avPlayerEvidence: .init(
+                requiresVideoFrame: true, renderedVideoFrame: false, settledNativeClockAdvanced: true)))
+        check("first frame: optimistic seek cannot start even with picture evidence",
+            !StartPolicy.hasStarted(positionSeconds: 120, positionSettled: false, avPlayerEvidence: videoRendered))
+        let rawSeekPending = StartPolicy.AVPlayerEvidence(requiresVideoFrame: true,
+            renderedVideoFrame: true, settledNativeClockAdvanced: false, positionSettled: false)
+        check("queued settled event: current pre-start seek cannot commit even with picture evidence",
+            !StartPolicy.hasStarted(positionSeconds: 120, positionSettled: true, avPlayerEvidence: rawSeekPending)
+                && StartPolicy.shouldIgnoreIssuedAdvanceTick(
+                    positionSeconds: 120, positionSettled: true, avPlayerEvidence: rawSeekPending))
+        check("first frame: unsettled libmpv target cannot start",
+            !StartPolicy.hasStarted(positionSeconds: 120, positionSettled: false))
+        check("first frame: libmpv zero and invalid positions remain unstarted",
+            !StartPolicy.hasStarted(positionSeconds: 0)
+                && !StartPolicy.hasStarted(positionSeconds: .nan, avPlayerEvidence: videoRendered)
+                && !StartPolicy.hasStarted(positionSeconds: .infinity, avPlayerEvidence: videoRendered)
+                && !StartPolicy.hasStarted(positionSeconds: -1, avPlayerEvidence: videoRendered))
 
+        var startupClock = StartPolicy.NativeClockProgress()
+        startupClock.reset(generation: 1)
+        startupClock.observe(generation: 1, playerSeconds: 120, transportRunning: true, positionSettled: true)
+        check("direct audio/HLS: initial positive native position is not advancement",
+            !startupClock.hasAdvanced(generation: 1))
+        startupClock.observe(generation: 1, playerSeconds: 120, transportRunning: true, positionSettled: true)
+        check("direct audio/HLS: frozen positive native position remains unstarted",
+            !StartPolicy.hasStarted(positionSeconds: 120, avPlayerEvidence: .init(
+                requiresVideoFrame: false, renderedVideoFrame: false,
+                settledNativeClockAdvanced: startupClock.hasAdvanced(generation: 1))))
+        startupClock.observe(generation: 1, playerSeconds: 120.25, transportRunning: true, positionSettled: true)
+        check("direct audio/HLS: settled native advancement starts without video track metadata",
+            StartPolicy.hasStarted(positionSeconds: 120.25, avPlayerEvidence: .init(
+                requiresVideoFrame: false, renderedVideoFrame: false,
+                settledNativeClockAdvanced: startupClock.hasAdvanced(generation: 1))))
+        check("PiP/background: existing exact-item picture proof does not require native-clock progress",
+            StartPolicy.hasStarted(positionSeconds: 0, avPlayerEvidence: videoRendered))
+
+        // URL and logical load token can remain the same during an HDR-item replacement. The item
+        // generation must retire both the already-latched progress and any delayed old observer tick.
+        startupClock.reset(generation: 2)
+        startupClock.observe(generation: 1, playerSeconds: 121, transportRunning: true, positionSettled: true)
+        check("same-URL/token item replacement: old generation cannot seed current native progress",
+            !startupClock.hasAdvanced(generation: 1) && !startupClock.hasAdvanced(generation: 2))
+        startupClock.observe(generation: 2, playerSeconds: 0, transportRunning: true, positionSettled: true)
+        startupClock.observe(generation: 2, playerSeconds: 180, transportRunning: true, positionSettled: false)
+        startupClock.observe(generation: 2, playerSeconds: 180, transportRunning: true, positionSettled: true)
+        check("direct audio/HLS: optimistic seek jump cannot count as native advancement",
+            !startupClock.hasAdvanced(generation: 2))
+        startupClock.observe(generation: 2, playerSeconds: 200, transportRunning: false, positionSettled: true)
+        startupClock.observe(generation: 2, playerSeconds: 200, transportRunning: true, positionSettled: true)
+        check("direct audio/HLS: paused gap cannot count as native advancement",
+            !startupClock.hasAdvanced(generation: 2))
+        startupClock.observe(generation: 2, playerSeconds: .nan, transportRunning: true, positionSettled: true)
+        startupClock.observe(generation: 2, playerSeconds: 201, transportRunning: true, positionSettled: true)
+        check("direct audio/HLS: invalid native sample clears the advancement baseline",
+            !startupClock.hasAdvanced(generation: 2))
+        startupClock.observe(generation: 2, playerSeconds: 201.25, transportRunning: true, positionSettled: true)
+        check("direct audio/HLS: actual progress after seek/pause still starts",
+            startupClock.hasAdvanced(generation: 2))
+        startupClock.reset(generation: nil)
+        startupClock.observe(generation: 2, playerSeconds: 202, transportRunning: true, positionSettled: true)
+        check("teardown: delayed native progress cannot revive the retired item",
+            !startupClock.hasAdvanced(generation: 2))
+
+        // Exercise the current engine's synchronous seek-supersession wiring: no periodic tick is
+        // delivered while this seek is pending. Its first completed position is a jump, not playback.
+        let startupEngineSource = (try? String(contentsOfFile: "app/Sources/Player/AVPlayerEngine.swift", encoding: .utf8)) ?? ""
+        startupClock.reset(generation: 3)
+        startupClock.observe(generation: 3, playerSeconds: 0, transportRunning: true, positionSettled: true)
+        if let start = startupEngineSource.range(of: "private func supersedeSeekRequest()"),
+           let end = startupEngineSource.range(of: "seekDestination.clear()", range: start.upperBound..<startupEngineSource.endIndex),
+           startupEngineSource[start.upperBound..<end.lowerBound].contains("nativeStartupClock.reset(generation: itemGeneration)") {
+            startupClock.reset(generation: 3)
+        }
+        startupClock.observe(generation: 3, playerSeconds: 120, transportRunning: true, positionSettled: true)
+        check("seek between observer ticks: current seek supersession cannot turn a landing jump into playback",
+            !startupClock.hasAdvanced(generation: 3))
+        startupClock.observe(generation: 3, playerSeconds: 120.25, transportRunning: true, positionSettled: true)
+        check("seek between observer ticks: subsequent native progress is accepted",
+            startupClock.hasAdvanced(generation: 3))
+
+        startupClock.beginSeek(generation: 3, requestID: 40)
+        startupClock.finishSeek(generation: 3, requestID: 40)
+        startupClock.observe(generation: 3, playerSeconds: 300, transportRunning: true, positionSettled: true)
+        check("pre-start seek: synchronous issue/completion cannot count its first landing as advancement",
+            !startupClock.hasAdvanced(generation: 3))
+        startupClock.beginSeek(generation: 3, requestID: 41)
+        startupClock.beginSeek(generation: 3, requestID: 42)
+        startupClock.finishSeek(generation: 3, requestID: 41)
+        startupClock.observe(generation: 3, playerSeconds: 400, transportRunning: true, positionSettled: true)
+        startupClock.observe(generation: 3, playerSeconds: 400.25, transportRunning: true, positionSettled: true)
+        check("same-item/token seek replacement: stale completion cannot clear the newer pending seek",
+            startupClock.isSeekPending(generation: 3) && !startupClock.hasAdvanced(generation: 3))
+        startupClock.reset(generation: 4)
+        startupClock.beginSeek(generation: 4, requestID: 43)
+        startupClock.finishSeek(generation: 3, requestID: 43)
+        check("same-URL/token item replacement: stale completion with matching request cannot clear new item",
+            startupClock.isSeekPending(generation: 4))
+        startupClock.finishSeek(generation: 4, requestID: 43)
+        startupClock.observe(generation: 4, playerSeconds: 500, transportRunning: true, positionSettled: true)
+        startupClock.observe(generation: 4, playerSeconds: 500.25, transportRunning: true, positionSettled: true)
+        check("pre-start seek: exact completion restores subsequent native-clock advancement",
+            !startupClock.isSeekPending(generation: 4) && startupClock.hasAdvanced(generation: 4))
         check(
             "load timeout: an active AVPlayer remux defers to its progress-aware watchdog",
             StartPolicy.genericLoadTimeoutDefersToRemuxWatchdog(
@@ -367,6 +482,39 @@ private enum TVAVStartWatchdogPolicyTests {
             && engineSource.contains("nativePreflightTimeoutSeconds"))
         check("native DV: actual item attachment publishes the decode boundary", engineSource.contains("nativePreflightState.didAttach(")
             && engineSource.contains("uptime: ProcessInfo.processInfo.systemUptime"))
+        check("AV startup: known DV/remux requires picture while unknown direct audio keeps clock proof",
+            engineSource.contains("requiresVideoFrame: contentIsDolbyVision || isRemuxMounted")
+                && engineSource.contains("renderedVideoFrame: hasProducedPlayableVideoFrame")
+                && engineSource.contains("nativeStartupClock.hasAdvanced(generation: itemGeneration)"))
+        check("AV startup: queued settled events also require live native settlement",
+            engineSource.contains("positionSettled: !seekEndBoundary.isPending")
+                && engineSource.contains("!nativeStartupClock.isSeekPending(generation: itemGeneration)"))
+        check("AV startup: exact observed generation owns native-clock progress",
+            engineSource.contains("let observedGeneration = itemGeneration")
+                && engineSource.contains("nativeStartupClock.reset(generation: observedGeneration)")
+                && engineSource.contains("generation: observedGeneration, playerSeconds: time.seconds")
+                && engineSource.contains("self.owns(item, loadToken: loadToken) else { return }")
+                && engineSource.contains("nativeStartupClock.reset(generation: nil)"))
+        check("AV seek: optimistic and completed positions have distinct settlement",
+            engineSource.contains("publishSeekPosition(playerSeconds: clamped, positionSettled: false)")
+                && engineSource.contains("publishSeekPosition(playerSeconds: landing, positionSettled: true)")
+                && engineSource.contains("let positionSettled = !self.seekEndBoundary.isPending"))
+        check("AV seek: completion and queued position delivery retain exact item and seek ownership",
+            engineSource.contains("self.itemGeneration == seekGeneration")
+                && engineSource.contains("self.item === seekItem")
+                && engineSource.contains("self.activeLoadToken == seekLoadToken")
+                && engineSource.contains("loadToken: loadToken, seekRequestID: seekRequestGeneration")
+                && engineSource.contains("loadToken: loadToken, seekRequestID: self.seekRequestGeneration")
+                && engineSource.contains("capturedItemGeneration == self.itemGeneration")
+                && engineSource.contains("seekRequestID == nil || seekRequestID == self.seekRequestGeneration"))
+        check("AV pre-start: both direct and preroll seeks retain pending startup proof and exact completion",
+            engineSource.contains("seekBeforeStart(playerSeconds: playerSeconds, item: item, loadToken: loadToken)")
+                && engineSource.contains("seekBeforeStart(playerSeconds: target, item: item, loadToken: loadToken)")
+                && engineSource.contains("nativeStartupClock.beginSeek(generation: generation, requestID: requestID)")
+                && engineSource.contains("self.itemGeneration == generation,")
+                && engineSource.contains("self.seekRequestGeneration == requestID,")
+                && engineSource.contains("self.nativeStartupClock.finishSeek(generation: generation, requestID: requestID)")
+                && engineSource.contains("!self.nativeStartupClock.isSeekPending(generation: observedGeneration)"))
 
         for (label, path) in [
             ("iOS/macOS", "app/Sources/PlayerScreen.swift"),
@@ -374,7 +522,10 @@ private enum TVAVStartWatchdogPolicyTests {
         ] {
             let source = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
             check("\(label): first frame at zero is shared", source.contains("ApplePlaybackStartPolicy.hasStarted(")
-                && source.contains("hasProducedPlayableVideoFrame"))
+                && source.contains("playbackStartEvidence"))
+            check("\(label): startup and incoming-episode commit both require settled engine proof",
+                source.components(separatedBy: "positionSettled: event.transportSettled").count == 3
+                    && source.components(separatedBy: "avPlayerEvidence: avStartEvidence").count == 3)
             check("\(label): load timers defer to the remux owner", source.contains("ApplePlaybackStartPolicy.genericLoadTimeoutDefersToRemuxWatchdog("))
             if let start = source.range(of: "private func startAVStartWatchdog()") {
                 let watchdog = String(source[start.lowerBound...])

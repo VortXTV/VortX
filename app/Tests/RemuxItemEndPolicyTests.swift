@@ -392,7 +392,7 @@ enum RemuxItemEndPolicyTests {
                   "return", "self.seekEndBoundary.finish", "self.completeSeekAdmission"]))
         check("wiring: successful seek corrects paused position and cue from the producer's same actual landing",
               containsInOrder(completion, ["let landing = self.player.currentTime().seconds",
-                  "self.completeSeekAdmission", "playerSeconds: landing", "self.publishSeekPosition(playerSeconds: landing)"]))
+                  "self.completeSeekAdmission", "playerSeconds: landing", "self.publishSeekPosition(playerSeconds: landing, positionSettled: true)"]))
         let seekDeadline = sourceSection(engine, from: "private func armSeekCompletionDeadline", to: "private func registerSeekAdmission")
         check("wiring: deadline checks owner then invalidates before native cancellation and target-only remount",
               containsInOrder(seekDeadline, ["Task.sleep", "self.seekRequestGeneration == requestID",

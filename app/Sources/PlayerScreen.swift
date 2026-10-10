@@ -2912,12 +2912,12 @@ struct PlayerScreen: View {
                 let supersededTick = supersededAdvance?.pending.issued == true
                     && event.loadToken == supersededAdvance?.pending.loadToken
                 if supersededTick { return }
-                let renderedAVFrame = (coordinator.player as? AVPlayerEngineController)?
-                    .hasProducedPlayableVideoFrame == true
+                let avStartEvidence = (coordinator.player as? AVPlayerEngineController)?.playbackStartEvidence
                 if pendingAdvance?.issued == true,
                    event.loadToken == pendingAdvance?.loadToken,
                    ApplePlaybackStartPolicy.shouldIgnoreIssuedAdvanceTick(
-                       positionSeconds: d, avPlayerRenderedFrame: renderedAVFrame) { return }
+                       positionSeconds: d, positionSettled: event.transportSettled,
+                       avPlayerEvidence: avStartEvidence) { return }
                 if let target = postFrameResumeSeekWatchdogTarget,
                    postFrameResumeSeekWatchdogOwner == event.loadToken,
                    event.transportSettled,
@@ -2927,7 +2927,8 @@ struct PlayerScreen: View {
                     cancelPostFrameResumeSeekWatchdog()
                 }
                 if ApplePlaybackStartPolicy.hasStarted(
-                    positionSeconds: d, avPlayerRenderedFrame: renderedAVFrame),
+                    positionSeconds: d, positionSettled: event.transportSettled,
+                    avPlayerEvidence: avStartEvidence),
                    !hasStartedPlaying {
                     if let pending = pendingAdvance {
                         guard pending.issued,

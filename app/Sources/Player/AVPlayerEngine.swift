@@ -397,6 +397,15 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         return latchPlayableVideoFrame(atClock: seconds.isFinite ? seconds : 0)
     }
 
+    private var nativeStartupClock = ApplePlaybackStartPolicy.NativeClockProgress()
+    var playbackStartEvidence: ApplePlaybackStartPolicy.AVPlayerEvidence {
+        .init(requiresVideoFrame: contentIsDolbyVision || isRemuxMounted,
+              renderedVideoFrame: hasProducedPlayableVideoFrame,
+              settledNativeClockAdvanced: nativeStartupClock.hasAdvanced(generation: itemGeneration),
+              positionSettled: !seekEndBoundary.isPending
+                  && !nativeStartupClock.isSeekPending(generation: itemGeneration))
+    }
+
     /// Diag-6 coupling ownership state, keyed by `itemGeneration` (branch review finding 2). The first frame
     /// can render before the server has its 10 s bitrate sample and before `signaling.bandwidth` is parsed,
     /// so the coupling RETRIES on the periodic observer instead of latching once; a replaced item resets the
@@ -903,6 +912,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     /// leave a server playhead pinned behind an admission that AVPlayer will never receive.
     @discardableResult
     private func supersedeSeekRequest() -> UInt64 {
+        // A complete seek can fit between observer ticks. Its landing must seed a new native baseline,
+        // never turn the old position -> target jump into first-start proof.
+        nativeStartupClock.reset(generation: itemGeneration)
         seekDestination.clear()
         seekEndBoundary.reset()
         seekCompletionTimeoutTask?.cancel()
@@ -2731,6 +2743,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
         preparedServer: VortXRemuxHLSServer? = nil
     ) {
         seekEndBoundary.begin(requestID: requestID)
+        nativeStartupClock.beginSeek(generation: itemGeneration, requestID: requestID)
         let seekItem = item
         let seekGeneration = itemGeneration
         let seekLoadToken = activeLoadToken
@@ -2770,6 +2783,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                     return
                 }
                 self.seekEndBoundary.finish(requestID: requestID)
+                self.nativeStartupClock.finishSeek(generation: seekGeneration, requestID: requestID)
                 self.seekDestination.finish(ownership: self.seekDestinationOwnership)
                 _ = self.recoverySeekSettlement.finish(requestID: requestID)
                 if let preparedServer {
@@ -2781,13 +2795,30 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 }
                 // A paused clock may not tick again. Keep the chrome and cue on the actual landing,
                 // exactly like the producer lead ledger, not the optimistic requested position.
-                self.publishSeekPosition(playerSeconds: landing)
+                self.publishSeekPosition(playerSeconds: landing, positionSettled: true)
             }
         }
-        publishSeekPosition(playerSeconds: clamped)
+        publishSeekPosition(playerSeconds: clamped, positionSettled: false)
     }
 
-    private func publishSeekPosition(playerSeconds: Double) {
+    /// Preserve the existing pre-ready raw-seek behavior and recovery deadlines, but keep its in-flight
+    /// target out of native startup evidence. Logical load tokens can survive item replacement.
+    private func seekBeforeStart(playerSeconds: Double, item: AVPlayerItem, loadToken: PlayerLoadToken) {
+        let generation = itemGeneration
+        let requestID = seekRequestGeneration
+        nativeStartupClock.beginSeek(generation: generation, requestID: requestID)
+        player.seek(to: CMTime(seconds: max(playerSeconds, 0), preferredTimescale: 600)) { [weak self] finished in
+            Task { @MainActor in
+                guard let self, finished,
+                      self.itemGeneration == generation,
+                      self.seekRequestGeneration == requestID,
+                      self.owns(item, loadToken: loadToken) else { return }
+                self.nativeStartupClock.finishSeek(generation: generation, requestID: requestID)
+            }
+        }
+    }
+
+    private func publishSeekPosition(playerSeconds: Double, positionSettled: Bool) {
         let reported = RemuxResumePolicy.presented(
             playerSeconds: playerSeconds,
             origin: remuxTimelineOrigin)
@@ -2795,8 +2826,9 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
            owns(item, loadToken: loadToken) {
             emit(
                 MPVProperty.timePos,
-                PlayerTimePositionEvent(seconds: reported, loadToken: loadToken),
-                loadToken: loadToken
+                PlayerTimePositionEvent(seconds: reported, loadToken: loadToken,
+                                        positionSettled: positionSettled),
+                loadToken: loadToken, seekRequestID: seekRequestGeneration
             )
         }
         updateSubtitleOverlay(atClock: reported)   // re-check the cue now; the observer is only ~4 Hz
@@ -4003,6 +4035,8 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func observe(_ item: AVPlayerItem, loadToken: PlayerLoadToken) {
+        let observedGeneration = itemGeneration
+        nativeStartupClock.reset(generation: observedGeneration)
         observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
             Task { @MainActor in self?.handleStatus(observedItem, loadToken: loadToken) }
         })
@@ -4108,10 +4142,17 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                 let position = RemuxResumePolicy.presented(
                     playerSeconds: time.seconds,
                     origin: self.remuxTimelineOrigin)
+                let positionSettled = !self.seekEndBoundary.isPending
+                    && !self.nativeStartupClock.isSeekPending(generation: observedGeneration)
+                self.nativeStartupClock.observe(
+                    generation: observedGeneration, playerSeconds: time.seconds,
+                    transportRunning: self.playbackRequested && self.player.timeControlStatus == .playing,
+                    positionSettled: positionSettled)
                 self.emit(
                     MPVProperty.timePos,
-                    PlayerTimePositionEvent(seconds: position, loadToken: loadToken),
-                    loadToken: loadToken
+                    PlayerTimePositionEvent(seconds: position, loadToken: loadToken,
+                                            positionSettled: positionSettled),
+                    loadToken: loadToken, seekRequestID: self.seekRequestGeneration
                 )
                 self.updateSubtitleOverlay(atClock: position)   // sync external-sub overlay to source time
                 let clock = ProcessInfo.processInfo.systemUptime
@@ -4344,11 +4385,10 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                             "dv",
                             "pre-start seek to \(Int(target))s already satisfied by remux origin \(Int(remuxTimelineOrigin))s")
                     case .hidePreroll(let playerSeconds):
-                        // `playerSeconds` is already the exact local-clock destination (see the policy's own
-                        // header): the SAME CMTime construction the non-remux branch below uses, so a mutant
-                        // that reused `target` (the SOURCE second) here instead would seek to the wrong clock
-                        // on every resumed remux mount, not just fail to hide the preroll.
-                        player.seek(to: CMTime(seconds: max(playerSeconds, 0), preferredTimescale: 600))
+                        // `playerSeconds` is already the local-clock destination. The helper keeps the SAME
+                        // CMTime construction for direct and preroll seeks; reusing the source `target` here
+                        // would seek to the wrong clock on every resumed remux mount.
+                        seekBeforeStart(playerSeconds: playerSeconds, item: item, loadToken: loadToken)
                         DiagnosticsLog.log(
                             "dv",
                             "pre-start seek to \(Int(target))s: hiding \(String(format: "%.3f", playerSeconds))s of keyframe preroll from remux origin \(Int(remuxTimelineOrigin))s")
@@ -4358,7 +4398,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
                             "dropped pre-start seek to \(Int(target))s: \(Int(ahead))s past remux origin \(Int(remuxTimelineOrigin))s")
                     }
                 } else {
-                    player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
+                    seekBeforeStart(playerSeconds: target, item: item, loadToken: loadToken)
                 }
             }
             // Consume and clear the remount transaction before kicking off unbounded group discovery.  This
@@ -5306,6 +5346,7 @@ final class AVPlayerEngineController: NSObject, ObservableObject, PlayerEngine {
     }
 
     private func teardownObservers() {
+        nativeStartupClock.reset(generation: nil)
         externalSubtitleSettlement.clear()
         invalidateNativeSubtitleOverlay()
         remuxSubtitleInventoryRefreshTask?.cancel()

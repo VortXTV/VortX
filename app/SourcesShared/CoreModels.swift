@@ -931,19 +931,23 @@ struct PlayerLoadToken: Hashable, Sendable {
 struct PlayerTimePositionEvent: Sendable {
     let seconds: Double
     let loadToken: PlayerLoadToken
-    /// nil preserves the existing AVPlayer/non-mpv contract. MPV supplies explicit evidence.
+    /// MPV's attributed settlement evidence takes precedence; other engines can explicitly distinguish
+    /// optimistic seek targets from completed/observed positions without fabricating an MPV receipt.
     let mpvSeekSettlement: MPVSeekSettlementEvidence?
-    var positionSettled: Bool { mpvSeekSettlement?.settled ?? true }
+    private let nonMPVPositionSettled: Bool
+    var positionSettled: Bool { mpvSeekSettlement?.settled ?? nonMPVPositionSettled }
     var transportSettled: Bool {
-        guard let evidence = mpvSeekSettlement else { return true }
+        guard let evidence = mpvSeekSettlement else { return nonMPVPositionSettled }
         return evidence.settled && evidence.attributed
     }
 
     init(seconds: Double, loadToken: PlayerLoadToken,
-         mpvSeekSettlement: MPVSeekSettlementEvidence? = nil) {
+         mpvSeekSettlement: MPVSeekSettlementEvidence? = nil,
+         positionSettled: Bool = true) {
         self.seconds = seconds
         self.loadToken = loadToken
         self.mpvSeekSettlement = mpvSeekSettlement
+        self.nonMPVPositionSettled = positionSettled
     }
 }
 
