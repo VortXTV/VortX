@@ -618,9 +618,12 @@ actor TorBoxUsenetResolver {
     func resolve(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?,
                  ownerIsCurrent: @escaping @Sendable () async -> Bool = { true }) async throws -> URL {
         try Task.checkCancellation()
+        // Pure local validation cannot retire another caller's healthy pending cloud job.
+        // Keep this outside the catch that clears admission after a real provider/selection failure.
+        let selector = try usenetFileSelector(fileMustInclude)
         let key = Self.jobKey(nzbURL: nzbUrl, knownHash: knownHash)
         do {
-            return try await resolveJob(nzbURL: nzbUrl, key: key, fileMustInclude: fileMustInclude,
+            return try await resolveJob(nzbURL: nzbUrl, key: key, selector: selector,
                                         fileIdx: fileIdx, episode: episode, ownerIsCurrent: ownerIsCurrent)
         } catch {
             // A real status/auth/selection failure must not leave a stale "still preparing" message.
@@ -632,7 +635,7 @@ actor TorBoxUsenetResolver {
         }
     }
 
-    private func resolveJob(nzbURL: String, key: String, fileMustInclude: String?, fileIdx: Int?,
+    private func resolveJob(nzbURL: String, key: String, selector: NSRegularExpression?, fileIdx: Int?,
                             episode: DebridEpisode?, ownerIsCurrent: @escaping @Sendable () async -> Bool) async throws -> URL {
         let started = Date()
         // 1. Adopt an existing job before creating one. Concurrent callers serialize only this step;
@@ -649,7 +652,7 @@ actor TorBoxUsenetResolver {
         }
 
         // 3. Pick the file, applying fileMustInclude first, then the shared semantic episode/movie heuristic.
-        guard let pick = pickUsenetFile(files, mustInclude: fileMustInclude, fileIdx: fileIdx, episode: episode) else {
+        guard let pick = pickUsenetFile(files, selector: selector, fileIdx: fileIdx, episode: episode) else {
             throw DebridError.noMatchingFile
         }
 
@@ -702,19 +705,113 @@ actor TorBoxUsenetResolver {
         return nil
     }
 
-    /// File pick with the usenet-specific `fileMustInclude` regex applied first when it matches a video,
-    /// then the shared semantic provider picker. Raw fileIdx remains provenance and is deliberately ignored.
-    private func pickUsenetFile(_ files: [DebridFile], mustInclude: String?, fileIdx: Int?, episode: DebridEpisode?) -> DebridFile? {
-        if let pattern = mustInclude, !pattern.isEmpty,
-           let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) {
-            let matched = files.filter { f in
-                guard f.isVideo else { return false }
-                let name = f.shortName.isEmpty ? f.name : f.shortName
-                return re.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
+    /// Match the native route's bare-or-js-ims selector syntax, including delimiter escapes.
+    /// A supplied selector is a constraint, not permission to choose a different, larger video.
+    private func usenetFileSelector(_ input: String?) throws -> NSRegularExpression? {
+        guard let input else { return nil }
+        guard !input.isEmpty, input.utf8.count <= 512 else { throw DebridError.noMatchingFile }
+        let pattern: String
+        let flags: String
+        if input.hasPrefix("/") {
+            let remainder = input.dropFirst()
+            guard let delimiter = remainder.lastIndex(of: "/") else { throw DebridError.noMatchingFile }
+            pattern = String(remainder[..<delimiter])
+            flags = String(remainder[remainder.index(after: delimiter)...])
+        } else {
+            pattern = input
+            flags = ""
+        }
+        guard !pattern.isEmpty else { throw DebridError.noMatchingFile }
+        var seen = Set<Character>()
+        var options: NSRegularExpression.Options = []
+        for flag in flags {
+            guard seen.insert(flag).inserted else { throw DebridError.noMatchingFile }
+            switch flag {
+            case "i": options.insert(.caseInsensitive)
+            case "m": options.insert(.anchorsMatchLines)
+            case "s": options.insert(.dotMatchesLineSeparators)
+            default: throw DebridError.noMatchingFile
             }
-            if let best = DebridResolve.pickFile(matched, episode: episode) { return best }
+        }
+        var normalized = ""
+        var characters = pattern.makeIterator()
+        while let character = characters.next() {
+            if character == "\\", let next = characters.next() {
+                if next != "/" { normalized.append(character) }
+                normalized.append(next)
+            } else {
+                normalized.append(character)
+            }
+        }
+        guard let expression = try? NSRegularExpression(pattern: normalized, options: options) else {
+            throw DebridError.noMatchingFile
+        }
+        return expression
+    }
+
+    /// Raw fileIdx remains provenance: provider IDs/order are independent of the source NZB.
+    private func pickUsenetFile(_ files: [DebridFile], selector: NSRegularExpression?,
+                                fileIdx: Int?, episode: DebridEpisode?) -> DebridFile? {
+        if let selector {
+            let matched = files.filter { f in
+                guard f.isVideo, usenetEpisodeMatches(f, episode: episode) else { return false }
+                // Providers may include a containing folder only in name, or expose just short_name.
+                return [f.name, f.shortName].contains { name in
+                    !name.isEmpty && selector.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
+                }
+            }
+            return DebridResolve.pickFile(matched, episode: episode)
         }
         return DebridResolve.pickFile(files, episode: episode)
+    }
+
+    /// An explicit regex may establish an opaque/absolute anime filename, but never override a
+    /// recognizable contradictory or combined episode. The shared picker permits a sole-file
+    /// fallback; constrain that fallback here without changing other providers' established routing.
+    private func usenetEpisodeMatches(_ file: DebridFile, episode: DebridEpisode?) -> Bool {
+        guard let episode else { return true }
+        guard let expected = EpisodePlaybackIdentity.provenEpisodeNumbers(
+            season: episode.season, episode: episode.episode
+        ) else { return false }
+        let pattern = #"(?i)(?:^|[^a-z0-9])(?:s([0-9]{1,4})e([0-9]{1,4})|([0-9]{1,4})x([0-9]{1,4})|season[ ._-]+([0-9]{1,4})[ ._-]+episode[ ._-]+([0-9]{1,4}))"#
+        let continuation = #"(?i)^(?:[\s._+&\p{Pd}]*(?:e(?:p(?:isode)?)?|x)[\s._\p{Pd}]*[0-9]{1,4}|[\s._]*[\p{Pd}+&][\s._]*[0-9]{1,4}|[\s._\p{Pd}]*(?:and|to)[\s._\p{Pd}]+(?:e)?[0-9]{1,4})(?:[^a-z0-9]|$)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return false }
+        func matchesRecognizableEpisode(in name: String) -> Bool? {
+            let text = name as NSString
+            let matches = expression.matches(in: name, range: NSRange(location: 0, length: text.length))
+            guard matches.count <= 1 else { return false }
+            guard let match = matches.first else { return nil }
+            let suffix = text.substring(from: NSMaxRange(match.range))
+            if let first = suffix.utf8.first,
+               (48...57).contains(first) || (65...90).contains(first) || (97...122).contains(first) {
+                return false
+            }
+            guard suffix.range(of: continuation, options: .regularExpression) == nil else { return false }
+            let group = [1, 3, 5].first { match.range(at: $0).location != NSNotFound }!
+            guard Int(text.substring(with: match.range(at: group))) == expected.season,
+                  Int(text.substring(with: match.range(at: group + 1))) == expected.episode else { return false }
+            return true
+        }
+        // Provider name can contain a season-pack folder. The actual basename owns episode identity;
+        // repeating an identical token in a parent folder does not create a combined episode.
+        let paths = Set([file.name, file.shortName].map { $0.replacingOccurrences(of: "\\", with: "/") })
+        var recognizedBasename = false
+        for path in paths where !path.isEmpty {
+            let basename = (path as NSString).lastPathComponent
+            if let matches = matchesRecognizableEpisode(in: basename) {
+                guard matches else { return false }
+                recognizedBasename = true
+            }
+        }
+        if recognizedBasename { return true }
+        // An opaque explicit filename remains usable; only a contradictory recognizable directory
+        // token can disprove it when neither provider basename carries an episode identity.
+        for path in paths {
+            for directory in path.split(separator: "/").dropLast() {
+                if let matches = matchesRecognizableEpisode(in: String(directory)), !matches { return false }
+            }
+        }
+        return true
     }
 
     /// The `requestdl` leg: mint a direct stream URL for a known usenet_id+file_id.

@@ -35,6 +35,12 @@ final class ProbeLines: @unchecked Sendable {
 final class TorBoxFixture: @unchecked Sendable {
     static let shared = TorBoxFixture()
     let lock = NSLock()
+    struct Video: Sendable {
+        let id: Int
+        let name: String
+        let size: Int
+        var shortName: String? = nil
+    }
     struct State {
         var requests: [URLRequest] = []
         var creates = 0
@@ -45,6 +51,11 @@ final class TorBoxFixture: @unchecked Sendable {
         var omitCreatedID = false
         var lookupStatus = 200
         var jobState: String? = nil
+        var videos: [Video] = [
+            .init(id: 7, name: "Show.S02E33.mkv", size: 3000),
+            .init(id: 9, name: "Show.S02E34.mkv", size: 2000)
+        ]
+        var expectedFileID: Int? = 9
         var onLookup: (@Sendable () -> Void)? = nil
         var onRequestDL: (@Sendable () -> Void)? = nil
     }
@@ -73,10 +84,11 @@ final class TorBoxFixture: @unchecked Sendable {
                 let item: [String: Any] = [
                     "id": 42, "hash": state.hash, "download_finished": ready,
                     "download_present": ready, "download_state": state.jobState ?? (ready ? "completed" : "downloading"),
-                    "files": ready ? [
-                        ["id": 7, "name": "Show.S02E33.mkv", "size": 3000],
-                        ["id": 9, "name": "Show.S02E34.mkv", "size": 2000]
-                    ] : []
+                    "files": ready ? state.videos.map { video -> [String: Any] in
+                        var file: [String: Any] = ["id": video.id, "name": video.name, "size": video.size]
+                        if let shortName = video.shortName { file["short_name"] = shortName }
+                        return file
+                    } : []
                 ]
                 if query.contains(where: { $0.name == "id" }) {
                     precondition(query.first(where: { $0.name == "id" })?.value == "42")
@@ -87,7 +99,10 @@ final class TorBoxFixture: @unchecked Sendable {
             case "requestdl":
                 state.onRequestDL?()
                 precondition(query.first(where: { $0.name == "usenet_id" })?.value == "42")
-                precondition(query.first(where: { $0.name == "file_id" })?.value == "9", "must preserve semantic episode choice")
+                if let expected = state.expectedFileID {
+                    precondition(query.first(where: { $0.name == "file_id" })?.value == String(expected),
+                                 "must preserve semantic episode choice")
+                }
                 body = ["success": true, "data": "https://1.1.1.1/fixture-video.mkv"]
             default: preconditionFailure("Unexpected API request \(url.path)")
             }
@@ -130,11 +145,174 @@ final class TorBoxFixtureProtocol: URLProtocol, @unchecked Sendable {
         try await resolver.resolve(nzbUrl: nzb, knownHash: "fixture-hash", fileMustInclude: nil,
                                    fileIdx: 0, episode: .init(season: 2, episode: 34))
     }
+    static func selectorCase(_ label: String, selector: String?, selected: Int?,
+                             videos: [TorBoxFixture.Video], session: URLSession,
+                             invalid: Bool = false, episode: DebridEpisode? = nil) async throws {
+        fixture.reset(.init(readyAt: 0, existing: true, videos: videos, expectedFileID: nil))
+        let resolver = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session, pollInterval: .zero)
+        var noMatch = false
+        do {
+            _ = try await resolver.resolve(nzbUrl: nzb, knownHash: "fixture-hash",
+                                           fileMustInclude: selector, fileIdx: 0, episode: episode)
+        } catch {
+            guard error as? DebridError == .noMatchingFile else { throw error }
+            noMatch = true
+        }
+        let state = fixture.snapshot()
+        let downloads = state.requests.filter { $0.url?.lastPathComponent == "requestdl" }
+        let picked = downloads.first.flatMap { request in
+            URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "file_id" })?.value
+        }
+        let correct = selected.map { !noMatch && downloads.count == 1 && picked == String($0) }
+            ?? (noMatch && downloads.isEmpty)
+        guard correct, state.creates == 0, !invalid || state.requests.isEmpty else {
+            print("FAIL file selector: \(label), expected=\(selected.map(String.init) ?? "no match"), actual=\(picked ?? "none")")
+            exit(1)
+        }
+        print("PASS file selector: \(label)")
+    }
+
+    static func selectorCases(session: URLSession) async throws {
+        let videos: [TorBoxFixture.Video] = [
+            .init(id: 7, name: "Movie.mkv", size: 3000),
+            .init(id: 9, name: "Special.mkv", size: 2000)
+        ]
+        try await selectorCase("absent selector retains ordinary largest-file choice", selector: nil,
+                               selected: 7, videos: videos, session: session)
+        try await selectorCase("slash-delimited i chooses Special rather than larger Movie",
+                               selector: "/special/i", selected: 9, videos: videos, session: session)
+        try await selectorCase("bare selector is case-sensitive", selector: "^Special\\.mkv$",
+                               selected: 9, videos: videos, session: session)
+        try await selectorCase("bare nonmatching case cannot borrow unrelated Movie", selector: "^special\\.mkv$",
+                               selected: nil, videos: videos, session: session)
+        try await selectorCase("slash-delimited no-flags selector", selector: "/^Special\\.mkv$/",
+                               selected: 9, videos: videos, session: session)
+        try await selectorCase("escaped slash matches provider path", selector: "/Folder\\/Special\\.mkv/",
+                               selected: 9, videos: [
+                                .init(id: 7, name: "Movie.mkv", size: 3000),
+                                .init(id: 9, name: "Folder/Special.mkv", size: 2000, shortName: "Special.mkv")
+                               ], session: session)
+        try await selectorCase("m anchors match a line", selector: "/^Special\\.mkv$/m",
+                               selected: 9, videos: [
+                                .init(id: 7, name: "Movie.mkv", size: 3000),
+                                .init(id: 9, name: "Title\nSpecial.mkv", size: 2000)
+                               ], session: session)
+        try await selectorCase("s dot matches newline", selector: "/^Title.Special\\.mkv$/s",
+                               selected: 9, videos: [
+                                .init(id: 7, name: "Movie.mkv", size: 3000),
+                                .init(id: 9, name: "Title\nSpecial.mkv", size: 2000)
+                               ], session: session)
+        try await selectorCase("all supported flags", selector: "/^special\\.mkv$/ims",
+                               selected: 9, videos: videos, session: session)
+        try await selectorCase("valid selector without matching file never falls through", selector: "/Missing/i",
+                               selected: nil, videos: videos, session: session)
+        for (label, selector) in [
+            ("invalid flag", "/Special/g"), ("duplicate flag", "/Special/ii"),
+            ("empty pattern", "//i"), ("missing delimiter", "/Special"),
+            ("invalid regex", "/[/i"), ("empty supplied selector", ""),
+            ("overlong supplied selector", String(repeating: "x", count: 513))
+        ] {
+            try await selectorCase(label, selector: selector, selected: nil, videos: videos,
+                                   session: session, invalid: true)
+        }
+        try await selectorCase("selector precedes semantic episode without provider-array fileIdx",
+                               selector: "/S02E34/i", selected: 9, videos: [
+                                .init(id: 7, name: "Show.S02E33.mkv", size: 3000),
+                                .init(id: 9, name: "Show.S02E34.mkv", size: 2000)
+                               ], session: session, episode: .init(season: 2, episode: 34))
+        try await conflictingEpisodeCase(session: session)
+        for name in ["Show.S02E34E35.mkv", "Show.S02E34-35.mkv", "Show.S02E34 and E35.mkv",
+                     "Show.2x34x35.mkv", "Show.S02E34.S02E34.mkv", "Show.S02E34000.mkv",
+                     "Show.Season 2 Episode 33.mkv"] {
+            try await selectorCase("explicit selector cannot admit ambiguous/wrong episode: \(name)",
+                                   selector: "/Show/i", selected: nil,
+                                   videos: [.init(id: 9, name: name, size: 2000)], session: session,
+                                   episode: .init(season: 2, episode: 34))
+        }
+        try await selectorCase("explicit selector admits unique opaque anime filename",
+                               selector: "/Naruto - 034/i", selected: 9,
+                               videos: [.init(id: 9, name: "Naruto - 034.mkv", size: 2000)],
+                               session: session, episode: .init(season: 2, episode: 34))
+        try await selectorCase("short_name alone satisfies explicit anchored selector",
+                               selector: "/^Special\\.mkv$/", selected: 9,
+                               videos: [.init(id: 9, name: "Folder/Special.mkv", size: 2000,
+                                              shortName: "Special.mkv")], session: session)
+        try await selectorCase("same episode folder plus basename is not a combined episode",
+                               selector: "/S02E34/i", selected: 9,
+                               videos: [.init(id: 9, name: "Show.S02E34/Show.S02E34.mkv", size: 2000,
+                                              shortName: "Show.S02E34.mkv")], session: session,
+                               episode: .init(season: 2, episode: 34))
+        try await selectorCase("pack folder cannot override authoritative episode basename",
+                               selector: "/Show/i", selected: 9,
+                               videos: [.init(id: 9, name: "Show.S02E01-E40/Show.S02E34.mkv", size: 2000,
+                                              shortName: "Show.S02E34.mkv")], session: session,
+                               episode: .init(season: 2, episode: 34))
+        try await selectorCase("matching folder cannot conceal wrong episode basename",
+                               selector: "/Show/i", selected: nil,
+                               videos: [.init(id: 9, name: "Show.S02E34/Show.S02E33.mkv", size: 2000,
+                                              shortName: "Show.S02E33.mkv")], session: session,
+                               episode: .init(season: 2, episode: 34))
+        try await selectorCase("contradictory provider basenames fail closed",
+                               selector: "/Show/i", selected: nil,
+                               videos: [.init(id: 9, name: "Show.S02E34.mkv", size: 2000,
+                                              shortName: "Show.S02E33.mkv")], session: session,
+                               episode: .init(season: 2, episode: 34))
+        try await pendingSelectorCase(session: session)
+    }
+
+    static func conflictingEpisodeCase(session: URLSession) async throws {
+        try await selectorCase("selector cannot substitute S02E33 for requested S02E34",
+                               selector: "/S02E33/i", selected: nil, videos: [
+                                .init(id: 7, name: "Show.S02E33.mkv", size: 3000),
+                                .init(id: 9, name: "Show.S02E34.mkv", size: 2000)
+                               ], session: session, episode: .init(season: 2, episode: 34))
+    }
+
+    static func pendingSelectorCase(session: URLSession) async throws {
+        fixture.reset()
+        let resolver = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session,
+                                           pollInterval: .zero, pollAttempts: 3)
+        do { _ = try await resolve(resolver); preconditionFailure("fixture must remain pending") }
+        catch { precondition(error as? DebridError == .notReady) }
+        let requestsBefore = fixture.snapshot().requests.count
+        let waitingBefore = await resolver.isWaiting(nzbURL: nzb, knownHash: "fixture-hash")
+        precondition(waitingBefore && fixture.snapshot().creates == 1)
+        do {
+            _ = try await resolver.resolve(nzbUrl: nzb, knownHash: "fixture-hash", fileMustInclude: "/Special/g",
+                                           fileIdx: 0, episode: .init(season: 2, episode: 34))
+            preconditionFailure("invalid local selector must fail")
+        } catch {
+            guard error as? DebridError == .noMatchingFile else {
+                print("FAIL invalid local selector must reject before polling pending job: \(error)")
+                exit(1)
+            }
+        }
+        let waitingAfter = await resolver.isWaiting(nzbURL: nzb, knownHash: "fixture-hash")
+        let acknowledged = await resolver.hasJob(nzbURL: nzb, knownHash: "fixture-hash")
+        guard waitingAfter && acknowledged && fixture.snapshot().requests.count == requestsBefore else {
+            print("FAIL invalid local selector retired or polled an existing pending job")
+            exit(1)
+        }
+        fixture.ready()
+        _ = try await resolve(resolver)
+        precondition(fixture.snapshot().creates == 1)
+        print("PASS invalid local selector preserves pending job and same-ID Retry")
+    }
+
     static func main() async throws {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [TorBoxFixtureProtocol.self]
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
+        if CommandLine.arguments.dropFirst().first == "--pending-selector-state" {
+            try await pendingSelectorCase(session: session)
+            return
+        }
+        if CommandLine.arguments.dropFirst().first == "--conflicting-episode-selector" {
+            try await conflictingEpisodeCase(session: session)
+            return
+        }
 
         #if TORBOX_USENET_BASELINE
         fixture.reset(.init(readyAt: 0, existing: true))
@@ -157,6 +335,7 @@ final class TorBoxFixtureProtocol: URLProtocol, @unchecked Sendable {
                                                            hasAcknowledgedJob: baselineOwnsPendingJob),
                      "baseline incorrectly lets a stale negative cache snapshot hide its acknowledged job")
         #else
+        try await selectorCases(session: session)
         fixture.reset()
         let resolver = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session, pollInterval: .zero, pollAttempts: 3)
         do { _ = try await resolve(resolver); preconditionFailure("pending must not mint media") }
