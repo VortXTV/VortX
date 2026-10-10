@@ -58,6 +58,7 @@ class PlayerBingeHandoffTest {
     @Test fun `semantic audio follows language and role with different ids on the next file`() {
         val selected = PlayerTrack(4, "English Commentary", "eng")
         val intent = PlaybackAudioIntent.fromTrack(selected)
+        assertEquals("en", intent.language) // The source ranker's language keys use canonical two-letter codes.
         val next = listOf(PlayerTrack(4, "French Main", "fr"), PlayerTrack(17, "English Main", "en"),
             PlayerTrack(23, "English Commentary", "en"), PlayerTrack(25, "English Audio Description", "en"))
         assertEquals(listOf(23), intent.matchingTracks(next).map { it.id })

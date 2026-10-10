@@ -10,7 +10,7 @@ data class PlaybackAudioIntent(val language: String?, val role: Role) {
 
     companion object {
         fun fromTrack(track: PlayerTrack): PlaybackAudioIntent =
-            PlaybackAudioIntent(track.lang?.trim()?.lowercase()?.takeIf { it.isNotBlank() }, roleOf(track))
+            PlaybackAudioIntent(TrackSelector.canonical(track.lang?.trim()).takeIf { it.isNotBlank() }, roleOf(track))
 
         private fun roleOf(track: PlayerTrack): Role {
             val title = track.title.lowercase()
