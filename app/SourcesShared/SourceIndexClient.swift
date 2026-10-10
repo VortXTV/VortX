@@ -2203,6 +2203,9 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     /// The sealed target for the rows currently owned by this source. The source-list assembler authorizes its
     /// merge against this value, so a detached E2 snapshot cannot be reused for E3.
     private var lastTarget: SourceIndexIdentity.PublicationTarget?
+    /// The lifecycle that established this local owner, including already-published rows. A delayed
+    /// retirement announcement may clear only owners at or below its cutoff, not a reopened scope.
+    private var ownedLifecycle: SourceIndexLifecycleSnapshot?
     var publishedTarget: SourceIndexIdentity.PublicationTarget? { lastTarget }
     private var task: Task<Void, Never>?
     /// Empty successful/failing fetches do not bump the rows epoch, so settlement has its own observable
@@ -2285,17 +2288,18 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
             invalidateLocal(clearIdentity: true)
             return
         }
-        let identityChanged = target != lastTarget
+        let lifecycle = SourceIndexLifecycleClock.snapshot()
+        let identityChanged = target != lastTarget || ownedLifecycle != lifecycle
         if identityChanged {
             invalidateLocal(clearIdentity: false)
             lastTarget = target
+            ownedLifecycle = lifecycle
             publishSettlement(contentID: target.contentID, terminal: false)
         }
 
         guard identityChanged else { return }
         let contentID = target.contentID
 
-        let lifecycle = SourceIndexLifecycleClock.snapshot()
         let generation = refreshGeneration
         let fetchPooled = self.fetchPooled
         let serveGate = self.serveGate
@@ -2340,6 +2344,8 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
     }
 
     func sourceIndexLifecycleDidClose(retiredSourceGeneration: UInt64) {
+        guard let ownedLifecycle,
+              ownedLifecycle.sourceGeneration <= retiredSourceGeneration else { return }
         invalidateLocal(clearIdentity: true)
     }
 
@@ -2351,7 +2357,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         includedSingularity: Bool
     ) -> Bool {
         guard epoch == sourceEpoch, SourceIndexLifecycleClock.snapshot() == lifecycle else { return false }
-        return !includedSingularity || (serveGate() && accountGate())
+        return !includedSingularity || (ownedLifecycle == lifecycle && serveGate() && accountGate())
     }
 
     private func invalidateLocal(clearIdentity: Bool) {
@@ -2360,6 +2366,7 @@ final class SourceIndexServeSource: ObservableObject, SourceIndexLifecyclePartic
         task = nil
         if clearIdentity {
             lastTarget = nil
+            ownedLifecycle = nil
             publishSettlement(contentID: nil, terminal: true)
         }
         if !streams.isEmpty { streams = [] }
