@@ -101,6 +101,7 @@ struct iOSRootView: View {
     @FocusState private var macSearchFocused: Bool
     #endif
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @ScaledMetric(relativeTo: .caption) private var compactLabelSize: CGFloat = 11
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
@@ -418,25 +419,28 @@ struct iOSRootView: View {
             }
             if !hideDiscoverTab, !homeHasDestination {
                 HStack(spacing: Theme.Space.xs) {
-                    homeModeButton("Featured", browse: false)
-                    homeModeButton("Discover", browse: true)
+                    homeModeButton("Featured", discover: false)
+                    homeModeButton("Discover", discover: true)
                 }
-                .padding(6)
+                // Phone Home keeps the mode switch close to the centered wordmark/customize chrome;
+                // iPad/Mac retain the existing roomier shell spacing.
+                .padding(compactPhoneHome ? 3 : 6)
                 .vortxGlass(in: Capsule())
-                .padding(.horizontal, Theme.Space.md)
-                .padding(.vertical, Theme.Space.xs)
+                .padding(.horizontal, compactPhoneHome ? 16 : Theme.Space.md)
+                .padding(.vertical, compactPhoneHome ? 2 : Theme.Space.xs)
             }
         }
     }
 
-    private func homeModeButton(_ title: LocalizedStringKey, browse: Bool) -> some View {
-        let selected = homeBrowse == browse
-        return Button { homeBrowse = browse } label: {
+    private func homeModeButton(_ title: LocalizedStringKey, discover: Bool) -> some View {
+        let selected = homeBrowse == discover
+        return Button { homeBrowse = discover } label: {
             Text(title)
-                .font(.system(size: 14, weight: selected ? .semibold : .medium))
+                .font(.system(size: compactPhoneHome ? 13 : 14,
+                              weight: selected ? .semibold : .medium))
                 .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
-                .padding(.horizontal, Theme.Space.md)
-                .frame(minHeight: 44)
+                .padding(.horizontal, compactPhoneHome ? 13 : Theme.Space.md)
+                .frame(minHeight: compactPhoneHome ? 36 : 44)
                 .background(selected ? Theme.Palette.accent : .clear, in: Capsule())
         }
         .buttonStyle(.plain)
@@ -692,6 +696,17 @@ struct iOSRootView: View {
         if hideLibraryTab { hidden.insert(.library) }
         if hideSearchTab { hidden.insert(.search) }
         return hidden
+    }
+
+    /// The phone-only Home chrome is deliberately keyed to the device idiom as well as the compact
+    /// width class. An iPad in Split View can be compact, but it keeps the existing tablet hero/header
+    /// treatment; the compact card is an iPhone presentation detail only.
+    private var compactPhoneHome: Bool {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .phone && horizontalSizeClass == .compact
+        #else
+        return false
+        #endif
     }
 
     private var customTabBar: some View {
@@ -1023,6 +1038,8 @@ struct iOSHomeView: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // gate Continue Watching on the active profile's own history
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
@@ -1207,6 +1224,80 @@ struct iOSHomeView: View {
         return items
     }
 
+    /// The inset hero card is an iPhone-only Home presentation. iPad Split View can report a compact
+    /// width, but it keeps the existing full-width hero geometry and chrome.
+    private var compactPhoneHome: Bool {
+        #if os(iOS)
+        return UIDevice.current.userInterfaceIdiom == .phone && horizontalSizeClass == .compact
+        #else
+        return false
+        #endif
+    }
+
+    /// A restrained cinema wash behind Home. It keeps the theme's deep canvas as the base and places the
+    /// profile accent only near the upper content edges, so OLED still reads black while the page has a
+    /// little of the title-screen atmosphere that a flat canvas loses. It deliberately does not sample or
+    /// decode artwork: FeaturedHeroView already owns its cached per-title tint, and this layer stays static
+    /// between hero rotations instead of repeating a full-size average-color computation.
+    private var homeAmbientCanvas: some View {
+        let alpha = reduceTransparency ? 0.025 : 0.055
+        return ZStack {
+            Theme.Palette.canvas
+            RadialGradient(
+                colors: [Theme.Palette.accent.opacity(alpha), .clear],
+                center: .topLeading,
+                startRadius: 8,
+                endRadius: 300
+            )
+            RadialGradient(
+                colors: [Theme.Palette.accent.opacity(alpha * 0.62), .clear],
+                center: .topTrailing,
+                startRadius: 20,
+                endRadius: 360
+            )
+            LinearGradient(
+                colors: [.clear, Theme.Palette.accent.opacity(alpha * 0.22), .clear],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Home's compact card wrapper keeps the shared FeaturedHeroView's model, actions, rotation, trailer,
+    /// reduce-motion behavior, and navigation untouched. Only the phone presentation gets the inset,
+    /// continuous radius, and quiet accent edge; iPad and Mac continue to call the shared hero directly.
+    @ViewBuilder
+    private var homeFeaturedHero: some View {
+        if compactPhoneHome {
+            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
+                .background {
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .fill(Theme.Palette.accent.opacity(reduceTransparency ? 0.022 : 0.045))
+                        .overlay {
+                            LinearGradient(
+                                colors: [Theme.Palette.accent.opacity(0.075), .clear,
+                                         Theme.Palette.accent.opacity(0.018)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                        }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .strokeBorder(Theme.Palette.accent.opacity(reduceTransparency ? 0.24 : 0.16),
+                                      lineWidth: 0.8)
+                }
+                .shadow(color: .black.opacity(0.32), radius: 20, y: 12)
+                .padding(.horizontal, 16)
+                .padding(.top, Theme.Space.xs)
+        } else {
+            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
+        }
+    }
+
     @ViewBuilder
     private var homeNavigation: some View {
         let renderedContinueWatching = continueWatchingRenderSnapshot
@@ -1224,7 +1315,7 @@ struct iOSHomeView: View {
                     Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Home tab -> scroll here
                     // The redesign mockup's ember "Featured" hero kicker (Home only; Library / Discover pass
                     // no eyebrow so their heroes are unchanged).
-                    FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
+                    homeFeaturedHero
                     // Once this marker (just below the hero) scrolls out of view, the floating
                     // back-to-top button appears; it hides again when you return to the top (#8).
                     // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
@@ -1347,7 +1438,7 @@ struct iOSHomeView: View {
             // content still starts below the pill. macOS-only; iOS/iPad already bleed with no shell inset.
             .ignoresSafeArea(.container, edges: .top)
             #endif
-            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .background(homeAmbientCanvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)
             // iOS-only: a runtime insert/remove of this trailing toolbar item when sign-in flips also
             // trips the shared-window NSToolbar on macOS (same crash class as the principal item). On
@@ -2222,6 +2313,13 @@ struct iOSLibraryView: View {
         return source.prefix(5).map(FeaturedHeroItem.from(cw:))
     }
 
+    /// Library's hero pool is bounded to the first five saved titles. Observe that exact ordered identity
+    /// set so a real insert/remove/reorder reseeds the hero, while unrelated engine revisions (metadata,
+    /// source, or progress events) do not walk the library and rebuild the pool.
+    private var heroCandidateSignature: [String] {
+        heroCandidates.map { "\($0.type):\($0.id)" }
+    }
+
     /// The Library's compact Continue Watching shelf uses the same owner/profile source and the same
     /// direct-resume primitive as Home. It is a second entry point, not a second history model.
     private var libraryContinueWatchingItems: [RailItem] {
@@ -2380,7 +2478,9 @@ struct iOSLibraryView: View {
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
         }
-        .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
+        .onChange(of: heroCandidateSignature) { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        }
         // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
@@ -3389,6 +3489,13 @@ struct iOSDiscoverView: View {
         (core.discover?.items.prefix(5).map(FeaturedHeroItem.from(meta:))) ?? []
     }
 
+    /// Discover's hero pool is bounded to the first five visible catalog items. Observe that exact ordered
+    /// identity set so a real page/selection/order change updates the hero, while unrelated engine revisions
+    /// (metadata, source, or progress events) do not reseed the pool.
+    private var heroCandidateSignature: [String] {
+        heroCandidates.map { "\($0.type):\($0.id)" }
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
@@ -3511,9 +3618,11 @@ struct iOSDiscoverView: View {
             if showCollectionsHub { collectionsHub.load() }
         }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: the render is already gated on showCollectionsHub, and clear() blanked the shared hub for the OTHER surface (Home vs Discover)
-        // The grid changes whenever a different type/catalog/genre is selected, which bumps revision;
-        // reseed so the hero pool tracks the visible catalog.
-        .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) } }
+        // The visible catalog's bounded candidate signature changes whenever a different type/catalog/
+        // genre/page selection changes its first five items. Unrelated core revisions stay off this path.
+        .onChange(of: heroCandidateSignature) { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        }
         // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
