@@ -203,6 +203,7 @@ enum LocalNNTPPlaybackPolicyTests {
         let controller = try String(contentsOf: root.appendingPathComponent("Sources/Player/MPVMetalViewController.swift"), encoding: .utf8)
         let player = try String(contentsOf: root.appendingPathComponent("Sources/PlayerScreen.swift"), encoding: .utf8)
         let tv = try String(contentsOf: root.appendingPathComponent("SourcesTV/TVPlayerView.swift"), encoding: .utf8)
+        let integrity = try String(contentsOf: root.appendingPathComponent("SourcesShared/DiagnosticPlaybackIntegrityPolicy.swift"), encoding: .utf8)
         func section(_ source: String, _ first: String, _ end: String) -> String {
             let start = source.range(of: first)!
             let finish = source.range(of: end, range: start.upperBound..<source.endIndex)!
@@ -220,10 +221,13 @@ enum LocalNNTPPlaybackPolicyTests {
             preconditionFailure("missing source witness: \(needle)")
         }
         for needle in ["let nextCachePauseWait = LocalNNTPBufferPolicy", "cachePauseWaitSeconds = nextCachePauseWait",
-                       "private var cachePauseWaitSeconds", "setString(\"cache-pause-wait\", priorCachePauseWait)"] {
+                       "private var cachePauseWaitSeconds", "priorPlaybackProfile.restore"] {
             check(!insideTVOSOnly(needle), "Mac/iOS compile the NNTP buffer profile: \(needle)")
         }
-        let beforeAdmission = section(controller, "let priorCachePauseInitial", "loadTokenLock.lock()")
+        let snapshot = section(integrity, "struct MPVPlaybackProfileSnapshot", "/// Exact ownership for work")
+        check(snapshot.contains("\"cache-pause-initial\"") && snapshot.contains("\"cache-pause-wait\""),
+              "typed profile rollback retains both native cache-pause options")
+        let beforeAdmission = section(controller, "let nextCachePauseWait = LocalNNTPBufferPolicy", "loadTokenLock.lock()")
         check(beforeAdmission.contains("setString(\"cache-pause-wait\", String(nextCachePauseWait))"),
               "cache cushion applies before load admission")
         let raw = section(controller, "func localNNTPPlaybackSample", "#if os(tvOS)")
