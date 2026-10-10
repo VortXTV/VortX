@@ -26,19 +26,46 @@ enum VXProbe {
 private final class LocalCinematicFixtureServer {
     private static let script = #"""
         import http.server, os, socketserver, sys, time
-        os.chdir(sys.argv[1])
-        count_path = sys.argv[2]
+        root, count_path, ack_dir, gate_dir = sys.argv[1:5]
+        os.chdir(root)
+
+        def marker_name(path, suffix):
+            return os.path.join(ack_dir, path.lstrip("/").replace("/", "_") + "." + suffix)
+
         class Handler(http.server.SimpleHTTPRequestHandler):
             def log_message(self, format, *args):
                 pass
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                name = path.lstrip("/")
                 with open(count_path, "a") as stream:
                     stream.write(path + "\n")
-                if path.startswith("/slow-"):
-                    time.sleep(0.35)
-                super().do_GET()
-        with socketserver.TCPServer(("127.0.0.1", 0), Handler) as server:
+                open(marker_name(path, "started"), "a").close()
+                gate_path = os.path.join(gate_dir, name.replace("/", "_"))
+                while os.path.exists(gate_path):
+                    time.sleep(0.002)
+                file_path = os.path.join(root, name)
+                if os.path.isfile(file_path):
+                    body = open(file_path, "rb").read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/png")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    try:
+                        self.wfile.write(body)
+                    except BrokenPipeError:
+                        pass
+                else:
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                open(marker_name(path, "response"), "a").close()
+
+        class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
             print(server.server_address[1], flush=True)
             server.serve_forever()
         """#
@@ -47,6 +74,8 @@ private final class LocalCinematicFixtureServer {
     private let output = Pipe()
     private let directory: URL
     private let countURL: URL
+    private let acknowledgementDirectory: URL
+    private let gateDirectory: URL
     private var serverURL: URL?
 
     init(fixtures: [String: Data]) throws {
@@ -55,14 +84,24 @@ private final class LocalCinematicFixtureServer {
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         directory = base
         countURL = base.appendingPathComponent("requests.txt")
+        acknowledgementDirectory = base.appendingPathComponent("ack", isDirectory: true)
+        gateDirectory = base.appendingPathComponent("gates", isDirectory: true)
+        try FileManager.default.createDirectory(at: acknowledgementDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: gateDirectory, withIntermediateDirectories: true)
         for (name, fixture) in fixtures {
             try fixture.write(to: base.appendingPathComponent(name), options: .atomic)
+        }
+        for name in ["slow-backdrop.png", "slow-stale.png", "slow-title-a-backdrop.png"] {
+            FileManager.default.createFile(atPath: gateDirectory.appendingPathComponent(name).path, contents: nil)
         }
     }
 
     func start() throws -> URL {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["python3", "-u", "-c", Self.script, directory.path, countURL.path]
+        process.arguments = [
+            "python3", "-u", "-c", Self.script,
+            directory.path, countURL.path, acknowledgementDirectory.path, gateDirectory.path
+        ]
         process.standardOutput = output
         process.standardError = output
         try process.run()
@@ -94,6 +133,28 @@ private final class LocalCinematicFixtureServer {
         }.count
     }
 
+    func waitForRequest(_ path: String) async -> Bool {
+        await waitForMarker(path, suffix: "started")
+    }
+
+    func release(_ path: String) {
+        try? FileManager.default.removeItem(at: gateDirectory.appendingPathComponent(path))
+    }
+
+    func waitForResponse(_ path: String) async -> Bool {
+        await waitForMarker(path, suffix: "response")
+    }
+
+    private func waitForMarker(_ path: String, suffix: String) async -> Bool {
+        let marker = acknowledgementDirectory.appendingPathComponent("\(path).\(suffix)")
+        let deadline = ProcessInfo.processInfo.systemUptime + 5
+        while !FileManager.default.fileExists(atPath: marker.path) {
+            guard ProcessInfo.processInfo.systemUptime < deadline else { return false }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        return true
+    }
+
     func stop() {
         if process.isRunning {
             process.terminate()
@@ -102,9 +163,7 @@ private final class LocalCinematicFixtureServer {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    deinit {
-        stop()
-    }
+    deinit { stop() }
 }
 
 private func imageFixture(
@@ -175,15 +234,20 @@ private func layerImage(_ layer: CALayer) -> CGImage? {
 
 /// Wait for the real production KenBurnsLoader to paint a decoded image onto its CALayer.
 @MainActor
-private func waitForLayerContents(_ layer: CALayer, timeout: TimeInterval = 3) async -> CGImage? {
+private func waitForLayerContents(
+    _ layer: CALayer,
+    timeout: TimeInterval = 3,
+    matching predicate: (CGImage) -> Bool
+) async -> CGImage? {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
-        if let image = layerImage(layer) {
+        if let image = layerImage(layer), predicate(image) {
             return image
         }
         try? await Task.sleep(for: .milliseconds(20))
     }
-    return layerImage(layer)
+    guard let image = layerImage(layer), predicate(image) else { return nil }
+    return image
 }
 
 /// Exercise the production coordinator rather than copying its backdrop→poster algorithm into the test.
@@ -191,7 +255,8 @@ private func waitForLayerContents(_ layer: CALayer, timeout: TimeInterval = 3) a
 private func loadHeroArt(
     backdrop: URL,
     poster: URL,
-    maxPixel: CGFloat
+    maxPixel: CGFloat,
+    expectedSize: (width: Int, height: Int)
 ) async -> CGImage? {
     let layer = CALayer()
     let loader = KenBurnsLoader()
@@ -201,7 +266,9 @@ private func loadHeroArt(
         maxPixel: Int(maxPixel),
         into: layer
     )
-    let image = await waitForLayerContents(layer)
+    let image = await waitForLayerContents(layer) {
+        $0.width == expectedSize.width && $0.height == expectedSize.height
+    }
     loader.cancel()
     return image
 }
@@ -341,10 +408,20 @@ private enum CinematicBackdropImageTests {
         let slowBackdropTask = Task {
             await PosterImageLoader.load(slowBackdropURL.absoluteString, maxPixel: boundedPixel)
         }
-        try? await Task.sleep(for: .milliseconds(50))
+        check(
+            "slow backdrop request starts before warm fallback observation",
+            await fixtureServer.waitForRequest("slow-backdrop.png"),
+            failures: &failures
+        )
         check(
             "warm poster remains available while a backdrop request is slow",
             PosterImageLoader.cached(warmPosterURL, maxPixel: boundedPixel) != nil,
+            failures: &failures
+        )
+        fixtureServer.release("slow-backdrop.png")
+        check(
+            "slow backdrop response is explicitly released",
+            await fixtureServer.waitForResponse("slow-backdrop.png"),
             failures: &failures
         )
         check(
@@ -363,7 +440,8 @@ private enum CinematicBackdropImageTests {
         let fallbackImage = await loadHeroArt(
             backdrop: failedBackdropURL,
             poster: fastPosterURL,
-            maxPixel: boundedPixel
+            maxPixel: boundedPixel,
+            expectedSize: (1_280, 960)
         )
         check("failed backdrop falls through to the fast poster", fallbackImage != nil, failures: &failures)
         check(
@@ -379,7 +457,8 @@ private enum CinematicBackdropImageTests {
         _ = await loadHeroArt(
             backdrop: failedBackdropURL,
             poster: fastPosterURL,
-            maxPixel: boundedPixel
+            maxPixel: boundedPixel,
+            expectedSize: (1_280, 960)
         )
         check(
             "warm fallback repeat does not re-request the poster",
@@ -393,7 +472,8 @@ private enum CinematicBackdropImageTests {
             let rotationImage = await loadHeroArt(
                 backdrop: rotationBackdropURL,
                 poster: rotationPosterURL,
-                maxPixel: boundedPixel
+                maxPixel: boundedPixel,
+                expectedSize: (1_280, 960)
             )
             check("rotation \(index + 1) paints its poster fallback", rotationImage != nil, failures: &failures)
             check(
@@ -411,7 +491,8 @@ private enum CinematicBackdropImageTests {
         let priorityImage = await loadHeroArt(
             backdrop: fixtureServer.url("missing-priority-backdrop.png"),
             poster: fixtureServer.url("priority-poster.png"),
-            maxPixel: boundedPixel
+            maxPixel: boundedPixel,
+            expectedSize: (1_280, 720)
         )
         check(
             "real KenBurnsLoader falls through a failed backdrop to its poster",
@@ -437,20 +518,36 @@ private enum CinematicBackdropImageTests {
             maxPixel: Int(boundedPixel),
             into: rotatingLayer
         )
-        try? await Task.sleep(for: .milliseconds(50))
+        check(
+            "old title request starts before rotation",
+            await fixtureServer.waitForRequest("slow-title-a-backdrop.png"),
+            failures: &failures
+        )
         rotatingLoader.load(
             backdrop: fixtureServer.url("title-b-backdrop.png").absoluteString,
             poster: fixtureServer.url("title-b-poster.png").absoluteString,
             maxPixel: Int(boundedPixel),
             into: rotatingLayer
         )
-        let replacementImage = await waitForLayerContents(rotatingLayer)
+        check(
+            "replacement title request starts after rotation",
+            await fixtureServer.waitForRequest("title-b-backdrop.png"),
+            failures: &failures
+        )
+        let replacementImage = await waitForLayerContents(rotatingLayer) {
+            $0.width == 1_280 && $0.height == 427
+        }
         check(
             "real KenBurnsLoader paints the replacement title after rotation",
             replacementImage?.width == 1_280 && replacementImage?.height == 427,
             failures: &failures
         )
-        try? await Task.sleep(for: .milliseconds(500))
+        fixtureServer.release("slow-title-a-backdrop.png")
+        check(
+            "late old-title response is explicitly released",
+            await fixtureServer.waitForResponse("slow-title-a-backdrop.png"),
+            failures: &failures
+        )
         let finalImage = layerImage(rotatingLayer)
         check(
             "late old-title completion cannot overwrite the replacement layer",
@@ -463,8 +560,13 @@ private enum CinematicBackdropImageTests {
         let staleTask = Task {
             await PosterImageLoader.load(staleURL.absoluteString, maxPixel: boundedPixel)
         }
-        try? await Task.sleep(for: .milliseconds(50))
+        check(
+            "cancelled old-title request starts before cancellation",
+            await fixtureServer.waitForRequest("slow-stale.png"),
+            failures: &failures
+        )
         staleTask.cancel()
+        fixtureServer.release("slow-stale.png")
         _ = await staleTask.value
         check(
             "cancelled old-title completion does not enter decoded cache",
