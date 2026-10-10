@@ -270,22 +270,32 @@ private func decodedImageHasTransparentPixel(_ image: VXPosterImage) -> Bool {
     #else
     guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
     #endif
-    let alphaOffset: Int
-    switch cg.alphaInfo {
-    case .first, .premultipliedFirst: alphaOffset = 0
-    case .last, .premultipliedLast: alphaOffset = max(0, cg.bitsPerPixel / 8 - 1)
-    default: return false
+    // Do not infer the alpha byte from alphaInfo alone: a little-endian BGRA provider can report an
+    // alpha-first format while exposing the alpha byte at the opposite end of each pixel. Rendering into a
+    // known RGBA context makes this receipt independent of the provider's component order and bit depth.
+    let width = max(cg.width, 1)
+    let height = max(cg.height, 1)
+    var pixels = [UInt8](repeating: 0, count: width * height * 4)
+    return pixels.withUnsafeMutableBytes { rawBuffer in
+        guard let context = CGContext(
+            data: rawBuffer.baseAddress,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return false
+        }
+        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        context.draw(cg, in: CGRect(x: 0, y: 0, width: width, height: height))
+        for (x, y) in [(0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)] {
+            let offset = y * width * 4 + x * 4 + 3
+            if rawBuffer[offset] < 255 { return true }
+        }
+        return false
     }
-    guard let provider = cg.dataProvider,
-          let providerData = provider.data,
-          let bytes = CFDataGetBytePtr(providerData) else { return false }
-    let bytesPerPixel = cg.bitsPerPixel / 8
-    guard bytesPerPixel > alphaOffset else { return false }
-    for (x, y) in [(0, 0), (cg.width - 1, 0), (0, cg.height - 1), (cg.width - 1, cg.height - 1)] {
-        let offset = y * cg.bytesPerRow + x * bytesPerPixel + alphaOffset
-        if bytes[offset] < 255 { return true }
-    }
-    return false
 }
 
 private func layerImage(_ layer: CALayer) -> CGImage? {
@@ -419,6 +429,7 @@ private enum CinematicBackdropImageTests {
         var fixtures: [String: Data] = [
             "oversized.png": oversizedFixture(),
             "transparent-oversized.png": transparentOversizedFixture(),
+            "opaque-black.png": imageFixture(width: 4_096, height: 2_048, red: 0, green: 0, blue: 0),
             "warm-poster.png": oversizedFixture(),
             "slow-backdrop.png": oversizedFixture(),
             "fast-poster.png": oversizedFixture(),
@@ -475,6 +486,19 @@ private enum CinematicBackdropImageTests {
         check(
             "transparent logo fixture retains transparent pixels through bounded decode",
             decodedImageHasTransparentPixel(transparent),
+            failures: &failures
+        )
+
+        let opaqueBlackURL = fixtureServer.url("opaque-black.png")
+        guard let opaqueBlack = await PosterImageLoader.load(opaqueBlackURL.absoluteString, maxPixel: 960) else {
+            check("opaque black negative-control fixture decodes through PosterImageLoader", false, failures: &failures)
+            fixtureServer.stop()
+            print("\(failures) FAILED")
+            exit(1)
+        }
+        check(
+            "transparent-pixel assertion rejects an opaque black decode",
+            !decodedImageHasTransparentPixel(opaqueBlack),
             failures: &failures
         )
 
