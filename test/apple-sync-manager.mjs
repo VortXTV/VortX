@@ -7,14 +7,17 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 const members = ['nativeGlobalEdits', 'nativeDirtySettingIsExported', 'clearPushedDirtySettings', 'ensureNativeCheckpoint',
-  'syncUp', 'mergeLocalIntoDoc', 'pullDocVersionedResult', 'pushSyncDocAt', 'pushDerivedDoc', 'requestSyncSoon'];
+  'syncUp', 'finishSyncUp', 'mergeLocalIntoDoc', 'pullDocVersionedResult', 'pushSyncDocAt', 'pushDerivedDoc', 'requestSyncSoon'];
 if (process.argv[2] === '--extract') {
   const source = await readFile(process.argv[3], 'utf8');
-  const selected = members.map(name => {
+  const selected = members.flatMap(name => {
     const start = source.search(new RegExp(`^    (?:private )?func ${name}\\(`, 'm'));
+    // Older source settles uploads inline. Do not inject the new completion helper into a
+    // baseline that does not call it; current source must still supply its actual helper.
+    if (name === 'finishSyncUp' && start < 0 && !source.includes('finishSyncUp(operationID)')) return [];
     assert(start >= 0, `missing production method ${name}`);
     const end = source.indexOf('\n    }', start); assert(end > start);
-    return source.slice(start, end + 6);
+    return [source.slice(start, end + 6)];
   });
   selected.push('private enum VersionedPull { case doc(doc: [String: Any], version: Int); case empty; case failed(retryable: Bool) }',
     'private enum PushOutcome { case accepted(version: Int); case rejected(storedVersion: Int?); case error }',

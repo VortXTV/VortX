@@ -124,6 +124,7 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     var nativeUnsupportedSettings: [String] = []
     var pendingAddonOrderIntent: AddonOrderIntent?
     var activeSyncUp: (id: UUID, capture: CredentialScopeRegistry.Capture)?
+    var syncUpCompletionWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
     var activeSyncDown: (id: UUID, capture: CredentialScopeRegistry.Capture)?
     var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
     var lastSyncedVersion = 0
