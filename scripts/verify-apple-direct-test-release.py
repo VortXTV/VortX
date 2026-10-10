@@ -167,6 +167,34 @@ def _fetch_json(url: str) -> tuple[dict[str, Any], dict[str, str]]:
     return value, headers
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _download_release_url() -> str:
+    """Keep the stable route identity before GitHub's temporary asset-CDN redirect."""
+    route = "https://dl.vortx.tv/"
+    request = urllib.request.Request(route, method="HEAD", headers={
+        "User-Agent": "VortX-direct-test-release-verifier"})
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        with opener.open(request, timeout=20) as response:
+            raise DirectTestError(f"Android download route did not redirect (HTTP {response.status})")
+    except urllib.error.HTTPError as error:
+        status, location = error.code, error.headers.get("Location", "")
+        error.close()
+        require(status in (301, 302, 303, 307, 308),
+                f"existing Android download route returned HTTP {status}")
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise DirectTestError(f"Android download route unavailable ({error})") from error
+    # Validate before following: no arbitrary destination, credentials, query, or fragment.
+    parse_github_release_asset(location, "dl.vortx.tv")
+    _, _, _, status = _fetch(location, method="HEAD")
+    require(status in (200, 206), f"existing Android asset returned HTTP {status}")
+    return location
+
+
 def _appcast_entry(entry: Any, label: str) -> dict[str, Any]:
     require(isinstance(entry, dict), f"existing appcast is missing {label}")
     tag, asset = parse_github_release_asset(entry.get("url"), f"appcast {label}")
@@ -243,9 +271,7 @@ def capture_public_routes(direct_tag: str) -> dict[str, Any]:
             source_apps[IOS_BUNDLE]["sha256"] == apple["ios"]["sha256"] and
             source_apps["com.stremiox.tv"]["sha256"] == apple["tvos"]["sha256"],
             "AltStore Apple metadata differs from the existing appcast")
-    _, _, final_url, status = _fetch("https://dl.vortx.tv/", method="HEAD")
-    require(status in (200, 206), f"existing Android download route returned HTTP {status}")
-    dl_tag, dl_asset = parse_github_release_asset(final_url, "dl.vortx.tv")
+    dl_tag, dl_asset = parse_github_release_asset(_download_release_url(), "dl.vortx.tv")
     require(dl_tag != direct_tag and re.fullmatch(r"VortX-[0-9.]+-full-mpv-universal\.apk", dl_asset) is not None,
             "dl.vortx.tv must remain an Android Full/MPV APK route, not an Apple asset")
     return {

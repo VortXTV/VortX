@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 SCRIPT_PATH = Path(__file__).parents[1] / "verify-apple-direct-test-release.py"
 SPEC = importlib.util.spec_from_file_location("apple_direct_test_release", SCRIPT_PATH)
@@ -102,6 +103,50 @@ def release_json(manifest, body=None, published=True):
     return {"id": 123, "tag_name": manifest["release"]["tag"], "draft": not published,
             "prerelease": True, "published_at": "2026-10-10T00:00:00Z" if published else None,
             "body": body or f"Apple only\n{DIRECT.APPLE_MARKER}\n{DIRECT.DIRECT_MARKER}", "assets": assets}
+
+
+class DownloadRedirectTests(unittest.TestCase):
+    URL = "https://github.com/VortXTV/VortX/releases/download/v0.4.0-beta.21/VortX-0.4.0-full-mpv-universal.apk"
+
+    def opener(self, location, code=302):
+        opener = SimpleNamespace(open=lambda request, timeout: None)
+        def open_route(request, timeout):
+            self.assertEqual(request.full_url, "https://dl.vortx.tv/")
+            self.assertEqual(request.get_method(), "HEAD")
+            self.assertEqual(timeout, 20)
+            raise HTTPError(request.full_url, code, "fixture", {"Location": location}, None)
+        opener.open = open_route
+        return opener
+
+    def test_identity_is_first_github_redirect_not_signed_cdn_url(self):
+        cdn = "https://release-assets.githubusercontent.com/temporary?signature=fixture"
+        with patch.object(DIRECT.urllib.request, "build_opener", return_value=self.opener(self.URL)), \
+             patch.object(DIRECT, "_fetch", return_value=(b"", {}, cdn, 200)) as fetch:
+            self.assertEqual(DIRECT._download_release_url(), self.URL)
+        fetch.assert_called_once_with(self.URL, method="HEAD")
+        self.assertIsNone(DIRECT._NoRedirect().redirect_request(None, None, 302, "", {}, self.URL))
+
+    def test_invalid_first_destinations_are_rejected_before_following(self):
+        for url in ("https://example.com/asset.apk", self.URL + "?token=bad", "/relative.apk", ""):
+            with self.subTest(url=url), \
+                 patch.object(DIRECT.urllib.request, "build_opener", return_value=self.opener(url)), \
+                 patch.object(DIRECT, "_fetch") as fetch:
+                with self.assertRaises(DIRECT.DirectTestError):
+                    DIRECT._download_release_url()
+                fetch.assert_not_called()
+
+    def test_non_redirect_status_is_rejected(self):
+        with patch.object(DIRECT.urllib.request, "build_opener", return_value=self.opener(self.URL, 404)), \
+             patch.object(DIRECT, "_fetch") as fetch:
+            with self.assertRaisesRegex(DIRECT.DirectTestError, "HTTP 404"):
+                DIRECT._download_release_url()
+            fetch.assert_not_called()
+
+    def test_asset_reachability_is_still_required(self):
+        with patch.object(DIRECT.urllib.request, "build_opener", return_value=self.opener(self.URL)), \
+             patch.object(DIRECT, "_fetch", return_value=(b"", {}, self.URL, 403)):
+            with self.assertRaisesRegex(DIRECT.DirectTestError, "HTTP 403"):
+                DIRECT._download_release_url()
 
 
 class DirectReleaseIdentityTests(unittest.TestCase):
