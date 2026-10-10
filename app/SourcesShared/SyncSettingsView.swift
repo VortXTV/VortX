@@ -49,12 +49,12 @@ struct SyncSettingsView: View {
             // "Merge both" is the recommended/default: it unions the rosters so NO profile is lost.
             // The other two force one side, but even "Use account's data" still keeps local-only
             // profiles (syncDown unions them back), so neither choice can silently delete a profile.
-            Button("Merge both (keep all profiles)") { resolveConflict { await sync.mergeBoth() } }
+            Button("Merge both (keep all profiles)") { resolveConflict { await sync.mergeBoth() ? .completed : .failed } }
             Button("Use account's data") { resolveConflict { await sync.useAccountData() } }
             // keepThisDeviceOverridingAccount, not pushThisDevice: this prompt is only reached after the
             // account's doc was positively READ, so the user is making an informed choice to overwrite it.
             // That is the one push allowed past the #145 restore gate (an automatic push is not).
-            Button("Keep this device") { resolveConflict { await sync.keepThisDeviceOverridingAccount() } }
+            Button("Keep this device") { resolveConflict { await sync.keepThisDeviceOverridingAccount() ? .completed : .failed } }
         } message: {
             Text("This account's profiles differ from this device. Merge both to keep every profile (recommended), or force one side.")
         }
@@ -200,12 +200,17 @@ struct SyncSettingsView: View {
     /// whichever side won, the engine should hold the account's owned add-ons + owner library
     /// right away, without waiting for a background/foreground cycle to re-check. Idempotent and
     /// never-zero guarded inside the manager (a .failed/.empty pull does nothing; install-only union).
-    private func resolveConflict(_ action: @escaping () async -> Void) {
+    private func resolveConflict(_ action: @escaping () async -> VortXSyncManager.ConflictResolutionOutcome) {
         Task { @MainActor in
             syncing = true
             syncNote = nil
-            await action()
-            await sync.hydrateEngineFromOwnedAddons()
+            let outcome = await action()
+            if outcome == .completed { await sync.hydrateEngineFromOwnedAddons() }
+            switch outcome {
+            case .completed: syncNote = nil
+            case .pending: syncNote = "Your changes are still waiting to sync. Try again shortly."
+            case .failed: syncNote = "Could not finish syncing. Check your connection and try again."
+            }
             syncing = false
         }
     }

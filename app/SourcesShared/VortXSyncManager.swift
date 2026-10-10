@@ -1692,6 +1692,33 @@ final class VortXSyncManager: ObservableObject {
         }
     }
     private var activeSyncUp: (id: UUID, capture: CredentialScopeRegistry.Capture)?
+    private var syncUpCompletionWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
+
+    private func finishSyncUp(_ operationID: UUID) {
+        if activeSyncUp?.id == operationID { activeSyncUp = nil }
+        let waiters = syncUpCompletionWaiters.removeValue(forKey: operationID) ?? [:]
+        for waiter in waiters.values { waiter.resume() }
+    }
+
+    /// Join the exact upload, without polling or cancelling the uploader when UIKit expires our lease.
+    private func awaitSyncUpCompletion(_ operationID: UUID) async {
+        let waiterID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !Task.isCancelled, activeSyncUp?.id == operationID else {
+                    continuation.resume(); return
+                }
+                syncUpCompletionWaiters[operationID, default: [:]][waiterID] = continuation
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.syncUpCompletionWaiters[operationID]?.removeValue(forKey: waiterID)?.resume()
+                if self?.syncUpCompletionWaiters[operationID]?.isEmpty == true {
+                    self?.syncUpCompletionWaiters.removeValue(forKey: operationID)
+                }
+            }
+        }
+    }
     /// Last shared add-on ORDER applied from the account (Bug B). Persisted normalized transportUrls in the
     /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
     /// itself carry addonOrder, so a device that hydrates after (but not during) an order change still lands
@@ -3359,7 +3386,7 @@ final class VortXSyncManager: ObservableObject {
 #endif
         let operationID = UUID()
         activeSyncUp = (operationID, capture)
-        defer { if activeSyncUp?.id == operationID { activeSyncUp = nil } }
+        defer { finishSyncUp(operationID) }
 #if VORTX_NATIVE_DATA_ENGINE
         // An already-restored account may have lost its resident native session. A queued
         // upload must repair that binding itself: ordinary pulls defer to this pending push.
@@ -3730,13 +3757,19 @@ final class VortXSyncManager: ObservableObject {
     /// never clobbers a fresh local edit). `force` ignores both guards (used by the manual "Sync now"
     /// and by sign-in reconciliation). True if anything was restored.
     @discardableResult
-    func syncDown(force: Bool = false, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil) async -> Bool {
+    func syncDown(force: Bool = false, credentialCapture suppliedCapture: CredentialScopeRegistry.Capture? = nil,
+                  reportOutcome: ((ConflictResolutionOutcome) -> Void)? = nil) async -> Bool {
         let capture = suppliedCapture ?? credentialAuthority.capture()
+        let capturedDataKey = dataKey
+        var outcome: ConflictResolutionOutcome = .failed
+        defer { reportOutcome?(isCurrent(capture) && dataKey == capturedDataKey && !Task.isCancelled ? outcome : .failed) }
         guard isSignedIn, isCurrent(capture) else { return false }
 #if VORTX_NATIVE_DATA_ENGINE
         // One pulled document may commit at a time, and a pull may not project an older host
         // document over an in-flight export. A refused operation leaves its ACK/version untouched.
-        guard activeSyncDown?.capture != capture, activeSyncUp?.capture != capture else { return false }
+        guard activeSyncDown?.capture != capture, activeSyncUp?.capture != capture else {
+            outcome = .pending; return false
+        }
         let pullID = UUID()
         activeSyncDown = (pullID, capture)
         defer { if activeSyncDown?.id == pullID { activeSyncDown = nil } }
@@ -3759,7 +3792,7 @@ final class VortXSyncManager: ObservableObject {
         // regardless of a queued push, and syncUp refuses to let that push land first.
         let mustRestore = !hasAppliedAccountDoc || hasPendingAccountDocApply(for: capture)
         let effectiveForce = force || mustRestore
-        if !effectiveForce, hasPendingPush { return false }
+        if !effectiveForce, hasPendingPush { outcome = .pending; return false }
         let pulled: (doc: [String: Any], version: Int)
         switch await pullDocVersionedRetrying(credentialCapture: capture) {
         case .doc(let doc, let version):
@@ -3769,8 +3802,9 @@ final class VortXSyncManager: ObservableObject {
             // over, so open the gate: a genuinely fresh account must still be seedable (reconcileAfterSignIn's
             // .seededFromDevice path pushes through syncUp). Stamped inside the suppression window because it is
             // a UserDefaults write, and an unsuppressed write here would arm the very push we are ordering.
-            guard !hasPendingAccountDocApply(for: capture) else { return false }
+            guard isCurrent(capture), !hasPendingAccountDocApply(for: capture) else { return false }
             withRemoteApplySuppressed { hasAppliedAccountDoc = true }
+            outcome = .completed
             return false
         case .failed:
             // We did NOT read the account (transient fault already retried, or an undecryptable doc). Leave the
@@ -3801,6 +3835,7 @@ final class VortXSyncManager: ObservableObject {
             // An equal document is never reapplied, but a certified current owner may still need its
             // already-pulled descriptors materialized after a warm engine lost them. Do not fetch again.
             CoreBridge.shared.hydrateAddonsFromAccount(Self.ownedAddons(from: pulled.doc))
+            outcome = .completed
             return false
         case .apply:
             break
@@ -4376,6 +4411,7 @@ final class VortXSyncManager: ObservableObject {
         // unconditional because refreshOwnerResumeCache does not contribute to `restored`.
         guard isCurrent(capture) else { return false }
         CoreBridge.shared.rebuildContinueWatching()
+        outcome = .completed
         return restored
     }
 
@@ -4866,9 +4902,15 @@ final class VortXSyncManager: ObservableObject {
     /// Conflict resolution: replace this device's profiles + settings with the account's (forced).
     /// Even this "use account" path still UNIONs profiles (syncDown merges the local roster back in),
     /// so it can never delete a local-only profile; it only adopts the account's settings + fields.
-    func useAccountData() async {
+    enum ConflictResolutionOutcome: Equatable { case completed, pending, failed }
+
+    @discardableResult func useAccountData() async -> ConflictResolutionOutcome {
+        let capture = credentialAuthority.capture()
+        guard isSignedIn, isCurrent(capture) else { return .failed }
         withRemoteApplySuppressed { pendingAddonOrderIntent = nil }
-        await syncDown(force: true)
+        var outcome: ConflictResolutionOutcome = .failed
+        await syncDown(force: true, credentialCapture: capture, reportOutcome: { outcome = $0 })
+        return isCurrent(capture) ? outcome : .failed
     }
     /// Conflict resolution / "Sync now": push this device's profiles + settings to the account.
     /// STAYS BEHIND THE #145 RESTORE GATE. Most callers are automatic, not user choices (the engine-driven
@@ -4901,19 +4943,64 @@ final class VortXSyncManager: ObservableObject {
     /// macOS has no such API (and no jetsam on background), so it falls back to a plain push there. Called
     /// from BOTH app entry points (tvOS + iOS/Mac) for parity.
     func syncUpOnBackground() {
+        let capture = credentialAuthority.capture()
+        let capturedDataKey = dataKey
         #if canImport(UIKit) && !os(macOS)
         let app = UIApplication.shared
-        var bgTask: UIBackgroundTaskIdentifier = .invalid
-        bgTask = app.beginBackgroundTask(withName: "vortx.sync.background") {
-            if bgTask != .invalid { app.endBackgroundTask(bgTask); bgTask = .invalid }
+        let lease = BackgroundSyncLease(app: app)
+        lease.id = app.beginBackgroundTask(withName: "vortx.sync.background") {
+            Task { @MainActor in lease.expire() }
         }
-        Task {
-            await self.syncUp()
-            if bgTask != .invalid { app.endBackgroundTask(bgTask); bgTask = .invalid }
+        guard lease.id != .invalid else { return }
+        lease.worker = Task { @MainActor in
+            await self.flushBackgroundSync(capture: capture, dataKey: capturedDataKey)
+            lease.finish()
         }
         #else
-        Task { await self.syncUp() }
+        Task { await self.flushBackgroundSync(capture: capture, dataKey: capturedDataKey) }
         #endif
+    }
+
+    #if canImport(UIKit) && !os(macOS)
+    @MainActor private final class BackgroundSyncLease {
+        let app: UIApplication
+        var id: UIBackgroundTaskIdentifier = .invalid
+        var worker: Task<Void, Never>?
+        init(app: UIApplication) { self.app = app }
+        func expire() { worker?.cancel(); finish() }
+        func finish() {
+            if id != .invalid { app.endBackgroundTask(id); id = .invalid }
+            worker = nil
+        }
+    }
+    #endif
+
+    private func flushBackgroundSync(capture: CredentialScopeRegistry.Capture, dataKey capturedDataKey: Data?) async {
+        guard isSignedIn, isCurrent(capture), dataKey == capturedDataKey, !Task.isCancelled else { return }
+        // Preserve the queued request when an older snapshot already owns the upload slot.
+        if activeSyncUp?.capture == capture { requestSyncSoon() }
+        while isSignedIn, isCurrent(capture), dataKey == capturedDataKey, !Task.isCancelled {
+            if let active = activeSyncUp, active.capture == capture {
+                await awaitSyncUpCompletion(active.id)
+                continue
+            }
+            #if VORTX_NATIVE_DATA_ENGINE
+            let generation = nativePushQueue.generation
+            #endif
+            let accepted = await syncUp()
+            guard isCurrent(capture), dataKey == capturedDataKey, !Task.isCancelled else { return }
+            // syncUp may suspend before acquiring its slot. If another upload won during that
+            // suspension, its queued refusal still needs this lease until the exact winner finishes.
+            if !accepted, activeSyncUp?.capture == capture { continue }
+            #if VORTX_NATIVE_DATA_ENGINE
+            nativePushQueue.acknowledge(generation, accepted: accepted)
+            if accepted, !nativePushQueue.hasPendingPush { nativeDurablePushPending = false }
+            // Only a successful upload with a newer edit warrants another immediate export.
+            guard accepted, nativePushQueue.hasPendingPush else { return }
+            #else
+            return
+            #endif
+        }
     }
 
     /// Conflict resolution (the RECOMMENDED choice on an explicit "Sync now" when the rosters differ):
@@ -4921,7 +5008,10 @@ final class VortXSyncManager: ObservableObject {
     /// roster into this device, and syncUp re-unions and pushes, so afterwards both the device and the
     /// account hold the full set of profiles.
     @discardableResult func mergeBoth() async -> Bool {
-        await syncDown(force: true)
+        let capture = credentialAuthority.capture()
+        var outcome: ConflictResolutionOutcome = .failed
+        await syncDown(force: true, credentialCapture: capture, reportOutcome: { outcome = $0 })
+        guard isCurrent(capture), outcome == .completed else { return false }
         return await syncUp()
     }
 
