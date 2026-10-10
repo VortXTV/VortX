@@ -22,7 +22,7 @@ class TvPosterLayoutPolicyTest {
             ),
         )
 
-        assertEquals(200.dp, layout.width)
+        assertEquals(286.dp, layout.width)
         assertEquals(6.dp, layout.cornerRadius)
         assertEquals(16f / 9f, layout.aspectRatio)
         assertFalse(layout.showLabels)
@@ -32,7 +32,7 @@ class TvPosterLayoutPolicyTest {
     fun `portrait default preserves labels and portrait ratio`() {
         val layout = TvPosterLayoutPolicy.layout(PosterStylePreferences.State())
 
-        assertEquals(168.dp, layout.width)
+        assertEquals(200.dp, layout.width)
         assertEquals(16.dp, layout.cornerRadius)
         assertEquals(2f / 3f, layout.aspectRatio)
         assertTrue(layout.showLabels)
@@ -55,4 +55,69 @@ class TvPosterLayoutPolicyTest {
         assertTrue(source.contains("val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()"))
         assertTrue(source.contains("columns = GridCells.Adaptive(minSize = layout.width)"))
     }
+
+    @Test
+    fun `continue watching uses the shared cinematic baseline and bounds narrow windows`() {
+        assertEquals(390.dp, TvPosterLayoutPolicy.continueWatchingWidth(1280f))
+        assertEquals(390.dp, TvPosterLayoutPolicy.continueWatchingWidth(1920f))
+        assertEquals(224.dp, TvPosterLayoutPolicy.continueWatchingWidth(320f))
+    }
+
+    @Test
+    fun `Library continue watching rail forwards its measured viewport to cinema cards`() {
+        val source = sourceFile("TvCinemaCards.kt")
+        val rail = source.substringAfter("fun TvContinueWatchingRail(")
+
+        assertTrue(rail.contains("BoxWithConstraints(modifier = Modifier.fillMaxWidth())"))
+        assertTrue(rail.contains("val viewportWidth = maxWidth.value"))
+        assertTrue(rail.contains("TvCinemaCard("))
+        assertTrue(rail.contains("viewportWidth = viewportWidth"))
+        assertTrue(rail.contains("continueWatching = true"))
+        assertFalse(rail.contains("PosterStylePreferences"))
+        assertFalse(rail.contains("collectAsStateWithLifecycle"))
+        assertFalse(rail.contains("width = TvPosterLayoutPolicy.layout("))
+        assertFalse(rail.contains("width = 300.dp"))
+    }
+
+    @Test
+    fun `Home catalog row measures viewport while preserving focus and row callbacks`() {
+        val source = sourceFile("TvHomeScreen.kt")
+        val row = source
+            .substringAfter("private fun TvCatalogRow(")
+            .substringBefore("private fun TvCatalogWall(")
+
+        assertTrue(row.contains("BoxWithConstraints(modifier = Modifier.fillMaxWidth())"))
+        assertTrue(row.contains("val viewportWidth = maxWidth.value"))
+        assertTrue(row.contains("state = rowState"))
+        assertTrue(row.contains("width = TvPosterLayoutPolicy.continueWatchingWidth(viewportWidth)"))
+        assertTrue(row.contains("viewportWidth = viewportWidth"))
+        assertTrue(row.contains("recovery?.key == focusKey"))
+        assertTrue(row.contains("onFocused = { onFocused(item)"))
+        assertTrue(row.contains("onRemoveFromContinueWatching"))
+        assertFalse(row.contains("width = 300.dp"))
+    }
+
+    @Test
+    fun `touch poster rail uses measured card width and policy gap`() {
+        val source = sourceFile("Poster.kt")
+        val rail = source
+            .substringAfter("fun PosterRail(")
+            .substringBefore("/// Skeleton rail")
+
+        assertTrue(rail.contains("BoxWithConstraints(modifier = Modifier.fillMaxWidth())"))
+        assertTrue(rail.contains("surface = PosterViewportGeometryPolicy.Surface.TOUCH"))
+        assertTrue(rail.contains("landscape = posterStyle.landscape || cardKind == PosterViewportGeometryPolicy.CardKind.CONTINUE_WATCHING"))
+        assertTrue(rail.contains("horizontalArrangement = Arrangement.spacedBy(geometry.cardGap.dp)"))
+        assertTrue(rail.contains("modifier = Modifier.width(geometry.cardWidth.dp)"))
+        assertFalse(rail.contains("padding(end = VortXTheme.spacing.sm)"))
+        assertFalse(rail.contains("maxOf(240.dp)"))
+    }
+
+    private fun sourceFile(name: String): String = listOf(
+        File("src/main/kotlin/com/vortx/android/ui/tv/$name"),
+        File("app/src/main/kotlin/com/vortx/android/ui/tv/$name"),
+        File("android/app/src/main/kotlin/com/vortx/android/ui/tv/$name"),
+        File("app/src/main/kotlin/com/vortx/android/ui/components/$name"),
+        File("android/app/src/main/kotlin/com/vortx/android/ui/components/$name"),
+    ).firstOrNull(File::isFile)?.readText() ?: error("Could not locate $name")
 }

@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -406,50 +407,54 @@ private fun TvCatalogRow(
                 Text("Continue catalog")
             }
         }
-        LazyRow(
-            state = rowState,
-            contentPadding = PaddingValues(horizontal = TvDimens.edge),
-            horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
-        ) {
-            itemsIndexed(visibleItems, key = { _, it -> tvHomeItemKey(it) }) { i, item ->
-                if (onEndReached != null && i == visibleItems.lastIndex) {
-                    LaunchedEffect(catalog.engineIndex, visibleItems.size, tvHomeItemKey(item)) {
-                        onEndReached()
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val viewportWidth = maxWidth.value
+            LazyRow(
+                state = rowState,
+                contentPadding = PaddingValues(horizontal = TvDimens.edge),
+                horizontalArrangement = Arrangement.spacedBy(TvDimens.cardGap),
+            ) {
+                itemsIndexed(visibleItems, key = { _, it -> tvHomeItemKey(it) }) { i, item ->
+                    if (onEndReached != null && i == visibleItems.lastIndex) {
+                        LaunchedEffect(catalog.engineIndex, visibleItems.size, tvHomeItemKey(item)) {
+                            onEndReached()
+                        }
                     }
-                }
-                val menu = posterMenuFor(catalog)
-                val focusKey = TvHomeFocusKey(catalog.id, item.type, item.id)
-                val cardFocus = when {
-                    recovery?.key == focusKey -> recoveryFocus
-                    firstCardFocus != null && i == 0 -> firstCardFocus
-                    else -> null
-                }
-                if (usesContinueWatchingCard) {
-                    TvCinemaCard(
+                    val menu = posterMenuFor(catalog)
+                    val focusKey = TvHomeFocusKey(catalog.id, item.type, item.id)
+                    val cardFocus = when {
+                        recovery?.key == focusKey -> recoveryFocus
+                        firstCardFocus != null && i == 0 -> firstCardFocus
+                        else -> null
+                    }
+                    if (usesContinueWatchingCard) {
+                        TvCinemaCard(
+                            item = item,
+                            onClick = { onItem(item) },
+                            onFocused = { onFocused(item); if (isContinueWatchingRow) focusedCwItem = item },
+                            focusRequester = cardFocus,
+                            width = TvPosterLayoutPolicy.continueWatchingWidth(viewportWidth),
+                            viewportWidth = viewportWidth,
+                            continueWatching = true,
+                            onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onRemoveFromContinueWatching(item) }) else null,
+                        )
+                    } else TvPosterCard(
                         item = item,
                         onClick = { onItem(item) },
-                        onFocused = { onFocused(item); if (isContinueWatchingRow) focusedCwItem = item },
+                        onFocused = {
+                            onFocused(item)
+                            if (menu == PosterCardMenu.CONTINUE_WATCHING) focusedCwItem = item
+                        },
                         focusRequester = cardFocus,
-                        width = 300.dp,
-                        continueWatching = true,
-                        onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onRemoveFromContinueWatching(item) }) else null,
+                        menu = menu,
+                        onDetails = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onItem(item) }) else null,
+                        onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) {
+                            { onRemoveFromContinueWatching(item) }
+                        } else {
+                            null
+                        },
                     )
-                } else TvPosterCard(
-                    item = item,
-                    onClick = { onItem(item) },
-                    onFocused = {
-                        onFocused(item)
-                        if (menu == PosterCardMenu.CONTINUE_WATCHING) focusedCwItem = item
-                    },
-                    focusRequester = cardFocus,
-                    menu = menu,
-                    onDetails = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onItem(item) }) else null,
-                    onRemoveFromContinueWatching = if (menu == PosterCardMenu.CONTINUE_WATCHING) {
-                        { onRemoveFromContinueWatching(item) }
-                    } else {
-                        null
-                    },
-                )
+                }
             }
         }
     }

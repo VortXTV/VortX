@@ -6,6 +6,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -33,6 +35,7 @@ import com.vortx.android.metadata.PosterArtwork
 import com.vortx.android.model.Catalog
 import com.vortx.android.model.MetaItem
 import com.vortx.android.ui.prefs.PosterStylePreferences
+import com.vortx.android.ui.PosterViewportGeometryPolicy
 import com.vortx.android.ui.theme.VortXGlass
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
@@ -144,9 +147,9 @@ fun PosterRail(
     onQuickView: ((MetaItem) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
-    // Poster width preset (item 5): the rail card width follows the user's Poster Style choice (default
-    // Balanced = 168dp), read live so a change re-lays out the rail. Also enqueue this page of ids for a
-    // localized-metadata resolve (item 9), a cheap no-op for English / when the feature is off.
+    // Poster width preset (item 5): the rail card width follows the user's Poster Style choice (Balanced
+    // = 168dp compact / 224dp regular), read live so a change re-lays out the rail. Also enqueue this page
+    // of ids for a localized-metadata resolve (item 9), a cheap no-op for English / when the feature is off.
     val posterStyle by PosterStylePreferences.state.collectAsStateWithLifecycle()
     LaunchedEffect(catalog.items) {
         if (!catalog.readOnly) LocalizedMetadataStore.resolve(catalog.items.map { it.id })
@@ -170,40 +173,61 @@ fun PosterRail(
                 androidx.compose.material3.Text("Continue catalog")
             }
         }
-        LazyRow(contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge)) {
-            itemsIndexed(catalog.items, key = { _, item -> "${item.type.name}|${item.id}" }) { index, item ->
-                if (onEndReached != null && index == catalog.items.lastIndex) {
-                    LaunchedEffect(catalog.engineIndex, catalog.items.size, item.type, item.id) {
-                        onEndReached()
+        // Measure the actual rail viewport so compact phones/narrow tablets use the compact ladder while
+        // regular tablets use the Apple-aligned regular ladder. Catalog and Continue Watching share a width
+        // when they share an orientation; CW additionally carries its landscape, progress and action semantics.
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val cardKind = if (catalog.id == CONTINUE_WATCHING_ROW_ID) {
+                PosterViewportGeometryPolicy.CardKind.CONTINUE_WATCHING
+            } else {
+                PosterViewportGeometryPolicy.CardKind.CATALOG
+            }
+            val geometry = PosterViewportGeometryPolicy.resolve(
+                viewportWidth = maxWidth.value,
+                widthPreset = posterStyle.width,
+                surface = PosterViewportGeometryPolicy.Surface.TOUCH,
+                cardKind = cardKind,
+                landscape = posterStyle.landscape || cardKind == PosterViewportGeometryPolicy.CardKind.CONTINUE_WATCHING,
+            )
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = VortXTheme.spacing.edge),
+                horizontalArrangement = Arrangement.spacedBy(geometry.cardGap.dp),
+            ) {
+                itemsIndexed(catalog.items, key = { _, item -> "${item.type.name}|${item.id}" }) { index, item ->
+                    if (onEndReached != null && index == catalog.items.lastIndex) {
+                        LaunchedEffect(catalog.engineIndex, catalog.items.size, item.type, item.id) {
+                            onEndReached()
+                        }
                     }
+                    val menu = posterMenuFor(catalog)
+                    val continueWatching = catalog.id == CONTINUE_WATCHING_ROW_ID
+                    PosterCard(
+                        title = item.name,
+                        subtitle = item.continueWatchingUnavailableMessage ?: cinemaCardFacts(item),
+                        onClick = { onItem(item) },
+                        // Continue Watching items carry a watched fraction; the card draws its accent
+                        // progress track for them (null on plain catalog items = no track).
+                        progress = item.progress,
+                        watched = item.watched,
+                        menuItem = item.takeIf { menu != PosterCardMenu.NONE },
+                        menu = menu,
+                        onDetails = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onItem(item) }) else null,
+                        onRemoveFromContinueWatching = if (
+                            menu == PosterCardMenu.CONTINUE_WATCHING && onRemoveFromContinueWatching != null
+                        ) ({ onRemoveFromContinueWatching(item) }) else null,
+                        onQuickView = onQuickView?.let { quickView -> { quickView(item) } },
+                        art = {
+                            if (continueWatching) CinemaLandscapeArt(item)
+                            else PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
+                        },
+                        cinema = true,
+                        landscape = true.takeIf { continueWatching },
+                        reserveLabelSpace = continueWatching,
+                        // The policy width is the artwork/card width. Keep the inter-card rhythm in the
+                        // LazyRow arrangement so the measured card never loses pixels to an end inset.
+                        modifier = Modifier.width(geometry.cardWidth.dp),
+                    )
                 }
-                val menu = posterMenuFor(catalog)
-                val continueWatching = catalog.id == CONTINUE_WATCHING_ROW_ID
-                PosterCard(
-                    title = item.name,
-                    subtitle = item.continueWatchingUnavailableMessage ?: cinemaCardFacts(item),
-                    onClick = { onItem(item) },
-                    // Continue Watching items carry a watched fraction; the card draws its accent
-                    // progress track for them (null on plain catalog items = no track).
-                    progress = item.progress,
-                    watched = item.watched,
-                    menuItem = item.takeIf { menu != PosterCardMenu.NONE },
-                    menu = menu,
-                    onDetails = if (menu == PosterCardMenu.CONTINUE_WATCHING) ({ onItem(item) }) else null,
-                    onRemoveFromContinueWatching = if (
-                        menu == PosterCardMenu.CONTINUE_WATCHING && onRemoveFromContinueWatching != null
-                    ) ({ onRemoveFromContinueWatching(item) }) else null,
-                    onQuickView = onQuickView?.let { quickView -> { quickView(item) } },
-                    art = {
-                        if (continueWatching) CinemaLandscapeArt(item)
-                        else PosterArt(item.poster, item.name, id = item.id, type = item.type.id)
-                    },
-                    cinema = true,
-                    landscape = true.takeIf { continueWatching },
-                    reserveLabelSpace = continueWatching,
-                    modifier = Modifier.width(if (continueWatching) maxOf(240.dp, posterStyle.width.compactWidth) else posterStyle.width.compactWidth)
-                        .padding(end = VortXTheme.spacing.sm),
-                )
             }
         }
     }
