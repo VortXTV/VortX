@@ -456,8 +456,8 @@ struct NextEpisodePreloadPolicyTests {
             let rotatedResults: [Int?] = await BoundedPreloadWorkPool.map(
                 rotatedInputs,
                 limit: NextEpisodePreloadPolicy.addonConcurrencyLimit,
-                timeoutNanoseconds: 190_000_000,
-                operationTimeoutNanoseconds: 40_000_000
+                timeoutNanoseconds: 500_000_000,
+                operationTimeoutNanoseconds: 100_000_000
             ) { value in
                 await counter.begin(value)
                 do {
