@@ -269,6 +269,12 @@ struct iOSRootView: View {
     }
 
     var body: some View {
+        shellWithProfilePicker
+    }
+
+    /// Keeps the base presentation subtree in its own inferred type so the root's long-lived
+    /// observation and presentation modifiers do not all participate in one SwiftUI type-check.
+    private var shellPresentation: some View {
         VStack(spacing: 0) {
             #if os(macOS)
             macDesktopShell
@@ -320,6 +326,10 @@ struct iOSRootView: View {
         .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: updates.available?.build)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: dismissedUpdateVersion)
         .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: connectivity.isOffline)
+    }
+
+    private var shellWithConnectivityRouting: some View {
+        shellPresentation
         // Offline-at-LAUNCH routing (#120): the monitor's FIRST verdict (and only that one) may redirect
         // the initial tab, so an app opened with no connection lands on something usable instead of a
         // dead Home: the Downloads surface when a completed download exists, else Settings. Strictly
@@ -388,6 +398,10 @@ struct iOSRootView: View {
         }
         #endif
         .task { await armSeedingNag() }
+    }
+
+    private var shellWithTabPreferenceRouting: some View {
+        shellWithConnectivityRouting
         .onChange(of: hideLiveTab) { hidden in
             if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen
         }
@@ -422,9 +436,14 @@ struct iOSRootView: View {
             updates.startMonitoring()   // cached result immediately, network at most once per day
             presentUpdateIfReady()
         }
+    }
+
+    @ViewBuilder
+    private var shellWithProfilePicker: some View {
         #if os(macOS)
         // macOS menu-bar commands (the "Go" menu + ⌘-shortcuts) post here, since they live at the
         // Scene level and can't set this @State directly. The raw value mirrors Tab's order.
+        shellWithTabPreferenceRouting
         .onReceive(NotificationCenter.default.publisher(for: MacCommands.tabRequest)) { note in
             guard let raw = note.userInfo?["tab"] as? Int, let dest = Tab(rawValue: raw) else { return }
             // ⌘F lands the cursor in the persistent top-bar search field. The destination follows
@@ -441,7 +460,6 @@ struct iOSRootView: View {
             // never routed to; fall back to Home instead of resurrecting a hidden screen.
             selectTab(hiddenTabs.contains(dest) ? .home : dest)
         }
-        #endif
         // Launch "Who's watching?" picker: a real modal at cold start when the roster has more than one
         // profile and none has been chosen this launch (ProfileStore.needsPicker), re-presented whenever
         // Settings' Switch Profile flips pickedThisLaunch back to false. `.platformFullScreenCover` is a
@@ -454,6 +472,10 @@ struct iOSRootView: View {
         // clipped the trailing Add Profile circle off the window's right edge. iPhone / iPad keep a real
         // `.fullScreenCover`. The shell behind stays hidden by the opacity gate above.
         .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
+        #else
+        shellWithTabPreferenceRouting
+            .platformFullScreenRootCover(isPresented: pickerPresented) { ProfilePickerView() }
+        #endif
     }
 
     /// Phase-0 seeding nag arm (com.vortx move): a named method (not an inline closure) so the shell
