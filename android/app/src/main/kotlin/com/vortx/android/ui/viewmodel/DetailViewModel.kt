@@ -316,16 +316,21 @@ internal fun nativeDebridResumeRef(
 internal suspend fun <T> ownerBoundResult(
     expectedOwner: DebridOwnerToken?,
     currentOwner: () -> DebridOwnerToken?,
+    discard: (T) -> Unit = {},
     resolve: suspend () -> Result<T>,
 ): Result<T> {
     if (currentOwner() != expectedOwner) {
         return Result.failure(DebridResolver.DebridException.OwnerChanged)
     }
     val result = resolve()
-    return if (currentOwner() == expectedOwner) {
-        result
-    } else {
-        Result.failure(DebridResolver.DebridException.OwnerChanged)
+    var accepted = false
+    try {
+        currentCoroutineContext().ensureActive()
+        if (currentOwner() != expectedOwner) return Result.failure(DebridResolver.DebridException.OwnerChanged)
+        accepted = true
+        return result
+    } finally {
+        if (!accepted) result.getOrNull()?.let { runCatching { discard(it) } }
     }
 }
 
@@ -575,20 +580,9 @@ class DetailViewModel(
     /// repository call is still returning; the old call must not repopulate it after the clear.
     private val warmNextLock = Any()
     private var warmNextGeneration = 0L
-    private var warmNextSourceByEpisode: WarmNextSourceLease? = null
-
-    private data class WarmNextCapture(
-        val episodeId: String,
-        val profileId: String,
-        val owner: ContinueWatchingOwner,
-        val sourceRequest: SourceRequestFence.Token?,
-        val prewarmGeneration: Long,
-    )
-
-    private sealed interface WarmNextPlan {
-        data object AlreadyWarm : WarmNextPlan
-        data class Fetch(val capture: WarmNextCapture) : WarmNextPlan
-    }
+    private val preparedEpisodeSlot = PreparedEpisodeSlot<PreparedEpisodeAuthority>(::isCurrentWarmNextCapture)
+    private var playbackAudioRevision = 0L
+    private var playbackAudioLanguage: String? = null
 
     /// Detail reactivity (see [CatalogRepository.detailUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
@@ -782,6 +776,7 @@ class DetailViewModel(
     }
 
     private fun startSourceLoad(episodeId: String?, forceRefresh: Boolean = false) {
+        invalidateWarmNextSource()
         cancelPlaybackResolveForSourceTargetInvalidation()
         val profileId = sourceSticky.currentProfileId()
         val token = if (forceRefresh) {
@@ -1262,6 +1257,7 @@ class DetailViewModel(
     /// already invalidated the memoized scores). The StateFlow analogue of Apple's `@ObservedObject
     /// pinStore` + published-groups re-rank.
     private fun onPinsChanged() {
+        invalidateWarmNextSource()
         _pinUi.value = readPinUi()
         lastCtx?.let { ctx ->
             val updated = ctx.copy(pin = currentPin())
@@ -1287,6 +1283,7 @@ class DetailViewModel(
     fun setSourceAudioLanguageHint(language: String?) {
         val normalized = language?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
         if (_sourceAudioLanguageHint.value == normalized) return
+        invalidateWarmNextSource()
         // The picker is session-only, but it still changes the immutable ranking input.  Advance the same
         // source request fence used for episode changes so an in-flight assembly for the old language cannot
         // repaint the list after the viewer has selected a new one.  Keep the current groups visible while
@@ -1438,7 +1435,7 @@ class DetailViewModel(
             result.getOrNull()?.playbackLease?.close()
             return Result.failure(IllegalStateException(OWNER_CHANGED_MESSAGE))
         }
-        return result.mapCatching { resolved ->
+        return result.mapOwnedPlayable { resolved ->
             if (resolved.url.isBlank()) throw IllegalStateException()
             PlayerSourceSwitchResolution(
                 playable = resolved.copy(
@@ -1478,6 +1475,11 @@ class DetailViewModel(
             ?: return Result.failure(IllegalStateException())
         val target = detail.videos.firstOrNull { it.id == episodeId }
             ?: return Result.failure(IllegalStateException())
+        // Claim before startSourceLoad advances the outgoing request fence. A warm hit does not
+        // load providers or resolve again; host acceptance alone installs its source-list context.
+        preparedEpisodeSlot.claim(target.id)?.let { claimed ->
+            return preparedEpisodeResolution(claimed, target, detail)
+        }
         val previousEpisodeId = _selectedEpisodeId.value
         val previousSeason = _selectedSeason.value
         _selectedEpisodeId.value = target.id
@@ -1504,7 +1506,7 @@ class DetailViewModel(
             }
         }
         val budget = EpisodeResolutionBudget()
-        return budget.outer { withEpisodeSwitchCancellationRollback(::restorePreviousTargetIfCurrent) {
+        return budget.outer(discard = { it.getOrNull()?.discard() }) { withEpisodeSwitchCancellationRollback(::restorePreviousTargetIfCurrent) {
             budget.source { awaitEpisodeSourceSettlement(sourceSettlement, request) }
             if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 return@withEpisodeSwitchCancellationRollback Result.failure(IllegalStateException(OWNER_CHANGED_MESSAGE))
@@ -1533,7 +1535,7 @@ class DetailViewModel(
                 )
             }
             val actionOwner = debridKeys.ownerToken()
-            val result = budget.candidate { resolveForOwner(source, target, actionOwner) }
+            val result = budget.candidate(discard = { it.getOrNull()?.playbackLease?.close() }) { resolveForOwner(source, target, actionOwner) }
                 ?: Result.failure(IllegalStateException("Episode preparation timed out. Try this episode again."))
             if (
                 !isActionOwnerCurrent(actionOwner) ||
@@ -1546,7 +1548,7 @@ class DetailViewModel(
             }
             val year = detail.releaseInfo?.take(4)?.toIntOrNull()
             val mediaRef = buildMediaRef(type = type, metaId = id, episode = target, title = detail.name, year = year)
-            val resolution = result.mapCatching { resolved ->
+            val resolution = result.mapOwnedPlayable { resolved ->
                 if (resolved.url.isBlank()) throw IllegalStateException()
                 PlayerSourceSwitchResolution(
                     playable = resolved.copy(
@@ -1579,6 +1581,81 @@ class DetailViewModel(
             restorePreviousTargetIfCurrent()
             Result.failure(IllegalStateException("Episode preparation timed out. Try this episode again."))
         }
+    }
+
+    private fun preparedEpisodeResolution(
+        claimed: PreparedEpisodeSlot.Claim<PreparedEpisodeAuthority>,
+        target: Episode,
+        detail: MetaDetail,
+    ): Result<PlayerSourceSwitchResolution> {
+        val prepared = claimed.episode
+        val previousEpisode = _selectedEpisodeId.value
+        val previousSeason = _selectedSeason.value
+        val previousStreams = _streams.value
+        val previousContext = lastCtx
+        val previousSource = lastPlayedSource
+        val previousAcceptedEpisode = lastAcceptedEpisodeId
+        val previousManualEpisode = explicitManualEpisodeId
+        val previousResume = resumeRef
+        var installedRequest: SourceRequestFence.Token? = null
+        return Result.success(preparedEpisodeHandoff(
+            prepared = prepared,
+            playable = prepared.playable.copy(startPositionMs = 0L,
+                mediaRef = buildMediaRef(type, id, target, detail.name, detail.releaseInfo?.take(4)?.toIntOrNull()),
+                expectedDurationMs = expectedRuntimeMs(), posterUrl = nowPlayingPoster(target),
+                isLive = isLivePlayback(), episodeTitle = target.title.takeIf { it.isNotBlank() }),
+            commitGate = sourceSwitchCommitGate,
+            isCurrent = { preparedEpisodeSlot.accepts(claimed.ticket) },
+            install = { groups ->
+                sourceLoadJob?.cancel()
+                episodeBudgetJob?.cancel()
+                automaticEpisodeBudget = null
+                pendingAutoPick = false
+                pendingAdvanceHint = null
+                val token = sourceRequestFence.begin(sourceSticky.currentProfileId(), target.id)
+                installedRequest = token
+                _selectedEpisodeId.value = target.id
+                _selectedSeason.value = target.season
+                seedPreparedSources(token, groups,
+                    buildContext(target.id, CanonicalContentIdentity.imdb(metaId.takeIf { it.startsWith("tt") }, target.season, target.episode),
+                        token, lastPlayedSource?.let { StreamRanking.signature(it) to it.bingeGroup }))
+                lastPlayedSource = prepared.source
+                resumeRef = null
+                explicitManualEpisodeId = target.id
+                lastAcceptedEpisodeId = target.id
+            },
+            rollback = {
+                installedRequest?.takeIf { sourceRequestFence.currentToken() === it }?.let {
+                    val restored = sourceRequestFence.begin(sourceSticky.currentProfileId(), previousEpisode)
+                    _selectedEpisodeId.value = previousEpisode
+                    _selectedSeason.value = previousSeason
+                    seedPreparedSources(restored, (previousStreams as? UiState.Success)?.data.orEmpty(),
+                        (previousContext ?: SourceListModel.Context()).copy(requestGeneration = restored.generation, streamId = previousEpisode))
+                    _streams.value = previousStreams
+                    lastPlayedSource = previousSource
+                    lastAcceptedEpisodeId = previousAcceptedEpisode
+                    explicitManualEpisodeId = previousManualEpisode
+                    resumeRef = previousResume
+                }
+            },
+        ))
+    }
+
+    /** Seed accepted bindings without a provider/cache/contributor fetch or a second player. */
+    private fun seedPreparedSources(request: SourceRequestFence.Token, groups: List<StreamGroup>, ctx: SourceListModel.Context) {
+        sourcesReady = false
+        torbox.reset(request.generation)
+        singularity.reset(request.generation)
+        communityJs.reset()
+        debridCacheEvidence = null
+        sourceSelectionRevision = DetailSourceSelectionRevision(request.generation, _sourceAudioLanguageHint.value)
+        lastCtx = ctx
+        sourceModel.setContext(ctx)
+        sourceModel.setMediaServerGroups(emptyList())
+        sourceModel.setRawGroups(groups)
+        _streams.value = UiState.Success(SourceListModel.directLinkDisplayGroups(groups, ctx.directLinksOnly))
+        sourceSettlement.value = EpisodeSourceSettlement(request, settled = true)
+        sourcesReady = true
     }
 
     /// Save a chosen source for OFFLINE viewing. This is the download subsystem's create entry point (the one
@@ -1853,9 +1930,10 @@ class DetailViewModel(
         owner: DebridOwnerToken?,
     ): Result<Playable> {
         val budget = automaticEpisodeBudget?.takeIf { it.first === sourceRequestFence.currentToken() }?.second ?: EpisodeResolutionBudget()
-        return budget.candidate {
+        return budget.candidate(discard = { it.getOrNull()?.playbackLease?.close() }) {
             com.vortx.android.home.continueWatchingAdmittedResult(continueWatchingAdmission, discard = { it.playbackLease?.close() }) {
-                ownerBoundResult(expectedOwner = owner, currentOwner = debridKeys::ownerToken) { repo.resolve(source, episode) }
+                ownerBoundResult(expectedOwner = owner, currentOwner = debridKeys::ownerToken,
+                    discard = { it.playbackLease?.close() }) { repo.resolve(source, episode) }
             }
         } ?: Result.failure(IllegalStateException("Source preparation timed out. Try another source."))
     }
@@ -2007,147 +2085,55 @@ class DetailViewModel(
     }
 
     /** Invalidate every outstanding next-episode warm publication and its cached source. */
-    private fun invalidateWarmNextSource() = synchronized(warmNextLock) {
-        warmNextGeneration += 1L
-        warmNextSourceByEpisode = null
-    }
-
-    /**
-     * Claim the current warm target. A cached source is retained only when the complete immutable lease still
-     * matches; otherwise it is withdrawn and this call starts a new generation for the requested episode.
-     */
-    private fun beginWarmNext(episodeId: String): WarmNextPlan = synchronized(warmNextLock) {
-        val profileId = sourceSticky.currentProfileId()
-        val owner = repo.continueWatchingOwner()
-        val sourceRequest = sourceRequestFence.currentToken()
-        val cached = warmNextSourceByEpisode
-        if (cached != null && acceptsWarmNextSourceLease(
-                lease = cached,
-                targetEpisodeId = episodeId,
-                currentProfileId = profileId,
-                currentOwner = owner,
-                currentSourceRequest = sourceRequest,
-                currentPrewarmGeneration = warmNextGeneration,
-            )
-        ) {
-            WarmNextPlan.AlreadyWarm
-        } else {
-            if (cached != null) {
-                warmNextGeneration += 1L
-                warmNextSourceByEpisode = null
-            }
-            WarmNextPlan.Fetch(
-                WarmNextCapture(
-                    episodeId = episodeId,
-                    profileId = profileId,
-                    owner = owner,
-                    sourceRequest = sourceRequest,
-                    prewarmGeneration = warmNextGeneration,
-                ),
-            )
-        }
+    private fun invalidateWarmNextSource() {
+        synchronized(warmNextLock) { warmNextGeneration += 1L }
+        preparedEpisodeSlot.invalidate()
     }
 
     /** Read all mutable owner/fence state atomically with the warm generation. */
-    private fun isCurrentWarmNextCapture(capture: WarmNextCapture): Boolean = synchronized(warmNextLock) {
-        capture.profileId == sourceSticky.currentProfileId() &&
-            capture.owner == repo.continueWatchingOwner() &&
-            capture.sourceRequest === sourceRequestFence.currentToken() &&
-            capture.prewarmGeneration == warmNextGeneration
+    private fun preparationAuthority(episodeId: String): PreparedEpisodeAuthority = synchronized(warmNextLock) {
+        PreparedEpisodeAuthority(episodeId, sourceSticky.currentProfileId(), repo.continueWatchingOwner(),
+            sourceRequestFence.currentToken(), warmNextGeneration, debridKeys.ownerToken(),
+            debridKeys.currentCredentialRevision(), playbackAudioRevision)
     }
 
-    /** Publish only after the final active-state check, so a late non-cooperative result is a no-op. */
-    private fun publishWarmNext(capture: WarmNextCapture, source: StreamSource): Boolean =
-        synchronized(warmNextLock) {
-            if (!isCurrentWarmNextCapture(capture)) return@synchronized false
-            warmNextSourceByEpisode = WarmNextSourceLease(
-                episodeId = capture.episodeId,
-                source = source,
-                profileId = capture.profileId,
-                owner = capture.owner,
-                sourceRequest = capture.sourceRequest,
-                prewarmGeneration = capture.prewarmGeneration,
-            )
-            true
-        }
+    private fun isCurrentWarmNextCapture(capture: PreparedEpisodeAuthority): Boolean =
+        isRouteAdmissionCurrent() && capture.accepts(preparationAuthority(capture.episodeId))
 
-    /** Consume a warm source only when its full lease is still current; every consume retires its generation. */
-    private fun consumeWarmNextSource(episodeId: String): StreamSource? = synchronized(warmNextLock) {
-        val cached = warmNextSourceByEpisode ?: return@synchronized null
-        val valid = acceptsWarmNextSourceLease(
-            lease = cached,
-            targetEpisodeId = episodeId,
-            currentProfileId = sourceSticky.currentProfileId(),
-            currentOwner = repo.continueWatchingOwner(),
-            currentSourceRequest = sourceRequestFence.currentToken(),
-            currentPrewarmGeneration = warmNextGeneration,
-        )
-        warmNextSourceByEpisode = null
-        warmNextGeneration += 1L
-        cached.source.takeIf { valid }
+    /** Semantic audio intent only; local engine track ids never cross episode boundaries. */
+    fun notePlaybackAudioIntent(language: String?) {
+        playbackAudioRevision++
+        playbackAudioLanguage = language?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+        invalidateWarmNextSource()
     }
 
-    /// Auto-advance to [nextEpisode]: select it and play its best-ranked source the moment its add-on
-    /// groups land, via the same consume-once latch a Smart-Source episode tap uses -- but armed
-    /// UNCONDITIONALLY (an Up Next the viewer accepted, or let count down, must play whether or not the
-    /// Smart Source setting is on) and carrying the just-finished play's quality signature + bingeGroup
-    /// so the ranking's continuity/binge bonuses keep the binge on the same release family. Resolution
-    /// posts through [playback] exactly like a manual play; the shell's Up Next layer collects
-    /// Ready/Failed from there. No-op when there is no next episode or a resolve is already running.
-    /**
-     * PLR-8 next-episode PRELOAD: pre-fetch and rank the NEXT episode's sources OFF the live playback fence,
-     * caching the best source by episode id so an eventual auto-advance skips the source-assembly wait.
-     *
-     * Non-disruptive by construction: it uses a direct [CatalogRepository.streams] fetch (a one-shot that
-     * returns its own result and never feeds the reactive [_streams] / [sourceRequestFence] the live episode
-     * owns) and writes ONLY the [warmNextSourceByEpisode] cache. It resolves nothing (no debrid unlock, no
-     * torrent warm-up), so it is cheap and cannot contend with the playing stream. Fail-soft and idempotent
-     * per episode. Returns true when a source was cached. Driven by the shell's [NextEpisodePreloadPolicy].
-     */
+    fun hasPreparedNextEpisode(episodeId: String): Boolean = preparedEpisodeSlot.hasReady(episodeId)
+
+    /** Resolve one isolated native preparation. Unsupported repositories stay on the bounded cold path. */
     suspend fun warmNextEpisode(episodeId: String): Boolean {
         if (type != MediaType.SERIES) return false
         currentCoroutineContext().ensureActive()
-        val plan = beginWarmNext(episodeId)
-        if (plan === WarmNextPlan.AlreadyWarm) return true
-        val capture = (plan as WarmNextPlan.Fetch).capture
+        if (preparedEpisodeSlot.hasReady(episodeId)) return true
         val detail = (_meta.value as? UiState.Success)?.data ?: return false
         val target = detail.videos.firstOrNull { it.id == episodeId } ?: return false
-
-        // Capture every mutable ranking input before the one-shot fetch. If the profile/source owner changes
-        // while that fetch is in flight, the lease check below rejects the result rather than ranking with a
-        // different profile's sticky source or history context.
-        val rememberedQuality = lastPlayedSource?.let(StreamRanking::qualityLabel)
-        val wantedAddon = sourceSticky.preference(id)?.addon
+        invalidateWarmNextSource()
+        val capture = preparationAuthority(episodeId)
+        val ticket = preparedEpisodeSlot.begin(capture)
+        val preparation = repo.openSourcePreparation(type, metaId, target) ?: return false
         val continuity = lastPlayedSource?.let(StreamRanking::signature)
         val binge = lastPlayedSource?.bingeGroup
         val pin = currentPin()
         val sticky = sourceSticky.preference(id)
-        val prefs = lastCtx?.prefs ?: StreamRanking.reading()
-
-        val groupsResult = repo.streams(
-            type = type,
-            id = id,
-            episodeId = target.id,
-            rememberedQuality = rememberedQuality,
-            wantedAddon = wantedAddon,
-        )
-        // Some repositories do not make cancellation cooperative. Do not let their late normal return
-        // publish a source after this coroutine was cancelled or any of the captured owners changed.
-        currentCoroutineContext().ensureActive()
-        if (!isCurrentWarmNextCapture(capture)) return false
-        val groups = groupsResult.getOrNull()?.takeIf { list -> list.any { it.streams.isNotEmpty() } } ?: return false
-        val best = StreamRanking.best(
-            groups = groups,
-            continuity = continuity,
-            binge = binge,
-            pin = pin,
-            sticky = sticky,
-            providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
-            prefs = prefs,
-        ) ?: return false
-        currentCoroutineContext().ensureActive()
-        if (!isCurrentWarmNextCapture(capture)) return false
-        return publishWarmNext(capture, best)
+        val prefs = sourcePrefs.snapshot(
+            detailSourceAudioLanguages(playbackAudioLanguage ?: _sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
+            isKids = ProfileStore.sharedOrNull()?.activeIsKids == true)
+        val directOnly = PlaybackBehaviorSettings.directLinksOnly(app)
+        val unhealthy = ProviderHealth.activeAddons()
+        return preparedEpisodeSlot.prepare(ticket, target.id, preparation, choose = { groups ->
+            StreamRanking.best(SourceListModel.directLinkDisplayGroups(groups, directOnly),
+                continuity = continuity, binge = binge, pin = pin, sticky = sticky,
+                providerPenalty = { it in unhealthy }, prefs = prefs)
+        })
     }
 
     fun playNextEpisode() {
@@ -2158,15 +2144,6 @@ class DetailViewModel(
         // below. The fence is (re)begun for the target so play()'s token + episode identity are correct;
         // the reactive assembly still runs to populate the new episode's in-player source list, but playback
         // no longer waits on it.
-        val warm = consumeWarmNextSource(next.id)
-        if (warm != null) {
-            _selectedSeason.value = next.season
-            _selectedEpisodeId.value = next.id
-            startSourceLoad(next.id)
-            sourceRequestFence.currentToken()?.let(::armAutomaticEpisodeBudget)
-            playAutomatically(warm)
-            return
-        }
         pendingAdvanceHint = lastPlayedSource?.let { StreamRanking.signature(it) to it.bingeGroup }
         // Keep the episode browser in step so backing out of the advanced play shows the RIGHT season.
         _selectedSeason.value = next.season

@@ -21,6 +21,22 @@ internal class EpisodeResolutionBudget(
     fun remainingMs(): Long = (outerMs - (nowMs() - started).coerceAtLeast(0L)).coerceAtLeast(0L)
     fun sourceRemainingMs(): Long = minOf(remainingMs(), (sourceMs - (nowMs() - started).coerceAtLeast(0L)).coerceAtLeast(0L))
     suspend fun <T> source(block: suspend () -> T): T? = withTimeoutOrNull(sourceRemainingMs()) { block() }
-    suspend fun <T> candidate(block: suspend () -> T): T? = withTimeoutOrNull(minOf(candidateMs, remainingMs())) { block() }
-    suspend fun <T> outer(block: suspend () -> T): T? = withTimeoutOrNull(remainingMs()) { block() }
+    suspend fun <T> candidate(discard: (T) -> Unit = {}, block: suspend () -> T): T? =
+        ownedTimeout(minOf(candidateMs, remainingMs()), discard, block)
+    suspend fun <T> outer(discard: (T) -> Unit = {}, block: suspend () -> T): T? =
+        ownedTimeout(remainingMs(), discard, block)
+
+    private class Produced<T>(val value: T)
+    /** Timeout may win after a non-cooperative producer succeeds but before its value is delivered. */
+    private suspend fun <T> ownedTimeout(timeoutMs: Long, discard: (T) -> Unit, block: suspend () -> T): T? {
+        var produced: Produced<T>? = null
+        var delivered = false
+        try {
+            val result = withTimeoutOrNull(timeoutMs) { Produced(block()).also { produced = it } }
+            delivered = result != null
+            return result?.value
+        } finally {
+            if (!delivered) produced?.let { runCatching { discard(it.value) } }
+        }
+    }
 }

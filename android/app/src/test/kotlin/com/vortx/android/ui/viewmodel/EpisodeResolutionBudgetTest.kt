@@ -7,6 +7,20 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class EpisodeResolutionBudgetTest {
+    @Test fun `candidate and outer timeout discard late successful resource once`() = kotlinx.coroutines.test.runTest {
+        for (outer in listOf(false, true)) {
+            var closes = 0
+            val budget = EpisodeResolutionBudget(nowMs = { testScheduler.currentTime }, outerMs = 20, candidateMs = 10)
+            val produce: suspend () -> AutoCloseable = {
+                withContext(NonCancellable) { delay(30) }
+                AutoCloseable { closes++ }
+            }
+            val result = if (outer) budget.outer(discard = { it.close() }, block = produce)
+                else budget.candidate(discard = { it.close() }, block = produce)
+            assertNull(result)
+            assertEquals(1, closes)
+        }
+    }
     @Test fun `empty partial UI is not a network settlement and A B A cannot unlock old target`() = runBlocking {
         val fence = SourceRequestFence("owner")
         val a = fence.begin("owner", "opaque-a")
