@@ -619,11 +619,14 @@ private enum CinematicBackdropImageTests {
 
         let rotatingLayer = CALayer()
         let rotatingLoader = KenBurnsLoader()
+        var publishedTitles: [String] = []
+        var publishedImage: CGImage?
         rotatingLoader.load(
             backdrop: fixtureServer.url("slow-title-a-backdrop.png").absoluteString,
             poster: fixtureServer.url("title-a-poster.png").absoluteString,
             maxPixel: Int(boundedPixel),
-            into: rotatingLayer
+            into: rotatingLayer,
+            onArtwork: { image in publishedTitles.append("A"); publishedImage = image }
         )
         check(
             "old title request starts before rotation",
@@ -634,7 +637,8 @@ private enum CinematicBackdropImageTests {
             backdrop: fixtureServer.url("title-b-backdrop.png").absoluteString,
             poster: fixtureServer.url("title-b-poster.png").absoluteString,
             maxPixel: Int(boundedPixel),
-            into: rotatingLayer
+            into: rotatingLayer,
+            onArtwork: { image in publishedTitles.append("B"); publishedImage = image }
         )
         check(
             "replacement title request starts after rotation",
@@ -659,6 +663,11 @@ private enum CinematicBackdropImageTests {
         check(
             "late old-title completion cannot overwrite the replacement layer",
             finalImage?.width == 1_280 && finalImage?.height == 427,
+            failures: &failures
+        )
+        check(
+            "navigation receives exactly the same immutable bitmap accepted by the current loader",
+            publishedImage === finalImage && publishedTitles == ["B"],
             failures: &failures
         )
         rotatingLoader.cancel()

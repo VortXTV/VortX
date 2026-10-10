@@ -102,7 +102,11 @@ struct iOSRootView: View {
     @FocusState private var macSearchFocused: Bool
     #endif
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var navigationArtwork: CinemaNavigationArtwork?
+    @State private var navigationHeight: CGFloat = 80
     @ScaledMetric(relativeTo: .caption) private var compactLabelSize: CGFloat = 11
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
     /// learn about it without opening Settings. Dismissing it remembers the version, so it reappears only
@@ -205,9 +209,13 @@ struct iOSRootView: View {
         .allowsHitTesting(quickViewPresenter.presentation == nil)
         .accessibilityHidden(quickViewPresenter.presentation != nil)
         .overlay { CinemaQuickViewOverlay(presenter: quickViewPresenter) }
-        .onChange(of: profiles.activeID) { _ in quickViewPresenter.close() }
+        .onChange(of: profiles.activeID) { _ in
+            quickViewPresenter.close()
+            navigationArtwork = nil
+        }
         .onChange(of: tab) { newTab in
             quickViewPresenter.close()
+            navigationArtwork = nil
             presentUpdateIfReady()
             // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
             VXProbeState.shared.setRoute(newTab.probeName)
@@ -457,11 +465,15 @@ struct iOSRootView: View {
     #endif
 
     #if os(macOS)
-    /// TV-inspired desktop navigation, not a sidebar. The transparent safe-area insert keeps
-    /// ordinary forms below the floating chrome; the existing hero's top bleed paints behind it.
+    /// A real reserved row keeps every destination's controls below the floating chrome. The
+    /// visible hero borrows that row for artwork only, using its existing accepted decoded image.
     private var macDesktopShell: some View {
-        measuredTabContent
-            .safeAreaInset(edge: .top, spacing: 0) { cinematicTopBar }
+        CinemaNavigationReservedShell {
+            cinematicTopBar
+        } content: {
+            measuredTabContent
+                .environment(\.cinemaNavigationArtworkInset, navigationHeight)
+        }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Palette.canvas)
         .onExitCommand {
@@ -535,13 +547,21 @@ struct iOSRootView: View {
             // Window width, not physical-screen width: Split View/Stage Manager retain the phone
             // treatment when narrow, and rotating a phone never turns it into a desktop shell.
             let topNavigation = UIDevice.current.userInterfaceIdiom == .pad && geometry.size.width >= 760
-            // Reserve real layout space, not just a propagated safe-area inset. Nested detail
-            // GeometryReaders/NavigationStacks can otherwise lay controls underneath the floating
-            // chrome. Only hero artwork bleeds; every scrolling control has an unobscured viewport.
-            VStack(spacing: 0) {
-                if topNavigation { cinematicTopBar }
-                measuredTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)
-                if !topNavigation { bottomTabBarRow }
+            // Nested detail GeometryReaders retain a real unobscured viewport. The existing
+            // hero image alone extends through the reserved top row via its artwork preference.
+            Group {
+                if topNavigation {
+                    CinemaNavigationReservedShell {
+                        cinematicTopBar
+                    } content: {
+                        measuredTabContent.environment(\.cinemaNavigationArtworkInset, navigationHeight)
+                    }
+                } else {
+                    VStack(spacing: 0) {
+                        measuredTabContent.frame(maxWidth: .infinity, maxHeight: .infinity)
+                        bottomTabBarRow
+                    }
+                }
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
         }
@@ -550,9 +570,16 @@ struct iOSRootView: View {
 
     private var measuredTabContent: some View {
         GeometryReader { geometry in
-            selectedTabContent.environment(\.cinemaCardViewportWidth, geometry.size.width)
+            selectedTabContent
+                .environment(\.cinemaCardViewportWidth, geometry.size.width)
+                .environment(\.cinemaNavigationArtworkOwner, navigationArtworkOwner)
+        }
+        .onPreferenceChange(CinemaNavigationArtworkKey.self) { artwork in
+            navigationArtwork = artwork?.owner == navigationArtworkOwner ? artwork : nil
         }
     }
+
+    private var navigationArtworkOwner: String { "\(tab.rawValue):\(profiles.activeID)" }
 
     private var cinematicTopBar: some View {
         HStack(spacing: Theme.Space.sm) {
@@ -579,6 +606,19 @@ struct iOSRootView: View {
         .padding(.horizontal, Theme.Space.md)
         .padding(.vertical, Theme.Space.sm)
         .frame(maxWidth: .infinity)
+        .background {
+            CinemaNavigationArtworkStrip(artwork: navigationArtwork,
+                                         reduceTransparency: reduceTransparency,
+                                         highContrast: accessibilityContrast == .increased)
+        }
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(key: CinemaNavigationHeightKey.self, value: geometry.size.height)
+            }
+        }
+        .onPreferenceChange(CinemaNavigationHeightKey.self) { height in
+            if height > 0, height != navigationHeight { navigationHeight = height }
+        }
     }
 
     private var horizontalTabBar: some View {
@@ -1511,17 +1551,6 @@ struct iOSHomeView: View {
             // and again when the rails first hydrate (boardRows / CW arrive async after onAppear).
             .onAppear { seedMacFocusIfNeeded() }
             .onChange(of: macRailSeedKey) { _ in seedMacFocusIfNeeded() }
-            // Home black-band fix: let the Home ScrollView bleed UNDER the floated top chrome so the
-            // billboard art reaches the very window top (search strip + nav pill float as glass over it),
-            // instead of starting below the shell's reserved chrome band as a bare near-black strip (the
-            // CEO's "big fat black bar"). The hero's own `.ignoresSafeArea(.container, .top)` cannot reclaim
-            // the shell's top `.safeAreaInset` from INSIDE a scroll view (the ScrollView consumes it into a
-            // content inset), so the ScrollView ITSELF must ignore that top region, the same way the Detail
-            // hero (a fixed banner) already reaches the top. Scoped to the Home ROOT only: the pushed detail
-            // page keeps the shell inset (its pinned banner bleeds on its own), and the list-first /
-            // conditional-hero screens (Settings, Add-ons, Library, Discover) keep the inset so their top
-            // content still starts below the pill. macOS-only; iOS/iPad already bleed with no shell inset.
-            .ignoresSafeArea(.container, edges: .top)
             #endif
             .background(homeAmbientCanvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)

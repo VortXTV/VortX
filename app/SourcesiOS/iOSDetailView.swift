@@ -372,6 +372,9 @@ struct iOSDetailView: View {
     // #44: the in-hero auto-play trailer is skipped when the user prefers reduced motion (the hero then
     // stays a still backdrop). Read here so the hero composition can gate the clip overlay.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
+    @Environment(\.cinemaNavigationArtworkInset) private var navigationArtworkInset
 #if os(iOS)
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 #endif
@@ -1392,7 +1395,6 @@ struct iOSDetailView: View {
                 .frame(width: geo.size.width, alignment: .leading)
         }
         .coordinateSpace(name: Self.detailScrollSpace)
-        .background(Theme.Palette.canvas.ignoresSafeArea())
     }
     #endif
 
@@ -1583,17 +1585,20 @@ struct iOSDetailView: View {
         meta?.background ?? meta?.poster ?? seedBackdrop ?? FeaturedHeroItem.metahubBackground(forId: id)
     }
 
-    /// Canvas with the dominant-color wash ramping in BELOW the hero band (clear at the top, so the hero's
-    /// canvas-fade seam stays seamless) and easing off toward the bottom. nil tint = today's flat canvas.
+    /// The title palette remains a restrained wash over the opaque canvas. The hero's last
+    /// pixels dissolve into this same surface, and the lower rails settle back to OLED black.
     private var dominantColorBackground: some View {
-        ZStack {
+        let alpha = HomeAtmospherePolicy.alpha(reduceTransparency: reduceTransparency,
+                                               highContrast: accessibilityContrast == .increased)
+        return ZStack {
             Theme.Palette.canvas
-            if let dominantTint {
+            if alpha > 0 {
+                let tint = dominantTint ?? Theme.Palette.accent
                 LinearGradient(stops: [
                     .init(color: .clear, location: 0.0),
                     .init(color: .clear, location: 0.30),
-                    .init(color: dominantTint.opacity(0.28), location: 0.60),
-                    .init(color: dominantTint.opacity(0.10), location: 1.0),
+                    .init(color: tint.opacity(alpha), location: 0.60),
+                    .init(color: .clear, location: 1.0),
                 ], startPoint: .top, endPoint: .bottom)
             }
         }
@@ -1603,8 +1608,10 @@ struct iOSDetailView: View {
     /// Off-main average-color compute (PosterImageLoader.averageColor, cached + downsampled); cross-fades
     /// the wash in. nil (no art / failure) keeps the plain canvas, the graceful fallback.
     private func recomputeTint() async {
-        let tint = await PosterImageLoader.averageColor(tintArtURL)
-        guard !Task.isCancelled else { return }
+        let requested = tintArtURL
+        dominantTint = nil
+        let tint = await PosterImageLoader.averageColor(requested)
+        guard !Task.isCancelled, requested == tintArtURL else { return }
         withAnimation(reduceMotion ? nil : .easeOut(duration: 0.6)) { dominantTint = tint }
     }
 
@@ -1627,7 +1634,9 @@ struct iOSDetailView: View {
             url: bg,
             contentMode: (effectiveType == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill
         )
-        .frame(height: height)
+        .frame(height: CinemaArtworkGeometry.expandedHeight(band: height, navigation: navigationArtworkInset))
+        .offset(y: -navigationArtworkInset)
+        .frame(height: height, alignment: .top)
         // The backdrop is the ZStack's WIDTH ANCHOR: it greedily takes the full viewport width and
         // pins to the leading edge, so the ZStack's leading edge is the screen's leading edge. Before
         // this, the oversized serif hero title made the ZStack wider than the screen and `.bottomLeading`
@@ -1655,6 +1664,7 @@ struct iOSDetailView: View {
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.5), .clear],
                            startPoint: .leading, endPoint: .center)
         )
+        .mask(CinemaHeroDissolve())
     }
 
     /// Full-bleed detail artwork backed by the shared off-main ImageIO loader. The request key includes the
@@ -1666,6 +1676,8 @@ struct iOSDetailView: View {
         let contentMode: ContentMode
 
         @Environment(\.displayScale) private var displayScale
+        @Environment(\.cinemaNavigationArtworkInset) private var navigationArtworkInset
+        @Environment(\.cinemaNavigationArtworkOwner) private var navigationArtworkOwner
         @State private var image: VXPosterImage?
         @State private var imageRequest: Request?
 
@@ -1690,11 +1702,12 @@ struct iOSDetailView: View {
                 )
                 Group {
                     if let image, imageRequest == request {
-                        renderedImage(image)
+                        renderedImage(image, request: request, height: viewport.size.height)
                     } else if let cached = cachedImage(for: request) {
-                        renderedImage(cached)
+                        renderedImage(cached, request: request, height: viewport.size.height)
                     } else {
                         Theme.Palette.surface1
+                            .preference(key: CinemaNavigationArtworkKey.self, value: nil)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1738,12 +1751,23 @@ struct iOSDetailView: View {
         }
 
         @ViewBuilder
-        private func renderedImage(_ image: VXPosterImage) -> some View {
+        private func renderedImage(_ image: VXPosterImage, request: Request, height: CGFloat) -> some View {
             #if canImport(UIKit)
             Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
+                .preference(key: CinemaNavigationArtworkKey.self,
+                            value: navigationArtwork(image.cgImage, request: request, height: height))
             #else
             Image(nsImage: image).resizable().aspectRatio(contentMode: contentMode)
+                .preference(key: CinemaNavigationArtworkKey.self,
+                            value: navigationArtwork(image.cgImage(forProposedRect: nil, context: nil, hints: nil),
+                                                     request: request, height: height))
             #endif
+        }
+
+        private func navigationArtwork(_ image: CGImage?, request: Request, height: CGFloat) -> CinemaNavigationArtwork? {
+            guard navigationArtworkInset > 0, let image else { return nil }
+            return .init(owner: navigationArtworkOwner, identity: request.url ?? "", image: image,
+                         height: height, contentMode: contentMode, panEpoch: nil, reduceMotion: true)
         }
     }
 

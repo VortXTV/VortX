@@ -56,6 +56,8 @@ struct FeaturedHeroView: View {
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized hero title/logo override
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.cinemaNavigationArtworkInset) private var navigationArtworkInset
+    @Environment(\.cinemaNavigationArtworkOwner) private var navigationArtworkOwner
     /// The "Auto-play trailers" setting, honored by the other three hero clip call sites (tvOS home + both
     /// detail pages). The home billboard clip gates on it too so turning trailers off in Settings actually
     /// stops this ambient clip, not just reduced-motion.
@@ -82,12 +84,30 @@ struct FeaturedHeroView: View {
     /// atmosphere behind the art already carry the title's palette. nil (no art / not computed yet) keeps
     /// today's fixed canvas + gradients exactly, so this is purely additive ambience.
     @State private var heroTint: FeaturedHeroTintSnapshot<Color>?
+    @State private var navigationImage: NavigationImage?
+
+    private struct NavigationImage {
+        let key: FeaturedHeroTintKey
+        let owner: String
+        let image: CGImage
+        let panEpoch: CFTimeInterval
+    }
 
     private var heroTintKey: FeaturedHeroTintKey {
         .init(id: model.hero?.id, type: model.hero?.type,
               artwork: model.hero?.backdrop ?? model.hero?.poster)
     }
     private var currentHeroTint: Color? { heroTint?.value(for: heroTintKey) }
+
+    private var navigationArtwork: CinemaNavigationArtwork? {
+        guard navigationArtworkInset > 0, let navigationImage,
+              navigationImage.key == heroTintKey, navigationImage.owner == navigationArtworkOwner else { return nil }
+        return .init(owner: navigationArtworkOwner,
+                     identity: "\(heroTintKey.type ?? ""): \(heroTintKey.id ?? ""): \(heroTintKey.artwork ?? "")",
+                     image: navigationImage.image,
+                     height: CinemaArtworkGeometry.expandedHeight(band: heroHeight, navigation: navigationArtworkInset),
+                     contentMode: .fill, panEpoch: navigationImage.panEpoch, reduceMotion: reduceMotion)
+    }
 
 
     /// Hero band height. iPhone: the billboard must command MORE THAN HALF the screen (owner ask), so the
@@ -160,6 +180,9 @@ struct FeaturedHeroView: View {
         }
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
+        .preference(key: CinemaNavigationArtworkKey.self, value: navigationArtwork)
+        .onChange(of: heroTintKey) { _ in navigationImage = nil }
+        .onChange(of: navigationArtworkOwner) { _ in navigationImage = nil }
         // Let just the first band bleed to the very top so the hero art runs behind the chrome (the
         // cinematic media-app look) instead of starting below it. On macOS that's behind the hidden
         // title-bar / traffic-light region; on iOS it's behind the frosted status-bar / nav bar. Only
@@ -282,6 +305,8 @@ struct FeaturedHeroView: View {
         // this exact frame, so the wide macOS band never falls back to a natural image width with a bare
         // scrim beside it.
         GeometryReader { geo in
+            let requested = heroTintKey
+            let requestedOwner = navigationArtworkOwner
             ZStack {
                 // Dynamic dominant-color base: the featured art's average color under everything, so the
                 // band already carries the title's palette while the art streams in (and whenever a layer
@@ -302,15 +327,23 @@ struct FeaturedHeroView: View {
                 // on its own layer and animating THAT keeps the exact motion at ~0% main-thread cost. The
                 // host loads the 16:9 backdrop (poster fallback) through the shared PosterImageLoader.
                 KenBurnsLayerHost(backdrop: model.hero?.backdrop, poster: model.hero?.poster,
-                                  reduceMotion: reduceMotion)
+                                  reduceMotion: reduceMotion,
+                                  usesAcceptedImageFallback: navigationArtworkInset > 0, onArtwork: { image, epoch in
+                    guard navigationArtworkInset > 0, requested == heroTintKey,
+                          requestedOwner == navigationArtworkOwner else { return }
+                    navigationImage = NavigationImage(key: requested, owner: requestedOwner, image: image, panEpoch: epoch)
+                })
             }
-            .frame(width: geo.size.width, height: geo.size.height)
+            .frame(width: geo.size.width, height: CinemaArtworkGeometry.expandedHeight(
+                band: geo.size.height, navigation: navigationArtworkInset))
+            .offset(y: -navigationArtworkInset)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
             .clipped()
         }
         .frame(height: heroHeight)
         .frame(maxWidth: .infinity)
         // Cross-fade the artwork itself on id change so a new featured title dissolves in.
-        .id(model.hero?.id)
+        .id(navigationArtworkInset > 0 ? "\(navigationArtworkOwner):\(model.hero?.id ?? "")" : model.hero?.id ?? "")
         .transition(reduceMotion ? .identity : .opacity)
         .overlay(
             // Smooth multi-stop vertical fade to canvas so the rails / grid below read cleanly and the band
@@ -328,6 +361,11 @@ struct FeaturedHeroView: View {
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.5), .clear],
                            startPoint: .leading, endPoint: .center)
         )
+        .overlay(
+            LinearGradient(colors: [Theme.Palette.canvas.opacity(0.45), .clear],
+                           startPoint: .top, endPoint: .center)
+        )
+        .mask(CinemaHeroDissolve())
         // Purely decorative art + scrims; hide from VoiceOver so the title/meta read first.
         .accessibilityHidden(true)
     }
@@ -613,7 +651,7 @@ struct FeaturedHeroView: View {
 /// through Core Text (~55% of a core on an idle Home, #178). Expressed as a single layer animation the
 /// motion is byte-for-byte the same while the main thread does nothing per frame. Reduce Motion adds no
 /// animation (static art), exactly as before.
-private enum KenBurnsPan {
+enum KenBurnsPan {
     static let scaleFrom: CGFloat = 1.0
     static let scaleTo: CGFloat = 1.08
     static let offsetX: CGFloat = 12
@@ -649,7 +687,7 @@ private enum KenBurnsPan {
         transform(scale: scaleTo, offsetX: offsetX, offsetY: offsetY)
     }
 
-    static func makeAnimation() -> CABasicAnimation {
+    static func makeAnimation(epoch: CFTimeInterval = 0) -> CABasicAnimation {
         let anim = CABasicAnimation(keyPath: "transform")
         anim.fromValue = NSValue(caTransform3D: restingTransform)
         anim.toValue = NSValue(caTransform3D: activeTransform)
@@ -659,21 +697,22 @@ private enum KenBurnsPan {
         anim.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         anim.isRemovedOnCompletion = false
         anim.fillMode = .both
+        anim.beginTime = epoch
         return anim
     }
 
     /// Install the resting transform + (unless Reduce Motion) the pan ONCE, from make…View, so the animation
     /// is submitted a single time per host and never re-created per SwiftUI frame.
-    static func configure(_ layer: CALayer, reduceMotion: Bool) {
+    static func configure(_ layer: CALayer, reduceMotion: Bool, epoch: CFTimeInterval = 0) {
         layer.contentsGravity = .resizeAspectFill
         layer.masksToBounds = true
         layer.transform = restingTransform
-        if !reduceMotion { layer.add(makeAnimation(), forKey: animationKey) }
+        if !reduceMotion { layer.add(makeAnimation(epoch: epoch), forKey: animationKey) }
     }
 
     /// Reconcile only a Reduce-Motion toggle (rare): add or remove the pan without touching contents, so a
     /// routine SwiftUI update never restarts the animation.
-    static func reconcile(_ layer: CALayer, reduceMotion: Bool) {
+    static func reconcile(_ layer: CALayer, reduceMotion: Bool, epoch: CFTimeInterval = 0) {
         let running = layer.animation(forKey: animationKey) != nil
         if reduceMotion, running {
             layer.removeAnimation(forKey: animationKey)
@@ -682,7 +721,7 @@ private enum KenBurnsPan {
             CATransaction.commit()
         } else if !reduceMotion, !running {
             layer.transform = restingTransform
-            layer.add(makeAnimation(), forKey: animationKey)
+            layer.add(makeAnimation(epoch: epoch), forKey: animationKey)
         }
     }
 }
@@ -697,8 +736,11 @@ final class KenBurnsLoader {
     private var task: Task<Void, Never>?
     private var requestID = ""
     private weak var targetLayer: CALayer?
+    private var onArtwork: ((CGImage) -> Void)?
 
-    func load(backdrop: String?, poster: String?, maxPixel: Int, into layer: CALayer) {
+    func load(backdrop: String?, poster: String?, maxPixel: Int, into layer: CALayer,
+              onArtwork: ((CGImage) -> Void)? = nil) {
+        self.onArtwork = onArtwork
         let backdropURL = HeroArtworkQualityPolicy.preferredURL(backdrop, maxPixel: maxPixel)
         let requestID = "\(backdropURL ?? poster ?? "")#\(maxPixel)"
         guard self.requestID != requestID else { return }
@@ -719,7 +761,7 @@ final class KenBurnsLoader {
         }
     }
 
-    func cancel() { task?.cancel(); task = nil }
+    func cancel() { task?.cancel(); task = nil; onArtwork = nil }
     deinit { task?.cancel() }
 
     /// The only layer mutation point. CALayer never crosses the detached task boundary; this MainActor method
@@ -731,6 +773,7 @@ final class KenBurnsLoader {
         CATransaction.begin(); CATransaction.setDisableActions(true)
         layer.contents = image
         CATransaction.commit()
+        onArtwork?(image)
         return true
     }
 
@@ -767,14 +810,18 @@ private extension VXPosterImage {
 // applied), and the host clips it to the band (the old outer `.clipped()`). `#if` splits ONLY the view-host
 // type; the CALayer + animation code above is shared.
 #if canImport(UIKit)
-private final class KenBurnsBackingView: UIView {
+final class KenBurnsBackingView: UIView {
+    let fallbackLayer = CALayer()
     let artLayer = CALayer()
+    let animationEpoch = CACurrentMediaTime()
+    var artworkHeight: CGFloat?
     override init(frame: CGRect) {
         super.init(frame: frame)
         isUserInteractionEnabled = false          // decorative art; the CTA/overlay sit in a sibling layer
         backgroundColor = .clear                   // let the static tint/poster show through until art loads
         clipsToBounds = true                       // clip the scaled/panned sublayer to the band (old .clipped())
         artLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer.addSublayer(fallbackLayer)
         layer.addSublayer(artLayer)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -782,8 +829,13 @@ private final class KenBurnsBackingView: UIView {
         super.layoutSubviews()
         CATransaction.begin(); CATransaction.setDisableActions(true)
         artLayer.contentsScale = layer.contentsScale   // crisp on Retina (sublayers don't inherit scale)
-        artLayer.bounds = CGRect(origin: .zero, size: bounds.size)
-        artLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        let height = artworkHeight ?? bounds.height
+        artLayer.bounds = CGRect(x: 0, y: 0, width: bounds.width, height: height)
+        artLayer.position = CGPoint(x: bounds.midX, y: height / 2)
+        fallbackLayer.contentsScale = artLayer.contentsScale
+        fallbackLayer.bounds = artLayer.bounds
+        fallbackLayer.position = artLayer.position
+        fallbackLayer.contentsGravity = .resizeAspectFill
         CATransaction.commit()
     }
 }
@@ -792,23 +844,34 @@ private struct KenBurnsLayerHost: UIViewRepresentable {
     let backdrop: String?
     let poster: String?
     let reduceMotion: Bool
+    var usesAcceptedImageFallback = false
+    var onArtwork: ((CGImage, CFTimeInterval) -> Void)? = nil
 
     func makeCoordinator() -> KenBurnsLoader { KenBurnsLoader() }
 
     func makeUIView(context: Context) -> KenBurnsBackingView {
         let view = KenBurnsBackingView(frame: .zero)
-        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion, epoch: view.animationEpoch)
+        load(on: view, coordinator: context.coordinator)
         return view
     }
 
     func updateUIView(_ view: KenBurnsBackingView, context: Context) {
-        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion, epoch: view.animationEpoch)
+        load(on: view, coordinator: context.coordinator)
     }
 
     static func dismantleUIView(_ view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
         coordinator.cancel()
+    }
+
+    private func load(on view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
+        coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer,
+                         onArtwork: { [weak view] image in
+            guard let view else { return }
+            if usesAcceptedImageFallback { view.fallbackLayer.contents = image }
+            onArtwork?(image, view.animationEpoch)
+        })
     }
 
     private func heroMaxPixel(for view: UIView) -> Int {
@@ -820,14 +883,18 @@ private struct KenBurnsLayerHost: UIViewRepresentable {
     }
 }
 #elseif canImport(AppKit)
-private final class KenBurnsBackingView: NSView {
+final class KenBurnsBackingView: NSView {
+    let fallbackLayer = CALayer()
     let artLayer = CALayer()
+    let animationEpoch = CACurrentMediaTime()
+    var artworkHeight: CGFloat?
     var screenChanged: (() -> Void)?
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.masksToBounds = true               // clip the scaled/panned sublayer to the band (old .clipped())
         artLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        layer?.addSublayer(fallbackLayer)
         layer?.addSublayer(artLayer)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -843,8 +910,13 @@ private final class KenBurnsBackingView: NSView {
         super.layout()
         CATransaction.begin(); CATransaction.setDisableActions(true)
         if let host = layer { artLayer.contentsScale = host.contentsScale }   // crisp on Retina
-        artLayer.bounds = CGRect(origin: .zero, size: bounds.size)
-        artLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        let height = artworkHeight ?? bounds.height
+        artLayer.bounds = CGRect(x: 0, y: 0, width: bounds.width, height: height)
+        artLayer.position = CGPoint(x: bounds.midX, y: bounds.height - height / 2)
+        fallbackLayer.contentsScale = artLayer.contentsScale
+        fallbackLayer.bounds = artLayer.bounds
+        fallbackLayer.position = artLayer.position
+        fallbackLayer.contentsGravity = .resizeAspectFill
         CATransaction.commit()
     }
 }
@@ -853,25 +925,36 @@ private struct KenBurnsLayerHost: NSViewRepresentable {
     let backdrop: String?
     let poster: String?
     let reduceMotion: Bool
+    var usesAcceptedImageFallback = false
+    var onArtwork: ((CGImage, CFTimeInterval) -> Void)? = nil
 
     func makeCoordinator() -> KenBurnsLoader { KenBurnsLoader() }
 
     func makeNSView(context: Context) -> KenBurnsBackingView {
         let view = KenBurnsBackingView(frame: .zero)
-        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        KenBurnsPan.configure(view.artLayer, reduceMotion: reduceMotion, epoch: view.animationEpoch)
+        load(on: view, coordinator: context.coordinator)
         installScreenChangeHandler(on: view, coordinator: context.coordinator)
         return view
     }
 
     func updateNSView(_ view: KenBurnsBackingView, context: Context) {
-        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion)
-        context.coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+        KenBurnsPan.reconcile(view.artLayer, reduceMotion: reduceMotion, epoch: view.animationEpoch)
+        load(on: view, coordinator: context.coordinator)
         installScreenChangeHandler(on: view, coordinator: context.coordinator)
     }
 
     static func dismantleNSView(_ view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
         coordinator.cancel()
+    }
+
+    private func load(on view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
+        coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer,
+                         onArtwork: { [weak view] image in
+            guard let view else { return }
+            if usesAcceptedImageFallback { view.fallbackLayer.contents = image }
+            onArtwork?(image, view.animationEpoch)
+        })
     }
 
     private func heroMaxPixel(for view: NSView) -> Int {
@@ -887,8 +970,56 @@ private struct KenBurnsLayerHost: NSViewRepresentable {
     private func installScreenChangeHandler(on view: KenBurnsBackingView, coordinator: KenBurnsLoader) {
         view.screenChanged = { [weak view, weak coordinator] in
             guard let view, let coordinator else { return }
-            coordinator.load(backdrop: backdrop, poster: poster, maxPixel: heroMaxPixel(for: view), into: view.artLayer)
+            load(on: view, coordinator: coordinator)
         }
+    }
+}
+#endif
+
+/// A second crop of the accepted immutable bitmap, never a second artwork loader. Its image
+/// bounds and compositor epoch match the hero, so the reserved navigation row continues it.
+#if canImport(UIKit)
+struct CinemaNavigationArtworkLayerHost: UIViewRepresentable {
+    let artwork: CinemaNavigationArtwork
+    func makeUIView(context: Context) -> KenBurnsBackingView {
+        let view = KenBurnsBackingView(frame: .zero)
+        if let epoch = artwork.panEpoch {
+            KenBurnsPan.configure(view.artLayer, reduceMotion: artwork.reduceMotion, epoch: epoch)
+        }
+        updateUIView(view, context: context)
+        return view
+    }
+    func updateUIView(_ view: KenBurnsBackingView, context: Context) {
+        view.artworkHeight = artwork.height
+        view.artLayer.contentsGravity = artwork.contentMode == .fill ? .resizeAspectFill : .resizeAspect
+        view.artLayer.contents = artwork.image
+        view.fallbackLayer.contents = artwork.panEpoch == nil ? nil : artwork.image
+        if let epoch = artwork.panEpoch {
+            KenBurnsPan.reconcile(view.artLayer, reduceMotion: artwork.reduceMotion, epoch: epoch)
+        }
+        view.setNeedsLayout()
+    }
+}
+#elseif canImport(AppKit)
+struct CinemaNavigationArtworkLayerHost: NSViewRepresentable {
+    let artwork: CinemaNavigationArtwork
+    func makeNSView(context: Context) -> KenBurnsBackingView {
+        let view = KenBurnsBackingView(frame: .zero)
+        if let epoch = artwork.panEpoch {
+            KenBurnsPan.configure(view.artLayer, reduceMotion: artwork.reduceMotion, epoch: epoch)
+        }
+        updateNSView(view, context: context)
+        return view
+    }
+    func updateNSView(_ view: KenBurnsBackingView, context: Context) {
+        view.artworkHeight = artwork.height
+        view.artLayer.contentsGravity = artwork.contentMode == .fill ? .resizeAspectFill : .resizeAspect
+        view.artLayer.contents = artwork.image
+        view.fallbackLayer.contents = artwork.panEpoch == nil ? nil : artwork.image
+        if let epoch = artwork.panEpoch {
+            KenBurnsPan.reconcile(view.artLayer, reduceMotion: artwork.reduceMotion, epoch: epoch)
+        }
+        view.needsLayout = true
     }
 }
 #endif
