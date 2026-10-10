@@ -257,6 +257,7 @@ final class VortXSyncManager: ObservableObject {
         let intent: NativePreferenceIntentStore.Intent
     }
     private var nativePreferenceLocalAdmissions: [UUID: [NativePreferenceIntentStore.Group: NativePreferenceLocalAdmission]] = [:]
+    private let nativePreferenceAdmissionGate = NativePreferenceIntentStore.AdmissionGate()
     /// An account-only legacy dirty stamp is not evidence of the profile that authored it.
     /// Remember its exact stamp before a new native installation replaces the flat projection.
     private func quarantineNativePreferenceStamps() -> Bool {
@@ -372,6 +373,10 @@ final class VortXSyncManager: ObservableObject {
     /// It must not reach MainActor, defaults, credentials or the file system from its FIFO lock.
     func nativePreferenceAdmission(_ intents: [NativePreferenceIntentStore.Intent], profile: UserProfile,
                                    target: PlaybackMutationTarget) throws -> @Sendable (VortxJSON, VortxJSON) -> Bool {
+        guard case .native(let binding?) = target else { throw VortxNativeError.superseded }
+        let store = try nativePreferenceStore(capture: binding.credential)
+        let gate = nativePreferenceAdmissionGate
+        return try gate.withJournal(read: { try store.pending() }) {
         let context = try nativePreferenceContext(profileID: profile.id, target: target)
         let authority = context.authority
         var expected: [NativePreferenceIntentStore.Group: NativePreferenceIntentStore.Snapshot] = [:]
@@ -390,6 +395,7 @@ final class VortXSyncManager: ObservableObject {
         }
         let captured = expected
         return { state, host in
+            gate.admits(intents) {
             guard let id = UUID(uuidString: authority.profileID),
                   let current = try? Self.makeNativePreferenceContext(state: state, host: host, profileID: id,
                     scope: .init(account: authority.account, ownerProfileID: authority.ownerProfileID)),
@@ -401,6 +407,8 @@ final class VortXSyncManager: ObservableObject {
                 }
                 return snapshot == captured[group]
             }
+            }
+        }
         }
     }
     /// Unedited presentation fields are not save intent. Carry the current native values for
@@ -437,10 +445,11 @@ final class VortXSyncManager: ObservableObject {
                                         editedGroups: Set<NativePreferenceIntentStore.Group>? = nil,
                                         baseline: UserProfile? = nil) throws -> [NativePreferenceIntentStore.Intent] {
         guard case .native(let binding?) = target else { throw VortxNativeError.superseded }
+        let store = try nativePreferenceStore(capture: binding.credential)
+        return try nativePreferenceAdmissionGate.withJournal(read: { try store.pending() }) {
         let context = try nativePreferenceContext(profileID: profile.id, target: target)
         guard let published = baseline ?? ProfileStore.shared.profiles.first(where: { $0.id == profile.id }),
               published.id == profile.id else { throw VortxNativeError.superseded }
-        let store = try nativePreferenceStore(capture: binding.credential)
         let pending = try store.pending()
         let pendingIDs = Set(pending.map(\.id))
         nativePreferenceLocalAdmissions = nativePreferenceLocalAdmissions.mapValues {
@@ -480,6 +489,7 @@ final class VortXSyncManager: ObservableObject {
         }
         if conflicted { nativePreferenceIntentStatus = "conflict"; throw VortxNativeError.superseded }
         return result
+        }
     }
     func finishNativePreferenceIntents(_ intents: [NativePreferenceIntentStore.Intent], target: PlaybackMutationTarget) throws {
         guard !intents.isEmpty else { return }
@@ -509,6 +519,7 @@ final class VortXSyncManager: ObservableObject {
             let profiles = records.compactMapValues { $0["profile"] }
             let state = VortxJSON.object(["nativeSync": native, "roster": .object(["profiles": .object(profiles)])])
             let store = try nativePreferenceStore(capture: capture)
+            try nativePreferenceAdmissionGate.withJournal(read: { try store.pending() }) {
             for sent in receipts {
                 guard isCurrent(capture), let id = UUID(uuidString: sent.authority.profileID),
                       let context = try? Self.makeNativePreferenceContext(state: state, host: host, profileID: id,
@@ -528,6 +539,7 @@ final class VortXSyncManager: ObservableObject {
                 _ = try store.acknowledge(sent, current: exported)
             }
             nativePreferenceIntentStatus = try store.pending().isEmpty ? "idle" : "pending"
+            }
         } catch { nativePreferenceIntentStatus = "unavailable" }
     }
     /// A failed save replays only after the peer carrier has merged. A changed group revision is
@@ -1655,7 +1667,9 @@ final class VortXSyncManager: ObservableObject {
     private func clearPushedDirtySettings(_ snapshot: [String: Double]) {
         guard !snapshot.isEmpty else { return }
 #if VORTX_NATIVE_DATA_ENGINE
-        let snapshot = snapshot.filter { nativeDirtySettingIsExported($0.key) }
+        // Preference stamps are cleared only by their exact accepted journal receipt. A
+        // predecessor upload can complete after a successor has committed another field.
+        let snapshot = snapshot.filter { !Self.nativePreferenceProjectionKeys.contains($0.key) && nativeDirtySettingIsExported($0.key) }
 #endif
         withRemoteApplySuppressed {
             var dirty = dirtySettings

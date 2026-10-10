@@ -66,6 +66,7 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     func capture(_ data: Data, for name: String) { snapshots[name] = data }
     func saveNativeProfile(_ profile: UserProfile, creating: Bool, target: ManagerPlaybackMutationTarget,
                            preferenceAdmission: (@Sendable (VortxJSON, VortxJSON) -> Bool)? = nil) async throws {
+        ProfileStore.shared.saves += 1
         if let preferenceAdmission {
             guard let stateBytes = stateData("native_state"), let hostBytes = stateData("native_host_preferences"),
                   let state = try? JSONDecoder().decode(VortxJSON.self, from: stateBytes),
@@ -140,6 +141,7 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
     var realtimeActive = false
     var nativePreferenceIntentStatus = "idle"
     var nativePreferenceLocalAdmissions: [UUID: [NativePreferenceIntentStore.Group: NativePreferenceLocalAdmission]] = [:]
+    let nativePreferenceAdmissionGate = NativePreferenceIntentStore.AdmissionGate()
     var hasPendingPush: Bool { nativePushQueue.hasPendingPush || nativeDurablePushPending }
     static let writeSyncDocV2 = true
     init(_ command: Command) {
@@ -245,6 +247,18 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
         profile.accentID = accent
         return profile
     }
+    func generationFixtureSnapshots() throws -> (VortxJSON, VortxJSON) {
+        guard let state = CoreBridge.shared.stateData("native_state"),
+              let host = CoreBridge.shared.stateData("native_host_preferences") else { throw VortxNativeError.invalidSnapshot }
+        return (try JSONDecoder().decode(VortxJSON.self, from: state), try JSONDecoder().decode(VortxJSON.self, from: host))
+    }
+    func generationFixtureExport() throws -> [String: Any] {
+        let (state, host) = try generationFixtureSnapshots()
+        guard let native = state["nativeSync"] else { throw VortxNativeError.invalidSnapshot }
+        let encoded = try JSONEncoder().encode(VortxJSON.object(["nativeSync": native, "nativeHostPreferences": host]))
+        guard let document = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] else { throw VortxNativeError.invalidSnapshot }
+        return document
+    }
     func profile(for intent: NativePreferenceIntentStore.Intent) throws -> UserProfile {
         var profile = ProfileStore.shared.active!
         switch intent.group {
@@ -341,6 +355,138 @@ private struct FixtureProviders { var document: VortxJSON { .object([:]) } }
         if let preferenceCommand = command.preferenceCommand {
             let target = CoreBridge.shared.captureNativePlaybackTarget()
             switch preferenceCommand {
+            case "failed-preference-queue-drain":
+                // Discovering a new durable intent inside an older upload queues one follow-up.
+                // Exercise both actual workers in this process; a new process would reset the
+                // transport queue and could hide starvation of the live pending generation.
+                let store = try nativePreferenceStore(capture: credentialAuthority.capture())
+                requestSyncSoon()
+                await pendingSync?.value
+                let pending = try store.pending()
+                let firstContext = try nativePreferenceContext(profileID: UUID(uuidString: AppleSyncManagerPeer.owner)!, target: target)
+                let native = try Self.nativePreferenceSnapshot(firstContext, group: .theme)
+                guard stamped == 1, hasPendingPush, pending.count == 1, pending[0].group == .theme,
+                      pending[0].desired["accentID"] == .string("violet"),
+                      pending[0].projectionStamps["stremiox.theme.accent"] == 1,
+                      dirtySettings["stremiox.theme.accent"] == 1,
+                      native.value["accentID"] == .string("ember") else { throw VortxNativeError.invalidSnapshot }
+                result["queueDrainFirstUploadRetainedNewIntent"] = .bool(true)
+                requestSyncSoon()
+                await pendingSync?.value
+                let after = try store.pending()
+                let secondContext = try nativePreferenceContext(profileID: UUID(uuidString: AppleSyncManagerPeer.owner)!, target: target)
+                let afterNative = try Self.nativePreferenceSnapshot(secondContext, group: .theme)
+                guard stamped == 2, !hasPendingPush, after == pending, afterNative == native,
+                      dirtySettings["stremiox.theme.accent"] == 1 else { throw VortxNativeError.invalidSnapshot }
+                result["queueDrainRetainedExactPreferenceReceipt"] = .bool(true)
+                result["queueDrainNativeUnchanged"] = .bool(true)
+                result["accepted"] = .bool(true)
+            case "generation-capacity":
+                // Actual extracted manager prepare/admit/finish and ProfileStore.saveNative,
+                // with the production C ABI/checkpoint. FIFO scheduling is covered separately
+                // by the facade harness, not by this environment collaborator.
+                let capture = credentialAuthority.capture()
+                var previous: (NativePreferenceIntentStore.Intent, @Sendable (VortxJSON, VortxJSON) -> Bool, VortxJSON, VortxJSON)?
+                var maximumBytes = 0
+                var fullBaseBytes = 0
+                for index in 0..<64 {
+                    guard var draft = ProfileStore.shared.active else { throw VortxNativeError.invalidSnapshot }
+                    var playback = draft.playback ?? ProfileStore.shared.flatPlayback
+                    playback.audioLang = "language-\(index)"
+                    draft.playback = playback
+                    draft.addonPreferences = .init(disabledAddonURLsOverride: (0..<12).map {
+                        "https://addon-\($0).example.invalid/catalog/manifest.json"
+                    })
+                    dirtySettings["fixture.playback"] = Double(index + 1)
+                    let intents = try prepareNativePreferenceIntents(draft, target: target, editedGroups: [.playback])
+                    guard intents.count == 1, let intent = intents.first else { throw VortxNativeError.invalidSnapshot }
+                    let admission = try nativePreferenceAdmission(intents, profile: draft, target: target)
+                    let (state, host) = try generationFixtureSnapshots()
+                    guard admission(state, host), intent.acceptedBases.isEmpty, intent.supersededIDs.isEmpty,
+                          intent.projectionStamps["fixture.playback"] == Double(index + 1) else { throw VortxNativeError.invalidSnapshot }
+                    if let previous {
+                        // Supplying the predecessor's *own* snapshots avoids a vacuous failure
+                        // from revision drift: only the live generation gate rejects it.
+                        guard !previous.1(previous.2, previous.3) else { throw VortxNativeError.invalidSnapshot }
+                        try finishNativePreferenceIntents([previous.0], target: target)
+                    }
+                    guard await ProfileStore.shared.saveNative(draft, creating: false, target: target, preferenceIntents: intents) else {
+                        throw VortxNativeError.unavailable
+                    }
+                    await cancelDebouncedSyncForProcessExit()
+                    // Construct a fresh store every iteration; the pending receipt must come
+                    // from authenticated bytes, not any in-memory gate or native commit ACK.
+                    let reopened = try nativePreferenceStore(capture: capture)
+                    guard try reopened.pending() == [intent], ProfileStore.shared.active?.playback?.audioLang == playback.audioLang else {
+                        throw VortxNativeError.invalidSnapshot
+                    }
+                    maximumBytes = max(maximumBytes, try JSONEncoder().encode(intent).count)
+                    fullBaseBytes = max(fullBaseBytes, try JSONEncoder().encode(intent.base).count)
+                    guard maximumBytes < NativePreferenceIntentStore.maximumRecordBytes else { throw VortxNativeError.invalidSnapshot }
+                    previous = (intent, admission, state, host)
+                }
+                guard fullBaseBytes >= 1_509, dirtySettings["fixture.playback"] == 64,
+                      let latest = previous?.0, nativePreferenceAdmissionGate.admits([latest], operation: { true }) else {
+                    throw VortxNativeError.invalidSnapshot
+                }
+                result["generationOfflineCommits"] = .integer(64)
+                result["generationMaximumRecordBytes"] = .integer(Int64(maximumBytes))
+                result["generationFullSnapshotBytes"] = .integer(Int64(fullBaseBytes))
+                result["generationLatestPendingStamp"] = .number(64)
+            case "generation-late-ack":
+                let capture = credentialAuthority.capture()
+                let accentKey = "stremiox.theme.accent"
+                UserDefaults.standard.set("violet", forKey: accentKey)
+                ThemeManager.shared.accentID = "violet"
+                settingsShadow = currentSyncableDomain()
+                dirtySettings[accentKey] = 101
+                let firstDraft = editedTheme("violet")
+                let first = try prepareNativePreferenceIntents(firstDraft, target: target, editedGroups: [.theme])
+                let firstAdmission = try nativePreferenceAdmission(first, profile: firstDraft, target: target)
+                let firstSnapshots = try generationFixtureSnapshots()
+                guard first.count == 1, firstAdmission(firstSnapshots.0, firstSnapshots.1),
+                      await ProfileStore.shared.saveNative(firstDraft, creating: false, target: target, preferenceIntents: first) else {
+                    throw VortxNativeError.invalidSnapshot
+                }
+                await cancelDebouncedSyncForProcessExit()
+                let firstDocument = try generationFixtureExport()
+                let firstDirty = dirtySettings
+                var secondDraft = editedTheme("violet")
+                secondDraft.oled.toggle()
+                ThemeManager.shared.oled = secondDraft.oled
+                UserDefaults.standard.set(secondDraft.oled, forKey: "theme")
+                settingsShadow = currentSyncableDomain()
+                dirtySettings["theme"] = 202
+                let second = try prepareNativePreferenceIntents(secondDraft, target: target, editedGroups: [.theme])
+                guard second.count == 1, second[0].id != first[0].id,
+                      second[0].projectionStamps[accentKey] == 101, second[0].projectionStamps["theme"] == 202,
+                      !firstAdmission(firstSnapshots.0, firstSnapshots.1),
+                      await ProfileStore.shared.saveNative(secondDraft, creating: false, target: target, preferenceIntents: second) else {
+                    throw VortxNativeError.invalidSnapshot
+                }
+                await cancelDebouncedSyncForProcessExit()
+                try finishNativePreferenceIntents(first, target: target)
+                // Model the projection publication already acknowledged by the completed
+                // native save. Without this, the generic exportability guard itself would
+                // reject the stamp, hiding the predecessor-ACK dirty-clear regression.
+                ProfileStore.shared.establishBaselines()
+                guard nativeDirtySettingIsExported(accentKey) else { throw VortxNativeError.invalidSnapshot }
+                // Deliver synthetic accepted-transport callbacks through the actual manager
+                // ACK and generic dirty-clear methods. This case makes no network claim.
+                acknowledgeNativePreferenceCloud(firstDocument, receipts: first, capture: capture)
+                clearPushedDirtySettings(firstDirty)
+                let reopened = try nativePreferenceStore(capture: capture)
+                guard try reopened.pending() == second, dirtySettings[accentKey] == 101, dirtySettings["theme"] == 202 else {
+                    throw VortxNativeError.invalidSnapshot
+                }
+                result["generationLateAckPreservedSuccessor"] = .bool(true)
+                let secondDocument = try generationFixtureExport()
+                guard nativePreferenceAdmissionGate.admits(second, operation: { true }) else { throw VortxNativeError.invalidSnapshot }
+                acknowledgeNativePreferenceCloud(secondDocument, receipts: second, capture: capture)
+                clearPushedDirtySettings(dirtySettings)
+                guard try reopened.pending().isEmpty, dirtySettings[accentKey] == nil, dirtySettings["theme"] == nil,
+                      !nativePreferenceAdmissionGate.admits(second, operation: { true }) else { throw VortxNativeError.invalidSnapshot }
+                result["generationExactAckClearedSuccessor"] = .bool(true)
             case "prepare-theme":
                 let intents = try prepareNativePreferenceIntents(editedTheme(command.preferenceValue ?? "violet"), target: target, editedGroups: [.theme])
                 result["preparationQueuedPush"] = .bool(hasPendingPush)

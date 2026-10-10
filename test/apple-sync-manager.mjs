@@ -34,6 +34,9 @@ if (process.argv[2] === '--extract') {
     + preferenceFixture.slice(preferenceFixture.indexOf('@MainActor private final class PreferenceHarness'), preferenceFixture.indexOf('@main private enum'))
         .replace('final class PreferenceHarness {', 'final class ProfileStore {\n    static let shared = ProfileStore()');
   const managerEnvironment = environment
+    // The acknowledgement-only fixture has a narrower synthetic overload. Remove it so
+    // production retryNativePreferenceProjection resolves only to the verbatim save below.
+    .replace(block(preferenceFixture, '    func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget) async -> Bool {'), '')
     .replace(/private struct PlaybackMutationTarget: Equatable \{[\s\S]*?\n\}/, '')
     .replaceAll('PlaybackMutationTarget', 'ManagerPlaybackMutationTarget')
     .replace('.init(generation: 1)', '.native(.init(credential: .init(generation: 1), profileID: UUID(uuidString: AppleSyncManagerPeer.owner)!))');
@@ -123,7 +126,7 @@ async function peer(name, mode, extra = {}) {
   const sequence = ++serial;
   const path = join(root, `command-${sequence}.json`);
   await writeFile(path, JSON.stringify({ mode, directory, baseURL, actor: name === 'phone' ? '00000000-0000-4000-8000-000000000001' : '00000000-0000-4000-8000-000000000002', ...extra }));
-  const { stdout } = await run(peerBinary, [path], { maxBuffer: 16 * 1024 * 1024 });
+  const { stdout } = await run(peerBinary, [path], { maxBuffer: 16 * 1024 * 1024, timeout: 60_000 });
   const result = JSON.parse(stdout); await writeFile(join(root, `result-${sequence}.json`), JSON.stringify(result)); return result;
 }
 const owner = '10000000-0000-0000-0000-000000000001';
@@ -137,10 +140,15 @@ try {
     { type: 'add_library_item', profileId: owner, item: { kind: 'standard', id: 'tt-naruto-fixture', type: 'series', name: 'Synthetic Naruto', poster: null } },
     { type: 'report_progress', metaId: 'tt-naruto-fixture', videoId: 'tt-naruto-fixture:1:2', name: 'Synthetic Naruto', positionMs: 120000, durationMs: 1200000, metadata: { type: 'series' } }
   ], edits: [{ profileID: owner, fields: { [watchField]: { id: 'tt-naruto-fixture', type: 'series', name: 'Synthetic Naruto', addedAt: 123.5 } } }] });
-  const blocked = await peer('phone', 'auto', { pendingProjection: true, projectionSaveFails: true });
-  check(blocked.accepted === true && blocked.stamped === 1, 'unacknowledged preference cannot block committed native state upload or success stamp');
-  check(blocked.dirtyProjectionRetained === true, 'unexported preference remains dirty');
-  check(blocked.pendingPush === false, 'accepted native upload releases the pending-push pull guard');
+  const blocked = await peer('phone', 'inspect', { pendingProjection: true, projectionSaveFails: true,
+    preferenceCommand: 'failed-preference-queue-drain' });
+  check(blocked.accepted === true && blocked.stamped === 2 && blocked.queueDrainFirstUploadRetainedNewIntent === true,
+    'unacknowledged preference cannot block native state upload; a newly journaled edit remains pending after the older first upload');
+  check(blocked.dirtyProjectionRetained === true && blocked.pendingPreferenceIntentCount === 1
+    && blocked.pendingThemeAccent === 'violet' && blocked.pendingThemeProjectionStamp === 1,
+    'unexported preference retains its exact pending desired value and dirty stamp');
+  check(blocked.pendingPush === false && blocked.queueDrainRetainedExactPreferenceReceipt === true && blocked.queueDrainNativeUnchanged === true,
+    'accepted idempotent follow-up releases the live transport pull guard without acknowledging unapplied preference or changing native state');
   if (!blocked.accepted) {
     await writeFile(join(root, 'receipt.json'), JSON.stringify({ result: 'RED', failures, wire, members }, null, 2));
     process.exitCode = 1;
@@ -150,8 +158,11 @@ try {
     check(mac.host.profiles[owner].fields[watchField].value.addedAt === 123.5, 'remote profile Watchlist receives fractional timestamp');
     check(mac.playback.resumeById['tt-naruto-fixture:1:2'].offsetMs === 120000, 'remote episode Continue Watching position receives exact video identity');
     const preferences = await peer('phone', 'auto', { pendingProjection: true, pendingPlayback: true, pendingDiscovery: true });
-    check(preferences.accepted && preferences.preferenceSaves === 1 && !preferences.dirtyProjectionRetained,
-      'production retry commits local theme/playback/discovery through real native transaction before upload ACK');
+    check(preferences.accepted && preferences.preferenceSaves === 2 && !preferences.dirtyProjectionRetained
+      && preferences.pendingPreferenceIntentCount === 0 && preferences.state.roster.profiles[owner].settings.accent === 'violet'
+      && preferences.host.profiles[owner].fields.playback.value.audioLang === 'hi'
+      && preferences.host.profiles[owner].fields.discovery.value.catalogOrder[0] === 'fixture-catalog',
+      'production retry replays the failed theme then commits the new playback/discovery batch in exactly two native calls before matching cloud ACK clears journal and dirty stamp');
     const remotePreferences = await peer('mac', 'pull');
     check(remotePreferences.state.roster.profiles[owner].settings.accent === 'violet'
       && remotePreferences.host.profiles[owner].fields.playback.value.audioLang === 'hi'
@@ -395,6 +406,25 @@ try {
     const coldDefaultEcho = await peer('intent-capture-cold-echo', 'inspect', { preferenceCommand: 'capture-cold-default-echo' });
     check(coldDefaultEcho.coldDefaultEchoUpdateCount === 0 && coldDefaultEcho.coldDefaultEchoKeptNilCarrier,
       'actual capturePlayback ignores unchanged cold-mount defaults without materializing optional nil playback');
+
+    const putsBeforeGenerations = wire.filter(entry => entry.method === 'PUT').length;
+    const generations = await peer('intent-generation-capacity', 'inspect', { preferenceCommand: 'generation-capacity' });
+    check(generations.generationOfflineCommits === 64 && generations.generationFullSnapshotBytes >= 1509
+      && generations.generationMaximumRecordBytes > 0 && generations.generationMaximumRecordBytes < 16 * 1024
+      && generations.generationLatestPendingStamp === 64 && generations.pendingPreferenceIntentCount === 1
+      && generations.pendingPlaybackAudioLang === 'language-63'
+      && generations.host.profiles[owner].fields.playback.value.audioLang === 'language-63',
+      '64 full-size actual-manager offline prepare/admit/commit/reopen edits retain latest desired and stamps under the unchanged record cap');
+    const coldGeneration = await peer('intent-generation-capacity', 'inspect');
+    check(coldGeneration.pendingPreferenceIntentCount === 1 && coldGeneration.pendingPlaybackAudioLang === 'language-63'
+      && coldGeneration.host.profiles[owner].fields.playback.value.audioLang === 'language-63',
+      'a fresh manager process reopens the latest durable native value and still-pending cloud intent after 64 offline edits');
+    const lateGenerationAck = await peer('intent-generation-late-ack', 'inspect', { preferenceCommand: 'generation-late-ack' });
+    check(lateGenerationAck.generationLateAckPreservedSuccessor === true && lateGenerationAck.generationExactAckClearedSuccessor === true
+      && lateGenerationAck.pendingPreferenceIntentCount === 0 && lateGenerationAck.dirtyProjectionRetained === false,
+      'actual manager rejects retired cloud ACK and generic stamp clearing, then exact successor ACK clears pending generation and stamps');
+    check(wire.filter(entry => entry.method === 'PUT').length === putsBeforeGenerations,
+      'offline generation and synthetic accepted-callback scenarios perform no cloud upload');
 
     const digest = async path => createHash('sha256').update(await readFile(path)).digest('hex');
     await writeFile(join(root, 'receipt.json'), JSON.stringify({ result: failures ? 'FAIL' : 'GREEN', failures, wire, members,

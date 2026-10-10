@@ -38,16 +38,20 @@ struct NativePreferenceIntentStore {
         let projectionStamps: [String: Double]
         let requiresResolution: Bool
         var acceptedBases: [Snapshot]
+        /// A fresh signed generation retires earlier local submissions. Only its exact cloud
+        /// receipt can clear it; native completion is never a cloud acknowledgement.
+        var generationAuthentication: Data?
 
         private enum CodingKeys: String, CodingKey {
-            case id, authority, group, base, desired, supersededIDs, supersededReceipts, projectionStamps, requiresResolution, acceptedBases
+            case id, authority, group, base, desired, supersededIDs, supersededReceipts, projectionStamps, requiresResolution, acceptedBases, generationAuthentication
         }
         init(id: UUID, authority: Authority, group: Group, base: Snapshot, desired: VortxJSON,
              supersededIDs: [UUID], supersededReceipts: [SupersededReceipt], acceptedBases: [Snapshot],
-             projectionStamps: [String: Double] = [:], requiresResolution: Bool = false) {
+             projectionStamps: [String: Double] = [:], requiresResolution: Bool = false, generationAuthentication: Data? = nil) {
             self.id = id; self.authority = authority; self.group = group; self.base = base; self.desired = desired
             self.supersededIDs = supersededIDs; self.supersededReceipts = supersededReceipts
             self.projectionStamps = projectionStamps; self.requiresResolution = requiresResolution; self.acceptedBases = acceptedBases
+            self.generationAuthentication = generationAuthentication
         }
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -61,12 +65,14 @@ struct NativePreferenceIntentStore {
             projectionStamps = try container.decodeIfPresent([String: Double].self, forKey: .projectionStamps) ?? [:]
             requiresResolution = try container.decodeIfPresent(Bool.self, forKey: .requiresResolution) ?? false
             acceptedBases = try container.decode([Snapshot].self, forKey: .acceptedBases)
+            generationAuthentication = try container.decodeIfPresent(Data.self, forKey: .generationAuthentication)
         }
     }
     enum Decision: Equatable, Sendable { case apply, alreadyApplied, conflict }
     enum StoreError: Error, Sendable { case invalid, unreadable, tooLarge, conflict, persistence }
+    enum WritePhase: Sendable { case beforeReplace, afterReplace }
 
-    static let schemaVersion = 1
+    static let schemaVersion = 2
     static let maximumFileBytes = 512 * 1_024
     static let maximumRecordBytes = 16 * 1_024
     static let maximumRecords = 192
@@ -111,17 +117,54 @@ struct NativePreferenceIntentStore {
         }
     }
 
+    /// Linearizes journal generation replacement with the facade's *already enqueued* admission.
+    /// Preparation must read the quiescent native context inside this lock. The facade marks
+    /// profile transactions pending before calling admission, and exposes no registry binding
+    /// until their acknowledged state is published. Never hold this lock across an await.
+    final class AdmissionGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var active: [Intent] = []
+
+        func withJournal<T>(read: () throws -> [Intent], operation: () throws -> T) throws -> T {
+            lock.lock(); defer { lock.unlock() }
+            do {
+                active = try read()
+                let result = try operation()
+                active = try read()
+                return result
+            } catch {
+                // A failed write can have taken effect before readback/fsync failed. Reload
+                // while admission is excluded; uncertain disk state revokes every old ticket.
+                active = (try? read()) ?? []
+                throw error
+            }
+        }
+
+        func admits(_ intents: [Intent], operation: () -> Bool) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            guard intents.allSatisfy({ sent in active.contains { candidate in
+                candidate.generationAuthentication == sent.generationAuthentication
+                    && ReceiptPayload(candidate) == ReceiptPayload(sent)
+                    && sent.acceptedBases.allSatisfy(candidate.acceptedBases.contains)
+            } }) else { return false }
+            return operation()
+        }
+    }
+
     private let directoryURL: URL
     private let key: SymmetricKey
     private let keyByteCount: Int
     private let namespace: String
     private let fileURL: URL
+    private let writeBarrier: @Sendable (WritePhase) throws -> Void
 
-    init(directoryURL: URL, key: Data, namespace: String) {
+    init(directoryURL: URL, key: Data, namespace: String,
+         writeBarrier: @escaping @Sendable (WritePhase) throws -> Void = { _ in }) {
         self.directoryURL = directoryURL
         self.key = SymmetricKey(data: key)
         self.keyByteCount = key.count
         self.namespace = namespace
+        self.writeBarrier = writeBarrier
         let digest = SHA256.hash(data: Data(namespace.utf8)).map { String(format: "%02x", $0) }.joined()
         self.fileURL = directoryURL.appendingPathComponent("preference-intents-\(digest).bin", isDirectory: false)
     }
@@ -133,18 +176,27 @@ struct NativePreferenceIntentStore {
         try Self.validate(desired: desired, group: group)
         try Self.validate(projectionStamps: projectionStamps)
         var document = try readDocument()
-        if let existing = document.intents.last(where: { $0.authority == authority && $0.group == group && $0.desired == desired }) {
-            return existing
-        }
         let previous = document.intents.last(where: { $0.authority == authority && $0.group == group })
-        let lineage = ([previous?.id].compactMap { $0 } + (previous?.supersededIDs ?? []))
-        guard lineage.count <= Self.maximumLineage else { throw StoreError.tooLarge }
-        let receipts = (previous.map { [SupersededReceipt(id: $0.id, digest: receiptDigest($0))] } ?? []) + (previous?.supersededReceipts ?? [])
-        guard receipts.count <= Self.maximumLineage,
-              receipts.map(\.id) == lineage else { throw StoreError.unreadable }
-        let intent = Intent(id: UUID(), authority: authority, group: group, base: base, desired: desired,
-                            supersededIDs: lineage, supersededReceipts: receipts, acceptedBases: previous?.acceptedBases ?? [],
-                            projectionStamps: projectionStamps, requiresResolution: requiresResolution)
+        let stamps = (previous?.projectionStamps ?? [:]).merging(projectionStamps) { _, newer in newer }
+        let sameDesired = previous?.desired == desired
+        if let previous, sameDesired, previous.projectionStamps == stamps { return previous }
+        // The caller holds AdmissionGate across quiescent context capture and this write.
+        // Old queued local work is then fenced before dispatch; old cloud receipts cannot
+        // acknowledge this fresh generation. Keep only the legacy active receipt bridge:
+        // its native transaction may have published before its MainActor completion resumes.
+        let receipts: [SupersededReceipt]
+        if let previous, previous.generationAuthentication == nil {
+            receipts = [.init(id: previous.id, digest: receiptDigest(previous))]
+        } else { receipts = previous?.supersededReceipts ?? [] }
+        // A refreshed stamp for the same desired value needs its own exact cloud receipt.
+        // It must not silently rebase a conflicted draft or clear its resolution requirement.
+        let preparedBase = sameDesired && previous.map({ Self.decision($0, current: base, authority: authority) == .conflict }) == true
+            ? previous!.base : base
+        let resolution = sameDesired ? previous!.requiresResolution : requiresResolution
+        var intent = Intent(id: UUID(), authority: authority, group: group, base: preparedBase, desired: desired,
+                            supersededIDs: receipts.map(\.id), supersededReceipts: receipts, acceptedBases: [],
+                            projectionStamps: stamps, requiresResolution: resolution)
+        intent.generationAuthentication = try generationDigest(intent)
         document.intents.removeAll { $0.authority == authority && $0.group == group }
         guard document.intents.count + document.quarantined.count < Self.maximumRecords else { throw StoreError.tooLarge }
         document.intents.append(intent)
@@ -213,21 +265,35 @@ struct NativePreferenceIntentStore {
         try Self.validate(desired: sent.desired, group: sent.group)
         try Self.validate(projectionStamps: sent.projectionStamps)
         try validate(snapshot: current)
-        guard current.value == sent.desired else { return false }
         var document = try readDocument()
+        if let authentication = sent.generationAuthentication {
+            guard try authenticatesGeneration(sent, authentication: authentication) else { return false }
+            guard let active = document.intents.first(where: { $0.authority == sent.authority && $0.group == sent.group }),
+                  active.id == sent.id else { return true } // Authenticated retired completion; no state/stamp change.
+            return try matchingIndex(for: sent, in: document) != nil && current.value == sent.desired
+        }
+        // A migrated legacy operation can finish after the new generation's quiescent read.
+        // Its authenticated bridge is completion evidence only, never replay/cloud authority.
+        if let index = try matchingIndex(for: sent, in: document, allowRetiredLegacy: true),
+           document.intents[index].generationAuthentication != nil { return true }
+        guard current.value == sent.desired else { return false }
         guard let index = try matchingIndex(for: sent, in: document) else { return false }
+        if document.intents[index].id == sent.id { return true }
         if try appendAcceptedBase(current, to: index, in: &document) { try writeDocument(document) }
         return true
     }
 
-    private func matchingIndex(for sent: Intent, in document: Document) throws -> Int? {
+    private func matchingIndex(for sent: Intent, in document: Document, allowRetiredLegacy: Bool = false) throws -> Int? {
         guard let index = document.intents.firstIndex(where: {
             $0.authority == sent.authority && $0.group == sent.group && ($0.id == sent.id || $0.supersededIDs.contains(sent.id))
         }) else { return nil }
         let active = document.intents[index]
         if active.id == sent.id {
-            guard ReceiptPayload(active) == ReceiptPayload(sent) else { return nil }
+            guard ReceiptPayload(active) == ReceiptPayload(sent), active.generationAuthentication == sent.generationAuthentication else { return nil }
+            if let authentication = sent.generationAuthentication,
+               try !authenticatesGeneration(sent, authentication: authentication) { return nil }
         } else {
+            guard active.generationAuthentication == nil || (allowRetiredLegacy && sent.generationAuthentication == nil) else { return nil }
             guard let receipt = active.supersededReceipts.first(where: { $0.id == sent.id }),
                   HMAC<SHA256>.isValidAuthenticationCode(receipt.digest, authenticating: try receiptMessage(sent), using: key) else { return nil }
         }
@@ -247,7 +313,7 @@ struct NativePreferenceIntentStore {
         guard intent.authority == authority else { return .conflict }
         if current.value == intent.desired { return .alreadyApplied }
         if intent.requiresResolution { return .conflict }
-        if current == intent.base || intent.acceptedBases.contains(current) { return .apply }
+        if current == intent.base || (intent.generationAuthentication == nil && intent.acceptedBases.contains(current)) { return .apply }
         return .conflict
     }
 
@@ -346,6 +412,16 @@ struct NativePreferenceIntentStore {
         return Data(HMAC<SHA256>.authenticationCode(for: message, using: key))
     }
 
+    private func generationDigest(_ intent: Intent) throws -> Data {
+        let message = Data("vortx-native-preference-generation|v=1|".utf8) + (try receiptMessage(intent))
+        return Data(HMAC<SHA256>.authenticationCode(for: message, using: key))
+    }
+
+    private func authenticatesGeneration(_ intent: Intent, authentication: Data) throws -> Bool {
+        let message = Data("vortx-native-preference-generation|v=1|".utf8) + (try receiptMessage(intent))
+        return HMAC<SHA256>.isValidAuthenticationCode(authentication, authenticating: message, using: key)
+    }
+
     private func groupOwnerIdentity(_ authority: Authority, group: Group) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -354,24 +430,28 @@ struct NativePreferenceIntentStore {
         return "\(digest)|\(group.rawValue)"
     }
 
-    private var authenticatedData: Data { Data("vortx-native-preference-intents|schema=1|namespace=\(namespace)".utf8) }
+    private func authenticatedData(version: Int) -> Data { Data("vortx-native-preference-intents|schema=\(version)|namespace=\(namespace)".utf8) }
 
     private func readDocument() throws -> Document {
         try validateNamespaceAndKey()
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return Document(schemaVersion: Self.schemaVersion, intents: []) }
         do {
             let bytes = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
-            guard bytes.count <= Self.maximumFileBytes, let box = try? AES.GCM.SealedBox(combined: bytes),
-                  let plaintext = try? AES.GCM.open(box, using: key, authenticating: authenticatedData),
-                  plaintext.count <= Self.maximumFileBytes else { throw StoreError.unreadable }
-            let document = try JSONDecoder().decode(Document.self, from: plaintext)
-            try validate(document: document)
-            return document
+            guard bytes.count <= Self.maximumFileBytes, let box = try? AES.GCM.SealedBox(combined: bytes) else { throw StoreError.unreadable }
+            for version in [Self.schemaVersion, 1] {
+                guard let plaintext = try? AES.GCM.open(box, using: key, authenticating: authenticatedData(version: version)) else { continue }
+                guard plaintext.count <= Self.maximumFileBytes else { throw StoreError.unreadable }
+                let document = try JSONDecoder().decode(Document.self, from: plaintext)
+                guard document.schemaVersion == version else { throw StoreError.unreadable }
+                try validate(document: document)
+                return Document(schemaVersion: Self.schemaVersion, intents: document.intents, quarantined: document.quarantined)
+            }
+            throw StoreError.unreadable
         } catch { throw StoreError.unreadable }
     }
 
     private func validate(document: Document) throws {
-        guard document.schemaVersion == Self.schemaVersion,
+        guard [1, Self.schemaVersion].contains(document.schemaVersion),
               document.intents.count + document.quarantined.count <= Self.maximumRecords else { throw StoreError.unreadable }
         var identities = Set<String>()
         var groupOwners = Set<String>()
@@ -389,6 +469,11 @@ struct NativePreferenceIntentStore {
                   Set(intent.supersededIDs).count == intent.supersededIDs.count,
                   intent.acceptedBases.allSatisfy({ (try? Self.encodedSize($0)) != nil }) else { throw StoreError.unreadable }
             for snapshot in intent.acceptedBases { try validate(snapshot: snapshot) }
+            if let authentication = intent.generationAuthentication {
+                guard document.schemaVersion == Self.schemaVersion, authentication.count == 32,
+                      intent.acceptedBases.isEmpty, intent.supersededIDs.count <= 1,
+                      try authenticatesGeneration(intent, authentication: authentication) else { throw StoreError.unreadable }
+            }
             let owner = try groupOwnerIdentity(intent.authority, group: intent.group)
             guard groupOwners.insert(owner).inserted, identities.insert(intent.id.uuidString).inserted else { throw StoreError.unreadable }
             guard try Self.encodedSize(intent) <= Self.maximumRecordBytes else { throw StoreError.unreadable }
@@ -407,7 +492,7 @@ struct NativePreferenceIntentStore {
             try validate(document: document)
             let plaintext = try JSONEncoder().encode(document)
             guard plaintext.count <= Self.maximumFileBytes else { throw StoreError.tooLarge }
-            let box = try AES.GCM.seal(plaintext, using: key, authenticating: authenticatedData)
+            let box = try AES.GCM.seal(plaintext, using: key, authenticating: authenticatedData(version: document.schemaVersion))
             guard let bytes = box.combined, bytes.count <= Self.maximumFileBytes else { throw StoreError.tooLarge }
             let manager = FileManager.default
             try manager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -420,7 +505,9 @@ struct NativePreferenceIntentStore {
                 try handle.synchronize()
                 try handle.close()
                 try manager.setAttributes(Self.protectedFileAttributes, ofItemAtPath: temporaryURL.path)
+                try writeBarrier(.beforeReplace)
                 guard rename(temporaryURL.path, fileURL.path) == 0 else { throw StoreError.persistence }
+                try writeBarrier(.afterReplace)
                 #if canImport(Darwin)
                 let directoryFD = directoryURL.path.withCString { Darwin.open($0, O_RDONLY) }
                 guard directoryFD >= 0 else { throw StoreError.persistence }
