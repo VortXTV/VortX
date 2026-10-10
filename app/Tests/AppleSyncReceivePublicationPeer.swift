@@ -4,7 +4,6 @@ import CoreFoundation
 
 // External environment only. The extractor appends the production receive, merge,
 // projection and main-queue publication functions without replacing their bodies.
-enum VXProbe { static func log(_ category: String, _ message: String) {} }
 enum DiagnosticsLog { static func log(_ category: String, _ message: String) {} }
 final class UserDefaults: @unchecked Sendable {
     static let standard = UserDefaults()
