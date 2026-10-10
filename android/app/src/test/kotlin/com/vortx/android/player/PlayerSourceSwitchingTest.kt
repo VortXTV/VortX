@@ -1,6 +1,7 @@
 package com.vortx.android.player
 
 import com.vortx.android.engine.StreamRanking
+import com.vortx.android.model.Episode
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
@@ -489,6 +490,213 @@ class PlayerSourceSwitchingTest {
 
         assertEquals(19_750L, applied.playable.startPositionMs)
         assertTrue(applied.playable.userForcedSource)
+    }
+
+    @Test
+    fun `late successful source and episode resolutions discard exactly once after A B A requests`() = runBlocking {
+        for (episodeSwitch in listOf(false, true)) {
+            val fixture = LeaseFixture(episodeSwitch)
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val result = fixture.resolution()
+            val job = launch {
+                fixture.resolve {
+                    started.complete(Unit)
+                    release.await()
+                    Result.success(result)
+                }
+            }
+            withTimeout(5_000L) { started.await() }
+            val a = fixture.pendingState
+            fixture.coordinator.beginRequest(a.outerSessionId) // B.
+            val newer = requireNotNull(fixture.coordinator.beginRequest(a.outerSessionId)) // A again.
+            fixture.state = if (episodeSwitch) beginPlayerEpisodeSwitch(a, fixture.episode, newer)
+                else beginPlayerSourceSwitch(a, fixture.source, newer)
+            val expected = fixture.state
+            release.complete(Unit)
+            withTimeout(5_000L) { job.join() }
+            assertSame(expected, fixture.state)
+            fixture.assertRejected()
+        }
+    }
+
+    @Test
+    fun `cancelled noncooperative resolver cannot adopt even while host request remains current`() = runBlocking {
+        for (episodeSwitch in listOf(false, true)) {
+            val fixture = LeaseFixture(episodeSwitch)
+            val started = CompletableDeferred<Unit>()
+            val release = CompletableDeferred<Unit>()
+            val result = fixture.resolution()
+            val job = launch {
+                fixture.resolve {
+                    try {
+                        withContext(NonCancellable) { started.complete(Unit); release.await() }
+                    } catch (_: CancellationException) {
+                        // Deliberately return a resource after the producing job was cancelled.
+                    }
+                    Result.success(result)
+                }
+            }
+            withTimeout(5_000L) { started.await() }
+            job.cancel()
+            release.complete(Unit)
+            withTimeout(5_000L) { job.join() }
+            assertSame(fixture.pendingState, fixture.state)
+            fixture.assertRejected()
+        }
+    }
+
+    @Test
+    fun `invalid producer gate authority and malformed successes close new resource and retain outgoing`() = runBlocking {
+        for (episodeSwitch in listOf(false, true)) {
+            for (rejection in listOf("gate", "owner", "blank") + if (episodeSwitch) listOf("source") else emptyList()) {
+                val fixture = LeaseFixture(episodeSwitch)
+                val gate = PlayerSourceSwitchCommitGate().also { if (rejection == "gate") it.invalidate() }
+                fixture.resolve {
+                    Result.success(fixture.resolution(gate, current = rejection != "owner",
+                        blank = rejection == "blank", missingSource = rejection == "source"))
+                }
+                assertSame(fixture.outgoing, fixture.state.playable)
+                assertEquals(0L, fixture.state.revision)
+                if (episodeSwitch) assertEquals(fixture.episode, fixture.state.failedEpisode)
+                fixture.assertRejected()
+            }
+        }
+    }
+
+    @Test
+    fun `completion rejected after resolution rolls back and closes once across duplicate delivery`() {
+        for (episodeSwitch in listOf(false, true)) {
+            val fixture = LeaseFixture(episodeSwitch)
+            val result = Result.success(fixture.resolution())
+            if (episodeSwitch) {
+                val pending = requireNotNull(fixture.pendingState.pendingEpisodeSwitch)
+                val completion = completePlayerEpisodeSwitch(fixture.pendingState, pending, result)
+                repeat(2) {
+                    fixture.state = applyPlayerEpisodeSwitchCompletion(fixture.state, pending, completion) { false }
+                }
+            } else {
+                val pending = requireNotNull(fixture.pendingState.pendingSwitch)
+                val completion = completePlayerSourceSwitch(fixture.pendingState, pending, result, 100)
+                repeat(2) {
+                    fixture.state = applyPlayerSourceSwitchCompletion(fixture.state, pending, completion) { false }
+                }
+            }
+            assertSame(fixture.pendingState, fixture.state)
+            fixture.assertRejected()
+        }
+    }
+
+    @Test
+    fun `accepted resolution adopts once and late duplicate cannot close the player lease`() = runBlocking {
+        for (episodeSwitch in listOf(false, true)) {
+            val fixture = LeaseFixture(episodeSwitch)
+            val result = fixture.resolution()
+            fixture.resolve { Result.success(result) }
+            val accepted = fixture.state
+            assertEquals(1L, accepted.revision)
+            assertEquals(if (episodeSwitch) 0L else 42_000L, accepted.playable.startPositionMs)
+            assertSame(fixture.incomingLease, accepted.playable.playbackLease)
+            assertEquals(1, fixture.commits)
+            assertFalse("A resolution is one shot", result.commitIfCurrent { true })
+            fixture.resolve { Result.success(result) }
+            assertSame(accepted, fixture.state)
+            assertEquals(1, fixture.commits)
+            assertEquals(0, fixture.rollbacks)
+            assertEquals(0, fixture.incomingLease.closes)
+            assertEquals(0, fixture.outgoingLease.closes)
+            // The mounted player, not the completed resolver task, now owns final disposal.
+            accepted.playable.playbackLease?.close()
+            assertEquals(1, fixture.incomingLease.closes)
+        }
+    }
+
+    @Test
+    fun `failed and throwing resolvers never release outgoing resource`() = runBlocking {
+        for (episodeSwitch in listOf(false, true)) {
+            for (throws in listOf(false, true)) {
+                val fixture = LeaseFixture(episodeSwitch)
+                fixture.resolve {
+                    if (throws) throw IllegalStateException("Synthetic failure")
+                    Result.failure(IllegalStateException("Synthetic failure"))
+                }
+                assertSame(fixture.outgoing, fixture.state.playable)
+                assertEquals(0L, fixture.state.revision)
+                assertEquals(0, fixture.outgoingLease.closes)
+                assertEquals(0, fixture.commits)
+                assertEquals(0, fixture.rollbacks)
+                if (episodeSwitch) assertEquals(fixture.episode, fixture.state.failedEpisode)
+            }
+        }
+    }
+
+    @Test
+    fun `host publication failure releases the unmounted lease and rolls back once`() = runBlocking {
+        for (episodeSwitch in listOf(false, true)) {
+            val fixture = LeaseFixture(episodeSwitch)
+            fixture.beforePublish = { throw IllegalStateException("Synthetic publication failure") }
+            val result = fixture.resolution()
+            val failure = runCatching { fixture.resolve { Result.success(result) } }.exceptionOrNull()
+            assertEquals("Synthetic publication failure", failure?.message)
+            assertSame(fixture.pendingState, fixture.state)
+            assertEquals(1, fixture.incomingLease.closes)
+            assertEquals(1, fixture.rollbacks)
+            assertEquals(0, fixture.outgoingLease.closes)
+            result.discard()
+            assertEquals(1, fixture.incomingLease.closes)
+            assertEquals(1, fixture.rollbacks)
+        }
+    }
+
+    /** Intentionally non-idempotent: production must supply one-shot disposal. */
+    private class CountingLease : AutoCloseable {
+        var closes = 0
+        override fun close() { closes++ }
+    }
+
+    private class LeaseFixture(private val episodeSwitch: Boolean) {
+        val coordinator = PlayerSourceSwitchCoordinator()
+        val source = StreamSource("next", "Fixture", "Next", url = "https://fixture.invalid/next")
+        val episode = Episode("episode-2", "Second", 1, 2)
+        val outgoingLease = CountingLease()
+        val incomingLease = CountingLease()
+        val outgoing = Playable("https://fixture.invalid/outgoing", "Outgoing", playbackLease = outgoingLease)
+        private val outer = coordinator.replaceOuterSession()
+        private val authority = requireNotNull(coordinator.beginRequest(outer))
+        val pendingState = PlayerSourceSwitchState(outer, outgoing, null).let {
+            if (episodeSwitch) beginPlayerEpisodeSwitch(it, episode, authority)
+            else beginPlayerSourceSwitch(it, source, authority)
+        }
+        var state = pendingState
+        var commits = 0
+        var rollbacks = 0
+        var beforePublish: () -> Unit = {}
+
+        fun resolution(gate: PlayerSourceSwitchCommitGate = PlayerSourceSwitchCommitGate(),
+            current: Boolean = true, blank: Boolean = false, missingSource: Boolean = false) =
+            PlayerSourceSwitchResolution(
+                Playable(if (blank) "" else "https://fixture.invalid/incoming", "Incoming", startPositionMs = 999,
+                    playbackLease = incomingLease),
+                resolvedSource = source.takeUnless { missingSource },
+                commitGate = gate,
+                commitAuthorityIsCurrent = { current },
+                commitAccepted = { commits++ },
+                commitRejected = { rollbacks++ },
+            )
+
+        suspend fun resolve(resolver: suspend () -> Result<PlayerSourceSwitchResolution>) {
+            if (episodeSwitch) resolveAndApplyPlayerEpisodeSwitch(coordinator,
+                requireNotNull(pendingState.pendingEpisodeSwitch), { resolver() }, { state }, { beforePublish(); state = it })
+            else resolveAndApplyPlayerSourceSwitch(coordinator,
+                requireNotNull(pendingState.pendingSwitch), { resolver() }, { state }, { 42_000L }, { beforePublish(); state = it })
+        }
+
+        fun assertRejected() {
+            assertEquals("New resource must close once", 1, incomingLease.closes)
+            assertEquals("Outgoing resource remains mounted", 0, outgoingLease.closes)
+            assertEquals("Owned rollback runs once", 1, rollbacks)
+            assertEquals("Rejected result cannot commit", 0, commits)
+        }
     }
 
     private fun resolution(

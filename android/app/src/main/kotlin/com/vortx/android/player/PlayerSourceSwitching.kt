@@ -6,6 +6,9 @@ import com.vortx.android.model.MediaRef
 import com.vortx.android.model.Playable
 import com.vortx.android.model.StreamSource
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
@@ -93,9 +96,9 @@ internal class PlayerSourceSwitchCommitGate {
 }
 
 /**
- * A side-effect-free resolver result. The host calls [commitIfCurrent] only after the result's exact request
- * authority has been accepted. The second authority check belongs to the producing ViewModel and protects its
- * identity and sticky write if that ViewModel's request, account owner, profile, or lifetime changed meanwhile.
+ * A resolver result owns its incoming resource until the host accepts it or [discard] retires it. The host
+ * calls [commitIfCurrent] only for the exact request authority. The second authority check belongs to the
+ * producing ViewModel and protects its identity and sticky write if its request, owner or lifetime changed.
  */
 class PlayerSourceSwitchResolution internal constructor(
     val playable: Playable,
@@ -108,13 +111,54 @@ class PlayerSourceSwitchResolution internal constructor(
     private val commitAccepted: () -> Unit,
     private val commitRejected: () -> Unit = {},
 ) {
-    internal fun commitIfCurrent(hostAuthorityIsCurrent: () -> Boolean): Boolean {
-        if (!commitGate.isValid() || !commitAuthorityIsCurrent() || !hostAuthorityIsCurrent()) {
-            commitRejected()
-            return false
+    private enum class Ownership { PENDING, ADOPTED, DISCARDED }
+    private val ownershipLock = Any()
+    private var ownership = Ownership.PENDING
+
+    /** Transfer the incoming lease to the mounted player only once, at host acceptance. */
+    internal fun commitIfCurrent(hostAuthorityIsCurrent: () -> Boolean): Boolean =
+        commitIfCurrent(hostAuthorityIsCurrent, acceptReplacement = {})
+
+    /** The production host publishes inside the same transfer so an unmounted result cannot leak. */
+    internal fun commitIfCurrent(
+        hostAuthorityIsCurrent: () -> Boolean,
+        acceptReplacement: () -> Unit,
+    ): Boolean = synchronized(ownershipLock) {
+        if (ownership != Ownership.PENDING) return@synchronized false
+        try {
+            if (!commitGate.isValid() || !commitAuthorityIsCurrent() || !hostAuthorityIsCurrent()) {
+                discard()
+                return@synchronized false
+            }
+            // Claim before invoking callbacks so duplicate/reentrant acceptance cannot commit twice.
+            ownership = Ownership.ADOPTED
+            try {
+                commitAccepted()
+                acceptReplacement()
+            } catch (failure: Throwable) {
+                ownership = Ownership.PENDING
+                throw failure
+            }
+            true
+        } catch (failure: Throwable) {
+            discard()
+            throw failure
         }
-        commitAccepted()
-        return true
+    }
+
+    /** A stale, cancelled or malformed result still owns its new resource, never the outgoing one. */
+    internal fun discard() {
+        val rejected = synchronized(ownershipLock) {
+            if (ownership != Ownership.PENDING) false else {
+                ownership = Ownership.DISCARDED
+                true
+            }
+        }
+        if (!rejected) return
+        // Rollback is producer-owned and may itself be stale; its callback checks that authority.
+        // Neither callback failure may mask cancellation or prevent the other cleanup from running.
+        runCatching { commitRejected() }
+        runCatching { playable.playbackLease?.close() }
     }
 }
 
@@ -345,11 +389,13 @@ internal fun completePlayerEpisodeSwitch(
         pending.authority.outerSessionId != state.outerSessionId ||
         state.pendingEpisodeSwitch != pending
     ) {
+        result.getOrNull()?.discard()
         return PlayerEpisodeSwitchCompletion(state, requestAccepted = false)
     }
     return result.fold(
         onSuccess = { resolution ->
             if (resolution.playable.url.isBlank() || resolution.resolvedSource == null) {
+                resolution.discard()
                 PlayerEpisodeSwitchCompletion(
                     state.copy(pendingEpisodeSwitch = null, failedEpisode = pending.episode, errorMessage = ""),
                     requestAccepted = true,
@@ -382,6 +428,7 @@ internal fun applyPlayerEpisodeSwitchCompletion(
     currentState: PlayerSourceSwitchState,
     pending: PendingPlayerEpisodeSwitch,
     completion: PlayerEpisodeSwitchCompletion,
+    publishAccepted: (PlayerSourceSwitchState) -> Unit = {},
     hostAuthorityIsCurrent: () -> Boolean,
 ): PlayerSourceSwitchState {
     if (
@@ -390,10 +437,11 @@ internal fun applyPlayerEpisodeSwitchCompletion(
         currentState.pendingEpisodeSwitch != pending ||
         !hostAuthorityIsCurrent()
     ) {
+        completion.resolution?.discard()
         return currentState
     }
     val resolution = completion.resolution ?: return completion.state
-    if (resolution.commitIfCurrent(hostAuthorityIsCurrent)) return completion.state
+    if (resolution.commitIfCurrent(hostAuthorityIsCurrent) { publishAccepted(completion.state) }) return completion.state
     return currentState.copy(pendingEpisodeSwitch = null, failedEpisode = pending.episode, errorMessage = "")
 }
 
@@ -454,11 +502,13 @@ internal fun completePlayerSourceSwitch(
         pending.authority.outerSessionId != state.outerSessionId ||
         state.pendingSwitch != pending
     ) {
+        result.getOrNull()?.discard()
         return PlayerSourceSwitchCompletion(state, requestAccepted = false)
     }
     return result.fold(
         onSuccess = { resolution ->
             if (resolution.playable.url.isBlank()) {
+                resolution.discard()
                 PlayerSourceSwitchCompletion(
                     state.copy(pendingSwitch = null, errorMessage = ""),
                     requestAccepted = true,
@@ -498,6 +548,7 @@ internal fun applyPlayerSourceSwitchCompletion(
     currentState: PlayerSourceSwitchState,
     pending: PendingPlayerSourceSwitch,
     completion: PlayerSourceSwitchCompletion,
+    publishAccepted: (PlayerSourceSwitchState) -> Unit = {},
     hostAuthorityIsCurrent: () -> Boolean,
 ): PlayerSourceSwitchState {
     if (
@@ -506,10 +557,11 @@ internal fun applyPlayerSourceSwitchCompletion(
         currentState.pendingSwitch != pending ||
         !hostAuthorityIsCurrent()
     ) {
+        completion.resolution?.discard()
         return currentState
     }
     val resolution = completion.resolution ?: return completion.state
-    if (resolution.commitIfCurrent(hostAuthorityIsCurrent)) return completion.state
+    if (resolution.commitIfCurrent(hostAuthorityIsCurrent) { publishAccepted(completion.state) }) return completion.state
     return currentState.copy(pendingSwitch = null, errorMessage = "")
 }
 
@@ -525,6 +577,7 @@ internal suspend fun resolveAndApplyPlayerSourceSwitch(
     latestPositionMs: () -> Long,
     publishState: (PlayerSourceSwitchState) -> Unit,
 ) {
+    val resolutionContext = currentCoroutineContext()
     val result = try {
         resolver(pending.source)
     } catch (cancelled: CancellationException) {
@@ -532,21 +585,31 @@ internal suspend fun resolveAndApplyPlayerSourceSwitch(
     } catch (error: Throwable) {
         Result.failure(error)
     }
-    coordinator.finishIfCurrent(pending.authority) {
-        val liveState = currentState()
-        val completion = completePlayerSourceSwitch(
-            state = liveState,
-            pending = pending,
-            result = result,
-            latestPositionMs = latestPositionMs(),
-        )
-        val accepted = applyPlayerSourceSwitchCompletion(
-            currentState = liveState,
-            pending = pending,
-            completion = completion,
-            hostAuthorityIsCurrent = { coordinator.isCurrent(pending.authority) },
-        )
-        if (coordinator.isCurrent(pending.authority)) publishState(accepted)
+    try {
+        // Some resolvers return successfully after swallowing cancellation. Such a result is owned,
+        // but cannot replace a mounted player even if its host token has not been retired yet.
+        resolutionContext.ensureActive()
+        coordinator.finishIfCurrent(pending.authority) {
+            resolutionContext.ensureActive()
+            val liveState = currentState()
+            val completion = completePlayerSourceSwitch(
+                state = liveState,
+                pending = pending,
+                result = result,
+                latestPositionMs = latestPositionMs(),
+            )
+            var published = false
+            val accepted = applyPlayerSourceSwitchCompletion(
+                currentState = liveState,
+                pending = pending,
+                completion = completion,
+                publishAccepted = { publishState(it); published = true },
+                hostAuthorityIsCurrent = { resolutionContext.isActive && coordinator.isCurrent(pending.authority) },
+            )
+            if (!published && coordinator.isCurrent(pending.authority)) publishState(accepted)
+        }
+    } finally {
+        result.getOrNull()?.discard()
     }
 }
 
@@ -562,6 +625,7 @@ internal suspend fun resolveAndApplyPlayerEpisodeSwitch(
     currentState: () -> PlayerSourceSwitchState,
     publishState: (PlayerSourceSwitchState) -> Unit,
 ) {
+    val resolutionContext = currentCoroutineContext()
     val result = try {
         resolver(pending.episode)
     } catch (cancelled: CancellationException) {
@@ -569,16 +633,24 @@ internal suspend fun resolveAndApplyPlayerEpisodeSwitch(
     } catch (error: Throwable) {
         Result.failure(error)
     }
-    coordinator.finishIfCurrent(pending.authority) {
-        val liveState = currentState()
-        val completion = completePlayerEpisodeSwitch(liveState, pending, result)
-        val accepted = applyPlayerEpisodeSwitchCompletion(
-            currentState = liveState,
-            pending = pending,
-            completion = completion,
-            hostAuthorityIsCurrent = { coordinator.isCurrent(pending.authority) },
-        )
-        if (coordinator.isCurrent(pending.authority)) publishState(accepted)
+    try {
+        resolutionContext.ensureActive()
+        coordinator.finishIfCurrent(pending.authority) {
+            resolutionContext.ensureActive()
+            val liveState = currentState()
+            val completion = completePlayerEpisodeSwitch(liveState, pending, result)
+            var published = false
+            val accepted = applyPlayerEpisodeSwitchCompletion(
+                currentState = liveState,
+                pending = pending,
+                completion = completion,
+                publishAccepted = { publishState(it); published = true },
+                hostAuthorityIsCurrent = { resolutionContext.isActive && coordinator.isCurrent(pending.authority) },
+            )
+            if (!published && coordinator.isCurrent(pending.authority)) publishState(accepted)
+        }
+    } finally {
+        result.getOrNull()?.discard()
     }
 }
 
