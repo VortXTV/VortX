@@ -1,0 +1,169 @@
+// The extractor inserts these environment declarations into the existing receive fixture.
+// Central receive/upload/suppression/scheduler decisions are extracted from production.
+// BEGIN DEFAULTS ENVIRONMENT
+    static let didChangeNotification = Notification.Name("synthetic.causal.defaultsChanged")
+    func dictionary(forKey key: String) -> [String: Any]? { object(forKey: key) as? [String: Any] }
+    func persistentDomain(forName name: String) -> [String: Any]? { lock.withLock { values } }
+// END DEFAULTS ENVIRONMENT
+// BEGIN PROFILE ENVIRONMENT
+    static let nativePlaybackProjectionKeys: Set<String> = []
+    static let nativeThemeProjectionKeys: Set<String> = []
+    func nativePreferenceIsAcknowledged(_ key: String) -> Bool { preconditionFailure("preference projection outside causal repair proof") }
+    func retryNativePreferenceProjection(keys: Set<String>) async -> Bool {
+        precondition(keys.isEmpty, "profile preference retry outside causal repair proof"); return true
+    }
+    func saveNative(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget, preferenceIntents: [NativePreferenceIntentStore.Intent]) async -> Bool { preconditionFailure("profile edit outside causal repair proof") }
+// END PROFILE ENVIRONMENT
+// BEGIN MANAGER ENVIRONMENT
+    var nativePushQueue = NativeForegroundSyncPolicy.PushQueue()
+    var settingsShadow: [String: Any] = [:]
+    var isApplyingRemote = false
+    var pendingLocalRosterPush: CredentialScopeRegistry.Capture?
+    var pendingNativeMutationPush: CredentialScopeRegistry.Capture?
+    var pendingSync: Task<Void, Never>?
+    var pendingSyncCapture: CredentialScopeRegistry.Capture?
+    var pendingSyncID: UUID?
+    var realtimeActive = false
+    var syncUpCompletionWaiters: [UUID: [UUID: CheckedContinuation<Void, Never>]] = [:]
+    var nativePreparedSeedCapture: CredentialScopeRegistry.Capture?
+    var pendingAddonOrderIntent: AddonOrderIntent?
+    var nativeLegacyWatchlistPending: Set<String> = []
+    var nativeUnsupportedSettings: [String] = []
+    var nativePreferenceIntentStatus = "idle"
+    var fixtureProviderState: VortxNativeProviderCredentials?
+    func restoreAccountDocIfNeeded(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool { preconditionFailure("cold restore outside causal repair proof") }
+    func nativeEmptyAccountDocument(capture: CredentialScopeRegistry.Capture) throws -> [String: Any] { preconditionFailure("empty account outside causal repair proof") }
+    func restoreNativeCheckpoint(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool { preconditionFailure("session restore outside causal repair proof") }
+    func nativePreferenceStore(capture: CredentialScopeRegistry.Capture) throws -> NativePreferenceIntentStore {
+        guard isCurrent(capture), let dataKey else { throw VortxNativeError.superseded }
+        return NativePreferenceIntentStore(directoryURL: directory.appendingPathComponent("empty-preference-journal"), key: dataKey, namespace: capture.namespace)
+    }
+    func saveNativeProviderState(_ state: VortxNativeProviderCredentials, capture: CredentialScopeRegistry.Capture) throws {
+        guard isCurrent(capture), state.local.document.fields.isEmpty, !state.hasPreparedMutation else { throw VortxNativeError.invalidSnapshot }
+        fixtureProviderState = state
+    }
+    func publishAppliedAddonOrder(_ order: [String]) { preconditionFailure("legacy order outside causal repair proof") }
+    func fixtureState() -> [String: Any] {
+        ["version": lastSyncedVersion, "stamped": stamped, "pending": hasPendingPush,
+         "durable": nativeDurablePushPending, "generation": nativePushQueue.generation,
+         "worker": pendingSync != nil, "deferred": pendingNativeMutationPush != nil,
+         "suppressed": isApplyingRemote, "dirty": Array(dirtySettings.keys).sorted(),
+         "credential": credentialAuthority.capture().generation]
+    }
+    func fixtureObserve() { observeDefaultsChange() }
+    func fixtureBaseline() { refreshSettingsShadow() }
+    func fixtureStop() { pendingSync?.cancel() }
+    func fixtureDocument() async -> [String: Any] {
+        if case .doc(let doc, _) = await pullDocVersionedResult() { return doc }
+        preconditionFailure("expected encrypted fixture document")
+    }
+// END MANAGER ENVIRONMENT
+
+@main @MainActor enum NativeCausalRepairPeer {
+    typealias Seed = AppleSyncReceivePublicationPeer
+    struct Command: Decodable {
+        let mode: String; let directory: String; let baseURL: String
+        let stage: Int?; let version: Int?; let sibling: String?
+    }
+    struct Instruction: Decodable { let action: String; let milliseconds: UInt64? }
+    nonisolated static func nextLine() async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().async { continuation.resume(returning: readLine()) }
+        }
+    }
+    static func snapshot(_ manager: VortXSyncManager, _ session: VortxNativeSession) async throws -> [String: Any] {
+        var result = manager.fixtureState()
+        result["native"] = try JSONSerialization.jsonObject(with: Data(try await session.stateJSON().utf8))
+        result["host"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(await session.hostPreferencesDocument()))
+        result["selection"] = HomeContinueWatchingSelection.current(core: .shared, profiles: .shared).selection.items.map {
+            ["id": $0.id, "videoId": $0.state.videoId ?? "", "offset": $0.state.timeOffset, "duration": $0.state.duration]
+        }
+        return result
+    }
+    static func main() async {
+        do {
+            let command = try JSONDecoder().decode(Command.self, from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))
+            guard let base = URL(string: command.baseURL), base.host == "127.0.0.1", base.scheme == "http" else { throw VortxNativeError.invalidResponse }
+            let manager = VortXSyncManager(directory: URL(fileURLWithPath: command.directory), baseURL: base)
+            manager.fixtureBaseline()
+            let checkpoint = try VortxEncryptedCheckpointStore(directory: manager.directory, key: SymmetricKey(data: Seed.key), installationKey: SymmetricKey(data: Data(repeating: 42, count: 32)))
+            let actor = command.mode == "upload" ? Seed.actor : (manager.directory.lastPathComponent == "peer-c" ? "00000000-0000-4000-8000-000000000043" : "00000000-0000-4000-8000-000000000042")
+            let session = try VortxNativeSession(scope: .init(account: Seed.account, ownerProfileID: Seed.owner), ownerName: "Synthetic Owner", abi: VortxCABI(), store: checkpoint, transport: Seed.NoResources(), allowNewAccount: true, hostActor: actor)
+            if command.mode == "upload" {
+                let earlier = manager.directory.appendingPathComponent("causal-earlier-carrier.json")
+                var document: [String: Any]
+                if command.stage == 4 {
+                    document = try JSONSerialization.jsonObject(with: Data(contentsOf: earlier)) as! [String: Any]
+                } else {
+                    try await Seed.stageMutation(command.stage!, session: session)
+                    let state = try JSONDecoder().decode(VortxJSON.self, from: Data(try await session.stateJSON().utf8))
+                    document = ["nativeSync": try JSONSerialization.jsonObject(with: JSONEncoder().encode(state["nativeSync"]!)),
+                                "nativeHostPreferences": try JSONSerialization.jsonObject(with: JSONEncoder().encode(await session.hostPreferencesDocument()))]
+                    if command.stage == 1 { try JSONSerialization.data(withJSONObject: document).write(to: earlier) }
+                }
+                document["causalFixtureSibling"] = ["owner": command.sibling ?? "synthetic", "preserve": [1, 2, 3]]
+                document["apiKeys"] = ["unrelatedFixtureField": "retained-synthetic"]
+                let accepted = await manager.uploadForFixture(document, version: command.version!)
+                try Seed.emit(["accepted": accepted, "version": manager.lastSyncedVersion, "actor": actor])
+            } else {
+                let capture = CredentialScopeRegistry.shared.capture()
+                let facade = try await VortxNativeCoreFacade.create(session: session, registry: [], mutationAccepted: {
+                    Task { @MainActor in VortXSyncManager.shared.nativeMutationDidCommit(credentialCapture: capture) }
+                }, changed: { CoreBridge.shared.handleHistoryFields($0) })
+                let core = CoreBridge.shared
+                core.nativeFacadeStorage = facade; core.nativeCredentialCapture = capture
+                core.nativePublishedAccountGeneration = facade.accountGeneration
+                try core.refreshProfilesForFixture()
+                await Seed.drainMainQueue()
+                try Seed.emit(["ready": true, "actor": actor])
+                while let line = await nextLine() {
+                    let instruction = try JSONDecoder().decode(Instruction.self, from: Data(line.utf8))
+                    if instruction.action == "close" { break }
+                    var extra: [String: Any] = [:]
+                    switch instruction.action {
+                    case "pull":
+                        var outcome = VortXSyncManager.ConflictResolutionOutcome.failed
+                        extra["restored"] = await manager.syncDown(reportOutcome: { outcome = $0 })
+                        extra["outcome"] = outcome.rawValue
+                    case "wait": try await Task.sleep(nanoseconds: (instruction.milliseconds ?? 50) * 1_000_000)
+                    case "foreground": manager.realtimeActive = true; manager.requestSyncSoon()
+                    case "background": manager.realtimeActive = false
+                    case "observe": manager.fixtureObserve()
+                    case "progress":
+                        let action: VortxJSON = .object(["type": .string("report_progress"), "metaId": .string("tt-receive-fixture"), "videoId": .string("tt-receive-fixture:1:9"), "name": .string("Synthetic Series"), "positionMs": .integer(444000), "durationMs": .integer(1200000), "metadata": .object(["type": .string("series")])])
+                        guard facade.dispatchForProfile(action, profileID: Seed.owner, expectedAccountGeneration: facade.accountGeneration) else { throw VortxNativeError.superseded }
+                        await facade.settled()
+                    case "suppressed":
+                        let generation = manager.nativePushQueue.generation
+                        let previous = UserDefaults.standard.string(forKey: "vortx.home.layout")
+                        let changed = previous == "wall" ? "rails" : "wall"
+                        extra["changedDomain"] = previous != changed
+                        manager.withRemoteApplySuppressed {
+                            UserDefaults.standard.set(changed, forKey: "vortx.home.layout")
+                            manager.fixtureObserve()
+                            manager.nativeMutationDidCommit(credentialCapture: CredentialScopeRegistry.shared.capture())
+                            extra["waitedDuringSuppression"] = manager.pendingNativeMutationPush != nil && manager.nativePushQueue.generation == generation + 1
+                        }
+                        extra["beforeGeneration"] = generation
+                    case "wrong-owner":
+                        manager.nativeMutationDidCommit(credentialCapture: .init(generation: CredentialScopeRegistry.shared.capture().generation + 100))
+                    case "aba":
+                        CredentialScopeRegistry.shared.retire(); CredentialScopeRegistry.shared.retire()
+                        core.nativeCredentialCapture = CredentialScopeRegistry.shared.capture()
+                        manager.nativeMutationDidCommit(credentialCapture: CredentialScopeRegistry.shared.capture())
+                    case "trigger": manager.nativeMutationDidCommit(credentialCapture: CredentialScopeRegistry.shared.capture())
+                    case "snapshot": break
+                    case "document": extra["document"] = await manager.fixtureDocument()
+                    default: throw VortxNativeError.invalidResponse
+                    }
+                    await Seed.drainMainQueue()
+                    var value = try await snapshot(manager, session); extra.forEach { value[$0.key] = $0.value }
+                    try Seed.emit(value)
+                }
+                manager.fixtureStop()
+                await facade.shutdown()
+            }
+            await session.close()
+        } catch { FileHandle.standardError.write(Data("Causal repair fixture failed: \(error)\n".utf8)); exit(1) }
+    }
+}
