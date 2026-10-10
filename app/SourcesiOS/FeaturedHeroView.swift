@@ -240,10 +240,9 @@ struct FeaturedHeroView: View {
 
     private var backdrop: some View {
         // GeometryReader pins BOTH art layers to the EXACT band size so `scaledToFill` always covers the
-        // whole band at any window width. Without it, the AsyncImage sat unframed inside the ZStack (the
-        // frame was on the ZStack, not the image), so it sized to the loaded image's natural width and the
-        // rest of the wide macOS band stayed bare scrim, the "backdrop only fills part of the band" report.
-        // (On the narrow iPhone the image width happened to exceed the band, so the gap never showed.)
+        // whole band at any window width. The cache-only poster fallback and the layer host both receive
+        // this exact frame, so the wide macOS band never falls back to a natural image width with a bare
+        // scrim beside it.
         GeometryReader { geo in
             ZStack {
                 // Dynamic dominant-color base: the featured art's average color under everything, so the
@@ -295,24 +294,47 @@ struct FeaturedHeroView: View {
         .accessibilityHidden(true)
     }
 
-    /// The poster painted behind the backdrop so the band is never flat black. Falls to canvas only
-    /// when there is no poster at all (rare; the catalog/CW seed almost always carries one).
+    /// The warm poster painted behind the backdrop so the band is never flat black while the bounded
+    /// backdrop request is in flight. This is deliberately CACHE-ONLY: KenBurnsLoader owns the one
+    /// progressive network/decode path, so a cold cache shows the dominant-color base instead of starting
+    /// a second full-size unbounded request for the same poster. Falls to canvas only when there is no
+    /// decoded poster at all (rare; the catalog/CW seed almost always carries one).
+    private static let posterFallbackMaxPixel = CGFloat(HeroArtworkQualityPolicy.mobileLongEdge)
+
     @ViewBuilder private var posterFallback: some View {
-        if let poster = model.hero?.poster, let url = URL(string: poster) {
-            AsyncImage(url: url) { phase in
-                if case .success(let img) = phase {
-                    img.resizable().aspectRatio(contentMode: .fill)
-                } else {
-                    // Dominant-color tint while the poster streams in (falls to canvas with no tint).
-                    (heroTint ?? Theme.Palette.canvas)
-                }
-            }
-            // Decorative backdrop filler, never announced by VoiceOver.
-            .accessibilityHidden(true)
+        if let image = cachedPosterImage {
+            cachedPosterImageView(image)
         } else {
+            // Dominant-color tint while the owned progressive loader fetches/decodes the art (falls to
+            // canvas with no tint). This path never starts a second request.
             (heroTint ?? Theme.Palette.canvas)
                 .accessibilityHidden(true)
         }
+    }
+
+    /// Read only the decoded cache so a poster already loaded by a rail or prior hero paints immediately.
+    /// The fallback also accepts the loader's standard card budget because Home posters commonly arrive from
+    /// a 900 px tile before the hero mounts; neither branch can fetch or decode.
+    private var cachedPosterImage: VXPosterImage? {
+        guard let poster = model.hero?.poster, let url = URL(string: poster) else { return nil }
+        return PosterImageLoader.cached(url, maxPixel: Self.posterFallbackMaxPixel)
+            ?? PosterImageLoader.cached(url)
+    }
+
+    @ViewBuilder
+    private func cachedPosterImageView(_ image: VXPosterImage) -> some View {
+        #if canImport(UIKit)
+        Image(uiImage: image)
+            .resizable()
+            .aspectRatio(contentMode: .fill)
+        #elseif canImport(AppKit)
+        Image(nsImage: image)
+            .resizable()
+            .aspectRatio(contentMode: .fill)
+        #endif
+        // Match the GeometryReader's band bounds so a warm poster fills wide macOS bands too.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityHidden(true)
     }
 
     // MARK: Overlay (logo-or-title · meta row · synopsis · actions)
@@ -638,11 +660,15 @@ private final class KenBurnsLoader {
         guard self.requestID != requestID else { return }
         self.requestID = requestID
         task?.cancel()
-        task = Task { [weak layer] in
+        task = Task { [weak self, weak layer] in
             let cg = await Self.bestArt(backdrop: backdropURL, poster: poster, maxPixel: maxPixel)
-            guard let cg, !Task.isCancelled, let layer else { return }
+            guard let cg, !Task.isCancelled, self?.requestID == requestID else { return }
             let width = cg.width, height = cg.height
-            await MainActor.run {
+            await MainActor.run { [weak self, weak layer] in
+                // The representable coordinator is reused across SwiftUI updates. Recheck both cancellation
+                // and the request identity on the main-actor paint hop so an older title cannot land after a
+                // rotation, even if its ImageIO task completed just as cancellation arrived.
+                guard !Task.isCancelled, self?.requestID == requestID, let layer else { return }
                 CATransaction.begin(); CATransaction.setDisableActions(true)
                 layer.contents = cg
                 CATransaction.commit()

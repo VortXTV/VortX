@@ -5,6 +5,7 @@ root="${0:A:h:h}"
 cd "$root"
 
 xcrun swiftc -frontend -parse app/SourcesiOS/iOSDetailView.swift
+xcrun swiftc -frontend -parse app/SourcesiOS/FeaturedHeroView.swift
 
 build_dir="$(mktemp -d "${TMPDIR:-/tmp}/vortx-cinematic-backdrop.XXXXXX")"
 trap 'rm -rf "$build_dir"' EXIT
