@@ -70,15 +70,19 @@ require_grep "signed candidate APK and AAB both verify complete engine ABIs" \
     'verify-native-android-artifacts\.sh .*--native-only|--native-only --staged-dir android/app/src/main/jniLibs' \
     <(printf '%s\n' "$candidate_signing_step")
 ok "Apple and both Android lanes use one exact wrapper revision"
-native_pin=""
-for wf in "$APPLE_RELEASE_WF" "$ANDROID_CI_WF" "$RELEASE_WF"; do
+native_pin="$(awk '/^      NORMAL_NATIVE_REVISION:/{print $2}' "$APPLE_RELEASE_WF")"
+[[ "$native_pin" = 2652cd1ae6c1eda49a8b3c5e596d8b41e7073a95 ]] || fail "Apple normal native pin differs from the reviewed revision"
+apple_native_ref="$(awk '/repository: VortXTV\/vortx-core/{active=1; next}
+    active && /^[[:space:]]+ref:/{sub(/^[[:space:]]+ref: /, ""); print; exit}' "$APPLE_RELEASE_WF")"
+[[ "$apple_native_ref" = '${{ steps.native_source.outputs.revision }}' ]] || fail "Apple checkout must consume the authenticated source selection"
+for wf in "$ANDROID_CI_WF" "$RELEASE_WF"; do
     pin="$(awk '/repository: VortXTV\/vortx-core/{active=1; next}
         active && /^[[:space:]]+ref:/{print $2; exit}' "$wf")"
     [[ "$pin" =~ ^[0-9a-f]{40}$ ]] || fail "$(basename "$wf") native engine pin must be immutable"
-    [[ -z "$native_pin" || "$native_pin" = "$pin" ]] || fail "Apple/Android native engine pins differ"
-    native_pin="$pin"
+    [[ "$native_pin" = "$pin" ]] || fail "normal Apple/Android native engine pins differ"
 done
-ok "Apple and both Android lanes use one exact native engine revision"
+ok "normal Apple and both Android lanes use one exact native engine revision; historical Apple recovery is separately authenticated"
+/bin/bash "$REPO_ROOT/scripts/test-android-native-release-contracts.sh"
 
 # A directly invoked gate must survive Git checkout as executable; otherwise CI fails before its
 # artifact checks run. Inspect the actual workflow commands and tracked modes, not a prose list.

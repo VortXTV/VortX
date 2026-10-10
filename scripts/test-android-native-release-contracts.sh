@@ -11,7 +11,7 @@ readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 readonly GRADLE_BUILD="$REPO_ROOT/android/app/build.gradle.kts"
 readonly ANDROID_CI_WF="$REPO_ROOT/.github/workflows/android.yml"
 readonly ANDROID_RELEASE_WF="$REPO_ROOT/.github/workflows/android-release.yml"
-readonly REVIEWED_NATIVE_SHA='7e3e68be5bf2b11c65d158c1823be94bd1608d1b'
+readonly REVIEWED_NATIVE_SHA='2652cd1ae6c1eda49a8b3c5e596d8b41e7073a95'
 readonly APP_SOURCE="$REPO_ROOT/android/app/src/main/kotlin/com/vortx/android/VortXApplication.kt"
 readonly LEGACY_REPOSITORY="$REPO_ROOT/android/app/src/main/kotlin/com/vortx/android/engine/EngineStremioRepository.kt"
 readonly RESOURCE_BRIDGE="$REPO_ROOT/android/app/src/main/kotlin/com/vortx/android/engine/VortxResourceBridge.kt"
@@ -88,6 +88,8 @@ for workflow in "$ANDROID_CI_WF" "$ANDROID_RELEASE_WF"; do
     # rust-cache's explicit key survives its lockfile-prefix fallback. Bind that key to the
     # private source, not only the branch, so updating engine code cannot restore older targets.
     cache_key="$(awk '/^[[:space:]]*key:.*github.ref_name/{print; exit}' "$workflow")"
+    [[ "$cache_key" == *'${{ env.VORTX_ENGINE_SOURCE_SHA }}'* ]] \
+      || fail "$(basename "$workflow") private cache omits the verified source revision"
     [[ "$cache_key" == *"hashFiles("* ]] || fail "$(basename "$workflow") private cache is not content-addressed"
     for input in 'core/src/**' 'core/Cargo.*' 'vortx-core/crates/**' 'vortx-core/Cargo.*' \
                  'vortx-core/rust-toolchain.toml' 'vortx-core/.cargo/**' 'android/app/build.gradle.kts'; do

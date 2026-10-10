@@ -115,7 +115,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3
+          ref: 2652cd1ae6c1eda49a8b3c5e596d8b41e7073a95
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
@@ -124,7 +124,7 @@ jobs:
         run: |
           set -euo pipefail
           vortx_sha="$(git -C _vortx_core_src rev-parse HEAD^{commit})"
-          test "$vortx_sha" = "0c201563c6aa54eeb0545b55ad01582c0c3bcae3" \
+          test "$vortx_sha" = "2652cd1ae6c1eda49a8b3c5e596d8b41e7073a95" \
             || { echo "::error::vortx-core checkout does not match the reviewed private pin"; exit 1; }
           stremio_sha="$(git -C core rev-parse HEAD^{commit})"
           test "$stremio_sha" = "31c66611822043e089f5819ad232a5df93975873" \
@@ -198,7 +198,7 @@ jobs:
       # private targets. Public app-only edits can still reuse identical engine/dependency work.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: ${{ github.ref_name }}-native-${{ hashFiles('core/Cargo.*', 'core/rust-toolchain.toml', 'core/.cargo/**', 'core/src/**', 'core/include/**', 'vortx-core/Cargo.*', 'vortx-core/rust-toolchain.toml', 'vortx-core/.cargo/**', 'vortx-core/crates/**', 'android/app/build.gradle.kts') }}
+          key: ${{ github.ref_name }}-native-${{ env.VORTX_ENGINE_SOURCE_SHA }}-${{ hashFiles('core/Cargo.*', 'core/rust-toolchain.toml', 'core/.cargo/**', 'core/src/**', 'core/include/**', 'vortx-core/Cargo.*', 'vortx-core/rust-toolchain.toml', 'vortx-core/.cargo/**', 'vortx-core/crates/**', 'android/app/build.gradle.kts') }}
           workspaces: |
             core -> target
             vortx-core -> target-andx

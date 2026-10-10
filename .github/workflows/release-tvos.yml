@@ -125,6 +125,8 @@ jobs:
       # every native input/app/archive proof; an explicit dispatch false remains a comparison lane.
       VORTX_NATIVE_ONLY: ${{ github.event_name != 'workflow_dispatch' || inputs.native_only }}
       BUILD_SOURCE_SHA: ${{ inputs.recovery_source_commit || github.sha }}
+      # Normal new app sources advance independently of admitted historical recovery cuts.
+      NORMAL_NATIVE_REVISION: 2652cd1ae6c1eda49a8b3c5e596d8b41e7073a95
     # GitHub-owned actions are SHA-pinned too (a mutable tag -- even on an actions/* repo -- can be
     # repointed, and this job holds ENGINE_REPO_TOKEN + the release secrets). Each pin carries the
     # tag it resolved from.
@@ -155,11 +157,9 @@ jobs:
             *) exit 1 ;;
           esac
           [ "$VORTX_NATIVE_ONLY" = true ] && [ "$TVOS_TEST_ONLY" != true ] && [ -z "$RESUME_HANDOFF" ] && [ -z "$MPVKIT_URL$MPVKIT_SHA" ] || exit 1
-          # These assignments belong to the executing workflow, not the historical source
-          # checkout. A future main pin bump must disable these exact-cut recoveries fail-closed.
-          NATIVE_PIN="$(awk '/^      - name: Fetch vortx-core / {step=1; next} step && /^      - / {exit} step && /^          ref:/ {print $2}' .github/workflows/release-tvos.yml)"
+          # The executing player must still match the historical cut. Its native core is
+          # selected separately, only after this entire source/tag/draft admission succeeds.
           PLAYER_PINS="$(awk '/^      - name: Fetch the MPVKit-DVFEL artifacts / {step=1; next} step && /^      - / {exit} step && /^          (URL|EXPECTED)=/ {sub(/^          /, ""); print}' .github/workflows/release-tvos.yml)"
-          [ "$NATIVE_PIN" = 0c201563c6aa54eeb0545b55ad01582c0c3bcae3 ] || exit 1
           [ "$PLAYER_PINS" = 'EXPECTED="737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1"
           URL="https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip"' ] || exit 1
           gh api -- "repos/$GH_REPO/compare/$BUILD_SOURCE_SHA...$GITHUB_SHA" | jq -e --arg source "$BUILD_SOURCE_SHA" '
@@ -179,6 +179,8 @@ jobs:
             (if $tag == "v0.5.0-beta.3" then $latest != null and .prerelease == false
              elif $latest != null
              then .prerelease == false else .prerelease == true end)' >/dev/null
+          echo "source_sha=$BUILD_SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo 'native_revision=0c201563c6aa54eeb0545b55ad01582c0c3bcae3' >> "$GITHUB_OUTPUT"
 
       - name: Preserve the workflow revision's native acceptance tool
         id: tooling
@@ -203,9 +205,44 @@ jobs:
         run: |
           set -euo pipefail
           [ "$(git rev-parse HEAD)" = "$BUILD_SOURCE_SHA" ] && [ -z "$(git status --porcelain)" ] || exit 1
-          # Recovery is only packaging orchestration: retain the exact private and vendor pins.
-          grep -Fq 'ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3' .github/workflows/release-tvos.yml
-          grep -Fq 'vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip' .github/workflows/release-tvos.yml
+          # Authenticate each frozen workflow's recorded pin; effective recovery selection
+          # remains the separately admitted historical engine, never this checkout's default.
+          case "$BUILD_SOURCE_SHA" in
+            844782d29a93ae51991bfadc639d50bc3619d40b) RECORDED_NATIVE_PIN=7e3e68be5bf2b11c65d158c1823be94bd1608d1b ;;
+            bf4aad976aa7ad21e8d77b1b13c1d2a556b5dd39) RECORDED_NATIVE_PIN=0c201563c6aa54eeb0545b55ad01582c0c3bcae3 ;;
+            *) exit 1 ;;
+          esac
+          NATIVE_PIN="$(awk '/^      - name: Fetch vortx-core / {step=1; next} step && /^      - / {exit} step && /^          ref:/ {print $2}' .github/workflows/release-tvos.yml)"
+          NATIVE_ASSERTION="$(awk '/^      - name: Promote the vortx-core engine workspace / {step=1; next} step && /^      - / {exit} step && /^          \[ "\$NATIVE_REVISION" = / {sub(/^          /, ""); print}' .github/workflows/release-tvos.yml)"
+          PLAYER_PINS="$(awk '/^      - name: Fetch the MPVKit-DVFEL artifacts / {step=1; next} step && /^      - / {exit} step && /^          (URL|EXPECTED)=/ {sub(/^          /, ""); print}' .github/workflows/release-tvos.yml)"
+          [ "$NATIVE_PIN" = "$RECORDED_NATIVE_PIN" ] || exit 1
+          [ "$NATIVE_ASSERTION" = "[ \"\$NATIVE_REVISION\" = $RECORDED_NATIVE_PIN ] || { echo \"::error::native source checkout differs from reviewed pin\"; exit 1; }" ] || exit 1
+          [ "$PLAYER_PINS" = 'EXPECTED="737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1"
+          URL="https://github.com/VortXTV/VortX/releases/download/vendor-mpvkit-dvfel-3/mpvkit-dvfel-artifacts-http-seek-20261009.zip"' ] || exit 1
+
+      - name: Select the authenticated native source revision
+        id: native_source
+        env:
+          RECOVERY_SOURCE: ${{ inputs.recovery_source_commit }}
+          RECOVERY_OUTCOME: ${{ steps.recovery.outcome }}
+          ADMITTED_SOURCE: ${{ steps.recovery.outputs.source_sha }}
+          ADMITTED_NATIVE_REVISION: ${{ steps.recovery.outputs.native_revision }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$BUILD_SOURCE_SHA" ] && [ -z "$(git status --porcelain)" ] || exit 1
+          if [ -z "$RECOVERY_SOURCE" ]; then
+            [ "$BUILD_SOURCE_SHA" = "$GITHUB_SHA" ] && [ "$RECOVERY_OUTCOME" = skipped ] && [ -z "$ADMITTED_SOURCE$ADMITTED_NATIVE_REVISION" ] || exit 1
+            [ "$NORMAL_NATIVE_REVISION" = 2652cd1ae6c1eda49a8b3c5e596d8b41e7073a95 ] || exit 1
+            NATIVE_REVISION="$NORMAL_NATIVE_REVISION"
+          else
+            [ "$RECOVERY_OUTCOME" = success ] && [ "$RECOVERY_SOURCE" = "$BUILD_SOURCE_SHA" ] && [ "$ADMITTED_SOURCE" = "$BUILD_SOURCE_SHA" ] || exit 1
+            case "$ADMITTED_SOURCE:$ADMITTED_NATIVE_REVISION" in
+              844782d29a93ae51991bfadc639d50bc3619d40b:0c201563c6aa54eeb0545b55ad01582c0c3bcae3|bf4aad976aa7ad21e8d77b1b13c1d2a556b5dd39:0c201563c6aa54eeb0545b55ad01582c0c3bcae3) ;;
+              *) exit 1 ;;
+            esac
+            NATIVE_REVISION="$ADMITTED_NATIVE_REVISION"
+          fi
+          echo "revision=$NATIVE_REVISION" >> "$GITHUB_OUTPUT"
 
       - name: Bind native acceptance tooling to workflow and source provenance
         env:
@@ -284,16 +321,19 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: VortXTV/vortx-core
-          ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3
+          ref: ${{ steps.native_source.outputs.revision }}
           token: ${{ secrets.ENGINE_REPO_TOKEN }}
           path: _vortx_core_src
           persist-credentials: false
 
       - name: Promote the vortx-core engine workspace + verify both engines (fail closed)
+        env:
+          EXPECTED_NATIVE_REVISION: ${{ steps.native_source.outputs.revision }}
         run: |
           set -euo pipefail
-          NATIVE_REVISION="$(git -C _vortx_core_src rev-parse HEAD)"
-          [ "$NATIVE_REVISION" = 0c201563c6aa54eeb0545b55ad01582c0c3bcae3 ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
+          [[ "$EXPECTED_NATIVE_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          NATIVE_REVISION="$(git -C _vortx_core_src rev-parse 'HEAD^{commit}')"
+          [ "$NATIVE_REVISION" = "$EXPECTED_NATIVE_REVISION" ] || { echo "::error::native source checkout differs from reviewed pin"; exit 1; }
           echo "VORTX_ENGINE_SOURCE_REVISION=$NATIVE_REVISION" >> "$GITHUB_ENV"
           rm -rf vortx-core
           mv _vortx_core_src/vortx-core vortx-core
@@ -501,7 +541,7 @@ jobs:
           path: |
             app/Vendor/VortxEngine.xcframework
             app/Vendor/engine-prelocalize/VortxEngine
-          key: vortx-ffi-resource-host-v1-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh', 'scripts/verify-native-engine-abi.sh') }}
+          key: vortx-ffi-resource-host-v1-${{ runner.os }}-${{ steps.toolchain.outputs.xcode_version }}-${{ env.VORTX_ENGINE_SOURCE_REVISION }}-${{ hashFiles('vortx-core/Cargo.toml', 'vortx-core/Cargo.lock', 'vortx-core/rust-toolchain.toml', 'vortx-core/crates/**', 'scripts/build-ffi-xcframework.sh', 'scripts/verify-native-engine-abi.sh') }}
 
       - name: Build the vortx-ffi xcframework
         if: steps.cache-ffi-xcframework.outputs.cache-hit != 'true'
