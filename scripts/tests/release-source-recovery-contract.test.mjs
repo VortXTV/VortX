@@ -8,6 +8,10 @@ import { test } from 'node:test';
 
 const workflow = readFileSync(new URL('../../.github/workflows/release-tvos.yml', import.meta.url), 'utf8');
 const source = '844782d29a93ae51991bfadc639d50bc3619d40b', code = 'a'.repeat(40), tag = 'v0.5.0-beta.1';
+const recoveryCuts = [
+  { source, tag, releaseId: '407572242' },
+  { source: 'bf4aad976aa7ad21e8d77b1b13c1d2a556b5dd39', tag: 'v0.5.0-beta.3', releaseId: '408568690' },
+];
 function step(name) {
   const start = workflow.indexOf(`      - name: ${name}\n`);
   assert(start >= 0, name);
@@ -21,14 +25,14 @@ function fixture(fn) {
   const dir = mkdtempSync(join(tmpdir(), 'vortx-source-recovery-'));
   try { return fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
 }
-function admission(overrides = {}, mutations = {}, workflowText = workflow) {
+function admission(overrides = {}, mutations = {}, workflowText = workflow, cut = recoveryCuts[0]) {
   return fixture(dir => {
     mkdirSync(join(dir, '.github/workflows'), { recursive: true });
     writeFileSync(join(dir, '.github/workflows/release-tvos.yml'), workflowText);
     const records = {
-      main: code, comparison: { status: 'ahead', merge_base_commit: { sha: source } },
-      tag: { object: { type: 'tag', sha: 'b'.repeat(40) } }, peel: { object: { type: 'commit', sha: source } },
-      release: { id: 407572242, tag_name: tag, draft: true, prerelease: false, body: '<!-- vortx-channel: latest-beta -->' },
+      main: code, comparison: { status: 'ahead', merge_base_commit: { sha: cut.source } },
+      tag: { object: { type: 'tag', sha: 'b'.repeat(40) } }, peel: { object: { type: 'commit', sha: cut.source } },
+      release: { id: Number(cut.releaseId), tag_name: cut.tag, draft: true, prerelease: false, body: '<!-- vortx-channel: latest-beta -->' },
       ...mutations
     };
     for (const [key, value] of Object.entries(records)) writeFileSync(join(dir, `${key}.json`), JSON.stringify(value));
@@ -39,43 +43,82 @@ gh() {
     */compare/*) command cat "$RUNNER_TEMP/comparison.json" ;;
     */git/ref/tags/*) command cat "$RUNNER_TEMP/tag.json" ;;
     */git/tags/*) command cat "$RUNNER_TEMP/peel.json" ;;
-    */releases/407572242) command cat "$RUNNER_TEMP/release.json" ;;
+    */releases/${cut.releaseId}) command cat "$RUNNER_TEMP/release.json" ;;
     *) return 88 ;;
   esac
 }
 ${script('Validate immutable Beta 1 source recovery')}`], { cwd: dir, encoding: 'utf8', env: { ...process.env,
       RUNNER_TEMP: dir, GH_REPO: 'VortXTV/VortX', GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/heads/main', GITHUB_SHA: code,
-      BUILD_SOURCE_SHA: source, TAG: tag, RELEASE_ID: '407572242', VORTX_NATIVE_ONLY: 'true', TVOS_TEST_ONLY: 'false',
+      BUILD_SOURCE_SHA: cut.source, TAG: cut.tag, RELEASE_ID: cut.releaseId, VORTX_NATIVE_ONLY: 'true', TVOS_TEST_ONLY: 'false',
       RESUME_HANDOFF: '', MPVKIT_URL: '', MPVKIT_SHA: '', ...overrides } });
   });
 }
 
-test('actual recovery admission accepts exactly the main-only immutable cut and annotated tag peel', () => {
-  const result = admission(); assert.equal(result.status, 0, result.stderr);
-  assert.equal(admission({}, { tag: { object: { type: 'commit', sha: source } } }).status, 0);
+for (const cut of recoveryCuts) test(`actual recovery admission accepts exactly ${cut.tag} on current main with immutable tag peel`, () => {
+  const admit = (overrides = {}, mutations = {}, workflowText = workflow) => admission(overrides, mutations, workflowText, cut);
+  const result = admit(); assert.equal(result.status, 0, result.stderr);
+  assert.equal(admit({}, { tag: { object: { type: 'commit', sha: cut.source } } }).status, 0);
+  assert.equal(admit({}, { comparison: { status: 'identical', merge_base_commit: { sha: cut.source } } }).status, 0);
   for (const invalid of [
-    { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REF: `refs/tags/${tag}` }, { GITHUB_REF: 'refs/heads/feature' },
-    { GH_REPO: 'fork/VortX' }, { BUILD_SOURCE_SHA: code }, { TAG: 'v0.5.0-beta.2' }, { RELEASE_ID: '407572243' },
+    { GITHUB_EVENT_NAME: 'push' }, { GITHUB_REF: `refs/tags/${cut.tag}` }, { GITHUB_REF: 'refs/heads/feature' },
+    { GH_REPO: 'fork/VortX' }, { BUILD_SOURCE_SHA: code }, { TAG: 'v0.5.0-beta.2' }, { RELEASE_ID: String(Number(cut.releaseId) + 1) },
     { VORTX_NATIVE_ONLY: 'false' }, { TVOS_TEST_ONLY: 'true' }, { RESUME_HANDOFF: '{}' },
-    { MPVKIT_URL: 'https://github.com/VortXTV/VortX/releases/download/other/player.zip' }, { MPVKIT_SHA: 'd'.repeat(64) }
-  ]) assert.notEqual(admission(invalid).status, 0, JSON.stringify(invalid));
+    { MPVKIT_URL: 'https://github.com/VortXTV/VortX/releases/download/other/player.zip' }, { MPVKIT_SHA: 'd'.repeat(64) },
+    ...recoveryCuts.filter(other => other !== cut).flatMap(other => [
+      { BUILD_SOURCE_SHA: other.source }, { TAG: other.tag }, { RELEASE_ID: other.releaseId },
+    ])
+  ]) assert.notEqual(admit(invalid).status, 0, JSON.stringify(invalid));
   for (const invalid of [
-    { main: source }, { comparison: { status: 'diverged', merge_base_commit: { sha: source } } },
+    { main: cut.source }, { comparison: { status: 'diverged', merge_base_commit: { sha: cut.source } } },
     { comparison: { status: 'ahead', merge_base_commit: { sha: code } } },
-    { peel: { object: { type: 'commit', sha: code } } }, { peel: { object: { type: 'tree', sha: source } } },
+    { peel: { object: { type: 'commit', sha: code } } }, { peel: { object: { type: 'tree', sha: cut.source } } },
     { peel: { object: { type: 'tag', sha: code } } },
-    ...[{ draft: false }, { id: 407572243 }, { tag_name: 'v0.5.0-beta.2' }, { prerelease: true }]
-      .map(change => ({ release: { id: 407572242, tag_name: tag, draft: true, prerelease: false, body: '<!-- vortx-channel: latest-beta -->', ...change } }))
-  ]) assert.notEqual(admission({}, invalid).status, 0, JSON.stringify(invalid));
+    ...[{ draft: false }, { id: Number(cut.releaseId) + 1 }, { tag_name: 'v0.5.0-beta.2' }, { prerelease: true }, { body: '' },
+      { body: 'prefix <!-- vortx-channel: latest-beta -->' }]
+      .map(change => ({ release: { id: Number(cut.releaseId), tag_name: cut.tag, draft: true, prerelease: false, body: '<!-- vortx-channel: latest-beta -->', ...change } }))
+  ]) assert.notEqual(admit({}, invalid).status, 0, JSON.stringify(invalid));
+  const withoutMarker = { release: { id: Number(cut.releaseId), tag_name: cut.tag, draft: true, prerelease: true, body: '' } };
+  assert.equal(admit({}, withoutMarker).status === 0, cut.tag === tag, 'Beta 1 keeps its prerelease contract; Beta 3 requires Latest-beta');
+  assert.equal(admit({}, { release: { id: Number(cut.releaseId), tag_name: cut.tag, draft: true, prerelease: false,
+    body: 'Release notes\r\n<!-- vortx-channel: latest-beta -->\r\n' } }).status, 0);
   const native = step('Fetch vortx-core (private monorepo, pinned)');
   const changedNative = native.replace('0c201563c6aa54eeb0545b55ad01582c0c3bcae3', code);
   assert.notEqual(changedNative, native, 'the negative fixture must actually mutate the current private-engine pin');
-  assert.notEqual(admission({}, {}, workflow.replace(native, changedNative)).status, 0);
+  assert.notEqual(admit({}, {}, workflow.replace(native, changedNative)).status, 0);
   const player = step('Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)');
   for (const changed of [player.replace('vendor-mpvkit-dvfel-3/', 'vendor-mpvkit-dvfel-4/'),
     player.replace('737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1', 'd'.repeat(64))]) {
-    assert.notEqual(admission({}, {}, workflow.replace(player, changed)).status, 0);
+    assert.notEqual(admit({}, {}, workflow.replace(player, changed)).status, 0);
   }
+});
+
+for (const cut of recoveryCuts) test(`recovered checkout accepts only clean exact ${cut.tag} source and pinned inputs`, () => fixture(dir => {
+  mkdirSync(join(dir, '.github/workflows'), { recursive: true });
+  const verify = (head = cut.source, status = '', workflowText = workflow) => {
+    writeFileSync(join(dir, '.github/workflows/release-tvos.yml'), workflowText);
+    return spawnSync('bash', ['-c', `
+git() {
+  case "$*" in
+    'rev-parse HEAD') printf '%s' "$CHECKOUT_HEAD" ;;
+    'status --porcelain') printf '%s' "$CHECKOUT_STATUS" ;;
+    *) return 88 ;;
+  esac
+}
+${script('Verify immutable recovered source checkout')}`], { cwd: dir, encoding: 'utf8', env: { ...process.env,
+      BUILD_SOURCE_SHA: cut.source, CHECKOUT_HEAD: head, CHECKOUT_STATUS: status } });
+  };
+  assert.equal(verify().status, 0);
+  assert.notEqual(verify(code).status, 0, 'wrong checkout');
+  assert.notEqual(verify(cut.source, ' M app/fixture.swift').status, 0, 'dirty checkout');
+  assert.notEqual(verify(cut.source, '', workflow.replaceAll('ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3', `ref: ${code}`)).status, 0);
+  assert.notEqual(verify(cut.source, '', workflow.replaceAll('vendor-mpvkit-dvfel-3/', 'vendor-mpvkit-dvfel-4/')).status, 0);
+}));
+
+test('only the Apple build job receives the extended CI wall-clock budget', () => {
+  const build = workflow.split('  build-tvos:\n')[1].split('  attach-release:\n')[0];
+  assert.match(build, /^    timeout-minutes: 150$/m);
+  assert.equal((workflow.match(/^    timeout-minutes: 150$/gm) ?? []).length, 1);
+  assert.match(workflow.split('  attach-release:\n')[1], /^    timeout-minutes: 35$/m);
 });
 
 test('signing precedes first native app acceptance and packaging contains no signing mutation', () => fixture(dir => {
@@ -132,21 +175,21 @@ test('verifier location is created at step runtime and exported with the exact a
     /python3 "\$NATIVE_PACKAGE_VERIFIER_DIR"\/verify-native-apple-package\.py snapshot/);
 }));
 
-test('coordinator checks the recovered verifier against GitHub workflow bytes and exact run provenance', () => fixture(dir => {
+for (const cut of recoveryCuts) test(`coordinator checks ${cut.tag} verifier against GitHub workflow bytes and exact run provenance`, () => fixture(dir => {
   mkdirSync(join(dir, 'out'));
   const verifier = 'reviewed acceptance tool bytes\n', digest = createHash('sha256').update(verifier).digest('hex');
-  const receipt = { schemaVersion: 1, sourceCommit: source, workflowCommit: code, verifierSha256: digest, tag, runId: 123, attempt: 2 };
+  const receipt = { schemaVersion: 1, sourceCommit: cut.source, workflowCommit: code, verifierSha256: digest, tag: cut.tag, runId: 123, attempt: 2 };
   const identity = script('Bind the draft release, tag commit, and monotonic source before any write');
   const prefix = identity.slice(0, identity.indexOf('\njq -e --arg tag "$TAG" --arg commit'));
   const verify = (changes = {}) => {
     writeFileSync(join(dir, 'out/native-workflow-provenance.json'), JSON.stringify({ ...receipt, ...changes }));
     return spawnSync('bash', ['-c', `
 gh() { printf '%s' '${JSON.stringify({ content: Buffer.from(verifier).toString('base64') })}'; }
-${prefix}`], { cwd: dir, encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: dir, GH_REPO: 'VortXTV/VortX', TAG: tag,
-      BUILD_SOURCE_SHA: source, BUILD_WORKFLOW_SHA: code, BUILD_RUN_ID: '123', BUILD_ATTEMPT: '2' } });
+${prefix}`], { cwd: dir, encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: dir, GH_REPO: 'VortXTV/VortX', TAG: cut.tag,
+      BUILD_SOURCE_SHA: cut.source, BUILD_WORKFLOW_SHA: code, BUILD_RUN_ID: '123', BUILD_ATTEMPT: '2' } });
   };
   const result = verify(); assert.equal(result.status, 0, result.stderr);
-  for (const change of [{ sourceCommit: code }, { workflowCommit: source }, { verifierSha256: 'd'.repeat(64) },
+  for (const change of [{ sourceCommit: code }, { workflowCommit: cut.source }, { verifierSha256: 'd'.repeat(64) },
     { tag: 'v0.5.0-beta.2' }, { runId: 124 }, { attempt: 1 }, { schemaVersion: 2 }]) {
     assert.notEqual(verify(change).status, 0, JSON.stringify(change));
   }

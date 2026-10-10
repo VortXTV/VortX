@@ -342,8 +342,11 @@ printf 'rollback-failure:%s' "$ROLLBACK_FAILURE"`], { encoding: 'utf8', env: { .
   }
 }));
 
-test('recovery resume authenticates workflow execution independently of the unchanged Beta 1 source', () => {
-  const source = '844782d29a93ae51991bfadc639d50bc3619d40b', workflowSha = 'b'.repeat(40);
+for (const cut of [
+  { source: '844782d29a93ae51991bfadc639d50bc3619d40b', tag: 'v0.5.0-beta.1', releaseId: '407572242', build: '260' },
+  { source: 'bf4aad976aa7ad21e8d77b1b13c1d2a556b5dd39', tag: 'v0.5.0-beta.3', releaseId: '408568690', build: '263' },
+]) test(`recovery resume authenticates workflow execution independently of unchanged ${cut.tag} source`, () => {
+  const source = cut.source, workflowSha = 'b'.repeat(40);
   const data = evidence();
   for (const run of [data.run, data.latest]) { run.head_sha = workflowSha; run.head_branch = 'main'; }
   for (const job of data.jobs) job.head_sha = workflowSha;
@@ -351,12 +354,16 @@ test('recovery resume authenticates workflow execution independently of the unch
   data.comparison.merge_base_commit.sha = source;
   data.workflowComparison = { status: 'ahead', merge_base_commit: { sha: workflowSha } };
   data.jobs[0].steps.push(upload('Validate immutable Beta 1 source recovery'), upload('Verify immutable recovered source checkout'));
-  const input = { ...resume, sourceCommit: source };
-  const env = { TAG: 'v0.5.0-beta.1', RELEASE_ID_INPUT: '407572242' };
+  const input = { ...resume, sourceCommit: source, build: cut.build };
+  const env = { TAG: cut.tag, RELEASE_ID_INPUT: cut.releaseId };
   const valid = provenance(data, input, env);
   assert.equal(valid.status, 0, valid.stderr);
   assert(valid.outputs.includes(`build_source_sha=${source}\n`));
   assert(valid.outputs.includes(`build_workflow_sha=${workflowSha}\n`));
+  assert(valid.outputs.includes(`expected_build=${cut.build}\n`));
+  assert(valid.outputs.includes(`build_run_id=${resume.runId}\n`));
+  assert(valid.outputs.includes(`build_attempt=${resume.attempt}\n`));
+  assert(valid.outputs.includes('build_branch=main\n'));
   for (const [name, mutate] of Object.entries({
     'unreviewed workflow': e => { e.workflowComparison.status = 'diverged'; },
     'wrong workflow ancestor': e => { e.workflowComparison.merge_base_commit.sha = source; },
@@ -364,15 +371,39 @@ test('recovery resume authenticates workflow execution independently of the unch
     'skipped recovery admission': e => { e.jobs[0].steps.at(-2).conclusion = 'skipped'; },
     'mismatched workflow artifact': e => { e.apps.workflow_run.head_sha = source; },
     'wrong job source identity': e => { e.jobs[0].head_sha = source; },
-    'arbitrary branch': e => { e.run.head_branch = 'feature'; }
+    'arbitrary branch': e => { e.run.head_branch = 'feature'; },
+    'wrong source ancestry': e => { e.comparison.merge_base_commit.sha = sha; },
+    'main advanced': e => { e.main = workflowSha; },
+    'newer attempt exists': e => { e.latest.run_attempt++; },
+    'wrong original run': e => { e.run.id++; },
+    'wrong artifact run': e => { e.feed.workflow_run.id++; },
+    'wrong artifact attempt timestamp': e => { e.apps.created_at = '2026-09-30T12:00:30Z'; },
+    'wrong artifact ID': e => { e.apps.id++; },
+    'failed build': e => { e.jobs[0].conclusion = 'failure'; },
+    'failed immutable upload': e => { e.jobs[0].steps[0].conclusion = 'failure'; },
+    'missing immutable upload': e => { e.jobs[0].steps.shift(); },
+    'wrong latest workflow': e => { e.latest.head_sha = source; },
+    'wrong workflow path': e => { e.run.path = '.github/workflows/other.yml'; },
+    'wrong repository': e => { e.run.repository.full_name = 'fork/VortX'; }
   })) {
     const bad = structuredClone(data); mutate(bad);
     const result = provenance(bad, input, env);
     assert.notEqual(result.status, 0, name);
     assert.equal(result.outputs, '', name);
   }
-  assert.notEqual(provenance(data, input, { ...env, RELEASE_ID_INPUT: '407572243' }).status, 0);
-  assert.notEqual(provenance(data, input, { ...env, TAG: tag }).status, 0);
+  for (const invalid of [
+    { RELEASE_ID_INPUT: String(Number(cut.releaseId) + 1) }, { TAG: tag },
+    { GITHUB_REF: `refs/tags/${cut.tag}` }, { GITHUB_REF: 'refs/heads/feature' },
+    { GITHUB_EVENT_NAME: 'push' }, { RECOVERY_SOURCE: source },
+    ...(cut.tag === 'v0.5.0-beta.3' ? [{ TAG: 'v0.5.0-beta.1' }, { RELEASE_ID_INPUT: '407572242' }] : []),
+  ]) {
+    const result = provenance(data, input, { ...env, ...invalid });
+    assert.notEqual(result.status, 0, JSON.stringify(invalid));
+    assert.equal(result.outputs, '');
+  }
+  const wrongSource = provenance(data, { ...input, sourceCommit: sha }, env);
+  assert.notEqual(wrongSource.status, 0);
+  assert.equal(wrongSource.outputs, '');
 });
 
 for (const [name, mutate] of Object.entries({
