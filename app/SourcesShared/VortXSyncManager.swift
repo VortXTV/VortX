@@ -5207,6 +5207,17 @@ final class VortXSyncManager: ObservableObject {
         // gate is open, and the routine catch-up below then costs one cheap version-guarded pull.
         let profileID = ProfileStore.shared.activeID
         Task {
+            #if VORTX_NATIVE_DATA_ENGINE
+            // A certified mount may fall back to the account owner when the saved profile was
+            // deleted. Keep the profile guards below, but do not strand an account's durable
+            // upload behind them after a process restart. The mutation admission also survives
+            // a remote-projection suppression turn; a plain defaults push would be dropped.
+            defer {
+                if self.isCurrent(capture), self.realtimeActive, self.nativeDurablePushPending {
+                    self.nativeMutationDidCommit(credentialCapture: capture)
+                }
+            }
+            #endif
             await self.restoreAccountDocIfNeeded(credentialCapture: capture)
             guard self.isCurrent(capture), ProfileStore.shared.activeID == profileID else { return }
             await self.syncDown(credentialCapture: capture)
