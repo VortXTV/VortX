@@ -2267,6 +2267,10 @@ struct iOSLibraryView: View {
     /// Active client-side smart filters (Unwatched / In Progress / Watched / Short); empty = no filtering.
     /// Multi-select and AND-combined; applied on top of the type segment and the engine's sort.
     @State private var activeFilters: Set<LibrarySmartFilter> = []
+    /// The overlay profile's library is derived from an unbounded watch dictionary. Keep the bounded
+    /// hero projection local to this view and refresh it from ProfileStore's published watch mutation,
+    /// instead of sorting the entire dictionary while SwiftUI evaluates every body/signature pass.
+    @State private var overlayHeroCandidates: [FeaturedHeroItem] = []
     #if !os(tvOS)
     @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
     @State private var downloadPlayer: iOSPlayerLaunch?            // play-from-local cover
@@ -2309,8 +2313,30 @@ struct iOSLibraryView: View {
     /// The hero pool: the first few saved titles. Library entries carry no backdrop field, so (like
     /// tvOS) the hero derives 16:9 art from metahub for IMDB ids and enriches the rest in the background.
     private var heroCandidates: [FeaturedHeroItem] {
-        let source = core.usesNativeProfileState || profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
-        return source.prefix(5).map(FeaturedHeroItem.from(cw:))
+        if usesOverlayLibrary {
+            return overlayHeroCandidates
+        }
+        // Native/engine library models already publish their ordered catalog. Keep this projection bounded
+        // to the visible hero pool; no overlay dictionary sort is needed on the ordinary body path.
+        return (core.library?.catalog ?? []).prefix(5).map(FeaturedHeroItem.from(cw:))
+    }
+
+    private var usesOverlayLibrary: Bool {
+        !core.usesNativeProfileState && !profiles.activeUsesEngineHistory
+    }
+
+    /// Rebuild only after an overlay watch/profile mutation. `ProfileStore.libraryItems` intentionally
+    /// retains every saved title for the grid, so this is the one bounded hero projection that is allowed
+    /// to pay its full dictionary sort cost, and only on a genuine published change.
+    @discardableResult
+    private func refreshOverlayHeroCandidates() -> [FeaturedHeroItem] {
+        guard usesOverlayLibrary else {
+            overlayHeroCandidates = []
+            return []
+        }
+        let refreshed = profiles.libraryItems.prefix(5).map(FeaturedHeroItem.from(cw:))
+        overlayHeroCandidates = refreshed
+        return refreshed
     }
 
     /// Library's hero pool is bounded to the first five saved titles. Observe that exact ordered identity
@@ -2475,11 +2501,22 @@ struct iOSLibraryView: View {
                 path.append(LibraryRoute.downloads)
             }
             #endif
+            let refreshed = refreshOverlayHeroCandidates()
             FeaturedHeroModel.configureMetaSources(core.addons)
-            hero.seed(heroCandidates, reduceMotion: reduceMotion)
+            hero.seed(usesOverlayLibrary ? refreshed : heroCandidates, reduceMotion: reduceMotion)
         }
         .onChange(of: heroCandidateSignature) { _ in
             if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        }
+        // Overlay watch is the only unbounded source here. Its @Published dictionary is the existing
+        // mutation signal; sort the full overlay once per real watch update, then keep the signature path
+        // on the five-item local projection above. Engine/native profile switches clear or replace it.
+        .onReceive(profiles.$watch) { _ in
+            _ = refreshOverlayHeroCandidates()
+        }
+        .onChange(of: profiles.activeID) { _ in
+            let refreshed = refreshOverlayHeroCandidates()
+            if isActive { hero.seed(usesOverlayLibrary ? refreshed : heroCandidates, reduceMotion: reduceMotion) }
         }
         // Addons hydrate ASYNC, after onAppear, so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
