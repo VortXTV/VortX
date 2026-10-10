@@ -7,6 +7,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.Channel as PullSignals
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.takeWhile
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -56,8 +59,7 @@ internal class VortXSyncRealtime(
         }
         val opened = next ?: return
         val worker = scope.launch(start = CoroutineStart.LAZY) {
-            for (ignored in opened.requests) {
-                if (!current(opened)) break
+            opened.requests.receiveAsFlow().takeWhile { current(opened) }.collect {
                 manager.syncDownForRealtime(opened.lease)
             }
         }
