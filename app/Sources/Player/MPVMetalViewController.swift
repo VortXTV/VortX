@@ -11,6 +11,22 @@ import Libmpv
 import AVFoundation
 import os
 
+/// Own the native representation until load admission settles. In particular, lavf option maps cannot
+/// round-trip arbitrary comma-bearing values through mpv's human-readable string serializer.
+private final class MPVPlaybackProfileOption {
+    private var node = mpv_node()
+
+    init?(handle: OpaquePointer, name: String) {
+        guard mpv_get_property(handle, name, MPV_FORMAT_NODE, &node) >= 0 else { return nil }
+    }
+
+    func restore(handle: OpaquePointer, name: String) -> Int32 {
+        mpv_set_property(handle, name, MPV_FORMAT_NODE, &node)
+    }
+
+    deinit { mpv_free_node_contents(&node) }
+}
+
 // The player view controller is UIViewController on iOS/tvOS and NSViewController on macOS. iOS/tvOS
 // resolve PlatformViewController to UIViewController, so their compiled code is unchanged.
 #if canImport(UIKit)
@@ -1531,6 +1547,15 @@ final class MPVMetalViewController: PlatformViewController {
             }
             return issuedToken
         }
+        // Capture exact native values before any replacement mutations. If a read fails, the fresh token
+        // remains unadmitted and the outgoing profile stays intact, even if that option is still writable.
+        guard let priorPlaybackProfile = MPVPlaybackProfileSnapshot(
+            configuredLiveMode: configuredLiveMode,
+            read: { name in mpv.flatMap { MPVPlaybackProfileOption(handle: $0, name: name) } }
+        ) else {
+            DiagnosticsLog.log("player", "loadfile refused: playback profile snapshot unavailable")
+            return issuedToken
+        }
         // Header-admission transaction begins before mutating the still-owned source's state.
         // Per-stream HTTP headers (behaviorHints.proxyHeaders): some add-ons front CDNs that
         // require a specific Referer or a browser User-Agent; without them the server rejects
@@ -1773,8 +1798,6 @@ final class MPVMetalViewController: PlatformViewController {
         mpvLog.log("loadFile → \(redactedURL, privacy: .public)\(sidecar != nil ? " (+audio sidecar)" : "", privacy: .public)")
         // Apply before load admission so the first frame cannot outrun the NNTP cushion. A rejected
         // replacement restores the prior profile, including an outstanding manual-seek hold.
-        let priorCachePauseInitial = getString("cache-pause-initial") ?? "no"
-        let priorCachePauseWait = getString("cache-pause-wait") ?? "1"
         let nextCachePauseWait = LocalNNTPBufferPolicy.waitSeconds(url: playURL, live: live, preview: startMuted)
         setString("cache-pause-initial", nextCachePauseWait > 1 ? "yes" : "no")
         setString("cache-pause-wait", String(nextCachePauseWait))
@@ -1867,10 +1890,13 @@ final class MPVMetalViewController: PlatformViewController {
                 DiagnosticsLog.log("player", "local NNTP startup/rebuffer cushion=\(Int(nextCachePauseWait))s; memory cap unchanged")
             }
         } else {
-            // Rejected replace: preserve the previous source's cache budget. The request already
-            // canceled maintenance and restored its temporary option before attempting replacement.
-            setString("cache-pause-initial", priorCachePauseInitial)
-            setString("cache-pause-wait", priorCachePauseWait)
+            // Rejected replace: restore the previous source's exact profile and cache budget. The request
+            // already canceled maintenance and restored its temporary option before attempting replacement;
+            // the mode flag must follow the native properties so the next load is not short-circuited.
+            configuredLiveMode = priorPlaybackProfile.configuredLiveMode
+            priorPlaybackProfile.restore { name, value in
+                if let mpv { checkError(value.restore(handle: mpv, name: name)) }
+            }
         }
         return issuedToken
     }

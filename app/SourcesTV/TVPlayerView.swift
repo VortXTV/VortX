@@ -6714,9 +6714,27 @@ struct TVPlayerView: View {
             DiagnosticsLog.log("playback", "fallback attempt=\(handoff.attemptID) stage=teardown outcome=ack next=mpv-mount")
             let mounted = await awaitReplacementMPVMount(for: handoff)
             guard !Task.isCancelled,
-                  let mounted else { return }
+                  !leftPlayback,
+                  avToMPVHandoff == nil,
+                  !avToMPVHandoffBlocked,
+                  handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.sourceGeneration == sourceSwitchGeneration,
+                  handoff.resumeGeneration == resumeRetryGeneration,
+                  handoff.url == (curURL ?? url),
+                  let mounted,
+                  coordinator.player === mounted.controller else { return }
             let mpv = mounted.controller
             let mpvToken = mounted.token
+            guard mpv.activeLoadToken == mpvToken else {
+                avToMPVHandoffBlocked = true
+                loadErrorMsg = "The replacement player did not start."
+                presentTerminalLoadFailure()
+                return
+            }
+            adoptResumeSurfaceIfCurrent(loadToken: mpvToken)
+            // Read the current selection at the admitted continuation, not when teardown began; a speed
+            // change during the AV handoff must win and a failed/superseded mount must remain inert.
+            mpv.setSpeed(playSpeed)
             if let recovery = directAVNoFrameRecovery,
                recovery.url == handoff.url,
                recovery.episodeGeneration == handoff.episodeGeneration,
@@ -6730,13 +6748,6 @@ struct TVPlayerView: View {
                     attemptID: recovery.attemptID,
                     mpvLoadToken: mpvToken)
             }
-            guard mpv.activeLoadToken == mpvToken else {
-                avToMPVHandoffBlocked = true
-                loadErrorMsg = "The replacement player did not start."
-                presentTerminalLoadFailure()
-                return
-            }
-            adoptResumeSurfaceIfCurrent(loadToken: mpvToken)
             if followedDeadInput {
                 startLoadTimeout(seconds: avPostDemoteStartTimeoutSeconds)
             } else if followedDirectNoFrame {

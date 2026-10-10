@@ -4,6 +4,25 @@ import AppKit
 #endif
 #if os(iOS)
 import AVKit   // AVRoutePickerView (in-player AirPlay button)
+import UIKit
+#endif
+
+#if os(iOS)
+/// `UIApplication.isIdleTimerDisabled` is process-wide. A late SwiftUI disappearance from an older
+/// presentation may release only its own owner, never a newer player's keep-awake lease.
+@MainActor private enum IOSPlaybackIdleTimer {
+    static var lease = PlaybackIdleTimerLease<UUID>()
+
+    static func claim(_ owner: UUID) { lease.claim(owner) }
+    static func update(_ owner: UUID, preventIdle: Bool) {
+        guard lease.owns(owner) else { return }
+        UIApplication.shared.isIdleTimerDisabled = preventIdle
+    }
+    static func release(_ owner: UUID) {
+        guard lease.release(owner) else { return }
+        UIApplication.shared.isIdleTimerDisabled = false
+    }
+}
 #endif
 
 /// Full-screen native libmpv player for iOS / Mac, brought to parity with the tvOS `TVPlayerView`:
@@ -1732,6 +1751,9 @@ struct PlayerScreen: View {
     /// (source hop / demote / retry) keeps it unchanged, so the scrobble coordinator's once-latches survive
     /// and a completion recorded before the reload is never re-sent.
     @State private var playbackSessionID = UUID().uuidString
+#if os(iOS)
+    @State private var playbackIdleTimerOwner = UUID()
+#endif
     /// Latest mpv "seekable" flag. Defaults true so a VOD is never mis-flagged live before mpv reports;
     /// only consulted by `effectivelyLive` AFTER `hasStartedPlaying`. A true live feed stays false.
     @State private var isSeekable = true
@@ -2313,7 +2335,8 @@ struct PlayerScreen: View {
             hydrateDirectResumeMetadataForPlayerUI()
             hydrateDirectResumeSeriesInventory()
             #if os(iOS)
-            UIApplication.shared.isIdleTimerDisabled = true   // hold the screen awake while the player is open (parity with tvOS)
+            IOSPlaybackIdleTimer.claim(playbackIdleTimerOwner)
+            IOSPlaybackIdleTimer.update(playbackIdleTimerOwner, preventIdle: true) // hold the screen awake while the player is open (parity with tvOS)
             if !isTrailer { PlayerOrientation.forceLandscape() }   // rotate to landscape as the stream opens, even under rotation lock
             #elseif os(macOS)
             // macOS has no idle-timer API; hold a display-sleep assertion so the Mac doesn't dim/sleep
@@ -2360,7 +2383,7 @@ struct PlayerScreen: View {
             }
             NowPlayingCenter.clear()   // drop the Lock Screen / Control Center now-playing on close
             #if os(iOS)
-            UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
+            IOSPlaybackIdleTimer.release(playbackIdleTimerOwner)
             PlayerOrientation.release()                       // hand orientation back to the user's rotation lock
             #elseif os(macOS)
             if let token = macSleepActivity { ProcessInfo.processInfo.endActivity(token); macSleepActivity = nil }
@@ -5797,9 +5820,22 @@ struct PlayerScreen: View {
             }
             let mounted = await awaitReplacementMPVMount(for: handoff)
             guard !Task.isCancelled,
-                  let mpv = mounted?.controller,
-                  mpv.activeLoadToken == mounted?.token else { return }
-            if let token = mounted?.token { adoptResumeSurfaceIfCurrent(loadToken: token) }
+                  !playbackExited,
+                  avToMPVHandoff == nil,
+                  !avToMPVHandoffBlocked,
+                  handoff.episodeGeneration == episodeSwitchGeneration,
+                  handoff.sourceGeneration == sourceSwitchGeneration,
+                  handoff.resumeGeneration == resumeRetryGeneration,
+                  handoff.url == (curURL ?? url),
+                  let mounted,
+                  coordinator.player === mounted.controller,
+                  mounted.controller.activeLoadToken == mounted.token else { return }
+            let mpv = mounted.controller
+            let token = mounted.token
+            adoptResumeSurfaceIfCurrent(loadToken: token)
+            // The selected rate is live SwiftUI state. Apply it only after this exact handoff has admitted
+            // its mounted controller and token, before any watchdog or resume work can advance the new mount.
+            mpv.setSpeed(speed)
             if let recovery = directAVNoFrameRecovery,
                recovery.url == handoff.url,
                recovery.episodeGeneration == handoff.episodeGeneration,
@@ -5811,7 +5847,7 @@ struct PlayerScreen: View {
                     sourceGeneration: recovery.sourceGeneration,
                     resumeGeneration: recovery.resumeGeneration,
                     attemptID: recovery.attemptID,
-                    mpvLoadToken: mounted?.token)
+                    mpvLoadToken: token)
             }
             DiagnosticsLog.log(
                 "playback",

@@ -146,6 +146,32 @@ struct PlaybackIdleTimerLease<Owner: Equatable> {
     }
 }
 
+/// The runtime options that `MPVMetalViewController.configureLiveMode` changes before issuing a
+/// `loadfile` command. A rejected command must put the still-playing source back exactly where it was;
+/// in particular, `demuxer-max-back-bytes` may already be reduced by a real memory shed and must not be
+/// reconstructed from the normal VOD profile.
+struct MPVPlaybackProfileSnapshot<Value> {
+    let configuredLiveMode: Bool
+    private let values: [(name: String, value: Value)]
+
+    init?(configuredLiveMode: Bool, read: (String) -> Value?) {
+        self.configuredLiveMode = configuredLiveMode
+        var values: [(name: String, value: Value)] = []
+        for name in ["demuxer-readahead-secs", "demuxer-max-back-bytes", "demuxer-lavf-o",
+                     "stream-lavf-o", "cache-pause-initial", "cache-pause-wait"] {
+            // A failed native read does not imply that a write would also fail. Refuse preparation before
+            // any profile mutation if even one prior value cannot be restored.
+            guard let value = read(name) else { return nil }
+            values.append((name, value))
+        }
+        self.values = values
+    }
+
+    func restore(using set: (String, Value) -> Void) {
+        for (name, value) in values { set(name, value) }
+    }
+}
+
 /// Exact ownership for work that resolves an episode before a player command has been admitted.
 /// The owner includes every mutable selector that can supersede an in-flight resolve.
 struct EpisodeResolutionOwner: Equatable, Sendable {
