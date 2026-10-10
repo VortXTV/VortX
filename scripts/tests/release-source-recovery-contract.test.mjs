@@ -68,7 +68,9 @@ test('actual recovery admission accepts exactly the main-only immutable cut and 
       .map(change => ({ release: { id: 407572242, tag_name: tag, draft: true, prerelease: false, body: '<!-- vortx-channel: latest-beta -->', ...change } }))
   ]) assert.notEqual(admission({}, invalid).status, 0, JSON.stringify(invalid));
   const native = step('Fetch vortx-core (private monorepo, pinned)');
-  assert.notEqual(admission({}, {}, workflow.replace(native, native.replace('7e3e68be5bf2b11c65d158c1823be94bd1608d1b', code))).status, 0);
+  const changedNative = native.replace('0c201563c6aa54eeb0545b55ad01582c0c3bcae3', code);
+  assert.notEqual(changedNative, native, 'the negative fixture must actually mutate the current private-engine pin');
+  assert.notEqual(admission({}, {}, workflow.replace(native, changedNative)).status, 0);
   const player = step('Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)');
   for (const changed of [player.replace('vendor-mpvkit-dvfel-3/', 'vendor-mpvkit-dvfel-4/'),
     player.replace('737073f587b4d78c0436d3dc08c40bfab72b26e3d3a3ac3eab11a7a3a1c288d1', 'd'.repeat(64))]) {
@@ -102,7 +104,7 @@ test('recovery preserves only the verifier outside the source checkout and retai
   assert.match(step('Verify immutable recovered source checkout'), /git status --porcelain/);
   assert.match(workflow, /environment: engine-ci/);
   assert.match(workflow, /environment: release-approval/);
-  assert.match(step('Fetch vortx-core (private monorepo, pinned)'), /ref: 7e3e68be5bf2b11c65d158c1823be94bd1608d1b/);
+  assert.match(step('Fetch vortx-core (private monorepo, pinned)'), /ref: 0c201563c6aa54eeb0545b55ad01582c0c3bcae3/);
   assert.match(step('Fetch the MPVKit-DVFEL artifacts (pinned, sha256-verified)'), /vendor-mpvkit-dvfel-3\/mpvkit-dvfel-artifacts-http-seek-20261009.zip/);
   assert.match(step('Build the content-addressed release feed artifact'), /--source-commit "\$BUILD_SOURCE_SHA"/);
   assert.doesNotMatch(step('Build the content-addressed release feed artifact'), /\$GITHUB_SHA/);

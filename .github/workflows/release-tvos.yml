@@ -528,6 +528,20 @@ jobs:
           rustup component add llvm-tools-preview 2>/dev/null || true
           ./scripts/verify-apple-engine-artifacts.sh
 
+      - name: Verify native account and episode ABI against the reviewed engine
+        if: env.VORTX_NATIVE_ONLY == 'true'
+        run: |
+          set -euo pipefail
+          # Exercise the real C/Swift boundary with synthetic local account data only.
+          # This remains a strict disk-backed checkpoint gate, including Complete file
+          # protection; an unavailable protection class fails rather than weakening it.
+          MACOSX_DEPLOYMENT_TARGET=14.0 cargo +nightly-2026-07-19 build --locked \
+            --manifest-path vortx-core/Cargo.toml -p vortx-ffi \
+            --no-default-features --features resource-host --release --target aarch64-apple-darwin
+          VORTX_FFI_HEADER="$PWD/app/Vendor/VortxEngine.xcframework/macos-arm64/Headers/vortx/vortx_ffi.h" \
+            VORTX_FFI_LIBRARY="$PWD/vortx-core/target/aarch64-apple-darwin/release/libvortx_ffi.dylib" \
+            bash scripts/test-native-cutover-live-abi.sh
+
       # The self-built player stack. `app/Vendor/MPVKit-DVFEL/artifacts/` is gitignored and reproducing it
       # needs a multi-hour nine-slice source build, so CI fetches the prebuilt xcframeworks the same way it
       # fetches NodeMobile. Beta 9's release run failed without this: SwiftPM reported "does not contain a
