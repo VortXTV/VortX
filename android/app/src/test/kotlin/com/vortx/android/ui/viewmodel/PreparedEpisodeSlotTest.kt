@@ -41,6 +41,7 @@ class PreparedEpisodeSlotTest {
         var adopted = false
         var resolveAction: suspend () -> Playable = {
             Playable("https://fixture.invalid/video", "Prepared", startPositionMs = 999,
+                headers = mapOf("X-Fixture" to "prepared"), externalSubtitles = listOf("https://fixture.invalid/subtitle.vtt"),
                 playbackLease = AutoCloseable { leaseCloses++ })
         }
         override fun isCurrent() = current
@@ -78,7 +79,7 @@ class PreparedEpisodeSlotTest {
             val outer = coordinator.replaceOuterSession()
             val pendingState = beginPlayerEpisodeSwitch(PlayerSourceSwitchState(outer,
                 Playable("https://fixture.invalid/old", "Old", playbackLease = AutoCloseable { outgoingCloses++ }), null),
-                Episode("episode-2", "Second", 1, 2), requireNotNull(coordinator.beginRequest(outer)))
+                Episode("episode-2", "Second", 1, 2), requireNotNull(coordinator.beginRequest(outer)), automatic)
             var host = pendingState
             val resolution = preparedEpisodeHandoff(claim.episode, commitGate = PlayerSourceSwitchCommitGate(),
                 isCurrent = { slot.accepts(ticket) }, install = { installedGroups = it }, rollback = {})
@@ -91,6 +92,9 @@ class PreparedEpisodeSlotTest {
                 })
             assertEquals(1L, host.revision)
             assertEquals(0L, host.playable.startPositionMs)
+            assertEquals(automatic, requireNotNull(pendingState.pendingEpisodeSwitch).automatic)
+            assertEquals(mapOf("X-Fixture" to "prepared"), host.playable.headers)
+            assertEquals(listOf("https://fixture.invalid/subtitle.vtt"), host.playable.externalSubtitles)
             assertEquals(1, history)
             assertEquals(preparation.groups, installedGroups)
             assertEquals(1, preparation.fetches)
@@ -101,6 +105,42 @@ class PreparedEpisodeSlotTest {
             host.playable.playbackLease!!.close()
             assertEquals(1, preparation.leaseCloses)
         }
+    }
+
+    @Test fun claimedPreparationExpiresBeforeHostAcceptanceAndDiscardsOnceWithoutHistoryChange() = runBlocking {
+        var now = 0L
+        val slot = PreparedEpisodeSlot<Long>({ true }, nowMs = { now }, freshnessMs = 100)
+        val preparation = Preparation()
+        val ticket = slot.begin(1)
+        assertTrue(slot.prepare(ticket, "episode-2", preparation, { it.first().streams.first() }))
+        val claim = requireNotNull(slot.claim("episode-2"))
+        var installs = 0
+        var history = 0
+        var outgoingCloses = 0
+        val resolution = preparedEpisodeHandoff(claim.episode, commitGate = PlayerSourceSwitchCommitGate(),
+            isCurrent = { slot.accepts(ticket) }, install = { installs++ }, rollback = {})
+        val coordinator = PlayerSourceSwitchCoordinator()
+        val outer = coordinator.replaceOuterSession()
+        val outgoing = Playable("https://fixture.invalid/old", "Old", startPositionMs = 900,
+            playbackLease = AutoCloseable { outgoingCloses++ })
+        var host = beginPlayerEpisodeSwitch(PlayerSourceSwitchState(outer, outgoing, null),
+            Episode("episode-2", "Second", 1, 2), requireNotNull(coordinator.beginRequest(outer)), automatic = true)
+        now = 100L
+        resolveAndApplyPlayerEpisodeSwitch(coordinator, requireNotNull(host.pendingEpisodeSwitch),
+            resolver = { Result.success(resolution) }, currentState = { host }, publishState = { accepted, acknowledge ->
+                val previous = host
+                host = accepted
+                acknowledge()
+                if (acceptedEpisodeReplacement(previous, accepted) != null) history++
+            })
+        resolution.discard(); claim.episode.close(); slot.invalidate()
+        assertSame(outgoing, host.playable)
+        assertEquals(0L, host.revision)
+        assertEquals(0, installs)
+        assertEquals(0, history)
+        assertEquals(0, outgoingCloses)
+        assertEquals(1, preparation.leaseCloses)
+        assertEquals(1, preparation.closes)
     }
 
     @Test fun rejectedPreparedHandoffRetainsOutgoingAndClosesItsOwnLeaseOnce() = runBlocking {

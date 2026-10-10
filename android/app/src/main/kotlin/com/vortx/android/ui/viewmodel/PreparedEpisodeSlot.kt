@@ -95,13 +95,15 @@ internal class PreparedEpisodeSlot<C : Any>(
     private var generation = 0L
     private var active: Ticket<C>? = null
     private var ready: PreparedEpisode? = null
-    private var readyAt = 0L
+    // Retained through claim: a delayed host must not adopt a value after its freshness window.
+    private var readyAt: Long? = null
 
     @Synchronized fun invalidate() {
         generation++
         active = null
         val previous = ready
         ready = null
+        readyAt = null
         previous?.let { runCatching { it.close() } }
     }
 
@@ -111,11 +113,12 @@ internal class PreparedEpisodeSlot<C : Any>(
     }
 
     @Synchronized fun accepts(ticket: Ticket<C>): Boolean =
-        active === ticket && isAuthorityCurrent(ticket.capture)
+        active === ticket && isAuthorityCurrent(ticket.capture) &&
+            (readyAt?.let { nowMs() - it < freshnessMs } != false)
 
     @Synchronized fun hasReady(episodeId: String): Boolean {
         val value = ready ?: return false
-        if (active?.let(::accepts) != true || !value.preparation.isCurrent() || nowMs() - readyAt >= freshnessMs) {
+        if (active?.let(::accepts) != true || !value.preparation.isCurrent()) {
             invalidate()
             return false
         }
