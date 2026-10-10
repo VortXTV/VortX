@@ -19,4 +19,4 @@ xcrun swiftc -parse-as-library -strict-concurrency=complete -warnings-as-errors 
   app/SourcesShared/NextEpisodePreparationWork.swift app/SourcesTV/NextEpisodePreloadPolicy.swift \
   app/Tests/NextEpisodePreloadPolicyTests.swift -o "$episode_test_dir/preload"
 "$episode_test_dir/preload"
-xcrun swiftc -frontend -parse app/SourcesTV/TVPlayerView.swift app/SourcesTV/TVEpisodePanel.swift app/SourcesiOS/iOSDetailView.swift app/SourcesiOS/iOSNextEpisodePreparer.swift app/Sources/PlayerScreen.swift
+xcrun swiftc -frontend -parse app/SourcesTV/TVPlayerView.swift app/SourcesTV/TVEpisodePanel.swift app/SourcesiOS/iOSDetailView.swift app/SourcesiOS/iOSNextEpisodePreparer.swift app/SourcesiOS/iOSRootView.swift app/Sources/PlayerScreen.swift

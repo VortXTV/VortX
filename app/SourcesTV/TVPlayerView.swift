@@ -4867,7 +4867,7 @@ struct TVPlayerView: View {
                 }
                 guard let groups = await EpisodeSourceCollection.collect(seriesID: m.libraryId, videoID: m.videoId,
                     season: m.season, episode: m.episode, title: m.name,
-                    sources: owner.sources(for: m.videoId), wantedAddon: choice.addon, deadline: deadline,
+                    providers: owner.providers(seriesID: m.libraryId, videoID: m.videoId), wantedAddon: choice.addon, deadline: deadline,
                     isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
                 retainEpisodeSources(groups, videoID: m.videoId, owner: owner)
                 refinding = false
@@ -9015,7 +9015,7 @@ struct TVPlayerView: View {
                 }
                 guard let groups = await EpisodeSourceCollection.collect(seriesID: current.libraryId, videoID: current.videoId,
                     season: current.season, episode: current.episode, title: current.name,
-                    sources: owner.sources(for: current.videoId), wantedAddon: choice.addon, deadline: deadline,
+                    providers: owner.providers(seriesID: current.libraryId, videoID: current.videoId), wantedAddon: choice.addon, deadline: deadline,
                     isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
                 if !groups.isEmpty { retainEpisodeSources(groups, videoID: current.videoId, owner: owner) }
             }
@@ -9868,7 +9868,7 @@ struct TVPlayerView: View {
                 }
                 if let groups = await EpisodeSourceCollection.collect(seriesID: m.libraryId, videoID: v.id,
                     season: v.season, episode: v.episode, title: m.name,
-                    sources: sourceOwner.sources(for: v.id), wantedAddon: choice?.addon,
+                    providers: sourceOwner.providers(seriesID: m.libraryId, videoID: v.id), wantedAddon: choice?.addon,
                     deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
                     isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: preparedSourcesCurrent),
                    preparedSourcesCurrent(), !groups.isEmpty {
@@ -9892,7 +9892,7 @@ struct TVPlayerView: View {
             let wantedAddon = choice?.addon
             guard let groups = await EpisodeSourceCollection.collect(seriesID: m.libraryId, videoID: v.id,
                 season: v.season, episode: v.episode, title: m.name,
-                sources: sourceOwner.sources(for: v.id), wantedAddon: wantedAddon,
+                providers: sourceOwner.providers(seriesID: m.libraryId, videoID: v.id), wantedAddon: wantedAddon,
                 deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
                 isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
             retainEpisodeSources(groups, videoID: v.id, owner: sourceOwner)
@@ -10163,7 +10163,7 @@ struct TVPlayerView: View {
             now: ProcessInfo.processInfo.systemUptime
         ) else { return }
 
-        let sources = sourceOwner.sources(for: next.id)
+        let providers = sourceOwner.providers(seriesID: (curMeta ?? meta)?.libraryId, videoID: next.id)
         // Snapshot the main-actor @State continuity hints here (on the main actor) so the background
         // Task never reads them off-main; the heavy fetch + ranking stays off-main and only the @State
         // writes hop back to the main actor.
@@ -10205,14 +10205,14 @@ struct TVPlayerView: View {
             publicationTarget: mediaTarget
         )
         let episodeToken = VXProbeRedaction.identityToken(next.id)
-        plog.info("preloading next episode \(episodeToken, privacy: .public) from \(sources.count, privacy: .public) add-ons")
+        plog.info("preloading next episode \(episodeToken, privacy: .public) from \(providers.count, privacy: .public) add-ons")
         // `evaluate` can preempt a timed-out or halfway owner for a credits attempt. Cancel that owner before
         // replacing its task so its URLSession and debrid work do not continue in parallel.
         preloadTask?.cancel()
         preloadTask = Task(priority: .utility) { @MainActor in
             guard sourceOwner.isCurrent, SeriesSourceSticky.admits(choice), preloadPolicy.accepts(attempt) else { return }
             async let rawGroups = Self.fetchPreloadSourceGroups(
-                sources: sources,
+                providers: providers,
                 attemptSequence: attempt.sequence,
                 episodeID: nextID,
                 wantedAddonName: sticky?.addon,
@@ -10380,13 +10380,13 @@ struct TVPlayerView: View {
     /// Fetch every account add-on inside one bounded attempt. Per-provider terminal nil results still advance
     /// the sliding window, while a whole-batch timeout returns the completed subset for deadline settlement.
     private nonisolated static func fetchPreloadSourceGroups(
-        sources: [StreamSource],
+        providers: [EpisodeSourceProvider],
         attemptSequence: Int,
         episodeID: String,
         wantedAddonName: String?,
         deadline: TimeInterval
     ) async -> [CoreStreamSourceGroup] {
-        await EpisodeSourceCollection.rawGroups(sources: sources, episodeID: episodeID,
+        await EpisodeSourceCollection.rawGroups(providers: providers, episodeID: episodeID,
             wantedAddon: wantedAddonName, deadline: deadline, attemptSequence: attemptSequence)
     }
 

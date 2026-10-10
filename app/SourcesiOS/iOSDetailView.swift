@@ -52,6 +52,15 @@ func warmFetchEpisodeSourceGroups(
         wantedAddon: wantedAddon, deadline: request.deadline, attemptSequence: request.attemptSequence)
 }
 
+func warmFetchEpisodeSourceGroups(
+    providers: [EpisodeSourceProvider],
+    request: NextEpisodePreparationRequest,
+    wantedAddon: String?
+) async -> [CoreStreamSourceGroup] {
+    await EpisodeSourceCollection.rawGroups(providers: providers, episodeID: request.episodeID,
+        wantedAddon: wantedAddon, deadline: request.deadline, attemptSequence: request.attemptSequence)
+}
+
 /// Retire one raw-torrent preparation exactly once. A season-pack request can point at the hash already
 /// feeding the current episode; that engine remains under the ordinary player lifecycle and must not be
 /// removed by a canceled E+1 preload.
@@ -172,7 +181,7 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
     }
     guard let groups = await EpisodeSourceCollection.collect(seriesID: seriesId, videoID: v.id,
         season: v.season ?? defaultSeason, episode: v.episode, title: seriesName,
-        sources: sourceOwner.sources(for: v.id), wantedAddon: wantedAddon,
+        providers: sourceOwner.providers(seriesID: seriesId, videoID: v.id), wantedAddon: wantedAddon,
         deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
         isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
@@ -5795,7 +5804,7 @@ struct iOSEpisodeStreams: View {
         guard let groups = await EpisodeSourceCollection.collect(seriesID: meta.id, videoID: v.id,
             season: v.season ?? season, episode: v.episode, title: meta.name,
             defaultVideoID: meta.behaviorHints?.defaultVideoId,
-            sources: sourceOwner.sources(for: v.id), wantedAddon: wantedAddon,
+            providers: sourceOwner.providers(seriesID: meta.id, videoID: v.id), wantedAddon: wantedAddon,
             deadline: resolutionBudget.startedAt + SourceSettlementPolicy.maximumWait,
             isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
         // Next / Prev / list / binge preserve the chosen release when present. Keep the full filtered

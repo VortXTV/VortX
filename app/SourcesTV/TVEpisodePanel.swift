@@ -179,7 +179,7 @@ func tvResolveEpisodeRequest(video v: CoreVideo, in episodes: [CoreVideo], serie
     }
     guard let groups = await EpisodeSourceCollection.collect(seriesID: seriesId, videoID: v.id,
         season: v.season, episode: v.episode, title: seriesName,
-        sources: owner.sources(for: v.id), wantedAddon: choice.addon,
+        providers: owner.providers(seriesID: seriesId, videoID: v.id), wantedAddon: choice.addon,
         deadline: budget.startedAt + SourceSettlementPolicy.maximumWait,
         isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return nil }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))

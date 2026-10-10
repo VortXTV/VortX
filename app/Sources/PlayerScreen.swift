@@ -10249,7 +10249,7 @@ struct PlayerScreen: View {
             }
             guard let groups = await EpisodeSourceCollection.collect(seriesID: target.libraryId, videoID: target.videoId,
                 season: target.season, episode: target.episode, title: target.name,
-                sources: owner.sources(for: target.videoId), wantedAddon: choice.addon, deadline: deadline,
+                providers: owner.providers(seriesID: target.libraryId, videoID: target.videoId), wantedAddon: choice.addon, deadline: deadline,
                 isSignedIn: VortXSyncManager.shared.isSignedIn, isCurrent: admitted), admitted() else { return }
             // Preserve a prepared winner if alternatives are unavailable; never clear a usable selected row.
             if !groups.isEmpty { retainEpisodeSources(groups, videoID: target.videoId, owner: owner) }

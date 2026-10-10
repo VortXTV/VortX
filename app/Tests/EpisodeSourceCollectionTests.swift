@@ -1,7 +1,28 @@
 import Foundation
 
 // Provider/host seams only. The collector, deadline/pool and ordering under test are production source.
-struct CoreStream: Codable, Equatable, Sendable { let id: String; var isTorrent = false }
+struct CoreStream: Decodable, Equatable, Sendable {
+    let id: String
+    var isTorrent = false
+    var url: String?
+    var requestHeaders: [String: String]?
+    enum CodingKeys: String, CodingKey { case id, isTorrent, url, infoHash, behaviorHints }
+    struct BehaviorHints: Decodable {
+        struct ProxyHeaders: Decodable { let request: [String: String]? }
+        let proxyHeaders: ProxyHeaders?
+    }
+    init(id: String, isTorrent: Bool = false, url: String? = nil, requestHeaders: [String: String]? = nil) {
+        self.id = id; self.isTorrent = isTorrent; self.url = url; self.requestHeaders = requestHeaders
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        url = try c.decodeIfPresent(String.self, forKey: .url)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? url ?? ""
+        isTorrent = try c.decodeIfPresent(Bool.self, forKey: .isTorrent)
+            ?? (url == nil && c.decodeIfPresent(String.self, forKey: .infoHash) != nil)
+        requestHeaders = try c.decodeIfPresent(BehaviorHints.self, forKey: .behaviorHints)?.proxyHeaders?.request
+    }
+}
 struct CoreStreamSourceGroup: Equatable, Sendable { let id: String; let addon: String; let streams: [CoreStream] }
 struct StreamSource: Equatable, Sendable { let base: String; let name: String }
 enum PlaybackSettings { nonisolated(unsafe) static var directLinksOnly = false }
@@ -12,7 +33,14 @@ final class CredentialScopeRegistry: Sendable {
     func capture() -> Int { 1 }
     func isCurrent(_ capture: Int) -> Bool { capture == 1 }
 }
-@MainActor final class StremioAccount { var credentialBoundaryGeneration: UInt64 = 0; var streamSources: [StreamSource] = [] }
+struct AddonResource: Decodable { let name: String; let types: [String]?; let idPrefixes: [String]? }
+struct AddonManifest: Decodable { let id: String; let name: String; let types: [String]?; let idPrefixes: [String]?; let resources: [AddonResource] }
+struct AddonDescriptor: Decodable { let transportUrl: String; let manifest: AddonManifest }
+@MainActor final class StremioAccount {
+    var credentialBoundaryGeneration: UInt64 = 0
+    var streamSources: [StreamSource] = []
+    var addons: [AddonDescriptor] = []
+}
 @MainActor final class CoreBridge {
     static let shared = CoreBridge()
     var registryData: Data?
@@ -68,6 +96,62 @@ actor FetchProbe {
         guard source.name != "failure" else { return nil }
         return .init(id: source.base, addon: source.name, streams: [.init(id: episode)])
     }
+}
+
+/// The real collector's URLSession and response decoder run against these wire fixtures. Held callbacks
+/// remain pending through a registry edit so owner rejection is exercised after an actual metadata reply.
+final class EpisodeFixtureState: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var payloads: [String: Data] = [:]
+    private var held: Set<String> = []
+    private var requests: [URLRequest] = []
+    private var active = 0, peak = 0
+    func configure(_ payloads: [String: String], held: Set<String> = []) {
+        condition.lock(); defer { condition.unlock() }
+        self.payloads = payloads.mapValues { Data($0.utf8) }; self.held = held
+        requests = []; active = 0; peak = 0
+    }
+    func reply(_ request: URLRequest) -> Data? {
+        condition.lock(); defer { active -= 1; condition.unlock() }
+        active += 1; peak = max(peak, active); requests.append(request)
+        let path = request.url!.path
+        while held.contains(path) { condition.wait() }
+        return payloads[path]
+    }
+    func release(_ path: String) { condition.lock(); held.remove(path); condition.broadcast(); condition.unlock() }
+    var snapshot: (requests: [URLRequest], peak: Int, active: Int) {
+        condition.lock(); defer { condition.unlock() }; return (requests, peak, active)
+    }
+    func awaitRequest(_ path: String) async {
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while !snapshot.requests.contains(where: { $0.url?.path == path }) {
+            precondition(ProcessInfo.processInfo.systemUptime < deadline, "fixture metadata request never started")
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+    }
+    func awaitIdle() async {
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while snapshot.active != 0 {
+            precondition(ProcessInfo.processInfo.systemUptime < deadline, "fixture response never retired")
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+    }
+}
+final class EpisodeFixtureProtocol: URLProtocol, @unchecked Sendable {
+    static let state = EpisodeFixtureState()
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "episode.fixture" }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        DispatchQueue.global().async { [self] in
+            let body = Self.state.reply(request)
+            let response = HTTPURLResponse(url: request.url!, statusCode: body == nil ? 404 : 200,
+                                           httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if let body { client?.urlProtocol(self, didLoad: body) }
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+    override func stopLoading() {}
 }
 @main enum EpisodeSourceCollectionTests {
     @MainActor static func main() async {
@@ -167,8 +251,11 @@ actor FetchProbe {
         check(partialInventory.sources(for: "tt123:1:8") == inventory.sources(for: "tt123:1:8"), "malformed descriptor fails closed per provider without losing valid registry peers")
         check(inventory.sources(for: "tt123:1:8").map(\.name) == ["first", "override", "inherit", "all"], "native resource/type/prefix eligibility preserves exact registry order")
         check(inventory.sources(for: "other").map(\.name) == ["all"], "explicit empty resource prefix overrides manifest constraint")
+        check(inventory.providers(seriesID: "tt123", videoID: "tt123:1:8").map(\.source.name)
+            == ["first", "override", "inherit", "meta", "all"], "metadata capability joins registry order without weakening stream-only eligibility")
         let url = EpisodeSourceCollection.resourceURL(base: inventory.sources(for: "tt123")[0].base, episodeID: "tt123:1:8/a?b")!
         check(url.query == "key=fixture" && url.absoluteString.contains("/config/stream/series/tt123:1:8%2Fa%3Fb.json?"), "configured query and path survive exact episode segment escaping")
+        await metadataFixtures(check)
         let receiptOwner = EpisodeSourceOwner(account: account)
         let receipt = EpisodeSourceReceipt(videoID: "E8", owner: receiptOwner)
         await EpisodeSourceCollection.$receipt.withValue(receipt) {
@@ -257,9 +344,135 @@ actor FetchProbe {
         let refind = region(tv, "private func refindSourcesAndRetry()", "/// Nudge subtitle sync")
         check(refind.contains("defer {") && refind.contains("EpisodeRefindCompletionPolicy.action") && refind.contains("episodeRefindAttempt == attempt"), "TV refind installs attempt-owned cleanup on every return")
         let preparer = source("app/SourcesiOS/iOSNextEpisodePreparer.swift")
-        check(preparer.contains("sourceOwner.sources(for: video.id)") && tv.contains("sourceOwner.sources(for: next.id)"), "both preload lanes use the same exact-video native inventory as fallback")
+        check((preparer.contains("sourceOwner.sources(for: video.id)") || preparer.contains("sourceOwner.providers(seriesID: context.seriesID, videoID: video.id)"))
+            && tv.contains("sourceOwner.providers(seriesID: (curMeta ?? meta)?.libraryId, videoID: next.id)"), "both preload lanes use the same exact-video native inventory as fallback")
         let explicitLines = (player + tv + ios + source("app/SourcesTV/TVEpisodePanel.swift")).components(separatedBy: "\n")
             .filter { $0.contains("for: ") && $0.contains("videoId:") }
         check(explicitLines.count == 10 && explicitLines.allSatisfy { $0.contains("libraryId:") }, "every owned explicit episode binding carries its exact library identity")
+    }
+
+    @MainActor static func metadataFixtures(_ check: (Bool, String) -> Void) async {
+        precondition(URLProtocol.registerClass(EpisodeFixtureProtocol.self))
+        defer { URLProtocol.unregisterClass(EpisodeFixtureProtocol.self) }
+        let fixture = EpisodeFixtureProtocol.state
+        let registry = #"[{"transportUrl":"https://episode.fixture/config/meta/manifest.json?key=fixture","manifest":{"id":"meta","name":"meta-only","types":["series"],"idPrefixes":["TITLE"],"resources":["meta"]}},{"transportUrl":"https://episode.fixture/mixed/manifest.json","manifest":{"id":"mixed","name":"mixed","types":["movie"],"resources":[{"name":"meta","types":["series"],"idPrefixes":["TITLE"]},{"name":"stream","types":["series"],"idPrefixes":["E"]}]}},{"transportUrl":"https://episode.fixture/stream/manifest.json","manifest":{"id":"stream","name":"stream-only","types":["series"],"resources":["stream"]}},{"transportUrl":"https://episode.fixture/wrong/manifest.json","manifest":{"id":"wrong","name":"wrong-video","types":["series"],"resources":["meta"]}},{"transportUrl":"https://episode.fixture/malformed/manifest.json","manifest":{"id":"malformed","name":"malformed","types":["series"],"resources":["meta"]}},{"transportUrl":"https://episode.fixture/foreign/manifest.json","manifest":{"id":"foreign","name":"foreign-title","types":["series"],"resources":["meta"]}}]"#
+        let data = Data(registry.utf8), inventory = try! JSONDecoder().decode(EpisodeSourceInventory.self, from: data)
+        // Legacy descriptors use the exact same manifest capabilities, not a widened StreamSource list.
+        let legacyJSON = try! JSONSerialization.jsonObject(with: data) as! [[String: Any]]
+        let objectResources = legacyJSON.map { row -> [String: Any] in
+            var row = row, manifest = row["manifest"] as! [String: Any]
+            manifest["resources"] = (manifest["resources"] as! [Any]).map { item -> Any in
+                if let name = item as? String { return ["name": name] }; return item
+            }; row["manifest"] = manifest; return row
+        }
+        let addons = try! JSONDecoder().decode([AddonDescriptor].self, from: JSONSerialization.data(withJSONObject: objectResources))
+        let account = StremioAccount(); account.addons = addons; account.streamSources = inventory.sources(for: "E2")
+        CoreBridge.shared.registryData = data; CoreBridge.shared.generation = UUID()
+        let owner = EpisodeSourceOwner(account: account)
+        let providers = owner.providers(seriesID: "TITLE", videoID: "E2")
+        check(providers.map(\.source.name) == ["meta-only", "mixed", "stream-only", "wrong-video", "malformed", "foreign-title"],
+              "native and legacy captured manifests retain metadata-only providers and exact registry order")
+        check(inventory.sources(for: "E2").map(\.name) == ["mixed", "stream-only"], "metadata-only addon never receives a stream-resource request")
+        check(inventory.providers(seriesID: "OTHER", videoID: "E2").first?.source.name == "mixed"
+            && inventory.providers(seriesID: "OTHER", videoID: "E2").first?.metadataID == nil,
+              "metadata prefixes match library ID independently from episode stream prefixes")
+        let metaPath = "/config/meta/meta/series/TITLE.json"
+        let payloads = [
+            metaPath: #"{"meta":{"id":"TITLE","type":"series","videos":[{"id":"E1","streams":[{"url":"https://media.fixture/E1"}]},{"id":"E2","streams":[{"url":"https://media.fixture/E2","behaviorHints":{"proxyHeaders":{"request":{"Referer":"https://headers.fixture","Authorization":"fixture"}}}},{"infoHash":"0123456789012345678901234567890123456789"}]}]}}"#,
+            "/mixed/meta/series/TITLE.json": #"{"meta":{"id":"TITLE","videos":[{"bad":"malformed sibling"},{"id":"E2","streams":[{"url":"https://media.fixture/shared"},{"url":"https://media.fixture/shared","behaviorHints":{"proxyHeaders":{"request":{"Referer":"different"}}}}]}]}}"#,
+            "/mixed/stream/series/E2.json": #"{"streams":[{"url":"https://media.fixture/shared"},{"url":"https://media.fixture/stream"}]}"#,
+            "/stream/stream/series/E2.json": #"{"streams":[{"url":"https://media.fixture/direct"}]}"#,
+            "/wrong/meta/series/TITLE.json": #"{"meta":{"id":"TITLE","streams":[{"url":"https://media.fixture/wrong-title-level"}],"videos":[{"id":"E1","streams":[{"url":"https://media.fixture/wrong-E1"}]}]}}"#,
+            "/malformed/meta/series/TITLE.json": #"{"meta":{"id":"TITLE","videos":"malformed"}}"#,
+            "/foreign/meta/series/TITLE.json": #"{"meta":{"id":"OTHER","videos":[{"id":"E2","streams":[{"url":"https://media.fixture/foreign"}]}]}}"#
+        ]
+        fixture.configure(payloads)
+        let preload = await EpisodeSourceCollection.rawGroups(providers: providers, episodeID: "E2", wantedAddon: "mixed",
+            deadline: ProcessInfo.processInfo.systemUptime + 2)
+        check(preload.map(\.addon) == ["meta-only", "mixed", "stream-only"], "real metadata-only and mixed replies survive malformed and wrong-identity peers")
+        check(preload[0].streams.first?.url == "https://media.fixture/E2" && preload[0].streams.first?.requestHeaders?["Authorization"] == "fixture",
+              "only exact E2 embedded streams and their playback headers survive decode")
+        check(preload[1].streams.map(\.url) == ["https://media.fixture/shared", "https://media.fixture/shared", "https://media.fixture/stream"],
+              "mixed addon merges metadata before stream responses and deduplicates only full stream equality")
+        let wire = fixture.snapshot
+        check(wire.requests.count == 7 && wire.peak <= 5 && wire.requests.contains(where: {
+            $0.url?.path == metaPath && $0.url?.query == "key=fixture" && $0.value(forHTTPHeaderField: "User-Agent")?.contains("Apple TV") == true
+        }), "production requests retain configured metadata path query and CDN user agent within five-wide pool")
+        check(!wire.requests.contains(where: { $0.url?.path == "/stream/meta/series/TITLE.json" || $0.url?.path == "/config/meta/stream/series/E2.json" }),
+              "collector never invents metadata or stream capability for source-only peers")
+        fixture.configure(payloads)
+        let wrongSnapshot = await EpisodeSourceCollection.rawGroups(providers: providers, episodeID: "E1", wantedAddon: nil,
+            deadline: ProcessInfo.processInfo.systemUptime + 1)
+        check(wrongSnapshot.isEmpty && fixture.snapshot.requests.isEmpty, "an E2 capability snapshot cannot fetch or publish a different episode")
+        FixtureAuxiliary.foreignPublication = true
+        fixture.configure(payloads)
+        let receipt = EpisodeSourceReceipt(videoID: "E2", owner: owner)
+        let cold = await EpisodeSourceCollection.$receipt.withValue(receipt) {
+            await EpisodeSourceCollection.collect(seriesID: "TITLE", videoID: "E2", season: 1, episode: 2, title: "Fixture",
+                providers: providers, wantedAddon: "mixed", deadline: ProcessInfo.processInfo.systemUptime + 2,
+                isSignedIn: false, isCurrent: { owner.isCurrent })
+        }
+        check(cold == preload && receipt.groups == preload, "cold fallback and already-complete source handoff include the same embedded preload inventory")
+        PlaybackSettings.directLinksOnly = true
+        check(EpisodeSourceCollection.displayGroups(preload).flatMap(\.streams).allSatisfy { !$0.isTorrent },
+              "direct-only filtering also applies to embedded metadata streams")
+        PlaybackSettings.directLinksOnly = false
+        fixture.configure(payloads, held: [metaPath])
+        let boundedStart = ProcessInfo.processInfo.systemUptime
+        let bounded = await EpisodeSourceCollection.rawGroups(providers: providers, episodeID: "E2", wantedAddon: "mixed",
+            deadline: boundedStart + 0.05)
+        fixture.release(metaPath)
+        check(bounded.map(\.addon) == ["mixed", "stream-only"] && ProcessInfo.processInfo.systemUptime - boundedStart < 0.5,
+              "metadata timeout retains completed stream peers inside the same absolute deadline")
+        await fixture.awaitIdle()
+        fixture.configure(payloads, held: [metaPath])
+        let retiredReceipt = EpisodeSourceReceipt(videoID: "E2", owner: owner)
+        let held = Task { @MainActor in
+            await EpisodeSourceCollection.$receipt.withValue(retiredReceipt) {
+                await EpisodeSourceCollection.collect(seriesID: "TITLE", videoID: "E2", season: 1, episode: 2, title: nil,
+                    providers: providers, wantedAddon: nil, deadline: ProcessInfo.processInfo.systemUptime + 2,
+                    isSignedIn: false, isCurrent: { owner.isCurrent })
+            }
+        }
+        await fixture.awaitRequest(metaPath)
+#if VORTX_NATIVE_DATA_ENGINE
+        CoreBridge.shared.registryData = try! JSONSerialization.data(withJSONObject: Array(legacyJSON.dropFirst()))
+        CoreBridge.shared.generation = UUID()
+#else
+        account.addons.removeFirst()
+#endif
+        fixture.release(metaPath)
+        check(await held.value == nil && retiredReceipt.groups == nil && !owner.isCurrent,
+              "held metadata callback from removed registry provider cannot publish E2 or a source receipt")
+        CoreBridge.shared.registryData = data; account.addons = addons
+        let replacementOwner = EpisodeSourceOwner(account: account)
+        let replacementReceipt = EpisodeSourceReceipt(videoID: "E2", owner: replacementOwner)
+        fixture.configure(payloads, held: [metaPath])
+        let replaced = Task { @MainActor in
+            await EpisodeSourceCollection.$receipt.withValue(replacementReceipt) {
+                await EpisodeSourceCollection.collect(seriesID: "TITLE", videoID: "E2", season: 1, episode: 2, title: nil,
+                    providers: replacementOwner.providers(seriesID: "TITLE", videoID: "E2"), wantedAddon: nil,
+                    deadline: ProcessInfo.processInfo.systemUptime + 2, isSignedIn: false,
+                    isCurrent: { replacementOwner.isCurrent })
+            }
+        }
+        await fixture.awaitRequest(metaPath)
+        var replacedRows = objectResources
+        replacedRows[0]["transportUrl"] = "https://episode.fixture/replaced/manifest.json?key=new-fixture"
+#if VORTX_NATIVE_DATA_ENGINE
+        CoreBridge.shared.registryData = try! JSONSerialization.data(withJSONObject: replacedRows)
+        CoreBridge.shared.generation = UUID()
+#else
+        account.addons = try! JSONDecoder().decode([AddonDescriptor].self,
+            from: JSONSerialization.data(withJSONObject: replacedRows))
+#endif
+        fixture.release(metaPath)
+        check(await replaced.value == nil && replacementReceipt.groups == nil && !replacementOwner.isCurrent,
+              "same descriptor ID with replaced configured transport rejects held metadata and complete handoff")
+        FixtureAuxiliary.foreignPublication = false
+        // Restore the original fixture registry for the remaining lifecycle tests.
+        CoreBridge.shared.registryData = try! JSONSerialization.data(withJSONObject: (0..<8).map {
+            ["transportUrl": "https://fixture.invalid/\($0)/manifest.json", "manifest": ["name": "\($0)", "resources": ["stream"], "types": ["series"]]] as [String: Any]
+        } + [["transportUrl": "https://fixture.invalid/failure/manifest.json", "manifest": ["name": "failure", "resources": ["stream"], "types": ["series"]]]])
     }
 }
