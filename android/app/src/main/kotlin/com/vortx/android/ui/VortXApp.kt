@@ -92,6 +92,7 @@ import com.vortx.android.player.PlayerEngineRouter
 import com.vortx.android.player.PlayerEpisodeHistoryIdentity
 import com.vortx.android.player.PlayerLaunchPolicy
 import com.vortx.android.player.PlayerScreen
+import com.vortx.android.player.PlayerEpisodeHandoffRequest
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
 import com.vortx.android.sources.SourceSettingsRevision
@@ -772,6 +773,8 @@ fun VortXApp(
             // The next episode being offered, set by onEnded. Keyed per playable so advancing into the
             // next episode (a NEW playable) clears the offer automatically.
             var upNext by remember(playable) { mutableStateOf<Episode?>(null) }
+            var episodeHandoffSequence by remember(playable) { mutableStateOf(0L) }
+            var episodeHandoffRequest by remember(playable) { mutableStateOf<PlayerEpisodeHandoffRequest?>(null) }
             // Bad-source ladder surfaces, keyed per playable DELIBERATELY: a successful retry swaps
             // [playing] to the new source's playable, which resets both to false and closes the
             // overlay on its own. The ladder's cross-retry memory (failed sources + the 3-attempt
@@ -838,7 +841,17 @@ fun VortXApp(
                             vm.resolveEpisodeSwitch(episodeId)
                         }
                     },
-                    onEpisodeSwitched = { replacement, acceptedRevision ->
+                    episodeHandoffRequest = episodeHandoffRequest,
+                    onEpisodeHandoffQueued = { sequence ->
+                        if (episodeHandoffRequest?.sequence == sequence) episodeHandoffRequest = null
+                    },
+                    onAudioIntentChanged = { intent ->
+                        preloadTaskOwner.cancel()
+                        preloadPolicy.invalidate()
+                        advanceVm?.notePlaybackAudioIntent(intent.language)
+                    },
+                    onEpisodeSwitched = { replacement, acceptedRevision, automatic ->
+                        autoAdvanceStreak[0] = if (automatic) autoAdvanceStreak[0] + 1 else 0
                         historyIdentity = advancePlayerEpisodeHistory(
                             current = historyIdentity,
                             replacement = replacement,
@@ -857,6 +870,7 @@ fun VortXApp(
                             generation = historyIdentity.acceptedRevision,
                         )
                         val now = android.os.SystemClock.elapsedRealtime()
+                        if (preloadPolicy.isReady(target) && !vm.hasPreparedNextEpisode(next.id)) preloadPolicy.warmFailed(target)
                         val attempt = preloadPolicy.evaluate(target, pos, dur, now) ?: return@onWarmNext
                         preloadTaskOwner.launch(
                             target = target,
@@ -864,6 +878,7 @@ fun VortXApp(
                             onComplete = { ok ->
                                 preloadPolicy.complete(attempt, ok, android.os.SystemClock.elapsedRealtime())
                             },
+                            timeoutMs = (attempt.deadlineMs - android.os.SystemClock.elapsedRealtime()).coerceAtLeast(0L),
                         )
                     },
                     onBack = {
@@ -960,36 +975,22 @@ fun VortXApp(
                         }
                     },
                 )
-                // The Up Next countdown overlay + its resolution collector. The collector lives HERE, not in
-                // DetailScreen (which is not composed while the player covers it): playNextEpisode() posts
-                // Ready/Failed through the ViewModel's ordinary playback flow, and this is the only observer
-                // while the player is up. Ready swaps `playing` to the next episode's Playable (the
-                // DisposableEffect(playable) above then closes the old engine session and opens the new one);
-                // Failed falls back to the detail page, where the full source list is available.
+                // Countdown and Play now enter the mounted player's acknowledged episode handoff.
+                // A failure keeps its outgoing revision/history and exposes the exact-target retry.
                 val nextEp = upNext
                 if (nextEp != null && advanceVm != null) {
-                    val nextPlayback by advanceVm.playback.collectAsStateWithLifecycle()
-                    LaunchedEffect(nextPlayback) {
-                        when (val pb = nextPlayback) {
-                            is Playback.Ready -> {
-                                advanceVm.clearPlayback()
-                                playing = pb.playable
-                            }
-                            is Playback.Failed -> {
-                                advanceVm.clearPlayback()
-                                playing = null
-                            }
-                            else -> Unit
-                        }
+                    fun requestNext(automatic: Boolean) {
+                        upNext = null
+                        episodeHandoffRequest = PlayerEpisodeHandoffRequest(++episodeHandoffSequence, nextEp, automatic)
                     }
                     UpNextOverlay(
                         episode = nextEp,
-                        resolving = nextPlayback is Playback.Resolving,
+                        resolving = false,
                         // A countdown-expiry advance is an AUTO-advance: grow the streak so the binge
                         // boundary can fire on the next episode. A manual "Play now" tap or Cancel is
                         // presence, so it resets the streak (Apple's `noteInteraction`). Both paths play.
-                        onAutoAdvance = { autoAdvanceStreak[0]++; advanceVm.playNextEpisode() },
-                        onPlayNow = { autoAdvanceStreak[0] = 0; advanceVm.playNextEpisode() },
+                        onAutoAdvance = { requestNext(automatic = true) },
+                        onPlayNow = { requestNext(automatic = false) },
                         onCancel = {
                             autoAdvanceStreak[0] = 0
                             advanceVm.abandonPlaybackRoute()
@@ -997,8 +998,8 @@ fun VortXApp(
                         },
                     )
                 }
-                // The bad-source ladder's surfaces + their resolution collector. Like the Up Next
-                // collector above, this is the only [Playback] observer while its overlay is up (the
+                // The bad-source ladder's surfaces + their resolution collector. This is the only
+                // [Playback] observer while its overlay is up (the
                 // two are mutually exclusive: Up Next requires a GENUINE ended verdict, the ladder a
                 // BAD one, and PlayerScreen keeps those disjoint). Ready swaps [playing] to the
                 // retried/picked source's playable, which resets the per-playable overlay state and

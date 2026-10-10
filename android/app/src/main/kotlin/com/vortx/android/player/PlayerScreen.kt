@@ -163,7 +163,10 @@ fun PlayerScreen(
     onSwitchEpisode: (suspend (episodeId: String) -> Result<PlayerSourceSwitchResolution>)? = null,
     /// Fired when an episode switch is ACCEPTED, so the host can advance its own history identity (a new
     /// engine playback session for the new episode) even when the replacement Playable is value-equal.
-    onEpisodeSwitched: (Playable, acceptedRevision: Long) -> Unit = { _, _ -> },
+    onEpisodeSwitched: (Playable, acceptedRevision: Long, automatic: Boolean) -> Unit = { _, _, _ -> },
+    episodeHandoffRequest: PlayerEpisodeHandoffRequest? = null,
+    onEpisodeHandoffQueued: (sequence: Long) -> Unit = {},
+    onAudioIntentChanged: (PlaybackAudioIntent) -> Unit = {},
     /// Fired periodically while playback rolls with the live (positionMs, durationMs), so the host can drive
     /// its next-episode PRELOAD policy (warm the next episode's source before the current one ends). Default
     /// no-op keeps the screen usable in isolation; the phone shell wires it to [NextEpisodePreloadPolicy].
@@ -198,9 +201,12 @@ fun PlayerScreen(
     val currentOnSwitchSource by rememberUpdatedState(onSwitchSource)
     val currentOnSwitchEpisode by rememberUpdatedState(onSwitchEpisode)
     val currentOnEpisodeSwitched by rememberUpdatedState(onEpisodeSwitched)
+    val currentOnEpisodeHandoffQueued by rememberUpdatedState(onEpisodeHandoffQueued)
+    val currentOnAudioIntentChanged by rememberUpdatedState(onAudioIntentChanged)
     val currentOnWarmNext by rememberUpdatedState(onWarmNext)
     val sourceSwitchCoordinator = remember { PlayerSourceSwitchCoordinator() }
     val outerPlaybackSessionId = remember(playable) { sourceSwitchCoordinator.replaceOuterSession() }
+    var playbackAudioIntent by remember(outerPlaybackSessionId) { mutableStateOf<PlaybackAudioIntent?>(null) }
     // EOF/error received from the outgoing engine while a source replacement resolves must remain
     // quarantined even if that resolver later fails and exposes the old revision again.
     val sourceTerminalFence = remember(outerPlaybackSessionId) { PlayerTerminalFence() }
@@ -877,6 +883,15 @@ fun PlayerScreen(
     }
     // In-player EPISODE switch resolver: same coordinator/authority machinery as the source switch, but
     // the accepted episode starts from the top and notifies the host so it opens a fresh history session.
+    LaunchedEffect(outerPlaybackSessionId, episodeHandoffRequest?.sequence) {
+        val request = episodeHandoffRequest ?: return@LaunchedEffect
+        if (playerExitRequested) return@LaunchedEffect
+        sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
+        sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
+            sourceSwitchState = beginPlayerEpisodeSwitch(sourceSwitchState, request.episode, authority, request.automatic)
+            currentOnEpisodeHandoffQueued(request.sequence)
+        }
+    }
     val pendingEpisodeSwitch = sourceSwitchState.pendingEpisodeSwitch
     LaunchedEffect(pendingEpisodeSwitch?.authority) {
         val pending = pendingEpisodeSwitch ?: return@LaunchedEffect
@@ -892,7 +907,7 @@ fun PlayerScreen(
                 sourceSwitchState = accepted
                 acknowledgePublished()
                 acceptedEpisodeReplacement(previous, accepted)?.let { replacement ->
-                    currentOnEpisodeSwitched(replacement.playable, replacement.revision)
+                    currentOnEpisodeSwitched(replacement.playable, replacement.revision, pending.automatic)
                 }
             },
         )
@@ -1282,10 +1297,11 @@ fun PlayerScreen(
         // Fidelity refinement: among same-language audio tracks, honour the channel layout the active
         // output route can render, the tie-break Apple's picker cannot make (TrackSelector.swift documents
         // MPVTrack carries no channel counts). Fail-soft: unknown channels leave the language pick as-is.
+        val intentTracks = playbackAudioIntent?.matchingTracks(audioTracks).orEmpty()
         val audioId = com.vortx.android.player.audio.AudioTrackFidelity.refine(
-            audioTracks,
-            pick.audioId,
-            trackPreferences.rejectTerms,
+            intentTracks.ifEmpty { audioTracks },
+            intentTracks.firstOrNull()?.id ?: pick.audioId,
+            if (intentTracks.isNotEmpty()) emptyList() else trackPreferences.rejectTerms,
             com.vortx.android.player.audio.AudioRoute.current(context),
         )
         if (defaults.selectAudio) audioId?.let { engine.selectAudioTrack(it) }
@@ -1300,7 +1316,7 @@ fun PlayerScreen(
     // then reject only a labelled file with no requested/English audio, never a manual source/audio.
     LaunchedEffect(playbackSessionKey, engine, playerState.audioTracks, trackSelectionPhases.audio) {
         if (currentPlayable.isTrailer || currentPlayable.isLive || currentPlayable.userForcedSource || isLocalSession ||
-            trackSelectionPhases.audio == DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION) {
+            playbackAudioIntent != null || trackSelectionPhases.audio == DefaultTrackPhase.HELD_BY_EXPLICIT_SELECTION) {
             knownAudioMismatch = false
             return@LaunchedEffect
         }
@@ -1617,7 +1633,7 @@ fun PlayerScreen(
                 // decides (via its policy) when to warm; a movie / trailer / no-successor host no-ops.
                 // A LOCAL session never drives it: warming resolves through the host's detail ViewModel,
                 // which for a download play can belong to an earlier streamed title (AND-DL-01).
-                if (!isLocalSession) currentOnWarmNext(s.positionMs, s.durationMs)
+                if (!isLocalSession && !sourceSwitchState.isSwitching && !playerExitRequested) currentOnWarmNext(s.positionMs, s.durationMs)
             }
         }
     }
@@ -1983,6 +1999,11 @@ fun PlayerScreen(
                 }
                 trackSelectionPhases = trackSelectionPhases.holdAudio()
                 engine.selectAudioTrack(it)
+                latestState.audioTracks.firstOrNull { track -> track.id == it }?.let { track ->
+                    val intent = PlaybackAudioIntent.fromTrack(track)
+                    playbackAudioIntent = intent
+                    currentOnAudioIntentChanged(intent)
+                }
             },
             onSelectSubtitle = {
                 showControls()

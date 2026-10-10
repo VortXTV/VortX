@@ -83,7 +83,11 @@ internal data class PendingPlayerSourceSwitch(
 internal data class PendingPlayerEpisodeSwitch(
     val authority: PlayerSourceSwitchAuthority,
     val episode: Episode,
+    val automatic: Boolean = false,
 )
+
+/** A shell's Up Next request enters the same pending/accepted host state as an episode-menu pick. */
+data class PlayerEpisodeHandoffRequest(val sequence: Long, val episode: Episode, val automatic: Boolean = false)
 
 /**
  * Invalidated with the producing ViewModel. This prevents a resolution returned by an obsolete ViewModel
@@ -370,9 +374,10 @@ internal fun beginPlayerEpisodeSwitch(
     state: PlayerSourceSwitchState,
     episode: Episode,
     authority: PlayerSourceSwitchAuthority,
+    automatic: Boolean = false,
 ): PlayerSourceSwitchState = state.copy(
     pendingSwitch = null,
-    pendingEpisodeSwitch = PendingPlayerEpisodeSwitch(authority, episode),
+    pendingEpisodeSwitch = PendingPlayerEpisodeSwitch(authority, episode, automatic),
     errorMessage = null,
 )
 

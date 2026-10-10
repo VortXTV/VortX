@@ -19,8 +19,9 @@ class TvBingePreloadContractTest {
         assertTrue(player.contains("vm.warmNextEpisode(next.id)"))
         assertTrue(player.contains("preloadPolicy.complete(attempt"))
         assertTrue(player.contains("historyIdentity.acceptedRevision"))
-        assertTrue(player.contains("vm.playNextEpisode()"))
-        assertTrue(player.contains("autoAdvanceStreak[0]++"))
+        assertTrue(player.contains("episodeHandoffRequest = PlayerEpisodeHandoffRequest("))
+        assertTrue(player.contains("automatic = true"))
+        assertTrue(player.contains("autoAdvanceStreak[0] = if (automatic) autoAdvanceStreak[0] + 1 else 0"))
         assertTrue(player.contains("!advancingEpisode"))
     }
 
@@ -40,18 +41,16 @@ class TvBingePreloadContractTest {
         assertTrue(exit.contains("retryingSource = false"))
         assertTrue(exit.contains("returnToBrowse()"))
         assertTrue(app.contains("playerVm?.abandonPlaybackRoute()"))
-        assertTrue(app.contains("takeIf { it === launchedPlayerViewModel && !advancingEpisode && !retryingSource }"))
+        assertTrue(app.contains("takeIf { it === launchedPlayerViewModel && !retryingSource }"))
         assertTrue(app.contains("if (advancingEpisode || retryingSource) return@onWarmNext"))
         assertTrue(app.contains("BackHandler(onBack = ::exitPlayer)"))
         assertTrue(app.contains("onBack = ::exitPlayer"))
         assertTrue(app.contains("onError = ::exitPlayer"))
-        val advance = app.substringAfter("LaunchedEffect(advancingEpisode, retryPlayback)")
-            .substringBefore("LaunchedEffect(retryingSource, retryPlayback)")
-        assertTrue(advance.contains("launchedPlayerPrincipal != currentPlayerPrincipal"))
-        assertTrue(advance.contains("is Playback.Ready"))
-        assertTrue(advance.contains("playing = state.playable"))
-        assertTrue(advance.contains("is Playback.Failed"))
-        assertTrue(advance.contains("exitPlayer()"))
+        assertFalse(app.contains("LaunchedEffect(advancingEpisode, retryPlayback)"))
+        val advance = app.substringAfter("onSwitchEpisode =").substringBefore("episodeHandoffRequest =")
+        assertTrue(advance.contains("launchedPlayerPrincipal == currentPlayerPrincipal"))
+        assertTrue(advance.contains("vm.resolveEpisodeSwitch(episodeId)"))
+        assertFalse(advance.contains("exitPlayer()"))
     }
 
     @Test

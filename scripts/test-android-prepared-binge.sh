@@ -29,10 +29,12 @@ test_source="$repo_root/android/app/src/test/kotlin/com/vortx/android"
     "$source_dir/engine/VortxResourceBridge.kt" "$source_dir/engine/VortxResourceProjection.kt" "$source_dir/engine/EngineState.kt" \
     "$source_dir/engine/NativeCatalogRepository.kt" "$source_dir/engine/NzbSourceAggregator.kt" "$source_dir/engine/SourceListModel.kt" \
     "$source_dir/player/PlayerSourceSwitching.kt" "$source_dir/player/PlayerAdmissionPolicy.kt" \
-    "$source_dir/player/PlayerScreen.kt" "$source_dir/player/PlayerChrome.kt" "$source_dir/player/NextEpisodePreloadPolicy.kt" \
+    "$source_dir/player/PlayerScreen.kt" "$source_dir/player/PlayerChrome.kt" "$source_dir/player/NextEpisodePreloadPolicy.kt" "$source_dir/player/PlaybackAudioIntent.kt" \
+    "$source_dir/ui/VortXApp.kt" "$source_dir/ui/tv/TvApp.kt" \
     "$source_dir/ui/viewmodel/DetailViewModel.kt" "$source_dir/ui/viewmodel/PreparedEpisodeSlot.kt" "$source_dir/ui/viewmodel/EpisodeResolutionBudget.kt" "$source_dir/ui/components/EpisodeRailPolicy.kt" \
     "$test_source/engine/NativeNzbSourcesTest.kt" "$test_source/player/PlayerSourceSwitchingTest.kt" "$test_source/player/PlayerRecoveryParityTest.kt" \
     "$test_source/player/NextEpisodePreloadPolicyTest.kt" "$test_source/player/NextEpisodePreloadTaskOwnerTest.kt" \
+    "$test_source/player/PlayerBingeHandoffTest.kt" "$test_source/player/TvBingePreloadContractTest.kt" \
     "$test_source/ui/viewmodel/EpisodeResolutionBudgetTest.kt" "$test_source/ui/viewmodel/DetailEpisodeTargetPolicyTest.kt" \
     "$test_source/ui/viewmodel/PreparedEpisodeSlotTest.kt" -d "$test_dir/classes" 2>&1 | tee "$test_dir/compile.log"
 cd "$repo_root/android/app"
@@ -40,5 +42,6 @@ cd "$repo_root/android/app"
     com.vortx.android.engine.NativeNzbSourcesTest com.vortx.android.player.PlayerSourceSwitchingTest \
     com.vortx.android.player.PlayerRecoveryParityTest com.vortx.android.player.NextEpisodePreloadPolicyTest \
     com.vortx.android.player.NextEpisodePreloadTaskOwnerTest com.vortx.android.ui.viewmodel.EpisodeResolutionBudgetTest \
+    com.vortx.android.player.PlayerBingeHandoffTest com.vortx.android.player.TvBingePreloadContractTest \
     com.vortx.android.ui.viewmodel.DetailEpisodeTargetPolicyTest com.vortx.android.ui.viewmodel.PreparedEpisodeSlotTest \
     2>&1 | tee "$test_dir/result.log"
