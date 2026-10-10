@@ -7,29 +7,10 @@
 // SettingsBackup.swift AND Keychain.swift in. A re-typed copy of a filter would only ever prove the copy is
 // right, which for a security control is worth nothing.
 //
-// RUN (positive: every assertion must pass, exit 0):
-//
-//     xcrun swiftc -o /tmp/sbtest \
-//         app/SourcesShared/SettingsBackup.swift \
-//         app/SourcesShared/CredentialScope.swift \
-//         app/SourcesShared/Keychain.swift \
-//         app/Tests/SettingsBackupSecretsTests.swift && /tmp/sbtest
-//
-// RUN (NEGATIVE CONTROL: mandatory, and the actual point of the file). A guard that has never been shown to
-// FAIL is indistinguishable from a guard that CANNOT fail, so break it on purpose and confirm the tests
-// notice. Emptying `secretKeyPrefixes` must turn T1.1/T1.2/T1.3/T2.1/T3.1/T3.3/T5.4 RED and exit 1:
-//
-//     mkdir -p /tmp/sbctrl && cp app/SourcesShared/CredentialScope.swift app/SourcesShared/Keychain.swift /tmp/sbctrl/
-//     sed 's|static let secretKeyPrefixes: \[String\] = \[Keychain.fallbackKeyPrefix\]|static let secretKeyPrefixes: [String] = []|' \
-//         app/SourcesShared/SettingsBackup.swift > /tmp/sbctrl/SettingsBackup.swift
-//     xcrun swiftc -o /tmp/sbctrl/bin /tmp/sbctrl/SettingsBackup.swift /tmp/sbctrl/CredentialScope.swift /tmp/sbctrl/Keychain.swift \
-//         app/Tests/SettingsBackupSecretsTests.swift && /tmp/sbctrl/bin   # expect exit 1
-//
-// A second negative control removes `Keychain.invalidationKeyPrefix` from `deviceLocalKeyPrefixes`.
-// T1.5/T2.3/T3.4/T5.5 must then turn RED and the executable must exit 1.
-//
-// When last run, that control printed the plaintext token and dataKey straight out of the backup blob, which
-// is what upgraded the leak from "plausible" to "demonstrated on the pre-fix code path".
+// RUN: node test/settings-backup-secrets.mjs
+// The runner embeds a fresh test-only bundle identifier, checks missing/mismatched identity rejection,
+// and preserves positive plus cache/secret/invalidation negative-control receipts under app/build.
+// Never run a bare executable with an "unknown" or production defaults domain.
 //
 // NOTE for whoever wires up a real test target: the stubs below are top-level types that SHADOW the real
 // app types of the same name. They exist only so the file under test links standalone. This file is not in
@@ -113,7 +94,20 @@ struct SettingsBackupSecretsTests {
     }
 
     static func main() {
-        let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
+        let prefix = "tv.vortx.tests.settings-backup."
+        guard let expected = ProcessInfo.processInfo.environment["VORTX_SETTINGS_TEST_BUNDLE_ID"],
+              expected.hasPrefix(prefix),
+              let uuid = UUID(uuidString: String(expected.dropFirst(prefix.count))),
+              expected == prefix + uuid.uuidString.lowercased(),
+              let bundleID = Bundle.main.bundleIdentifier,
+              bundleID == expected else {
+            print("REFUSED: a unique embedded test bundle identifier is required")
+            exit(2)
+        }
+        guard (UserDefaults.standard.persistentDomain(forName: bundleID) ?? [:]).isEmpty else {
+            print("REFUSED: the test defaults domain must be empty")
+            exit(2)
+        }
 
         let seeded: [String: Any] = [
             leakedKey: sessionBlob,
@@ -123,6 +117,8 @@ struct SettingsBackupSecretsTests {
             "vortx.downloads.autoDeleteWatched": true,
             "vortx.downloads.queueOrder": ["11111111-1111-1111-1111-111111111111"],
             "vortx.downloads.maxConcurrent": 5,
+            "vortx.addons.tmdbMetaInstalled": true,
+            "vortx.addons.userPolicy": "preserved",
             "stremiox.diskCacheBytes": 12_345,
             "vortx.pgsSubtitleOCR": false,
             "vortx.sync.lastSyncedVersion.acct_1": 42,
@@ -154,6 +150,8 @@ struct SettingsBackupSecretsTests {
                 invalidationKey: true,
                 "vortx.owner.resumeCache.readdReceipt.v2.11111111-1111-1111-1111-111111111111": ["tt-a": 456],
                 "stremiox.accentColor": "red",
+                "vortx.addons.tmdbMetaInstalled": false,
+                "vortx.addons.userPolicy": "peer-policy",
             ],
             bundleID: bundleID,
             app: "VortX")
@@ -211,7 +209,27 @@ struct SettingsBackupSecretsTests {
         check("T5.4 isSyncable false for the leaked key", !SettingsBackup.isSyncable(leakedKey))
         check("T5.5 invalidation is device-local", !SettingsBackup.isSyncable(invalidationKey))
 
+        print("\n=== T6: descriptor-derived add-on cache is not portable user intent ===")
+        check("T6.1 resolver cache cannot dirty syncable preferences",
+              !SettingsBackup.isSyncable("vortx.addons.tmdbMetaInstalled"))
+        check("T6.2 unrelated add-on preferences remain syncable",
+              SettingsBackup.isSyncable("vortx.addons.userPolicy"))
+        check("T6.3 resolver cache is absent from the actual exported payload",
+              backupRaw["vortx.addons.tmdbMetaInstalled"] == nil)
+        check("T6.4 unrelated add-on preference remains in the actual export",
+              backupRaw["vortx.addons.userPolicy"] as? String == "preserved")
+        check("T6.5 old portable resolver cache cannot override this device",
+              decoded["vortx.addons.tmdbMetaInstalled"] == nil)
+        check("T6.6 unrelated incoming add-on preference remains readable",
+              decoded["vortx.addons.userPolicy"] as? String == "peer-policy")
+        check("T6.7 merge scrubs the old resolver cache from the pushed payload",
+              mergedRaw["vortx.addons.tmdbMetaInstalled"] == nil)
+        check("T6.8 merge retains the unrelated local add-on preference",
+              mergedRaw["vortx.addons.userPolicy"] as? String == "preserved")
+
         UserDefaults.standard.removePersistentDomain(forName: bundleID)
+        check("T7.1 only the owned test defaults domain is retired",
+              (UserDefaults.standard.persistentDomain(forName: bundleID) ?? [:]).isEmpty)
 
         print("\n----------------------------------------")
         print("passes: \(passes)  failures: \(failures)")

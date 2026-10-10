@@ -40,6 +40,8 @@ enum SettingsBackup {
     /// streaming server is per-device (one device may point at a custom/local server). A device that pulls a
     /// peer's settings keeps its own cache/server choice; its own choice is never pushed up to overwrite others.
     static let deviceLocalKeys: Set<String> = [
+        "vortx.addons.tmdbMetaInstalled", // descriptor-derived resolver cache, not a user preference;
+                                         // each device rebuilds it from its published add-on registry.
         "stremiox.diskCacheBytes",   // Settings -> Streaming cache (sized to the device's own storage)
         "stremiox.serverURL",        // custom streaming server URL (per-device)
         "stremiox.videoUpscaling",   // Settings -> Video upscaling (per-device: standard on Apple TV, scaled on Mac)
