@@ -684,18 +684,13 @@ final class CoreBridge: ObservableObject {
         loadBoard(); loadLibrary()
     }
     @MainActor
-    func switchNativeProfile(_ id: UUID, outgoing: UserProfile?, target: PlaybackMutationTarget) async throws {
+    func switchNativeProfile(_ id: UUID, target: PlaybackMutationTarget) async throws {
         guard let (facade, _) = nativePlaybackBinding(target), case .native(let binding?) = target,
-              let epoch = binding.accountGeneration,
-              let owner = facade.registryBinding?.scope.ownerProfileID else { throw VortxNativeError.closed }
-        var actions: [VortxJSON] = []; var hostEdits: [VortxNativeHostPreferences.Edit] = []
-        if let outgoing {
-            guard outgoing.id == binding.profileID else { throw VortxNativeError.superseded }
-            let mutation = try VortxNativeProfiles.mutation(outgoing, previous: ProfileStore.shared.active, ownerID: owner)
-            actions = mutation.0; hostEdits = [mutation.1]
-        }
-        actions.append(.object(["type": .string("switch_profile"), "id": .string(id.uuidString)]))
-        try await facade.mutateProfiles(actions, hostEdits: hostEdits, expectedProfileID: binding.profileID.uuidString, expectedAccountGeneration: epoch)
+              let epoch = binding.accountGeneration else { throw VortxNativeError.closed }
+        // Preference changes have their own authenticated intent admission before this boundary.
+        // Opening a profile must never mint preference clocks from the outgoing flat projection.
+        let action: VortxJSON = .object(["type": .string("switch_profile"), "id": .string(id.uuidString)])
+        try await facade.mutateProfiles([action], hostEdits: [], expectedProfileID: binding.profileID.uuidString, expectedAccountGeneration: epoch)
         guard CredentialScopeRegistry.shared.isCurrent(binding.credential),
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeInstallGeneration == binding.sessionGeneration }) else { throw VortxNativeError.superseded }
         nativeFacadeLock.withLock { nativeInstallGeneration = UUID() }

@@ -205,6 +205,13 @@ final class ProfileStore: ObservableObject {
     private var nativeProjectionTarget: PlaybackMutationTarget?
     private var nativePublishedPlayback: UserProfile.PlaybackPrefs?
     private var nativePublishedDiscovery: ProfileDiscoveryPreferences?
+    private struct NativeSwitchPreferenceCapture {
+        let id: UUID
+        let target: PlaybackMutationTarget
+        var playback: UserProfile.PlaybackPrefs
+        var discovery: ProfileDiscoveryPreferences
+    }
+    private var nativeSwitchPreferenceCapture: NativeSwitchPreferenceCapture?
     private struct NativePlaybackProjectionSource: Equatable {
         let playback: UserProfile.PlaybackPrefs?
         let addonPreferences: ProfileAddonPreferences?
@@ -377,8 +384,14 @@ final class ProfileStore: ObservableObject {
             ProfileDiscoveryPreferencesStore.applyContinueWatching(incomingActive?.discovery, resetUnset: true)
         }
         let flatPlayback = currentPlaybackPrefs(), flatDiscovery = currentDiscoveryPrefs(), flatTheme = currentNativeThemeProjection()
+        // A settings edit made while a switch's outgoing save awaits ACK cannot capture a new
+        // native target yet. Preserve even a revert to the old published value until that save
+        // resumes and admits the newer edit; never extend this fence across installations.
+        let switchCapture = sameInstallation && nativeSwitchPreferenceCapture?.target == target ? nativeSwitchPreferenceCapture : nil
         let pendingPlayback = quarantineFailed || (sameInstallation && nativePublishedPlayback != flatPlayback && incomingActive?.playback != flatPlayback)
+            || (switchCapture.map { $0.playback != flatPlayback } ?? false)
         let pendingDiscovery = quarantineFailed || (sameInstallation && nativePublishedDiscovery != flatDiscovery && incomingActive?.discovery != flatDiscovery)
+            || (switchCapture.map { $0.discovery != flatDiscovery } ?? false)
         let pendingTheme = quarantineFailed || (sameInstallation && nativePublishedTheme != flatTheme
             && (incomingActive?.accentID != flatTheme.accentID || incomingActive?.oled != flatTheme.oled || incomingActive?.textScale != flatTheme.textScale)
         )
@@ -394,10 +407,17 @@ final class ProfileStore: ObservableObject {
                 if !pendingPlayback {
                     self.nativePublishedPlayback = self.currentPlaybackPrefs()
                     self.nativePublishedPlaybackSource = .init(playback: active.playback, addonPreferences: active.addonPreferences)
+                    // A peer publication is authoritative, not a newly authored flat edit.
+                    if self.nativeSwitchPreferenceCapture?.id == switchCapture?.id {
+                        self.nativeSwitchPreferenceCapture?.playback = self.currentPlaybackPrefs()
+                    }
                 }
                 if !pendingDiscovery {
                     self.nativePublishedDiscovery = self.currentDiscoveryPrefs()
                     self.nativePublishedDiscoverySource = .init(discovery: active.discovery)
+                    if self.nativeSwitchPreferenceCapture?.id == switchCapture?.id {
+                        self.nativeSwitchPreferenceCapture?.discovery = self.currentDiscoveryPrefs()
+                    }
                 }
                 if !pendingTheme { self.nativePublishedTheme = self.currentNativeThemeProjection() }
             }
@@ -486,16 +506,65 @@ final class ProfileStore: ObservableObject {
     @MainActor
     func selectNative(_ profile: UserProfile, target: PlaybackMutationTarget? = nil, finishPicker: Bool = true) async -> Bool {
         let captured = target ?? CoreBridge.shared.captureNativePlaybackTarget()
+        guard nativeSwitchPreferenceCapture == nil else {
+            nativeProfileError = "Couldn't open this profile. Tap again to try once more."
+            return false
+        }
         guard CoreBridge.shared.nativePlaybackTargetIsCurrent(captured) else {
             CoreBridge.shared.reportNativeProfileFailure("open")
             nativeProfileError = CoreBridge.shared.nativeProfileRecoveryMessage
             return false
         }
-        var outgoing = active
-        outgoing?.playback = currentPlaybackPrefs()
-        outgoing?.discovery = currentDiscoveryPrefs()
         do {
-            try await CoreBridge.shared.switchNativeProfile(profile.id, outgoing: outgoing, target: captured)
+            // Flat values belong to this viewer only after its exact native projection mounted.
+            // A recoverable quarantine failure still permits opening profiles, but cannot turn
+            // the preserved, unattributed defaults into an authenticated outgoing preference edit.
+            var completedSaves = 0
+            var previousCapture: NativeSwitchPreferenceCapture?
+            while nativePreferenceProjectionMatches(captured), let original = active {
+                var outgoing = original
+                let playback = currentPlaybackPrefs(), discovery = currentDiscoveryPrefs()
+                if nativePublishedPlayback != nil,
+                   nativePublishedPlayback != playback || (!nativePlaybackProjectionRepresents(original)
+                    && (previousCapture.map { $0.playback != playback } ?? false)) {
+                    outgoing = profileCapturingPlayback(original)
+                }
+                if nativePublishedDiscovery != nil,
+                   nativePublishedDiscovery != discovery || (!nativeDiscoveryProjectionRepresents(original)
+                    && (previousCapture.map { $0.discovery != discovery } ?? false)) {
+                    outgoing.discovery = discovery
+                    if let witness = continueWatchingMigration, witness.profileID == original.id,
+                       witness.target == captured, TraktAuth.storedSessionID == witness.session {
+                        outgoing.discovery?.continueWatchingSource = "trakt"
+                    }
+                }
+                // Unchanged effective projections retain their nil/inherited representation.
+                // A locally reverted pending edit is still intent and must supersede its journal.
+                var groups = Set<NativePreferenceIntentStore.Group>()
+                if outgoing.playback != original.playback || outgoing.addonPreferences != original.addonPreferences
+                    || VortXSyncManager.shared.nativePreferenceIsLocalRevert(outgoing, group: .playback, target: captured) { groups.insert(.playback) }
+                if outgoing.discovery != original.discovery
+                    || VortXSyncManager.shared.nativePreferenceIsLocalRevert(outgoing, group: .discovery, target: captured) {
+                    groups.insert(.discovery)
+                }
+                guard !groups.isEmpty else { break }
+                let intents = try VortXSyncManager.shared.prepareNativePreferenceIntents(outgoing, target: captured, editedGroups: groups)
+                // Bound re-evaluation under continuous editing. The latest edit is journaled
+                // before returning a retryable failure, with the outgoing profile still active.
+                guard completedSaves < 3 else { throw VortxNativeError.superseded }
+                let attempt = NativeSwitchPreferenceCapture(id: UUID(), target: captured, playback: playback, discovery: discovery)
+                nativeSwitchPreferenceCapture = attempt
+                defer {
+                    if nativeSwitchPreferenceCapture?.id == attempt.id { nativeSwitchPreferenceCapture = nil }
+                }
+                // Finish under the original owner before switching retires that target. This
+                // uses the same durable journal, normalization and FIFO group-CAS as Settings.
+                guard await saveNative(outgoing, creating: false, target: captured, preferenceIntents: intents) else { return false }
+                completedSaves += 1
+                if currentPlaybackPrefs() == playback, currentDiscoveryPrefs() == discovery { break }
+                previousCapture = nativeSwitchPreferenceCapture?.id == attempt.id ? nativeSwitchPreferenceCapture : attempt
+            }
+            try await CoreBridge.shared.switchNativeProfile(profile.id, target: captured)
             // An authenticated switch made to edit a profile must not dismiss the picker and
             // its child editor. Ordinary playback/profile selection still completes the picker.
             if finishPicker { pickedThisLaunch = true }
