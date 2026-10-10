@@ -1611,15 +1611,13 @@ struct iOSDetailView: View {
         let bg = meta?.background ?? meta?.poster
             ?? seedBackdrop
             ?? FeaturedHeroItem.metahubBackground(forId: id)
-        return AsyncImage(url: URL(string: bg ?? "")) { phase in
-            switch phase {
-            // Movies carry a 16:9 `background`, so .fill crops cleanly. A SERIES usually has no landscape
-            // background and falls back to the PORTRAIT `poster`; .fill on that in the landscape band crops
-            // it to black bars (the "shows all have cut off hero image" report), so series fit instead.
-            case .success(let img): img.resizable().aspectRatio(contentMode: (effectiveType == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill)
-            default: Theme.Palette.surface1
-            }
-        }
+        // Keep the image request in a child view: the detail body observes a large, frequently changing
+        // state surface while sources settle, but backdrop loading should only restart when the artwork or
+        // its decoded-size budget changes. The child also rejects a late completion from a previous title.
+        iOSCinematicBackdropImage(
+            url: bg,
+            contentMode: (effectiveType == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill
+        )
         .frame(height: height)
         // The backdrop is the ZStack's WIDTH ANCHOR: it greedily takes the full viewport width and
         // pins to the leading edge, so the ZStack's leading edge is the screen's leading edge. Before
@@ -1648,6 +1646,96 @@ struct iOSDetailView: View {
             LinearGradient(colors: [Theme.Palette.canvas.opacity(0.5), .clear],
                            startPoint: .leading, endPoint: .center)
         )
+    }
+
+    /// Full-bleed detail artwork backed by the shared off-main ImageIO loader. The request key includes the
+    /// URL and the viewport budget so a warm image is painted synchronously without ever showing a previous
+    /// title's image. A canceled or superseded task cannot publish its result because both checks are required
+    /// after the shared loader returns.
+    private struct iOSCinematicBackdropImage: View {
+        let url: String?
+        let contentMode: ContentMode
+
+        @Environment(\.displayScale) private var displayScale
+        @State private var image: VXPosterImage?
+        @State private var imageRequest: Request?
+
+        private static let minimumBackdropPixel = 1_280
+        private static let maximumBackdropPixel = 2_048
+
+        private struct Request: Equatable {
+            let url: String?
+            let maxPixel: Int
+        }
+
+        private var candidateURL: String? {
+            guard let url, !url.isEmpty, URL(string: url) != nil else { return nil }
+            return url
+        }
+
+        var body: some View {
+            GeometryReader { viewport in
+                let request = Request(
+                    url: candidateURL,
+                    maxPixel: Self.maxPixel(for: viewport.size, displayScale: displayScale)
+                )
+                Group {
+                    if let image, imageRequest == request {
+                        renderedImage(image)
+                    } else if let cached = cachedImage(for: request) {
+                        renderedImage(cached)
+                    } else {
+                        Theme.Palette.surface1
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .task(id: request) { await load(request) }
+            }
+        }
+
+        private static func maxPixel(for viewport: CGSize, displayScale: CGFloat) -> Int {
+            let scale = displayScale.isFinite && displayScale > 0 ? displayScale : 1
+            let longEdge = max(viewport.width, viewport.height)
+            guard longEdge.isFinite, longEdge > 0 else { return minimumBackdropPixel }
+            let requested = longEdge * scale
+            let bounded = min(
+                CGFloat(maximumBackdropPixel),
+                max(CGFloat(minimumBackdropPixel), requested)
+            )
+            return Int(bounded.rounded(.up))
+        }
+
+        private func cachedImage(for request: Request) -> VXPosterImage? {
+            guard let raw = request.url, let parsed = URL(string: raw) else { return nil }
+            return PosterImageLoader.cached(parsed, maxPixel: CGFloat(request.maxPixel))
+        }
+
+        private func load(_ request: Request) async {
+            guard !Task.isCancelled else { return }
+            // Clear before every new request: `@State` survives a URL change, so the previous image must not
+            // remain eligible while this task is waiting on the network or decode gate.
+            image = nil
+            imageRequest = request
+
+            if let cached = cachedImage(for: request) {
+                guard !Task.isCancelled, imageRequest == request else { return }
+                image = cached
+                return
+            }
+
+            let loaded = await PosterImageLoader.load(request.url, maxPixel: CGFloat(request.maxPixel))
+            guard !Task.isCancelled, imageRequest == request else { return }
+            image = loaded
+        }
+
+        @ViewBuilder
+        private func renderedImage(_ image: VXPosterImage) -> some View {
+            #if canImport(UIKit)
+            Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
+            #else
+            Image(nsImage: image).resizable().aspectRatio(contentMode: contentMode)
+            #endif
+        }
     }
 
     /// H3 / #44: the muted, looping in-hero trailer painted over the still backdrop. The owner wants the WHOLE
