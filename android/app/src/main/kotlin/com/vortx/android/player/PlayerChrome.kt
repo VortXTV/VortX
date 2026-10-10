@@ -225,6 +225,7 @@ fun PlayerChrome(
     episodeOptions: List<Episode> = emptyList(),
     currentSource: StreamSource? = null,
     sourceSwitching: Boolean = false,
+    episodeSwitchPending: Boolean = false,
     sourceSwitchError: String? = null,
     failedEpisode: Episode? = null,
     onRetryEpisode: () -> Unit = {},
@@ -600,7 +601,7 @@ fun PlayerChrome(
                                 1 -> "${qualityChoices.first().label} only"
                                 else -> "${qualityChoices.size} options ›"
                             },
-                            enabled = qualityChoices.any { playerReplacementChoiceEnabled(it.selected) },
+                            enabled = qualityChoices.any { playerReplacementChoiceEnabled(it.selected, episodeSwitchPending) },
                             dismissOnPick = false,
                             onPick = { openSheet = ControlSheet.QUALITY },
                         ),
@@ -617,7 +618,8 @@ fun PlayerChrome(
                     )
                     add(SheetOption(sourcesTitle, false, enabled = false, isHeader = true))
                     if (sourceSwitching) {
-                        add(SheetOption(switchingSource, false, enabled = false, isStatus = true))
+                        add(SheetOption(if (episodeSwitchPending) "Switching episode..." else switchingSource,
+                            false, enabled = false, isStatus = true))
                     } else if (sourceSwitchError != null) {
                         add(
                             SheetOption(
@@ -634,7 +636,7 @@ fun PlayerChrome(
                                 label = choice.label,
                                 selected = choice.selected,
                                 detail = choice.detail,
-                                enabled = playerReplacementChoiceEnabled(choice.selected),
+                                enabled = playerReplacementChoiceEnabled(choice.selected, episodeSwitchPending),
                                 isChoice = true,
                                 dismissOnPick = false,
                                 onPick = { onSwitchSource(choice.source) },
@@ -684,7 +686,8 @@ fun PlayerChrome(
                 title = qualityTitle,
                 options = buildList {
                     if (sourceSwitching) {
-                        add(SheetOption(switchingSource, false, enabled = false, isStatus = true))
+                        add(SheetOption(if (episodeSwitchPending) "Switching episode..." else switchingSource,
+                            false, enabled = false, isStatus = true))
                     } else if (sourceSwitchError != null) {
                         add(
                             SheetOption(
@@ -701,7 +704,7 @@ fun PlayerChrome(
                                 label = choice.label,
                                 selected = choice.selected,
                                 detail = choice.detail,
-                                enabled = playerReplacementChoiceEnabled(choice.selected),
+                                enabled = playerReplacementChoiceEnabled(choice.selected, episodeSwitchPending),
                                 isChoice = true,
                                 dismissOnPick = false,
                                 onPick = { onSwitchSource(choice.source) },

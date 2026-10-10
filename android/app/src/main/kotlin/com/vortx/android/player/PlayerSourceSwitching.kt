@@ -226,10 +226,11 @@ internal data class PlayerEpisodeChoice(
 
 /**
  * A pending resolver is cancellable by selecting a different row. The selected row itself remains
- * inert, but all other choices stay reachable so a slow or non-cooperative resolver cannot trap the
- * viewer behind a "Switching" status message.
+ * inert. Episode choices and source-to-source replacements remain reachable, but source/quality rows
+ * cannot replace a pending episode: its resolver may already own a different episode's source context.
  */
-internal fun playerReplacementChoiceEnabled(selected: Boolean): Boolean = !selected
+internal fun playerReplacementChoiceEnabled(selected: Boolean, episodeSwitchPending: Boolean = false): Boolean =
+    !selected && !episodeSwitchPending
 
 /**
  * Quarantines a terminal callback observed while an old source is being replaced. If that replacement
@@ -358,6 +359,20 @@ internal fun beginPlayerSourceSwitch(
     source: StreamSource,
     authority: PlayerSourceSwitchAuthority,
 ): PlayerSourceSwitchState = beginPlayerSourceSwitch(state, source, authority, automatic = false)
+
+/** The host reads current state before issuing authority, including callbacks from an already open sheet. */
+internal fun requestPlayerSourceSwitch(
+    state: PlayerSourceSwitchState,
+    source: StreamSource,
+    coordinator: PlayerSourceSwitchCoordinator,
+): PlayerSourceSwitchState {
+    // Do not revoke the episode's authority while its context can still be live, even if cancellation
+    // would be requested next. A non-cooperative resolver may not roll that context back immediately.
+    if (state.pendingEpisodeSwitch != null) return state
+    return coordinator.beginRequest(state.outerSessionId)?.let { authority ->
+        beginPlayerSourceSwitch(state, source, authority)
+    } ?: state
+}
 
 internal fun beginPlayerSourceSwitch(
     state: PlayerSourceSwitchState,

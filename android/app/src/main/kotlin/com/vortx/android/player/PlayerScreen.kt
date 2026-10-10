@@ -2028,6 +2028,7 @@ fun PlayerScreen(
             episodeOptions = if (currentOnSwitchEpisode != null) episodeOptions else emptyList(),
             currentSource = sourceSwitchState.currentSource,
             sourceSwitching = sourceSwitchState.isSwitching,
+            episodeSwitchPending = sourceSwitchState.pendingEpisodeSwitch != null,
             sourceSwitchError = sourceSwitchState.errorMessage,
             failedEpisode = sourceSwitchState.failedEpisode,
             onRetryEpisode = {
@@ -2046,13 +2047,10 @@ fun PlayerScreen(
                     resolver != null &&
                     !playerSourceIsCurrent(source, sourceSwitchState.currentSource)
                 ) {
-                    sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
-                    sourceSwitchCoordinator.beginRequest(outerPlaybackSessionId)?.let { authority ->
-                        sourceSwitchState = beginPlayerSourceSwitch(
-                            state = sourceSwitchState,
-                            source = source,
-                            authority = authority,
-                        )
+                    val replacement = requestPlayerSourceSwitch(sourceSwitchState, source, sourceSwitchCoordinator)
+                    if (replacement !== sourceSwitchState) {
+                        sourceTerminalFence.reopenManualRetry(sourceSwitchState.revision)
+                        sourceSwitchState = replacement
                     }
                 }
             },
