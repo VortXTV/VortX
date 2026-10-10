@@ -131,8 +131,16 @@ final class CoreBridge: ObservableObject {
     }
     func nativePlaybackSnapshot() -> VortxJSON? {
         guard let binding = nativeFacadeLock.withLock({ currentNativePlaybackBinding() }),
-              let (facade, _) = nativePlaybackBinding(.native(binding)), let data = facade.stateData("native_playback") else { return nil }
-        return try? JSONDecoder().decode(VortxJSON.self, from: data)
+              let (facade, profile) = nativePlaybackBinding(.native(binding)),
+              let expected = facade.watchlistBinding,
+              expected.profileID == profile.uuidString,
+              expected.accountGeneration == binding.accountGeneration else { return nil }
+        // Keep the captured install/credential owner until the typed value is accepted. The
+        // facade also checks its profile generation, so A -> B -> A cannot revive this read.
+        return nativeFacadeLock.withLock {
+            guard nativeFacadeStorage === facade, currentNativePlaybackBinding() == binding else { return nil }
+            return facade.playbackSnapshot(expected: expected)
+        }
     }
     func captureNativePlaybackTarget() -> PlaybackMutationTarget {
         nativeFacadeLock.withLock { .native(currentNativePlaybackBinding()) }

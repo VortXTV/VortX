@@ -171,6 +171,18 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; guard !closed, let value = values[field] else { return nil }
         return try? JSONEncoder().encode(value)
     }
+    /// Owned, copy-on-write playback value for an exact accepted account/profile generation.
+    /// This is deliberately not a generic state getter: a body-time history read must not
+    /// serialize the whole projection, nor cross a queued transition or profile/account ABA.
+    func playbackSnapshot(expected: WatchlistBinding) -> VortxJSON? {
+        lock.withLock {
+            guard !closed, pendingProfileTransitions == 0, expected.scope == session.scope,
+                  expected.accountGeneration == accountEpoch,
+                  expected.profileGeneration == watchlistProfileGeneration,
+                  values["native_state"]?["activeProfileId"] == .string(expected.profileID) else { return nil }
+            return values["native_playback"]
+        }
+    }
     func profileSnapshot() -> (state: VortxJSON, host: VortxJSON, pending: VortxJSON, generation: UUID)? {
         lock.withLock {
             guard !closed, let state = values["native_state"], let host = values["native_host_preferences"] else { return nil }
