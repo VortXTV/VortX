@@ -47,6 +47,11 @@ private final class CinemaNavigationArtworkPresentation: ObservableObject {
     @Published var artwork: CinemaNavigationArtwork?
     @Published private(set) var detailHeroOpacity: Double = 1
 
+    func clear() {
+        artwork = nil
+        detailHeroOpacity = 1
+    }
+
     func updateDetailHero(minY: CGFloat, navigationHeight: CGFloat) {
         guard minY.isFinite, navigationHeight.isFinite, navigationHeight > 0 else {
             detailHeroOpacity = 1
@@ -288,11 +293,11 @@ struct iOSRootView: View {
         .overlay { CinemaQuickViewOverlay(presenter: quickViewPresenter) }
         .onChange(of: profiles.activeID) { _ in
             quickViewPresenter.close()
-            navigationArtwork = nil
+            navigationArtwork.clear()
         }
         .onChange(of: tab) { newTab in
             quickViewPresenter.close()
-            navigationArtwork = nil
+            navigationArtwork.clear()
             presentUpdateIfReady()
             // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
             VXProbeState.shared.setRoute(newTab.probeName)
