@@ -74,6 +74,8 @@ class ProfileStore private constructor(context: Context) {
 
     /** The launch picker shows once per cold start, and only when there is a real choice to make. */
     var pickedThisLaunch: Boolean = false
+    /** An admitted selection is not a completed account handoff, including on a one-profile device. */
+    internal var selectionPending: Boolean = false
 
     /**
      * Durable cross-device delete tombstones: profile ids the user has DELETED. The app owns this set so
@@ -116,7 +118,7 @@ class ProfileStore private constructor(context: Context) {
     // ---- Derived reads ----
 
     val active: UserProfile? get() = profiles.firstOrNull { it.id == activeID }
-    val needsPicker: Boolean get() = profiles.size > 1 && !pickedThisLaunch
+    val needsPicker: Boolean get() = selectionPending || (profiles.size > 1 && !pickedThisLaunch)
 
     /**
      * The active profile id string, in Apple's canonical uppercase form. `SourcePinStore` reads this for
@@ -298,7 +300,13 @@ class ProfileStore private constructor(context: Context) {
         if (!homeTransitionListeners.contains(listener)) homeTransitionListeners.add(listener)
     }
 
-    private fun notifyHomeTransitionListeners() = homeTransitionListeners.forEach { it() }
+    internal var selectionRevision = 0L
+        private set
+
+    private fun notifyHomeTransitionListeners() {
+        selectionRevision++
+        homeTransitionListeners.forEach { it() }
+    }
     private fun notifySwitchListeners() = switchListeners.forEach { it() }
 
     /**

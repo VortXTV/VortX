@@ -38,6 +38,10 @@ import com.vortx.android.player.PlayerScreen
 import com.vortx.android.player.PlayerEpisodeHandoffRequest
 import com.vortx.android.player.advancePlayerEpisodeHistory
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.BuildConfig
+import com.vortx.android.profile.ProfileSelectionRequest
+import com.vortx.android.profile.ProfileSelectionHandoff
+import com.vortx.android.ui.profilepicker.ProfileSelectionSurface
 import com.vortx.android.sources.SourceSettingsRevision
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.update.UpdatePromptHost
@@ -84,9 +88,17 @@ fun TvApp(
         // marks the launch picked) and dismisses. A single-profile install and a pick already made this launch
         // skip it by construction, because ProfileStore.needsPicker is false in both cases.
         var showPicker by remember { mutableStateOf(profileStore?.needsPicker == true) }
+        var profileSelection by remember { mutableStateOf<ProfileSelectionRequest?>(null) }
+        profileSelection?.let { request ->
+            val handoff = remember(request, auth) { ProfileSelectionHandoff(auth, BuildConfig.NATIVE_ENGINE_ENABLED) }
+            ProfileSelectionSurface(request, handoff,
+                onComplete = { profileSelection = null; showPicker = false },
+                onChooseAgain = { profileSelection = null; showPicker = true })
+            return@VortXTheme
+        }
         if (showPicker) {
             // The picker owns Back, its nested editor and exact native selection admission.
-            TvWhosWatching(onDone = { showPicker = false })
+            TvWhosWatching(onDone = { showPicker = false }, onSelected = { profileSelection = it })
             return@VortXTheme
         }
 
@@ -477,6 +489,7 @@ fun TvApp(
                 // from ANY surface routes through the same `detail` slot and the existing Home -> Detail ->
                 // Play flow is unchanged.
                 TvShell(
+                    onProfileSelected = { profileSelection = it },
                     repo = repo,
                     auth = auth,
                     destination = shellDestination,

@@ -2,6 +2,7 @@ package com.vortx.android.engine
 
 import android.content.Context
 import android.util.Log
+import com.vortx.android.BuildConfig
 import com.vortx.android.VortXApplication
 import com.vortx.android.auth.AuthIdentityStore
 import com.vortx.android.data.AddonPrefsStore
@@ -494,6 +495,13 @@ internal data class HomeSignInAttempt(
     val profile: HomeProfileIdentity,
 )
 
+internal class HomePrincipalBindingProof internal constructor(
+    internal val attempt: HomeSignInAttempt,
+    internal val uid: String,
+    internal val previewVerified: Boolean,
+    internal val minimumEventSequence: Long,
+)
+
 private data class FencedHomeSnapshot(
     val privacy: HomePrivacyPermit,
     val snapshot: HomeSnapshot,
@@ -519,6 +527,7 @@ internal class HomePrivacyFence(
     private var activeAccountUid: String? = null
     private var activeAccountGeneration: Long? = null
     private var previewObservation: PreviewObservation? = null
+    private var principalBindingPreview: Pair<HomePrincipalBindingProof, HomeSignInAttempt>? = null
 
     val isRaised: Boolean
         @Synchronized get() = suppressAccountHistory || suppressContinueWatchingPreview
@@ -554,6 +563,7 @@ internal class HomePrivacyFence(
         minimumPreviewEventSequence = nextPreviewEventSequence
         pendingSignIn = null
         previewObservation = null
+        principalBindingPreview = null
         activeAccountUid = signedInUid?.takeIf { isSignedIn && accountUidVerified }
         activeAccountGeneration = activeAccountUid?.let { generation }
         val accountIsFresh = !isSignedIn || (!signedInUid.isNullOrBlank() && accountUidVerified)
@@ -577,6 +587,7 @@ internal class HomePrivacyFence(
         minimumPreviewEventSequence = nextPreviewEventSequence
         pendingSignIn = null
         previewObservation = null
+        principalBindingPreview = null
         if (accountChanged || principalChanged) {
             suppressAccountHistory = true
             suppressContinueWatchingPreview = true
@@ -599,6 +610,7 @@ internal class HomePrivacyFence(
         activeAccountUid = null
         activeAccountGeneration = null
         previewObservation = null
+        principalBindingPreview = null
         return HomeSignInAttempt(
             id = nextSignInAttemptId,
             requestId = requestId,
@@ -619,6 +631,7 @@ internal class HomePrivacyFence(
         activeAccountUid = null
         activeAccountGeneration = null
         previewObservation = null
+        principalBindingPreview = null
         return capture()
     }
 
@@ -650,6 +663,27 @@ internal class HomePrivacyFence(
         return true
     }
 
+    /** Retain actual preview provenance while adding a verified email to this same account slot. */
+    @Synchronized
+    fun capturePrincipalBinding(attempt: HomeSignInAttempt, uid: String): HomePrincipalBindingProof {
+        check(pendingSignIn == attempt && profile == attempt.profile && uid.isNotBlank())
+        return HomePrincipalBindingProof(attempt, uid, previewObservation == PreviewObservation(
+            attempt.privacyGeneration, attempt.profile, uid), minimumPreviewEventSequence)
+    }
+
+    @Synchronized
+    fun resumeAfterPrincipalBinding(proof: HomePrincipalBindingProof, nextPreviewEventSequence: Long): HomeSignInAttempt {
+        check(proof.attempt.profile.expectedPrincipal == null &&
+            proof.attempt.profile.copy(expectedPrincipal = profile.expectedPrincipal) == profile &&
+            generation == proof.attempt.privacyGeneration + (if (profile == proof.attempt.profile) 0L else 1L)) {
+            "The profile account changed while its identity was being saved."
+        }
+        val next = beginSignIn(proof.attempt.requestId, nextPreviewEventSequence)
+        principalBindingPreview = proof to next
+        if (proof.previewVerified) previewObservation = PreviewObservation(next.privacyGeneration, next.profile, proof.uid)
+        return next
+    }
+
     /**
      * Record a UID-less preview only when its producing engine event belongs to the current account
      * generation and the caller independently verified the current ctx plus persisted bucket uid.
@@ -663,16 +697,24 @@ internal class HomePrivacyFence(
     @Synchronized
     fun noteContinueWatchingRefresh(ticket: HomePreviewTicket, accountUid: String): Boolean {
         if (accountUid.isBlank()) return false
-        if (ticket.eventSequence < minimumPreviewEventSequence) return false
-        if (ticket.privacy.profile != profile) return false
-        val eventGeneration = ticket.privacy.generation
+        // A verifier already running for this exact successful login may finish after the email bind.
+        // Preserve only that witnessed ticket; any unrelated account/profile transition clears it.
+        val rebound = principalBindingPreview?.takeIf { (proof, next) ->
+            proof.uid == accountUid && proof.attempt.privacyGeneration == ticket.privacy.generation &&
+                proof.attempt.profile == ticket.privacy.profile && ticket.eventSequence >= proof.minimumEventSequence &&
+                next.profile == profile && (pendingSignIn == next || activeAccountGeneration == next.privacyGeneration)
+        }?.second
+        if (rebound == null && ticket.eventSequence < minimumPreviewEventSequence) return false
+        val eventProfile = rebound?.profile ?: ticket.privacy.profile
+        if (eventProfile != profile) return false
+        val eventGeneration = rebound?.privacyGeneration ?: ticket.privacy.generation
         val pending = pendingSignIn
         if (
             pending != null &&
             pending.privacyGeneration == eventGeneration &&
-            pending.profile == ticket.privacy.profile
+            pending.profile == eventProfile
         ) {
-            previewObservation = PreviewObservation(eventGeneration, ticket.privacy.profile, accountUid)
+            previewObservation = PreviewObservation(eventGeneration, eventProfile, accountUid)
             return false
         }
         if (
@@ -681,6 +723,7 @@ internal class HomePrivacyFence(
             suppressContinueWatchingPreview
         ) {
             suppressContinueWatchingPreview = false
+            principalBindingPreview = null
             generation += 1
             return true
         }
@@ -954,6 +997,9 @@ class EngineStremioRepository(
     private val homeEventOrder = Any()
     private var homeEventSequence = 0L
     private val authAttemptCoordinator = AuthAttemptCoordinator()
+    private var pendingProfileSelection: com.vortx.android.profile.ProfileSelectionRequest? = null
+    private var observedEngineAuth: AuthState = AuthState.SignedOut
+    private var engineAuthRevision = 0L
     private val homePrivacyFence = HomePrivacyFence(initialProfile = currentHomeProfileIdentity())
 
     init {
@@ -1322,9 +1368,11 @@ class EngineStremioRepository(
     /// Pull `ctx`, parse it into [AuthState], publish it, and keep [identityStore] in sync (a display
     /// cache only -- see its doc comment; the engine's own `ctx.profile.auth` stays authoritative).
     private fun refreshAuthState() {
-        val state = EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField()))
         ContinueWatchingOwnerGate.serialized {
-            val ownerChanged = authPrincipal(_authState.value) != authPrincipal(state)
+            val state = EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField()))
+            val ownerChanged = authPrincipal(observedEngineAuth) != authPrincipal(state)
+            observedEngineAuth = state
+            if (ownerChanged) engineAuthRevision++
             val unexpectedIdentityClear = if (ownerChanged && !authTransition.inProgress) {
                 synchronized(homeEventOrder) {
                     homePrivacyFence.invalidateAccount(homeEventSequence + 1)
@@ -1332,10 +1380,11 @@ class EngineStremioRepository(
             } else {
                 null
             }
-            _authState.value = state
+            // A resident outgoing session is not the selected profile's accepted session.
+            _authState.value = if (pendingProfileSelection == null) state else AuthState.SignedOut
             if (ownerChanged) ContinueWatchingOwnerGate.advance()
-            when (state) {
-                is AuthState.SignedIn -> identityStore.rememberSignedIn(state.email)
+            when (val published = _authState.value) {
+                is AuthState.SignedIn -> identityStore.rememberSignedIn(published.email)
                 AuthState.SignedOut -> identityStore.forget()
             }
             unexpectedIdentityClear?.let(homePrivacyClears::tryEmit)
@@ -3415,13 +3464,69 @@ class EngineStremioRepository(
 
     // ---- AuthRepository ----
 
+    override suspend fun completeProfileSelection(request: com.vortx.android.profile.ProfileSelectionRequest): Result<Boolean> =
+        runCatchingPreservingCancellation {
+            check(!BuildConfig.NATIVE_ENGINE_ENABLED) { "Native profiles own their account selection." }
+            val sameAccount = ContinueWatchingOwnerGate.serialized { revision ->
+                request.requireCurrent()
+                check(revision == request.ownerRevision) { "The account changed. Choose the profile again." }
+                val state = EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField()))
+                val matches = request.expectedEmail?.let { expected ->
+                    (state as? AuthState.SignedIn)?.email?.trim()?.lowercase() == expected
+                } ?: (!request.profile.usesOwnAccount || request.profile.isOwner)
+                if (request.outcome == ProfileStore.SwitchOutcome.SameAccount && pendingProfileSelection == null && matches) true
+                else {
+                    pendingProfileSelection = request
+                    val clear = synchronized(homeEventOrder) { homePrivacyFence.invalidateAccount(homeEventSequence + 1) }
+                    _authState.value = AuthState.SignedOut
+                    identityStore.forget()
+                    homePrivacyClears.tryEmit(clear)
+                    ContinueWatchingOwnerGate.advance()
+                    false
+                }
+            }
+            if (sameAccount) true
+            else when (val outcome = request.outcome) {
+                is ProfileStore.SwitchOutcome.SwitchAccount -> {
+                    authenticate(EngineActions.authenticateToken(outcome.token), EngineState.tokenAuthRequestId(outcome.token), request).getOrThrow()
+                    true
+                }
+                else -> false
+            }
+        }
+
+    override suspend fun signInForProfileSelection(
+        request: com.vortx.android.profile.ProfileSelectionRequest, email: String, password: String,
+    ): Result<Unit> = runCatchingPreservingCancellation {
+        request.requireCurrent()
+        check(pendingProfileSelection === request) { "The account changed. Choose the profile again." }
+        require(email.isNotBlank() && password.isNotBlank()) { "Enter your email and password." }
+        check(request.expectedEmail == null || request.expectedEmail == email.trim().lowercase()) {
+            "Sign in to the account connected to this profile."
+        }
+        authenticate(EngineActions.authenticateLogin(email.trim(), password), EngineState.authRequestId(email.trim(), password), request, email.trim().lowercase()).getOrThrow()
+    }
+
     override suspend fun signIn(email: String, password: String): Result<Unit> {
         if (email.isBlank() || password.isBlank()) {
             return Result.failure(IllegalArgumentException("Enter your email and password."))
         }
-        val authAttempt = runCatching { authTransition.begin() }
+        if (pendingProfileSelection != null) return Result.failure(IllegalStateException("Finish choosing your profile first."))
+        return authenticate(EngineActions.authenticateLogin(email, password), EngineState.authRequestId(email, password))
+    }
+
+    private suspend fun authenticate(
+        action: String,
+        authRequestId: String,
+        selection: com.vortx.android.profile.ProfileSelectionRequest? = null,
+        expectedLoginEmail: String? = null,
+    ): Result<Unit> {
+        val authAttempt = runCatching { ContinueWatchingOwnerGate.serialized {
+            selection?.requireCurrent()
+            check(selection === pendingProfileSelection) { "The account changed. Choose the profile again." }
+            authTransition.begin()
+        } }
             .getOrElse { return Result.failure(it) }
-        val authRequestId = EngineState.authRequestId(email, password)
         val authLease = authAttemptCoordinator.begin(authRequestId)
         if (authLease == null) {
             authTransition.finish(authAttempt)
@@ -3431,7 +3536,7 @@ class EngineStremioRepository(
                 ),
             )
         }
-        val privacyAttempt = synchronized(homeEventOrder) {
+        var privacyAttempt = synchronized(homeEventOrder) {
             homePrivacyFence.beginSignIn(
                 requestId = authRequestId,
                 nextPreviewEventSequence = homeEventSequence + 1,
@@ -3442,7 +3547,7 @@ class EngineStremioRepository(
         val result = try {
             runCatchingPreservingCancellation {
                 val attemptOutcome = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
-                    StremioCoreNative.dispatch(EngineActions.authenticateLogin(email, password))
+                    StremioCoreNative.dispatch(action)
                     dispatched = true
                     authLease.outcome.await()
                 } ?: throw IllegalStateException("Sign-in timed out. Check your connection and try again.")
@@ -3450,9 +3555,18 @@ class EngineStremioRepository(
                     throw IllegalStateException(attemptOutcome.message)
                 }
                 withContext(Dispatchers.Default) { refreshAuthState() }
-                val signedIn = _authState.value as? AuthState.SignedIn
-                    ?: throw IllegalStateException("Sign-in failed. Check your connection and try again.")
-                if (!engineHistoryPrincipalMatches(ProfileStore.sharedOrNull()?.active, signedIn)) {
+                val (signedIn, acceptedAuthRevision) = ContinueWatchingOwnerGate.serialized {
+                    val state = EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField())) as? AuthState.SignedIn
+                        ?: throw IllegalStateException("Sign-in failed. Check your connection and try again.")
+                    state to engineAuthRevision
+                }
+                selection?.requireCurrent()
+                val expectedPrincipal = selection?.expectedEmail ?: expectedLoginEmail
+                if (selection != null && expectedPrincipal != null &&
+                    signedIn.email?.trim()?.lowercase() != expectedPrincipal) {
+                    throw IllegalStateException("Sign in to the account connected to this profile.")
+                }
+                if (selection == null && !engineHistoryPrincipalMatches(ProfileStore.sharedOrNull()?.active, signedIn)) {
                     throw IllegalStateException(
                         "The signed-in account does not match this profile's own-account identity.",
                     )
@@ -3470,8 +3584,25 @@ class EngineStremioRepository(
                 if (!accountUidVerified) {
                     throw IllegalStateException("Sign-in completed, but account data did not finish loading. Try again.")
                 }
-                check(homePrivacyFence.completeSignIn(privacyAttempt, uid)) {
-                    "The active profile or account changed while sign-in was finishing."
+                ContinueWatchingOwnerGate.serialized {
+                    selection?.requireCurrent()
+                    check(selection === pendingProfileSelection) { "The account changed. Choose the profile again." }
+                    check(engineAuthRevision == acceptedAuthRevision &&
+                        EngineState.parseAuthState(StremioCoreNative.getState(EngineActions.ctxField())) == signedIn) {
+                        "The account changed while sign-in was finishing. Choose the profile again."
+                    }
+                    val bindingProof = homePrivacyFence.capturePrincipalBinding(privacyAttempt, uid)
+                    if (selection?.bindPrincipal(signedIn.email) == true) {
+                        privacyAttempt = synchronized(homeEventOrder) {
+                            homePrivacyFence.resumeAfterPrincipalBinding(bindingProof, homeEventSequence + 1)
+                        }
+                    }
+                    check(homePrivacyFence.completeSignIn(privacyAttempt, uid)) {
+                        "The active profile or account changed while sign-in was finishing."
+                    }
+                    pendingProfileSelection = null
+                    _authState.value = signedIn
+                    identityStore.rememberSignedIn(signedIn.email)
                 }
                 Unit
             }
@@ -3496,6 +3627,7 @@ class EngineStremioRepository(
             // Continue Watching mutation cannot enter between them.
             authTransition.cancelActive()
             authAttemptCoordinator.abandonActive()
+            pendingProfileSelection = null
             val clear = synchronized(homeEventOrder) {
                 var permit: HomePrivacyPermit? = null
                 homePrivacyFence.beforeLogout(

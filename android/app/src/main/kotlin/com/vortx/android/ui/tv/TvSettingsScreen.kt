@@ -99,6 +99,7 @@ import com.vortx.android.player.PerformanceMode
 import com.vortx.android.player.SubtitleStyle
 import com.vortx.android.player.LoudnessNormalizationSetting
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.tv.TopShelfSettings
 import com.vortx.android.tv.WatchNextPublisher
@@ -127,6 +128,7 @@ fun TvSettingsScreen(
     // Opening a title from a Settings-nested browse surface (the Upcoming screen) routes back up to the shell's
     // shared detail flow. Default no-op keeps the screen usable in a @Preview / test.
     onItem: (MetaItem) -> Unit = {},
+    onProfileSelected: (ProfileSelectionRequest) -> Unit = {},
 ) {
     val appContext = LocalContext.current.applicationContext
     val homeRailPreferences = remember(appContext) { HomeRailPreferences.shared(appContext) }
@@ -192,7 +194,7 @@ fun TvSettingsScreen(
         ?: remember { mutableStateOf(null) })
 
     if (route == TvSettingsRoute.PROFILES) {
-        TvProfilesScreen(onBack = { route = TvSettingsRoute.ROOT; refresh++; restoreProfilesFocus = true }, modifier = modifier)
+        TvProfilesScreen(onBack = { route = TvSettingsRoute.ROOT; refresh++; restoreProfilesFocus = true }, onSelected = onProfileSelected, modifier = modifier)
         return
     }
 

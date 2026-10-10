@@ -46,6 +46,7 @@ import com.vortx.android.iptv.LiveViewModel
 import com.vortx.android.model.AuthState
 import com.vortx.android.model.MetaItem
 import com.vortx.android.model.Playable
+import com.vortx.android.profile.ProfileSelectionRequest
 import com.vortx.android.sync.VortXSyncManager
 import com.vortx.android.ui.prefs.TabBarPrefs
 import com.vortx.android.ui.prefs.HomeDiscoverPreferences
@@ -107,6 +108,7 @@ fun TvShell(
     // the shell usable in a @Preview / test.
     onPlayLocal: (Playable) -> Unit = {},
     syncManager: VortXSyncManager? = null,
+    onProfileSelected: (ProfileSelectionRequest) -> Unit = {},
 ) {
     val appContext = LocalContext.current.applicationContext
     // Bumped when the active tab is re-selected on the rail. A depth-aware destination (Add-ons) pops its own
@@ -302,7 +304,7 @@ fun TvShell(
                         onExit = { onDestinationChange(TvDestination.HOME) },
                     )
                 TvDestination.SETTINGS ->
-                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem)
+                    TvSettingsScreen(repo = repo, auth = auth, syncManager = syncManager, onItem = onItem, onProfileSelected = onProfileSelected)
             }
 
             // Quiet "You're offline" chip pinned to the bottom of the active surface while the device has no

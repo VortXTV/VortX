@@ -81,6 +81,16 @@ class TvProfilesRouteTest {
         compose.onNodeWithTag("tv-profile-${owner.id}").assertIsFocused()
     }
 
+    @Test fun managementSelectionDeliversTypedRequestToItsHost() {
+        val gateway = FixtureGateway(listOf(owner, other))
+        var selected: com.vortx.android.profile.ProfileSelectionRequest? = null
+        compose.setContent { VortXTheme { TvProfileManagement(gateway, onBack = {}, onSelected = { selected = it }) } }
+        enter("tv-profile-${other.id}")
+        assertEquals(other.id, selected?.profile?.id)
+        assertEquals(com.vortx.android.profile.ProfileStore.SwitchOutcome.SameAccount, selected?.outcome)
+        assertEquals(other.id, gateway.active)
+    }
+
     @Test fun pickerAddPersistsReloadsAndBackReturnsFocusToAdd() {
         val gateway = FixtureGateway(listOf(owner, other))
         compose.setContent { VortXTheme { TvProfilePicker(gateway, onDone = {}) } }
@@ -200,8 +210,12 @@ class TvProfilesRouteTest {
                 if (version != revision || active != before.activeID) false else runCatching { action(); true }.getOrDefault(false)
             }
         }
-        override fun select(profile: UserProfile, admission: TvProfileGateway.Admission): String? =
-            if (admission.commit { active = profile.id; revision++ }) null else "Profile changed"
+        override fun select(profile: UserProfile, admission: TvProfileGateway.Admission): Result<com.vortx.android.profile.ProfileSelectionRequest> = runCatching {
+            check(admission.commit { active = profile.id; revision++ }) { "Profile changed" }
+            val selectedRevision = revision
+            com.vortx.android.profile.ProfileSelectionRequest(profile, com.vortx.android.profile.ProfileStore.SwitchOutcome.SameAccount,
+                profile.email, selectedRevision.toLong(), { active == profile.id && revision == selectedRevision })
+        }
         override fun save(profile: UserProfile, adding: Boolean, admission: TvProfileGateway.Admission): Boolean = admission.commit {
             encoded = UserProfile.encodeRoster(if (adding) read().profiles + profile else read().profiles.map { if (it.id == profile.id) profile else it })
             revision++

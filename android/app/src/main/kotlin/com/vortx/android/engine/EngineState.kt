@@ -413,6 +413,10 @@ internal object EngineState {
         }
     }
 
+    fun tokenAuthRequestId(token: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(("LoginWithToken\u0000" + token).toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
     /** Parse only a login result whose serialized auth request carries an exact request identity. */
     fun parseAuthAttemptOutcome(json: String): AuthAttemptOutcome? {
         val event = json.toJsonObjectOrNull() ?: return null
@@ -434,6 +438,8 @@ internal object EngineState {
 
     private fun loginRequestId(authEvent: JSONObject): String? {
         val request = authEvent.optJSONObject("args")?.optJSONObject("auth_request") ?: return null
+        if (request.optString("type") == "LoginWithToken")
+            return request.optStringOrNull("token")?.takeIf { it.isNotBlank() }?.let(::tokenAuthRequestId)
         if (request.optString("type") != "Login") return null
         val email = request.optStringOrNull("email") ?: return null
         val password = request.optStringOrNull("password") ?: return null

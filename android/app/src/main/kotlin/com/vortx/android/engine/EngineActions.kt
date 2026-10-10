@@ -295,6 +295,10 @@ object EngineActions {
             ),
         )
 
+    /** stremio-core AuthRequest::LoginWithToken; replaces the local session without revoking the outgoing token. */
+    fun authenticateToken(token: String): String = ctxEnvelope(action("Authenticate",
+        JSONObject().put("type", "LoginWithToken").put("token", token)))
+
     /// Sign out. Destroys the engine's server-side session (mirrors Apple's plain `Logout`, used only
     /// for an explicit user sign-out, never for a profile switch) and clears `ctx.profile.auth`.
     fun logout(): String = ctxEnvelope(action("Logout", null))

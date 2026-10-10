@@ -41,6 +41,9 @@ import androidx.tv.material3.Surface
 import com.vortx.android.BuildConfig
 import com.vortx.android.VortXApplication
 import com.vortx.android.profile.ProfileStore
+import com.vortx.android.profile.ContinueWatchingOwnerGate
+import com.vortx.android.profile.ProfileSelectionRequest
+import com.vortx.android.profile.captureProfileSelection
 import com.vortx.android.profile.UserProfile
 import com.vortx.android.ui.screens.profiles.normalizeCustomAvatar
 import com.vortx.android.ui.theme.VortXAccents
@@ -50,11 +53,11 @@ import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
 
 /** Presentation adapter only: all durable roster, overlay and tombstone operations stay in ProfileStore. */
 internal interface TvProfileGateway {
-    data class Snapshot(val profiles: List<UserProfile>, val activeID: String?)
+    data class Snapshot(val profiles: List<UserProfile>, val activeID: String?, val selectionPending: Boolean = false)
     class Admission internal constructor(internal val commit: (() -> Unit) -> Boolean)
     fun read(): Snapshot
     fun capture(profile: UserProfile, adding: Boolean = false, selection: Boolean = false): Admission?
-    fun select(profile: UserProfile, admission: Admission): String?
+    fun select(profile: UserProfile, admission: Admission): Result<ProfileSelectionRequest>
     fun save(profile: UserProfile, adding: Boolean, admission: Admission): Boolean
     fun remove(profile: UserProfile, admission: Admission): Boolean
 }
@@ -65,8 +68,8 @@ internal class StoreTvProfileGateway(
 ) : TvProfileGateway {
     override fun read(): TvProfileGateway.Snapshot = if (BuildConfig.NATIVE_ENGINE_ENABLED) {
         val state = native?.state?.value
-        TvProfileGateway.Snapshot(state?.profiles.orEmpty(), state?.activeID)
-    } else TvProfileGateway.Snapshot(store.profiles, store.activeID)
+        TvProfileGateway.Snapshot(state?.profiles.orEmpty(), state?.activeID, store.selectionPending)
+    } else TvProfileGateway.Snapshot(store.profiles, store.activeID, store.selectionPending)
 
     override fun capture(profile: UserProfile, adding: Boolean, selection: Boolean): TvProfileGateway.Admission? {
         if (BuildConfig.NATIVE_ENGINE_ENABLED) {
@@ -74,24 +77,30 @@ internal class StoreTvProfileGateway(
             val editor = if (selection) model.captureSelection(profile) else model.captureEditor(profile, adding)
             return editor?.let { TvProfileGateway.Admission { action -> model.commitEditor(it, action) } }
         }
-        val before = read()
+        val (before, revision) = ContinueWatchingOwnerGate.serialized { read() to it }
         if ((!selection && !adding && before.activeID != profile.id) ||
             (if (adding) before.profiles.any { it.id == profile.id } else before.profiles.none { it == profile })) return null
-        return TvProfileGateway.Admission { action -> runCatching {
+        return TvProfileGateway.Admission { action -> runCatching { ContinueWatchingOwnerGate.serialized { currentRevision ->
             val current = read()
+            check(currentRevision == revision)
+            check(current.profiles === before.profiles)
             check(current.activeID == before.activeID)
             check(if (adding) current.profiles.none { it.id == profile.id } else current.profiles.any { it == profile })
             action(); true
-        }.getOrDefault(false) }
+        } }.getOrDefault(false) }
     }
 
-    override fun select(profile: UserProfile, admission: TvProfileGateway.Admission): String? {
-        var outcome: ProfileStore.SwitchOutcome = ProfileStore.SwitchOutcome.SameAccount
-        if (!admission.commit { outcome = store.select(profile) }) return "The profile changed. Open it again before switching."
-        return when (outcome) {
-            ProfileStore.SwitchOutcome.SameAccount -> null
-            else -> "This profile's separate account could not be switched here. The current account session remains in use."
+    override fun select(profile: UserProfile, admission: TvProfileGateway.Admission): Result<ProfileSelectionRequest> = runCatching {
+        var request: ProfileSelectionRequest? = null
+        check(admission.commit {
+            val outcome = store.select(profile)
+            val after = if (BuildConfig.NATIVE_ENGINE_ENABLED) checkNotNull(native?.captureSelection(checkNotNull(store.active))) else null
+            request = captureProfileSelection(store, profile, outcome,
+                nativeAdmission = after?.let { captured -> { checkNotNull(native).commitEditor(captured) {} } })
+        }) {
+            "The profile changed. Open it again before switching."
         }
+        checkNotNull(request)
     }
 
     override fun save(profile: UserProfile, adding: Boolean, admission: TvProfileGateway.Admission): Boolean = admission.commit {
@@ -128,7 +137,7 @@ internal fun rememberTvProfileGateway(): TvProfileGateway? {
 }
 
 @Composable
-fun TvProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
+fun TvProfilesScreen(onBack: () -> Unit, onSelected: (ProfileSelectionRequest) -> Unit, modifier: Modifier = Modifier) {
     val gateway = rememberTvProfileGateway()
     if (gateway == null) {
         Column(modifier.fillMaxSize().padding(TvDimens.edge), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -138,7 +147,7 @@ fun TvProfilesScreen(onBack: () -> Unit, modifier: Modifier = Modifier) {
         BackHandler(onBack = onBack)
         return
     }
-    TvProfileManagement(gateway, onBack = onBack, modifier = modifier)
+    TvProfileManagement(gateway, onBack = onBack, onSelected = onSelected, modifier = modifier)
 }
 
 /** The actual TV route is injectable for synthetic gateway / Compose remote tests without an account. */
@@ -147,6 +156,7 @@ internal fun TvProfileManagement(
     gateway: TvProfileGateway,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
+    onSelected: (ProfileSelectionRequest) -> Unit = {},
     startAdding: Boolean = false,
     startEditing: Boolean = false,
     returnAfterEditor: Boolean = false,
@@ -176,7 +186,10 @@ internal fun TvProfileManagement(
         else if (restoreKey != "add" && gateway.read().profiles.none { it.id == restoreKey }) restoreKey = gateway.read().activeID ?: "add"
     }
     fun select(profile: UserProfile, captured: TvProfileGateway.Admission) {
-        message = gateway.select(profile, captured); pending = null; restoreKey = profile.id; refresh++
+        gateway.select(profile, captured).fold(onSuccess = onSelected, onFailure = {
+            message = "The profile changed. Open it again before switching."
+        })
+        pending = null; restoreKey = profile.id; refresh++
     }
 
     LaunchedEffect(Unit) {
