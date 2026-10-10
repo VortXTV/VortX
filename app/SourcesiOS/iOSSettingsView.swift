@@ -6,6 +6,22 @@ import CoreTransferable
 import UIKit
 #endif
 
+#if os(macOS)
+/// Minimum readable typography for the dense desktop Settings form. Semantic child styles such as
+/// footnote and caption inherit the same Dynamic Type floor, while larger accessibility sizes pass
+/// through unchanged. This modifier is applied only to the macOS Settings form.
+private struct MacSettingsTypography: ViewModifier {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .body) private var bodyPointSize: CGFloat = 16
+
+    func body(content: Content) -> some View {
+        content
+            .font(.system(size: bodyPointSize))
+            .dynamicTypeSize(max(dynamicTypeSize, .xxxLarge))
+    }
+}
+#endif
+
 /// A lazy share-sheet payload for the rolling diagnostic log. `ShareLink` asks this representation for
 /// the file only after the owner taps it, so rebuilding Settings never rereads and rewrites the entire log.
 /// The produced file is still a sanitised copy rather than the live cache file.
@@ -545,6 +561,7 @@ struct iOSSettingsView: View {
             .formStyle(.grouped)
             .scrollContentBackground(.hidden)
             .listRowInsets(settingsRowInsets)
+            .modifier(MacSettingsTypography())
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(VortXProfileGlassCanvas(tint: Theme.Palette.accent).ignoresSafeArea())
         }
@@ -2000,7 +2017,11 @@ struct iOSSettingsView: View {
             Toggle("Prefer add-on subtitles", isOn: $preferAddonSubtitles)
                 .tint(Theme.Palette.accent)
             Text("Use a matching add-on subtitle when available. Keep the built-in track if loading fails.")
+                #if os(macOS)
+                .font(.footnote).foregroundStyle(Theme.Palette.textSecondary)
+                #else
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                #endif
             Toggle("Recognize image subtitles", isOn: $recogniseImageSubtitles)
                 .tint(Theme.Palette.accent)
         } header: {

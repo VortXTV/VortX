@@ -107,20 +107,54 @@ final class AddonHealthStore: ObservableObject {
 /// iPad/Mac. Keeping this switch in one modifier changes only presentation; all action rows remain live.
 private struct AddonSurfaceModifier: ViewModifier {
     let wide: Bool
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if wide {
-            content.vortxCinemaCard()
-        } else {
-            content.vortxSettingsCard()
-        }
+        #if os(tvOS)
+        // Keep the existing opaque, remote-focus surface on Apple TV.
+        content.vortxSettingsCard()
+        #else
+        let radius = wide ? Theme.Radius.card + 4 : Theme.Radius.card
+        content.vortxGlassTintedSurface(
+            in: RoundedRectangle(cornerRadius: radius, style: .continuous),
+            fillAlpha: VortXGlass.cardFillAlpha,
+            tint: Theme.Palette.accent,
+            tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                reduceTransparency: reduceTransparency, highContrast: contrast == .increased),
+            shadow: .card,
+            contained: true,
+            forceOpaque: reduceTransparency || contrast == .increased)
+        #endif
     }
 }
 
 private extension View {
     func addonSurface(wide: Bool) -> some View {
         modifier(AddonSurfaceModifier(wide: wide))
+    }
+}
+
+/// Gives a vertical panel an explicit viewport width and centers a capped content column within it.
+/// Keeping both frame owners together makes this behavior testable without constructing AddonsView's
+/// account, engine, and profile stores.
+private struct AddonPanelScrollContainer<Content: View>: View {
+    let maxContentWidth: CGFloat
+    let content: Content
+
+    init(maxContentWidth: CGFloat, @ViewBuilder content: () -> Content) {
+        self.maxContentWidth = maxContentWidth
+        self.content = content()
+    }
+
+    var body: some View {
+        ScrollView {
+            content
+                .frame(maxWidth: maxContentWidth, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -169,7 +203,7 @@ struct AddonsView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
+            AddonPanelScrollContainer(maxContentWidth: usesWideAddonLayout ? 1120 : .infinity) {
                 VStack(alignment: .leading, spacing: usesCompactAddonLayout ? Theme.Space.md : Theme.Space.lg) {
                     // Read the shared order revision so a reorder (in-app drag or remote pull) re-runs body and
                     // re-sorts the ForEach below via orderedByApplied. Must be READ in body to be tracked.
@@ -267,8 +301,6 @@ struct AddonsView: View {
                 }
                 .padding(.horizontal, usesCompactAddonLayout ? Theme.Space.sm : Theme.Space.screenInset)
                 .padding(.vertical, usesCompactAddonLayout ? Theme.Space.md : Theme.Space.xl)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .frame(maxWidth: usesWideAddonLayout ? 1120 : .infinity, alignment: .center)
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
@@ -291,6 +323,7 @@ struct AddonsView: View {
                 Text("This add-on is already installed. Update it to its latest manifest?")
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var installSection: some View {
