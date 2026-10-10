@@ -156,6 +156,14 @@ enum Theme {
     }
 }
 
+/// Home-only atmosphere stays near black; increased contrast removes decorative color entirely.
+enum HomeAtmospherePolicy {
+    static func alpha(reduceTransparency: Bool, highContrast: Bool) -> Double {
+        if highContrast { return 0 }
+        return reduceTransparency ? 0.02 : 0.05
+    }
+}
+
 // MARK: - Text role helpers (font + tracking + default color in one place)
 
 extension View {

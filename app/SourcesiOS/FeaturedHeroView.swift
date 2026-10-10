@@ -6,6 +6,26 @@ import UIKit   // UIScreen / UIDevice for the screen-proportional hero band heig
 import AppKit  // NSApplication / NSScreen for the window-proportional macOS hero band height
 #endif
 
+/// A tint belongs to the exact displayed title/artwork, not whichever async sample finishes last.
+struct FeaturedHeroTintKey: Equatable {
+    let id: String?
+    let type: String?
+    let artwork: String?
+}
+
+struct FeaturedHeroTintSnapshot<Tint> {
+    let key: FeaturedHeroTintKey
+    let tint: Tint?
+
+    static func accepting(_ tint: Tint?, for requested: FeaturedHeroTintKey,
+                          current: FeaturedHeroTintKey, isCancelled: Bool) -> Self? {
+        guard !isCancelled, requested == current else { return nil }
+        return Self(key: requested, tint: tint)
+    }
+
+    func value(for current: FeaturedHeroTintKey) -> Tint? { key == current ? tint : nil }
+}
+
 /// The ambient featured hero shown at the top of Home, Library, and Discover, the touch/Mac twin of
 /// the tvOS browse hero. It mirrors the `iOSDetailView` hero's visual language: a full-bleed
 /// `meta.background` STILL backdrop with the same dual-gradient scrim, a logo-or-serif-title, the
@@ -29,6 +49,9 @@ struct FeaturedHeroView: View {
     /// An optional ember uppercase kicker rendered above the title, the redesign mockup's "Featured" hero
     /// eyebrow. Only Home passes it; Library / Discover / Browse leave it nil so their heroes are unchanged.
     var eyebrow: String? = nil
+    /// Home alone continues the existing cached art tint into its upper canvas. Other heroes
+    /// leave this nil; no image loading or analysis is added by the surrounding page.
+    var onTintChange: (@MainActor (FeaturedHeroTintSnapshot<Color>) -> Void)? = nil
 
     @ObservedObject private var l10n = LocalizedMetadataStore.shared   // localized hero title/logo override
     @EnvironmentObject private var theme: ThemeManager
@@ -58,7 +81,13 @@ struct FeaturedHeroView: View {
     /// painted as the band's BASE layer in place of flat canvas, so the load-in / fallback state and the
     /// atmosphere behind the art already carry the title's palette. nil (no art / not computed yet) keeps
     /// today's fixed canvas + gradients exactly, so this is purely additive ambience.
-    @State private var heroTint: Color?
+    @State private var heroTint: FeaturedHeroTintSnapshot<Color>?
+
+    private var heroTintKey: FeaturedHeroTintKey {
+        .init(id: model.hero?.id, type: model.hero?.type,
+              artwork: model.hero?.backdrop ?? model.hero?.poster)
+    }
+    private var currentHeroTint: Color? { heroTint?.value(for: heroTintKey) }
 
 
     /// Hero band height. iPhone: the billboard must command MORE THAN HALF the screen (owner ask), so the
@@ -166,12 +195,11 @@ struct FeaturedHeroView: View {
                    value: model.hero?.id)
         // Dynamic dominant-color backdrop: recompute the band's base tint per featured title, off-main and
         // cached (PosterImageLoader.averageColor). Cross-fades with the art; nil keeps the canvas fallback.
-        .task(id: model.hero?.id) {
-            let tint = await PosterImageLoader.averageColor(model.hero?.backdrop ?? model.hero?.poster)
-            guard !Task.isCancelled else { return }
-            withAnimation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade)) {
-                heroTint = tint
-            }
+        .task(id: heroTintKey) {
+            let requested = heroTintKey
+            await MainActor.run { publishHeroTint(nil, for: requested) }
+            let tint = await PosterImageLoader.averageColor(requested.artwork)
+            await MainActor.run { publishHeroTint(tint, for: requested) }
         }
         // FALLBACK cover (iOS/Mac, no server): the keyless WKWebView IFrame, used only when the native /yt
         // resolver is unavailable (Lite build) but a YouTube id exists. Fills the window on macOS too.
@@ -187,6 +215,16 @@ struct FeaturedHeroView: View {
                          onClose: { trailerPlay = nil })
                 .id(launch.id)
                 .ignoresSafeArea()
+        }
+    }
+
+    @MainActor
+    private func publishHeroTint(_ tint: Color?, for requested: FeaturedHeroTintKey) {
+        guard let snapshot = FeaturedHeroTintSnapshot.accepting(tint, for: requested,
+            current: heroTintKey, isCancelled: Task.isCancelled) else { return }
+        withAnimation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade)) {
+            heroTint = snapshot
+            onTintChange?(snapshot)
         }
     }
 
@@ -249,7 +287,7 @@ struct FeaturedHeroView: View {
                 // band already carries the title's palette while the art streams in (and whenever a layer
                 // above misses). nil = today's flat canvas, the graceful fallback. STATIC on purpose: a
                 // solid tint has no visible pan, so leaving it off the render path is pixel-identical.
-                (heroTint ?? Theme.Palette.canvas)
+                (currentHeroTint ?? Theme.Palette.canvas)
                 // Poster fallback layer: a slow or failed backdrop request must never leave a flat black
                 // band (the iPhone "no backdrop" report). The poster is the catalog art the screen already
                 // loaded, so it's almost always available; the layer host paints the band-filling art over
@@ -307,7 +345,7 @@ struct FeaturedHeroView: View {
         } else {
             // Dominant-color tint while the owned progressive loader fetches/decodes the art (falls to
             // canvas with no tint). This path never starts a second request.
-            (heroTint ?? Theme.Palette.canvas)
+            (currentHeroTint ?? Theme.Palette.canvas)
                 .accessibilityHidden(true)
         }
     }

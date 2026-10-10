@@ -30,15 +30,15 @@ expect(sourceText.contains("UIDevice.current.userInterfaceIdiom == .phone")
        "compact Home presentation is limited to a compact iPhone width")
 
 expect(home.contains("private var homeAmbientCanvas: some View")
-       && home.contains("Theme.Palette.accent.opacity(alpha)")
-       && home.contains("reduceTransparency"),
-       "Home uses a restrained accent wash with an accessibility transparency fallback")
+       && home.contains("HomeCinemaAtmosphere(tint: homeHeroTint?.value(for: homeHeroTintKey) ?? Theme.Palette.accent")
+       && home.contains("reduceTransparency: reduceTransparency, highContrast: accessibilityContrast == .increased"),
+       "Home reuses its current hero tint with a profile-accent and accessibility fallback")
 expect(home.contains("FeaturedHeroView(model: hero, onOpen: { path.append($0) }")
        && home.contains("RoundedRectangle(cornerRadius: 28, style: .continuous)")
        && home.contains(".padding(.horizontal, 16)"),
        "phone Home wraps the shared hero in a continuous rounded inset card")
 expect(home.contains("if compactPhoneHome")
-       && home.contains("else {\n            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: \"Featured\"))"),
+       && home.contains("else {\n            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: \"Featured\"),"),
        "iPad and Mac keep the existing direct shared-hero call site")
 expect(home.contains("reduceMotion") && home.contains("onOpen: { path.append($0) }"),
        "the local wrapper preserves hero rotation accessibility and navigation actions")

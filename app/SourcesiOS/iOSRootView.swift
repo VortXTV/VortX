@@ -1033,6 +1033,30 @@ private struct iOSCWPresentationSnapshot {
     let localInput: [AppleHomeHistoryProjection.Key]
 }
 
+/// A static Home-only continuation of the hero palette. No blur, material, image work or
+/// animation loop: the theme canvas remains opaque, including OLED's true-black base.
+private struct HomeCinemaAtmosphere: View {
+    let tint: Color
+    let reduceTransparency: Bool
+    let highContrast: Bool
+    let reach: CGFloat
+
+    var body: some View {
+        let alpha = HomeAtmospherePolicy.alpha(reduceTransparency: reduceTransparency, highContrast: highContrast)
+        return ZStack {
+            Theme.Palette.canvas
+            if alpha > 0 {
+                RadialGradient(colors: [tint.opacity(alpha), .clear],
+                               center: .topLeading, startRadius: 8, endRadius: reach)
+                RadialGradient(colors: [tint.opacity(alpha * 0.62), .clear],
+                               center: .topTrailing, startRadius: 20, endRadius: reach)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
 struct iOSHomeView: View {
     /// True only when this is the visible tab; gates the macOS window-titlebar wordmark (#46).
     var isActive: Bool = true
@@ -1046,9 +1070,11 @@ struct iOSHomeView: View {
     @EnvironmentObject private var profiles: ProfileStore   // gate Continue Watching on the active profile's own history
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityContrast) private var accessibilityContrast
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
+    @State private var homeHeroTint: FeaturedHeroTintSnapshot<Color>?
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var becauseYouWatched = BecauseYouWatchedModel()   // "Because you watched <title>" rail, seeded from recent watches
     @StateObject private var traktRails = TraktRailsModel()   // Trakt watchlist as a client-side rail (dormant with empty creds)
@@ -1302,34 +1328,23 @@ struct iOSHomeView: View {
         #endif
     }
 
-    /// A restrained cinema wash behind Home. It keeps the theme's deep canvas as the base and places the
-    /// profile accent only near the upper content edges, so OLED still reads black while the page has a
-    /// little of the title-screen atmosphere that a flat canvas loses. It deliberately does not sample or
-    /// decode artwork: FeaturedHeroView already owns its cached per-title tint, and this layer stays static
-    /// between hero rotations instead of repeating a full-size average-color computation.
+    private var homeHeroTintKey: FeaturedHeroTintKey {
+        .init(id: hero.hero?.id, type: hero.hero?.type,
+              artwork: hero.hero?.backdrop ?? hero.hero?.poster)
+    }
+
+    @MainActor
+    private func acceptHomeHeroTint(_ snapshot: FeaturedHeroTintSnapshot<Color>) {
+        guard snapshot.key == homeHeroTintKey else { return }
+        homeHeroTint = snapshot
+    }
+
+    /// Reuse the hero's owned cached sample; cold/nil art falls back to the profile accent.
+    /// The keyed read immediately hides a retired title's tint, even before the next task starts.
     private var homeAmbientCanvas: some View {
-        let alpha = reduceTransparency ? 0.025 : 0.055
-        return ZStack {
-            Theme.Palette.canvas
-            RadialGradient(
-                colors: [Theme.Palette.accent.opacity(alpha), .clear],
-                center: .topLeading,
-                startRadius: 8,
-                endRadius: 300
-            )
-            RadialGradient(
-                colors: [Theme.Palette.accent.opacity(alpha * 0.62), .clear],
-                center: .topTrailing,
-                startRadius: 20,
-                endRadius: 360
-            )
-            LinearGradient(
-                colors: [.clear, Theme.Palette.accent.opacity(alpha * 0.22), .clear],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        }
-        .allowsHitTesting(false)
+        HomeCinemaAtmosphere(tint: homeHeroTint?.value(for: homeHeroTintKey) ?? Theme.Palette.accent,
+                             reduceTransparency: reduceTransparency, highContrast: accessibilityContrast == .increased,
+                             reach: FeaturedHeroView.heroHeight + 180)
     }
 
     /// Home's compact card wrapper keeps the shared FeaturedHeroView's model, actions, rotation, trailer,
@@ -1338,7 +1353,8 @@ struct iOSHomeView: View {
     @ViewBuilder
     private var homeFeaturedHero: some View {
         if compactPhoneHome {
-            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
+            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"),
+                             onTintChange: acceptHomeHeroTint)
                 .background {
                     RoundedRectangle(cornerRadius: 28, style: .continuous)
                         .fill(Theme.Palette.accent.opacity(reduceTransparency ? 0.022 : 0.045))
@@ -1362,7 +1378,8 @@ struct iOSHomeView: View {
                 .padding(.horizontal, 16)
                 .padding(.top, Theme.Space.xs)
         } else {
-            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"))
+            FeaturedHeroView(model: hero, onOpen: { path.append($0) }, eyebrow: String(localized: "Featured"),
+                             onTintChange: acceptHomeHeroTint)
         }
     }
 
@@ -5199,6 +5216,7 @@ struct PosterGrid: View {
                 // than the tvOS 1.08. This is the same style tvOS poster cards use, so the resting shadow
                 // comes from the style (no separate shadow, which would double it and diverge from tvOS).
                 .buttonStyle(CardFocusStyle(scale: 1.04))
+                .environment(\.cinemaCardHasExternalLift, true)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(item.name)
                 .accessibilityHint("Opens details")
@@ -5409,6 +5427,7 @@ private struct PosterRailBody: View {
         // S3: shared card treatment (resting shadow, Mac hover lift, designed press, Reduce-Motion aware),
         // matching the browse grid and tvOS poster cards. scale 1.04 is touch-tuned.
         .buttonStyle(CardFocusStyle(scale: 1.04))
+        .environment(\.cinemaCardHasExternalLift, true)
         .id(item.id)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
@@ -5766,6 +5785,17 @@ struct CinemaPosterCardPresentation {
     }
 }
 
+private struct CinemaCardExternalLiftKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+private extension EnvironmentValues {
+    var cinemaCardHasExternalLift: Bool {
+        get { self[CinemaCardExternalLiftKey.self] }
+        set { self[CinemaCardExternalLiftKey.self] = newValue }
+    }
+}
+
 private struct CinemaPosterCardBody: View {
     let id: String
     let type: String
@@ -5802,6 +5832,7 @@ private struct CinemaPosterCardBody: View {
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @Environment(\.horizontalSizeClass) private var hSize
     @Environment(\.cinemaCardViewportWidth) private var viewportWidth
+    @Environment(\.cinemaCardHasExternalLift) private var hasExternalLift
 
     /// The title to show: the pooled localized title in the user's language when available, else the add-on's.
     private var displayName: String { presentation.displayName }
@@ -5942,7 +5973,10 @@ private struct CinemaPosterCardBody: View {
                 }
             }
             .frame(width: cardW, height: cardH)
-            .shadow(color: .black.opacity(0.28), radius: 10, y: 5)
+            // Styled grid/rail Buttons own the resting/focus lift. Plain detail/person Buttons
+            // keep this original depth, so consolidating one owner does not flatten those surfaces.
+            .shadow(color: .black.opacity(hasExternalLift ? 0 : 0.28),
+                    radius: hasExternalLift ? 0 : 10, y: hasExternalLift ? 0 : 5)
             // The title label is hidden when the user turns off poster labels in Poster Style (default:
             // shown). The caption (Upcoming Episodes "S2E5 · Jun 30") is a functional date, not a title, so
             // it stays visible even with labels hidden.
