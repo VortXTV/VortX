@@ -128,6 +128,151 @@ class NativeNzbSourcesTest {
         nzbSourceAggregator = source.aggregator(), sessionProvider = session,
     )
 
+    @Test fun preparedSourcesDoNotRevokeForegroundAndAdoptWithoutProviderRefetch() = runBlocking {
+        val transport = Transport()
+        open(transport).use { session ->
+            val repo = repository(ConfigSource(account)) { session }
+            val first = repo.streams(MediaType.SERIES, "tt123456", "tt123456:1:1").getOrThrow().first().streams.first()
+            val episode = Episode("tt123456:1:2", "Second", 1, 2)
+            val preparation = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", episode))
+            preparation.updates().collect {}
+            val warmed = preparation.groups.first().streams.first()
+            val playable = preparation.resolve(warmed).getOrThrow()
+            assertEquals(episode.id, playable.playbackContext!!.videoId)
+            assertTrue(repo.resolve(first, Episode("tt123456:1:1", "First", 1, 1)).isSuccess)
+            assertTrue("Warm rows are private until adopted", repo.resolve(warmed, episode).isFailure)
+            val calls = transport.streamCalls.get()
+            val adopted = requireNotNull(preparation.adopt())
+            preparation.close()
+            assertEquals(preparation.groups, adopted.groups)
+            assertTrue("Adopted source menu resolves using retained bindings", repo.resolve(warmed, episode).isSuccess)
+            assertTrue(repo.resolve(first).isFailure)
+            assertEquals("Adoption and source menu do not refetch providers", calls, transport.streamCalls.get())
+            assertNull("Preparation is consumed once", preparation.adopt())
+        }
+    }
+
+    @Test fun gatedForegroundAndPreparedProviderLoadsAndResolversRemainIndependent() = runBlocking {
+        val providerEntered = CountDownLatch(1); val providerRelease = CountDownLatch(1)
+        val transport = Transport().also { it.beforeLoad = { input ->
+            val request = input.getJSONObject("request")
+            if (request.getString("resource") == "stream" && request.getString("id").endsWith(":1:1")) {
+                providerEntered.countDown(); check(providerRelease.await(3, TimeUnit.SECONDS))
+            }
+        } }
+        open(transport).use { session ->
+            val resolveEntered = Channel<String>(Channel.UNLIMITED)
+            val resolveRelease = CompletableDeferred<Unit>()
+            val repo = NativeCatalogRepository(playbackResolver = NativePlaybackResolver { _, episode ->
+                resolveEntered.send(episode!!.id); resolveRelease.await()
+                Playable("https://fixture.invalid/${episode.id}", "Fixture")
+            }, sessionProvider = { session })
+            val pendingForeground = async(Dispatchers.Default) { repo.streams(MediaType.SERIES, "tt123456", "tt123456:1:1") }
+            try {
+                assertTrue(providerEntered.await(2, TimeUnit.SECONDS))
+                val episode = Episode("tt123456:1:2", "Second", 1, 2)
+                val prepared = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", episode))
+                withTimeout(2_000) { prepared.updates().collect {} }
+                providerRelease.countDown()
+                val outgoing = withTimeout(2_000) { pendingForeground.await().getOrThrow() }.first().streams.first()
+                val foregroundResolve = async { repo.resolve(outgoing, Episode("tt123456:1:1", "First", 1, 1)) }
+                val warmResolve = async { prepared.resolve(prepared.groups.first().streams.first()) }
+                val entered = withTimeout(2_000) { setOf(resolveEntered.receive(), resolveEntered.receive()) }
+                assertEquals(setOf("tt123456:1:1", "tt123456:1:2"), entered)
+                resolveRelease.complete(Unit)
+                assertTrue(foregroundResolve.await().isSuccess)
+                assertTrue(warmResolve.await().isSuccess)
+                prepared.close()
+            } finally {
+                providerRelease.countDown(); resolveRelease.complete(Unit); pendingForeground.cancelAndJoin(); resolveEntered.close()
+            }
+        }
+    }
+
+    @Test fun exactTicketRetirementCannotRevokeReplacementAndPreparedSlotsDoNotAccumulate() = runBlocking {
+        open().use { session ->
+            val owner = session.read().owner
+            lateinit var oldTicket: java.util.UUID
+            lateinit var currentTicket: java.util.UUID
+            var pages = emptyList<VortxResourceSnapshot>()
+            session.loadProviders("fixture-slot", owner, emptyList()) { update, ticket -> oldTicket = ticket; pages = update.pages }
+            session.loadProviders("fixture-slot", owner, emptyList()) { update, ticket -> currentTicket = ticket; pages = update.pages }
+            session.retireResourceSlot("fixture-slot", oldTicket)
+            assertTrue(session.publish("fixture-slot", owner, pages, currentTicket) { true })
+            session.retireResourceSlot("fixture-slot", currentTicket)
+            assertTrue(runCatching { session.publish("fixture-slot", owner, pages, currentTicket) {} }.isFailure)
+            val repo = repository(ConfigSource(account)) { session }
+            repeat(5) {
+                val prepared = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", Episode("tt123456:1:2", "Second", 1, 2)))
+                prepared.updates().collect {}
+                prepared.close()
+            }
+            val slots = VortxNativeSession::class.java.getDeclaredField("slots").also { it.isAccessible = true }
+            assertEquals("Completed unique preparation slots must be retired", 0, (slots.get(session) as Map<*, *>).size)
+        }
+    }
+
+    @Test fun preparedTargetRequiresFreshApprovedMetadataAndExactEpisodeCoordinates() = runBlocking {
+        open().use { session ->
+            val repo = repository(ConfigSource(account)) { session }
+            val prepared = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", Episode("tt123456:1:2", "Wrong coordinates", 9, 9)))
+            assertTrue(runCatching { prepared.updates().collect {} }.isFailure)
+            assertTrue(prepared.groups.isEmpty())
+            assertNull(prepared.adopt())
+            prepared.close()
+        }
+    }
+
+    @Test fun rejectedPreparationRestoresOnlyItsExactForegroundAndNeverNewerState() = runBlocking {
+        open().use { session ->
+            val repo = repository(ConfigSource(account)) { session }
+            val first = repo.streams(MediaType.SERIES, "tt123456", "tt123456:1:1").getOrThrow().first().streams.first()
+            val episode = Episode("tt123456:1:2", "Second", 1, 2)
+            val preparation = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", episode))
+            preparation.updates().collect {}
+            val warm = preparation.groups.first().streams.first()
+            val adoption = requireNotNull(preparation.adopt())
+            adoption.rollback(); adoption.rollback(); preparation.close()
+            assertTrue(repo.resolve(first).isSuccess)
+            assertTrue(repo.resolve(warm).isFailure)
+
+            val another = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", episode))
+            another.updates().collect {}
+            val retired = requireNotNull(another.adopt())
+            val newest = repo.streams(MediaType.SERIES, "tt123456", "tt123456:1:3").getOrThrow().first().streams.first()
+            retired.rollback(); another.close()
+            assertTrue(repo.resolve(newest).isSuccess)
+            assertTrue(repo.resolve(first).isFailure)
+        }
+    }
+
+    @Test fun preparationCloseAndOwnerABARejectLateNonCooperativeLeaseExactlyOnce() = runBlocking {
+        for (changeOwner in listOf(false, true)) {
+            open().use { session ->
+                val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+                val closes = AtomicInteger()
+                val repo = NativeCatalogRepository(playbackResolver = NativePlaybackResolver { _, _ ->
+                    withContext(NonCancellable) { entered.complete(Unit); release.await() }
+                    Playable("https://fixture.invalid/prepared", "Prepared", playbackLease = AutoCloseable { closes.incrementAndGet() })
+                }, sessionProvider = { session })
+                val preparation = requireNotNull(repo.openSourcePreparation(MediaType.SERIES, "tt123456", Episode("tt123456:1:2", "Second", 1, 2)))
+                preparation.updates().collect {}
+                val pending = async { preparation.resolve(preparation.groups.first().streams.first()) }
+                withTimeout(2_000) { entered.await() }
+                if (changeOwner) {
+                    session.dispatch(listOf(JSONObject().put("type", "switch_profile").put("id", "guest")), session.read().owner)
+                    session.dispatch(listOf(JSONObject().put("type", "switch_profile").put("id", "owner")), session.read().owner)
+                } else preparation.close()
+                release.complete(Unit)
+                assertTrue(withTimeout(2_000) { pending.await() }.isFailure)
+                assertFalse(preparation.isCurrent())
+                assertNull(preparation.adopt())
+                preparation.close(); preparation.close()
+                assertEquals(1, closes.get())
+            }
+        }
+    }
+
     @Test fun firstApprovedMetadataPublishesIndexerBeforeUnrelatedAddonLegsSettle() = runBlocking {
         val gate = CountDownLatch(1)
         val observed = CopyOnWriteArrayList<String>()

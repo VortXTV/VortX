@@ -383,6 +383,9 @@ interface CatalogRepository {
         episode: Episode? = null,
     ): Result<Playable>
 
+    /** A separate preparation context is required; legacy/preview repositories keep the cold path. */
+    fun openSourcePreparation(type: MediaType, id: String, episode: Episode): SourcePreparation? = null
+
     /// Resolve a pasted DIRECT/debrid/usenet http(s) link into a [Playable] (SD-1). The URL is already
     /// resolved by the user's service, so it plays as-is (no debrid round-trip, no keys). Overridden by
     /// [com.vortx.android.engine.EngineStremioRepository]; the preview cannot play ad-hoc links.

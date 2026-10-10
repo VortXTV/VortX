@@ -706,6 +706,13 @@ internal class VortxNativeSession private constructor(
         if (revoke && slots[name] === slot) slots.remove(name)
     }
 
+    /** Retire an exact consumer ticket, never a newer request that reused its slot name. */
+    @Synchronized fun retireResourceSlot(name: String, ticket: UUID) {
+        val slot = slots[name]?.takeIf { it.ticket == ticket } ?: return
+        slots.remove(name)
+        slot.close()
+    }
+
     /** Parsing may occur off-lock; publication must still belong to the exact latest consumer load. */
     @Synchronized fun <T> publish(name: String, owner: VortxNativeOwner, pages: List<VortxResourceSnapshot>, action: () -> T): T =
         publish(name, owner, pages, null, action)
