@@ -10242,7 +10242,7 @@ struct PlayerScreen: View {
         let choice = SeriesSourceSticky.snapshot(for: target.libraryId)
         let deadline = ProcessInfo.processInfo.systemUptime + SourceSettlementPolicy.maximumWait
         episodeSourceHydrationTask = Task { @MainActor in
-            func admitted() -> Bool {
+            @MainActor func admitted() -> Bool {
                 owner.isCurrent && !playbackExited && episodeSourceHydrationGeneration == generation
                     && episodeSwitchGeneration == episodeGeneration && resumeRetryGeneration == mediaGeneration
                     && (pendingAdvance?.meta ?? curMeta)?.videoId == target.videoId && SeriesSourceSticky.admits(choice)
