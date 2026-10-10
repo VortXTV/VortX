@@ -2232,11 +2232,69 @@ jobs:
   # namespace contains dependency-only archives, not app/feed releases. Exclude only those external
   # release events; dispatch publication still always verifies after successful attachment.
   # Neither path attaches assets, mutates main, promotes a feed, or republishes.
+  # A separate opt-in lane below accepts only a local Apple direct-test manifest and verifies
+  # the published bytes/routes; it never invokes the package builder or the feed coordinator.
+  verify-direct-apple-test:
+    if: >-
+      github.event_name == 'release' &&
+      !startsWith(github.event.release.tag_name, 'vendor-') &&
+      contains(github.event.release.body, 'vortx-distribution: direct-test')
+    concurrency:
+      group: vortx-direct-apple-test-${{ github.event.release.id }}
+      cancel-in-progress: false
+    runs-on: macos-26
+    permissions:
+      contents: read
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download only the immutable direct-test provenance and Apple assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]] || { echo "::error::direct-test event has no immutable release ID"; exit 1; }
+          [[ "$EVENT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+$ ]] || { echo "::error::direct-test event is not a strict beta tag"; exit 1; }
+          WORK_DIR="$(mktemp -d "$RUNNER_TEMP/vortx-direct-apple-test.XXXXXX")"
+          RELEASE_JSON="$WORK_DIR/release.json"
+          READY=0
+          for _ in $(seq 1 18); do
+            if gh api -- "repos/$GH_REPO/releases/$RELEASE_ID" > "$RELEASE_JSON" 2>/dev/null && \
+              jq -e --arg tag "$EVENT_TAG" --argjson id "$RELEASE_ID" '.id == $id and .tag_name == $tag and .draft == false and .prerelease == true and .published_at != null' "$RELEASE_JSON" >/dev/null; then
+              READY=1
+              break
+            fi
+            sleep 5
+          done
+          [ "$READY" = 1 ] || { echo "::error::published direct-test release is not readable by immutable ID"; exit 1; }
+          manifest_id="$(jq -er '[.assets[] | select(.name == "VortX-Apple-Local-Test-Provenance.json" and .state == "uploaded")] | if length == 1 then .[0].id else error("expected exactly one provenance asset") end' "$RELEASE_JSON")"
+          gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$manifest_id" > "$WORK_DIR/provenance.json"
+          IOS_NAME="$(jq -er '.artifacts.ios.name | select(test("^VortX-iOS-[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+-test\\.ipa$"))' "$WORK_DIR/provenance.json")"
+          MAC_NAME="$(jq -er '.artifacts.macos.name | select(test("^VortX-macOS-[0-9]+\\.[0-9]+\\.[0-9]+-[0-9]+-test\\.dmg$"))' "$WORK_DIR/provenance.json")"
+          asset_id() {
+            jq -er --arg name "$1" '[.assets[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id else error("expected exactly one uploaded asset") end' "$RELEASE_JSON"
+          }
+          IOS_ID="$(asset_id "$IOS_NAME")"
+          MAC_ID="$(asset_id "$MAC_NAME")"
+          gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$IOS_ID" > "$WORK_DIR/$IOS_NAME"
+          gh api -H 'Accept: application/octet-stream' -- "repos/$GH_REPO/releases/assets/$MAC_ID" > "$WORK_DIR/$MAC_NAME"
+          unset GH_TOKEN
+          python3 scripts/verify-apple-direct-test-release.py verify-published \
+            --release-json "$RELEASE_JSON" --provenance "$WORK_DIR/provenance.json" \
+            --asset-dir "$WORK_DIR" --release-commit "$GITHUB_SHA" --repo-root "$GITHUB_WORKSPACE"
+
   verify-published:
     needs: [attach-release]
     if: >-
       always() && (
         (github.event_name == 'release' &&
+        !contains(github.event.release.body, 'vortx-distribution: direct-test') &&
         !startsWith(github.event.release.tag_name, 'vendor-')) ||
         (github.event_name == 'workflow_dispatch' &&
         inputs.publish_release == true &&
