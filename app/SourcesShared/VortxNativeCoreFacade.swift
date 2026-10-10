@@ -464,6 +464,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
     }
     func mutateProfiles(_ actions: [VortxJSON], hostEdits: [VortxNativeHostPreferences.Edit], expectedProfileID: String, expectedAccountGeneration: UUID,
+                        preferenceAdmission: (@Sendable (VortxJSON, VortxJSON) -> Bool)? = nil,
                         sourceAuthority: (any VortxMutationAuthority)? = nil, authenticatedSourceArchive: Data? = nil) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             lock.lock(); defer { lock.unlock() }
@@ -471,7 +472,24 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                   actions.allSatisfy({ ["add_profile", "patch_profile", "delete_profile", "switch_profile", "rebind_profile_account"].contains(string($0["type"]) ?? "") }) else { continuation.resume(throwing: VortxNativeError.superseded); return }
             do {
                 let raw = try actions.map { String(decoding: try JSONEncoder().encode($0), as: UTF8.self) }
+                let admission: (@Sendable () throws -> Bool)?
+                if let preferenceAdmission {
+                    admission = { [weak self] in
+                        guard let self else { return false }
+                        let context = self.lock.withLock { () -> (VortxJSON, VortxJSON)? in
+                            guard !self.closed, self.accountEpoch == expectedAccountGeneration,
+                                  let state = self.values["native_state"], state["activeProfileId"] == .string(expectedProfileID),
+                                  let host = self.values["native_host_preferences"] else { return nil }
+                            return (state, host)
+                        }
+                        guard let context else { return false }
+                        // The acknowledged FIFO snapshot is immutable. Evaluate the composed
+                        // Bridge/credential fence outside this lock to avoid lock-order inversion.
+                        return preferenceAdmission(context.0, context.1)
+                    }
+                } else { admission = nil }
                 if !enqueueMutation(type: "patch_profile", raw: "", actions: raw, hostEdits: hostEdits,
+                                    admission: admission,
                                     sourceAuthority: sourceAuthority, authenticatedSourceArchive: authenticatedSourceArchive,
                                     completion: { result in continuation.resume(with: result.map { _ in () }) }) {
                     continuation.resume(throwing: VortxNativeError.closed)

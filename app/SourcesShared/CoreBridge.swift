@@ -356,7 +356,8 @@ final class CoreBridge: ObservableObject {
         }
     }
     @MainActor
-    func saveNativeProfile(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget) async throws {
+    func saveNativeProfile(_ profile: UserProfile, creating: Bool, target: PlaybackMutationTarget,
+                           preferenceAdmission: (@Sendable (VortxJSON, VortxJSON) -> Bool)? = nil) async throws {
         guard let (facade, _) = nativePlaybackBinding(target), case .native(let binding?) = target,
               let epoch = binding.accountGeneration,
               let owner = facade.registryBinding?.scope.ownerProfileID else { throw VortxNativeError.closed }
@@ -379,11 +380,35 @@ final class CoreBridge: ObservableObject {
             }
         }
         let mutation = try VortxNativeProfiles.mutation(profile, previous: previous, ownerID: owner, rebind: rebind)
-        try await facade.mutateProfiles(mutation.0, hostEdits: [mutation.1], expectedProfileID: binding.profileID.uuidString, expectedAccountGeneration: epoch)
+        let fencedPreferenceAdmission: (@Sendable (VortxJSON, VortxJSON) -> Bool)?
+        if let preferenceAdmission {
+            let authority = NativeProfilePreferenceAuthority(core: self, facade: facade,
+                credential: binding.credential, installation: binding.sessionGeneration)
+            fencedPreferenceAdmission = { state, host in authority.isCurrent() && preferenceAdmission(state, host) }
+        } else { fencedPreferenceAdmission = nil }
+        try await facade.mutateProfiles(mutation.0, hostEdits: [mutation.1], expectedProfileID: binding.profileID.uuidString,
+                                        expectedAccountGeneration: epoch, preferenceAdmission: fencedPreferenceAdmission)
         guard CredentialScopeRegistry.shared.isCurrent(binding.credential), ProfileStore.shared.activeID == binding.profileID,
               nativeFacadeLock.withLock({ nativeFacadeStorage === facade && nativeInstallGeneration == binding.sessionGeneration }) else { throw VortxNativeError.superseded }
         try refreshNativeProfiles()
         nativeAccountEditRequests.removeValue(forKey: profile.id)
+    }
+    /// Worker-safe only because every referenced Bridge field is protected by nativeFacadeLock.
+    /// Do not make CoreBridge broadly Sendable or read MainActor ProfileStore from this receipt.
+    private final class NativeProfilePreferenceAuthority: @unchecked Sendable {
+        private weak var core: CoreBridge?
+        private let facade: VortxNativeCoreFacade
+        private let credential: CredentialScopeRegistry.Capture
+        private let installation: UUID
+        init(core: CoreBridge, facade: VortxNativeCoreFacade, credential: CredentialScopeRegistry.Capture, installation: UUID) {
+            self.core = core; self.facade = facade; self.credential = credential; self.installation = installation
+        }
+        func isCurrent() -> Bool {
+            guard let core, CredentialScopeRegistry.shared.isCurrent(credential) else { return false }
+            return core.nativeFacadeLock.withLock {
+                core.nativeFacadeStorage === facade && core.nativeCredentialCapture == credential && core.nativeInstallGeneration == installation
+            }
+        }
     }
     @MainActor func refreshNativeProfileEditBinding(_ profileID: UUID) { nativeAccountEditRequests.removeValue(forKey: profileID) }
 
