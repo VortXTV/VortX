@@ -504,6 +504,15 @@ private extension Array {
 
 // MARK: - TorBox usenet resolver
 
+/// Cache-check snapshots are a cold-path admission gate, not authority to discard an already-owned
+/// TorBox job. That job is scoped to the same resolver/account and NZB key and can be resumed safely.
+enum TorBoxUsenetCacheGate {
+    static func permitsResolve(nzbURL: String, confirmedUsenetURLs: Set<String>?,
+                               hasAcknowledgedJob: Bool) -> Bool {
+        hasAcknowledgedJob || (confirmedUsenetURLs?.contains(nzbURL) ?? true)
+    }
+}
+
 /// TorBox USENET resolver. A DROP-IN TWIN of `TorBoxResolver`, pointed at TorBox's `/usenet/*` backend
 /// (base `https://api.torbox.app/v1/api/usenet`, same Bearer auth). A usenet stream carries an `.nzb`
 /// link (`CoreStream.nzbUrl`) instead of an infohash; the resolver adds the nzb, waits until TorBox has
@@ -520,7 +529,7 @@ actor TorBoxUsenetResolver {
     private let pollAttempts: Int
     // This resolver is replaced on every credential revision. IDs never cross an account boundary.
     // Keep acknowledged creates after timeout/cancellation: TorBox continues that exact cloud job.
-    private struct Job { var id: Int?; var waiting: Bool }
+    private struct Job { var id: Int?; var waiting: Bool; var ready: Bool }
     private var jobs: [String: Job] = [:]
     private var creating: Set<String> = []
 
@@ -537,7 +546,10 @@ actor TorBoxUsenetResolver {
     }
 
     func hasJob(nzbURL: String, knownHash: String?) -> Bool {
-        jobs[Self.jobKey(nzbURL: nzbURL, knownHash: knownHash)] != nil
+        guard let job = jobs[Self.jobKey(nzbURL: nzbURL, knownHash: knownHash)] else { return false }
+        // Only a live pending job or a confirmed-ready job may resume past a cold negative cache snapshot.
+        // Terminal provider failures are retired and must not turn a later tap into an implicit retry.
+        return job.waiting || job.ready
     }
 
     func isWaiting(nzbURL: String, knownHash: String?) -> Bool {
@@ -670,7 +682,11 @@ actor TorBoxUsenetResolver {
         // A lookup failure is not permission to submit another download.
         if let item = try await fetchItem(hash: key) {
             try await validateOwner(ownerIsCurrent)
-            jobs[key] = Job(id: item.id, waiting: !item.ready)
+            let ready = item.ready && !(item.files ?? []).isEmpty
+            if ["failed", "error", "cancelled"].contains(item.downloadState?.lowercased() ?? "") {
+                throw DebridError.providerError("TorBox Usenet job failed")
+            }
+            jobs[key] = Job(id: item.id, waiting: !ready, ready: ready)
             DebridProbe.log("usenet-cloud", "adopt existing job ready=\(item.ready)")
             return item
         }
@@ -680,7 +696,7 @@ actor TorBoxUsenetResolver {
         }
         let created: Envelope<Created> = try await send(request)
         guard created.success else { throw DebridError.providerError("TorBox rejected the Usenet create request") }
-        jobs[key] = Job(id: created.data?.usenetId, waiting: true)
+        jobs[key] = Job(id: created.data?.usenetId, waiting: true, ready: false)
         DebridProbe.log("usenet-cloud", "created job hasID=\(created.data?.usenetId != nil)")
         try await validateOwner(ownerIsCurrent)
         return nil
@@ -743,12 +759,15 @@ actor TorBoxUsenetResolver {
             try await validateOwner(ownerIsCurrent)
             if let item {
                 let ready = item.ready && !(item.files ?? []).isEmpty
-                jobs[key] = Job(id: item.id, waiting: !ready)
+                jobs[key] = Job(id: item.id, waiting: !ready, ready: ready)
                 if ready { return (item.id, (item.files ?? []).map(file(from:))) }
                 if ["failed", "error", "cancelled"].contains(item.downloadState?.lowercased() ?? "") {
-                    jobs[key]?.waiting = false
+                    jobs.removeValue(forKey: key)
                     throw DebridError.providerError("TorBox Usenet job failed")
                 }
+            } else if jobs[key]?.id != nil {
+                // A previously acknowledged ID that has disappeared is no longer resumable.
+                jobs.removeValue(forKey: key)
             }
         }
         DebridProbe.log("usenet-cloud", "pending after bounded poll; job retained for Retry")
@@ -1504,19 +1523,22 @@ actor DebridCoordinator {
     /// `.noKey` when no TorBox key is configured, so the bounded resolve below collapses it to `nil`.
     /// `knownHash` = the stream's authoritative NZB md5 when its emitter carried one (nil otherwise).
     func resolveUsenet(nzbUrl: String, knownHash: String? = nil, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?,
+                       expectedCapture: CredentialScopeRegistry.Capture, expectedRevision: UInt64,
                        inheritedNativeOwner: UsenetLocalResolver.NativeOwner? = nil) async throws -> URL {
         try await inheritedNativeOwner?.validate()
         await warmIfNeeded()
         try await inheritedNativeOwner?.validate()
-        guard let capture = currentAuthorityCapture() else { throw DebridError.sessionChanged }
+        guard let capture = currentAuthorityCapture(), capture == expectedCapture,
+              latestCredentialRevision == expectedRevision else { throw DebridError.sessionChanged }
         guard inheritedNativeOwner == nil || inheritedNativeOwner?.credential == capture else { throw DebridError.sessionChanged }
-        let revision = latestCredentialRevision
+        let revision = expectedRevision
         guard let usenet = torboxUsenet else { throw DebridError.noKey }
         let breakerProvider = DebridService.torBox.rawValue
         let breakerSource = knownHash ?? nzbUrl
         guard await ProviderCircuitBreaker.shared.shouldAttempt(
             provider: breakerProvider, sourceID: breakerSource
         ) else { throw DebridError.providerError("circuit open, backing off \(breakerProvider)") }
+        guard isCurrent(expectedCapture, revision: expectedRevision) else { throw DebridError.sessionChanged }
         try await inheritedNativeOwner?.validate()
         let result: URL
         do {
@@ -1526,6 +1548,7 @@ actor DebridCoordinator {
                     nzbUrl: nzbUrl, knownHash: knownHash, fileMustInclude: fileMustInclude,
                     fileIdx: fileIdx, episode: episode,
                     ownerIsCurrent: {
+                        guard await self.isCurrent(expectedCapture, revision: expectedRevision) else { return false }
                         guard let inheritedNativeOwner else { return true }
                         return await inheritedNativeOwner.isCurrent()
                     }
@@ -1759,7 +1782,9 @@ extension DebridCoordinator {
             let usenetRevision = latestCredentialRevision
             // Retry continues a cloud job already chosen for this source. Repeating failed native
             // probes would delay an already-completed cloud download and restart the route sequence.
-            let resumingCloudJob = await torboxUsenet?.hasJob(nzbURL: nzb, knownHash: stream.usenetKnownHash) == true
+            let resolverAtCapture = torboxUsenet
+            let resumingCloudJob = await resolverAtCapture?.hasJob(nzbURL: nzb, knownHash: stream.usenetKnownHash) == true
+            guard !Task.isCancelled, isCurrent(usenetCapture, revision: usenetRevision) else { return nil }
             if resumingCloudJob, nativeOwner.requiresNativeAuthority { nativeFallbackOwner = nativeOwner }
             // BUILT-IN NNTP (full targets only): when the user configured their OWN usenet providers, resolve
             // the nzb on device through the embedded server's dormant NNTP engine (no debrid). Preferred over
@@ -1816,15 +1841,23 @@ extension DebridCoordinator {
             }
             #endif
             guard !Task.isCancelled, isCurrent(usenetCapture, revision: usenetRevision),
-                  !excludingUsenetRoutes.contains(.torBoxCloud), await hasUsenetResolver else { return nil }
-            // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
-            // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through
-            // to today's embedded path instead of burning the resolve budget. nil set = pre-gate behaviour.
-            if let confirmed = confirmedUsenetURLs, !confirmed.contains(nzb) {
-                DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) gate=NOT-CONFIRMED (confirmedSet=\(confirmed.count)) -> nil ZERO-NETWORK, embedded path")
+                  !excludingUsenetRoutes.contains(.torBoxCloud) else { return nil }
+            let hasCloudUsenet = await hasUsenetResolver
+            guard !Task.isCancelled, isCurrent(usenetCapture, revision: usenetRevision),
+                  !excludingUsenetRoutes.contains(.torBoxCloud), hasCloudUsenet else { return nil }
+            // CACHE-GATE (instant first-play): a nonnil negative cache snapshot still blocks a cold create
+            // with ZERO network. Once this exact resolver already owns the source's acknowledged cloud job,
+            // the snapshot cannot invalidate that job; allow the caller to poll its same ID after Retry.
+            // nil set = pre-gate behaviour.
+            if !TorBoxUsenetCacheGate.permitsResolve(nzbURL: nzb,
+                                                     confirmedUsenetURLs: confirmedUsenetURLs,
+                                                     hasAcknowledgedJob: resumingCloudJob) {
+                DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) gate=NOT-CONFIRMED (confirmedSet=\(confirmedUsenetURLs?.count ?? 0)) -> nil ZERO-NETWORK, embedded path")
                 return nil
             }
-            DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) gate=\(confirmedUsenetURLs == nil ? "OPEN(no set)" : "CONFIRMED-CACHED") -> running blocking usenet resolve")
+            let gateReason = resumingCloudJob ? "RESUME-OWNED-JOB"
+                : (confirmedUsenetURLs == nil ? "OPEN(no set)" : "CONFIRMED-CACHED")
+            DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) gate=\(gateReason) -> running blocking usenet resolve")
             let mustInclude = stream.fileMustInclude
             let fileIdx = stream.fileIdx
             let knownHash = stream.usenetKnownHash
@@ -1835,7 +1868,9 @@ extension DebridCoordinator {
                     do {
                         let url = try await DebridCoordinator.shared.resolveUsenet(
                             nzbUrl: nzb, knownHash: knownHash, fileMustInclude: mustInclude,
-                            fileIdx: fileIdx, episode: selectionEpisode, inheritedNativeOwner: fallbackOwner
+                            fileIdx: fileIdx, episode: selectionEpisode,
+                            expectedCapture: usenetCapture, expectedRevision: usenetRevision,
+                            inheritedNativeOwner: fallbackOwner
                         )
                     // Usenet is a plain direct link: no infoHash / torrentId to carry (no reresolve fast
                     // path), so the ref's torrent fields are nil. The `url` alone lets the player open it.
@@ -1856,6 +1891,7 @@ extension DebridCoordinator {
                 group.cancelAll()
                 return first
             }
+            guard !Task.isCancelled, isCurrent(usenetCapture, revision: usenetRevision) else { return nil }
             if let fallbackOwner, !(await fallbackOwner.isCurrent()) { return nil }
             return result
         }

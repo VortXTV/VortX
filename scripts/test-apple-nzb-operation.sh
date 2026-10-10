@@ -36,9 +36,9 @@ else
       'var torboxUsenet: FixtureCloudResolver? { FixtureCloudResolver.shared }' \
       'func recordBreakerFailure(_ error: Error, provider: String, sourceID: String, phase: ProviderCircuitBreaker.Phase) async {}' \
       'func currentAuthorityCapture() -> CredentialScopeRegistry.Capture? { CredentialScopeRegistry.shared.capture() }' \
-      'var latestCredentialRevision: Int { 0 }' \
-      'func isCurrent(_ capture: CredentialScopeRegistry.Capture, revision: Int) -> Bool { CredentialScopeRegistry.shared.isCurrent(capture) }' \
-      'func runProvider<T: Sendable>(capture: CredentialScopeRegistry.Capture, revision: Int, operation: @Sendable () async throws -> T) async throws -> T { do { return try await operation() } catch { await failureGate?.wait(); throw error } }'
+      'var latestCredentialRevision: UInt64 { 0 }' \
+      'func isCurrent(_ capture: CredentialScopeRegistry.Capture, revision: UInt64) -> Bool { CredentialScopeRegistry.shared.isCurrent(capture) }' \
+      'func runProvider<T: Sendable>(capture: CredentialScopeRegistry.Capture, revision: UInt64, operation: @Sendable () async throws -> T) async throws -> T { do { return try await operation() } catch { await failureGate?.wait(); throw error } }'
     if [[ -n $warm_baseline ]]; then
       # Original actor entry/signature, warm-before-capture order, and local-create block, not a
       # simulation of the new ownership policy. Other provider branches are inert fixture seams.
@@ -55,6 +55,7 @@ else
       else
         sed -n '/    func resolveUsenet(nzbUrl:/,/^    }/p' app/SourcesShared/DebridResolver.swift
       fi
+      sed -n '/^enum TorBoxUsenetCacheGate {/,/^}/p' app/SourcesShared/DebridResolver.swift
       sed -n '/    enum ExplicitUsenetResolution:/,/^    }/p' app/SourcesShared/DebridResolver.swift
       sed -n '/    func resolveExplicitUsenetPlayback(/,/^    }/p' app/SourcesShared/DebridResolver.swift
       sed -n '/    @MainActor func recoverUsenetPlayback(/,/^    }/p' app/SourcesShared/DebridResolver.swift
@@ -66,7 +67,7 @@ else
       sed -n '/            let ownsNativeAttempt = nativeOwner.requiresNativeAuthority/,/            let usenetRevision = latestCredentialRevision/p' \
         app/SourcesShared/DebridResolver.swift \
         | sed '/^[[:space:]]*#else$/,/^[[:space:]]*#endif$/d; /^[[:space:]]*#if/d; /^[[:space:]]*#endif/d'
-      sed -n '/            let resumingCloudJob = /,/            if resumingCloudJob,/p' app/SourcesShared/DebridResolver.swift
+      sed -n '/            let resolverAtCapture = /,/            if resumingCloudJob,/p' app/SourcesShared/DebridResolver.swift
     fi
     if [[ -n $warm_baseline ]]; then
       printf '%s\n' 'let usenetSavedServers = savedServers' 'do {'

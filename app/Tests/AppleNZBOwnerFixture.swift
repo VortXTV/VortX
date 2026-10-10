@@ -59,11 +59,13 @@ actor FixtureCloudResolver {
     func gateOutput(_ gate: FixtureWarmGate?) { outputGate = gate }
     func resolve(nzbUrl: String, knownHash: String?, fileMustInclude: String?, fileIdx: Int?, episode: DebridEpisode?,
                  ownerIsCurrent: @escaping @Sendable () async -> Bool = { true }) async throws -> URL {
+        guard await ownerIsCurrent() else { throw CancellationError() }
         calls += 1
         if let delay { try await Task.sleep(for: delay) }
         if let responseError { throw responseError }
         let gate = outputGate; outputGate = nil
         await gate?.wait()
+        guard await ownerIsCurrent() else { throw CancellationError() }
         return URL(string: "https://fixture.invalid/cloud")!
     }
 }

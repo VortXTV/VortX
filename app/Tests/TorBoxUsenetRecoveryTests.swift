@@ -1,5 +1,16 @@
 import Foundation
 
+#if TORBOX_USENET_BASELINE
+// Reproduce the pre-fix coordinator admission condition for the baseline run. It ignored an already
+// acknowledged job and treated a stale negative cache snapshot as terminal for this source.
+enum TorBoxUsenetCacheGate {
+    static func permitsResolve(nzbURL: String, confirmedUsenetURLs: Set<String>?,
+                               hasAcknowledgedJob _: Bool) -> Bool {
+        confirmedUsenetURLs?.contains(nzbURL) ?? true
+    }
+}
+#endif
+
 // Actual TorBox resolver, request builder, selector and public-URL policy; URLProtocol intercepts every
 // API request. The inert gateway never starts the app, contacts a provider, or downloads media.
 enum CommunityStreamGateway {
@@ -35,6 +46,7 @@ final class TorBoxFixture: @unchecked Sendable {
         var lookupStatus = 200
         var jobState: String? = nil
         var onLookup: (@Sendable () -> Void)? = nil
+        var onRequestDL: (@Sendable () -> Void)? = nil
     }
     private var state = State()
     func reset(_ value: State = .init()) { lock.withLock { state = value } }
@@ -73,6 +85,7 @@ final class TorBoxFixture: @unchecked Sendable {
                     body = ["success": true, "data": state.existing || state.creates > 0 ? [item] : []]
                 }
             case "requestdl":
+                state.onRequestDL?()
                 precondition(query.first(where: { $0.name == "usenet_id" })?.value == "42")
                 precondition(query.first(where: { $0.name == "file_id" })?.value == "9", "must preserve semantic episode choice")
                 body = ["success": true, "data": "https://1.1.1.1/fixture-video.mkv"]
@@ -87,6 +100,14 @@ final class FixtureOwner: @unchecked Sendable {
     private var current = true
     func retire() { lock.withLock { current = false } }
     func isCurrent() -> Bool { lock.withLock { current } }
+}
+final class FixtureAuthority: @unchecked Sendable {
+    struct Capture: Equatable, Sendable { let key: String; let revision: UInt64 }
+    private let lock = NSLock()
+    private var current = Capture(key: "fixture-key-a", revision: 1)
+    func capture() -> Capture { lock.withLock { current } }
+    func rotate(key: String) { lock.withLock { current = Capture(key: key, revision: current.revision &+ 1) } }
+    func matches(_ capture: Capture) -> Bool { lock.withLock { current == capture } }
 }
 final class TorBoxFixtureProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -123,6 +144,18 @@ final class TorBoxFixtureProtocol: URLProtocol, @unchecked Sendable {
             print("FAIL baseline POSTs create for an already-completed job instead of adopting it")
             exit(1)
         }
+        fixture.reset()
+        let pendingBaseline = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session,
+                                                   pollInterval: .zero, pollAttempts: 3)
+        do { _ = try await resolve(pendingBaseline); preconditionFailure("pending job must not mint media") }
+        catch { precondition(error as? DebridError == .notReady) }
+        let baselineOwnsPendingJob = await pendingBaseline.hasJob(nzbURL: nzb, knownHash: "fixture-hash")
+        precondition(baselineOwnsPendingJob)
+        let negativeSnapshot: Set<String> = ["https://fixture.invalid/different-source.nzb"]
+        precondition(TorBoxUsenetCacheGate.permitsResolve(nzbURL: nzb,
+                                                           confirmedUsenetURLs: negativeSnapshot,
+                                                           hasAcknowledgedJob: baselineOwnsPendingJob),
+                     "baseline incorrectly lets a stale negative cache snapshot hide its acknowledged job")
         #else
         fixture.reset()
         let resolver = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session, pollInterval: .zero, pollAttempts: 3)
@@ -177,6 +210,35 @@ final class TorBoxFixtureProtocol: URLProtocol, @unchecked Sendable {
         precondition(fixture.snapshot().creates == 1)
         print("PASS cancellation stops polling immediately and later Retry reuses job")
 
+        // A manual same-source tap carries a possibly stale negative cache snapshot. Preserve the explicit
+        // cold/uncached gate when no job exists, but let the owned resolver resume its acknowledged job.
+        fixture.reset()
+        let cacheRetry = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session,
+                                              pollInterval: .zero, pollAttempts: 3)
+        do { _ = try await resolve(cacheRetry); preconditionFailure("pending job must not mint media") }
+        catch { precondition(error as? DebridError == .notReady) }
+        let negativeSnapshot: Set<String> = ["https://fixture.invalid/different-source.nzb"]
+        precondition(!TorBoxUsenetCacheGate.permitsResolve(nzbURL: nzb,
+                                                           confirmedUsenetURLs: negativeSnapshot,
+                                                           hasAcknowledgedJob: false),
+                     "a cold not-confirmed source must remain zero-network")
+        let ownsPendingJob = await cacheRetry.hasJob(nzbURL: nzb, knownHash: "fixture-hash")
+        precondition(ownsPendingJob)
+        precondition(TorBoxUsenetCacheGate.permitsResolve(nzbURL: nzb,
+                                                          confirmedUsenetURLs: negativeSnapshot,
+                                                          hasAcknowledgedJob: ownsPendingJob),
+                     "a stale negative cache snapshot must not suppress the same owned pending job")
+        fixture.ready()
+        let cacheRetriedURL = try await resolve(cacheRetry)
+        precondition(cacheRetriedURL.path == "/fixture-video.mkv")
+        let afterCacheRetry = fixture.snapshot()
+        precondition(afterCacheRetry.creates == 1, "same-source cache retry must not duplicate the job")
+        precondition(afterCacheRetry.requests.filter { $0.url?.lastPathComponent == "requestdl" }.count == 1)
+        precondition(afterCacheRetry.requests.allSatisfy {
+            $0.value(forHTTPHeaderField: "Authorization") == "Bearer fixture-key-a"
+        })
+        print("PASS stale negative cache snapshot cannot hide same-account pending source; cold uncached gate remains")
+
         let differentOwner = TorBoxUsenetResolver(apiKey: "fixture-key-b", session: session, pollInterval: .zero)
         let inherited = await differentOwner.hasJob(nzbURL: nzb, knownHash: "fixture-hash")
         precondition(!inherited, "credential replacement must not inherit account-scoped IDs")
@@ -205,6 +267,74 @@ final class TorBoxFixtureProtocol: URLProtocol, @unchecked Sendable {
         precondition(fixture.snapshot().creates == 0)
         print("PASS owner retired during existing-job lookup cannot submit a new cloud job")
 
+        // Model the coordinator's captured credential scope/revision across a resolver await. The same
+        // credential value returning after an A -> B -> A switch is not the original authority: revision
+        // 3 must not satisfy the captured A/revision-1 admission closure.
+        let authority = FixtureAuthority()
+        let capturedAuthority = authority.capture()
+        fixture.reset(.init(onLookup: {
+            authority.rotate(key: "fixture-key-b")
+            authority.rotate(key: "fixture-key-a")
+        }))
+        let abaResolver = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session, pollInterval: .zero)
+        do {
+            _ = try await abaResolver.resolve(nzbUrl: nzb, knownHash: "fixture-hash", fileMustInclude: nil,
+                                              fileIdx: 0, episode: .init(season: 2, episode: 34),
+                                              ownerIsCurrent: { authority.matches(capturedAuthority) })
+            preconditionFailure("A -> B -> A credential ABA must invalidate the original resolve")
+        } catch is CancellationError {}
+        let abaState = fixture.snapshot()
+        precondition(authority.capture().key == capturedAuthority.key
+                     && authority.capture().revision != capturedAuthority.revision,
+                     "fixture must return to the original key with a newer authority revision")
+        precondition(abaState.creates == 0 && abaState.requests.count == 1,
+                     "stale A/revision-1 work must stop after the awaited lookup, before create")
+        precondition(abaState.requests.allSatisfy {
+            $0.value(forHTTPHeaderField: "Authorization") == "Bearer fixture-key-a"
+        })
+        print("PASS controlled A -> B -> A credential ABA fences create after awaited lookup")
+
+        // A newly captured B resolver is likewise not usable by an intent that retained A/revision-1.
+        // This is the cloud-only case: no native-owner lease exists to provide a second fence.
+        authority.rotate(key: "fixture-key-b")
+        fixture.reset()
+        let replacementResolver = TorBoxUsenetResolver(apiKey: "fixture-key-b", session: session,
+                                                       pollInterval: .zero)
+        do {
+            _ = try await replacementResolver.resolve(
+                nzbUrl: nzb, knownHash: "fixture-hash", fileMustInclude: nil,
+                fileIdx: 0, episode: .init(season: 2, episode: 34),
+                ownerIsCurrent: { authority.matches(capturedAuthority) }
+            )
+            preconditionFailure("old cloud intent must not admit the replacement account resolver")
+        } catch is CancellationError {}
+        precondition(fixture.snapshot().requests.isEmpty && fixture.snapshot().creates == 0,
+                     "old cloud intent must not send a request using the replacement key")
+        print("PASS cloud-only old intent cannot admit replacement credential resolver")
+
+        // The provider may finish requestdl after authority changes. Its syntactically valid link must not
+        // escape the resolver under the original capture, including an A -> B -> A key-value ABA.
+        authority.rotate(key: "fixture-key-a")
+        let linkCapture = authority.capture()
+        fixture.reset(.init(readyAt: 0, onRequestDL: {
+            authority.rotate(key: "fixture-key-b")
+            authority.rotate(key: "fixture-key-a")
+        }))
+        let linkResolver = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session, pollInterval: .zero)
+        do {
+            _ = try await linkResolver.resolve(
+                nzbUrl: nzb, knownHash: "fixture-hash", fileMustInclude: nil,
+                fileIdx: 0, episode: .init(season: 2, episode: 34),
+                ownerIsCurrent: { authority.matches(linkCapture) }
+            )
+            preconditionFailure("stale requestdl response must not return its media link")
+        } catch is CancellationError {}
+        let linkState = fixture.snapshot()
+        precondition(linkState.requests.filter { $0.url?.lastPathComponent == "requestdl" }.count == 1)
+        precondition(authority.capture().key == linkCapture.key
+                     && authority.capture().revision != linkCapture.revision)
+        print("PASS credential ABA after requestdl fences returned playback link")
+
         fixture.reset(.init(readyAt: 0))
         let concurrent = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session, pollInterval: .zero)
         async let first = resolve(concurrent)
@@ -218,8 +348,23 @@ final class TorBoxFixtureProtocol: URLProtocol, @unchecked Sendable {
         do { _ = try await resolve(failed); preconditionFailure("failed job must stop") }
         catch { precondition(error as? DebridError == .providerError("TorBox Usenet job failed")) }
         let stillWaiting = await failed.isWaiting(nzbURL: nzb, knownHash: "fixture-hash")
-        precondition(!stillWaiting && fixture.snapshot().polls == 1)
+        let failedJobResumable = await failed.hasJob(nzbURL: nzb, knownHash: "fixture-hash")
+        precondition(!stillWaiting && !failedJobResumable && fixture.snapshot().polls == 1)
+        let negativeAfterFailure: Set<String> = ["https://fixture.invalid/different-source.nzb"]
+        precondition(!TorBoxUsenetCacheGate.permitsResolve(nzbURL: nzb,
+                                                           confirmedUsenetURLs: negativeAfterFailure,
+                                                           hasAcknowledgedJob: failedJobResumable),
+                     "terminal failed jobs must not bypass the cold negative-cache gate")
         print("PASS failed provider job is terminal, not displayed as still preparing")
+
+        fixture.reset(.init(jobState: "cancelled"))
+        let providerCancelled = TorBoxUsenetResolver(apiKey: "fixture-key-a", session: session,
+                                                     pollInterval: .zero)
+        do { _ = try await resolve(providerCancelled); preconditionFailure("cancelled provider job must stop") }
+        catch { precondition(error as? DebridError == .providerError("TorBox Usenet job failed")) }
+        let cancelledJobResumable = await providerCancelled.hasJob(nzbURL: nzb, knownHash: "fixture-hash")
+        precondition(!cancelledJobResumable)
+        print("PASS provider-cancelled job is retired from retry admission")
 
         let secretError = NSError(domain: NSURLErrorDomain, code: -1001,
                                   userInfo: [NSLocalizedDescriptionKey: "secret-fixture https://fixture.invalid/?key=secret-fixture"])

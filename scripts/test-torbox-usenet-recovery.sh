@@ -15,7 +15,7 @@ if [[ $# -gt 0 ]]; then
 fi
 {
   printf '%s\n' 'import Foundation' 'import CryptoKit'
-  for type in 'enum DebridProbe' 'enum DebridQuery' 'struct DebridFile' 'struct DebridEpisode' 'enum DebridError' 'enum DebridResolve' 'actor TorBoxUsenetResolver'; do
+  for type in 'enum DebridProbe' 'enum DebridQuery' 'struct DebridFile' 'struct DebridEpisode' 'enum DebridError' 'enum DebridResolve' 'enum TorBoxUsenetCacheGate' 'actor TorBoxUsenetResolver'; do
     sed -n "/^$type[ :{]/,/^}/p" "$usenet_resolver_source"
   done
   sed -n '/^private extension Array {/,/^}/p' "$usenet_resolver_source"
