@@ -45,14 +45,18 @@ internal class PlayerSourceSwitchCoordinator {
         liveAuthority.get()?.let { it.outerSessionId == authority.outerSessionId && it.request == authority } == true
 
     /**
-     * Linearization point for a resolver completion. Replacement, a newer request, and disposal cannot enter
-     * while [finish] accepts host state and commits ViewModel side effects. The token is one-shot on success.
+     * Linearization point for a resolver completion. Other threads cannot replace authority while [finish]
+     * accepts host state and commits ViewModel side effects. Always retire this request,
+     * including when post-publication notification throws; a reentrant newer request is left intact.
      */
     fun finishIfCurrent(authority: PlayerSourceSwitchAuthority, finish: () -> Unit): Boolean = synchronized(lock) {
         val live = liveAuthority.get()
         if (live?.outerSessionId != authority.outerSessionId || live.request != authority) return@synchronized false
-        finish()
-        liveAuthority.compareAndSet(live, live.copy(request = null))
+        try {
+            finish()
+        } finally {
+            liveAuthority.compareAndSet(live, live.copy(request = null))
+        }
         true
     }
 
@@ -114,35 +118,43 @@ class PlayerSourceSwitchResolution internal constructor(
     private enum class Ownership { PENDING, ADOPTED, DISCARDED }
     private val ownershipLock = Any()
     private var ownership = Ownership.PENDING
+    private var accepting = false
 
     /** Transfer the incoming lease to the mounted player only once, at host acceptance. */
     internal fun commitIfCurrent(hostAuthorityIsCurrent: () -> Boolean): Boolean =
-        commitIfCurrent(hostAuthorityIsCurrent, acceptReplacement = {})
+        commitIfCurrent(hostAuthorityIsCurrent) { acknowledgePublished -> acknowledgePublished() }
 
-    /** The production host publishes inside the same transfer so an unmounted result cannot leak. */
+    /**
+     * The host must acknowledge immediately after installing state, before any fallible notification.
+     * The acknowledgment only changes ownership, cannot throw, and is irreversible: a later exception or
+     * reentrant replacement/disposal cannot make an already published lease resolver-owned again.
+     */
     internal fun commitIfCurrent(
         hostAuthorityIsCurrent: () -> Boolean,
-        acceptReplacement: () -> Unit,
+        acceptReplacement: (acknowledgePublished: () -> Unit) -> Unit,
     ): Boolean = synchronized(ownershipLock) {
-        if (ownership != Ownership.PENDING) return@synchronized false
+        if (ownership != Ownership.PENDING || accepting) return@synchronized false
+        // Keep an uninstalled resource pending, but block duplicate/reentrant commit callbacks.
+        accepting = true
         try {
             if (!commitGate.isValid() || !commitAuthorityIsCurrent() || !hostAuthorityIsCurrent()) {
                 discard()
                 return@synchronized false
             }
-            // Claim before invoking callbacks so duplicate/reentrant acceptance cannot commit twice.
-            ownership = Ownership.ADOPTED
-            try {
-                commitAccepted()
-                acceptReplacement()
-            } catch (failure: Throwable) {
-                ownership = Ownership.PENDING
-                throw failure
+            commitAccepted()
+            if (ownership != Ownership.PENDING) return@synchronized false
+            acceptReplacement {
+                synchronized(ownershipLock) {
+                    if (accepting && ownership == Ownership.PENDING) ownership = Ownership.ADOPTED
+                }
             }
+            check(ownership == Ownership.ADOPTED) { "Player replacement publication was not acknowledged" }
             true
         } catch (failure: Throwable) {
             discard()
             throw failure
+        } finally {
+            accepting = false
         }
     }
 
@@ -428,7 +440,7 @@ internal fun applyPlayerEpisodeSwitchCompletion(
     currentState: PlayerSourceSwitchState,
     pending: PendingPlayerEpisodeSwitch,
     completion: PlayerEpisodeSwitchCompletion,
-    publishAccepted: (PlayerSourceSwitchState) -> Unit = {},
+    publishAccepted: (PlayerSourceSwitchState, acknowledgePublished: () -> Unit) -> Unit = { _, acknowledge -> acknowledge() },
     hostAuthorityIsCurrent: () -> Boolean,
 ): PlayerSourceSwitchState {
     if (
@@ -441,7 +453,7 @@ internal fun applyPlayerEpisodeSwitchCompletion(
         return currentState
     }
     val resolution = completion.resolution ?: return completion.state
-    if (resolution.commitIfCurrent(hostAuthorityIsCurrent) { publishAccepted(completion.state) }) return completion.state
+    if (resolution.commitIfCurrent(hostAuthorityIsCurrent) { publishAccepted(completion.state, it) }) return completion.state
     return currentState.copy(pendingEpisodeSwitch = null, failedEpisode = pending.episode, errorMessage = "")
 }
 
@@ -548,7 +560,7 @@ internal fun applyPlayerSourceSwitchCompletion(
     currentState: PlayerSourceSwitchState,
     pending: PendingPlayerSourceSwitch,
     completion: PlayerSourceSwitchCompletion,
-    publishAccepted: (PlayerSourceSwitchState) -> Unit = {},
+    publishAccepted: (PlayerSourceSwitchState, acknowledgePublished: () -> Unit) -> Unit = { _, acknowledge -> acknowledge() },
     hostAuthorityIsCurrent: () -> Boolean,
 ): PlayerSourceSwitchState {
     if (
@@ -561,13 +573,14 @@ internal fun applyPlayerSourceSwitchCompletion(
         return currentState
     }
     val resolution = completion.resolution ?: return completion.state
-    if (resolution.commitIfCurrent(hostAuthorityIsCurrent) { publishAccepted(completion.state) }) return completion.state
+    if (resolution.commitIfCurrent(hostAuthorityIsCurrent) { publishAccepted(completion.state, it) }) return completion.state
     return currentState.copy(pendingSwitch = null, errorMessage = "")
 }
 
 /**
  * Production host path for one resolver job. A resolver may ignore coroutine cancellation; only the stable
  * coordinator can accept its result, commit the producing ViewModel, and publish the replacement state.
+ * [publishState] acknowledges immediately after host assignment, before invoking external callbacks.
  */
 internal suspend fun resolveAndApplyPlayerSourceSwitch(
     coordinator: PlayerSourceSwitchCoordinator,
@@ -575,7 +588,7 @@ internal suspend fun resolveAndApplyPlayerSourceSwitch(
     resolver: suspend (StreamSource) -> Result<PlayerSourceSwitchResolution>,
     currentState: () -> PlayerSourceSwitchState,
     latestPositionMs: () -> Long,
-    publishState: (PlayerSourceSwitchState) -> Unit,
+    publishState: (PlayerSourceSwitchState, acknowledgePublished: () -> Unit) -> Unit,
 ) {
     val resolutionContext = currentCoroutineContext()
     val result = try {
@@ -603,10 +616,15 @@ internal suspend fun resolveAndApplyPlayerSourceSwitch(
                 currentState = liveState,
                 pending = pending,
                 completion = completion,
-                publishAccepted = { publishState(it); published = true },
+                publishAccepted = { replacement, acknowledge ->
+                    publishState(replacement) {
+                        acknowledge()
+                        published = true
+                    }
+                },
                 hostAuthorityIsCurrent = { resolutionContext.isActive && coordinator.isCurrent(pending.authority) },
             )
-            if (!published && coordinator.isCurrent(pending.authority)) publishState(accepted)
+            if (!published && coordinator.isCurrent(pending.authority)) publishState(accepted) {}
         }
     } finally {
         result.getOrNull()?.discard()
@@ -623,7 +641,7 @@ internal suspend fun resolveAndApplyPlayerEpisodeSwitch(
     pending: PendingPlayerEpisodeSwitch,
     resolver: suspend (Episode) -> Result<PlayerSourceSwitchResolution>,
     currentState: () -> PlayerSourceSwitchState,
-    publishState: (PlayerSourceSwitchState) -> Unit,
+    publishState: (PlayerSourceSwitchState, acknowledgePublished: () -> Unit) -> Unit,
 ) {
     val resolutionContext = currentCoroutineContext()
     val result = try {
@@ -644,10 +662,15 @@ internal suspend fun resolveAndApplyPlayerEpisodeSwitch(
                 currentState = liveState,
                 pending = pending,
                 completion = completion,
-                publishAccepted = { publishState(it); published = true },
+                publishAccepted = { replacement, acknowledge ->
+                    publishState(replacement) {
+                        acknowledge()
+                        published = true
+                    }
+                },
                 hostAuthorityIsCurrent = { resolutionContext.isActive && coordinator.isCurrent(pending.authority) },
             )
-            if (!published && coordinator.isCurrent(pending.authority)) publishState(accepted)
+            if (!published && coordinator.isCurrent(pending.authority)) publishState(accepted) {}
         }
     } finally {
         result.getOrNull()?.discard()

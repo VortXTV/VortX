@@ -19,6 +19,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
 
 class PlayerSourceSwitchingTest {
     @Test
@@ -305,7 +306,7 @@ class PlayerSourceSwitchingTest {
                 },
                 currentState = { hostState },
                 latestPositionMs = { 44_000L },
-                publishState = { hostState = it },
+                publishState = { accepted, acknowledge -> hostState = accepted; acknowledge() },
             )
         }
         withTimeout(5_000L) { resolverStarted.await() }
@@ -347,7 +348,7 @@ class PlayerSourceSwitchingTest {
             },
             currentState = { hostState },
             latestPositionMs = { 52_000L },
-            publishState = { hostState = it },
+            publishState = { accepted, acknowledge -> hostState = accepted; acknowledge() },
         )
 
         assertEquals(8L, hostState.revision)
@@ -648,6 +649,174 @@ class PlayerSourceSwitchingTest {
         }
     }
 
+    @Test
+    fun `episode history notification failure preserves the already mounted lease`() = runBlocking {
+        assertPostPublicationFailure(episodeSwitch = true)
+    }
+
+    @Test
+    fun `source post-publication failure preserves the already mounted lease`() = runBlocking {
+        assertPostPublicationFailure(episodeSwitch = false)
+    }
+
+    @Test
+    fun `reentrant replacement and disposal before notification throws cannot revoke adoption`() = runBlocking {
+        for (episodeSwitch in listOf(false, true)) {
+            for (replaceOuter in listOf(false, true)) {
+                val fixture = LeaseFixture(episodeSwitch)
+                val expectedFailure = IllegalStateException("Synthetic reentrant notification failure")
+                val newerLease = CountingLease()
+                lateinit var newerAuthority: PlayerSourceSwitchAuthority
+                lateinit var newerState: PlayerSourceSwitchState
+                var notifications = 0
+                fixture.beforePublish = {
+                    assertSame(fixture.outgoing, fixture.state.playable)
+                    assertEquals(0, fixture.outgoingLease.closes)
+                    assertEquals(0, fixture.incomingLease.closes)
+                }
+                fixture.afterPublish = { accepted ->
+                    assertSame(accepted, fixture.state)
+                    notifications++
+                    // Model mounted effect retirement after publication, followed by a reentrant
+                    // request/outer replacement. Exception-time state readback cannot see adoption.
+                    fixture.outgoing.playbackLease?.close()
+                    accepted.playable.playbackLease?.close()
+                    val outer = if (replaceOuter) fixture.coordinator.replaceOuterSession() else accepted.outerSessionId
+                    newerAuthority = requireNotNull(fixture.coordinator.beginRequest(outer))
+                    newerState = beginPlayerSourceSwitch(
+                        PlayerSourceSwitchState(outer,
+                            Playable("https://fixture.invalid/newest", "Newest", playbackLease = newerLease),
+                            fixture.source, revision = accepted.revision + 1),
+                        fixture.source, newerAuthority,
+                    )
+                    fixture.state = newerState
+                    throw expectedFailure
+                }
+                val result = fixture.resolution()
+                val failure = runCatching { fixture.resolve { Result.success(result) } }.exceptionOrNull()
+                assertSame(expectedFailure, failure)
+                assertSame("Old completion must not overwrite reentrant publication", newerState, fixture.state)
+                assertTrue("Old finish must not retire the newer request", fixture.coordinator.isCurrent(newerAuthority))
+                assertEquals(1, notifications)
+                assertEquals(1, fixture.commits)
+                assertEquals(0, fixture.rollbacks)
+                assertEquals("Mounted disposal already released the adopted resource", 1, fixture.incomingLease.closes)
+                assertEquals(1, fixture.outgoingLease.closes)
+                result.discard()
+                fixture.resolve { Result.success(result) }
+                assertSame(newerState, fixture.state)
+                assertTrue(fixture.coordinator.isCurrent(newerAuthority))
+                assertEquals(1, notifications)
+                assertEquals(0, fixture.rollbacks)
+                assertEquals(1, fixture.incomingLease.closes)
+                assertEquals(0, newerLease.closes)
+                newerState.playable.playbackLease?.close()
+                assertEquals(1, newerLease.closes)
+            }
+        }
+    }
+
+    @Test
+    fun `missing publication acknowledgment discards once and late acknowledgment cannot revive it`() {
+        val fixture = LeaseFixture(episodeSwitch = true)
+        val result = fixture.resolution()
+        lateinit var lateAcknowledgment: () -> Unit
+        val failure = runCatching {
+            result.commitIfCurrent({ true }) { acknowledge -> lateAcknowledgment = acknowledge }
+        }.exceptionOrNull()
+        assertEquals("Player replacement publication was not acknowledged", failure?.message)
+        assertSame(fixture.outgoing, fixture.state.playable)
+        assertEquals(1, fixture.rollbacks)
+        assertEquals(1, fixture.incomingLease.closes)
+        assertEquals(0, fixture.outgoingLease.closes)
+        lateAcknowledgment()
+        result.discard()
+        assertFalse(result.commitIfCurrent { true })
+        assertEquals(1, fixture.commits)
+        assertEquals(1, fixture.rollbacks)
+        assertEquals(1, fixture.incomingLease.closes)
+    }
+
+    @Test
+    fun `duplicate acknowledgment and reentrant acceptance do not duplicate producer commit`() {
+        val fixture = LeaseFixture(episodeSwitch = false)
+        val result = fixture.resolution()
+        assertTrue(result.commitIfCurrent({ true }) { acknowledge ->
+            assertFalse(result.commitIfCurrent { true })
+            assertEquals(1, fixture.commits)
+            acknowledge()
+            acknowledge()
+            result.discard()
+        })
+        assertEquals(1, fixture.commits)
+        assertEquals(0, fixture.rollbacks)
+        assertEquals(0, fixture.incomingLease.closes)
+        result.playable.playbackLease?.close()
+        assertEquals(1, fixture.incomingLease.closes)
+    }
+
+    @Test
+    fun `actual player callbacks acknowledge directly after assignment before episode notification`() {
+        val screen = File("src/main/kotlin/com/vortx/android/player/PlayerScreen.kt").readText()
+        val sourceCallback = screen.substringAfter("publishState = { replacement, acknowledgePublished ->")
+            .substringBefore("// In-player EPISODE")
+        assertTrue(Regex("sourceSwitchState = replacement\\s+acknowledgePublished\\(\\)").containsMatchIn(sourceCallback))
+        assertTrue(sourceCallback.indexOf("engine.pause()") < sourceCallback.indexOf("sourceSwitchState = replacement"))
+        val episodeCallback = screen.substringAfter("publishState = { accepted, acknowledgePublished ->")
+            .substringBefore("var chapters")
+        assertTrue(Regex("sourceSwitchState = accepted\\s+acknowledgePublished\\(\\)").containsMatchIn(episodeCallback))
+        assertTrue(episodeCallback.indexOf("engine.pause()") < episodeCallback.indexOf("sourceSwitchState = accepted"))
+        assertTrue(episodeCallback.indexOf("acknowledgePublished()") < episodeCallback.indexOf("currentOnEpisodeSwitched("))
+    }
+
+    private suspend fun assertPostPublicationFailure(episodeSwitch: Boolean) {
+        val fixture = LeaseFixture(episodeSwitch)
+        val expectedFailure = IllegalStateException("Synthetic post-publication notification failure")
+        var notifications = 0
+        fixture.beforePublish = {
+            assertSame(fixture.outgoing, fixture.state.playable)
+            assertEquals(0, fixture.outgoingLease.closes)
+            assertEquals(0, fixture.incomingLease.closes)
+        }
+        fixture.afterPublish = { accepted ->
+            // Actual PlayerScreen order: state assignment precedes the episode history callback.
+            assertSame(accepted, fixture.state)
+            if (episodeSwitch) {
+                val history = requireNotNull(acceptedEpisodeReplacement(fixture.pendingState, accepted))
+                assertSame(accepted.playable, history.playable)
+                assertEquals(accepted.revision, history.revision)
+            }
+            notifications++
+            throw expectedFailure
+        }
+        val result = fixture.resolution()
+        val failure = runCatching { fixture.resolve { Result.success(result) } }.exceptionOrNull()
+        assertSame("Notification errors still propagate", expectedFailure, failure)
+        val accepted = fixture.state
+        assertEquals(1L, accepted.revision)
+        assertSame(fixture.incomingLease, accepted.playable.playbackLease)
+        assertEquals(if (episodeSwitch) 0L else 42_000L, accepted.playable.startPositionMs)
+        assertNull(accepted.pendingSwitch)
+        assertNull(accepted.pendingEpisodeSwitch)
+        assertNull(accepted.failedEpisode)
+        assertEquals(1, notifications)
+        assertEquals(1, fixture.commits)
+        assertEquals("Published state cannot roll back its producer", 0, fixture.rollbacks)
+        assertEquals("Mounted resource remains player-owned", 0, fixture.incomingLease.closes)
+        assertEquals(0, fixture.outgoingLease.closes)
+        val authority = fixture.pendingState.pendingSwitch?.authority
+            ?: requireNotNull(fixture.pendingState.pendingEpisodeSwitch).authority
+        assertFalse("Published request must be retired despite notification failure", fixture.coordinator.isCurrent(authority))
+        result.discard()
+        fixture.resolve { Result.success(result) }
+        assertSame(accepted, fixture.state)
+        assertEquals(1, notifications)
+        assertEquals(0, fixture.rollbacks)
+        assertEquals(0, fixture.incomingLease.closes)
+        accepted.playable.playbackLease?.close()
+        assertEquals("Mounted disposal is the only incoming close", 1, fixture.incomingLease.closes)
+    }
+
     /** Intentionally non-idempotent: production must supply one-shot disposal. */
     private class CountingLease : AutoCloseable {
         var closes = 0
@@ -671,6 +840,7 @@ class PlayerSourceSwitchingTest {
         var commits = 0
         var rollbacks = 0
         var beforePublish: () -> Unit = {}
+        var afterPublish: (PlayerSourceSwitchState) -> Unit = {}
 
         fun resolution(gate: PlayerSourceSwitchCommitGate = PlayerSourceSwitchCommitGate(),
             current: Boolean = true, blank: Boolean = false, missingSource: Boolean = false) =
@@ -685,10 +855,16 @@ class PlayerSourceSwitchingTest {
             )
 
         suspend fun resolve(resolver: suspend () -> Result<PlayerSourceSwitchResolution>) {
+            val publish: (PlayerSourceSwitchState, () -> Unit) -> Unit = { accepted, acknowledge ->
+                beforePublish()
+                state = accepted
+                acknowledge()
+                afterPublish(accepted)
+            }
             if (episodeSwitch) resolveAndApplyPlayerEpisodeSwitch(coordinator,
-                requireNotNull(pendingState.pendingEpisodeSwitch), { resolver() }, { state }, { beforePublish(); state = it })
+                requireNotNull(pendingState.pendingEpisodeSwitch), { resolver() }, { state }, publish)
             else resolveAndApplyPlayerSourceSwitch(coordinator,
-                requireNotNull(pendingState.pendingSwitch), { resolver() }, { state }, { 42_000L }, { beforePublish(); state = it })
+                requireNotNull(pendingState.pendingSwitch), { resolver() }, { state }, { 42_000L }, publish)
         }
 
         fun assertRejected() {

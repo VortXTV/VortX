@@ -866,11 +866,12 @@ fun PlayerScreen(
             resolver = { source -> resolver?.invoke(source) ?: Result.failure(IllegalStateException()) },
             currentState = { sourceSwitchState },
             latestPositionMs = { latestState.positionMs },
-            publishState = { replacement ->
+            publishState = { replacement, acknowledgePublished ->
                 // Keep the old frame alive while resolving, then cut its audio at the linearized
                 // accepted replacement boundary. An already-paused viewer remains paused.
                 if (replacement.revision > sourceSwitchState.revision) engine.pause()
                 sourceSwitchState = replacement
+                acknowledgePublished()
             },
         )
     }
@@ -885,10 +886,11 @@ fun PlayerScreen(
             pending = pending,
             resolver = { episode -> resolver?.invoke(episode.id) ?: Result.failure(IllegalStateException()) },
             currentState = { sourceSwitchState },
-            publishState = { accepted ->
+            publishState = { accepted, acknowledgePublished ->
                 val previous = sourceSwitchState
                 if (accepted.revision > previous.revision) engine.pause()
                 sourceSwitchState = accepted
+                acknowledgePublished()
                 acceptedEpisodeReplacement(previous, accepted)?.let { replacement ->
                     currentOnEpisodeSwitched(replacement.playable, replacement.revision)
                 }
