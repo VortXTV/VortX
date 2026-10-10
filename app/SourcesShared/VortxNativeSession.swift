@@ -1211,13 +1211,13 @@ actor VortxNativeSession {
             return value
         }
         _ = try publish(logStreams: true)
-        return try await withThrowingTaskGroup(of: (Int, VortxResourceSnapshot?).self) { group in
+        return try await withThrowingTaskGroup(of: (Int, Result<VortxResourceSnapshot, VortxResourceGroup.Failure>).self) { group in
             func schedule(_ offset: Int) {
                 let job = jobs[offset], bridge = workers[offset], addon = addons[job.0]
                 group.addTask {
-                    do { return (offset, try await bridge.load(ownerID: profile, request: job.1, addons: [addon], budgetMs: 20_000,
-                        maxResponseBytes: 8_388_608, maxTotalResponseBytes: 33_554_432)) }
-                    catch { return (offset, nil) }
+                    do { return (offset, .success(try await bridge.load(ownerID: profile, request: job.1, addons: [addon], budgetMs: 20_000,
+                        maxResponseBytes: 8_388_608, maxTotalResponseBytes: 33_554_432))) }
+                    catch { return (offset, .failure(.from(error))) }
                 }
             }
             let metaStride = stream == nil ? 1 : 2
@@ -1229,13 +1229,14 @@ actor VortxNativeSession {
                 guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
                 let job = jobs[offset], addon = addons[job.0]
                 var value: VortxResourceGroup
-                if let result {
+                switch result {
+                case .success(let result):
                     guard workers[offset].accepts(result) else { throw VortxNativeError.superseded }
                     // Unsupported/empty singleton responses are terminal, not still-loading rows.
                     value = result.groups.first ?? .init(addonId: addon.id, status: .ready,
                         content: .object(job.1.resource == .meta ? ["meta": .null] : ["streams": .array([])]), error: nil)
-                } else {
-                    value = .init(addonId: addon.id, status: .error, content: nil, error: .init(code: "native_resource_failed"))
+                case .failure(let failure):
+                    value = .failed(addonId: addon.id, failure: failure)
                 }
                 if value.status == .ready {
                     do {
@@ -1259,6 +1260,12 @@ actor VortxNativeSession {
                 if job.1.resource == .meta { metas[job.0] = value } else { streams[job.0] = value }
                 completed += 1
                 _ = try publish(logStreams: job.1.resource == .stream)
+                // Publish/log the accepted terminal leg once, not every snapshot of prior legs.
+                // No await separates these ownership checks from submitting the redacted receipt.
+                try Task.checkCancellation()
+                guard current(name, ticket, capturedEpoch) else { throw VortxNativeError.superseded }
+                VXProbe.log("native-addon", value.terminalDiagnostic(requestID: ticket,
+                    request: job.1, sourceOrdinal: job.0 + 1))
                 if job.1.resource == .meta, scheduledMeta < addons.count {
                     schedule(scheduledMeta * metaStride); scheduledMeta += 1
                 } else if job.1.resource == .stream, scheduledStreams < addons.count {

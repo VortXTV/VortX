@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import CryptoKit
 #if !VORTX_NATIVE_DATA_ENGINE
 import StremioXCore
@@ -3147,6 +3148,17 @@ final class CoreBridge: ObservableObject {
     private static func describeResourceError(_ content: Any?) -> String? {
         if let s = content as? String { return s }
         guard let d = content as? [String: Any] else { return "error" }
+        if d["type"] == nil, let code = d["code"] as? String {
+            // Native resource errors carry only controlled categories and optional HTTP status.
+            // Never expose an arbitrary native error string or infer TLS/DNS from "network".
+            if code == "empty_resource" { return nil } // Empty metadata is not a provider failure.
+            let status = (d["status"] as? NSNumber).flatMap { value -> Int? in
+                guard CFGetTypeID(value) != CFBooleanGetTypeID(), value.doubleValue == Double(value.intValue),
+                      (100...599).contains(value.intValue) else { return nil }
+                return value.intValue
+            }
+            return VortxResourceGroup.Failure(code: code, status: status).userMessage
+        }
         let type = d["type"] as? String
         if type == "EmptyContent" { return nil }   // not an error: the add-on simply had nothing
         if let innerStr = d["content"] as? String { return [type, innerStr].compactMap { $0 }.joined(separator: ": ") }

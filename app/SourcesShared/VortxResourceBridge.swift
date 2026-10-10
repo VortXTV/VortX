@@ -54,11 +54,70 @@ struct VortxResourceAddon: Codable, Sendable {
 
 struct VortxResourceGroup: Decodable, Sendable {
     enum Status: String, Decodable, Sendable { case ready, error, timeout, cancelled }
-    struct Failure: Decodable, Sendable { let code: String }
+    /// Only controlled categories and a bounded HTTP status cross into presentation/diagnostics.
+    /// Never retain a transport's arbitrary error description: it may contain configured URLs.
+    struct Failure: Error, Decodable, Sendable {
+        let code: String
+        let status: Int?
+        private static let codes: Set<String> = ["invalid_request", "invalid_source", "unsupported_resource",
+            "network", "http", "timeout", "cancelled", "body_too_large", "malformed", "unavailable",
+            "invalid_response", "empty_resource", "native_resource_failed", "native_catalog_failed",
+            "closed", "invalid_snapshot", "superseded", "checkpoint_uncertain"]
+        init(code: String, status: Int? = nil) {
+            self.code = Self.codes.contains(code) ? code : "native_resource_failed"
+            self.status = self.code == "http" ? status.flatMap { (100...599).contains($0) ? $0 : nil } : nil
+        }
+        private enum CodingKeys: String, CodingKey { case code, status }
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(code: try values.decode(String.self, forKey: .code),
+                      status: try? values.decode(Int.self, forKey: .status))
+        }
+        static func from(_ error: Error) -> Self {
+            if error is CancellationError { return .init(code: "cancelled") }
+            if error is DecodingError { return .init(code: "invalid_response") }
+            if error is VortxNativeError { return .init(code: VortxNativeError.diagnosticCode(error)) }
+            return .init(code: "native_resource_failed")
+        }
+        var userMessage: String {
+            switch code {
+            case "http":
+                if let status { return status == 429 ? "Add-on rate limited (HTTP 429). Try again later." : "Add-on returned HTTP \(status)." }
+                return "Add-on returned an HTTP error."
+            case "network": return "Add-on network request failed."
+            case "timeout": return "Add-on request timed out. Try again."
+            case "malformed", "invalid_response": return "Could not read the add-on response."
+            case "invalid_request", "invalid_source": return "Add-on configuration could not be used."
+            case "unsupported_resource", "empty_resource": return "No results for this request."
+            case "body_too_large": return "Add-on response exceeded the size limit."
+            case "cancelled", "closed", "superseded": return "Add-on request was cancelled."
+            default: return "Add-on request could not be completed. Try again."
+            }
+        }
+    }
     let addonId: String
     let status: Status
     let content: VortxJSON?
     let error: Failure?
+
+    static func failed(addonId: String, failure: Failure) -> Self {
+        let status: Status = failure.code == "timeout" ? .timeout :
+            ["cancelled", "closed", "superseded"].contains(failure.code) ? .cancelled : .error
+        return .init(addonId: addonId, status: status, content: nil, error: failure)
+    }
+
+    /// A request-local ordinal identifies a source without logging its URL, manifest, name or ID.
+    /// Call only after the consumer's ticket/epoch and bridge acceptance checks, once per leg.
+    func terminalDiagnostic(requestID: UUID, request: VortxResourceRequest, sourceOrdinal: Int) -> String {
+        let prefix = "request=\(requestID.uuidString) resource=\(request.resource.rawValue) source=\(sourceOrdinal)"
+        if status == .ready {
+            guard let items = try? items(for: request.resource) else { return "\(prefix) result=error code=invalid_response" }
+            let count = items.count
+            return "\(prefix) result=\(count == 0 ? "empty" : "ready") items=\(count)"
+        }
+        let failure = error ?? .init(code: status.rawValue)
+        return "\(prefix) result=error code=\(failure.code)" + (failure.status.map { " status=\($0)" } ?? "")
+    }
 
     /// All results remain grouped under the exact registry identity. No cross-addon de-duplication,
     /// sorting, dropped subtitle tracks, or substitution of metadata from an unrelated request.
