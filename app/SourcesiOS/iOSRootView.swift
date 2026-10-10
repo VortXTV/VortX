@@ -2499,6 +2499,7 @@ struct iOSLibraryView: View {
                 }
                 .padding(.horizontal, Theme.Space.md)
                 .padding(.bottom, Theme.Space.lg)
+                .background(VortXProfileGlassCanvas(tint: Theme.Palette.accent))
                 #endif
                 if !libraryContinueWatchingItems.isEmpty {
                     PosterRail(title: "Continue Watching", eyebrow: "Pick up where you left off",
@@ -2817,19 +2818,30 @@ private struct iOSLibraryHubCard: View {
     let subtitle: String
     let systemImage: String
     var badge: String? = nil
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        iOSLibraryHubCardSurface(title: title, subtitle: subtitle, systemImage: systemImage, badge: badge,
+                                 reduceTransparency: reduceTransparency, highContrast: contrast == .increased)
+    }
+}
+
+/// Presentation-only inputs; the doorway's navigation/filter action remains with iOSLibraryView.
+private struct iOSLibraryHubCardSurface: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let badge: String?
+    let reduceTransparency: Bool
+    let highContrast: Bool
 
     var body: some View {
         HStack(spacing: Theme.Space.md) {
             Image(systemName: systemImage)
                 .font(.system(size: 24, weight: .semibold))
-                .foregroundStyle(Theme.Palette.accent)
+                .foregroundStyle(highContrast ? Theme.Palette.textPrimary : Theme.Palette.accent.opacity(0.85))
                 .frame(width: 52, height: 52)
-                .vortxGlassTintedSurface(
-                    in: RoundedRectangle(cornerRadius: 16, style: .continuous),
-                    fillAlpha: VortXGlass.pillFillAlpha,
-                    tint: Theme.Palette.accent,
-                    tintAlpha: VortXGlass.cinemaTintAlpha * 0.8,
-                    shadow: .flat)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
                     .font(Theme.Typography.cardTitle)
@@ -2843,7 +2855,7 @@ private struct iOSLibraryHubCard: View {
             if let badge {
                 Text(badge)
                     .font(Theme.Typography.eyebrow)
-                    .foregroundStyle(Theme.Palette.accent)
+                    .foregroundStyle(highContrast ? Theme.Palette.textPrimary : Theme.Palette.accent)
             }
             Image(systemName: "chevron.right")
                 .font(.system(size: 13, weight: .semibold))
@@ -2855,8 +2867,11 @@ private struct iOSLibraryHubCard: View {
             in: RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous),
             fillAlpha: VortXGlass.cardFillAlpha,
             tint: Theme.Palette.accent,
-            tintAlpha: VortXGlass.cinemaTintAlpha,
-            shadow: .card)
+            tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                reduceTransparency: reduceTransparency, highContrast: highContrast),
+            shadow: .card,
+            contained: true,
+            forceOpaque: reduceTransparency || highContrast)
         .contentShape(RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous))
     }
 }

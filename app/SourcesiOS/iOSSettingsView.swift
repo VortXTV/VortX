@@ -222,36 +222,8 @@ struct iOSSettingsView: View {
         #endif
     }
 
-    private var settingsCardRadius: CGFloat {
-        usesWideSettingsLayout ? 24 : 18
-    }
-
     private var settingsRowInsets: EdgeInsets {
-        usesWideSettingsLayout
-            ? EdgeInsets(top: 14, leading: 20, bottom: 14, trailing: 20)
-            : EdgeInsets(top: 14, leading: 18, bottom: 14, trailing: 18)
-    }
-
-    /// Padding keeps text readable; this is the actual space between row cards. The old form only inset
-    /// the background shape, so neighbouring rounded boxes still touched even with generous row padding.
-    private var settingsRowSpacing: CGFloat {
-        usesWideSettingsLayout ? Theme.Space.sm : Theme.Space.xs
-    }
-
-    /// Wide surfaces can carry a little more of the active profile hue; the phone stays restrained so the
-    /// compact form remains dark and scannable instead of becoming a column of coloured slabs.
-    private var settingsTintAlpha: Double {
-        usesWideSettingsLayout ? 0.10 : 0.08
-    }
-
-    /// macOS Form does not expose `listRowSpacing`; keep its wide-column card breathing room with the
-    /// clipped background inset while iPhone/iPad use the real iOS row-spacing API above.
-    private var settingsCardVerticalInset: CGFloat {
-        #if os(macOS)
-        return Theme.Space.xs / 2
-        #else
-        return 0
-        #endif
+        VortXInlineGlassPolicy.rowInsets(wide: usesWideSettingsLayout)
     }
 
     var body: some View {
@@ -303,9 +275,10 @@ struct iOSSettingsView: View {
             .scrollContentBackground(.hidden)
             .listRowInsets(settingsRowInsets)
             #if os(iOS)
-            .listRowSpacing(settingsRowSpacing)
+            // The row's layout insets and background share one gutter owner on every platform.
+            .listRowSpacing(0)
             #endif
-            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .background(VortXProfileGlassCanvas(tint: Theme.Palette.accent).ignoresSafeArea())
             .frame(maxWidth: usesWideSettingsLayout ? 1120 : .infinity, alignment: .center)
             .padding(.horizontal, usesWideSettingsLayout ? Theme.Space.sm : 0)
             #endif
@@ -484,13 +457,7 @@ struct iOSSettingsView: View {
     /// grouped-list platter when a new section is added.
     private func styledSettingsSection<Content: View>(_ content: Content) -> some View {
         content
-            .listRowBackground(Color.clear.vortxGlassTintedSurface(
-                in: RoundedRectangle(cornerRadius: settingsCardRadius, style: .continuous),
-                fillAlpha: VortXGlass.cardFillAlpha,
-                tint: Theme.Palette.accent,
-                tintAlpha: settingsTintAlpha,
-                shadow: .flat)
-                .padding(.vertical, settingsCardVerticalInset))
+            .listRowBackground(VortXSettingsRowBackground(wide: usesWideSettingsLayout, tint: Theme.Palette.accent))
             .listRowInsets(settingsRowInsets)
             .listRowSeparator(.hidden)
     }
@@ -579,7 +546,7 @@ struct iOSSettingsView: View {
             .scrollContentBackground(.hidden)
             .listRowInsets(settingsRowInsets)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Theme.Palette.canvas.ignoresSafeArea())
+            .background(VortXProfileGlassCanvas(tint: Theme.Palette.accent).ignoresSafeArea())
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.Palette.canvas.ignoresSafeArea())
@@ -720,7 +687,7 @@ struct iOSSettingsView: View {
                 }
                 .padding(.vertical, 2)
             }
-            .listRowInsets(EdgeInsets(top: 8, leading: 8, bottom: 8, trailing: 8))
+            .listRowInsets(settingsRowInsets)
         } header: {
             Text("Profiles")
         } footer: {
@@ -1264,8 +1231,7 @@ struct iOSSettingsView: View {
             // Auto-pick + live preview) binds directly to the SourcePreferences singleton, the same
             // direct-singleton pattern the rest of this section uses.
             SourceFilterChipsView(prefs: sourcePrefs)
-                .listRowInsets(EdgeInsets(top: Theme.Space.sm, leading: Theme.Space.md,
-                                          bottom: Theme.Space.sm, trailing: Theme.Space.md))
+                .listRowInsets(settingsRowInsets)
             Toggle("Use add-on ranking order", isOn: $sourcePrefs.useAddonOrder)
                 .tint(Theme.Palette.accent)
 

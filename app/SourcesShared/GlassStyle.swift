@@ -311,6 +311,97 @@ enum VortXGlass {
     #endif
 }
 
+// MARK: - Settings and Library inline surfaces
+
+/// One owner for inline row rhythm: the transparent gutter is reserved in the row's layout insets as
+/// well as its background. This works with macOS Form too, without relying on iOS-only listRowSpacing.
+/// The inner control padding remains 14pt on both layouts; the wider column earns a larger card gap.
+enum VortXInlineGlassPolicy {
+    static func rowGutter(wide: Bool) -> CGFloat { wide ? 8 : 6 }
+    static func rowRadius(wide: Bool) -> CGFloat { wide ? 24 : 18 }
+    static func rowInsets(wide: Bool) -> EdgeInsets {
+        let vertical = 14 + rowGutter(wide: wide)
+        let horizontal: CGFloat = wide ? 20 : 18
+        return EdgeInsets(top: vertical, leading: horizontal, bottom: vertical, trailing: horizontal)
+    }
+    static func tintAlpha(reduceTransparency: Bool, highContrast: Bool) -> Double {
+        if highContrast { return 0 }
+        return reduceTransparency ? 0.02 : 0.06
+    }
+    static func canvasAlpha(reduceTransparency: Bool, highContrast: Bool) -> Double {
+        if highContrast { return 0 }
+        return reduceTransparency ? 0.015 : 0.04
+    }
+}
+
+/// Static, bounded atmosphere from the already cached profile accent. No image, blur, animation or
+/// observation of its own; Settings and the Library doorway stack are its only consumers.
+struct VortXProfileGlassCanvas: View {
+    let tint: Color
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        VortXProfileGlassCanvasSurface(tint: tint, reduceTransparency: reduceTransparency,
+                                      highContrast: contrast == .increased)
+    }
+}
+
+/// Pure surface inputs keep accessibility policy testable without changing system preferences.
+struct VortXProfileGlassCanvasSurface: View {
+    let tint: Color
+    let reduceTransparency: Bool
+    let highContrast: Bool
+
+    var body: some View {
+        let alpha = VortXInlineGlassPolicy.canvasAlpha(
+            reduceTransparency: reduceTransparency, highContrast: highContrast)
+        Theme.Palette.canvas.overlay(alignment: .topLeading) {
+            if alpha > 0 {
+                RadialGradient(colors: [tint.opacity(alpha), .clear], center: .topLeading,
+                               startRadius: 0, endRadius: 520)
+                    .frame(maxWidth: .infinity, maxHeight: 520)
+                    .allowsHitTesting(false)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Form row background only: native row content and all bindings stay in the existing Section.
+/// Contained material prevents the OS-26 ambient bloom from bridging neighbouring rounded rows.
+struct VortXSettingsRowBackground: View {
+    let wide: Bool
+    let tint: Color
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var contrast
+
+    var body: some View {
+        VortXSettingsRowSurface(wide: wide, tint: tint, reduceTransparency: reduceTransparency,
+                               highContrast: contrast == .increased)
+    }
+}
+
+struct VortXSettingsRowSurface: View {
+    let wide: Bool
+    let tint: Color
+    let reduceTransparency: Bool
+    let highContrast: Bool
+
+    var body: some View {
+        Color.clear.vortxGlassTintedSurface(
+            in: RoundedRectangle(cornerRadius: VortXInlineGlassPolicy.rowRadius(wide: wide), style: .continuous),
+            fillAlpha: VortXGlass.cardFillAlpha,
+            tint: tint,
+            tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                reduceTransparency: reduceTransparency, highContrast: highContrast),
+            shadow: .flat,
+            contained: true,
+            forceOpaque: reduceTransparency || highContrast)
+        .padding(.vertical, VortXInlineGlassPolicy.rowGutter(wide: wide))
+    }
+}
+
 // MARK: - The reusable SwiftUI material
 
 /// Renders the VortX glass as a `background` behind its content: blur layer + warm tint + top highlight +
@@ -334,6 +425,12 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
     /// Tight small circular control (disc): forward to `blurLayer` so the blur is a shape-clipped material
     /// on every OS, never `glassEffect` (which would draw an un-clipped halo around the disc). Default off.
     var hugsTightly: Bool = false
+    /// Opt-in opaque presentation for an inline surface's increased-contrast fallback. Existing glass
+    /// presets keep their own behavior; only Settings and Library doorway cards request this.
+    var forceOpaque: Bool = false
+    /// Contained inline cards need less neutral material over OLED than floating chrome. Default one
+    /// keeps every existing preset unchanged; opaque accessibility fallbacks never reduce their opacity.
+    var materialOpacity: Double = 1
     /// tvOS ONLY: a fully OPAQUE warm fill for focusable / scrolling / on-art surfaces (rows, chips,
     /// badges). When set, tvOS renders this opaque fill in place of the live blur + translucent warm tint,
     /// so the Apple TV GPU does not composite a per-frame backdrop blur (the ~5fps focus-scroll regression)
@@ -373,10 +470,11 @@ private struct VortXGlassModifier<S: InsettableShape>: ViewModifier {
                     shape.fill(activeFill)
                 }
             } else {
-                VortXGlass.blurLayer(in: shape, reduceTransparency: reduceTransparency, hugsTightly: hugsTightly)
+                VortXGlass.blurLayer(in: shape, reduceTransparency: reduceTransparency || forceOpaque, hugsTightly: hugsTightly)
+                    .opacity(reduceTransparency || forceOpaque ? 1 : materialOpacity)
                 // The warm-dark VortX tint over the blur is what makes Apple's neutral Liquid Glass read as
                 // VortX chrome. Skipped under Reduce Transparency, where `blurLayer` is already an opaque warm fill.
-                if !reduceTransparency {
+                if !reduceTransparency && !forceOpaque {
                     shape.fill(VortXGlass.fill(fillAlpha, tone: tone))
                 }
                 // Ambient profile tint remains present in the opaque Reduce Transparency fallback as a
@@ -499,7 +597,8 @@ extension View {
     /// `vortxGlassActive` / `activeFill`: Settings rows and Library doorway cards are ambient surfaces, not
     /// selected controls, so they get a restrained tint with the normal glass edge and no accent glow.
     /// The helper is shape-generic so list rows can keep their clipped, flat shadow while Cinema cards keep
-    /// their raised card shadow.
+    /// their raised card shadow. `contained` keeps inline glass within its silhouette and lowers only the
+    /// neutral material contribution; the shared warm lift, profile wash and opaque fallback remain.
     func vortxGlassTintedSurface<S: InsettableShape>(
         in shape: S,
         fillAlpha: Double = VortXGlass.cardFillAlpha,
@@ -507,7 +606,9 @@ extension View {
         tintAlpha: Double = VortXGlass.cinemaTintAlpha,
         highlight: Double = 0.14,
         shadow: VortXGlass.Shadow = .flat,
-        tone: VortXGlass.Tone = .lift
+        tone: VortXGlass.Tone = .lift,
+        contained: Bool = false,
+        forceOpaque: Bool = false
     ) -> some View {
         modifier(VortXGlassModifier(
             shape: shape,
@@ -516,6 +617,9 @@ extension View {
             shadow: shadow,
             accentTint: tint,
             accentTintAlpha: tintAlpha,
+            hugsTightly: contained,
+            forceOpaque: forceOpaque,
+            materialOpacity: contained ? 0.55 : 1,
             tone: tone
         ))
     }
