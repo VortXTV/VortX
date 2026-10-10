@@ -44,22 +44,26 @@ private final class LocalCinematicFixtureServer {
                 gate_path = os.path.join(gate_dir, name.replace("/", "_"))
                 while os.path.exists(gate_path):
                     time.sleep(0.002)
-                file_path = os.path.join(root, name)
-                if os.path.isfile(file_path):
-                    body = open(file_path, "rb").read()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    try:
+                # A canceled URLSession can close the socket before headers are accepted. A release marker
+                # records that the explicit gate opened independently of whether response bytes were accepted.
+                open(marker_name(path, "released"), "a").close()
+                try:
+                    file_path = os.path.join(root, name)
+                    if os.path.isfile(file_path):
+                        body = open(file_path, "rb").read()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/png")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
                         self.wfile.write(body)
-                    except BrokenPipeError:
-                        pass
-                else:
-                    self.send_response(404)
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                open(marker_name(path, "response"), "a").close()
+                    else:
+                        self.send_response(404)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                except OSError:
+                    pass
+                finally:
+                    open(marker_name(path, "response"), "a").close()
 
         class ThreadingHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
             allow_reuse_address = True
@@ -143,6 +147,10 @@ private final class LocalCinematicFixtureServer {
 
     func waitForResponse(_ path: String) async -> Bool {
         await waitForMarker(path, suffix: "response")
+    }
+
+    func waitForRelease(_ path: String) async -> Bool {
+        await waitForMarker(path, suffix: "released")
     }
 
     private func waitForMarker(_ path: String, suffix: String) async -> Bool {
@@ -544,8 +552,8 @@ private enum CinematicBackdropImageTests {
         )
         fixtureServer.release("slow-title-a-backdrop.png")
         check(
-            "late old-title response is explicitly released",
-            await fixtureServer.waitForResponse("slow-title-a-backdrop.png"),
+            "late old-title response release is explicitly acknowledged",
+            await fixtureServer.waitForRelease("slow-title-a-backdrop.png"),
             failures: &failures
         )
         let finalImage = layerImage(rotatingLayer)
