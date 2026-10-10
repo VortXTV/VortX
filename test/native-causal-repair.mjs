@@ -58,8 +58,15 @@ if (process.argv[2] === '--extract') {
   replace('    var cwItems: [CoreCWItem] = []', '    var cwItems: [CoreCWItem] = []\n' + section('PROFILE ENVIRONMENT'));
   replace('        ProfileDiscoveryPreferencesStore.apply(active?.discovery, resetUnset: true)',
     '        VortXSyncManager.suppressHousekeeping { ProfileDiscoveryPreferencesStore.apply(self.active?.discovery, resetUnset: true) }');
+  const admissionMarker = '    private let nativePreferenceAdmissionGate =';
+  const admissionStart = source.indexOf(admissionMarker);
+  assert(admissionStart >= 0 && source.indexOf(admissionMarker, admissionStart + admissionMarker.length) === -1,
+    'missing or ambiguous production preference admission gate');
+  const admissionDeclaration = source.slice(admissionStart, source.indexOf('\n', admissionStart));
+  receipts.push({ path: 'app/SourcesShared/VortXSyncManager.swift', marker: admissionMarker,
+    firstLine: source.slice(0, admissionStart).split('\n').length, sourceSHA256: hash(source), sliceSHA256: hash(admissionDeclaration) });
   replace('    var isSignedIn = true; var hasAppliedAccountDoc = false; var hasPendingPush = false',
-    '    var isSignedIn = true; var hasAppliedAccountDoc = false\n' + section('MANAGER ENVIRONMENT'));
+    '    var isSignedIn = true; var hasAppliedAccountDoc = false\n' + admissionDeclaration + '\n' + section('MANAGER ENVIRONMENT'));
   replace('    var dirtySettings: [String: Double] = [:]; var appliedSettingsBaseline: Set<String> = []', '    var appliedSettingsBaseline: Set<String> = []');
   const remove = [
     '    func withRemoteApplySuppressed(_ body: () -> Void) { body() }',
@@ -88,6 +95,7 @@ if (process.argv[2] === '--extract') {
     '    private func observeDefaultsChange(', '    func nativeMutationDidCommit(', '    private func drainNativeMutationPush(', '    private func drainLocalRosterPush(',
     '    func withRemoteApplySuppressed(', '    nonisolated static func suppressHousekeeping(', '    func requestSyncSoon(',
     '    private func nativeGlobalEdits(', '    private func nativeDirtySettingIsExported(', '    private func nativePreferenceStampIsAttributed(',
+    '    private static var nativePreferenceProjectionKeys:',
     '    private func clearPushedDirtySettings(', '    func syncUp(', '    private func finishSyncUp(', '    private func mergeLocalIntoDoc(',
     '    private func pushDerivedDoc(', '    private struct DerivedSyncDoc {', '    private func ensureNativeCheckpoint(',
     '    private struct NativePreferenceContext {', '    private func nativePreferenceContext(', '    nonisolated private static func makeNativePreferenceContext(',
