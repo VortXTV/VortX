@@ -9861,7 +9861,7 @@ struct TVPlayerView: View {
                 startLoadTimeout()
                 // Fill the in-player alternatives after issuing the prepared winner, without touching the
                 // covered detail page. First-frame commit may clear pendingAdvance while this fetch runs.
-                func preparedSourcesCurrent() -> Bool {
+                @MainActor func preparedSourcesCurrent() -> Bool {
                     sourceOwner.isCurrent && !leftPlayback && SeriesSourceSticky.admits(choice)
                         && episodeGeneration == episodeSwitchGeneration && sourceGeneration == sourceSwitchGeneration
                         && (pendingAdvance?.meta.videoId == v.id || curMeta?.videoId == v.id)
