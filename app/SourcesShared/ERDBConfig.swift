@@ -193,6 +193,10 @@ enum PosterArtwork {
 /// all platforms (no per-platform divergence). The title text shows immediately and the logo swaps in once
 /// resolved (instant when fanart is off - no network; one hop when on), so the band never blanks.
 struct ResolvedTitleLogo<TitleText: View>: View {
+    /// 320pt at the largest supported iOS display scale. Logos stay transparent and aspect-fit, but the
+    /// decoded bitmap never follows a multi-megapixel source image past this small, explicit budget.
+    private static var logoMaxPixel: CGFloat { 960 }
+
     let id: String?
     let type: String
     let fallbackLogo: String?
@@ -203,33 +207,60 @@ struct ResolvedTitleLogo<TitleText: View>: View {
     var shadowY: CGFloat = 4
     var accessibilityName: String = ""
     @ViewBuilder var titleText: () -> TitleText
-    @State private var logoURL: String?
+    @State private var signedLogoURL: URL?
+    @State private var logoImage: VXPosterImage?
+    @State private var loadedLogoURL: String?
 
     var body: some View {
         Group {
-            if let logoURL, !logoURL.isEmpty, let rawURL = URL(string: logoURL) {
-                // AsyncImage cannot attach headers, so a rating-baked ERDB logo (erdb.vortx.tv, a gated host)
-                // is signed via query params (`vts`/`vkid`/`vsig`) instead. `signedURL` MEMOIZES per raw URL
-                // (reuse within half the 300s worker window), so this body re-evaluating on focus/scroll/
-                // progress ticks returns the SAME signed URL: AsyncImage keeps its identity (no phase reset,
-                // no flicker) and URLCache stays warm, instead of a new per-second `vts` busting both. Fails
-                // open: a fanart.tv / metahub / add-on logo (non-gated host) or an unprovisioned build is
-                // returned unchanged and loads normally.
-                let url = VortXEdgeAuth.signedURL(rawURL)
-                AsyncImage(url: url) { phase in
-                    if case .success(let img) = phase {
-                        img.resizable().aspectRatio(contentMode: .fit)
-                            .frame(maxWidth: maxWidth, maxHeight: maxHeight, alignment: .leading)
-                            .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, y: shadowY)
-                            .accessibilityLabel(accessibilityName)
-                    } else {
-                        titleText()
-                    }
-                }
+            if let image = logoImage,
+               let signedLogoURL,
+               loadedLogoURL == signedLogoURL.absoluteString {
+                renderedLogo(image)
             } else {
                 titleText()
             }
         }
-        .task(id: id) { logoURL = await PosterArtwork.resolvedLogo(id: id, type: type, fallback: fallbackLogo) }
+        .task(id: id) { await loadLogo() }
+    }
+
+    /// Resolve the logo once, preserve the memoized query-signed URL for the gated ERDB host, and then use the
+    /// shared off-main ImageIO loader. Clearing the request identity before every load keeps a recycled hero from
+    /// painting the prior title's logo while a new URL is waiting on the bounded loader.
+    private func loadLogo() async {
+        logoImage = nil
+        loadedLogoURL = nil
+        signedLogoURL = nil
+
+        let resolved = await PosterArtwork.resolvedLogo(id: id, type: type, fallback: fallbackLogo)
+        guard !Task.isCancelled else { return }
+        guard let resolved, !resolved.isEmpty, let rawURL = URL(string: resolved) else { return }
+
+        // `signedURL` MEMOIZES per raw URL (reuse within half the 300s worker window). Keep that exact signed
+        // URL as the request identity while PosterImageLoader supplies header signing, cache, and downsampling.
+        let signedURL = VortXEdgeAuth.signedURL(rawURL)
+        signedLogoURL = signedURL
+        guard !Task.isCancelled,
+              let image = await PosterImageLoader.load(signedURL.absoluteString, maxPixel: Self.logoMaxPixel),
+              !Task.isCancelled else { return }
+        logoImage = image
+        loadedLogoURL = signedURL.absoluteString
+    }
+
+    private func renderedLogo(_ image: VXPosterImage) -> some View {
+        imageView(image)
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(maxWidth: maxWidth, maxHeight: maxHeight, alignment: .leading)
+            .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius, y: shadowY)
+            .accessibilityLabel(accessibilityName)
+    }
+
+    private func imageView(_ image: VXPosterImage) -> Image {
+        #if canImport(UIKit)
+        Image(uiImage: image)
+        #else
+        Image(nsImage: image)
+        #endif
     }
 }
