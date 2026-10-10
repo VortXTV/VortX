@@ -239,6 +239,7 @@ struct FeaturedHeroView: View {
                 .id(launch.id)
                 .ignoresSafeArea()
         }
+        .cinemaHeroScrollOffsetTracking(enabled: navigationArtworkInset > 0)
     }
 
     @MainActor

@@ -894,6 +894,7 @@ struct iOSDetailView: View {
                             } else {
                                 // The Sources action in the hero row scrolls to this anchor.
                                 hero(width: geo.size.width, height: geo.size.height) { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
+                                    .cinemaHeroScrollOffsetTracking(enabled: navigationArtworkInset > 0)
                                 // #9: on a wide iPad/Mac window keep the hero full-bleed but cap the
                                 // source-heavy content to a readable column and center it (long lines hurt
                                 // readability). iPhone (and any narrow width) stays full-width as before.
@@ -1376,6 +1377,7 @@ struct iOSDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     heroBanner(width: geo.size.width, height: geo.size.height)
+                        .cinemaHeroScrollOffsetTracking(enabled: navigationArtworkInset > 0)
                     heroBelow(width: geo.size.width) { withAnimation { proxy.scrollTo(Self.sourcesAnchor, anchor: .top) } }
                     // #9: cap the source-heavy content to a readable column and center it on a wide window.
                     if isEpisodic {
@@ -1394,7 +1396,7 @@ struct iOSDetailView: View {
                 .padding(.bottom, Theme.Space.xl)
                 .frame(width: geo.size.width, alignment: .leading)
         }
-        .coordinateSpace(name: Self.detailScrollSpace)
+        .coordinateSpace(name: CinemaDetailHeroScrollOffsetKey.coordinateSpace)
     }
     #endif
 
@@ -4612,6 +4614,8 @@ struct CinemaEpisodeRailCard: View {
     var qualityLabel: String? = nil
     let artwork: AnyView
     let trailingStatus: AnyView
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
 
     private var coordinate: String {
         if let season = video.season { return "S\(season) · E\(video.episodeNumber)" }
@@ -4665,8 +4669,15 @@ struct CinemaEpisodeRailCard: View {
         }
         .padding(Theme.Space.md)
         .frame(width: cardWidth, alignment: .leading)
-        .vortxGlass(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
-                    fillAlpha: VortXGlass.cardFillAlpha, shadow: .card)
+        .vortxGlassTintedSurface(
+            in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
+            fillAlpha: VortXGlass.cardFillAlpha,
+            tint: Theme.Palette.accent,
+            tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                reduceTransparency: reduceTransparency, highContrast: accessibilityContrast == .increased),
+            shadow: .card,
+            contained: true,
+            forceOpaque: reduceTransparency || accessibilityContrast == .increased)
         .opacity(isWatched ? 0.58 : 1)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(coordinate): \(video.episodeTitle)")
@@ -4685,6 +4696,7 @@ struct CinemaEpisodeRailCard: View {
 struct iOSEpisodeStreams: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.cinemaNavigationArtworkInset) private var navigationArtworkInset
     let meta: CoreMetaItem
     let video: CoreVideo
     let season: Int
@@ -4817,16 +4829,19 @@ struct iOSEpisodeStreams: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     macEpisodeBanner(width: geo.size.width, height: episodeBandHeight(viewport: geo.size.height))
+                        .cinemaHeroScrollOffsetTracking(enabled: navigationArtworkInset > 0)
                     episodeOverviewText
                     sourceListView(width: geo.size.width)
                 }
                 .padding(.bottom, Theme.Space.xl)
                 .frame(width: geo.size.width, alignment: .leading)
         }
+        .coordinateSpace(name: CinemaDetailHeroScrollOffsetKey.coordinateSpace)
         #else
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 hero(width: geo.size.width, viewport: geo.size.height)
+                        .cinemaHeroScrollOffsetTracking(enabled: navigationArtworkInset > 0)
                 sourceListView(width: geo.size.width,
                                heroOwnsPrimaryPlay: SourcePresentationPolicy.mobileHeroActionOverlap(
                                    width: geo.size.width, viewport: geo.size.height) > 0)
@@ -4834,6 +4849,7 @@ struct iOSEpisodeStreams: View {
             .padding(.bottom, Theme.Space.xl)
             .frame(width: geo.size.width, alignment: .leading)
         }
+        .coordinateSpace(name: CinemaDetailHeroScrollOffsetKey.coordinateSpace)
         #endif
         }
         .environment(\.cinemaSourceJump, { anchor in
@@ -6339,8 +6355,65 @@ private extension EnvironmentValues {
     }
 }
 
+/// Detail-local counterpart to `RowFocusStyle`: it preserves the same focus/hover ring and motion
+/// response while giving Cinema's source rows the profile-tinted contained glass used by Library.
+private struct iOSSourceRowFocusStyle: ButtonStyle {
+    let reduceTransparency: Bool
+    let highContrast: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        iOSSourceRowFocusContent(configuration: configuration,
+                                 reduceTransparency: reduceTransparency,
+                                 highContrast: highContrast)
+    }
+}
+
+private struct iOSSourceRowFocusContent: View {
+    let configuration: ButtonStyle.Configuration
+    let reduceTransparency: Bool
+    let highContrast: Bool
+    @Environment(\.isFocused) private var focused
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    #if os(macOS)
+    @State private var isHovered = false
+    #endif
+
+    var body: some View {
+        #if os(macOS)
+        let active = focused || isHovered
+        #else
+        let active = focused
+        #endif
+        let label = configuration.label
+            .vortxGlassTintedSurface(
+                in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
+                fillAlpha: active ? VortXGlass.rowFocusFillAlpha : VortXGlass.cardFillAlpha,
+                tint: Theme.Palette.accent,
+                tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                    reduceTransparency: reduceTransparency, highContrast: highContrast),
+                shadow: .flat,
+                contained: true,
+                forceOpaque: reduceTransparency || highContrast)
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
+                    .strokeBorder(Theme.Palette.accent, lineWidth: active ? 3 : 0)
+            )
+            .scaleEffect(active && !reduceMotion ? 1.015 : (configuration.isPressed ? 0.99 : 1))
+            .shadow(color: active ? Theme.Palette.accent.opacity(0.28) : .clear, radius: 22, y: 10)
+            .animation(reduceMotion ? nil : Theme.Motion.focus, value: active)
+        #if os(macOS)
+        return label.onHover { isHovered = $0 }
+        #else
+        return label
+        #endif
+    }
+}
+
 struct iOSSourceList: View {
     @Environment(\.cinemaSourceJump) private var jumpToSource
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
     let groups: [CoreStreamSourceGroup]
     let progress: (loaded: Int, total: Int)
     /// The resolved movie, episode, or live identity. Only Infuse consumes it as filename metadata.
@@ -6799,14 +6872,13 @@ struct iOSSourceList: View {
                     Text(title).lineLimit(1)
                 }
                 .font(Theme.Typography.label.weight(.semibold))
-                .foregroundStyle(selected ? Theme.Palette.onAccent : Theme.Palette.textSecondary)
+                .foregroundStyle(selected ? Theme.Palette.accent : Theme.Palette.textSecondary)
                 .padding(.horizontal, 14)
                 .frame(minHeight: 44)
-                .background {
-                    Capsule().fill(selected ? Theme.Palette.accent : Theme.Palette.surface2)
-                }
+                .vortxGlassChip(selected: selected)
                 .overlay {
-                    Capsule().strokeBorder(.white.opacity(selected ? 0 : 0.12), lineWidth: 1)
+                    Capsule().strokeBorder(Theme.Palette.accent.opacity(selected ? 0.55 : 0.12),
+                                          lineWidth: selected ? 1.25 : 0.75)
                 }
                 .contentShape(Capsule())
             }
@@ -6820,21 +6892,77 @@ struct iOSSourceList: View {
     /// already used by the legacy filter chips, so the chosen add-on becomes the first visible card without
     /// introducing a second scroll container or changing any stream identity / ranking semantics.
     private var sourceAddonTabs: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: Theme.Space.sm) {
-                sourceAddonTab(title: "All", count: streamCount, selected: selectedSourceAddon == nil) {
-                    selectSourceAddon(nil)
+        HStack(spacing: Theme.Space.xs) {
+            sourceAddonStepButton(forward: false)
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: Theme.Space.sm) {
+                        sourceAddonTab(title: "All", count: streamCount, selected: selectedSourceAddon == nil) {
+                            selectSourceAddon(nil)
+                        }
+                        .id(SourceAddonTabAnchor.all)
+                        ForEach(groups) { group in
+                            sourceAddonTab(title: group.addon, count: group.streams.count,
+                                           selected: selectedSourceAddon == group.addon) {
+                                selectSourceAddon(group.addon)
+                            }
+                            .id(SourceAddonTabAnchor.addon(group.id))
+                        }
+                    }
+                    .padding(.vertical, Theme.Space.xs)
                 }
-                ForEach(groups) { group in
-                    sourceAddonTab(title: group.addon, count: group.streams.count,
-                                   selected: selectedSourceAddon == group.addon) {
-                        selectSourceAddon(group.addon)
+                .onAppear {
+                    proxy.scrollTo(sourceAddonTabAnchor(selectedSourceAddon), anchor: .center)
+                }
+                .onChange(of: selectedSourceAddon) { addon in
+                    withAnimation(reduceMotion ? nil : Theme.Motion.state) {
+                        proxy.scrollTo(sourceAddonTabAnchor(addon), anchor: .center)
                     }
                 }
             }
-            .padding(.vertical, Theme.Space.xs)
+            .accessibilityLabel("Source add-ons")
+            sourceAddonStepButton(forward: true)
         }
-        .accessibilityLabel("Source add-ons")
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Source add-ons, selection \(sourceAddonSelectionIndex + 1) of \(groups.count + 1)")
+    }
+
+    private var sourceAddonSelectionIndex: Int {
+        guard let selectedSourceAddon,
+              let index = groups.firstIndex(where: { $0.addon == selectedSourceAddon }) else { return 0 }
+        return index + 1 // All is index 0; add-ons retain the incoming group order.
+    }
+
+    private enum SourceAddonTabAnchor: Hashable {
+        case all
+        case addon(String)
+    }
+
+    private func sourceAddonTabAnchor(_ addon: String?) -> SourceAddonTabAnchor {
+        guard let addon, let group = groups.first(where: { $0.addon == addon }) else { return .all }
+        return .addon(group.id)
+    }
+
+    private func sourceAddonStepButton(forward: Bool) -> some View {
+        let index = sourceAddonSelectionIndex
+        let lastIndex = groups.count // All plus N groups gives valid indices 0...N.
+        let disabled = forward ? index >= lastIndex : index == 0
+        return Button {
+            let next = index + (forward ? 1 : -1)
+            guard next >= 0, next <= lastIndex else { return }
+            selectSourceAddon(next == 0 ? nil : groups[next - 1].addon)
+        } label: {
+            Image(systemName: forward ? "chevron.right" : "chevron.left")
+                .font(.system(size: 12, weight: .semibold))
+                .frame(width: 28, height: 28)
+                .vortxGlassChip(selected: false)
+                .frame(width: 44, height: 44)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .accessibilityLabel(forward ? "Next source add-on" : "Previous source add-on")
+        .accessibilityHint(disabled ? "No more source add-ons in that direction" : "Selects the adjacent source add-on")
     }
 
     @ViewBuilder
@@ -6854,9 +6982,15 @@ struct iOSSourceList: View {
             .padding(.horizontal, Theme.Space.md)
             .padding(.vertical, Theme.Space.sm)
             .frame(minWidth: 104, alignment: .leading)
-            .vortxGlass(in: Capsule(style: .continuous),
-                        fillAlpha: selected ? VortXGlass.rowFocusFillAlpha : VortXGlass.cardFillAlpha,
-                        shadow: .flat)
+            .vortxGlassTintedSurface(
+                in: Capsule(style: .continuous),
+                fillAlpha: selected ? VortXGlass.rowFocusFillAlpha : VortXGlass.cardFillAlpha,
+                tint: Theme.Palette.accent,
+                tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                    reduceTransparency: reduceTransparency, highContrast: accessibilityContrast == .increased),
+                shadow: .flat,
+                contained: true,
+                forceOpaque: reduceTransparency || accessibilityContrast == .increased)
             .overlay {
                 Capsule(style: .continuous)
                     .strokeBorder(selected ? Theme.Palette.accent : .clear, lineWidth: selected ? 1.5 : 0)
@@ -6976,7 +7110,15 @@ struct iOSSourceList: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             // Glass the collapsible per-addon section header so the grouping reads as a deliberate
             // raised card, matching the settings-card language used across the app's chrome.
-            .vortxSettingsCard()
+            .vortxGlassTintedSurface(
+                in: RoundedRectangle(cornerRadius: Theme.Radius.card + 4, style: .continuous),
+                fillAlpha: VortXGlass.cardFillAlpha,
+                tint: Theme.Palette.accent,
+                tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                    reduceTransparency: reduceTransparency, highContrast: accessibilityContrast == .increased),
+                shadow: .flat,
+                contained: true,
+                forceOpaque: reduceTransparency || accessibilityContrast == .increased)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -6993,7 +7135,8 @@ struct iOSSourceList: View {
                     iOSStreamLabel(addon: addon, stream: stream, enabled: true, pinned: isPinned(addon, stream),
                                    debridCached: isDebridCached(stream))
                 }
-                .buttonStyle(RowFocusStyle())
+                .buttonStyle(iOSSourceRowFocusStyle(
+                    reduceTransparency: reduceTransparency, highContrast: accessibilityContrast == .increased))
                 .accessibilityHint("Double-tap to play. Long-press for player options and source actions.")
                 .contextMenu {
                     sourcePlayerMenu(stream, url, addon: addon)
@@ -7032,9 +7175,15 @@ struct iOSSourceList: View {
         } else {
             iOSStreamLabel(addon: addon, stream: stream, enabled: false, pinned: false,
                            debridCached: isDebridCached(stream))
-                // The disabled (no playable URL) source row sits on the shared card glass so it reads
-                // as the same surface family as the loading / empty state cards, just non-interactive.
-                .vortxGlassListRow(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                .vortxGlassTintedSurface(
+                    in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous),
+                    fillAlpha: VortXGlass.cardFillAlpha,
+                    tint: Theme.Palette.accent,
+                    tintAlpha: VortXInlineGlassPolicy.tintAlpha(
+                        reduceTransparency: reduceTransparency, highContrast: accessibilityContrast == .increased),
+                    shadow: .flat,
+                    contained: true,
+                    forceOpaque: reduceTransparency || accessibilityContrast == .increased)
         }
     }
 
@@ -7180,8 +7329,12 @@ struct iOSStreamLabel: View {
         let cached = debridCached || StreamRanking.isCached(stream, StreamRanking.signature(stream))
         // Drop the plain "Cached" flavour chip when the row already shows the prominent "⚡ CACHED" badge,
         // so a cached row reads as one bolt badge, not a doubled bolt-plus-plain-"Cached".
-        let flavors = StreamRanking.flavorTags(stream).filter { !($0 == "Cached" && cached) }
-        let size = StreamRanking.sizeText(stream)
+        // The expanded label below already preserves the add-on's authored text. Skip parsing an
+        // additional set of compact flavor/size labels for every visible row unless compact mode shows them.
+        let flavors = compactLabels
+            ? StreamRanking.flavorTags(stream).filter { !($0 == "Cached" && cached) }
+            : []
+        let size = compactLabels ? StreamRanking.sizeText(stream) : nil
         return HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: enabled ? (stream.isTorrent ? "arrow.down.circle.fill" : "play.circle.fill") : "lock.circle")
                 .font(.system(size: 26))

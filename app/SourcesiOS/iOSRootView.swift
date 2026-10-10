@@ -6,6 +6,75 @@ import UIKit
 import AppKit
 #endif
 
+/// The detail hero's real top edge in its owning scroll view. Root consumes it only for the
+/// fixed navigation artwork copy; the scroll view itself remains the geometry owner.
+struct CinemaDetailHeroScrollOffsetKey: PreferenceKey {
+    static let coordinateSpace = "iOSDetailScrollSpace"
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+/// Reports a moving hero's real top edge in the owning scroll view. The geometry reader is
+/// omitted entirely when the view has no matching fixed navigation-artwork copy.
+struct CinemaHeroScrollOffsetTracking: ViewModifier {
+    let enabled: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.background {
+                GeometryReader { heroFrame in
+                    Color.clear.preference(
+                        key: CinemaDetailHeroScrollOffsetKey.self,
+                        value: heroFrame.frame(in: .named(CinemaDetailHeroScrollOffsetKey.coordinateSpace)).minY)
+                }
+            }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    func cinemaHeroScrollOffsetTracking(enabled: Bool) -> some View {
+        modifier(CinemaHeroScrollOffsetTracking(enabled: enabled))
+    }
+}
+
+/// Mutable presentation data is observed by the artwork background leaf, not `iOSRootView`.
+@MainActor
+private final class CinemaNavigationArtworkPresentation: ObservableObject {
+    @Published var artwork: CinemaNavigationArtwork?
+    @Published private(set) var detailHeroOpacity: Double = 1
+
+    func updateDetailHero(minY: CGFloat, navigationHeight: CGFloat) {
+        guard minY.isFinite, navigationHeight.isFinite, navigationHeight > 0 else {
+            detailHeroOpacity = 1
+            return
+        }
+        detailHeroOpacity = min(1, max(0, 1 + Double(minY / navigationHeight)))
+    }
+}
+
+private struct CinemaNavigationArtworkBackground: View {
+    @ObservedObject var presentation: CinemaNavigationArtworkPresentation
+    let reduceTransparency: Bool
+    let highContrast: Bool
+
+    var body: some View {
+        ZStack {
+            CinemaNavigationArtworkStrip(artwork: presentation.artwork,
+                                         reduceTransparency: reduceTransparency,
+                                         highContrast: highContrast)
+            if presentation.artwork != nil {
+                Theme.Palette.canvas.opacity(1 - presentation.detailHeroOpacity)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+}
+
 /// The Apple TV visual hierarchy adapted to each window: floating horizontal navigation on
 /// Mac/wide iPad and a compact bottom bar on phones/narrow iPad. One route owner still drives
 /// every destination; overflow never creates a second Settings or Add-ons presentation host.
@@ -105,7 +174,9 @@ struct iOSRootView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @State private var navigationArtwork: CinemaNavigationArtwork?
+    // Reference state keeps high-frequency hero scroll progress scoped to the small artwork background
+    // child; the root view itself does not subscribe to these per-scroll updates.
+    @State private var navigationArtwork = CinemaNavigationArtworkPresentation()
     @State private var navigationHeight: CGFloat = 80
     @ScaledMetric(relativeTo: .caption) private var compactLabelSize: CGFloat = 11
     /// A new release found by the once-per-foreground check, surfaced as a prominent top banner so users
@@ -575,7 +646,10 @@ struct iOSRootView: View {
                 .environment(\.cinemaNavigationArtworkOwner, navigationArtworkOwner)
         }
         .onPreferenceChange(CinemaNavigationArtworkKey.self) { artwork in
-            navigationArtwork = artwork?.owner == navigationArtworkOwner ? artwork : nil
+            navigationArtwork.artwork = artwork?.owner == navigationArtworkOwner ? artwork : nil
+        }
+        .onPreferenceChange(CinemaDetailHeroScrollOffsetKey.self) { minY in
+            navigationArtwork.updateDetailHero(minY: minY, navigationHeight: navigationHeight)
         }
     }
 
@@ -607,9 +681,9 @@ struct iOSRootView: View {
         .padding(.vertical, Theme.Space.sm)
         .frame(maxWidth: .infinity)
         .background {
-            CinemaNavigationArtworkStrip(artwork: navigationArtwork,
-                                         reduceTransparency: reduceTransparency,
-                                         highContrast: accessibilityContrast == .increased)
+            CinemaNavigationArtworkBackground(presentation: navigationArtwork,
+                                              reduceTransparency: reduceTransparency,
+                                              highContrast: accessibilityContrast == .increased)
         }
         .background {
             GeometryReader { geometry in
@@ -1437,10 +1511,13 @@ struct iOSHomeView: View {
                 // header). Pinning put it ON TOP of the rails on macOS, where it intercepted every tap;
                 // as a normal first child it scrolls with the content and its own controls stay hit-tested.
                 LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
-                    Color.clear.frame(height: 0).scrollToTopAnchor()   // re-tap Home tab -> scroll here
                     // The redesign mockup's ember "Featured" hero kicker (Home only; Library / Discover pass
                     // no eyebrow so their heroes are unchanged).
+                    // Keep the scroll-to-top identity on the hero itself. A zero-height first sibling still
+                    // participates in LazyVStack spacing, which inserted one full `Theme.Space.lg` of canvas
+                    // between the reserved navigation row and the first artwork pixel on Mac.
                     homeFeaturedHero
+                        .scrollToTopAnchor()
                     // Once this marker (just below the hero) scrolls out of view, the floating
                     // back-to-top button appears; it hides again when you return to the top (#8).
                     // `active: isActive` keeps a hidden (opacity-switched) Home from writing stale state.
@@ -1514,6 +1591,7 @@ struct iOSHomeView: View {
                 }
                 .padding(.bottom, Theme.Space.md)
             }
+            .coordinateSpace(name: CinemaDetailHeroScrollOffsetKey.coordinateSpace)
             // A scroll gesture quiets the ambient hero rotation (resumes after inactivity), the
             // billboard never yanks the page while the user is browsing (#53).
             .scrollDismissesHeroRotation(model: hero)
@@ -2583,6 +2661,7 @@ struct iOSLibraryView: View {
                         .frame(minHeight: 420)
                 }
             }
+            .coordinateSpace(name: CinemaDetailHeroScrollOffsetKey.coordinateSpace)
             .scrollDismissesHeroRotation(model: hero)
             // Re-tapping the active Library tab scrolls back to the top.
             .scrollToTopOnBump(TabScrollKeys.library)
@@ -3830,6 +3909,7 @@ struct iOSDiscoverView: View {
                 // clipping report. Home has only self-bounding horizontal rails, so it never needed this.
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .coordinateSpace(name: CinemaDetailHeroScrollOffsetKey.coordinateSpace)
             .scrollDismissesHeroRotation(model: hero)
             // Re-tapping the active Discover tab scrolls back to the top.
             .scrollToTopOnBump(TabScrollKeys.discover)
