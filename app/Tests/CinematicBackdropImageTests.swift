@@ -83,8 +83,9 @@ private final class LocalCinematicFixtureServer {
     private var serverURL: URL?
 
     init(fixtures: [String: Data]) throws {
-        let base = FileManager.default.temporaryDirectory
-            .appendingPathComponent("vortx-cinematic-backdrop-\(UUID().uuidString)", isDirectory: true)
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("app/build/cinematic-backdrop-fixtures", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         directory = base
         countURL = base.appendingPathComponent("requests.txt")
@@ -168,7 +169,6 @@ private final class LocalCinematicFixtureServer {
             process.terminate()
             process.waitUntilExit()
         }
-        try? FileManager.default.removeItem(at: directory)
     }
 
     deinit { stop() }
@@ -212,6 +212,37 @@ private func oversizedFixture() -> Data {
     imageFixture(width: 4_096, height: 3_072, red: 0.18, green: 0.34, blue: 0.62)
 }
 
+/// A large transparent PNG like the clearlogos used by `ResolvedTitleLogo`. The opaque ellipse keeps the
+/// fixture deterministic while the cleared canvas proves the ImageIO thumbnail path retains alpha.
+private func transparentOversizedFixture() -> Data {
+    guard let context = CGContext(
+        data: nil,
+        width: 4_096,
+        height: 2_048,
+        bitsPerComponent: 8,
+        bytesPerRow: 4_096 * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else {
+        fatalError("could not create transparent oversized fixture image")
+    }
+    context.clear(CGRect(x: 0, y: 0, width: 4_096, height: 2_048))
+    context.setFillColor(CGColor(red: 0.95, green: 0.82, blue: 0.12, alpha: 0.62))
+    context.fillEllipse(in: CGRect(x: 512, y: 256, width: 3_072, height: 1_536))
+    guard let image = context.makeImage() else {
+        fatalError("could not snapshot transparent oversized fixture image")
+    }
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else {
+        fatalError("could not create transparent fixture destination")
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else {
+        fatalError("could not finalize transparent fixture")
+    }
+    return data as Data
+}
+
 private func kenBurnsBackdropFixture() -> Data {
     imageFixture(width: 4_096, height: 2_048, red: 0.75, green: 0.12, blue: 0.10)
 }
@@ -231,6 +262,30 @@ private func decodedPixelSize(_ image: VXPosterImage) -> (width: Int, height: In
     guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
     #endif
     return (cg.width, cg.height)
+}
+
+private func decodedImageHasTransparentPixel(_ image: VXPosterImage) -> Bool {
+    #if canImport(UIKit)
+    guard let cg = image.cgImage else { return false }
+    #else
+    guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return false }
+    #endif
+    let alphaOffset: Int
+    switch cg.alphaInfo {
+    case .first, .premultipliedFirst: alphaOffset = 0
+    case .last, .premultipliedLast: alphaOffset = max(0, cg.bitsPerPixel / 8 - 1)
+    default: return false
+    }
+    guard let provider = cg.dataProvider,
+          let providerData = provider.data,
+          let bytes = CFDataGetBytePtr(providerData) else { return false }
+    let bytesPerPixel = cg.bitsPerPixel / 8
+    guard bytesPerPixel > alphaOffset else { return false }
+    for (x, y) in [(0, 0), (cg.width - 1, 0), (0, cg.height - 1), (cg.width - 1, cg.height - 1)] {
+        let offset = y * cg.bytesPerRow + x * bytesPerPixel + alphaOffset
+        if bytes[offset] < 255 { return true }
+    }
+    return false
 }
 
 private func layerImage(_ layer: CALayer) -> CGImage? {
@@ -363,6 +418,7 @@ private enum CinematicBackdropImageTests {
 
         var fixtures: [String: Data] = [
             "oversized.png": oversizedFixture(),
+            "transparent-oversized.png": transparentOversizedFixture(),
             "warm-poster.png": oversizedFixture(),
             "slow-backdrop.png": oversizedFixture(),
             "fast-poster.png": oversizedFixture(),
@@ -400,6 +456,25 @@ private enum CinematicBackdropImageTests {
         check(
             "decoded cache serves a repeated bounded backdrop request",
             fixtureServer.requestCount(for: "oversized.png") == 1,
+            failures: &failures
+        )
+
+        let transparentURL = fixtureServer.url("transparent-oversized.png")
+        guard let transparent = await PosterImageLoader.load(transparentURL.absoluteString, maxPixel: 960),
+              let transparentSize = decodedPixelSize(transparent) else {
+            check("oversized transparent PNG decodes through PosterImageLoader", false, failures: &failures)
+            fixtureServer.stop()
+            print("\(failures) FAILED")
+            exit(1)
+        }
+        check(
+            "transparent logo fixture is downsampled to the 960 px logo budget",
+            max(transparentSize.width, transparentSize.height) <= 960,
+            failures: &failures
+        )
+        check(
+            "transparent logo fixture retains transparent pixels through bounded decode",
+            decodedImageHasTransparentPixel(transparent),
             failures: &failures
         )
 

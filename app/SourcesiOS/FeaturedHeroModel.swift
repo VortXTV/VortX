@@ -149,6 +149,16 @@ final class FeaturedHeroModel: ObservableObject {
             // This identical-content emit supersedes any changed-content seed still waiting out the
             // debounce; a stale pending pool must not land later.
             pendingSeedTask?.cancel(); pendingSeedTask = nil; pendingSeed = nil
+            // A prior stop() cancels every in-flight enrichment so a hidden screen cannot retain network
+            // work. Re-arm the unfinished pool immediately when the same screen reappears; the cache and
+            // per-id task lease guards keep already-complete/in-flight titles from duplicating work.
+            for item in pool { enrichIfNeeded(item) }
+            // macOS keyboard browse can feature an item outside the ambient pool. It is still the visible hero
+            // after a hide/reappear, so give that item the same immediate retry opportunity when stop() retired
+            // its request; the cache/task guard keeps this a no-op when it already completed or is in flight.
+            if let visible = hero, !pool.contains(where: { $0.id == visible.id }) {
+                enrichIfNeeded(visible)
+            }
             return
         }
 

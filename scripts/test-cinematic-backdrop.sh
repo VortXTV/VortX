@@ -7,8 +7,8 @@ cd "$root"
 xcrun swiftc -frontend -parse app/SourcesiOS/iOSDetailView.swift
 xcrun swiftc -frontend -parse app/SourcesiOS/FeaturedHeroView.swift
 
-build_dir="$(mktemp -d "${TMPDIR:-/tmp}/vortx-cinematic-backdrop.XXXXXX")"
-trap 'rm -rf "$build_dir"' EXIT
+build_dir="$root/app/build/cinematic-backdrop"
+mkdir -p "$build_dir"
 
 kenburns_source="$build_dir/FeaturedHeroKenBurnsLoader.swift"
 {

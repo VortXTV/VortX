@@ -221,13 +221,14 @@ struct ResolvedTitleLogo<TitleText: View>: View {
                 titleText()
             }
         }
-        .task(id: id) { await loadLogo() }
+        .task(id: LogoLoadKey(id: id, type: type, fallbackLogo: fallbackLogo)) { await loadLogo() }
     }
 
     /// Resolve the logo once, preserve the memoized query-signed URL for the gated ERDB host, and then use the
     /// shared off-main ImageIO loader. Clearing the request identity before every load keeps a recycled hero from
     /// painting the prior title's logo while a new URL is waiting on the bounded loader.
     private func loadLogo() async {
+        guard !Task.isCancelled else { return }
         logoImage = nil
         loadedLogoURL = nil
         signedLogoURL = nil
@@ -262,5 +263,11 @@ struct ResolvedTitleLogo<TitleText: View>: View {
         #else
         Image(nsImage: image)
         #endif
+    }
+
+    private struct LogoLoadKey: Equatable {
+        let id: String?
+        let type: String
+        let fallbackLogo: String?
     }
 }
