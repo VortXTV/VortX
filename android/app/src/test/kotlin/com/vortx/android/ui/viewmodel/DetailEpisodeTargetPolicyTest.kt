@@ -9,6 +9,8 @@ import com.vortx.android.model.PreferredEpisode
 import com.vortx.android.model.StreamGroup
 import com.vortx.android.model.StreamSource
 import com.vortx.android.sources.SourceRequestFence
+import com.vortx.android.engine.StreamRanking
+import com.vortx.android.sources.SourcePrefsSnapshot
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.launch
@@ -22,6 +24,47 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class DetailEpisodeTargetPolicyTest {
+    @Test
+    fun `warm and cold binge ranking share explicit playing language without changing detail or global preferences`() {
+        val preference = PlaybackBingeAudioPreference()
+        val global = listOf("en")
+        val detailHint = "de"
+        val english = StreamSource("en", "Fixture", "Show 1080p English", url = "https://fixture.invalid/en")
+        val french = english.copy(id = "fr", title = "Show 1080p French", url = "https://fixture.invalid/fr")
+        val groups = listOf(StreamGroup("Fixture", listOf(english, french)))
+        preference.select("fr")
+        val coldPrefs = SourcePrefsSnapshot.DEFAULT.copy(audioLanguages = preference.languages(detailHint, global))
+        val warmPrefs = SourcePrefsSnapshot.DEFAULT.copy(audioLanguages = preference.languages(detailHint, global))
+        val settled = com.vortx.android.engine.SourceListState(groups = groups, best = english)
+        assertEquals("fr", StreamRanking.best(settled.groups, prefs = coldPrefs)?.id)
+        assertEquals("fr", StreamRanking.best(groups, prefs = warmPrefs)?.id)
+        assertEquals(warmPrefs.audioLanguages, coldPrefs.audioLanguages)
+        assertEquals("de", detailHint)
+        assertEquals(listOf("en"), global)
+        preference.reset()
+        val resetPrefs = SourcePrefsSnapshot.DEFAULT.copy(audioLanguages = preference.languages(null, global))
+        assertEquals("en", StreamRanking.best(groups, prefs = resetPrefs)?.id)
+    }
+
+    @Test
+    fun `binge audio reset ends preference lifetime and every selection or reset fences ABA`() {
+        val preference = PlaybackBingeAudioPreference()
+        preference.select("fr")
+        val first = preference.revision
+        preference.select("en"); preference.select("fr")
+        assertTrue(preference.revision > first)
+        assertEquals(listOf("fr"), preference.languages(null, listOf("en")))
+        val beforeReset = preference.revision
+        preference.reset()
+        assertTrue(preference.revision > beforeReset)
+        assertNull(preference.language)
+        assertEquals(listOf("de"), preference.languages("de", listOf("en")))
+        assertEquals(listOf("en"), preference.languages(null, listOf("en")))
+        preference.select("und")
+        assertNull(preference.language)
+        assertEquals(listOf("en"), preference.languages(null, listOf("en")))
+    }
+
     @Test
     fun `episode rollback uses accepted season and has a first-selection fallback without accepting a provisional target`() {
         val episodes = listOf(Episode("E1", "First", 1, 1), Episode("E2", "Second", 2, 1))

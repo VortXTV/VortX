@@ -1,5 +1,12 @@
 package com.vortx.android.player
 
+/** Missing/sentinel metadata expresses no cross-file language preference. */
+internal fun playbackAudioLanguage(value: String?): String? {
+    val raw = value?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return null
+    if (raw.substringBefore('-').substringBefore('_') in setOf("und", "unknown")) return null
+    return TrackSelector.canonical(raw).takeIf { it.isNotBlank() }
+}
+
 /** User intent across files; engine-local track identifiers are deliberately not retained. */
 data class PlaybackAudioIntent(val language: String?, val role: Role) {
     enum class Role { MAIN, COMMENTARY, DESCRIPTION }
@@ -10,7 +17,7 @@ data class PlaybackAudioIntent(val language: String?, val role: Role) {
 
     companion object {
         fun fromTrack(track: PlayerTrack): PlaybackAudioIntent =
-            PlaybackAudioIntent(TrackSelector.canonical(track.lang?.trim()).takeIf { it.isNotBlank() }, roleOf(track))
+            PlaybackAudioIntent(playbackAudioLanguage(track.lang), roleOf(track))
 
         private fun roleOf(track: PlayerTrack): Role {
             val title = track.title.lowercase()

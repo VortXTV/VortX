@@ -8,6 +8,40 @@ import org.junit.Test
 /** Integration contracts complement the executable preload-policy and task-owner regressions. */
 class TvBingePreloadContractTest {
     @Test
+    fun `audio lifetime resets outer routes but preserves mounted handoffs retry and Ready consumption`() {
+        val vm = source("ui/viewmodel/DetailViewModel.kt")
+        val cold = vm.substringAfter("suspend fun resolveEpisodeSwitch(").substringBefore("private fun preparedEpisodeResolution(")
+        assertTrue(cold.contains("val prefs = playbackSourcePreferences()"))
+        assertTrue(cold.contains("val groups = settled?.groups"))
+        assertFalse(cold.contains("settled?.best"))
+        assertTrue(cold.contains("audioRevision == playbackAudioPreference.revision"))
+        assertTrue(vm.substringAfter("suspend fun warmNextEpisode(").substringBefore("fun playNextEpisode()")
+            .contains("val prefs = playbackSourcePreferences()"))
+        assertTrue(vm.substringAfter("private fun play(").substringBefore("suspend fun resolveSourceSwitch(")
+            .contains("if (freshPlayback) resetPlaybackAudioIntent()"))
+        assertTrue(vm.substringAfter("private fun playBest(").substringBefore("private suspend fun resolveBestViaFailover(")
+            .contains("if (freshPlayback) resetPlaybackAudioIntent()"))
+        assertTrue(vm.substringAfter("fun playTrailer() {").substringBefore("fun playBest(").contains("resetPlaybackAudioIntent()"))
+        assertTrue(vm.substringAfter("fun abandonPlaybackRoute() {").substringBefore("private fun canPublishPlaybackResolve")
+            .contains("resetPlaybackAudioIntent()"))
+        assertTrue(vm.substringAfter("private fun rebuildForProfile(").substringBefore("private suspend fun loadMetaAndSources(")
+            .contains("resetPlaybackAudioIntent(refreshRanking = false)"))
+        assertFalse(vm.substringAfter("fun clearPlayback() {").substringBefore("fun clearMutationError()")
+            .contains("resetPlaybackAudioIntent"))
+        assertFalse(vm.substringAfter("suspend fun resolveSourceSwitch(").substringBefore("private fun preparedEpisodeResolution(")
+            .contains("resetPlaybackAudioIntent"))
+        assertTrue(vm.substringAfter("fun retrySameSource(").substringBefore("fun retryNextSource(")
+            .contains("preserveAudioIntent = true"))
+        assertTrue(vm.substringAfter("fun retryNextSource(").substringBefore("fun playerSourceOptions(")
+            .contains("preserveAudioIntent = true"))
+        val refresh = vm.substringAfter("private fun refreshPlaybackAudioRanking() {").substringBefore("fun hasPreparedNextEpisode(")
+        assertTrue(refresh.contains("sourceModel.setContext(updated)"))
+        assertFalse(refresh.contains("sourceRequestFence.begin"))
+        assertFalse(refresh.contains("startSourceLoad"))
+        assertFalse(refresh.contains("repo."))
+    }
+
+    @Test
     fun `TV wires preload natural end and binge boundary rather than exit defaults`() {
         val app = source("ui/tv/TvApp.kt")
         val player = app.substringAfter("PlayerScreen(").substringBefore("return@VortXTheme")

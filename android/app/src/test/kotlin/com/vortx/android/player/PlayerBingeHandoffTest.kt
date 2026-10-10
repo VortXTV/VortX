@@ -6,6 +6,7 @@ import com.vortx.android.model.StreamSource
 import com.vortx.android.sources.SourceRequestFence
 import com.vortx.android.ui.viewmodel.EpisodeSwitchSelectionLease
 import com.vortx.android.ui.viewmodel.episodeSwitchRollbackTarget
+import com.vortx.android.ui.viewmodel.PlaybackBingeAudioPreference
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
@@ -15,6 +16,50 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PlayerBingeHandoffTest {
+    @Test fun `cold audio capture rejects ABA and session reset without changing outgoing history or leaking incoming`() = runBlocking {
+        for (change in listOf("none", "aba", "reset")) {
+            val preference = PlaybackBingeAudioPreference().apply { select("fr") }
+            val captured = preference.revision
+            val coordinator = PlayerSourceSwitchCoordinator()
+            val outer = coordinator.replaceOuterSession()
+            var incomingCloses = 0
+            var outgoingCloses = 0
+            var history = 0
+            val old = Playable("https://fixture.invalid/old", "Old", startPositionMs = 900,
+                playbackLease = AutoCloseable { outgoingCloses++ })
+            var host = beginPlayerEpisodeSwitch(PlayerSourceSwitchState(outer, old, null), Episode("next", "Next", 1, 2),
+                requireNotNull(coordinator.beginRequest(outer)))
+            val pending = requireNotNull(host.pendingEpisodeSwitch)
+            val entered = CompletableDeferred<Unit>(); val release = CompletableDeferred<Unit>()
+            val job = launch {
+                resolveAndApplyPlayerEpisodeSwitch(coordinator, pending, resolver = {
+                    entered.complete(Unit); release.await()
+                    Result.success(PlayerSourceSwitchResolution(
+                        Playable("https://fixture.invalid/next", "Next", playbackLease = AutoCloseable { incomingCloses++ }),
+                        resolvedSource = StreamSource("next", "Fixture", "Next", url = "https://fixture.invalid/next"),
+                        commitGate = PlayerSourceSwitchCommitGate(),
+                        commitAuthorityIsCurrent = { preference.revision == captured }, commitAccepted = {}))
+                }, currentState = { host }, publishState = { value, acknowledge ->
+                    val previous = host; host = value; acknowledge()
+                    if (value.revision != previous.revision) history++
+                })
+            }
+            entered.await()
+            when (change) {
+                "aba" -> { preference.select("en"); preference.select("fr") }
+                "reset" -> preference.reset()
+            }
+            release.complete(Unit); job.join()
+            assertEquals(0, outgoingCloses)
+            assertEquals(if (change == "none") 1 else 0, history)
+            assertEquals(if (change == "none") 1L else 0L, host.revision)
+            assertEquals(if (change == "none") 0L else 900L, host.playable.startPositionMs)
+            if (change == "none") host.playable.playbackLease?.close() else assertSame(old, host.playable)
+            assertEquals(1, incomingCloses)
+            old.playbackLease?.close()
+        }
+    }
+
     @Test fun `prepublication episode failure restores owned accepted metadata but acknowledged publication retains it`() {
         for (publish in listOf(false, true)) {
             val fence = SourceRequestFence("owner")
@@ -349,5 +394,10 @@ class PlayerBingeHandoffTest {
             .matchingTracks(next).map { it.id })
         assertTrue(intent.matchingTracks(next.filterNot { it.id == 23 }).isEmpty())
         assertTrue(PlaybackAudioIntent.fromTrack(PlayerTrack(1, "Unknown")).matchingTracks(next).isEmpty())
+        for (unknown in listOf("und", "UNKNOWN", " und-US ")) {
+            val absent = PlaybackAudioIntent.fromTrack(PlayerTrack(1, "Unknown", unknown))
+            assertNull(absent.language)
+            assertTrue(absent.matchingTracks(listOf(PlayerTrack(2, "Unknown", unknown))).isEmpty())
+        }
     }
 }

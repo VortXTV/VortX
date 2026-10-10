@@ -366,6 +366,24 @@ internal fun detailSourceAudioLanguages(
     LanguagePriority.normalized(listOf(sessionHint))
 }
 
+/** Session-only language intent. It never mutates the detail filter or persisted global preferences. */
+internal class PlaybackBingeAudioPreference {
+    var revision: Long = 0L
+        private set
+    var language: String? = null
+        private set
+
+    fun select(value: String?) {
+        revision++
+        language = com.vortx.android.player.playbackAudioLanguage(value)
+    }
+
+    fun reset() { revision++; language = null }
+
+    fun languages(detailHint: String?, saved: List<String>): List<String> =
+        detailSourceAudioLanguages(language ?: detailHint, saved)
+}
+
 /// Detail page state: the meta (hero + metadata) and the sources list load independently, mirroring
 /// tvOS where the page renders the hero as soon as `meta_details.meta` is ready and the stream
 /// groups stream in behind it. Both are [UiState] so a meta-add-on failure and a stream-add-on
@@ -599,8 +617,7 @@ class DetailViewModel(
     private val warmNextLock = Any()
     private var warmNextGeneration = 0L
     private val preparedEpisodeSlot = PreparedEpisodeSlot<PreparedEpisodeAuthority>(::isCurrentWarmNextCapture)
-    private var playbackAudioRevision = 0L
-    private var playbackAudioLanguage: String? = null
+    private val playbackAudioPreference = PlaybackBingeAudioPreference()
 
     /// Detail reactivity (see [CatalogRepository.detailUpdates]): the Saved chip and per-episode ticks
     /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
@@ -821,10 +838,11 @@ class DetailViewModel(
             delay(budget.sourceRemainingMs())
             if (automaticEpisodeBudget !== bound || !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return@launch
             if (pendingAutoPick) {
+                val preserveAudioIntent = pendingAdvanceHint != null
                 pendingAutoPick = false
                 pendingAdvanceHint = null
                 val current = sourceModel.state.value.takeIf { it.requestGeneration == request.generation && it.streamId == request.targetId }
-                if (current?.best != null) playAutomatically(current.best)
+                if (current?.best != null) playAutomatically(current.best, preserveAudioIntent = preserveAudioIntent)
                 else {
                     sourceLoadJob?.cancel()
                     _playback.value = Playback.Failed("No playable source for the next episode.")
@@ -871,7 +889,7 @@ class DetailViewModel(
     fun abandonPlaybackRoute() {
         pendingAutoPick = false
         pendingAdvanceHint = null
-        invalidateWarmNextSource()
+        resetPlaybackAudioIntent()
         abandonPlaybackResolve()
         episodeBudgetJob?.cancel()
         automaticEpisodeBudget = null
@@ -913,6 +931,7 @@ class DetailViewModel(
     }
 
     private fun rebuildForProfile(profileId: String) {
+        resetPlaybackAudioIntent(refreshRanking = false)
         lastAcceptedEpisodeId = null
         _episodeBrowseAnchor.value = null
         episodeBudgetJob?.cancel()
@@ -1095,7 +1114,7 @@ class DetailViewModel(
                         }
                         if (!autoPickIntent.accepts(autoPickLease)) return@collect
                         when {
-                            pick != null -> playAutomatically(pick)
+                            pick != null -> playAutomatically(pick, preserveAudioIntent = hint != null)
                             hint != null || episodeBudget != null -> _playback.value = Playback.Failed("No playable source for this episode.")
                         }
                     }
@@ -1143,14 +1162,16 @@ class DetailViewModel(
             // isKids rides the snapshot so a Kids profile's content guard (hard-hide adult/junk; Avoid
             // words always DROP, never merely demote) is live in the frozen reading, mirroring Apple's
             // `ProfileStore.activeIsKids()` read inside `passesUserFilters`.
-            prefs = sourcePrefs.snapshot(
-                detailSourceAudioLanguages(_sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
-                isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
-            ),
+            prefs = playbackSourcePreferences(),
             directLinksOnly = PlaybackBehaviorSettings.directLinksOnly(app),
             pin = currentPin(),
             contentId = contentId,
         )
+
+    private fun playbackSourcePreferences() = sourcePrefs.snapshot(
+        playbackAudioPreference.languages(_sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
+        isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
+    )
 
     /// Query the user's debrid account for which of the loaded torrents it has CACHED, then use the result to
     /// (a) feed the failover race + resume ([cachedHashes] / [cachedUsenetURLs]) and (b) badge + rank up the
@@ -1313,10 +1334,7 @@ class DetailViewModel(
         lastCtx?.let { ctx ->
             val updated = ctx.copy(
                 requestGeneration = token.generation,
-                prefs = sourcePrefs.snapshot(
-                    detailSourceAudioLanguages(normalized, trackPrefs.current.audioLanguages),
-                    isKids = ProfileStore.sharedOrNull()?.activeIsKids == true,
-                ),
+                prefs = playbackSourcePreferences(),
             )
             lastCtx = updated
             sourceModel.setContext(updated)
@@ -1361,13 +1379,16 @@ class DetailViewModel(
     /// silently doing nothing.
     fun play(source: StreamSource) = play(source, manualPick = true, startPositionOverrideMs = null)
 
-    private fun playAutomatically(source: StreamSource, startPositionOverrideMs: Long? = null) =
-        play(source, manualPick = false, startPositionOverrideMs = startPositionOverrideMs)
+    private fun playAutomatically(source: StreamSource, startPositionOverrideMs: Long? = null,
+                                  preserveAudioIntent: Boolean = false) =
+        play(source, manualPick = false, startPositionOverrideMs = startPositionOverrideMs,
+            freshPlayback = !preserveAudioIntent)
 
     private fun play(
         source: StreamSource,
         manualPick: Boolean,
         startPositionOverrideMs: Long?,
+        freshPlayback: Boolean = true,
     ) {
         if (!isRouteAdmissionCurrent()) {
             _playback.value = Playback.Failed("This Continue Watching request expired. Open the title again from Home.")
@@ -1376,6 +1397,7 @@ class DetailViewModel(
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
+        if (freshPlayback) resetPlaybackAudioIntent()
         val stickyWrite = if (manualPick && type == MediaType.SERIES) sourceSticky.capture(id) else null
         if (lastPlayedSource != null && handleOf(lastPlayedSource!!) != handleOf(source)) {
             sameSourceReresolved = false   // a different mount gets its own one re-resolve
@@ -1504,6 +1526,8 @@ class DetailViewModel(
         val previousAcceptedEpisode = lastAcceptedEpisodeId
         val previousManualEpisode = explicitManualEpisodeId
         val previousResume = resumeRef
+        val audioRevision = playbackAudioPreference.revision
+        val prefs = playbackSourcePreferences()
         _selectedEpisodeId.value = target.id
         _selectedSeason.value = target.season
         pendingAutoPick = false
@@ -1547,15 +1571,21 @@ class DetailViewModel(
             if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
                 return@withEpisodeSwitchCancellationRollback Result.failure(IllegalStateException())
             }
-            val groups = (_streams.value as? UiState.Success)?.data.orEmpty()
-            val source = settled?.best ?: StreamRanking.best(
+            if (audioRevision != playbackAudioPreference.revision) {
+                restorePreviousTargetIfCurrent()
+                return@withEpisodeSwitchCancellationRollback Result.failure(IllegalStateException("Playback audio selection changed. Try this episode again."))
+            }
+            // The assembly's cached best may predate a rank-only audio refresh. Re-rank its actual
+            // settled groups with this request's captured preferences, without loading providers again.
+            val groups = settled?.groups ?: (_streams.value as? UiState.Success)?.data.orEmpty()
+            val source = StreamRanking.best(
                 groups = groups,
                 continuity = lastPlayedSource?.let(StreamRanking::signature),
                 binge = lastPlayedSource?.bingeGroup,
                 pin = currentPin(),
                 sticky = sourceSticky.preference(id),
                 providerPenalty = { addon -> ProviderHealth.penaltyActive(addon) },
-                prefs = lastCtx?.prefs ?: StreamRanking.reading(),
+                prefs = prefs,
             ) ?: run {
                 restorePreviousTargetIfCurrent()
                 return@withEpisodeSwitchCancellationRollback Result.failure(
@@ -1567,9 +1597,13 @@ class DetailViewModel(
                 ?: Result.failure(IllegalStateException("Episode preparation timed out. Try this episode again."))
             if (
                 !isActionOwnerCurrent(actionOwner) ||
-                !sourceRequestFence.accepts(request, sourceSticky.currentProfileId())
+                !sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) ||
+                audioRevision != playbackAudioPreference.revision
             ) {
                 result.getOrNull()?.playbackLease?.close()
+                if (isActionOwnerCurrent(actionOwner) && sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) {
+                    restorePreviousTargetIfCurrent()
+                }
                 return@withEpisodeSwitchCancellationRollback Result.failure(
                     IllegalStateException(OWNER_CHANGED_MESSAGE),
                 )
@@ -1592,6 +1626,7 @@ class DetailViewModel(
                     commitAuthorityIsCurrent = {
                         isActionOwnerCurrent(actionOwner) &&
                             sourceRequestFence.accepts(request, sourceSticky.currentProfileId()) &&
+                            audioRevision == playbackAudioPreference.revision &&
                             _selectedEpisodeId.value == target.id
                     },
                     commitAccepted = {
@@ -1777,6 +1812,7 @@ class DetailViewModel(
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         val detail = (_meta.value as? UiState.Success)?.data ?: return
         val ytId = detail.trailerYouTubeId ?: return
+        resetPlaybackAudioIntent()
         _playback.value = Playback.Resolving
         playbackResolveJob?.cancel()
         val resolveLease = playbackResolveFence.begin(request)
@@ -1815,12 +1851,13 @@ class DetailViewModel(
     /// three legs below by not reading [resumeOffsetMs]; nothing engine/account state is written.
     fun playBest(fromStart: Boolean = false) = playBest(fromStart, startPositionOverrideMs = null)
 
-    private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?) {
+    private fun playBest(fromStart: Boolean, startPositionOverrideMs: Long?, freshPlayback: Boolean = true) {
         if (_playback.value is Playback.Resolving) return
         val request = sourceRequestFence.currentToken() ?: return
         if (!sourceRequestFence.accepts(request, sourceSticky.currentProfileId())) return
         val groups = (_streams.value as? UiState.Success)?.data ?: return
         val best = bestSource() ?: return
+        if (freshPlayback) resetPlaybackAudioIntent()
         lastPlayedSource = best
         _playback.value = Playback.Resolving
         val resumeMs = if (fromStart) 0L else startPositionOverrideMs?.coerceAtLeast(0L) ?: resumeOffsetMs()
@@ -2122,7 +2159,7 @@ class DetailViewModel(
     private fun preparationAuthority(episodeId: String): PreparedEpisodeAuthority = synchronized(warmNextLock) {
         PreparedEpisodeAuthority(episodeId, sourceSticky.currentProfileId(), repo.continueWatchingOwner(),
             sourceRequestFence.currentToken(), warmNextGeneration, debridKeys.ownerToken(),
-            debridKeys.currentCredentialRevision(), playbackAudioRevision)
+            debridKeys.currentCredentialRevision(), playbackAudioPreference.revision)
     }
 
     private fun isCurrentWarmNextCapture(capture: PreparedEpisodeAuthority): Boolean =
@@ -2130,9 +2167,24 @@ class DetailViewModel(
 
     /** Semantic audio intent only; local engine track ids never cross episode boundaries. */
     fun notePlaybackAudioIntent(language: String?) {
-        playbackAudioRevision++
-        playbackAudioLanguage = language?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+        playbackAudioPreference.select(language)
         invalidateWarmNextSource()
+        refreshPlaybackAudioRanking()
+    }
+
+    private fun resetPlaybackAudioIntent(refreshRanking: Boolean = true) {
+        playbackAudioPreference.reset()
+        invalidateWarmNextSource()
+        if (refreshRanking) refreshPlaybackAudioRanking()
+    }
+
+    /** Rank-only refresh: keep bindings and request generation, and do not fetch any provider. */
+    private fun refreshPlaybackAudioRanking() {
+        lastCtx?.let { ctx ->
+            val updated = ctx.copy(prefs = playbackSourcePreferences())
+            lastCtx = updated
+            sourceModel.setContext(updated)
+        }
     }
 
     fun hasPreparedNextEpisode(episodeId: String): Boolean = preparedEpisodeSlot.hasReady(episodeId)
@@ -2152,9 +2204,7 @@ class DetailViewModel(
         val binge = lastPlayedSource?.bingeGroup
         val pin = currentPin()
         val sticky = sourceSticky.preference(id)
-        val prefs = sourcePrefs.snapshot(
-            detailSourceAudioLanguages(playbackAudioLanguage ?: _sourceAudioLanguageHint.value, trackPrefs.current.audioLanguages),
-            isKids = ProfileStore.sharedOrNull()?.activeIsKids == true)
+        val prefs = playbackSourcePreferences()
         val directOnly = PlaybackBehaviorSettings.directLinksOnly(app)
         val unhealthy = ProviderHealth.activeAddons()
         return preparedEpisodeSlot.prepare(ticket, target.id, preparation, choose = { groups ->
@@ -2178,7 +2228,7 @@ class DetailViewModel(
         if (_selectedEpisodeId.value == next.id) {
             // Already scoped to the target (a countdown double-fire, or a re-offer): play what is loaded.
             pendingAdvanceHint = null
-            playBest()
+            playBest(fromStart = false, startPositionOverrideMs = null, freshPlayback = false)
             return
         }
         // Auto-advance assigns the target directly so it can carry the continuation hint; retire any
@@ -2231,7 +2281,7 @@ class DetailViewModel(
         if (sameSourceReresolved) return false
         if (_playback.value is Playback.Resolving) return false
         sameSourceReresolved = true
-        playAutomatically(source, resumePositionMs)
+        playAutomatically(source, resumePositionMs, preserveAudioIntent = true)
         return true
     }
 
@@ -2259,7 +2309,7 @@ class DetailViewModel(
             prefs = ctx.prefs,
         )
         val next = ranked.firstOrNull { handleOf(it) !in failed } ?: return false
-        playAutomatically(next, resumePositionMs)
+        playAutomatically(next, resumePositionMs, preserveAudioIntent = true)
         return true
     }
 
