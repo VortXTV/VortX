@@ -361,15 +361,17 @@ struct FeaturedHeroView: View {
 
     @ViewBuilder
     private func cachedPosterImageView(_ image: VXPosterImage) -> some View {
-        #if canImport(UIKit)
-        Image(uiImage: image)
-            .resizable()
-            .aspectRatio(contentMode: .fill)
-        #elseif canImport(AppKit)
-        Image(nsImage: image)
-            .resizable()
-            .aspectRatio(contentMode: .fill)
-        #endif
+        Group {
+            #if canImport(UIKit)
+            Image(uiImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+            #elseif canImport(AppKit)
+            Image(nsImage: image)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+            #endif
+        }
         // Match the GeometryReader's band bounds so a warm poster fills wide macOS bands too.
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityHidden(true)
