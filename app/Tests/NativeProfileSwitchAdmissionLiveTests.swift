@@ -406,6 +406,7 @@ final class CoreBridge: @unchecked Sendable {
     var nativeCheckpointStatus = "ready"
     struct NativePreferenceLocalAdmission { let target: PlaybackMutationTarget; let intent: NativePreferenceIntentStore.Intent }
     var nativePreferenceLocalAdmissions: [UUID: [NativePreferenceIntentStore.Group: NativePreferenceLocalAdmission]] = [:]
+    let nativePreferenceAdmissionGate = NativePreferenceIntentStore.AdmissionGate()
     let directory: URL
     init(directory: URL) { self.directory = directory; self.account = .init(id: NativeProfileSwitchAdmissionEnvironment.account); Self.shared = self }
     func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { credentialAuthority.isCurrent(capture) }
@@ -420,6 +421,10 @@ final class CoreBridge: @unchecked Sendable {
     func publishNativeWatchedPending(_ archive: Data?, capture: CredentialScopeRegistry.Capture) throws {}
     func publishNativeOwnOverlayPending(_ pending: VortxJSON, capture: CredentialScopeRegistry.Capture) throws {}
     func updateNativeOwnAccountAvailability(missing: [UUID], profiles: [UserProfile], capture: CredentialScopeRegistry.Capture) {}
+    func preferenceSnapshotForHarness(profileID: UUID, group: NativePreferenceIntentStore.Group) throws -> NativePreferenceIntentStore.Snapshot {
+        let context = try nativePreferenceContext(profileID: profileID, target: CoreBridge.shared.captureNativePlaybackTarget())
+        return try Self.nativePreferenceSnapshot(context, group: group)
+    }
 }
 
 enum NativeProfileSwitchAdmissionEnvironment {
@@ -446,6 +451,47 @@ enum NativeProfileSwitchAdmissionEnvironment {
             throw Failure.assertion("quarantined projection was not a binary plist carrier")
         }
         return try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+    }
+    static func journalBytes() throws -> [String: Data] {
+        try Dictionary(uniqueKeysWithValues: FileManager.default.contentsOfDirectory(
+            at: NativeProfileSwitchAdmissionEnvironment.journalRoot, includingPropertiesForKeys: nil).map {
+                ($0.lastPathComponent, try Data(contentsOf: $0))
+            })
+    }
+    static func checkPendingGeneration(_ intent: NativePreferenceIntentStore.Intent,
+                                       store: NativePreferenceIntentStore, manager: VortXSyncManager,
+                                       stamps: [String: Double]) throws {
+        // pending() authenticates the encrypted document and the exact generation payload.
+        try check(intent.generationAuthentication?.count == 32, "pending edit has no authenticated generation")
+        try check(try store.pending().contains(intent), "native completion cleared or changed the pending generation")
+        try check(intent.projectionStamps == stamps, "pending generation lost its exact dirty stamps")
+        try check(manager.nativePreferenceAdmissionGate.admits([intent]) { true }, "current generation lost admission")
+        try check(try JSONEncoder().encode(intent).count <= NativePreferenceIntentStore.maximumRecordBytes,
+                  "pending generation exceeded its bounded record size")
+        try check(try journalBytes().values.allSatisfy { $0.count <= NativePreferenceIntentStore.maximumFileBytes },
+                  "pending journal exceeded its bounded file size")
+    }
+    static func checkRetiredGeneration(_ retired: NativePreferenceIntentStore.Intent,
+                                       successor: NativePreferenceIntentStore.Intent,
+                                       store: NativePreferenceIntentStore, manager: VortXSyncManager) throws {
+        try check(retired.generationAuthentication?.count == 32 && successor.generationAuthentication?.count == 32,
+                  "generation retirement lacks authenticated receipts")
+        try check(retired.id != successor.id && retired.generationAuthentication != successor.generationAuthentication,
+                  "new edit reused the retired generation")
+        try check(!successor.supersededIDs.contains(retired.id), "retired signed generation retained replay authority")
+        // The successor's immutable base was captured from the actual native context after the
+        // predecessor committed. Use it unchanged so rejection cannot pass on value mismatch.
+        try check(successor.base.value == retired.desired, "retirement proof did not capture the committed predecessor")
+        let pending = try store.pending()
+        let bytes = try journalBytes()
+        let stamps = manager.dirtySettings
+        try check(!manager.nativePreferenceAdmissionGate.admits([retired]) { true }, "retired generation regained FIFO admission")
+        try check(try store.recordCommitted(retired, current: successor.base), "authenticated retired completion was not idempotent")
+        try check(try !store.authorizesAcknowledgement(retired, current: successor.base), "retired cloud receipt authorized acknowledgement")
+        try check(try !store.acknowledge(retired, current: successor.base), "retired cloud receipt cleared the current generation")
+        try check(try store.pending() == pending && journalBytes() == bytes,
+                  "retired completion or cloud receipt changed the pending journal")
+        try check(manager.dirtySettings == stamps, "retired receipt changed dirty stamps")
     }
     static func main() async {
         do { try await run(); print("GREEN native profile switch admission") }
@@ -607,6 +653,7 @@ enum NativeProfileSwitchAdmissionEnvironment {
         let stressTarget = CoreBridge.shared.captureNativePlaybackTarget()
         let stressOwnerProfile = ProfileStore.shared.profiles.first { $0.id == owner.id }!
         UserDefaults.standard.set("it", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 1001
         let stressHostBefore = try await session.hostPreferencesDocument()
         let stressEntryBefore = checkpointGate.entryCountSnapshot()
         checkpointGate.holdNext()
@@ -617,6 +664,7 @@ enum NativeProfileSwitchAdmissionEnvironment {
         try check(!CoreBridge.shared.nativePlaybackTargetIsCurrent(stressTarget),
                   "native target remained current while outgoing checkpoint ACK was held")
         UserDefaults.standard.set("es", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 1002
         let rejectedDuringStress = (try? manager.prepareNativePreferenceIntents(stressOwnerProfile,
                                                                                   target: stressTarget,
                                                                                   editedGroups: [.playback])) == nil
@@ -639,10 +687,9 @@ enum NativeProfileSwitchAdmissionEnvironment {
         }
         try check(latestStressIntent.desired["playback"]?["audioLang"] == .string("es"),
                   "newer flat edit was not the final admitted playback value")
-        try check(latestStressIntent.supersededIDs.contains(firstStressIntent.id),
-                  "newer flat edit did not supersede the held-save receipt")
-        try check(!latestStressIntent.acceptedBases.isEmpty,
-                  "newer flat edit lost accepted native base lineage")
+        try checkPendingGeneration(latestStressIntent, store: recoveredStore, manager: manager,
+                                   stamps: [TrackPreferences.Key.audio: 1002])
+        try checkRetiredGeneration(firstStressIntent, successor: latestStressIntent, store: recoveredStore, manager: manager)
         let stressHostAfter = try await session.hostPreferencesDocument()
         try check(stressHostAfter["profiles"]?[scope.ownerProfileID]?["fields"]?["playback"]?["value"]?["audioLang"] == .string("es"),
                   "newer flat edit did not persist to the native host")
@@ -660,6 +707,7 @@ enum NativeProfileSwitchAdmissionEnvironment {
         let revertOwnerProfile = ProfileStore.shared.profiles.first { $0.id == owner.id }!
         let publishedBaselineAudio = UserDefaults.standard.string(forKey: TrackPreferences.Key.audio) ?? "en"
         UserDefaults.standard.set("de", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 1101
         let revertHostBefore = try await session.hostPreferencesDocument()
         let revertEntryBefore = checkpointGate.entryCountSnapshot()
         checkpointGate.holdNext()
@@ -670,6 +718,7 @@ enum NativeProfileSwitchAdmissionEnvironment {
         try check(!CoreBridge.shared.nativePlaybackTargetIsCurrent(revertTarget),
                   "baseline-revert target remained current while checkpoint ACK was held")
         UserDefaults.standard.set(publishedBaselineAudio, forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 1102
         let rejectedRevertCapture = (try? manager.prepareNativePreferenceIntents(revertOwnerProfile,
                                                                                    target: revertTarget,
                                                                                    editedGroups: [.playback])) == nil
@@ -692,10 +741,9 @@ enum NativeProfileSwitchAdmissionEnvironment {
         }
         try check(latestRevertIntent.desired["playback"]?["audioLang"] == .string(publishedBaselineAudio),
                   "baseline-revert final value was not the published baseline")
-        try check(latestRevertIntent.supersededIDs.contains(firstRevertIntent.id),
-                  "baseline-revert did not supersede the held-save receipt")
-        try check(!latestRevertIntent.acceptedBases.isEmpty,
-                  "baseline-revert lost accepted native base lineage")
+        try checkPendingGeneration(latestRevertIntent, store: recoveredStore, manager: manager,
+                                   stamps: [TrackPreferences.Key.audio: 1102])
+        try checkRetiredGeneration(firstRevertIntent, successor: latestRevertIntent, store: recoveredStore, manager: manager)
         let revertHostAfter = try await session.hostPreferencesDocument()
         try check(revertHostAfter["profiles"]?[scope.ownerProfileID]?["fields"]?["playback"]?["value"]?["audioLang"] == .string(publishedBaselineAudio),
                   "baseline-revert final value did not persist to the native host")
@@ -710,6 +758,7 @@ enum NativeProfileSwitchAdmissionEnvironment {
         try check(switchedToOwnerForExhaustion, "switch to owner before bounded retry proof failed")
         let exhaustionTarget = CoreBridge.shared.captureNativePlaybackTarget()
         UserDefaults.standard.set("ja", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 1201
         checkpointGate.holdNext()
         let exhaustionSelection = Task { @MainActor in
             await ProfileStore.shared.selectNative(viewer, target: exhaustionTarget, finishPicker: false)
@@ -721,14 +770,23 @@ enum NativeProfileSwitchAdmissionEnvironment {
             throw Failure.assertion("bounded retry first playback receipt was not prepared")
         }
         UserDefaults.standard.set("ko", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 1202
         checkpointGate.holdNext()
         checkpointGate.release()
         let secondExhaustionEntry = try await checkpointGate.waitUntilEntered(after: firstExhaustionEntry)
+        guard let secondExhaustionIntent = try recoveredStore.pending().first(where: { $0.group == .playback }) else {
+            throw Failure.assertion("bounded retry second generation was not prepared")
+        }
         UserDefaults.standard.set("pt", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 1203
         checkpointGate.holdNext()
         checkpointGate.release()
         let thirdExhaustionEntry = try await checkpointGate.waitUntilEntered(after: secondExhaustionEntry)
+        guard let thirdExhaustionIntent = try recoveredStore.pending().first(where: { $0.group == .playback }) else {
+            throw Failure.assertion("bounded retry third generation was not prepared")
+        }
         UserDefaults.standard.set("nl", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 1204
         checkpointGate.release()
         _ = thirdExhaustionEntry
         let exhaustionResult = await exhaustionSelection.value
@@ -741,12 +799,13 @@ enum NativeProfileSwitchAdmissionEnvironment {
         }
         try check(latestExhaustionIntent.desired["playback"]?["audioLang"] == .string("nl"),
                   "bounded retry did not retain the latest flat value")
-        try check(latestExhaustionIntent.supersededIDs.contains(firstExhaustionIntent.id),
-                  "bounded retry latest receipt lost its predecessor lineage")
-        try check(latestExhaustionIntent.supersededIDs.count >= 3,
-                  "bounded retry did not record all three admitted predecessors")
-        try check(!latestExhaustionIntent.acceptedBases.isEmpty,
-                  "bounded retry latest receipt lost accepted native base lineage")
+        try check(Set([firstExhaustionIntent.id, secondExhaustionIntent.id, thirdExhaustionIntent.id, latestExhaustionIntent.id]).count == 4,
+                  "bounded retry did not retain evidence of three distinct saves and the final pending edit")
+        try checkPendingGeneration(latestExhaustionIntent, store: recoveredStore, manager: manager,
+                                   stamps: [TrackPreferences.Key.audio: 1204])
+        try checkRetiredGeneration(firstExhaustionIntent, successor: secondExhaustionIntent, store: recoveredStore, manager: manager)
+        try checkRetiredGeneration(secondExhaustionIntent, successor: thirdExhaustionIntent, store: recoveredStore, manager: manager)
+        try checkRetiredGeneration(thirdExhaustionIntent, successor: latestExhaustionIntent, store: recoveredStore, manager: manager)
         let exhaustionHost = try await session.hostPreferencesDocument()
         try check(exhaustionHost["profiles"]?[scope.ownerProfileID]?["fields"]?["playback"]?["value"]?["audioLang"] == .string("pt"),
                   "bounded retry failure wrote the unadmitted fourth value to the native host")
@@ -757,6 +816,9 @@ enum NativeProfileSwitchAdmissionEnvironment {
         // budget. Retain that journal verbatim; do not clear its unacknowledged intent, fabricate
         // a cloud ACK, or change production bounds to make the following scenarios fit.
         let retainedStressStore = recoveredStore
+        let retainedStressQuarantine = try retainedStressStore.quarantined()
+        try check(quarantined.allSatisfy(retainedStressQuarantine.contains),
+                  "stress scenarios lost the original unknown projection evidence")
         let retainedStressFiles = try Dictionary(uniqueKeysWithValues:
             FileManager.default.contentsOfDirectory(at: recoveredJournalRoot, includingPropertiesForKeys: nil).map {
                 ($0.lastPathComponent, try Data(contentsOf: $0))
@@ -774,6 +836,8 @@ enum NativeProfileSwitchAdmissionEnvironment {
         let activeOwnerTarget = CoreBridge.shared.captureNativePlaybackTarget()
         UserDefaults.standard.set("fr", forKey: TrackPreferences.Key.audio)
         UserDefaults.standard.set(["fr-catalog"], forKey: ProfileDiscoveryPreferencesStore.Key.catalogOrder)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 2001
+        manager.dirtySettings[ProfileDiscoveryPreferencesStore.Key.catalogOrder] = 2002
         let switchedToViewer = await ProfileStore.shared.selectNative(viewer, target: activeOwnerTarget, finishPicker: false)
         if !switchedToViewer {
             let diagnostics = try recoveredStore.pending().map {
@@ -783,8 +847,18 @@ enum NativeProfileSwitchAdmissionEnvironment {
         }
         try check(switchedToViewer, "genuine owned edit did not admit switch")
         let pendingAfterSave = try recoveredStore.pending()
-        try check(pendingAfterSave.contains { $0.group == .playback && !$0.acceptedBases.isEmpty }, "journal ACK record did not retain playback intent lineage")
-        try check(pendingAfterSave.contains { $0.group == .discovery && !$0.acceptedBases.isEmpty }, "journal ACK record did not retain discovery intent lineage")
+        for (group, stamps) in [(NativePreferenceIntentStore.Group.playback, [TrackPreferences.Key.audio: 2001.0]),
+                                (.discovery, [ProfileDiscoveryPreferencesStore.Key.catalogOrder: 2002.0])] {
+            guard let pending = pendingAfterSave.first(where: { $0.group == group }) else {
+                throw Failure.assertion("native save cleared a group before its matching cloud acknowledgement")
+            }
+            try checkPendingGeneration(pending, store: recoveredStore, manager: manager, stamps: stamps)
+            let snapshot = try manager.preferenceSnapshotForHarness(profileID: owner.id, group: group)
+            try check(snapshot.value == pending.desired, "saved group differs from its pending desired value")
+            try check(try recoveredStore.authorizesAcknowledgement(pending, current: snapshot),
+                      "exact current cloud receipt was not authorized")
+            try check(try recoveredStore.pending() == pendingAfterSave, "read-only cloud acknowledgement preflight consumed the pending edit")
+        }
         let hostAfterSave = try await session.hostPreferencesDocument()
         try check(hostAfterSave["profiles"]?[scope.ownerProfileID]?["fields"]?["playback"]?["value"]?["audioLang"] == .string("fr"),
                   "normal save did not persist the edited playback value in the native host")
@@ -803,9 +877,11 @@ enum NativeProfileSwitchAdmissionEnvironment {
         draftPlayback.audioLang = "de"
         playbackDraft.playback = draftPlayback
         UserDefaults.standard.set("de", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 2003
         let draft = try manager.prepareNativePreferenceIntents(playbackDraft, target: ownerTarget, editedGroups: [.playback])
         guard let draftIntent = draft.first(where: { $0.group == .playback }) else { throw Failure.assertion("playback draft did not prepare") }
         UserDefaults.standard.set("fr", forKey: TrackPreferences.Key.audio)
+        manager.dirtySettings[TrackPreferences.Key.audio] = 2004
         try check(manager.nativePreferenceIsLocalRevert(mountedOwner, group: .playback, target: ownerTarget), "same-group playback local revert was not recognized")
         let switchedAfterRevert = await ProfileStore.shared.selectNative(
             ProfileStore.shared.profiles.first { $0.id == NativeProfileSwitchAdmissionEnvironment.viewer }!,
@@ -815,9 +891,12 @@ enum NativeProfileSwitchAdmissionEnvironment {
         guard let reverted = pendingAfterRevert.first(where: { $0.group == .playback }) else {
             throw Failure.assertion("playback revert receipt was lost")
         }
-        try check(reverted.supersededIDs.contains(draftIntent.id), "playback revert did not supersede the draft receipt")
+        try check(reverted.id != draftIntent.id && !reverted.supersededIDs.contains(draftIntent.id),
+                  "playback revert did not retire the draft generation")
         try check(reverted.desired["playback"]?["audioLang"] == .string("fr"), "playback revert desired value was not the acknowledged fr projection")
-        try check(!reverted.acceptedBases.isEmpty, "playback revert receipt lost accepted native base lineage")
+        try checkPendingGeneration(reverted, store: recoveredStore, manager: manager,
+                                   stamps: [TrackPreferences.Key.audio: 2004])
+        try check(!manager.nativePreferenceAdmissionGate.admits([draftIntent]) { true }, "uncommitted draft regained admission after revert")
 
         // The original target is now stale after the next switch; rejected ABA admission must not
         // erase the pending receipt prepared above.
@@ -929,8 +1008,8 @@ enum NativeProfileSwitchAdmissionEnvironment {
 
         try check(try retainedStressStore.pending() == exhaustionPending,
                   "independent scenarios changed the retained stress intent")
-        try check(try retainedStressStore.quarantined() == quarantined,
-                  "independent scenarios changed the retained unknown projection evidence")
+        try check(try retainedStressStore.quarantined() == retainedStressQuarantine,
+                  "independent scenarios changed the retained projection evidence")
         let finalStressFiles = try Dictionary(uniqueKeysWithValues:
             FileManager.default.contentsOfDirectory(at: recoveredJournalRoot, includingPropertiesForKeys: nil).map {
                 ($0.lastPathComponent, try Data(contentsOf: $0))
