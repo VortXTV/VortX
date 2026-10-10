@@ -268,21 +268,12 @@ private struct PlayerSeekSliderSurface: View {
     private var trackWidth: CGFloat { max(1, size.width - sliderInset * 2) }
 
     var body: some View {
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         PlayerStyledSeekSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
                                duration: duration, bufferedTime: bufferedTime, width: size.width,
                                accent: accent, animated: animated,
                                onScrubChanged: onScrubChanged, onEditingChanged: onEditingChanged)
-            .overlay {
-                PlayerChapterMarkers(fractions: chapterFractions, trackWidth: trackWidth,
-                                     sliderInset: sliderInset, height: size.height)
-            }
-        #else
-        PlayerClockSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
-                          duration: duration, onScrubChanged: onScrubChanged,
-                          onEditingChanged: onEditingChanged)
-            .tint(accent)
-            #if os(macOS)
+#if os(macOS)
             .onContinuousHover { phase in
                 guard !scrubbing else { return }
                 switch phase {
@@ -293,7 +284,16 @@ private struct PlayerSeekSliderSurface: View {
                     onHoverPreviewChanged(nil)
                 }
             }
-            #endif
+#endif
+            .overlay {
+                PlayerChapterMarkers(fractions: chapterFractions, trackWidth: trackWidth,
+                                     sliderInset: sliderInset, height: size.height)
+            }
+        #else
+        PlayerClockSlider(clock: clock, scrubbing: $scrubbing, scrubTarget: $scrubTarget,
+                          duration: duration, onScrubChanged: onScrubChanged,
+                          onEditingChanged: onEditingChanged)
+            .tint(accent)
             .overlay {
                 if !scrubbing {
                     PlayerBufferedBand(clock: clock, duration: duration, bufferedTime: bufferedTime,
@@ -489,7 +489,7 @@ private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
             } else {
                 shape.fill(.ultraThinMaterial)
                     .environment(\.colorScheme, .dark)
-                shape.fill(neutral.opacity(prominent ? 0.62 : 0.66))
+                shape.fill(neutral.opacity(prominent ? 0.56 : 0.60))
             }
             if active && isEnabled {
                 shape.fill(Theme.Palette.accent.opacity(0.16))
@@ -506,16 +506,16 @@ private struct PlayerControlSurfaceModifier<S: InsettableShape>: ViewModifier {
     }
 
     private var border: LinearGradient {
-        let top = contrast == .increased ? 0.48 : prominent ? 0.26 : 0.18
-        let tint: Color = active && isEnabled ? Theme.Palette.accent : .white
-        return LinearGradient(colors: [tint.opacity(active && isEnabled ? 0.72 : top),
-                                       tint.opacity(active && isEnabled ? 0.32 : top * 0.28)],
+        let top = contrast == .increased ? 0.48 : active && isEnabled ? 0.48 : prominent ? 0.24 : 0.20
+        let tint: Color = contrast == .increased ? .white : Theme.Palette.accent
+        return LinearGradient(colors: [tint.opacity(active && isEnabled ? 0.60 : top),
+                                       tint.opacity(active && isEnabled ? 0.28 : top * 0.32)],
                               startPoint: .top, endPoint: .bottom)
     }
 
-    private var shadowOpacity: Double { isEnabled ? 0.20 : 0.10 }
-    private var shadowRadius: CGFloat { prominent ? 5 : 3 }
-    private var shadowY: CGFloat { 2 }
+    private var shadowOpacity: Double { isEnabled ? 0.16 : 0.08 }
+    private var shadowRadius: CGFloat { prominent ? 4 : 2 }
+    private var shadowY: CGFloat { 1 }
 }
 
 private extension View {
@@ -536,19 +536,31 @@ private struct PlayerControlButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 7) {
+                #if os(macOS)
+                Image(systemName: icon).font(.system(size: 17, weight: .semibold))
+                #else
                 Image(systemName: icon).font(.system(size: 15, weight: .semibold))
+                #endif
                 // #135: force a single line + allow the font to shrink instead of wrapping mid-word
                 // ("Spee d", "Subti tles") on the narrower iOS control-row width; macOS/tvOS already
                 // fit at full size so minimumScaleFactor is a no-op there.
-                Text(title).font(.subheadline.weight(.medium))
+                #if os(macOS)
+                Text(title)
+                    .font(.system(size: 16, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                #else
+                Text(title)
+                    .font(.subheadline.weight(.medium))
                     .lineLimit(1)
                     #if !os(iOS)
                     .minimumScaleFactor(0.75)
                     #endif
+                #endif
             }
             .padding(.horizontal, 12).padding(.vertical, 7)
-            #if os(iOS)
             .frame(minHeight: 44)
+            #if os(iOS)
             .fixedSize(horizontal: true, vertical: false)
             #endif
             .playerControlSurface(in: RoundedRectangle(cornerRadius: 11, style: .continuous), active: active)
@@ -654,7 +666,11 @@ private struct PlayerBottomTimeline: View {
         HStack(spacing: 12) {
             PlayerTimeLabel(clock: clock)
             GeometryReader { geo in track(geo.size) }
+                #if os(macOS)
+                .frame(height: 44)
+                #else
                 .frame(height: 24)
+                #endif
                 .animation(.easeOut(duration: 0.12), value: hasThumbnail)
             VStack(alignment: .trailing, spacing: 1) {
                 Text(durationText).font(.caption.monospacedDigit()).foregroundStyle(.white)
