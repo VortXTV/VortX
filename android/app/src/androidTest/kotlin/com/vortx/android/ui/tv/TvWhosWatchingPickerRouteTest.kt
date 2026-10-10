@@ -165,10 +165,22 @@ class TvWhosWatchingPickerRouteTest {
         assertEquals(listOf(owner.id), gateway.selectedIDs)
     }
 
+    @Test
+    fun pickerUsesOneCoherentSnapshotForRosterAndActiveMarker() {
+        val gateway = PickerGateway(owner)
+        show(gateway)
+
+        // TvProfilePicker must derive both values from the same gateway read. A second read can observe a
+        // roster/account replacement between the grid and its active marker; this route fixture counts the
+        // initial snapshot reads without exercising any management action.
+        assertEquals(1, gateway.readCalls)
+    }
+
     private class PickerGateway(initial: UserProfile) : TvProfileGateway {
         private var profiles = listOf(initial)
         private var active = initial.id
         private var admissionGeneration = 0
+        var readCalls = 0
         var editorCaptureCalls = 0
         var selectionAdmissionCaptureCalls = 0
         val selectedIDs = mutableListOf<String>()
@@ -184,7 +196,10 @@ class TvWhosWatchingPickerRouteTest {
             admissionGeneration++
         }
 
-        override fun read(): TvProfileGateway.Snapshot = TvProfileGateway.Snapshot(profiles, active)
+        override fun read(): TvProfileGateway.Snapshot {
+            readCalls++
+            return TvProfileGateway.Snapshot(profiles, active)
+        }
 
         override fun capture(
             profile: UserProfile,

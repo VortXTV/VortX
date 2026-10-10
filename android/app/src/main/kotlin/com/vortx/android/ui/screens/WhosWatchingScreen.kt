@@ -1,5 +1,6 @@
 package com.vortx.android.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -113,6 +114,17 @@ fun WhosWatchingScreen(
     var pickerError by remember { mutableStateOf<String?>(null) }
     var rosterRevision by remember { mutableStateOf(0) }
     @Suppress("UNUSED_VARIABLE") val rosterRedraw = rosterRevision
+
+    // Keep one owner for the launch route's system Back key. The PIN scrim and the editor are state in this
+    // route (rather than separate navigation destinations), so a nested handler would let Back finish the
+    // host activity or skip the PIN depending on which child happened to be composed last.
+    WhosWatchingBackHandler(
+        pinVisible = pinTarget != null,
+        editorVisible = editorRequest != null,
+        onCancelPin = { pinTarget = null },
+        onCancelEditor = { editorRequest = null },
+        onDone = onDone,
+    )
 
     fun requestPin(profile: UserProfile, purpose: PickerPinPurpose): PickerPinRequest =
         ContinueWatchingOwnerGate.serialized { revision ->
@@ -335,6 +347,28 @@ fun WhosWatchingScreen(
                 },
                 onCancel = { pinTarget = null },
             )
+        }
+    }
+}
+
+/**
+ * System Back policy for the phone launch picker. The precedence is intentionally explicit and shared by
+ * the production route and its Compose route tests: dismiss the PIN first, then abandon the editor without
+ * saving its local draft, and only finish the picker when no transient overlay is active.
+ */
+@Composable
+internal fun WhosWatchingBackHandler(
+    pinVisible: Boolean,
+    editorVisible: Boolean,
+    onCancelPin: () -> Unit,
+    onCancelEditor: () -> Unit,
+    onDone: () -> Unit,
+) {
+    BackHandler {
+        when {
+            pinVisible -> onCancelPin()
+            editorVisible -> onCancelEditor()
+            else -> onDone()
         }
     }
 }

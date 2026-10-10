@@ -39,6 +39,11 @@ class WhosWatchingPickerContractTest {
     fun `phone pin panel consumes touches and native selection carries admission witness`() {
         val source = readSource("WhosWatchingScreen.kt")
 
+        assertTrue(source.contains("WhosWatchingBackHandler("))
+        assertTrue(source.contains("pinVisible = pinTarget != null"))
+        assertTrue(source.contains("editorVisible = editorRequest != null"))
+        assertTrue(source.contains("pinVisible -> onCancelPin()"))
+        assertTrue(source.contains("editorVisible -> onCancelEditor()"))
         assertTrue(source.contains(".clickable(onClick = {}) // consume panel taps"))
         assertTrue(source.contains("nativeModel?.captureSelection(selected)"))
         assertTrue(source.contains("nativeModel?.commitEditor(captured) {} == true"))
@@ -78,6 +83,9 @@ class WhosWatchingPickerContractTest {
     fun `tv active edit carries a pre-pin selection admission and validates it without selecting`() {
         val source = readTvSource()
 
+        assertTrue(source.contains("val snapshot = gateway.read()"))
+        assertTrue(source.contains("val roster = snapshot.profiles"))
+        assertTrue(source.contains("val activeId = snapshot.activeID"))
         assertTrue(source.contains("data class Edit(val profile: UserProfile, val admission: TvProfileGateway.Admission)"))
         assertTrue(source.contains("val admission = gateway.capture(active, selection = true)"))
         assertTrue(source.contains("if (!admission.commit { })"))

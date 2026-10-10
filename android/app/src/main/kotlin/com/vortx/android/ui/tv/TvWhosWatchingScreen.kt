@@ -100,8 +100,11 @@ internal fun TvProfilePicker(
 ) {
     var refresh by remember { mutableStateOf(0) }
     @Suppress("UNUSED_VARIABLE") val redraw = refresh
-    val roster = gateway.read().profiles
-    val activeId = gateway.read().activeID
+    // Keep the visible roster and active marker from one owner-gate snapshot. Separate reads can observe an
+    // account/roster replacement between calls and paint a profile grid that never belonged to one state.
+    val snapshot = gateway.read()
+    val roster = snapshot.profiles
+    val activeId = snapshot.activeID
     var pinTarget by remember { mutableStateOf<TvPendingPinAction?>(null) }
     var managementRequest by remember { mutableStateOf<TvManagementRequest?>(null) }
     var restore by remember { mutableStateOf<String?>(activeId) }
