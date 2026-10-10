@@ -3241,6 +3241,7 @@ final class AppleSearchPresentation: ObservableObject {
     private weak var core: CoreBridge?
     private var query = ""
     private var lastResultInput: [AppleSearchResultProjection.Input]?
+    private var suggestionsRefreshScheduled = false
     private let projectResults: ([CoreMeta]) -> AppleSearchResultProjection
 
     init(projectResults: @escaping ([CoreMeta]) -> AppleSearchResultProjection = { AppleSearchResultProjection($0) }) {
@@ -3277,8 +3278,17 @@ final class AppleSearchPresentation: ObservableObject {
 
     private func scheduleSuggestionsRefresh() {
         // @Published delivers before storage commits. Suggestions use the committed source
-        // snapshot; accepted result cards above use the publication payload directly.
-        DispatchQueue.main.async { [weak self] in self?.refreshSuggestions() }
+        // snapshot; accepted result cards above use the publication payload directly. Keep one
+        // main-queue refresh for a burst of results/suggestions/history/board publications, and
+        // read the current binding/query when that refresh runs so a surface switch in the same
+        // run loop cannot refresh a stale owner.
+        guard !suggestionsRefreshScheduled else { return }
+        suggestionsRefreshScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.suggestionsRefreshScheduled = false
+            self.refreshSuggestions()
+        }
     }
 
     private func refreshSuggestions() {
@@ -3420,9 +3430,16 @@ struct iOSSearchView: View {
             guard let q = pending, !q.isEmpty else { return }
             searchTask?.cancel()
             searchDebouncePending = false
-            query = q
-            core.suggestSearch(q)
-            core.search(q)
+            if query != q {
+                // The state mutation below is followed by SwiftUI's onChange callback. Mark only
+                // a real value change as already submitted so the callback skips its ordinary
+                // debounce; a same-query handoff must not leave a stamp that consumes later input.
+                submittedSuggestion = q
+                query = q
+            } else {
+                submittedSuggestion = nil
+            }
+            submitTouchSearch(q)
             MacSearchBridge.shared.pending = nil
         }
         #endif
@@ -3438,13 +3455,7 @@ struct iOSSearchView: View {
                 .font(Theme.Typography.body)
                 .foregroundStyle(Theme.Palette.textPrimary)
                 .focused($macInlineSearchFocused)
-                .onSubmit {
-                    searchTask?.cancel()
-                    searchDebouncePending = false
-                    let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
-                    core.suggestSearch(value)
-                    core.search(value)
-                }
+                .onSubmit { submitTouchSearch() }
                 .accessibilityLabel("Search movies or series")
             if !query.isEmpty {
                 Button { query = "" } label: {
@@ -3527,6 +3538,7 @@ struct iOSSearchView: View {
         let value = (submittedQuery ?? query).trimmingCharacters(in: .whitespacesAndNewlines)
         searchTask?.cancel()
         searchDebouncePending = false
+        searchPresentation.setQuery(value)
         core.suggestSearch(value)
         core.search(value)
         #if os(iOS)
@@ -3694,6 +3706,7 @@ struct iOSDiscoverView: View {
     /// swaps the catalog browse for grouped search results. OFF = Discover is unchanged and Search is its own tab.
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
     @State private var searchQuery = ""
+    @State private var submittedSuggestion: String?
     @State private var searchTask: Task<Void, Never>?
     @State private var searchDebouncePending = false
     @StateObject private var searchPresentation = AppleSearchPresentation.shared
@@ -3814,6 +3827,7 @@ struct iOSDiscoverView: View {
             }
             .onAppear {
                 searchPresentation.bind(to: core)
+                searchPresentation.setQuery(searchQuery)
                 if core.discover == nil { core.loadDiscover() }
             }
             // Advanced filter panel. Presented as a sheet (never a `.toolbar` item, which realizes on the
@@ -3863,16 +3877,35 @@ struct iOSDiscoverView: View {
             guard mergeDiscoverSearch, let q = pending, !q.isEmpty else { return }
             searchTask?.cancel()
             searchDebouncePending = false
-            searchQuery = q
-            core.suggestSearch(q)
-            core.search(q)
+            if searchQuery != q {
+                // The state mutation below is followed by SwiftUI's onChange callback. Mark only
+                // a real value change as already submitted so the callback skips its ordinary
+                // debounce; a same-query handoff must not leave a stamp that consumes later input.
+                submittedSuggestion = q
+                searchQuery = q
+            } else {
+                submittedSuggestion = nil
+            }
+            submitMergedSearch(q)
             MacSearchBridge.shared.pending = nil
         }
         #endif
         // Merged search: debounce the query into the engine (same contract as iOSSearchView), and clear the
         // field/results when the user turns the merge off so Discover returns to the plain catalog browse.
-        .onChange(of: searchQuery) { value in if mergeDiscoverSearch { scheduleMergedSearch(value) } }
-        .onChange(of: mergeDiscoverSearch) { on in if !on { searchTask?.cancel(); searchQuery = ""; core.search("") } }
+        .onChange(of: searchQuery) { value in
+            searchPresentation.setQuery(value)
+            let alreadySubmitted = submittedSuggestion == value
+            submittedSuggestion = nil
+            if mergeDiscoverSearch, !alreadySubmitted { scheduleMergedSearch(value) }
+        }
+        .onChange(of: mergeDiscoverSearch) { on in
+            if !on {
+                searchTask?.cancel()
+                searchDebouncePending = false
+                searchQuery = ""
+                core.search("")
+            }
+        }
         .onDisappear { hero.stop(); searchTask?.cancel() }
     }
 
@@ -3897,9 +3930,9 @@ struct iOSDiscoverView: View {
             .textFieldStyle(.plain)
             .font(Theme.Typography.body)
             .foregroundStyle(Theme.Palette.textPrimary)
-            .onSubmit { core.suggestSearch(searchQuery); core.search(searchQuery) }
+            .onSubmit { submitMergedSearch() }
             if !searchQuery.isEmpty {
-                Button { searchQuery = ""; core.search("") } label: {
+                Button { searchQuery = "" } label: {
                     Image(systemName: "xmark.circle.fill")
                         .foregroundStyle(Theme.Palette.textTertiary)
                         .font(.system(size: 16, weight: .semibold))
@@ -3948,6 +3981,16 @@ struct iOSDiscoverView: View {
                 }
             }
         }
+    }
+
+    /// Submit the merged query immediately, matching iOSSearchView.submitTouchSearch.
+    private func submitMergedSearch(_ submittedQuery: String? = nil) {
+        let value = (submittedQuery ?? searchQuery).trimmingCharacters(in: .whitespacesAndNewlines)
+        searchTask?.cancel()
+        searchDebouncePending = false
+        searchPresentation.setQuery(value)
+        core.suggestSearch(value)
+        core.search(value)
     }
 
     /// Debounce the merged query into the engine (350ms), matching iOSSearchView.scheduleSearch.
