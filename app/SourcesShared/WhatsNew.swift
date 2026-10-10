@@ -5,19 +5,19 @@ import Foundation
 /// The in-app "What's New" screen (Settings > What's New) renders the full bundled CHANGELOG.md and only falls
 /// back to these highlights when that resource is absent. Pure logic so it compiles on every target.
 enum WhatsNew {
-    static let version = "0.5.0-beta.1"
+    static let version = "0.5.0-beta.3"
     static let highlights: [String] = [
-        "VortX's native core now owns account, catalog, resource and streaming work. Native packages omit the legacy core and Node runtime; optional Stremio sign-in remains a separate integration. Full, Lite and Mac retain their documented server boundaries.",
-        "Profile, add-on, watched and Watchlist changes retain the viewer that initiated them and publish after a durable checkpoint. Independent streaming accounts cannot borrow another profile's credentials or relabel its old history.",
-        "Watchlist is separate from Library and viewing history, with per-title edits, retained removals and acknowledged buttons. Authenticated legacy lists seed missing entries without replacing newer changes; a capacity limit reports an error instead of silently deleting an older title.",
-        "Previously watched episode bitmaps migrate against their original episode inventory. Missing or ambiguous metadata stays visibly pending with Retry and retained evidence; changing a streaming account cannot redirect its old history into the new account.",
-        "Cinema brings rich catalog cards, Quick View, episode rails, detailed source groups and clearer Library destinations to Apple and Android. Phone actions fit the narrow layout; Mac and wide iPad keep horizontal navigation and a visible Search field.",
-        "Continue Watching prepares the next episode for the captured viewer, episode and chosen source. Discovery, resolution and Usenet share a bounded handoff; an obsolete preparation cannot replace a newer episode or profile.",
-        "Binge selection remembers the audio language actually selected, alongside the chosen add-on and release. Fresh shows prefer regular seasons while explicitly chosen or resumed specials remain authoritative.",
-        "Accepted same-media player or source replacements preserve Pause. AVPlayer recovery retains its accepted seek target, manual seeking retires stale resume intent, and terminal errors cannot restart an outgoing item behind the error screen.",
-        "Native NNTP read-ahead now warms bounded article batches concurrently instead of serial small reads. Seeks cancel older warm work, nearby useful coverage takes priority, and foreground reads retain connection headroom without increasing the memory budget.",
-        "Subtitle background styles drive the actual mpv renderer. Player accent controls stay within their shapes and respect Reduce Transparency. Fresh FFmpeg 9/SecureTransport MPV inputs retain Dolby Vision split support and repair a Mac CoreAudio initialization-failure lifetime defect.",
-        "Existing seek-bar styles, pinch Fit/Fill, chapters, subtitle controls, skip editing and countdown cancellation, downloads, live TV, debrid, indexers, ordered Usenet servers and integrations remain available. No blanket claim of uninterrupted provider playback, physical-device acceptance or complete Apple/Android parity replaces the detailed release notes."
+        "Add-ons and episode sources stay with the account and profile that opened them. An older response cannot replace the current viewer's results, and episode sources supplied inside an add-on's title details are retained.",
+        "A cancelled next-episode request cannot clear the newer request. Binge preparation keeps the selected episode, add-on, release and audio-language choice while sources arrive.",
+        "Watch progress and watched changes stay attached to the exact episode. A short unfinished play does not count as finishing the episode, and marking another episode watched does not remove the current one from Continue Watching.",
+        "Sync shows success only after the complete update is saved. Newer edits made during an upload stay queued. Open apps listen for updates, with a three-second fallback. Background updates are not guaranteed when the app is closed or suspended.",
+        "Search shows separate Movies, Series and Collections rows as results arrive while you type, without waiting for every category to finish.",
+        "Quick View has a visible close button, closes when you tap outside or press Escape, shows a three-line description, and applies Watchlist to the title you opened.",
+        "Episode rows use the available width, with smaller cards, navigation arrows and watched/unwatched menus. Phone Home has a rounded hero; Settings and Library have more space and softly tinted glass, with calmer player controls.",
+        "Artwork is decoded at a bounded display size and reused from memory. Library no longer sorts the full viewing history on every redraw, reducing unnecessary work while browsing.",
+        "Usenet streaming retains a chunk until the player finishes reading it instead of repeatedly throwing it away and downloading it again. Seeking or cancelling releases that retained work safely. Existing cloud jobs keep the selected file and episode during recovery.",
+        "Apple and Android use build 263. Existing source tabs, downloads, integrations, subtitle controls, skip countdown cancellation and seek-bar choices remain available.",
+        "These fixes still need live-provider and physical-device testing. This release does not claim that every playback stall, Usenet performance issue or cross-device sync case has been verified."
     ]
 
     // Kept as release-history fallback text for older bundled changelogs. The current screen uses
