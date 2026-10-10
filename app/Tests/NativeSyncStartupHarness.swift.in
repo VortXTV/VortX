@@ -1,0 +1,139 @@
+// Inert collaborators; production startup and queue methods are injected by the test runner.
+import Foundation
+
+enum VortxJSON: Equatable {
+    case object([String: VortxJSON]), bool(Bool), string(String)
+    subscript(_ key: String) -> VortxJSON? { if case .object(let values) = self { return values[key] }; return nil }
+}
+private final class CredentialScopeRegistry {
+    struct Capture: Equatable, Sendable { let generation: Int }
+    var generation = 1
+    func capture() -> Capture { .init(generation: generation) }
+}
+@MainActor private final class ProfileStore {
+    static let shared = ProfileStore()
+    var activeID: UUID?
+}
+@MainActor private final class CoreBridge {
+    static let shared = CoreBridge()
+    var certified = false
+    func hasCertifiedNativeSession(capture: CredentialScopeRegistry.Capture, profileID: UUID?) -> Bool {
+        certified && profileID == ProfileStore.shared.activeID
+    }
+    func settleResidentNativeSession(capture: CredentialScopeRegistry.Capture) async {}
+}
+@MainActor private final class StartupHarness {
+    static let owner = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
+    static let viewer = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+    struct Owner { let id: UUID }
+    let deleted: Bool
+    let retireCapture: Bool
+    let suppressMount: Bool
+    let backgroundMount: Bool
+    let credentialAuthority = CredentialScopeRegistry()
+    var isSignedIn = true
+    var realtimeActive = false
+    var isApplyingRemote = false
+    var wsCapture: CredentialScopeRegistry.Capture?
+    var ws: URLSessionWebSocketTask?
+    var wsBackoff: Double = 1
+    var wsReconnect: Task<Void, Never>?
+    var wsKeepAlive: Task<Void, Never>?
+    var pollTask: Task<Void, Never>?
+    let pollIntervalNanos: UInt64 = 50_000_000
+    var pendingSync: Task<Void, Never>?
+    var pendingSyncCapture: CredentialScopeRegistry.Capture?
+    var pendingSyncID: UUID?
+    var pendingNativeMutationPush: CredentialScopeRegistry.Capture?
+    var nativePushQueue = NativeForegroundSyncPolicy.PushQueue()
+    var nativeDurablePushPending = true
+    var hasPendingPush: Bool { nativePushQueue.hasPendingPush || nativeDurablePushPending }
+    var hasAppliedAccountDoc = true
+    var uploads = 0
+    var pullAttempts = 0
+    var remotePullsApplied = 0
+    var restoreCalls = 0
+    init(deleted: Bool, retireCapture: Bool, suppressMount: Bool, backgroundMount: Bool, pending: Bool) {
+        self.deleted = deleted; self.retireCapture = retireCapture; self.suppressMount = suppressMount
+        self.backgroundMount = backgroundMount; self.nativeDurablePushPending = pending
+    }
+    func isCurrent(_ capture: CredentialScopeRegistry.Capture) -> Bool { capture == credentialAuthority.capture() }
+    func connectWebSocket() { wsCapture = credentialAuthority.capture() }
+    func hasPendingAccountDocApply(for capture: CredentialScopeRegistry.Capture) -> Bool { false }
+    @discardableResult
+    func restoreAccountDocIfNeeded(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool { hasAppliedAccountDoc }
+    func flushDirtySettingsIfNeeded() {} // No legacy/default preference edits in this case.
+    @discardableResult
+    func syncDown(force: Bool = false, credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool {
+        pullAttempts += 1
+        /* PRODUCTION_PULL_GUARD */
+        remotePullsApplied += 1
+        return true
+    }
+    func syncUp() async -> Bool { uploads += 1; return true }
+    func restoreNativeCheckpoint(credentialCapture capture: CredentialScopeRegistry.Capture) async -> Bool {
+        restoreCalls += 1
+        guard let selectedProfile = ProfileStore.shared.activeID else { return false }
+        let owners = [Owner(id: Self.owner)]
+        let state: VortxJSON = .object(["roster": .object(["profiles": .object([
+            selectedProfile.uuidString: .object(["deleted": .bool(deleted)])
+        ])])])
+        /* PRODUCTION_RESTORE_FALLBACK */
+        // Inert equivalent of the checkpoint mount publishing its selected native profile.
+        ProfileStore.shared.activeID = installationProfile
+        CoreBridge.shared.certified = true
+        if retireCapture { credentialAuthority.generation = 3 } // Same named account after account/key ABA.
+        if suppressMount { isApplyingRemote = true }
+        if backgroundMount { realtimeActive = false }
+        // Existing native carrier, no web events: production restore does not request an upload.
+        return true
+    }
+    /* PRODUCTION_METHODS */
+    func drainSuppression() { isApplyingRemote = false; drainNativeMutationPush() }
+    func observation() -> [String: Any] {
+        ["activeOwner": ProfileStore.shared.activeID == Self.owner,
+         "workerExists": pendingSync != nil, "durablePending": nativeDurablePushPending,
+         "uploads": uploads, "pullAttempts": pullAttempts, "remotePullsApplied": remotePullsApplied,
+         "restoreCalls": restoreCalls]
+    }
+}
+@main private enum Probe {
+    @MainActor static func run(deleted: Bool, pending: Bool = true, retireCapture: Bool = false,
+                              suppressMount: Bool = false, backgroundMount: Bool = false) async -> [String: Any] {
+        ProfileStore.shared.activeID = StartupHarness.viewer
+        CoreBridge.shared.certified = false
+        let harness = StartupHarness(deleted: deleted, retireCapture: retireCapture, suppressMount: suppressMount,
+                                     backgroundMount: backgroundMount, pending: pending)
+        harness.startRealtime()
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let beforeDrainWorker = harness.pendingSync != nil
+        let beforeDrainAdmission = harness.pendingNativeMutationPush != nil
+        if suppressMount {
+            harness.drainSuppression()
+        }
+        try? await Task.sleep(nanoseconds: 3_050_000_000)
+        if !retireCapture && !backgroundMount {
+            harness.startRealtime() // Existing-account idempotent entry cannot revive the missing worker.
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        var result = harness.observation()
+        result["beforeDrainWorkerExists"] = beforeDrainWorker
+        result["beforeDrainAdmission"] = beforeDrainAdmission
+        harness.stopRealtime()
+        harness.pendingSync?.cancel()
+        return result
+    }
+    @MainActor static func main() async throws {
+        let deleted = await run(deleted: true)
+        let control = await run(deleted: false)
+        let aba = await run(deleted: true, retireCapture: true)
+        let suppression = await run(deleted: true, suppressMount: true)
+        let clean = await run(deleted: true, pending: false)
+        let cleanSame = await run(deleted: false, pending: false)
+        let background = await run(deleted: true, backgroundMount: true)
+        let result: [String: Any] = ["deletedProfile": deleted, "sameProfile": control, "accountKeyABA": aba,
+            "suppression": suppression, "cleanFallback": clean, "cleanSameProfile": cleanSame, "backgrounded": background]
+        let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
+        print(String(decoding: data, as: UTF8.self))
+    }
+}
