@@ -6,8 +6,8 @@ import Foundation
 struct PlaybackNavigationOwner {
 #if VORTX_NATIVE_DATA_ENGINE
     private let target: CoreBridge.NativeNavigationTarget?
-    init(core: CoreBridge) { target = core.captureNativeNavigationTarget() }
-    func isCurrent(core: CoreBridge) -> Bool {
+    init(core: CoreBridge, account: StremioAccount) { target = core.captureNativeNavigationTarget() }
+    func isCurrent(core: CoreBridge, account: StremioAccount) -> Bool {
         guard let target else { return false }
         return core.nativeNavigationTargetIsCurrent(target)
     }
@@ -17,19 +17,22 @@ struct PlaybackNavigationOwner {
     private let credential: CredentialScopeRegistry.Capture
     private let accountSlot: String
     private let accountEpoch: UInt64
-    init(core: CoreBridge) {
+    private let account: StremioAccount
+    init(core: CoreBridge, account: StremioAccount) {
         profileID = ProfileStore.shared.activeID
         profileEpoch = ContinueWatchingPreferences.selectionEpoch
         credential = CredentialScopeRegistry.shared.capture()
         accountSlot = ProfileStore.shared.activeKeychainAccount
-        accountEpoch = StremioAccount.shared.credentialBoundaryGeneration
+        self.account = account
+        accountEpoch = account.credentialBoundaryGeneration
     }
-    func isCurrent(core: CoreBridge) -> Bool {
-        ProfileStore.shared.activeID == profileID
+    func isCurrent(core: CoreBridge, account: StremioAccount) -> Bool {
+        account === self.account
+            && ProfileStore.shared.activeID == profileID
             && ContinueWatchingPreferences.selectionEpoch == profileEpoch
             && CredentialScopeRegistry.shared.isCurrent(credential)
             && ProfileStore.shared.activeKeychainAccount == accountSlot
-            && StremioAccount.shared.credentialBoundaryGeneration == accountEpoch
+            && account.credentialBoundaryGeneration == accountEpoch
     }
 #endif
 }

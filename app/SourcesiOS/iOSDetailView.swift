@@ -4950,7 +4950,7 @@ struct iOSEpisodeStreams: View {
                     onPlaybackIdentityCommitted: { committed in
                         guard presentation?.id == item.id else { return }
                         beginPlaybackReturn(launch)
-                        guard playbackReturnTarget?.isCurrent(core: core) == true else { return }
+                        guard playbackReturnTarget?.isCurrent(core: core, account: account) == true else { return }
                         _ = playbackReturnReceipt.record(committed, requestID: launch.id)
                     },
                     onClose: {
@@ -4980,7 +4980,7 @@ struct iOSEpisodeStreams: View {
               playbackReturnReceipt.closedReceipt?.requestID != launch.id,
               playbackReturnReceipt.closedAttempt?.requestID != launch.id else { return }
         playbackReturnReceipt.begin(requestID: launch.id)
-        playbackReturnTarget = PlaybackNavigationOwner(core: core)
+        playbackReturnTarget = PlaybackNavigationOwner(core: core, account: account)
         _ = playbackReturnReceipt.recordAttempt(launch.meta, requestID: launch.id)
     }
 
@@ -4991,7 +4991,7 @@ struct iOSEpisodeStreams: View {
         let engineID = profiles.activeUsesEngineHistory
             ? core.metaDetails?.libraryItem?.state.videoId
             : profiles.watch[meta.id]?.videoId
-        let ownsReceipt = playbackReturnTarget?.isCurrent(core: core) == true
+        let ownsReceipt = playbackReturnTarget?.isCurrent(core: core, account: account) == true
         let committed = ownsReceipt ? playbackReturnReceipt.closedReceipt?.meta : nil
         let attempted = ownsReceipt ? playbackReturnReceipt.closedAttempt?.meta : nil
         let inventory = seasonEpisodes + (core.metaDetails?.meta?.id == meta.id ? core.metaDetails?.meta?.videos ?? [] : [])
