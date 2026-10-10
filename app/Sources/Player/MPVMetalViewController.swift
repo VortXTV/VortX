@@ -187,6 +187,16 @@ final class MPVMetalViewController: PlatformViewController {
         return acceptsCurrentSeekEvent(evidence, owner: owner)
     }
 
+    /// Native SEEK + non-EOF RESTART can prove a physical position even when overlapping
+    /// commands cannot be individually attributed. Preserve that distinction at UI delivery;
+    /// command-driven resume/EOF/recovery decisions retain acceptsSettledPosition's stricter gate.
+    private func acceptsCurrentPosition(_ evidence: MPVSeekSettlementEvidence,
+                                        owner: PlayerLoadToken) -> Bool {
+        guard evidence.settled else { return false }
+        loadTokenLock.lock(); defer { loadTokenLock.unlock() }
+        return seekSettlement.accepts(evidence, owner: owner)
+    }
+
     /// Called on the controller or event queue while loadTokenLock fences the exact accepted
     /// source and seek generation. Values are observational, never a replacement for settlement.
     private func nativeSeekSnapshot(handle: OpaquePointer) -> MPVSeekNativeSnapshot {
@@ -4369,7 +4379,7 @@ final class MPVMetalViewController: PlatformViewController {
                     seconds: position.seconds, loadToken: position.loadToken,
                     mpvSeekSettlement: MPVSeekSettlementEvidence(
                         generation: evidence.generation,
-                        settled: self.acceptsSettledPosition(evidence, owner: capturedToken),
+                        settled: self.acceptsCurrentPosition(evidence, owner: capturedToken),
                         attributed: evidence.attributed))
             }
             self.playDelegate?.propertyChange(
