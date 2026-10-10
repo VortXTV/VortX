@@ -22,16 +22,21 @@ done
 
 source_path="$repo_root/app/SourcesiOS/iOSRootView.swift"
 template_path="$repo_root/app/Tests/AppleSearchSubmissionExtractionRunner.swift"
-build_root="$repo_root/app/build/apple-search-submission"
+mkdir -p "$repo_root/app/build"
+build_root=$(mktemp -d "$repo_root/app/build/apple-search-submission.XXXXXX")
 extractor="$build_root/extractor"
+receipt="$build_root/receipt.txt"
 
 [[ -f "$source_path" ]] || { echo "missing production source: $source_path" >&2; exit 1; }
 [[ -f "$template_path" ]] || { echo "missing extraction runner: $template_path" >&2; exit 1; }
 
-# This exact directory is generated test output owned by this script. It stays inside the
-# registered app build tree so a successful run leaves inspectable source, binaries, and logs.
-rm -rf "$build_root"
-mkdir -p "$build_root"
+# Each run gets a fresh generated directory inside the registered app build tree. Existing
+# baseline/current source, binaries, logs, and receipts remain available for inspection.
+{
+  printf 'format\tapple-search-submission-receipt-v1\n'
+  printf 'script_commit\t%s\n' "$(git rev-parse HEAD)"
+  printf 'baseline_ref\t%s\n' "${baseline_ref:-none}"
+} > "$receipt"
 
 xcrun swiftc -parse-as-library -O "$repo_root/scripts/AppleSearchSubmissionExtract.swift" -o "$extractor"
 
@@ -42,6 +47,9 @@ run_variant() {
   local variant_dir="$build_root/$variant"
   mkdir -p "$variant_dir"
   "$extractor" --source "$variant_source" --template "$template_path" --output "$variant_dir/runner.swift"
+  printf 'source_path\t%s\t%s\n' "$variant" "$variant_source" >> "$receipt"
+  printf 'source_sha256\t%s\t%s\n' "$variant" "$(shasum -a 256 "$variant_source" | awk '{print $1}')" >> "$receipt"
+  printf 'runner_sha256\t%s\t%s\n' "$variant" "$(shasum -a 256 "$variant_dir/runner.swift" | awk '{print $1}')" >> "$receipt"
   xcrun swiftc -parse-as-library -O "$variant_dir/runner.swift" -o "$variant_dir/runner"
   if [[ "$mode" == baseline ]]; then
     "$variant_dir/runner" --baseline | tee "$variant_dir/run.log"
@@ -55,6 +63,7 @@ run_variant() {
     grep -F 'GREEN burst refreshes=1 current-binding=current-query' "$variant_dir/run.log" >/dev/null
     grep -F 'PASS actual-source Apple Search extraction' "$variant_dir/run.log" >/dev/null
   fi
+  printf 'result\t%s\tPASS\n' "$variant" >> "$receipt"
 }
 
 if [[ -n "$baseline_ref" ]]; then
