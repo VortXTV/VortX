@@ -30,6 +30,21 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     // Full engine materialization: includes protected and profile-disabled members. Resource/UI
     // visibility is separate, and no host comparison of membership clocks is authoritative.
     private var addonInventories: [String: [VortxJSON]] = [:]
+    /// Ephemeral acknowledgement of one submitted add-on operation. Kernel-normalized manifests
+    /// cannot be compared with their wire input to confirm an update. Keep both privately, bound
+    /// to the exact accepted owner/profile/registry and the latest attempted operation instead.
+    private struct AddonConfirmation {
+        let operation: UUID
+        let account: UUID
+        let profile: String
+        let owner: String
+        let registry: UUID
+        let url: String
+        let submittedManifest: VortxJSON
+        let acceptedDescriptor: VortxJSON
+    }
+    private var addonOperation = UUID()
+    private var addonConfirmation: AddonConfirmation?
     /// FIFO tasks are unstructured, so cancellation belongs to the original import operation.
     /// The latch linearizes cancellation with the final checkpoint, not merely queue admission.
     private final class ImportCommitAuthority: VortxMutationAuthority, @unchecked Sendable {
@@ -163,7 +178,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
         }
     }
     func close() {
-        lock.lock(); closed = true; let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); addonInventories.removeAll(); lock.unlock()
+        lock.lock(); closed = true; let old = Array(tasks.values); tasks.removeAll(); generations.removeAll(); values.removeAll(); addonInventories.removeAll(); addonConfirmation = nil; addonOperation = UUID(); lock.unlock()
         session.revoke()
         old.forEach { $0.cancel() }; Task { await session.close() }
     }
@@ -201,6 +216,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
             // enter the session actor. Wait for that exact FIFO member before invalidating the
             // resource host; otherwise a rebind can land between the facade check and dispatch.
             let predecessor = tasks["native_state"]
+            addonConfirmation = nil; addonOperation = UUID()
             invalidateResourcePublications(); return (true, predecessor)
         }
         guard admission.0 else { throw VortxNativeError.superseded }
@@ -885,13 +901,54 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
     private func addonMemberKey(_ url: String) -> String? {
         VortxNativeWebsiteAddonEdits.memberKey(url)
     }
+    /// The input comparison ties this caller to the acknowledged operation; it does not compare
+    /// unsupported wire fields with the canonical manifest or reproduce the kernel normalizer.
+    func confirmsInstalledAddon(_ identity: String, submittedManifest: VortxJSON) -> Bool {
+        lock.withLock {
+            guard !closed, pendingProfileTransitions == 0, resourceRegistryValid,
+                  let receipt = addonConfirmation, receipt.operation == addonOperation,
+                  receipt.account == accountEpoch, receipt.registry == registryGeneration,
+                  receipt.url == identity, receipt.submittedManifest == submittedManifest,
+                  let state = values["native_state"], string(state["activeProfileId"]) == receipt.profile,
+                  addonOwner(for: state) == receipt.owner,
+                  addonInventories[receipt.owner]?.contains(receipt.acceptedDescriptor) == true else { return false }
+            return true
+        }
+    }
     private func dispatchAddonMutation(subaction: String, args: VortxJSON?) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !closed, pendingProfileTransitions == 0, let state = values["native_state"], let owner = addonOwner(for: state) else {
+        // A rejected or superseding call cannot borrow the previous operation's acknowledgement.
+        addonConfirmation = nil; addonOperation = UUID()
+        let operation = addonOperation, account = accountEpoch
+        guard !closed, pendingProfileTransitions == 0, let state = values["native_state"], let owner = addonOwner(for: state),
+              let profile = string(state["activeProfileId"]) else {
             return fail("stale_or_invalid_addon_owner")
         }
         guard let current = installedAddonURLs(state: state, owner: owner) else { return fail("invalid_native_addon_inventory") }
         func raw(_ action: VortxJSON) throws -> String { String(decoding: try JSONEncoder().encode(action), as: UTF8.self) }
+        func enqueueInstall(type: String, actions: [String], descriptor: (url: String, addon: VortxJSON)) -> Bool {
+            enqueueMutation(type: type, raw: "", actions: actions, admission: { [weak self] in
+                guard let self else { return false }
+                return self.lock.withLock {
+                    !self.closed && self.accountEpoch == account
+                        && self.string(self.values["native_state"]?["activeProfileId"]) == profile
+                        && self.values["native_state"].flatMap(self.addonOwner) == owner
+                }
+            }) { [weak self] result in
+                guard case .success = result, let self else { return }
+                self.lock.withLock {
+                    guard !self.closed, self.pendingProfileTransitions == 0,
+                          self.addonOperation == operation, self.accountEpoch == account,
+                          self.string(self.values["native_state"]?["activeProfileId"]) == profile,
+                          self.values["native_state"].flatMap(self.addonOwner) == owner,
+                          let accepted = self.addonInventories[owner]?.first(where: { self.string($0["transportUrl"]) == descriptor.url }),
+                          let submitted = descriptor.addon["manifest"] else { return }
+                    self.addonConfirmation = .init(operation: operation, account: account, profile: profile, owner: owner,
+                                                  registry: self.registryGeneration, url: descriptor.url,
+                                                  submittedManifest: submitted, acceptedDescriptor: accepted)
+                }
+            }
+        }
         do {
             switch subaction {
             case "InstallAddon", "InstallAddonLocal":
@@ -899,9 +956,9 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                       !current.contains(where: { addonMemberKey($0) == identity }) else {
                     return fail("invalid_or_duplicate_addon")
                 }
-                return enqueueMutation(type: "install_addon", raw: try raw(.object([
+                return enqueueInstall(type: "install_addon", actions: [try raw(.object([
                     "type": .string("install_addon"), "profileId": .string(owner), "addon": descriptor.addon,
-                ])))
+                ]))], descriptor: descriptor)
             case "UninstallAddon", "UninstallAddonLocal":
                 guard let descriptor = addonDescriptor(args), let identity = addonMemberKey(descriptor.url),
                       current.contains(where: { addonMemberKey($0) == identity }) else {
@@ -928,7 +985,7 @@ final class VortxNativeCoreFacade: @unchecked Sendable {
                 // key before installing its replacement; install-then-remove would tombstone the
                 // newly written record and make the following canonical reorder fail.
                 let actions = oldIdentity == newIdentity ? [remove, install, reorder] : [install, remove, reorder]
-                return enqueueMutation(type: "replace_addon", raw: "", actions: try actions.map(raw))
+                return enqueueInstall(type: "replace_addon", actions: try actions.map(raw), descriptor: new)
             default: return fail("unsupported_addon_mutation")
             }
         } catch { return fail("invalid_addon_mutation") }

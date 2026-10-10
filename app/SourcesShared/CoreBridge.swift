@@ -1522,8 +1522,22 @@ final class CoreBridge: ObservableObject {
             action = ["action": addonMutationAction("ReplaceAddon", local: "ReplaceAddonLocal"),
                       "args": ["old": old, "new": descriptor]]
         } else {
+#if VORTX_NATIVE_DATA_ENGINE
+            if usesNativeProfileState, replacing {
+                // Existing native membership is updated by the kernel's atomic replacement,
+                // which retains its slot and deletion receipts. Install rejects a duplicate URL.
+                guard let old = rawAddonsByUrl[identity] else {
+                    return .failed(retryable: true, message: Self.accountTransitionMessage)
+                }
+                action = ["action": "ReplaceAddonLocal", "args": ["old": old, "new": descriptor]]
+            } else {
+                action = ["action": addonMutationAction("InstallAddon", local: "InstallAddonLocal"),
+                          "args": descriptor]
+            }
+#else
             action = ["action": addonMutationAction("InstallAddon", local: "InstallAddonLocal"),
                       "args": descriptor]
+#endif
         }
         let clearTombstoneBeforeDispatch: (() -> Void)? = {
 #if VORTX_NATIVE_DATA_ENGINE
@@ -1675,6 +1689,14 @@ final class CoreBridge: ObservableObject {
                                     replacingManifest: [String: Any]?,
                                     expectedManifest: [String: Any]?) -> Bool {
         guard addons.contains(where: { $0.transportUrl == identity }) else { return false }
+#if VORTX_NATIVE_DATA_ENGINE
+        if usesNativeProfileState {
+            guard let expectedManifest,
+                  let data = try? JSONSerialization.data(withJSONObject: expectedManifest),
+                  let submitted = try? JSONDecoder().decode(VortxJSON.self, from: data) else { return false }
+            return nativeFacade?.confirmsInstalledAddon(identity, submittedManifest: submitted) == true
+        }
+#endif
         guard replacingManifest != nil, let expectedManifest else { return true }
         guard let published = rawAddonsByUrl[identity]?["manifest"] as? [String: Any] else { return false }
         return NSDictionary(dictionary: published).isEqual(to: expectedManifest)
