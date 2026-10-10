@@ -50,6 +50,7 @@ import com.vortx.android.ui.theme.VortXAccents
 import com.vortx.android.ui.theme.VortXShapes
 import com.vortx.android.ui.theme.VortXTheme
 import com.vortx.android.ui.viewmodel.NativeStreamingAccountViewModel
+import kotlinx.coroutines.CancellationException
 
 /** Presentation adapter only: all durable roster, overlay and tombstone operations stay in ProfileStore. */
 internal interface TvProfileGateway {
@@ -60,6 +61,28 @@ internal interface TvProfileGateway {
     fun select(profile: UserProfile, admission: Admission): Result<ProfileSelectionRequest>
     fun save(profile: UserProfile, adding: Boolean, admission: Admission): Boolean
     fun remove(profile: UserProfile, admission: Admission): Boolean
+}
+
+/** Ordinary admission failures are actionable UI results; coroutine cancellation stays cancellation. */
+private inline fun <T> tvProfileResult(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (cancel: CancellationException) {
+    throw cancel
+} catch (error: Exception) {
+    Result.failure(error)
+}
+
+internal fun legacyTvProfileAdmission(commit: (() -> Unit) -> Unit): TvProfileGateway.Admission =
+    TvProfileGateway.Admission { action -> tvProfileResult { commit(action); true }.getOrDefault(false) }
+
+/** Shared by the store adapter and its synthetic admission tests; retains the exact typed request. */
+internal fun selectTvProfile(
+    admission: TvProfileGateway.Admission,
+    selection: () -> ProfileSelectionRequest,
+): Result<ProfileSelectionRequest> = tvProfileResult {
+    var request: ProfileSelectionRequest? = null
+    check(admission.commit { request = selection() }) { "The profile changed. Open it again before switching." }
+    checkNotNull(request)
 }
 
 internal class StoreTvProfileGateway(
@@ -80,28 +103,23 @@ internal class StoreTvProfileGateway(
         val (before, revision) = ContinueWatchingOwnerGate.serialized { read() to it }
         if ((!selection && !adding && before.activeID != profile.id) ||
             (if (adding) before.profiles.any { it.id == profile.id } else before.profiles.none { it == profile })) return null
-        return TvProfileGateway.Admission { action -> runCatching { ContinueWatchingOwnerGate.serialized { currentRevision ->
+        return legacyTvProfileAdmission { action -> ContinueWatchingOwnerGate.serialized { currentRevision ->
             val current = read()
             check(currentRevision == revision)
             check(current.profiles === before.profiles)
             check(current.activeID == before.activeID)
             check(if (adding) current.profiles.none { it.id == profile.id } else current.profiles.any { it == profile })
-            action(); true
-        } }.getOrDefault(false) }
+            action()
+        } }
     }
 
-    override fun select(profile: UserProfile, admission: TvProfileGateway.Admission): Result<ProfileSelectionRequest> = runCatching {
-        var request: ProfileSelectionRequest? = null
-        check(admission.commit {
+    override fun select(profile: UserProfile, admission: TvProfileGateway.Admission): Result<ProfileSelectionRequest> =
+        selectTvProfile(admission) {
             val outcome = store.select(profile)
             val after = if (BuildConfig.NATIVE_ENGINE_ENABLED) checkNotNull(native?.captureSelection(checkNotNull(store.active))) else null
-            request = captureProfileSelection(store, profile, outcome,
+            captureProfileSelection(store, profile, outcome,
                 nativeAdmission = after?.let { captured -> { checkNotNull(native).commitEditor(captured) {} } })
-        }) {
-            "The profile changed. Open it again before switching."
         }
-        checkNotNull(request)
-    }
 
     override fun save(profile: UserProfile, adding: Boolean, admission: TvProfileGateway.Admission): Boolean = admission.commit {
         if (adding) store.add(profile) else store.update(profile)
