@@ -4439,14 +4439,19 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         let preparer = iOSNextEpisodePreparer()
         cancelNextEpisodePreparation = { preparer.cancel() }
         warmNextEpisode = { request in
+            let expectedSources = account.streamSources
+            let expectedAddonCapabilities = EpisodeSourceInventory(legacyAddons: account.addons)
             let valid = {
                 ProfileStore.shared.activeID == pid
                     && account.credentialBoundaryGeneration == accountBoundary
+                    && account.streamSources == expectedSources
+                    && EpisodeSourceInventory(legacyAddons: account.addons) == expectedAddonCapabilities
                     && (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession)
             }
             let context = iOSNextEpisodePreparationContext(
                 seriesID: item.id, seriesName: entry.name, defaultSeason: season,
-                defaultVideoID: nil, poster: entry.poster, sources: account.streamSources,
+                defaultVideoID: nil, poster: entry.poster, sources: expectedSources,
+                legacyAddons: account.addons,
                 continuity: entry.qualityText, binge: entry.bingeGroup, pin: SourcePinStore.shared.effectivePin(
                     SourcePinContext(metaId: item.id, isSeries: true)), cachedHashes: [],
                 signedInToVortX: VortXSyncManager.shared.isSignedIn,

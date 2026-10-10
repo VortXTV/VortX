@@ -11,6 +11,7 @@ struct iOSNextEpisodePreparationContext {
     let defaultVideoID: String?
     let poster: String?
     let sources: [StreamSource]
+    let legacyAddons: [AddonDescriptor]
     let continuity: String?
     let binge: String?
     let pin: ResolvedPin?
@@ -28,29 +29,46 @@ struct iOSNextEpisodePreparationContext {
 /// player's TorBox/Singularity/media-server publications.
 @MainActor
 final class iOSNextEpisodePreparer: ObservableObject {
-    private let torbox = TorBoxSearchSource()
-    private let sourceIndex = SourceIndexServeSource()
-    private let mediaServers = MediaServerSource()
-    private var inFlight: (key: String, task: Task<PlayerEpisodeStream?, Never>)?
+    /// This scope is never shared between warm invocations. Cleanup can be immediate even when a
+    /// non-cooperative resolver still holds the cancelled invocation across an await.
+    @MainActor private final class AuxiliarySources {
+        let torbox = TorBoxSearchSource()
+        let sourceIndex = SourceIndexServeSource()
+        let mediaServers = MediaServerSource()
+
+        func clear() {
+            torbox.clearResults()
+            sourceIndex.clearResults()
+            mediaServers.clearResults()
+        }
+    }
+
+    private var attemptOwner = NextEpisodePreparationAttemptOwner()
+    private var inFlight: (id: UUID, task: Task<PlayerEpisodeStream?, Never>, auxiliary: AuxiliarySources)?
 
     deinit { inFlight?.task.cancel() }
 
     func cancel() {
         inFlight?.task.cancel()
+        inFlight?.auxiliary.clear()
         inFlight = nil
-        torbox.clearResults(); sourceIndex.clearResults(); mediaServers.clearResults()
+        attemptOwner.cancel()
     }
 
     func warm(_ request: NextEpisodePreparationRequest,
               context: iOSNextEpisodePreparationContext) async -> PlayerEpisodeStream? {
-        let key = "\(request.episodeID)|\(request.attemptSequence)"
-        if let inFlight, inFlight.key == key { return await inFlight.task.value }
+        guard !Task.isCancelled, context.isCurrent() else { return nil }
+        // PlayerScreen already admits only one warm at a time. Do not coalesce by episode/retry: a new
+        // invocation may carry a different source, remux generation or account even with the same key.
         inFlight?.task.cancel()
+        inFlight?.auxiliary.clear()
+        let attemptID = attemptOwner.begin()
+        let auxiliary = AuxiliarySources()
         let task = Task<PlayerEpisodeStream?, Never> { [weak self] in
             guard let self else { return nil }
-            return await self.prepare(request, context: context)
+            return await self.prepare(request, context: context, attemptID: attemptID, auxiliary: auxiliary)
         }
-        inFlight = (key, task)
+        inFlight = (attemptID, task, auxiliary)
         // Task is an owned child of this caller for cancellation purposes: PlayerScreen invalidation, cover
         // teardown, or replacement cancels the provider work immediately instead of merely abandoning an
         // unstructured task that continues to warm the old episode in the background.
@@ -58,24 +76,43 @@ final class iOSNextEpisodePreparer: ObservableObject {
             await task.value
         }, onCancel: {
             task.cancel()
+            Task { @MainActor in auxiliary.clear() }
         })
-        if inFlight?.key == key { inFlight = nil }
+        guard attemptOwner.isCurrent(attemptID), !Task.isCancelled, context.isCurrent() else {
+            if let lease = result?.torrentPreparationLease {
+                retireWarmTorrentEngine(lease, reason: "superseded preparation caller")
+            }
+            result?.preparedRemux?.abandon(reason: "superseded preparation caller")
+            if attemptOwner.finish(attemptID) { inFlight = nil }
+            return nil
+        }
+        if attemptOwner.finish(attemptID) { inFlight = nil }
         return result
     }
 
     private func prepare(_ request: NextEpisodePreparationRequest,
-                         context: iOSNextEpisodePreparationContext) async -> PlayerEpisodeStream? {
-        guard !Task.isCancelled, context.isCurrent(),
+                         context: iOSNextEpisodePreparationContext,
+                         attemptID: UUID, auxiliary: AuxiliarySources) async -> PlayerEpisodeStream? {
+        defer { auxiliary.clear() }
+        guard !Task.isCancelled, attemptOwner.isCurrent(attemptID), context.isCurrent(),
               request.deadline > ProcessInfo.processInfo.systemUptime,
               let video = context.videos().first(where: { $0.id == request.episodeID }) else { return nil }
         let choice = SeriesSourceSticky.snapshot(for: context.seriesID)
         let sticky = choice.source
-        let sourceOwner = EpisodeSourceOwner(legacySources: context.sources, legacyIsCurrent: context.isCurrent)
+        let sourceOwner = EpisodeSourceOwner(legacySources: context.sources,
+                                            legacyAddons: context.legacyAddons,
+                                            legacyIsCurrent: context.isCurrent)
         func admitted() -> Bool {
-            sourceOwner.isCurrent && context.isCurrent() && SeriesSourceSticky.admits(choice)
+            !Task.isCancelled && attemptOwner.isCurrent(attemptID)
+                && sourceOwner.isCurrent && context.isCurrent() && SeriesSourceSticky.admits(choice)
         }
         guard admitted() else { return nil }
-        async let rawGroups = warmFetchEpisodeSourceGroups(sources: sourceOwner.sources(for: video.id), request: request,
+        // Publications belong to this invocation, including its deferred cancellation cleanup. A held
+        // old attempt must never clear a successor that happens to target the same next episode.
+        let torbox = auxiliary.torbox
+        let sourceIndex = auxiliary.sourceIndex
+        let mediaServers = auxiliary.mediaServers
+        async let rawGroups = warmFetchEpisodeSourceGroups(providers: sourceOwner.providers(seriesID: context.seriesID, videoID: video.id), request: request,
                                                            wantedAddon: sticky.addon)
         let targetSeason = video.season ?? context.defaultSeason
         let targetEpisode = video.episode
@@ -90,8 +127,9 @@ final class iOSNextEpisodePreparer: ObservableObject {
                                         isSignedIn: context.signedInToVortX)
         mediaServers.refresh(imdb: titleID, season: targetSeason, episode: targetEpisode,
                              title: context.seriesName, publicationTarget: mediaTarget)
-        defer { clear(target: target, mediaTarget: mediaTarget) }
-        let auxiliary = await awaitAuxiliarySettlement(target: target, mediaTarget: mediaTarget,
+        let auxiliary = await awaitAuxiliarySettlement(torbox: torbox, sourceIndex: sourceIndex,
+                                                       mediaServers: mediaServers,
+                                                       target: target, mediaTarget: mediaTarget,
                                                        deadline: min(request.deadline, ProcessInfo.processInfo.systemUptime + NextEpisodePreparationBudget.addonFetchBudget),
                                                        isCurrent: admitted)
         guard admitted() else { return nil }
@@ -170,7 +208,8 @@ final class iOSNextEpisodePreparer: ObservableObject {
     private struct AuxiliarySnapshot {
         let torbox: [CoreStream]; let sourceIndex: [CoreStream]; let mediaServers: [CoreStreamSourceGroup]
     }
-    private func awaitAuxiliarySettlement(target: SourceIndexIdentity.TargetResolution,
+    private func awaitAuxiliarySettlement(torbox: TorBoxSearchSource, sourceIndex: SourceIndexServeSource,
+        mediaServers: MediaServerSource, target: SourceIndexIdentity.TargetResolution,
         mediaTarget: SourceIndexIdentity.MediaServerTarget?, deadline: TimeInterval,
         isCurrent: () -> Bool) async -> AuxiliarySnapshot {
         while !Task.isCancelled && isCurrent() {
@@ -184,10 +223,5 @@ final class iOSNextEpisodePreparer: ObservableObject {
             torbox: SourceIndexIdentity.mergeAuthorization(published: torbox.publishedTarget, page: target) != nil ? torbox.streams : [],
             sourceIndex: SourceIndexIdentity.mergeAuthorization(published: sourceIndex.publishedTarget, page: target) != nil ? sourceIndex.streams : [],
             mediaServers: SourceIndexIdentity.mediaServerMergeAuthorization(published: mediaServers.publishedTarget, page: mediaTarget) != nil ? mediaServers.groups : [])
-    }
-    private func clear(target: SourceIndexIdentity.TargetResolution, mediaTarget: SourceIndexIdentity.MediaServerTarget?) {
-        if SourceIndexIdentity.mergeAuthorization(published: torbox.publishedTarget, page: target) != nil { torbox.clearResults() }
-        if SourceIndexIdentity.mergeAuthorization(published: sourceIndex.publishedTarget, page: target) != nil { sourceIndex.clearResults() }
-        if SourceIndexIdentity.mediaServerMergeAuthorization(published: mediaServers.publishedTarget, page: mediaTarget) != nil { mediaServers.clearResults() }
     }
 }

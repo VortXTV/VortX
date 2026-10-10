@@ -5853,10 +5853,13 @@ struct iOSEpisodeStreams: View {
         let expectedProfileID = profiles.activeID
         let expectedAccountBoundary = account.credentialBoundaryGeneration
         let expectedTraktSession = initialTraktSessionID
+        let expectedSources = account.streamSources
+        let expectedAddonCapabilities = EpisodeSourceInventory(legacyAddons: account.addons)
         return iOSNextEpisodePreparationContext(
             seriesID: meta.id, seriesName: meta.name, defaultSeason: season,
             defaultVideoID: meta.behaviorHints?.defaultVideoId, poster: meta.poster,
-            sources: account.streamSources, continuity: rememberedQuality, binge: lastBinge,
+            sources: expectedSources, legacyAddons: account.addons,
+            continuity: rememberedQuality, binge: lastBinge,
             pin: sourcePin, cachedHashes: debridCache.cachedHashes,
             signedInToVortX: VortXSyncManager.shared.isSignedIn,
             videos: {
@@ -5870,6 +5873,8 @@ struct iOSEpisodeStreams: View {
             isCurrent: {
                 profiles.activeID == expectedProfileID
                     && account.credentialBoundaryGeneration == expectedAccountBoundary
+                    && account.streamSources == expectedSources
+                    && EpisodeSourceInventory(legacyAddons: account.addons) == expectedAddonCapabilities
                     && (expectedTraktSession == nil || TraktAuth.storedSessionID == expectedTraktSession)
             }
         )
